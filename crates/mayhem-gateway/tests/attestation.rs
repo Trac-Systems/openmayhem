@@ -103,8 +103,10 @@ fn golden_launch_measurements() -> serde_json::Value {
         "schema_version": 1,
         "effective_epoch": 0,
         "platform": "azure-h100-sev-snp-nvidia-cc",
-        "measurements": {
-            "snp_launch_digest": "ab".repeat(48)
+        "layers": {
+            "workload": {
+                "vtpm_pcr_0": "ab".repeat(48)
+            }
         }
     })
 }
@@ -836,7 +838,7 @@ fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -857,7 +859,7 @@ fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -882,7 +884,7 @@ fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","intel_tdx_dcap"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","intel_tdx_dcap"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -896,12 +898,136 @@ fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
 
 #[cfg(unix)]
 #[test]
+fn external_azure_maa_cpu_path_requires_azure_scope_gpu_roots_and_workload_pcr() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::json!({
+            "platform_id": "azure-ncc",
+            "region": "centralus"
+        }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","azure_maa_jwt_jwks_issuer_nonce_claims"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    verify_tier1_attestation(&request).expect(
+        "Azure-scoped MAA CPU path is accepted only after verifier validates JWT/JWKS/issuer/nonce/claims and workload PCR",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_azure_maa_cpu_path_is_not_universal_cpu_root() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::json!({
+            "platform_id": "onprem-qemu-v1"
+        }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","azure_maa_jwt_jwks_issuer_nonce_claims"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("MAA is not a universal CPU/VM root outside Azure platform entries");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("do not satisfy")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_azure_maa_cpu_path_still_rejects_wrong_workload_pcr() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::json!({
+            "platform_id": "azure-ncc",
+            "region": "centralus"
+        }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","azure_maa_jwt_jwks_issuer_nonce_claims"],"matched_measurements":{"workload":{"vtpm_pcr_0":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("MAA platform proof never skips Mayhem workload PCR matching");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("workload PCR/stack")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_tier3_registration_requires_workload_measurement_layer() {
+    let (temp, report, mut contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::json!({
+            "platform_id": "azure-ncc",
+            "region": "centralus"
+        }),
+    );
+    contract.launch_measurements = serde_json::json!({
+        "schema_version": 1,
+        "effective_epoch": 0,
+        "platform": "azure-ncc",
+        "layers": {
+            "vendor": {
+                "snp_launch_digest": "ab".repeat(48)
+            }
+        }
+    });
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","azure_maa_jwt_jwks_issuer_nonce_claims"],"matched_measurements":{"vendor":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("Tier-3 cannot register with only vendor-layer measurements");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("workload PCR/stack")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
     let (temp, report, contract, trusted) =
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"},"platform_id":"provider-declared-azure-ncc","region":"centralus","snp_chip_family":"genoa","snp_chip_id":"chip-123","snp_tcb":"svn27","gpu_model":"H100","gpu_driver":"550.90","gpu_vbios":"96.00.00"}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}},"platform_id":"provider-declared-azure-ncc","region":"centralus","snp_chip_family":"genoa","snp_chip_id":"chip-123","snp_tcb":"svn27","gpu_model":"H100","gpu_driver":"550.90","gpu_vbios":"96.00.00"}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -932,7 +1058,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
     );
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -958,7 +1084,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
     );
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -978,7 +1104,7 @@ fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
     contract.launch_measurements = serde_json::Value::Null;
     let script = write_verifier_script(
         &temp,
-        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
@@ -992,7 +1118,7 @@ fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
     assert!(matches!(
         err,
         GatewayError::HardwareQuoteInvalid { reason, .. }
-            if reason.contains("no admin-published launch measurements")
+            if reason.contains("no admin-published measurement layers")
     ));
 }
 

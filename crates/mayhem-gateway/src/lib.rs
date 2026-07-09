@@ -47,6 +47,11 @@ pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
 const APPLE_APP_ATTEST_ISSUER: &str = "https://appattest.apple.com";
 const NVIDIA_LOCAL_VERIFIER_ISSUER: &str = "https://local.verifier.attestation.nvidia.com";
 const NVIDIA_NRAS_ISSUER: &str = "https://nras.attestation.nvidia.com";
+const TIER3_VENDOR_LAYER: &str = "vendor";
+const TIER3_WORKLOAD_LAYER: &str = "workload";
+
+type GoldenTier3Measurements = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+type MatchedTier3Measurements = BTreeMap<String, BTreeMap<String, String>>;
 
 type Result<T> = std::result::Result<T, GatewayError>;
 
@@ -667,15 +672,10 @@ fn verify_hardware_quote_with_command(
         ));
     }
     let kind = hardware_quote_kind_name(&quote.kind);
-    let golden_measurements = golden_launch_measurements(&request.contract.launch_measurements);
-    if quote.kind.attestation_tier() >= 3 && golden_measurements.is_empty() {
-        return Err(hardware_quote_invalid(
-            kind,
-            "Tier-3 enclave has no admin-published launch measurements",
-        ));
-    }
+    let golden_measurements = golden_tier3_measurements(&request.contract.launch_measurements);
     let declared_platform = if quote.kind.attestation_tier() >= 3 {
         let platform = tier3_quote_platform_id(kind, quote)?;
+        require_tier3_workload_measurements(kind, &golden_measurements)?;
         Some(platform.to_owned())
     } else {
         None
@@ -685,7 +685,7 @@ fn verify_hardware_quote_with_command(
         "kind": kind,
         "expected_binding": expected_binding,
         "declared_platform": declared_platform.as_deref(),
-        "golden_launch_measurements": &golden_measurements,
+        "golden_measurement_layers": &golden_measurements,
         "quote": quote,
         "report": request.report,
         "contract": {
@@ -842,7 +842,7 @@ fn verify_hardware_quote_with_command(
             "admin verifier did not name any verified vendor root",
         ));
     }
-    if !verifier_roots_satisfy_quote_kind(&quote.kind, &roots) {
+    if !verifier_roots_satisfy_quote_kind(&quote.kind, &roots, declared_platform.as_deref()) {
         return Err(hardware_quote_invalid(
             kind,
             format!(
@@ -886,55 +886,71 @@ fn tier3_quote_platform_id<'a>(kind: &'static str, quote: &'a HardwareQuote) -> 
     Ok(platform)
 }
 
-fn golden_launch_measurements(value: &Value) -> BTreeMap<String, BTreeSet<String>> {
+fn golden_tier3_measurements(value: &Value) -> GoldenTier3Measurements {
     fn insert_measurement(
-        out: &mut BTreeMap<String, BTreeSet<String>>,
+        out: &mut GoldenTier3Measurements,
+        layer: &str,
         name: &str,
         measurement: &str,
     ) {
+        let layer = normalize_tier3_measurement_layer(layer);
         let name = normalize_verifier_root(name);
         let measurement = measurement.trim().to_ascii_lowercase();
-        if !name.is_empty() && !measurement.is_empty() {
-            out.entry(name).or_default().insert(measurement);
+        if !layer.is_empty() && !name.is_empty() && !measurement.is_empty() {
+            out.entry(layer)
+                .or_default()
+                .entry(name)
+                .or_default()
+                .insert(measurement);
         }
     }
 
-    fn collect_value(out: &mut BTreeMap<String, BTreeSet<String>>, name: &str, value: &Value) {
+    fn collect_value(out: &mut GoldenTier3Measurements, layer: &str, name: &str, value: &Value) {
         if let Some(measurement) = value.as_str() {
-            insert_measurement(out, name, measurement);
+            insert_measurement(out, layer, name, measurement);
             return;
         }
         if let Some(values) = value.as_array() {
             for value in values {
-                collect_value(out, name, value);
+                collect_value(out, layer, name, value);
             }
             return;
         }
         if let Some(object) = value.as_object() {
             if let Some(measurement) = object.get("measurement").and_then(Value::as_str) {
-                insert_measurement(out, name, measurement);
+                insert_measurement(out, layer, name, measurement);
             }
             if let Some(values) = object.get("values") {
-                collect_value(out, name, values);
+                collect_value(out, layer, name, values);
+            }
+        }
+    }
+
+    fn collect_measurement_map(out: &mut GoldenTier3Measurements, layer: &str, value: &Value) {
+        let measurements = value
+            .get("measurements")
+            .and_then(Value::as_object)
+            .or_else(|| value.as_object());
+        if let Some(measurements) = measurements {
+            for (name, value) in measurements {
+                if matches!(
+                    name.as_str(),
+                    "schema_version" | "effective_epoch" | "platform" | "entries" | "layers"
+                ) {
+                    continue;
+                }
+                collect_value(out, layer, name, value);
             }
         }
     }
 
     let mut out = BTreeMap::new();
-    let measurements = value
-        .get("measurements")
-        .and_then(Value::as_object)
-        .or_else(|| value.as_object());
-    if let Some(measurements) = measurements {
-        for (name, value) in measurements {
-            if matches!(
-                name.as_str(),
-                "schema_version" | "effective_epoch" | "platform" | "entries"
-            ) {
-                continue;
-            }
-            collect_value(&mut out, name, value);
+    if let Some(layers) = value.get("layers").and_then(Value::as_object) {
+        for (layer, layer_value) in layers {
+            collect_measurement_map(&mut out, layer, layer_value);
         }
+    } else {
+        collect_measurement_map(&mut out, TIER3_WORKLOAD_LAYER, value);
     }
     if let Some(entries) = value.get("entries").and_then(Value::as_array) {
         for entry in entries {
@@ -944,81 +960,232 @@ fn golden_launch_measurements(value: &Value) -> BTreeMap<String, BTreeSet<String
             let Some(measurement) = object.get("measurement").and_then(Value::as_str) else {
                 continue;
             };
+            let layer = object
+                .get("layer")
+                .and_then(Value::as_str)
+                .unwrap_or(TIER3_WORKLOAD_LAYER);
             let name = object
                 .get("measurement_name")
                 .or_else(|| object.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or("measurement");
-            insert_measurement(&mut out, name, measurement);
+            insert_measurement(&mut out, layer, name, measurement);
         }
     }
+    out.retain(|_, measurements| {
+        measurements.retain(|_, values| !values.is_empty());
+        !measurements.is_empty()
+    });
     out
+}
+
+fn require_tier3_workload_measurements(
+    kind: &'static str,
+    golden: &GoldenTier3Measurements,
+) -> Result<()> {
+    if golden.is_empty() {
+        return Err(hardware_quote_invalid(
+            kind,
+            "Tier-3 enclave has no admin-published measurement layers",
+        ));
+    }
+    if !golden
+        .get(TIER3_WORKLOAD_LAYER)
+        .is_some_and(|measurements| !measurements.is_empty())
+    {
+        return Err(hardware_quote_invalid(
+            kind,
+            "Tier-3 enclave has no admin-published workload PCR/stack measurements",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_tier3_measurement_layer(layer: &str) -> String {
+    normalize_verifier_root(layer)
+}
+
+fn split_tier3_measurement_name<'a>(name: &'a str) -> (String, &'a str) {
+    for (prefix, layer) in [
+        ("vendor.", TIER3_VENDOR_LAYER),
+        ("vendor:", TIER3_VENDOR_LAYER),
+        ("workload.", TIER3_WORKLOAD_LAYER),
+        ("workload:", TIER3_WORKLOAD_LAYER),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return (layer.to_owned(), rest);
+        }
+    }
+    (TIER3_WORKLOAD_LAYER.to_owned(), name)
+}
+
+fn insert_matched_measurement(
+    matched: &mut MatchedTier3Measurements,
+    layer: &str,
+    name: &str,
+    value: &str,
+) {
+    let layer = normalize_tier3_measurement_layer(layer);
+    let name = normalize_verifier_root(name);
+    let value = value.trim().to_ascii_lowercase();
+    if !layer.is_empty() && !name.is_empty() && !value.is_empty() {
+        matched.entry(layer).or_default().insert(name, value);
+    }
+}
+
+fn collect_matched_measurements_value(
+    matched: &mut MatchedTier3Measurements,
+    default_layer: &str,
+    name: &str,
+    value: &Value,
+) {
+    if let Some(value) = value.as_str() {
+        let (layer, name) = split_tier3_measurement_name(name);
+        let layer = if default_layer == TIER3_WORKLOAD_LAYER {
+            layer
+        } else {
+            default_layer.to_owned()
+        };
+        insert_matched_measurement(matched, &layer, name, value);
+        return;
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(measurement) = object.get("measurement").and_then(Value::as_str) {
+            let layer = object
+                .get("layer")
+                .and_then(Value::as_str)
+                .unwrap_or(default_layer);
+            let name = object
+                .get("measurement_name")
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(name);
+            insert_matched_measurement(matched, layer, name, measurement);
+        }
+        if let Some(values) = object.get("values").and_then(Value::as_array) {
+            for value in values {
+                collect_matched_measurements_value(matched, default_layer, name, value);
+            }
+        }
+    }
 }
 
 fn verify_verdict_matches_golden_measurement(
     kind: &'static str,
     verdict: &HardwareQuoteVerifierCommandOutput,
-    golden: &BTreeMap<String, BTreeSet<String>>,
+    golden: &GoldenTier3Measurements,
     quote_metadata: &Value,
 ) -> Result<()> {
     let matched = verifier_matched_measurements(verdict);
     if matched.is_empty() {
         return Err(hardware_quote_invalid(
             kind,
-            "admin verifier did not report a matched launch measurement",
+            "admin verifier did not report matched Tier-3 measurements",
         ));
     }
+    for (layer, required) in golden {
+        if required.is_empty() {
+            continue;
+        }
+        let Some(actual) = matched.get(layer) else {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!(
+                    "hardware quote did not report a matched {layer} measurement{}",
+                    tier3_alert_suffix(verdict, quote_metadata, Some(&matched))
+                ),
+            ));
+        };
+        if !tier3_layer_has_measurement_match(required, actual) {
+            let label = if layer == TIER3_WORKLOAD_LAYER {
+                "workload PCR/stack"
+            } else {
+                layer
+            };
+            return Err(hardware_quote_invalid(
+                kind,
+                format!(
+                    "hardware quote {label} measurement does not match the admin-published golden set{}",
+                    tier3_alert_suffix(verdict, quote_metadata, Some(&matched))
+                ),
+            ));
+        }
+    }
+    if !matched
+        .get(TIER3_WORKLOAD_LAYER)
+        .is_some_and(|values| !values.is_empty())
+    {
+        return Err(hardware_quote_invalid(
+            kind,
+            "admin verifier did not report a matched workload PCR/stack measurement",
+        ));
+    }
+    Ok(())
+}
+
+fn tier3_layer_has_measurement_match(
+    required: &BTreeMap<String, BTreeSet<String>>,
+    actual: &BTreeMap<String, String>,
+) -> bool {
     let value_matches_any =
-        |measurement: &str| golden.values().any(|values| values.contains(measurement));
-    for (name, measurement) in &matched {
-        if golden
+        |measurement: &str| required.values().any(|values| values.contains(measurement));
+    for (name, measurement) in actual {
+        if required
             .get(name)
             .is_some_and(|values| values.contains(measurement))
             || (name == "measurement" && value_matches_any(measurement))
         {
-            return Ok(());
+            return true;
         }
     }
-    Err(hardware_quote_invalid(
-        kind,
-        format!(
-            "hardware quote measurement does not match the admin-published launch measurement{}",
-            tier3_alert_suffix(verdict, quote_metadata, Some(&matched))
-        ),
-    ))
+    false
 }
 
 fn verifier_matched_measurements(
     verdict: &HardwareQuoteVerifierCommandOutput,
-) -> BTreeMap<String, String> {
+) -> MatchedTier3Measurements {
     let mut matched = BTreeMap::new();
     if let Some(value) = verdict.matched_measurement.as_deref() {
-        let name = verdict
+        let raw_name = verdict
             .matched_measurement_name
             .as_deref()
-            .map(normalize_verifier_root)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "measurement".to_owned());
-        matched.insert(name, value.trim().to_ascii_lowercase());
+            .unwrap_or("measurement");
+        let (layer, name) = split_tier3_measurement_name(raw_name);
+        insert_matched_measurement(&mut matched, &layer, name, value);
     }
     if let Some(object) = verdict.matched_measurements.as_object() {
         for (name, value) in object {
-            if let Some(value) = value.as_str() {
-                let name = normalize_verifier_root(name);
-                if !name.is_empty() {
-                    matched.insert(name, value.trim().to_ascii_lowercase());
+            let normalized = normalize_tier3_measurement_layer(name);
+            if matches!(
+                normalized.as_str(),
+                TIER3_VENDOR_LAYER | TIER3_WORKLOAD_LAYER
+            ) {
+                if let Some(layer_object) = value.as_object() {
+                    for (measurement_name, measurement_value) in layer_object {
+                        collect_matched_measurements_value(
+                            &mut matched,
+                            &normalized,
+                            measurement_name,
+                            measurement_value,
+                        );
+                    }
+                    continue;
                 }
             }
+            collect_matched_measurements_value(&mut matched, TIER3_WORKLOAD_LAYER, name, value);
         }
     }
-    matched.retain(|_, value| !value.is_empty());
+    matched.retain(|_, values| {
+        values.retain(|_, value| !value.is_empty());
+        !values.is_empty()
+    });
     matched
 }
 
 fn tier3_alert_suffix(
     verdict: &HardwareQuoteVerifierCommandOutput,
     quote_metadata: &Value,
-    matched: Option<&BTreeMap<String, String>>,
+    matched: Option<&MatchedTier3Measurements>,
 ) -> String {
     let mut parts = Vec::new();
     push_alert_part(
@@ -1045,9 +1212,7 @@ fn tier3_alert_suffix(
         "unknown_measurement",
         verifier_string(verdict.unknown_measurement.as_deref())
             .or_else(|| json_string_path(&verdict.alert, &["unknown_measurement"]))
-            .or_else(|| {
-                matched.and_then(|matched| matched.iter().next().map(|(_, value)| value.clone()))
-            })
+            .or_else(|| matched.and_then(first_matched_tier3_measurement))
             .as_deref(),
     );
     push_alert_part(
@@ -1144,6 +1309,12 @@ fn json_string_path(value: &Value, path: &[&str]) -> Option<String> {
         })
 }
 
+fn first_matched_tier3_measurement(matched: &MatchedTier3Measurements) -> Option<String> {
+    matched
+        .values()
+        .find_map(|measurements| measurements.values().next().cloned())
+}
+
 fn hardware_quote_kind_name(kind: &HardwareQuoteKind) -> &'static str {
     match kind {
         HardwareQuoteKind::AppleAppAttestJwt => "apple_app_attest_jwt",
@@ -1186,7 +1357,11 @@ fn normalize_verifier_root(root: &str) -> String {
         .join("_")
 }
 
-fn verifier_roots_satisfy_quote_kind(kind: &HardwareQuoteKind, roots: &[String]) -> bool {
+fn verifier_roots_satisfy_quote_kind(
+    kind: &HardwareQuoteKind,
+    roots: &[String],
+    declared_platform: Option<&str>,
+) -> bool {
     match kind {
         HardwareQuoteKind::AppleAppAttestJwt => root_has_all(roots, &["apple", "app", "attest"]),
         HardwareQuoteKind::AmdSevSnpVcek => has_amd_sev_snp_vcek_root(roots),
@@ -1197,16 +1372,19 @@ fn verifier_roots_satisfy_quote_kind(kind: &HardwareQuoteKind, roots: &[String])
         }
         HardwareQuoteKind::NvidiaNrasJwt => {
             root_has_all(roots, &["nvidia", "nras"])
-                || (has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots))
+                || (has_raw_nvidia_gpu_roots(roots)
+                    && has_confidential_cpu_root(roots, declared_platform))
         }
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt => {
-            has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots)
+            has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots, declared_platform)
         }
     }
 }
 
-fn has_confidential_cpu_root(roots: &[String]) -> bool {
-    has_amd_sev_snp_vcek_root(roots) || has_intel_tdx_dcap_root(roots)
+fn has_confidential_cpu_root(roots: &[String], declared_platform: Option<&str>) -> bool {
+    has_amd_sev_snp_vcek_root(roots)
+        || has_intel_tdx_dcap_root(roots)
+        || has_azure_maa_cpu_root(roots, declared_platform)
 }
 
 fn has_amd_sev_snp_vcek_root(roots: &[String]) -> bool {
@@ -1216,6 +1394,19 @@ fn has_amd_sev_snp_vcek_root(roots: &[String]) -> bool {
 
 fn has_intel_tdx_dcap_root(roots: &[String]) -> bool {
     root_has_all(roots, &["intel", "tdx", "dcap"])
+}
+
+fn has_azure_maa_cpu_root(roots: &[String], declared_platform: Option<&str>) -> bool {
+    let Some(platform) = declared_platform.map(normalize_verifier_root) else {
+        return false;
+    };
+    if !(platform == "azure_ncc" || platform.starts_with("azure_")) {
+        return false;
+    }
+    root_has_all(
+        roots,
+        &["azure", "maa", "jwt", "jwks", "issuer", "nonce", "claims"],
+    )
 }
 
 fn has_raw_nvidia_gpu_roots(roots: &[String]) -> bool {

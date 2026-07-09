@@ -3085,6 +3085,10 @@ struct AdminTier3DeriveArgs {
     #[arg(long, default_value = "snp_launch_digest")]
     measurement_name: String,
 
+    /// Measurement layer: workload pins Mayhem image/PCRs, vendor pins platform firmware.
+    #[arg(long, default_value = "workload")]
+    layer: String,
+
     /// Already-derived measurement hex from an admin-owned attestation run.
     #[arg(long)]
     measurement: Option<String>,
@@ -3143,6 +3147,10 @@ struct AdminTier3BlessArgs {
     #[arg(long, default_value = "snp_launch_digest")]
     measurement_name: String,
 
+    /// Measurement layer being blessed.
+    #[arg(long, default_value = "workload")]
+    layer: String,
+
     /// Golden measurement hex to append.
     #[arg(long)]
     measurement: String,
@@ -3192,6 +3200,8 @@ struct Tier3DerivationRecord {
     schema_version: u32,
     platform: String,
     region: Option<String>,
+    #[serde(default = "default_tier3_measurement_layer")]
+    layer: String,
     measurement_name: String,
     measurement: String,
     alert_measurement: Option<String>,
@@ -3203,6 +3213,10 @@ struct Tier3DerivationRecord {
     #[serde(default)]
     endorsement_sha256: Option<String>,
     derivation_hash: String,
+}
+
+fn default_tier3_measurement_layer() -> String {
+    "workload".to_owned()
 }
 
 #[derive(Debug, Parser)]
@@ -12482,6 +12496,7 @@ async fn admin_tier3_list(args: &AdminTier3ListArgs) -> Result<()> {
 async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
     validate_tier3_platform(&args.platform)?;
     validate_tier3_measurement_name(&args.measurement_name)?;
+    validate_tier3_measurement_layer(&args.layer)?;
     if args.measurement.is_some() && args.derive_command.is_some() {
         bail!("pass only one of --measurement or --derive-command");
     }
@@ -12500,6 +12515,14 @@ async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
         (normalize_tier3_measurement(measurement)?, source.to_owned())
     } else if let Some(command) = args.derive_command.as_ref() {
         let output = run_tier3_derive_command(command, args)?;
+        if let Some(layer) = output.layer.as_deref() {
+            if layer != args.layer {
+                bail!(
+                    "Tier-3 derive command returned layer {layer}, expected {}",
+                    args.layer
+                );
+            }
+        }
         if let Some(source_kind) = output.source_kind.as_deref() {
             if source_kind != args.source_kind.as_str() {
                 bail!(
@@ -12544,6 +12567,7 @@ async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
         schema_version: 1,
         platform: args.platform.clone(),
         region: args.region.clone(),
+        layer: args.layer.clone(),
         measurement_name: args.measurement_name.clone(),
         measurement,
         alert_measurement,
@@ -12559,6 +12583,7 @@ async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
     let mut records = read_tier3_derivations(&store_path)?;
     records.retain(|existing| {
         !(existing.platform == record.platform
+            && existing.layer == record.layer
             && existing.measurement_name == record.measurement_name
             && existing.measurement == record.measurement)
     });
@@ -12590,7 +12615,8 @@ async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
             report["record"]["platform"].as_str().unwrap_or("")
         );
         println!(
-            "Measurement: {}={}",
+            "Measurement: {}/{}={}",
+            report["record"]["layer"].as_str().unwrap_or(""),
             report["record"]["measurement_name"].as_str().unwrap_or(""),
             report["record"]["measurement"].as_str().unwrap_or("")
         );
@@ -12631,6 +12657,7 @@ async fn admin_tier3_bless(args: &AdminTier3BlessArgs) -> Result<()> {
     let measurement = normalize_tier3_measurement(&args.measurement)?;
     validate_tier3_platform(&args.platform)?;
     validate_tier3_measurement_name(&args.measurement_name)?;
+    validate_tier3_measurement_layer(&args.layer)?;
     if let Some(region) = args.region.as_deref() {
         validate_tier3_platform(region)?;
     }
@@ -12641,6 +12668,7 @@ async fn admin_tier3_bless(args: &AdminTier3BlessArgs) -> Result<()> {
     let derivations = read_tier3_derivations(&store_path)?;
     let local = derivations.iter().find(|record| {
         record.platform == args.platform
+            && record.layer == args.layer
             && record.measurement_name == args.measurement_name
             && record.measurement == measurement
             && args
@@ -12669,6 +12697,8 @@ struct Tier3DeriveCommandOutput {
     #[serde(default)]
     measurement_name: Option<String>,
     #[serde(default)]
+    layer: Option<String>,
+    #[serde(default)]
     measurements: Value,
     #[serde(default)]
     source: Option<String>,
@@ -12692,6 +12722,7 @@ fn run_tier3_derive_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("MAYHEM_TIER3_PLATFORM", &args.platform)
+        .env("MAYHEM_TIER3_LAYER", &args.layer)
         .env("MAYHEM_TIER3_MEASUREMENT_NAME", &args.measurement_name)
         .env("MAYHEM_TIER3_REGION", args.region.as_deref().unwrap_or(""))
         .env("MAYHEM_TIER3_SOURCE_KIND", args.source_kind.as_str())
@@ -12714,6 +12745,31 @@ fn run_tier3_derive_command(
                 command.display()
             )
         })?;
+    if parsed.measurement.is_empty() {
+        if let Some(value) = parsed
+            .measurements
+            .get(&args.layer)
+            .and_then(|layer| layer.get(&args.measurement_name))
+            .and_then(measurement_value_first_string)
+            .or_else(|| {
+                parsed
+                    .measurements
+                    .get(&args.measurement_name)
+                    .and_then(measurement_value_first_string)
+            })
+        {
+            parsed.measurement = value.to_owned();
+        }
+    }
+    if let Some(layer) = parsed.layer.as_deref() {
+        validate_tier3_measurement_layer(layer)?;
+        if layer != args.layer {
+            bail!(
+                "Tier-3 derive command returned layer {layer}, expected {}",
+                args.layer
+            );
+        }
+    }
     if parsed.measurement.is_empty() {
         if let Some(value) = parsed
             .measurements
@@ -12794,6 +12850,7 @@ fn admin_tier3_bless_payload(
     let mut value = json!({
         "op": "tier3_bless_measurement",
         "platform": &args.platform,
+        "layer": &args.layer,
         "measurement_name": &args.measurement_name,
         "measurement": measurement,
         "effective_epoch": args.effective_epoch,
@@ -12852,6 +12909,7 @@ fn tier3_derivation_hash(record: &Tier3DerivationRecord) -> String {
         "schema_version": record.schema_version,
         "platform": record.platform,
         "region": record.region,
+        "layer": record.layer,
         "measurement_name": record.measurement_name,
         "measurement": record.measurement,
         "alert_measurement": record.alert_measurement,
@@ -12879,6 +12937,13 @@ fn validate_tier3_measurement_name(value: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
     {
         bail!("Tier-3 measurement name must be a non-empty safe label");
+    }
+    Ok(())
+}
+
+fn validate_tier3_measurement_layer(value: &str) -> Result<()> {
+    if !matches!(value, "vendor" | "workload") {
+        bail!("Tier-3 measurement layer must be vendor or workload");
     }
     Ok(())
 }
@@ -14273,7 +14338,6 @@ fn validate_admin_launch_measurements_json(value: &Value, tier3_required: bool) 
     let Some(object) = value.as_object() else {
         bail!("launch measurements JSON must be an object");
     };
-    let measurements = object.get("measurements").unwrap_or(value);
     if tier3_required {
         let platform = object
             .get("platform")
@@ -14283,16 +14347,45 @@ fn validate_admin_launch_measurements_json(value: &Value, tier3_required: bool) 
             .context("Tier-3 launch measurements JSON must include platform")?;
         validate_tier3_platform(platform)?;
     }
-    let Some(measurements) = measurements.as_object() else {
-        bail!("launch measurements JSON measurements must be an object");
-    };
-    if tier3_required && measurements.is_empty() {
+    let mut total = 0usize;
+    let mut workload_total = 0usize;
+    if let Some(layers) = object.get("layers").and_then(Value::as_object) {
+        for (layer, measurements) in layers {
+            validate_tier3_measurement_layer(layer)?;
+            let count = validate_admin_launch_measurement_map(layer, measurements)?;
+            total += count;
+            if layer == "workload" {
+                workload_total += count;
+            }
+        }
+    } else if let Some(measurements) = object.get("measurements") {
+        let count = validate_admin_launch_measurement_map("workload", measurements)?;
+        total += count;
+        workload_total += count;
+    } else {
+        let count = validate_admin_launch_measurement_map("workload", value)?;
+        total += count;
+        workload_total += count;
+    }
+    if tier3_required && total == 0 {
         bail!("Tier-3 launch measurements JSON must include at least one measurement");
     }
+    if tier3_required && workload_total == 0 {
+        bail!("Tier-3 launch measurements JSON must include layers.workload for Mayhem PCR/stack identity");
+    }
+    Ok(())
+}
+
+fn validate_admin_launch_measurement_map(layer: &str, value: &Value) -> Result<usize> {
+    validate_tier3_measurement_layer(layer)?;
+    let Some(measurements) = value.as_object() else {
+        bail!("launch measurements JSON {layer} layer must be an object");
+    };
+    let mut count = 0usize;
     for (name, value) in measurements {
         if matches!(
             name.as_str(),
-            "schema_version" | "effective_epoch" | "platform" | "entries"
+            "schema_version" | "effective_epoch" | "platform" | "entries" | "layers"
         ) {
             continue;
         }
@@ -14300,13 +14393,14 @@ fn validate_admin_launch_measurements_json(value: &Value, tier3_required: bool) 
         let mut values = BTreeSet::new();
         collect_launch_measurement_strings(value, &mut values);
         if values.is_empty() {
-            bail!("launch measurements {name} must contain at least one hex measurement");
+            bail!("launch measurements {layer}.{name} must contain at least one hex measurement");
         }
+        count += values.len();
         for measurement in values {
             normalize_tier3_measurement(&measurement)?;
         }
     }
-    Ok(())
+    Ok(count)
 }
 
 fn admin_set_enclave_min_tier_payload(args: &AdminSetEnclaveMinTierArgs) -> Result<Value> {
@@ -31678,18 +31772,17 @@ fn launch_measurements_with_tier3_registry(
     let Some(object) = merged.as_object_mut() else {
         return merged;
     };
-    let measurements = object
-        .entry("measurements".to_owned())
-        .or_insert_with(|| json!({}));
-    if !measurements.is_object() {
-        *measurements = json!({});
-    }
-    if let (Some(target), Some(source)) = (
-        measurements.as_object_mut(),
-        registry.measurements.as_object(),
-    ) {
-        for (name, value) in source {
-            merge_launch_measurement_value(target, name, value);
+    normalize_launch_measurement_layers(object);
+    if let Some(source) = registry.measurements.as_object() {
+        if source
+            .keys()
+            .any(|layer| matches!(layer.as_str(), "vendor" | "workload"))
+        {
+            for (layer, values) in source {
+                merge_launch_measurement_layer(object, layer, values);
+            }
+        } else {
+            merge_launch_measurement_layer(object, "workload", &registry.measurements);
         }
     }
     if !registry.entries.is_empty() {
@@ -31704,6 +31797,46 @@ fn launch_measurements_with_tier3_registry(
         }
     }
     merged
+}
+
+fn normalize_launch_measurement_layers(object: &mut Map<String, Value>) {
+    if object.get("layers").is_some_and(Value::is_object) {
+        return;
+    }
+    let measurements = object
+        .remove("measurements")
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    object.insert(
+        "layers".to_owned(),
+        json!({
+            "workload": measurements
+        }),
+    );
+}
+
+fn merge_launch_measurement_layer(object: &mut Map<String, Value>, layer: &str, value: &Value) {
+    if !matches!(layer, "vendor" | "workload") {
+        return;
+    }
+    let layers = object
+        .entry("layers".to_owned())
+        .or_insert_with(|| json!({}));
+    if !layers.is_object() {
+        *layers = json!({});
+    }
+    let Some(layers) = layers.as_object_mut() else {
+        return;
+    };
+    let target = layers.entry(layer.to_owned()).or_insert_with(|| json!({}));
+    if !target.is_object() {
+        *target = json!({});
+    }
+    if let (Some(target), Some(source)) = (target.as_object_mut(), value.as_object()) {
+        for (name, value) in source {
+            merge_launch_measurement_value(target, name, value);
+        }
+    }
 }
 
 fn merge_launch_measurement_value(target: &mut Map<String, Value>, name: &str, value: &Value) {
@@ -41844,7 +41977,9 @@ mod tests {
             "--platform",
             "azure-h100-sev-snp-nvidia-cc",
             "--measurement-name",
-            "snp_launch_digest",
+            "vtpm_pcr_0",
+            "--layer",
+            "workload",
             "--measurement",
             "ab".repeat(48).as_str(),
             "--effective-epoch",
@@ -41873,6 +42008,7 @@ mod tests {
                 .unwrap();
         assert_eq!(payload["op"], "tier3_bless_measurement");
         assert_eq!(payload["platform"], "azure-h100-sev-snp-nvidia-cc");
+        assert_eq!(payload["layer"], "workload");
         assert_eq!(payload["region"], "centralus");
         assert_eq!(payload["measurement"], "ab".repeat(48));
         assert_eq!(payload["derivation_hash"], "cd".repeat(32));
@@ -41896,6 +42032,7 @@ mod tests {
                 json: true,
             },
             platform: "azure-h100-sev-snp-nvidia-cc".to_owned(),
+            layer: "workload".to_owned(),
             measurement_name: "snp_launch_digest".to_owned(),
             measurement: "ab".repeat(48),
             effective_epoch: 7,
@@ -41927,6 +42064,7 @@ mod tests {
                 json: true,
             },
             platform: "azure-h100-sev-snp-nvidia-cc".to_owned(),
+            layer: "workload".to_owned(),
             measurement_name: "snp_launch_digest".to_owned(),
             measurement: "ab".repeat(48),
             effective_epoch: 7,
@@ -41956,6 +42094,7 @@ mod tests {
             },
             platform: "onprem-qemu-v1".to_owned(),
             region: None,
+            layer: "workload".to_owned(),
             measurement_name: "snp_launch_digest".to_owned(),
             measurement: Some("ab".repeat(48)),
             derive_command: None,
@@ -41977,6 +42116,7 @@ mod tests {
             },
             platform: "azure-ncc".to_owned(),
             region: Some("centralus".to_owned()),
+            layer: "vendor".to_owned(),
             measurement_name: "snp_launch_digest".to_owned(),
             measurement: Some("cd".repeat(48)),
             derive_command: None,
@@ -41993,6 +42133,7 @@ mod tests {
             .find(|record| record.measurement == "ab".repeat(48))
             .expect("offline record");
         assert_eq!(offline.source_kind.as_deref(), Some("offline-compute"));
+        assert_eq!(offline.layer, "workload");
         assert_eq!(offline.source, "offline-compute");
         assert_eq!(offline.match_alert, Some(true));
         assert_eq!(offline.endorsement_sha256, None);
@@ -42002,6 +42143,7 @@ mod tests {
             .find(|record| record.measurement == "cd".repeat(48))
             .expect("vendor record");
         assert_eq!(vendor.source_kind.as_deref(), Some("vendor-endorsement"));
+        assert_eq!(vendor.layer, "vendor");
         assert_eq!(vendor.source, "vendor-endorsement");
         assert_eq!(
             vendor.endorsement_sha256.as_deref(),
@@ -42022,6 +42164,7 @@ mod tests {
             },
             platform: "azure-ncc".to_owned(),
             region: Some("centralus".to_owned()),
+            layer: "vendor".to_owned(),
             measurement_name: "snp_launch_digest".to_owned(),
             measurement: Some("cd".repeat(48)),
             derive_command: None,
@@ -42035,6 +42178,58 @@ mod tests {
         assert!(err
             .to_string()
             .contains("vendor-endorsement requires --endorsement-file"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn admin_tier3_drift_loop_derives_then_simulates_bless() {
+        let temp = test_temp_dir("mayhem-tier3-drift-loop");
+        let measurement = "ef".repeat(48);
+        let derive_args = AdminTier3DeriveArgs {
+            read: AdminReadArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                json: true,
+            },
+            platform: "azure-ncc".to_owned(),
+            region: Some("centralus".to_owned()),
+            layer: "workload".to_owned(),
+            measurement_name: "vtpm_pcr_0".to_owned(),
+            measurement: Some(measurement.clone()),
+            derive_command: None,
+            source_kind: Tier3DeriveSourceKind::AdminBoot,
+            endorsement_file: None,
+            alert_measurement: Some(measurement.clone()),
+            output: None,
+        };
+        admin_tier3_derive(&derive_args).await.unwrap();
+        let bless_args = AdminTier3BlessArgs {
+            tx: AdminTxArgs {
+                home: Some(temp.clone()),
+                rpc_url: Some("http://127.0.0.1:49223/v1".to_owned()),
+                peer_store_name: "main".to_owned(),
+                keypair: None,
+                wallet_password: None,
+                submit: true,
+                sim: true,
+                json: true,
+            },
+            platform: "azure-ncc".to_owned(),
+            layer: "workload".to_owned(),
+            measurement_name: "vtpm_pcr_0".to_owned(),
+            measurement: measurement.clone(),
+            effective_epoch: 42,
+            region: Some("centralus".to_owned()),
+            derivation_hash: None,
+            source: "admin-derive".to_owned(),
+            confirm: false,
+            allow_unconfirmed: false,
+        };
+
+        admin_tier3_bless(&bless_args)
+            .await
+            .expect("derive -> bless --sim works without raw scripts or unconfirmed override");
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -42671,14 +42866,14 @@ mod tests {
 
         let mut tier3_args = tier3_missing_measurement;
         tier3_args.launch_measurements_json = Some(
-            r#"{"schema_version":1,"effective_epoch":0,"platform":"azure-h100-sev-snp-nvidia-cc","measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#
+            r#"{"schema_version":1,"effective_epoch":0,"platform":"azure-h100-sev-snp-nvidia-cc","layers":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#
                 .to_owned(),
         );
         let tier3_payload = admin_register_enclave_payload(&tier3_args)
             .expect("Tier 3 accepts admin-published golden measurements");
         assert_eq!(tier3_payload["att_tier"], json!(3));
         assert_eq!(
-            tier3_payload["launch_measurements"]["measurements"]["snp_launch_digest"],
+            tier3_payload["launch_measurements"]["layers"]["workload"]["vtpm_pcr_0"],
             json!("abababababababababababababababababababababababababababababababababababababababababababababababab")
         );
 

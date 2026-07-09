@@ -50,8 +50,10 @@ const launchMeasurements = {
   schema_version: 1,
   effective_epoch: 0,
   platform: 'azure-h100-sev-snp-nvidia-cc',
-  measurements: {
-    snp_launch_digest: 'a'.repeat(96),
+  layers: {
+    workload: {
+      vtpm_pcr_0: 'a'.repeat(96),
+    },
   },
 };
 
@@ -816,7 +818,8 @@ test('MayhemContract appends Tier-3 measurement blessings as admin-only feature 
   const value = {
     op: 'tier3_bless_measurement',
     platform: 'azure-h100-sev-snp-nvidia-cc',
-    measurement_name: 'snp_launch_digest',
+    layer: 'workload',
+    measurement_name: 'vtpm_pcr_0',
     measurement: 'a'.repeat(96),
     effective_epoch: 7,
     at: 1783517300,
@@ -839,8 +842,9 @@ test('MayhemContract appends Tier-3 measurement blessings as admin-only feature 
   assert.equal(applied.ok, true, applied.message);
   assert.equal(applied.status, 'blessed');
   const first = await storage.get(`tier3/measurement/${value.platform}`);
-  assert.deepEqual(first.value.measurements.snp_launch_digest, [value.measurement]);
+  assert.deepEqual(first.value.measurements.workload.vtpm_pcr_0, [value.measurement]);
   assert.equal(first.value.entries.length, 1);
+  assert.equal(first.value.entries[0].layer, 'workload');
   assert.equal(first.value.entries[0].region, 'centralus');
 
   contract._mayhemLastFeatureResult = undefined;
@@ -857,7 +861,7 @@ test('MayhemContract appends Tier-3 measurement blessings as admin-only feature 
   const rolledResult = rolledRaw ?? contract._mayhemLastFeatureResult;
   assert.equal(rolledResult.status, 'blessed');
   const afterRoll = await storage.get(`tier3/measurement/${value.platform}`);
-  assert.deepEqual(afterRoll.value.measurements.snp_launch_digest, [value.measurement, rolled.measurement]);
+  assert.deepEqual(afterRoll.value.measurements.workload.vtpm_pcr_0, [value.measurement, rolled.measurement]);
   assert.equal(afterRoll.value.entries.length, 2);
 });
 
@@ -1286,6 +1290,31 @@ test('MayhemContract allows launch enclave hardware tiers and rejects KYB-only t
   assert.notEqual(tier3MissingMeasurement.ok, true);
   assert.match(tier3MissingMeasurement.message, /launch_measurements/i);
 
+  const tier3VendorOnlyMeasurement = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'd'.repeat(64),
+      att_tier: 3,
+      launch_measurements: {
+        schema_version: 1,
+        effective_epoch: 0,
+        platform: 'azure-h100-sev-snp-nvidia-cc',
+        layers: {
+          vendor: {
+            snp_launch_digest: 'b'.repeat(96),
+          },
+        },
+      },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.notEqual(tier3VendorOnlyMeasurement.ok, true);
+  assert.match(tier3VendorOnlyMeasurement.message, /workload PCR/i);
+
   const tier3Update = await execute(
     contract,
     storage,
@@ -1297,7 +1326,7 @@ test('MayhemContract allows launch enclave hardware tiers and rejects KYB-only t
       launch_measurements: launchMeasurements,
     },
     admin.publicKey,
-    4
+    5
   );
   assert.equal(tier3Update.ok, true, tier3Update.message);
   const afterTier3Update = await storage.get(`enclave/${'d'.repeat(64)}`);

@@ -1469,6 +1469,7 @@ class MayhemContract extends Contract {
     if (validationError) return validationError;
 
     const platform = this.value.platform;
+    const layer = this.value.layer;
     const measurementName = this.value.measurement_name;
     const measurement = this.value.measurement.toLowerCase();
     const key = `tier3/measurement/${platform}`;
@@ -1488,15 +1489,19 @@ class MayhemContract extends Contract {
     if (!record.measurements || typeof record.measurements !== 'object' || Array.isArray(record.measurements)) {
       record.measurements = {};
     }
+    if (!record.measurements[layer] || typeof record.measurements[layer] !== 'object' || Array.isArray(record.measurements[layer])) {
+      record.measurements[layer] = {};
+    }
 
     const already = record.entries.find((entry) =>
-      entry.measurement_name === measurementName && entry.measurement === measurement
+      entry.layer === layer && entry.measurement_name === measurementName && entry.measurement === measurement
     );
     if (already) {
       return {
         ok: true,
         op: 'tier3BlessMeasurement',
         platform,
+        layer,
         measurement_name: measurementName,
         measurement,
         status: 'already_blessed',
@@ -1504,6 +1509,7 @@ class MayhemContract extends Contract {
     }
 
     const entry = {
+      layer,
       measurement_name: measurementName,
       measurement,
       effective_epoch: this.value.effective_epoch,
@@ -1514,21 +1520,22 @@ class MayhemContract extends Contract {
       blessed_by: this.address,
     };
     record.entries.push(entry);
-    const values = Array.isArray(record.measurements[measurementName])
-      ? record.measurements[measurementName]
+    const values = Array.isArray(record.measurements[layer][measurementName])
+      ? record.measurements[layer][measurementName]
       : [];
     if (!values.includes(measurement)) values.push(measurement);
     values.sort();
-    record.measurements[measurementName] = values;
+    record.measurements[layer][measurementName] = values;
     record.updated_at = this.tx;
     record.updated_by = this.address;
     await this.put(key, record);
-    await this.put(`tier3/measurement/${platform}/${measurementName}/${measurement}`, entry);
+    await this.put(`tier3/measurement/${platform}/${layer}/${measurementName}/${measurement}`, entry);
     console.log('mayhem tier3BlessMeasurement', entry);
     return {
       ok: true,
       op: 'tier3BlessMeasurement',
       platform,
+      layer,
       measurement_name: measurementName,
       measurement,
       status: 'blessed',
@@ -5879,23 +5886,32 @@ class MayhemContract extends Contract {
   normalizeEnclaveLaunchMeasurements(value) {
     if (value === undefined || value === null) return null;
     if (!value || typeof value !== 'object' || Array.isArray(value)) return cloneValue(value);
+    if (hasOwn(value, 'layers')) {
+      return {
+        schema_version: value.schema_version ?? 1,
+        effective_epoch: value.effective_epoch ?? 0,
+        ...(hasOwn(value, 'platform') ? { platform: value.platform } : {}),
+        layers: cloneValue(value.layers),
+      };
+    }
     if (hasOwn(value, 'measurements')) {
       return {
         schema_version: value.schema_version ?? 1,
         effective_epoch: value.effective_epoch ?? 0,
         ...(hasOwn(value, 'platform') ? { platform: value.platform } : {}),
-        measurements: cloneValue(value.measurements),
+        layers: { workload: cloneValue(value.measurements) },
       };
     }
     const measurements = cloneValue(value);
     delete measurements.schema_version;
     delete measurements.effective_epoch;
     delete measurements.platform;
+    delete measurements.layers;
     return {
       schema_version: 1,
       effective_epoch: value.effective_epoch ?? 0,
       ...(hasOwn(value, 'platform') ? { platform: value.platform } : {}),
-      measurements,
+      layers: { workload: measurements },
     };
   }
 
@@ -5907,7 +5923,7 @@ class MayhemContract extends Contract {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Enclave launch_measurements must be an object.');
     }
-    const allowed = new Set(['schema_version', 'effective_epoch', 'platform', 'measurements']);
+    const allowed = new Set(['schema_version', 'effective_epoch', 'platform', 'layers']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`enclave launch measurements does not accept fields: ${unknown.join(', ')}.`);
@@ -5924,27 +5940,44 @@ class MayhemContract extends Contract {
     if (hasOwn(value, 'platform') && !this.isSafeKeyPart(value.platform)) {
       return new Error('Enclave launch_measurements platform must be a safe label.');
     }
-    const measurements = value.measurements;
-    if (!measurements || typeof measurements !== 'object' || Array.isArray(measurements)) {
-      return new Error('Enclave launch_measurements measurements must be an object.');
+    const layers = value.layers;
+    if (!layers || typeof layers !== 'object' || Array.isArray(layers)) {
+      return new Error('Enclave launch_measurements layers must be an object.');
     }
-    const names = Object.keys(measurements);
-    const count = this.countLaunchMeasurementValues(measurements);
+    let count = 0;
+    let workloadCount = 0;
+    let names = 0;
+    for (const [layer, measurements] of Object.entries(layers)) {
+      if (!this.isTier3MeasurementLayer(layer)) {
+        return new Error('Enclave launch_measurements layers must be vendor or workload.');
+      }
+      if (!measurements || typeof measurements !== 'object' || Array.isArray(measurements)) {
+        return new Error('Enclave launch_measurements layer values must be objects.');
+      }
+      const layerNames = Object.keys(measurements);
+      const layerCount = this.countLaunchMeasurementValues(measurements);
+      names += layerNames.length;
+      count += layerCount;
+      if (layer === 'workload') workloadCount += layerCount;
+      for (const [name, measurement] of Object.entries(measurements)) {
+        if (!this.isSafeLaunchMeasurementName(name)) {
+          return new Error('Enclave launch_measurements names must be non-empty safe labels.');
+        }
+        const measurementError = this.validateLaunchMeasurementValueList(name, measurement, `Enclave launch_measurements ${layer}`);
+        if (measurementError) return measurementError;
+      }
+    }
     if (attTier >= 3 && count === 0) {
       return new Error('Tier-3 enclaves require at least one launch measurement.');
     }
-    if (names.length > TIER3_MEASUREMENT_MAX_NAMES) {
+    if (attTier >= 3 && workloadCount === 0) {
+      return new Error('Tier-3 enclaves require workload PCR/stack measurements.');
+    }
+    if (names > TIER3_MEASUREMENT_MAX_NAMES) {
       return new Error('Enclave launch_measurements may contain at most 32 measurements.');
     }
     if (count > TIER3_MEASUREMENT_MAX_VALUES) {
       return new Error('Enclave launch_measurements may contain at most 128 measurement values.');
-    }
-    for (const [name, measurement] of Object.entries(measurements)) {
-      if (!this.isSafeLaunchMeasurementName(name)) {
-        return new Error('Enclave launch_measurements names must be non-empty safe labels.');
-      }
-      const measurementError = this.validateLaunchMeasurementValueList(name, measurement, 'Enclave launch_measurements');
-      if (measurementError) return measurementError;
     }
     return null;
   }
@@ -5962,6 +5995,10 @@ class MayhemContract extends Contract {
 
   isSafeLaunchMeasurementName(value) {
     return typeof value === 'string' && value.length > 0 && value.length <= 64 && /^[A-Za-z0-9_.:-]+$/.test(value);
+  }
+
+  isTier3MeasurementLayer(value) {
+    return value === 'vendor' || value === 'workload';
   }
 
   validateLaunchMeasurementHex(label, measurement) {
@@ -6001,7 +6038,7 @@ class MayhemContract extends Contract {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Tier-3 measurement blessing value must be an object.');
     }
-    const required = ['op', 'platform', 'measurement_name', 'measurement', 'effective_epoch', 'at'];
+    const required = ['op', 'platform', 'layer', 'measurement_name', 'measurement', 'effective_epoch', 'at'];
     const allowed = new Set([...required, 'region', 'derivation_hash', 'source']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
@@ -6012,6 +6049,7 @@ class MayhemContract extends Contract {
     }
     if (value.op !== 'tier3_bless_measurement') return new Error('Invalid Tier-3 measurement blessing op.');
     if (!this.isSafeKeyPart(value.platform)) return new Error('Invalid Tier-3 platform.');
+    if (!this.isTier3MeasurementLayer(value.layer)) return new Error('Invalid Tier-3 measurement layer.');
     if (!this.isSafeLaunchMeasurementName(value.measurement_name)) return new Error('Invalid Tier-3 measurement name.');
     const measurementError = this.validateLaunchMeasurementHex('Tier-3 measurement', value.measurement);
     if (measurementError) return measurementError;
