@@ -83,7 +83,7 @@ Environment:
   MAYHEM_E11_SSH_KEY               Optional private-key path for key-based SSH; ssh-agent is used when unset
   MAYHEM_E11_TAG                   Reuse a named run directory/tag instead of generating one
   MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
-  MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: $HOME/mayhem/i3-e11-operationmayhem)
+  MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: $HOME/mayhem/i3-e11-openmayhem)
   MAYHEM_E11_REMOTE_TARGET_DIR     Remote Cargo target dir (default: <remote root>/target)
   MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: $HOME/mayhem/e11-provider-downloads)
   MAYHEM_E11_REMOTE_PROVIDER_CACHE Spark provider sealed-store cache root (default: <remote root>/.mayhem-local/i3-e11-spark-provider-cache)
@@ -1496,7 +1496,7 @@ async function main() {
   const localBinaryHash = runSync(enclaveBin, ['measure-binary', '--binary', mayhemBin]).trim().replace(/^binary_hash=/, '');
 
   const remoteHome = (await ssh(remote, passFile, 'printf "%s\\n" "$HOME"')).stdout.trim();
-  const remoteRoot = (process.env.MAYHEM_E11_REMOTE_ROOT || '$HOME/mayhem/i3-e11-operationmayhem')
+  const remoteRoot = (process.env.MAYHEM_E11_REMOTE_ROOT || '$HOME/mayhem/i3-e11-openmayhem')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
   const remoteTargetDir = (process.env.MAYHEM_E11_REMOTE_TARGET_DIR || path.posix.join(remoteRoot, 'target'))

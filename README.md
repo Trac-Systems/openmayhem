@@ -31,6 +31,37 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 ## Quickstart
 
+### Quickest for non-techies: use your agent to install & run
+
+No terminal knowledge needed. Hand this repository to a coding agent — Claude Code, Codex, Cursor, or opencode — and paste one of the prompts below. The agent reads this README, checks your operating system and hardware, runs the real install, and verifies the gateway is answering before it hands back. You watch and approve each step; you never have to know a single command. For most people this is the whole install.
+
+**Agent prompt — user setup (buy inference):**
+
+```text
+Read the README of this repository. I want to USE OpenMayhem to run AI models
+(not provide compute). Install it for my operating system, run `mayhem up`,
+verify the gateway answers on http://127.0.0.1:11435/v1/models, then help me
+buy my first credits with `mayhem pay stripe` and run one test chat completion
+against a model from `mayhem models --gateway`. Explain each command before
+you run it and show me the dashboard URL at the end.
+```
+
+**Agent prompt — provider setup (earn on your hardware):**
+
+```text
+Read the README of this repository. I want to PROVIDE compute to OpenMayhem
+and earn with this machine. Check my hardware first and tell me which models
+fit. Install the software, run `mayhem up --provider`, help me choose which
+payment rails to accept with `mayhem provider rails set`, set sensible
+self-protection limits with `mayhem provider limits set`, and confirm I am
+serving with `mayhem provider health`. Explain what my expected earnings
+depend on, and show me the provider dashboard URL.
+```
+
+No coding agent yet? Any of the ones above installs in a minute, or drive it yourself with the manual steps below.
+
+### Manual install
+
 **Get the code first.** Either clone the repository and build from source:
 
 ```bash
@@ -56,15 +87,6 @@ curl http://127.0.0.1:11435/v1/models
 
 Point any OpenAI client at `http://127.0.0.1:11435/v1` and go.
 
-The installer ships a checksum-pinned [opencode](https://opencode.ai) coding agent (skip with `--skip-opencode` if you have your own). One command wires it to the gateway — it registers a `mayhem` provider in `~/.config/opencode/opencode.json` and fills its model list live from `/v1/models`, leaving any other providers you have configured untouched:
-
-```bash
-mayhem opencode                   # wire (or repair) opencode for the local gateway
-opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
-```
-
-When the catalog changes, `mayhem opencode` re-syncs the model list.
-
 **Provide to the network** (earn on your hardware):
 
 ```bash
@@ -75,31 +97,16 @@ mayhem provider health
 
 `mayhem up` starts everything supervised (peer, bridge, gateway, and the serving worker with `--provider`), health-checks each part, and prints endpoint and dashboard URLs you can copy. No browser required. `mayhem down` stops everything.
 
-> [!TIP]
-> **Let an AI assistant install it for you.** If you don't want to touch a terminal alone, open this repository in a coding agent (Claude Code, Codex, Cursor, opencode) and paste one of the prompts below. The agent reads this README and drives the real install with you.
+### Wire your coding agent to the gateway
 
-**Agent prompt — user setup:**
+The installer ships a checksum-pinned [opencode](https://opencode.ai) coding agent (skip with `--skip-opencode` if you have your own). One command wires it to the gateway — it registers a `mayhem` provider in `~/.config/opencode/opencode.json` and fills its model list live from `/v1/models`, leaving any other providers you have configured untouched:
 
-```text
-Read the README of this repository. I want to USE OpenMayhem to run AI models
-(not provide compute). Install it for my operating system, run `mayhem up`,
-verify the gateway answers on http://127.0.0.1:11435/v1/models, then help me
-buy my first credits with `mayhem pay stripe` and run one test chat completion
-against a model from `mayhem models --gateway`. Explain each command before
-you run it and show me the dashboard URL at the end.
+```bash
+mayhem opencode                   # wire (or repair) opencode for the local gateway
+opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
 ```
 
-**Agent prompt — provider setup:**
-
-```text
-Read the README of this repository. I want to PROVIDE compute to OpenMayhem
-and earn with this machine. Check my hardware first and tell me which models
-fit. Install the software, run `mayhem up --provider`, help me choose which
-payment rails to accept with `mayhem provider rails set`, set sensible
-self-protection limits with `mayhem provider limits set`, and confirm I am
-serving with `mayhem provider health`. Explain what my expected earnings
-depend on, and show me the provider dashboard URL.
-```
+When the catalog changes, `mayhem opencode` re-syncs the model list. Now your own agent loops run against models served from the network — including your own hardware.
 
 ---
 
@@ -423,25 +430,11 @@ Attestation tiers describe what trust evidence a provider has. They don't all me
 | Tier 3 | Hardware confidential compute — an AMD SEV-SNP confidential VM with an NVIDIA GPU in CC mode. Your prompt is protected even from the provider's own machine, and the served model is the pinned model by construction, not by spot check. | No. |
 | Tier 4 | A real, identity-verified business (KYB). You know who they are — and KYB is not just a passport check: the process asks what they run, whether they can read your data at all, and what they do with it. We publish which KYB'd entity is behind which offering, so their answers are on the record under their legal name. | Depends — on what that business runs and declared. Their published KYB profile says. |
 
-## Available Launch Models
+## Available Models
 
 The model catalog is signed and canonical: `mayhem models` reads the ledger anchor and verifies the signed catalog release, so you always discover current models without requiring a repo update. Providers opt into canonical enclaves the network operator creates — they do not set prices, create canonical rooms, or submit arbitrary models — which is what keeps every listed model a verified, hash-pinned artifact instead of a claim.
 
-This is the launch sellable surface. Dev catalog entries may exist for smoke work; don't treat them as launch products.
-
-<!-- MAYHEM-LAUNCH-SURFACE:START -->
-| Model ID | Class | Routes | Artifacts / engines | Verified path | Launch attestation |
-|----------|-------|--------|---------------------|---------------|--------------------|
-| `qwen/qwen2.5-1.5b-instruct@small` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `nvfp4` / trt-llm; `vllm-fp16` / vllm | I3-E11/I3-E14 real GGUF, TensorRT-LLM, and vLLM chat/tool paths | Tier 1 launch |
-| `meta/llama-3.1-8b-instruct@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `mlx-4bit` / mlx | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
-| `google/gemma-3-12b-it@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `mlx-4bit` / mlx | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
-| `deepseek/deepseek-r1-distill-qwen-14b@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
-| `baai/bge-small-en-v1.5@gguf-q8_0` | Embedding | `/v1/embeddings` | `gguf-q8_0` / llama.cpp | I3-E6 real embedding path | Tier 1 launch |
-| `huggingfacetb/smolvlm2-256m-video-instruct@gguf-q8_0` | Vision chat | `/v1/chat/completions`, `/v1/completions` | `gguf-q8_0` / llama.cpp | I3-E7/E12/E13 real vision chat path | Tier 1 launch |
-| `concedo/sdxs-512-tinysd-distilled@gguf-q8_0` | Image generation | `/v1/images/generations` | `gguf-q8_0` / stable-diffusion.cpp | I3-E8 real image-generation path | Tier 1 launch |
-| `openai/whisper-tiny-en@ggml` | Speech to text | `/v1/audio/transcriptions` | `ggml-tiny-en` / whisper.cpp | I3-E9 real STT path | Tier 1 launch |
-| `rhasspy/piper-en-us-lessac-low@onnx` | Text to speech | `/v1/audio/speech` | `onnx-lessac-low` / piper | I3-E9 real TTS path | Tier 1 launch |
-<!-- MAYHEM-LAUNCH-SURFACE:END -->
+The launch roster is being onboarded model by model right now; `mayhem models --gateway` is always the live truth. This section gets the full roster table once onboarding completes.
 
 **Routes:**
 
