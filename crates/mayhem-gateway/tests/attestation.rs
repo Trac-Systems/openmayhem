@@ -915,6 +915,64 @@ fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
 
 #[cfg(unix)]
 #[test]
+fn external_tpm2_ek_verifier_rejects_replayed_wrong_binding() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"binding":"{}","roots":["tpm_manufacturer_root"],"device_key":"{}"}}"#,
+            "cd".repeat(32),
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("TPM verifier verdict must be bound to this Mayhem attestation nonce");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteBindingMismatch { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_tpm2_ek_verifier_rejects_missing_contract_device_key_metadata() {
+    let (temp, report, contract, trusted) =
+        test_hardware_report_with_metadata(HardwareQuoteKind::Tpm2QuoteEk, serde_json::json!({}));
+    let script = write_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"roots":["tpm2_ek_cert_chain"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("TPM verifier-confirmed EK must match provider-submitted contract metadata");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("must carry the EK device_key")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn external_tpm2_ek_verifier_rejects_public_key_only_root_label() {
     let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
