@@ -915,6 +915,36 @@ fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
 
 #[cfg(unix)]
 #[test]
+fn external_tpm2_ek_verifier_rejects_public_key_only_root_label() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"roots":["tpm2_ek_public_sha256"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("Tier 2 TPM must be manufacturer/EK-cert rooted, not EK-public-only");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("do not satisfy")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
     let (temp, report, contract, trusted) =
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);

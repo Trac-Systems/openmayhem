@@ -1400,8 +1400,7 @@ fn verifier_roots_satisfy_quote_kind(
 }
 
 fn has_tpm2_ek_root(roots: &[String]) -> bool {
-    root_has_all(roots, &["tpm2", "ek"])
-        || root_has_all(roots, &["tpm", "ek", "cert"])
+    root_has_all(roots, &["tpm", "ek", "cert"])
         || root_has_all(roots, &["tpm", "endorsement", "key"])
         || root_has_all(roots, &["tpm", "manufacturer"])
 }
