@@ -15498,12 +15498,13 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         recomputed_field(recomputed.as_ref(), "earnings").or_else(|| Some(json!([]))),
         "epoch earnings",
     )?;
-    let market_usage = optional_json_arg_or_file(
+    let explicit_market_usage = optional_json_arg_or_file(
         args.market_usage_json.as_deref(),
         args.market_usage_file.as_ref(),
         "epoch market usage",
-    )?
-    .or_else(|| recomputed_field(recomputed.as_ref(), "market_usage"));
+    )?;
+    let market_usage =
+        explicit_market_usage.or_else(|| recomputed_market_usage_for_apply(recomputed.as_ref()));
     if let Some(value) = market_usage.as_ref() {
         ensure_json_array(value, "epoch market usage")?;
     }
@@ -15666,6 +15667,19 @@ fn optional_json_arg_or_file(
 
 fn recomputed_field(recomputed: Option<&Value>, field: &str) -> Option<Value> {
     recomputed.and_then(|value| value.get(field).cloned())
+}
+
+fn recomputed_market_usage_for_apply(recomputed: Option<&Value>) -> Option<Value> {
+    let recomputed = recomputed?;
+    let price_count = recomputed
+        .get("totals")
+        .and_then(|totals| totals.get("price_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if price_count == 0 {
+        return None;
+    }
+    recomputed.get("market_usage").cloned()
 }
 
 fn ensure_json_array(value: &Value, label: &str) -> Result<()> {
@@ -43623,6 +43637,26 @@ mod tests {
                 "op": "epoch_apply",
             }))
             .unwrap()
+        );
+        let recomputed_market_usage = json!([{
+            "enclave_id": "enclave-a",
+            "demand_au": "2000",
+            "session_count": 1,
+            "provider_count": 1,
+        }]);
+        assert_eq!(
+            recomputed_market_usage_for_apply(Some(&json!({
+                "totals": { "price_count": 0 },
+                "market_usage": recomputed_market_usage,
+            }))),
+            None
+        );
+        assert_eq!(
+            recomputed_market_usage_for_apply(Some(&json!({
+                "totals": { "price_count": 1 },
+                "market_usage": recomputed_market_usage,
+            }))),
+            Some(recomputed_market_usage)
         );
 
         let paged_apply = admin_epoch_apply_payload(&AdminEpochApplyArgs {
