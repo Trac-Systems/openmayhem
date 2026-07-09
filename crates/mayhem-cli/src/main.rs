@@ -156,6 +156,8 @@ enum Commands {
     Withdraw(WithdrawArgs),
     /// Open a paid participant dispute over a session.
     Dispute(DisputeArgs),
+    /// Refund an unresolved dispute bond after the contract timeout epoch.
+    DisputeExpire(DisputeExpireArgs),
     /// Submit fraud evidence against an epoch commit.
     FraudProof {
         #[command(subcommand)]
@@ -1998,6 +2000,20 @@ struct DisputeArgs {
     /// JSON evidence bundle file to store on-ledger. Keep it compact.
     #[arg(long, value_name = "PATH")]
     evidence_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct DisputeExpireArgs {
+    #[command(flatten)]
+    tx: ParticipantTxArgs,
+
+    /// Dispute id to expire after its timeout epoch.
+    #[arg(long)]
+    dispute_id: u64,
+
+    /// Contract timestamp/slot for evidence metadata. Defaults to current Unix seconds.
+    #[arg(long)]
+    at: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -5271,6 +5287,7 @@ async fn mayhem_main() -> Result<()> {
         Commands::Deposit { command } => deposit_command(command).await,
         Commands::Withdraw(args) => withdraw(args).await,
         Commands::Dispute(args) => dispute(args).await,
+        Commands::DisputeExpire(args) => dispute_expire(args).await,
         Commands::FraudProof { command } => match command {
             FraudProofCommands::Submit(args) => fraud_proof_submit(args).await,
             FraudProofCommands::Challenge(args) => fraud_proof_challenge(args).await,
@@ -16859,6 +16876,11 @@ async fn dispute(args: DisputeArgs) -> Result<()> {
     run_participant_command(&args.tx, "dispute", value).await
 }
 
+async fn dispute_expire(args: DisputeExpireArgs) -> Result<()> {
+    let value = dispute_expire_payload(&args)?;
+    run_participant_command(&args.tx, "disputeExpire", value).await
+}
+
 async fn fraud_proof_submit(args: FraudProofSubmitArgs) -> Result<()> {
     let value = fraud_proof_payload(&args)?;
     run_participant_command(&args.tx, "fraudProof", value).await
@@ -17025,6 +17047,17 @@ fn dispute_payload(args: &DisputeArgs) -> Result<Value> {
         payload["evidence"] = evidence;
     }
     Ok(payload)
+}
+
+fn dispute_expire_payload(args: &DisputeExpireArgs) -> Result<Value> {
+    if args.dispute_id == 0 {
+        bail!("--dispute-id must be positive");
+    }
+    Ok(json!({
+        "op": "dispute_expire",
+        "dispute_id": args.dispute_id,
+        "at": args.at.unwrap_or(unix_epoch_seconds()?),
+    }))
 }
 
 fn fraud_proof_payload(args: &FraudProofSubmitArgs) -> Result<Value> {
@@ -42706,6 +42739,15 @@ mod tests {
         assert_eq!(args.provider.as_deref(), Some("55"));
         assert!(args.tx.json);
 
+        let dispute_expire =
+            Cli::try_parse_from(["mayhem", "dispute-expire", "--dispute-id", "7", "--json"])
+                .unwrap();
+        let Commands::DisputeExpire(args) = dispute_expire.command else {
+            panic!("expected dispute-expire command");
+        };
+        assert_eq!(args.dispute_id, 7);
+        assert!(args.tx.json);
+
         let fraud = Cli::try_parse_from([
             "mayhem",
             "fraud-proof",
@@ -42792,6 +42834,23 @@ mod tests {
         assert_eq!(dispute["at"].as_u64(), Some(42));
         assert_eq!(dispute["evidence_hash"].as_str().map(str::len), Some(64));
         assert_eq!(dispute["evidence"]["kind"].as_str(), Some("timeout"));
+
+        let dispute_expire = dispute_expire_payload(&DisputeExpireArgs {
+            tx: test_participant_tx_args(),
+            dispute_id: 7,
+            at: Some(44),
+        })
+        .unwrap();
+        assert_eq!(dispute_expire["op"], "dispute_expire");
+        assert_eq!(dispute_expire["dispute_id"].as_u64(), Some(7));
+        assert_eq!(dispute_expire["at"].as_u64(), Some(44));
+        let bad_dispute_expire = dispute_expire_payload(&DisputeExpireArgs {
+            tx: test_participant_tx_args(),
+            dispute_id: 0,
+            at: Some(44),
+        })
+        .unwrap_err();
+        assert!(bad_dispute_expire.to_string().contains("--dispute-id"));
 
         let fraud = fraud_proof_payload(&FraudProofSubmitArgs {
             tx: test_participant_tx_args(),
@@ -44940,7 +44999,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 4);
+        assert_eq!(CONTRACT_VERSION, 5);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
     }

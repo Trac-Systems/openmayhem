@@ -2,7 +2,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-export const CONTRACT_VERSION = 4;
+export const CONTRACT_VERSION = 5;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -43,6 +43,7 @@ const DEFAULT_DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 3;
 const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
+const DEFAULT_DISPUTE_TIMEOUT_EPOCHS = 168;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
@@ -84,6 +85,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   min_tier_notice_epochs: { default: 24, min: 1, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
   dispute_deposit_au: { default: DEFAULT_DISPUTE_DEPOSIT_AU, min: '1', money: true },
+  dispute_timeout_epochs: { default: DEFAULT_DISPUTE_TIMEOUT_EPOCHS, min: 1, max: 1_000_000 },
   payout_min_au: { default: ONE_USD_AU, min: ZERO_AU, money: true },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
@@ -127,6 +129,7 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'min_tier_notice_epochs',
   'fee_bps',
   'dispute_deposit_au',
+  'dispute_timeout_epochs',
   'payout_min_au',
   'price_min_bps',
   'price_max_bps',
@@ -977,6 +980,16 @@ class MayhemContract extends Contract {
         at: { type: 'number', integer: true, min: 0 },
         slash: { type: 'boolean', optional: true },
         beneficiary: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('disputeExpire', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        dispute_id: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
       },
     });
 
@@ -4011,9 +4024,16 @@ class MayhemContract extends Contract {
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, this.address, rail);
     if (balanceError) return balanceError;
-    const params = await this.activeParamsAt(this.value.at, ['dispute_deposit_au']);
+    const params = await this.activeParamsAt(this.value.at, [
+      'dispute_deposit_au',
+      'dispute_timeout_epochs',
+    ]);
     const depositAu = params.dispute_deposit_au;
     if (this.compareAu(balance.au, depositAu) < 0) return new Error('Insufficient balance for dispute deposit.');
+    const applyState = await this.epochApplyStateRecord();
+    const disputeEpoch = this.value.epoch ?? applyState.updated_epoch;
+    const expiresAfterEpoch = disputeEpoch + params.dispute_timeout_epochs;
+    if (!Number.isSafeInteger(expiresAfterEpoch)) return new Error('Dispute timeout epoch overflow.');
 
     const nextBalanceAu = this.safeSubAu(balance.au, depositAu);
     if (nextBalanceAu instanceof Error) return nextBalanceAu;
@@ -4040,12 +4060,14 @@ class MayhemContract extends Contract {
       provider: this.value.provider ?? null,
       counterparty: this.value.counterparty ?? null,
       enclave_id: this.value.enclave_id ?? null,
-      epoch: this.value.epoch ?? null,
+      epoch: disputeEpoch,
       at: this.value.at,
       evidence_hash: this.value.evidence_hash ?? null,
       evidence: cloneValue(this.value.evidence ?? null),
       deposit_au: depositAu,
       deposit_holder: this.address,
+      timeout_epochs: params.dispute_timeout_epochs,
+      expires_after_epoch: expiresAfterEpoch,
       opened_at: this.tx,
       updated_at: this.tx,
     };
@@ -4060,6 +4082,7 @@ class MayhemContract extends Contract {
       op: 'dispute',
       dispute_id: disputeId,
       deposit_au: depositAu,
+      expires_after_epoch: expiresAfterEpoch,
       dispute_hash: record.dispute_hash,
     };
   }
@@ -4198,6 +4221,71 @@ class MayhemContract extends Contract {
       deposit_forfeited_au: depositForfeitedAu,
       slash,
       resolution_hash: resolved.resolution_hash,
+    };
+  }
+
+  async disputeExpire() {
+    const key = `disp/${this.value.dispute_id}`;
+    const dispute = await this.get(key);
+    if (!dispute || dispute.type !== 'dispute') return new Error('Dispute not found.');
+    if (dispute.status !== 'open') return new Error('Dispute is not open.');
+    if (!Number.isSafeInteger(dispute.expires_after_epoch) || dispute.expires_after_epoch < 0) {
+      return new Error('Dispute has no valid timeout epoch.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch < dispute.expires_after_epoch) {
+      return new Error('Dispute timeout epoch not reached.');
+    }
+
+    const rail = this.normalizeLedgerRail(dispute.rail, 'dispute rail');
+    if (rail instanceof Error) return rail;
+    const balance = await this.balanceRecord(dispute.opened_by, rail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by, rail);
+    if (balanceError) return balanceError;
+    const depositRefundedAu = dispute.deposit_au;
+    const nextAu = this.safeAddAu(balance.au, depositRefundedAu);
+    if (nextAu instanceof Error) return nextAu;
+    const nextBalance = {
+      ...balance,
+      rail,
+      au: nextAu,
+      updated_epoch: Math.max(balance.updated_epoch, applyState.updated_epoch, dispute.epoch ?? 0),
+      updated_at: this.tx,
+    };
+    const nextBalanceError = this.guardianValidateBalanceRecord(nextBalance, dispute.opened_by, rail);
+    if (nextBalanceError) return nextBalanceError;
+
+    const expired = {
+      ...dispute,
+      status: 'expired',
+      outcome: 'timeout_refund',
+      deposit_action: 'refund',
+      deposit_holder: null,
+      expired_by: this.address,
+      expired_at: this.tx,
+      expired_at_epoch: applyState.updated_epoch,
+      expired_at_seconds: this.value.at,
+      deposit_refunded_au: depositRefundedAu,
+      deposit_forfeited_au: ZERO_AU,
+      reputation_event: null,
+      slash: null,
+      updated_at: this.tx,
+    };
+    expired.expiry_hash = await this.opaqueHash('mayhem-dispute-expiry-v1', expired);
+    await this.put(this.balanceKey(dispute.opened_by, rail), nextBalance);
+    await this.put(key, expired);
+    console.log('mayhem disputeExpire', expired);
+    return {
+      ok: true,
+      op: 'disputeExpire',
+      dispute_id: dispute.dispute_id,
+      outcome: expired.outcome,
+      deposit_action: expired.deposit_action,
+      deposit_refunded_au: depositRefundedAu,
+      expired_at_epoch: expired.expired_at_epoch,
+      expiry_hash: expired.expiry_hash,
     };
   }
 

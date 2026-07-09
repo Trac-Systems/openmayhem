@@ -210,6 +210,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'dispute_expire') {
+      return {
+        type: 'disputeExpire',
+        value: json,
+      };
+    }
     if (json?.op === 'rate_oracle' || json?.op === 'tap_rate_oracle') return null;
     if (json?.op === 'tnk_settlement') return null;
     if (
@@ -260,10 +266,11 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "enclave_id": "<id>", "binary_hash": "<hash>", "verification_method": "token_fingerprint", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "session_receipt_hash": "<receipt-hash>", "evidence_hash": "<hash>", "auditor_sig": "<sig>", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits signed paid-session canary evidence.');
     console.log('- /tx --command \'{ "op": "epoch_commit", "epoch": 1, "at": 3600, "roots": { "dep": "<root>", "use": "<root>", "earn": "<root>", "fee": "<root>" }, "totals": { "dep_count": 0, "dep_au": "0", "use_count": 1, "use_au": "1000", "provider_count": 1, "earn_au": "850", "fee_au": "150", "fee_cum_au": "150" } }\' --sim 1 | permissionlessly anchors epoch roots.');
     console.log('- /tx --command \'{ "op": "fraud_proof", "epoch": 1, "proof_epoch": 2, "at": 7200, "reason": "over_credit", "receipt": { ... }, "claimed_au_owed_cum": "2000" }\' --sim 1 | submits a signed receipt proving an inflated epoch commit.');
-    console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with a refundable 5000 au deposit.');
+    console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with the admin-governed refundable AU bond.');
     console.log('- /tx --command \'{ "op": "dispute_resolve", "dispute_id": 1, "outcome": "provider_fault", "deposit_action": "refund", "rationale_hash": "<hash>", "slash": true, "at": 10800 }\' --sim 1 | admin resolves a dispute.');
+    console.log('- /tx --command \'{ "op": "dispute_expire", "dispute_id": 1, "at": 10800 }\' --sim 1 | permissionlessly refunds an unresolved dispute bond after its timeout epoch.');
     console.log('- Feature { "feature": "mayhem", "key": "epoch/apply/<epoch>/<payload_hash>", "value": { "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "rail": "fiat", "user": "<pk>", "au": "1000" }], "earnings": [{ "rail": "fiat", "provider": "<pk>", "gross_au": "1000" }] } } | admin/oracle applies bounded credit, earning, and fee deltas for free after epochCommit.');
-    console.log('- Feature { "feature": "mayhem", "key": "hold/reserve/<rail>/<user>/<epoch>/<session_id>/<payload_hash>", "value": { "op": "spend_reserve", "contract_version": 3, "session_id": "<id>", "epoch": 1, "rail": "fiat", "user": "<pk>", "provider": "<pk>", "enclave_id": "<id>", "price_ver": 1, "rules_ver": 1, "max_spend_au": "1000", "voucher": { ... }, "provider_sig": "<sig>" } } | provider reserves user balance for the active epoch before serving.');
+    console.log('- Feature { "feature": "mayhem", "key": "hold/reserve/<rail>/<user>/<epoch>/<session_id>/<payload_hash>", "value": { "op": "spend_reserve", "contract_version": 5, "session_id": "<id>", "epoch": 1, "rail": "fiat", "user": "<pk>", "provider": "<pk>", "enclave_id": "<id>", "price_ver": 1, "rules_ver": 1, "max_spend_au": "1000", "voucher": { ... }, "provider_sig": "<sig>" } } | provider reserves user balance for the active epoch before serving.');
     console.log('- Feature { "feature": "mayhem", "key": "rate/tnk/<ts>/<payload_hash>", "value": { "op": "rate_oracle", "tnk_usd_au": "50000000000000000", "source": "gate-spot", "ts": 3600 } } | admin/oracle updates the TNK/USD rate for free.');
     console.log('- Feature { "feature": "mayhem", "key": "rate/tap/<ts>/<payload_hash>", "value": { "op": "tap_rate_oracle", "tap_usd_au": "50000000000000000", "source": "uniswap-v2", "ts": 3600 } } | admin/oracle updates the TAP/USD policy rate for free.');
     console.log('- Feature { "feature": "mayhem", "key": "rep/<provider>/<epoch>/<payload_hash>", "value": { "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 } } | admin/oracle anchors a folded rep/<provider> snapshot for free.');

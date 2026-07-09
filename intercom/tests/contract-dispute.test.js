@@ -137,6 +137,133 @@ test('MayhemContract dispute default bond blocks half-cent spam-scale opens', as
   assert.equal(storage.snapshotBytes(), before);
 });
 
+test('MayhemContract dispute timeout permissionlessly refunds unresolved opener bond', async () => {
+  const { admin, user, provider, outsider, storage, contract } = await setupDisputeContract();
+
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider),
+    user.publicKey,
+    5
+  );
+  assert.equal(opened.ok, true, opened.message);
+  assert.equal(opened.expires_after_epoch, 170);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
+
+  await storage.put('epoch/apply/state', {
+    updated_epoch: 169,
+    updated_at: makeTxKey(6),
+    last_apply_hash: 'e'.repeat(64),
+  });
+  const early = await execute(
+    contract,
+    storage,
+    'disputeExpire',
+    {
+      op: 'dispute_expire',
+      dispute_id: 1,
+      at: 604_800,
+    },
+    outsider.publicKey,
+    6
+  );
+  assert.match(early.message, /timeout epoch not reached/i);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
+  assert.equal((await storage.get('disp/1')).value.status, 'open');
+
+  await storage.put('epoch/apply/state', {
+    updated_epoch: 170,
+    updated_at: makeTxKey(7),
+    last_apply_hash: 'f'.repeat(64),
+  });
+  const expired = await execute(
+    contract,
+    storage,
+    'disputeExpire',
+    {
+      op: 'dispute_expire',
+      dispute_id: 1,
+      at: 608_400,
+    },
+    outsider.publicKey,
+    7
+  );
+  assert.equal(expired.ok, true, expired.message);
+  assert.equal(expired.deposit_refunded_au, DISPUTE_DEPOSIT_AU);
+  assert.equal(expired.expired_at_epoch, 170);
+  assert.equal(expired.expiry_hash.length, 64);
+  assert.deepEqual((await storage.get(`bal/${user.publicKey}/fiat`)).value, {
+    user: user.publicKey,
+    rail: 'fiat',
+    denom: 'au_usd',
+    au: DOUBLE_DISPUTE_DEPOSIT_AU,
+    updated_epoch: 170,
+    updated_at: makeTxKey(7),
+  });
+
+  const dispute = (await storage.get('disp/1')).value;
+  assert.equal(dispute.status, 'expired');
+  assert.equal(dispute.outcome, 'timeout_refund');
+  assert.equal(dispute.deposit_action, 'refund');
+  assert.equal(dispute.deposit_holder, null);
+  assert.equal(dispute.expired_by, outsider.publicKey);
+  assert.equal(dispute.deposit_refunded_au, DISPUTE_DEPOSIT_AU);
+  assert.equal(dispute.deposit_forfeited_au, '0');
+  assert.equal(dispute.slash, null);
+
+  const lateAdmin = await execute(
+    contract,
+    storage,
+    'disputeResolve',
+    {
+      op: 'dispute_resolve',
+      dispute_id: 1,
+      outcome: 'opener_fault',
+      deposit_action: 'forfeit',
+      rationale_hash: 'b'.repeat(64),
+      at: 612_000,
+    },
+    admin.publicKey,
+    8
+  );
+  assert.match(lateAdmin.message, /not open/i);
+});
+
+test('MayhemContract dispute timeout epochs are admin-governed', async () => {
+  const { admin, user, provider, storage, contract } = await setupDisputeContract();
+
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { dispute_timeout_epochs: 3 },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, { at: DAY_SECONDS }),
+    user.publicKey,
+    6
+  );
+  assert.equal(opened.ok, true, opened.message);
+  assert.equal(opened.expires_after_epoch, 5);
+  const dispute = (await storage.get('disp/1')).value;
+  assert.equal(dispute.timeout_epochs, 3);
+  assert.equal(dispute.expires_after_epoch, 5);
+});
+
 test('MayhemContract dispute lifecycle refunds deposit and applies provider_fault slash', async () => {
   const { admin, user, provider, outsider, storage, contract } = await setupDisputeContract();
   await seedProviderHoldback(storage, provider);
