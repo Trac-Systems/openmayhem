@@ -3500,6 +3500,10 @@ mod vllm_backend {
             ("TORCHINDUCTOR_CACHE_DIR", cache_root.join("torchinductor")),
             ("CUDA_CACHE_PATH", cache_root.join("cuda")),
             ("FLASHINFER_CACHE_DIR", cache_root.join("flashinfer")),
+            (
+                "FLASHINFER_WORKSPACE_BASE",
+                cache_root.join("flashinfer/workspace-base"),
+            ),
             ("FLASHINFER_JIT_DIR", cache_root.join("flashinfer/jit")),
             (
                 "FLASHINFER_WORKSPACE_DIR",
