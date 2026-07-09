@@ -1027,7 +1027,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     'registerEnclave',
     {
       ...enclaveRegistration,
-      enclave_id: '8'.repeat(64),
+      enclave_id: '0'.repeat(64),
       caps: {
         ...enclaveRegistration.caps,
         tools: 'true',
@@ -1110,12 +1110,32 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         max_batch_size: 2,
         max_num_tokens: 1024,
         vllm_dtype: 'bfloat16',
+        vllm_gpu_memory_utilization_pct: 40,
       },
     },
     admin.publicKey,
     55
   );
   assert.equal(vllmEnclave.ok, true, vllmEnclave.message);
+
+  const invalidVllmMemoryCap = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '8'.repeat(64),
+      backend: 'vllm',
+      caps: {
+        ...catalogStyleCaps,
+        vllm_gpu_memory_utilization_pct: 101,
+      },
+    },
+    admin.publicKey,
+    56
+  );
+  assert.match(invalidVllmMemoryCap.message, /vllm_gpu_memory_utilization_pct must be between 1 and 100/i);
+  assert.equal(await storage.get(`enclave/${'0'.repeat(64)}`), null);
 
   const diffusionImageCaps = {
     image: true,

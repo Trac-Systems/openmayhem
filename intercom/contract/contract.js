@@ -264,6 +264,7 @@ const ENCLAVE_CAP_INTEGER_FIELDS = [
   'tp_degree',
   'max_batch_size',
   'max_num_tokens',
+  'vllm_gpu_memory_utilization_pct',
   'max_image_width',
   'max_image_height',
   'max_image_steps',
@@ -5801,6 +5802,9 @@ class MayhemContract extends Contract {
       if (hasOwn(caps, key) && (!Number.isSafeInteger(caps[key]) || caps[key] <= 0)) {
         return new Error(`Enclave caps ${key} must be a positive integer.`);
       }
+    }
+    if (hasOwn(caps, 'vllm_gpu_memory_utilization_pct') && caps.vllm_gpu_memory_utilization_pct > 100) {
+      return new Error('Enclave caps vllm_gpu_memory_utilization_pct must be between 1 and 100.');
     }
     for (const key of ENCLAVE_CAP_STRING_FIELDS) {
       if (hasOwn(caps, key) && (typeof caps[key] !== 'string' || caps[key].length === 0 || caps[key].length > 64)) {
