@@ -9,6 +9,7 @@ import { ethers } from 'ethers';
 const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tap-deposit-watcher.json');
 const TAP_WEI = 1_000_000_000_000_000_000n;
+const MIN_TAP_CONFIRMATIONS = 12;
 export const TAP_DEPOSIT_EVENT_SIGNATURE = ethers.id('Deposit(address,uint256)');
 export const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
@@ -333,17 +334,26 @@ function normalizeCursor(raw) {
 }
 
 async function safeToBlock(provider, { toBlock, confirmations = 12, blockTag }) {
-  if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
-    return parseNonNegativeInt(toBlock, '--to-block');
-  }
   if (blockTag === 'finalized') {
     const block = await provider.send('eth_getBlockByNumber', ['finalized', false]);
     if (!block || block.number == null) throw new Error('finalized block tag unavailable from RPC');
-    return Number(block.number);
+    const safeTo = Number(block.number);
+    return { safeTo, referenceBlock: safeTo, finalizedPolicy: true };
   }
   const head = Number(await provider.send('eth_blockNumber', []));
   const depth = parseNonNegativeInt(confirmations, '--confirmations', 12);
-  return Math.max(-1, head - depth);
+  if (depth < MIN_TAP_CONFIRMATIONS) {
+    throw new Error(`--confirmations must be at least ${MIN_TAP_CONFIRMATIONS} unless --block-tag finalized is used`);
+  }
+  const maxSafe = Math.max(-1, head - depth);
+  if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
+    const explicit = parseNonNegativeInt(toBlock, '--to-block');
+    if (explicit > maxSafe) {
+      throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} confirmations deep unless --block-tag finalized is used`);
+    }
+    return { safeTo: explicit, referenceBlock: head, finalizedPolicy: false };
+  }
+  return { safeTo: maxSafe, referenceBlock: head, finalizedPolicy: false };
 }
 
 export async function scanTapDeposits({
@@ -361,14 +371,9 @@ export async function scanTapDeposits({
   if (!provider) throw new Error('pool contract has no provider');
   const network = chainId ? null : await provider.getNetwork();
   const normalizedChainId = Number(chainId ?? network.chainId);
-  const safeTo = await safeToBlock(provider, { toBlock, confirmations, blockTag });
+  const { safeTo, referenceBlock, finalizedPolicy } = await safeToBlock(provider, { toBlock, confirmations, blockTag });
   const from = parseNonNegativeInt(fromBlock, '--from-block', 0);
   if (safeTo < from) return { deposits: [], from, to: from - 1 };
-  const confirmationPolicy = blockTag === 'finalized'
-    ? 'finalized-tag'
-    : toBlock !== undefined && toBlock !== null && toBlock !== ''
-      ? 'explicit-to-block'
-      : `depth-${parseNonNegativeInt(confirmations, '--confirmations', 12)}`;
 
   const deposits = [];
   const window = Math.max(1, parsePositiveInt(chunkSize, '--chunk-size', 5000));
@@ -376,13 +381,16 @@ export async function scanTapDeposits({
     const end = Math.min(start + window - 1, safeTo);
     const events = await pool.queryFilter(pool.filters.Deposit(), start, end);
     for (const event of events) {
+      const confirmationDepth = Math.max(0, referenceBlock - Number(event.blockNumber));
       deposits.push(tapDepositFromLog(event, {
         chainId: normalizedChainId,
         poolAddress: poolAddress ?? event.address ?? await pool.getAddress(),
         tapUsdAu,
-        finalizedBlockNumber: safeTo,
-        confirmationDepth: Math.max(0, safeTo - Number(event.blockNumber)),
-        confirmationPolicy,
+        finalizedBlockNumber: referenceBlock,
+        confirmationDepth,
+        confirmationPolicy: finalizedPolicy
+          ? 'finalized-tag'
+          : `depth-${confirmationDepth}`,
       }));
     }
   }

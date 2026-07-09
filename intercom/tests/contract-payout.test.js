@@ -10,6 +10,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedSpendHoldsForApply,
   signConsent,
 } from './helpers/contract.js';
 
@@ -229,6 +230,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     totals: roll.totals,
   };
   const applyKey = await epochApplyFeatureKey(contract, applyValue);
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
@@ -285,6 +287,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
 test('MayhemContract provider payoutConfirm is retired and cannot mutate state', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
   const applyValue = epochApply(1, user.publicKey, provider.publicKey, 2_000_000);
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,

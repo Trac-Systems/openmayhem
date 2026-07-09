@@ -8,6 +8,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedSpendHoldsForApply,
   signConsent,
   textRateMap,
 } from './helpers/contract.js';
@@ -333,17 +334,19 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
   assert.equal(joined.ok, true, joined.message);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 20_000_000));
 
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '10000000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '10000000' }],
+    market_usage: [makeMarketUsage(10_000_000, 4)],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '10000000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '10000000' }],
-      market_usage: [makeMarketUsage(10_000_000, 4)],
-    },
+    applyValue,
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
@@ -397,17 +400,19 @@ test('MayhemContract epochApply counts settled-work supply, not idle joined wall
   await registerAndJoinExtraProvider(contract, storage, admin, idleProvider, 7);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 5_000_000));
 
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000000' }],
+    market_usage: [makeMarketUsage(2_000_000, 2)],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000000' }],
-      market_usage: [makeMarketUsage(2_000_000, 2)],
-    },
+    applyValue,
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
@@ -438,20 +443,22 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
 
+  const highDemandValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+    ],
+    market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
+  };
+  await seedSpendHoldsForApply(storage, highDemandValue);
   const highDemand = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-      earnings: [
-        { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-      ],
-      market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
-    },
+    highDemandValue,
     admin.publicKey
   );
   assert.equal(highDemand.ok, true, highDemand.message);
@@ -481,20 +488,22 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   assert.ok(Number(rateFor(raised.rate_map, 'input_token')) <= Math.floor(18 * 1.1));
   assert.ok(Number(rateFor(raised.rate_map, 'output_token')) <= Math.floor(55 * 1.1));
 
+  const lowDemandValue = {
+    op: 'epoch_apply',
+    epoch: 2,
+    at: 46_801,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '10000' }],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '5000' },
+      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '5000' },
+    ],
+    market_usage: [makeMarketUsage(10_000, 1, { provider_count: 2 })],
+  };
+  await seedSpendHoldsForApply(storage, lowDemandValue);
   const lowDemand = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 2,
-      at: 46_801,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '10000' }],
-      earnings: [
-        { rail: 'fiat', provider: provider.publicKey, gross_au: '5000' },
-        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '5000' },
-      ],
-      market_usage: [makeMarketUsage(10_000, 1, { provider_count: 2 })],
-    },
+    lowDemandValue,
     admin.publicKey
   );
   assert.equal(lowDemand.ok, true, lowDemand.message);
@@ -561,20 +570,22 @@ test('MayhemContract keeps context brackets as independent price markets', async
   await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 8);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
 
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '3000000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '3000000' }],
+    market_usage: [
+      makeMarketUsage(1_000_000, 2),
+      makeMarketUsage(2_000_000, 3, { ctx_bracket: 'le128k' }),
+    ],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '3000000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '3000000' }],
-      market_usage: [
-        makeMarketUsage(1_000_000, 2),
-        makeMarketUsage(2_000_000, 3, { ctx_bracket: 'le128k' }),
-      ],
-    },
+    applyValue,
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
@@ -643,20 +654,22 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
   await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 8);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
 
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: DAY_SECONDS + 1,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+    ],
+    market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: DAY_SECONDS + 1,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-      earnings: [
-        { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-      ],
-      market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
-    },
+    applyValue,
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
@@ -727,6 +740,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
   };
 
   const simStorage = MemoryStorage.fromSnapshotBytes(storage.snapshotBytes());
+  await seedSpendHoldsForApply(simStorage, applyValue);
   const simApply = await executeEpochApplyFeature(contract, simStorage, applyValue, admin.publicKey);
   assert.equal(simApply.ok, true, simApply.message);
   const simDerivation = (await simStorage.get(priceEvidenceKey)).value;
@@ -750,6 +764,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
   );
   assert.equal(commit.ok, true, commit.message);
 
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
@@ -877,23 +892,25 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   await storage.put(`bal/${fiatUser.publicKey}/fiat`, seededBalance(fiatUser.publicKey, 2_000_000, 'fiat'));
   await storage.put(`bal/${tapUser.publicKey}/tap`, seededBalance(tapUser.publicKey, 2_000_000, 'tap'));
 
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [
+      { rail: 'fiat', user: fiatUser.publicKey, au: '500000' },
+      { rail: 'tap', user: tapUser.publicKey, au: '500000' },
+    ],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '500000' },
+      { rail: 'tap', provider: tapProvider.publicKey, gross_au: '500000' },
+    ],
+    market_usage: [makeMarketUsage(1_000_000, 2, { provider_count: 2 })],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [
-        { rail: 'fiat', user: fiatUser.publicKey, au: '500000' },
-        { rail: 'tap', user: tapUser.publicKey, au: '500000' },
-      ],
-      earnings: [
-        { rail: 'fiat', provider: provider.publicKey, gross_au: '500000' },
-        { rail: 'tap', provider: tapProvider.publicKey, gross_au: '500000' },
-      ],
-      market_usage: [makeMarketUsage(1_000_000, 2, { provider_count: 2 })],
-    },
+    applyValue,
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
@@ -927,17 +944,19 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '75000');
   assert.equal((await storage.get('fee/tap/cum')).value.cum_au, '75000');
 
+  const crossRailMismatchValue = {
+    op: 'epoch_apply',
+    epoch: 2,
+    at: 46_801,
+    debits: [{ rail: 'fiat', user: fiatUser.publicKey, au: '100' }],
+    earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_au: '100' }],
+    market_usage: [makeMarketUsage(100, 1)],
+  };
+  await seedSpendHoldsForApply(storage, crossRailMismatchValue);
   const crossRailMismatch = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 2,
-      at: 46_801,
-      debits: [{ rail: 'fiat', user: fiatUser.publicKey, au: '100' }],
-      earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_au: '100' }],
-      market_usage: [makeMarketUsage(100, 1)],
-    },
+    crossRailMismatchValue,
     admin.publicKey
   );
   assert.match(crossRailMismatch.message, /per rail/i);
@@ -950,17 +969,19 @@ test('MayhemContract epochApply rejects market usage that does not reconcile to 
   const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
   assert.equal(seeded.ok, true, seeded.message);
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
+  const mismatchValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000' }],
+    market_usage: [makeMarketUsage(1_999, 1)],
+  };
+  await seedSpendHoldsForApply(storage, mismatchValue);
   const mismatch = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000' }],
-      market_usage: [makeMarketUsage(1_999, 1)],
-    },
+    mismatchValue,
     admin.publicKey
   );
   assert.match(mismatch.message, /market usage demand must equal/i);

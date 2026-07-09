@@ -328,6 +328,43 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     ctx.admin.publicKey
   );
   assert.match(badEventSignature.message, /event signature mismatch/i);
+  const shallowConfirmation = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...value,
+      eth_tx_hash: `0x${'f'.repeat(64)}`,
+      finalized_block_number: 124,
+      confirmation_depth: 1,
+      confirmation_policy: 'depth-1',
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(shallowConfirmation.message, /confirmation depth below minimum/i);
+  const mismatchedPolicy = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...value,
+      eth_tx_hash: `0x${'1'.repeat(64)}`,
+      confirmation_policy: 'manual',
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(mismatchedPolicy.message, /confirmation policy must match/i);
+  const finalizedTag = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...value,
+      eth_tx_hash: `0x${'2'.repeat(64)}`,
+      finalized_block_number: 123,
+      confirmation_depth: 0,
+      confirmation_policy: 'finalized-tag',
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(finalizedTag.message, /Fresh TAP rate oracle required/i);
 
   const rate = await executeRateFeature(
     ctx.contract,

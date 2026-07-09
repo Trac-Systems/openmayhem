@@ -13,6 +13,8 @@ import {
   makeTxKey,
   makeVerifier,
   seedCurrentAdminPrice,
+  seedSpendHold,
+  seedSpendHoldsForApply,
   signConsent,
   signSpendReservation,
   signSpendVoucher,
@@ -750,6 +752,98 @@ test('MayhemContract spend reservation moves to next epoch after epochApply', as
   assert.equal(nextResult.available_au, '0');
 });
 
+test('MayhemContract epochApply refuses debits above reserved spend holds', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+
+  const reservation = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'd1'.repeat(32),
+    maxSpendAu: 100_000,
+  });
+  const reserved = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    reservation,
+    ctx.provider.publicKey
+  );
+  assert.equal(reserved.ok, true, reserved.message);
+
+  const overCap = await executeEpochApplyFeature(
+    ctx.contract,
+    ctx.storage,
+    makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_001),
+    ctx.admin.publicKey
+  );
+  assert.match(overCap.message, /exceeds reserved spend hold/i);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '1000000');
+
+  const atCap = await executeEpochApplyFeature(
+    ctx.contract,
+    ctx.storage,
+    makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_000),
+    ctx.admin.publicKey
+  );
+  assert.equal(atCap.ok, true, atCap.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '900000');
+});
+
+test('MayhemContract paged epochApply accumulates reserved debit checks', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+  const reservation = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'd2'.repeat(32),
+    maxSpendAu: 150_000,
+  });
+  const reserved = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    reservation,
+    ctx.provider.publicKey
+  );
+  assert.equal(reserved.ok, true, reserved.message);
+
+  const firstPage = await executeEpochApplyFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      page: 0,
+      last_page: false,
+      debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '100000' }],
+      earnings: [{ rail: 'fiat', provider: ctx.provider.publicKey, gross_au: '100000' }],
+    },
+    ctx.admin.publicKey
+  );
+  assert.equal(firstPage.ok, true, firstPage.message);
+  assert.deepEqual((await ctx.storage.get('epoch/apply/state')).value.pending_reserved_debits, [{
+    rail: 'fiat',
+    user: ctx.user.publicKey,
+    au: '100000',
+  }]);
+
+  const overCapSecondPage = await executeEpochApplyFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      page: 1,
+      last_page: true,
+      debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '50001' }],
+      earnings: [{ rail: 'fiat', provider: ctx.provider.publicKey, gross_au: '50001' }],
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(overCapSecondPage.message, /exceeds reserved spend hold/i);
+});
+
 test('MayhemContract context bracket tables are admin scheduled and pinned by version', async () => {
   const ctx = await setupLedgerContract();
   const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
@@ -883,6 +977,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.equal(wrongKey, undefined);
   assert.equal(storage.snapshotBytes(), wrongKeySnapshot);
 
+  await seedSpendHoldsForApply(storage, firstApply);
   const first = await executeEpochApplyFeature(
     contract,
     storage,
@@ -963,6 +1058,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   );
   assert.match(gap.message, /contiguous/i);
 
+  await seedSpendHold(storage, { user: user.publicKey, epoch: 2, au: '2000000' });
   const insufficientSnapshot = storage.snapshotBytes();
   const insufficient = await executeEpochApplyFeature(
     contract,
@@ -1032,7 +1128,6 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   let expectedFee = 0n;
   const netEarningsByEpoch = [];
 
-  let totalKeysAfterFirst = null;
   let paymentKeysAfterFirst = null;
   for (let epoch = 1; epoch <= 100; epoch++) {
     const grossAu = 1_000 + (epoch % 7);
@@ -1041,10 +1136,12 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
     expectedFee += feeAu;
     netEarningsByEpoch.push(BigInt(grossAu) - feeAu);
     for (const ctx of [left, right]) {
+      const value = makeEpochApply(epoch, identities.user.publicKey, identities.provider.publicKey, grossAu);
+      await seedSpendHoldsForApply(ctx.storage, value);
       const result = await executeEpochApplyFeature(
         ctx.contract,
         ctx.storage,
-        makeEpochApply(epoch, identities.user.publicKey, identities.provider.publicKey, grossAu),
+        value,
         identities.admin.publicKey
       );
       assert.equal(result.ok, true, result.message);
@@ -1052,13 +1149,11 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
     }
 
     if (epoch === 1) {
-      totalKeysAfterFirst = left.storage.values.size;
       paymentKeysAfterFirst = paymentKeys(left.storage);
     }
   }
 
   assert.equal(left.storage.snapshotBytes(), right.storage.snapshotBytes());
-  assert.equal(left.storage.values.size, totalKeysAfterFirst);
   assert.deepEqual(paymentKeys(left.storage), paymentKeysAfterFirst);
   assert.deepEqual(paymentKeysAfterFirst, [
     `bal/${identities.user.publicKey}/fiat`,
@@ -1123,6 +1218,7 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
   };
 
   for (const [ctx, value] of [[left, leftApply], [right, rightApply]]) {
+    await seedSpendHoldsForApply(ctx.storage, value);
     const result = await executeEpochApplyFeature(ctx.contract, ctx.storage, value, identities.admin.publicKey);
     assert.equal(result.ok, true, result.message);
     assert.equal(result.fee_au, '180');
@@ -1153,6 +1249,7 @@ test('MayhemContract epochApply computes large fee bps with exact BigInt math', 
   const { admin, provider, user, storage, contract } = await setupLedgerContract();
   const grossAu = '2000000000000000000000000';
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, grossAu));
+  await seedSpendHoldsForApply(storage, makeEpochApply(1, user.publicKey, provider.publicKey, grossAu));
 
   const result = await executeEpochApplyFeature(
     contract,
@@ -1263,6 +1360,7 @@ test('MayhemContract epochApply accepts admin-raised max_apply_batch above defau
     user: user.publicKey,
     au: '1',
   }));
+  await seedSpendHold(storage, { user: user.publicKey, epoch: 1, au: '5500' });
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
@@ -1329,6 +1427,7 @@ test('MayhemContract epochApply paginates settlement entries across free pages',
     user: user.publicKey,
     au: '1',
   }));
+  await seedSpendHold(storage, { user: user.publicKey, epoch: 1, au: '2500' });
 
   const firstPage = await executeEpochApplyFeature(
     contract,

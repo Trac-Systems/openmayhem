@@ -16,6 +16,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedSpendHoldsForApply,
   signConsent,
 } from './helpers/contract.js';
 
@@ -324,6 +325,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     totals: roll.totals,
   };
   const applyKey = await epochApplyFeatureKey(contract, applyValue);
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(
     contract,
     storage,
@@ -476,6 +478,7 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
     last_epoch_seconds: 3_600,
     pending_epoch: null,
     pending_next_page: 0,
+    pending_reserved_debits: null,
     last_page: 0,
   });
   assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1000000');
@@ -498,16 +501,18 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
     seal_hash: sealed.seal_hash,
   });
 
+  const laterSettlementValue = {
+    op: 'epoch_apply',
+    epoch: 2,
+    at: 7_200,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '1000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
+  };
+  await seedSpendHoldsForApply(storage, laterSettlementValue);
   const laterSettlement = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 2,
-      at: 7_200,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '1000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
-    },
+    laterSettlementValue,
     admin.publicKey
   );
   assert.equal(laterSettlement.ok, true, laterSettlement.message);
@@ -569,18 +574,20 @@ test('MayhemContract binds active admin epoch timing into commit and apply evide
     at: 86_400,
   });
 
+  const staleTimingValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 86_399,
+    debits: roll.debits,
+    earnings: roll.earnings,
+    roots: roll.roots,
+    totals: roll.totals,
+  };
+  await seedSpendHoldsForApply(storage, staleTimingValue);
   const staleTimingApply = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 86_399,
-      debits: roll.debits,
-      earnings: roll.earnings,
-      roots: roll.roots,
-      totals: roll.totals,
-    },
+    staleTimingValue,
     admin.publicKey
   );
   assert.match(staleTimingApply.message, /epoch_seconds does not match/i);
@@ -596,6 +603,7 @@ test('MayhemContract binds active admin epoch timing into commit and apply evide
     totals: roll.totals,
   };
   const applyKey = await epochApplyFeatureKey(contract, applyValue);
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
   assert.equal(applied.ok, true, applied.message);
   assert.equal((await storage.get('epoch/apply/state')).value.last_epoch_seconds, 7_200);
@@ -709,18 +717,20 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
     banned_submitter: submitter.publicKey,
   });
 
+  const voidApplyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: inflatedRoll.debits,
+    earnings: inflatedRoll.earnings,
+    roots: inflatedRoll.roots,
+    totals: inflatedRoll.totals,
+  };
+  await seedSpendHoldsForApply(storage, voidApplyValue);
   const voidApply = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: inflatedRoll.debits,
-      earnings: inflatedRoll.earnings,
-      roots: inflatedRoll.roots,
-      totals: inflatedRoll.totals,
-    },
+    voidApplyValue,
     admin.publicKey
   );
   assert.match(voidApply.message, /commit is void/i);
@@ -982,18 +992,20 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
   const { admin, provider, user, storage, contract } = await setupEpochContract();
   const roll = await recomputeEpoch(receiptBundle(user, provider));
 
+  const noCommitValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: roll.debits,
+    earnings: roll.earnings,
+    roots: roll.roots,
+    totals: roll.totals,
+  };
+  await seedSpendHoldsForApply(storage, noCommitValue);
   const noCommit = await executeEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: roll.debits,
-      earnings: roll.earnings,
-      roots: roll.roots,
-      totals: roll.totals,
-    },
+    noCommitValue,
     admin.publicKey
   );
   assert.match(noCommit.message, /commit required/i);

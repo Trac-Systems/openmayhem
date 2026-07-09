@@ -7,6 +7,8 @@ import {
   executeEpochApplyFeature,
   makeIdentity,
   makeVerifier,
+  seedSpendHold,
+  seedSpendHoldsForApply,
   signConsent,
 } from './helpers/contract.js';
 
@@ -83,12 +85,14 @@ test('MayhemContract guardian halts epochApply on conservation failure', async (
     last_apply_hash: null,
     last_fee_bps: null,
   });
+  const applyValue = epochApply(1, user.publicKey, provider.publicKey);
+  await seedSpendHoldsForApply(storage, applyValue);
   const before = storage.snapshotBytes();
 
   const result = await executeEpochApplyFeature(
     contract,
     storage,
-    epochApply(1, user.publicKey, provider.publicKey),
+    applyValue,
     admin.publicKey
   );
   assert.match(result.message, /guardian conservation/i);
@@ -97,6 +101,7 @@ test('MayhemContract guardian halts epochApply on conservation failure', async (
 
 test('MayhemContract guardian halts epochApply on non-monotonic epochs', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
+  await seedSpendHold(storage, { user: user.publicKey, epoch: 1, au: '2000' });
   const first = await executeEpochApplyFeature(
     contract,
     storage,
@@ -119,12 +124,14 @@ test('MayhemContract guardian halts epochApply on non-monotonic epochs', async (
 test('MayhemContract guardian halts epochApply on negative balances', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, -1));
+  const applyValue = epochApply(1, user.publicKey, provider.publicKey);
+  await seedSpendHoldsForApply(storage, applyValue);
   const before = storage.snapshotBytes();
 
   const result = await executeEpochApplyFeature(
     contract,
     storage,
-    epochApply(1, user.publicKey, provider.publicKey),
+    applyValue,
     admin.publicKey
   );
   assert.match(result.message, /guardian non-negative balance/i);

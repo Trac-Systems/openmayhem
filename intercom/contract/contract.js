@@ -2,7 +2,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-export const CONTRACT_VERSION = 6;
+export const CONTRACT_VERSION = 7;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -48,6 +48,7 @@ const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
 const DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS = 5_000;
+const MIN_TAP_CONFIRMATION_DEPTH = 12;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
@@ -3535,6 +3536,10 @@ class MayhemContract extends Contract {
     }
     const pageOrderError = this.validateEpochApplyPageOrder(applyState, this.value.epoch, page);
     if (pageOrderError) return pageOrderError;
+    const reservationDebitTotals = this.nextReservationDebitTotals(applyState, this.value.epoch, page, debitMap);
+    if (reservationDebitTotals instanceof Error) return reservationDebitTotals;
+    const reservationError = await this.validateEpochDebitReservations(this.value.epoch, reservationDebitTotals);
+    if (reservationError) return reservationError;
 
     const balances = new Map();
     for (const debit of debitMap.values()) {
@@ -3729,6 +3734,7 @@ class MayhemContract extends Contract {
       lastPage,
       applyHash,
       epochSeconds: params.epoch_seconds,
+      reservationDebitTotals,
     }));
     if (totals) {
       await this.writeEpochEvidenceRoots({
@@ -5592,6 +5598,14 @@ class MayhemContract extends Contract {
       return new Error('TAP confirmation depth does not match finalized block.');
     }
     if (!this.isSafeKeyPart(value.confirmation_policy)) return new Error('Invalid TAP confirmation policy.');
+    if (value.confirmation_policy !== 'finalized-tag') {
+      if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
+        return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
+      }
+      if (value.confirmation_policy !== `depth-${value.confirmation_depth}`) {
+        return new Error('TAP confirmation policy must match the confirmed depth or use finalized-tag.');
+      }
+    }
     if (!this.isEthHexBytes(value.event_signature, 32)) return new Error('Invalid TAP event signature.');
     if (value.event_signature.toLowerCase() !== TAP_DEPOSIT_EVENT_SIGNATURE) {
       return new Error('TAP deposit event signature mismatch.');
@@ -7909,6 +7923,70 @@ class MayhemContract extends Contract {
     };
   }
 
+  normalizePendingReservationDebitTotals(entries) {
+    const out = new Map();
+    if (entries === null || entries === undefined) return out;
+    if (!Array.isArray(entries)) return new Error('Pending reservation debits must be an array.');
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return new Error('Invalid pending reservation debit entry.');
+      }
+      const rail = this.normalizeLedgerRail(entry.rail, 'pending reservation debit rail');
+      if (rail instanceof Error) return rail;
+      if (!this.isSafeKeyPart(entry.user)) return new Error('Invalid pending reservation debit user.');
+      const au = this.normalizeAu(entry.au, 'pending reservation debit amount', { allowZero: false });
+      if (au instanceof Error) return new Error('Invalid pending reservation debit amount.');
+      const key = stableJson([rail, entry.user]);
+      if (out.has(key)) return new Error('Duplicate pending reservation debit entry.');
+      out.set(key, { rail, user: entry.user, au });
+    }
+    return out;
+  }
+
+  reservationDebitTotalEntries(map) {
+    if (!map) return [];
+    return this.sortedRailRecords(map, 'user').map((entry) => ({
+      rail: entry.rail,
+      user: entry.user,
+      au: entry.au,
+    }));
+  }
+
+  nextReservationDebitTotals(applyState, epoch, page, debitMap) {
+    const base = page === 0
+      ? new Map()
+      : this.normalizePendingReservationDebitTotals(applyState.pending_reserved_debits);
+    if (base instanceof Error) return base;
+    if (page > 0 && applyState.pending_epoch === epoch && !Array.isArray(applyState.pending_reserved_debits)) {
+      return new Error('Pending reservation debit state missing for paged epoch apply.');
+    }
+    const out = new Map(base);
+    for (const debit of debitMap.values()) {
+      const key = stableJson([debit.rail, debit.user]);
+      const current = out.get(key) ?? { rail: debit.rail, user: debit.user, au: ZERO_AU };
+      const nextAu = this.safeAddAu(current.au, debit.au);
+      if (nextAu instanceof Error) return nextAu;
+      out.set(key, { ...current, au: nextAu });
+    }
+    return out;
+  }
+
+  async validateEpochDebitReservations(epoch, debitTotals) {
+    for (const debit of debitTotals.values()) {
+      const hold = await this.normalizeSpendHoldRecord(
+        (await this.get(this.spendHoldKey(debit.user, debit.rail, epoch))) ?? null,
+        debit.user,
+        debit.rail,
+        epoch
+      );
+      if (hold instanceof Error) return hold;
+      if (this.compareAu(hold.reserved_au, debit.au) < 0) {
+        return new Error('Epoch debit exceeds reserved spend hold.');
+      }
+    }
+    return null;
+  }
+
   async requireBoundCanaryProbe(value, auditor) {
     const catalogError = await this.requirePublishedCanarySet(value.canary_set);
     if (catalogError) return catalogError;
@@ -8019,7 +8097,7 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash, epochSeconds }) {
+  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash, epochSeconds, reservationDebitTotals = null }) {
     const base = {
       ...applyState,
       updated_at: this.tx,
@@ -8032,6 +8110,7 @@ class MayhemContract extends Contract {
         updated_epoch: epoch,
         pending_epoch: null,
         pending_next_page: 0,
+        pending_reserved_debits: null,
         last_page: page,
       };
     }
@@ -8039,6 +8118,7 @@ class MayhemContract extends Contract {
       ...base,
       pending_epoch: epoch,
       pending_next_page: page + 1,
+      pending_reserved_debits: this.reservationDebitTotalEntries(reservationDebitTotals),
       updated_epoch: applyState.updated_epoch,
       last_page: page,
     };

@@ -54,6 +54,32 @@ export class MemoryStorage {
 
 export const makeTxKey = (n) => n.toString(16).padStart(64, '0');
 
+export async function seedSpendHold(storage, { user, rail = 'fiat', epoch, au }) {
+  await storage.put(`hold/${rail}/${user}/${epoch}`, {
+    user,
+    rail,
+    denom: 'au_usd',
+    epoch,
+    reserved_au: auString(au),
+    balance_au_at_last_reserve: null,
+    sessions: [],
+    updated_at: makeTxKey(99),
+  });
+}
+
+export async function seedSpendHoldsForApply(storage, value) {
+  const totals = new Map();
+  for (const debit of value.debits ?? []) {
+    const key = `${debit.rail}:${debit.user}:${value.epoch}`;
+    const current = totals.get(key) ?? 0n;
+    totals.set(key, current + BigInt(String(debit.au)));
+  }
+  for (const [key, au] of totals) {
+    const [rail, user, epoch] = key.split(':');
+    await seedSpendHold(storage, { user, rail, epoch: Number(epoch), au });
+  }
+}
+
 export const makeOperation = (type, value, sender, txNo, writer = ZERO_HEX) => ({
   type: 'tx',
   key: makeTxKey(txNo),
