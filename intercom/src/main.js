@@ -4,7 +4,7 @@ import path from 'path';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
-import { createServer as createRpcServer } from '../trac/trac-peer/rpc/create_server.js';
+import { createServer as createRpcServer } from './rpc.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
@@ -532,11 +532,20 @@ const sidechannel = new Sidechannel(peer, {
   allowRemoteOpen: sidechannelAllowRemoteOpen,
   autoJoinOnOpen: sidechannelAutoJoin,
   welcomeRequired: sidechannelWelcomeRequired,
-  onMessage: scBridgeEnabled
-    ? (channel, payload, connection) => scBridge.handleSidechannelMessage(channel, payload, connection)
-    : sidechannelQuiet
-      ? () => {}
-      : null,
+  onMessage: (channel, payload, connection) => {
+    if (mayhemFeature.isRelayMessage(payload)) {
+      mayhemFeature.handleSidechannelMessage(channel, payload, connection).catch((error) => {
+        console.error('Mayhem feature relay failed:', error?.message ?? error);
+      });
+      return;
+    }
+    if (scBridgeEnabled) {
+      scBridge.handleSidechannelMessage(channel, payload, connection);
+    } else if (!sidechannelQuiet) {
+      const from = payload?.from ?? 'unknown';
+      console.log(`[sidechannel:${channel}] ${from}:`, payload?.message ?? payload);
+    }
+  },
 });
 peer.sidechannel = sidechannel;
 

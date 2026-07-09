@@ -655,6 +655,12 @@ class Sidechannel extends Feature {
     return PeerWallet.verify(sigBuf, b4a.from(msg), pubBuf);
   }
 
+  verifyPayload(payload, expectedKey = payload?.from) {
+    const author = normalizeKeyHex(payload?.from);
+    const expected = normalizeKeyHex(expectedKey);
+    return !!author && author === expected && this._verifySig(payload, expected);
+  }
+
   _registerChannel(name) {
     const channel = String(name || '').trim();
     if (!channel) return null;
