@@ -26330,6 +26330,8 @@ struct LedgerServe {
     enclave_id: String,
     model_id: String,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    served_ctx: Option<u64>,
     #[serde(default)]
     rooms: Vec<String>,
 }
@@ -31394,6 +31396,13 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .or_insert_with(|| gateway_caps_from_contract(&enclave.caps));
     }
 
+    let active_serves_by_key: BTreeMap<String, &LedgerServe> = contract
+        .serves
+        .iter()
+        .filter(|serve| serve.status == "active")
+        .map(|serve| (format!("{}:{}", serve.provider, serve.enclave_id), serve))
+        .collect();
+
     let mut served_price_by_model: BTreeMap<String, GatewayServedPrice> = BTreeMap::new();
     for serving in contract
         .roomserve
@@ -31413,9 +31422,16 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             continue;
         }
         let route_caps = gateway_caps_from_contract(&enclave.caps);
+        let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
+        let served_ctx = active_serves_by_key
+            .get(&serving_key)
+            .and_then(|serve| serve.served_ctx)
+            .and_then(|ctx| u32::try_from(ctx).ok())
+            .filter(|ctx| *ctx > 0)
+            .unwrap_or(route_caps.ctx);
         let price_ctx_bracket = price_ctx_bracket_for_model_class(
             &enclave.model_class,
-            u64::from(route_caps.ctx),
+            u64::from(served_ctx),
             &contract.ctx_bracket_schedule,
             now,
         )?;
@@ -31466,9 +31482,16 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             continue;
         }
         let route_caps = gateway_caps_from_contract(&enclave.caps);
+        let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
+        let served_ctx = active_serves_by_key
+            .get(&serving_key)
+            .and_then(|serve| serve.served_ctx)
+            .and_then(|ctx| u32::try_from(ctx).ok())
+            .filter(|ctx| *ctx > 0)
+            .unwrap_or(route_caps.ctx);
         let price_ctx_bracket = price_ctx_bracket_for_model_class(
             &enclave.model_class,
-            u64::from(route_caps.ctx),
+            u64::from(served_ctx),
             &contract.ctx_bracket_schedule,
             now,
         )?;
@@ -31518,6 +31541,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     min_ask_au: 0,
                     att_tier: effective_att_tier,
                     quant: normalize_ledger_quant(&enclave.quant),
+                    served_ctx: Some(served_ctx),
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
                     artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
@@ -43710,6 +43734,7 @@ mod tests {
             enclave_id: contract.enclaves[0].enclave_id.clone(),
             model_id: contract.enclaves[0].model_id.clone(),
             status: "active".to_owned(),
+            served_ctx: None,
             rooms: vec!["room-a".to_owned()],
         }];
 
@@ -43753,6 +43778,7 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
+            served_ctx: None,
             rooms: vec![],
         });
         let err = resolve_provider_leave_enclave(
@@ -45415,6 +45441,7 @@ mod tests {
         );
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
         assert_eq!(models[0].mayhem.route_candidates[0].quant, "int4");
+        assert_eq!(models[0].mayhem.route_candidates[0].served_ctx, Some(4096));
         let route_price = models[0].mayhem.route_candidates[0]
             .price_ref_au
             .as_ref()
@@ -45587,6 +45614,7 @@ mod tests {
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
+            served_ctx: Some(8192),
             rooms: vec!["aa".repeat(16)],
         });
 
@@ -45618,6 +45646,7 @@ mod tests {
             enclave_id: second_enclave_id.clone(),
             model_id: second_model_id.clone(),
             status: "active".to_owned(),
+            served_ctx: Some(8192),
             rooms: vec![second_room_id],
         });
         contract.prices.push(LedgerPriceSchedule {
@@ -45727,6 +45756,7 @@ mod tests {
             enclave_id: tier3_enclave_id.clone(),
             model_id: model_id.clone(),
             status: "active".to_owned(),
+            served_ctx: Some(8192),
             rooms: vec![tier3_room_id],
         });
         contract.prices.push(LedgerPriceSchedule {
@@ -52863,6 +52893,7 @@ State initialization...
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
+                served_ctx: Some(4096),
                 rooms: vec![room_id],
             }],
             providers: vec![LedgerProvider {

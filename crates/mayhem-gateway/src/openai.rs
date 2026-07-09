@@ -274,6 +274,8 @@ pub struct GatewayRouteCandidate {
     pub att_tier: u8,
     #[serde(default = "default_quant_bucket")]
     pub quant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_ctx: Option<u32>,
     pub admin_pubkey: String,
     pub artifact_root: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -5990,11 +5992,16 @@ fn heartbeat_caps_for_route(
             .and_then(Value::as_bool)
             .unwrap_or(fallback.json),
         ctx: candidate
-            .caps
-            .get("ctx")
-            .or_else(|| candidate.caps.get("ctx_max"))
-            .and_then(Value::as_u64)
-            .and_then(|ctx| u32::try_from(ctx).ok())
+            .served_ctx
+            .filter(|ctx| *ctx > 0)
+            .or_else(|| {
+                candidate
+                    .caps
+                    .get("ctx")
+                    .or_else(|| candidate.caps.get("ctx_max"))
+                    .and_then(Value::as_u64)
+                    .and_then(|ctx| u32::try_from(ctx).ok())
+            })
             .unwrap_or(fallback.ctx),
         vision: candidate
             .caps
@@ -17754,6 +17761,30 @@ mod tests {
     }
 
     #[test]
+    fn spend_voucher_prefers_route_committed_ctx_before_live_heartbeat() {
+        let mut model = test_routed_model_with_id("test/model@4bit", 0, 1);
+        model.mayhem.caps.ctx = 1024;
+        model.mayhem.route_candidates[0].served_ctx = Some(512);
+        model.mayhem.route_candidates[0].caps = json!({
+            "ctx": 1024,
+            "tools": true,
+            "json": true,
+        });
+        let request = test_chat_request(&model.id);
+        let invocation = GatewayState::from_models(vec![model.clone()])
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                Some(&model.mayhem.route_candidates[0]),
+                &GatewayRequestOptions::default(),
+            )
+            .expect("route committed ctx is voucherable");
+
+        assert_eq!(invocation.served_ctx, 512);
+        assert_eq!(invocation.spend_voucher.body.served_ctx, 512);
+    }
+
+    #[test]
     fn non_text_spend_voucher_omits_ctx_bracket_terms() {
         let mut model = test_model();
         model.mayhem.model_class = "embedding".to_owned();
@@ -18916,6 +18947,7 @@ mod tests {
             min_ask_au: 0,
             att_tier: 1,
             quant: DEFAULT_QUANT_BUCKET.to_owned(),
+            served_ctx: None,
             admin_pubkey: "33".repeat(32),
             artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
             artifact_sidecar_roots: BTreeMap::new(),
