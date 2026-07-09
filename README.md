@@ -38,8 +38,10 @@ No terminal knowledge needed. Hand this repository to a coding agent — Claude 
 **Agent prompt — user setup (buy inference):**
 
 ```text
-Read the README of this repository. I want to USE OpenMayhem to run AI models
-(not provide compute). Install it for my operating system, run `mayhem up`,
+Read the README of this repository, especially "What you need installed
+first" and "Agent install checklist". I want to USE OpenMayhem to run AI
+models (not provide compute). Detect my OS, install the missing
+prerequisites for it FIRST, then install OpenMayhem, run `mayhem up`,
 verify the gateway answers on http://127.0.0.1:11435/v1/models, then help me
 buy my first credits with `mayhem pay stripe` and run one test chat completion
 against a model from `mayhem models --gateway`. Explain each command before
@@ -49,9 +51,12 @@ you run it and show me the dashboard URL at the end.
 **Agent prompt — provider setup (earn on your hardware):**
 
 ```text
-Read the README of this repository. I want to PROVIDE compute to OpenMayhem
-and earn with this machine. Check my hardware first and tell me which models
-fit. Install the software, run `mayhem up --provider`, help me choose which
+Read the README of this repository, especially "What you need installed
+first" and "Agent install checklist". I want to PROVIDE compute to OpenMayhem
+and earn with this machine. Detect my OS and hardware, install the missing
+prerequisites FIRST (including the GPU/backend-specific ones the checklist
+names for my hardware), install the software, run `mayhem doctor` and tell
+me which models fit, run `mayhem up --provider`, help me choose which
 payment rails to accept with `mayhem provider rails set`, set sensible
 self-protection limits with `mayhem provider limits set`, and confirm I am
 serving with `mayhem provider health`. Explain what my expected earnings
@@ -163,6 +168,24 @@ Metal ships with the OS — nothing GPU-specific to install.
 - Current NVIDIA driver for GPU serving
 - Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so Tier 2 works out of the box.
 
+### Agent install checklist (deterministic — for coding agents driving the install)
+
+Most installs are driven by a coding agent. Agent: execute in THIS order, verify each step before the next, and never skip the preflight — several failure modes below are silent if you do.
+
+1. **Detect OS + GPU** (`uname -a` / `systeminfo`; `nvidia-smi`, or on macOS assume Metal).
+2. **Install the per-OS prerequisites above and verify each**: `rustc --version`, `node --version` (≥20), `cmake --version`, and on Linux confirm libclang (`ldconfig -p | grep libclang`) — a missing libclang is the single most common build failure and only surfaces mid-`cargo build`.
+3. **NVIDIA machines**: `nvidia-smi` proves the driver, **not** the toolkit. If the provider will serve GPU models, also verify `nvcc --version`. ⚠ Without the CUDA pieces the install still succeeds and `mayhem up` reports healthy — the failure appears later as a model that never loads and a provider that silently earns nothing. Catch it now, not then.
+4. **Build/install**: `./install.sh --from-source` (Windows: `.\install.ps1 -FromSource`). Expect 20–40 min of compiling; that is normal.
+5. **Preflight before serving**: run `mayhem doctor` and read its verdicts. It reports per-backend feasibility for this machine (which engines can run, expected tok/s, memory fit). Do not start a provider whose chosen backend the doctor marks insufficient.
+6. **Backend-specific extras — install only what the hardware/models need:**
+   - **vLLM or TensorRT-LLM artifacts** (Linux + NVIDIA only): Python 3.10+ with `venv`/`pip`, and the packages installed into a venv the engine can find (`MAYHEM_VLLM_PYTHON` / `MAYHEM_TRTLLM_PYTHON` point at its `python`). vLLM configures its own CUDA/cache environment; **TensorRT-LLM currently does not** — `CUDA_HOME` must be valid in the environment the provider starts from.
+   - **MLX** (Apple Silicon): `python3 -m venv ~/.mayhem/venv-mlx && ~/.mayhem/venv-mlx/bin/pip install mlx-lm`, then set `MAYHEM_MLX_PYTHON=~/.mayhem/venv-mlx/bin/python`.
+   - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Text-only providers can ignore this.
+7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
+8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.
+
+Rule of thumb for agents: `llama.cpp`/GGUF models need nothing beyond steps 1–4 on any OS — that is the zero-extra path. Everything in step 6 is only for the specific backends named there.
+
 Before any download, the model list shows what actually fits on this machine: which models run, roughly how fast, at what context size, and how big the download is. Capacity math uses your GPU's dedicated memory (on Apple Silicon and GB10-class machines, the whole unified pool minus an OS reserve), and a model that only partially fits gets a CPU/GPU split computed for your card.
 
 ---
@@ -254,24 +277,62 @@ Either way, `mayhem deposit status` and `mayhem balance` show the credit land. T
 
 ### Control what you pay and what serves you
 
+You never *have* to set anything: with no ceiling, a session simply pays the current market price, and that price is locked for the whole session — no mid-conversation repricing. The controls below are for when you want guarantees.
+
+**One unit to know:** everything price-shaped ends in `-au` and is an integer in **atto-USD per token** (1 dollar = 10¹⁸ au). Handy conversion: *$X per 1M tokens = X × 10¹² au*. So "never pay more than $0.50 per million tokens" is `500000000000`. `mayhem price show <model>` prints the live market value in the same unit, so you can sanity-check your zeros against it.
+
+**Persistent ceiling (set once, applies to every session):**
+
 ```bash
-mayhem config max-price 0.25              # never pay above $0.25 per priced unit (persistent ceiling)
-mayhem config set --key min-ctx --value 128000   # only route to providers with ≥128k context
+mayhem config max-price 500000000000      # ceiling = $0.50 per 1M tokens, survives restarts
+mayhem config max-price                   # inspect
+mayhem config max-price --clear           # remove
+mayhem up --max-price-au 500000000000     # same thing for one run only (beats the config)
+```
+
+**Discovery filters (see what qualifies before you spend):**
+
+```bash
 mayhem models --gateway --min-att-tier 3  # only confidential-compute routes
 mayhem models --gateway --require-kyb     # only identity-verified businesses
 mayhem models --gateway --quant int4      # filter by quantization
 ```
 
-Per-request, any OpenAI client can override with headers — no SDK changes:
+**Per-request headers** — any OpenAI client, no SDK changes. A header beats the `--max-price-au` flag, which beats the persistent config. Where to put them:
 
-| Header | Effect |
-|---|---|
-| `X-Mayhem-Max-Price-Au` | price ceiling for this request |
-| `X-Mayhem-Min-Att-Tier` | minimum trust tier (hard filter, never downgraded) |
-| `X-Mayhem-Min-Ctx` | minimum context window |
-| `X-Mayhem-Quant` | required quantization bucket |
-| `X-Mayhem-Hedge` | race a second provider for latency |
-| `X-Mayhem-Min-Tok-S` | throughput floor |
+```bash
+# curl
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H "X-Mayhem-Max-Price-Au: 500000000000" \
+  -H "X-Mayhem-Min-Att-Tier: 3" \
+  -d '{"model":"...","messages":[...]}'
+```
+
+```python
+# OpenAI Python SDK — once for every call this client makes:
+client = OpenAI(base_url="http://127.0.0.1:11435/v1", api_key="sk-mayhem-...",
+                default_headers={"X-Mayhem-Max-Price-Au": "500000000000"})
+# or per call:
+client.chat.completions.create(..., extra_headers={"X-Mayhem-Min-Ctx": "128000"})
+```
+
+The Node SDK takes `defaultHeaders: {...}` on the client the same way, and any framework that lets you add custom headers to an OpenAI provider (opencode, LangChain, …) carries them on every call in the loop.
+
+| Request header | Value | Effect |
+|---|---|---|
+| `X-Mayhem-Max-Price-Au` | integer au per token | price ceiling for this request |
+| `X-Mayhem-Min-Att-Tier` | `1`–`4` (or `T3`) | minimum trust tier (hard filter, never downgraded) |
+| `X-Mayhem-Min-Ctx` | tokens, e.g. `128000` | minimum context window |
+| `X-Mayhem-Quant` | `fp16`, `int4`, `nvfp4`, … | required quantization bucket |
+| `X-Mayhem-Hedge` | `1` | race a second provider for latency |
+| `X-Mayhem-Min-Tok-S` | tokens/sec | throughput floor |
+| `X-Mayhem-Max-Wait-Ms` | ms (max 60000) | how long to wait for a free provider before giving up (default 10s) |
+
+These are **routing filters, not refunds**: a request whose conditions no live provider meets fails up front with a clear error and costs nothing — you're never silently served something worse or billed something higher. (Failover timing knobs — open/TTFT/stall timeouts — are catalog-controlled per model; sending them as headers is rejected by design.)
+
+**Response headers tell you what actually happened** on every reply: `X-Mayhem-Backend` (which provider served it), `X-Mayhem-Usage` (token counts), `X-Mayhem-Receipt` (the signed billing receipt, when enabled), `X-Mayhem-TTFT-Ms` (time to first token). `mayhem history` shows your recent sessions — per session, provider, model, spend — without any of this.
+
+**If a session goes wrong**, you're not stuck writing a support ticket: `mayhem dispute --session-id <id> --reason service_failure` opens a bonded on-ledger dispute, and if it's never resolved the bond auto-refunds after a timeout (`mayhem dispute-expire`).
 
 ### Share one funded gateway with your team or your other machines
 
@@ -298,6 +359,14 @@ mayhem tokens revoke laptop      # immediate
 | `mayhem price show <model> [--tier]` | current market price with published derivation |
 | `mayhem pay stripe` / `mayhem deposit tap\|tnk` | buy credits on your chosen rail (card is the default) |
 | `mayhem deposit status` | pending/confirmed deposits from the ledger |
+| `mayhem balance [--rail fiat\|tap\|tnk]` | your prepaid credit balance per rail |
+| `mayhem history` | recent sessions: provider, model, spend, receipts |
+| `mayhem config max-price [au]` | persistent price ceiling (inspect / set / `--clear`) |
+| `mayhem tokens create/list/revoke` | shared-gateway keys with per-token budget (`10/day`), rate limit, model allowlist |
+| `mayhem dispute` / `mayhem dispute-expire` | open a bonded session dispute / reclaim the bond after timeout |
+| `mayhem wallet show/backup` | your addresses / reveal the recovery mnemonic (gated) |
+| `mayhem doctor` | probe this machine's hardware and what it can run |
+| `mayhem update` | fetch, verify (signed manifest), and stage the latest release |
 | `mayhem balance` | per-rail balances |
 | `mayhem config max-price / set` | persistent spending and routing defaults |
 | `mayhem tokens create/list/revoke` | bearer tokens for shared gateways |
@@ -403,6 +472,7 @@ mayhem provider rails get
 | `mayhem provider min-ask set/get` | your price floor per market |
 | `mayhem provider limits set` | concurrency / accept-rate / daily budget caps |
 | `mayhem provider drain` | graceful sign-off |
+| `mayhem provider serve plan/add/remove` | see what fits this machine; add/remove served models live |
 | `mayhem provider earnings` | earnings, holdback, claimables per rail |
 | `mayhem reputation` | your standing and why |
 | `mayhem claim` | execute TAP Merkle claims |
