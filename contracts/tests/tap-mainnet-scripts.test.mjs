@@ -126,7 +126,11 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal((await pool.maxEpochDelta()).toString(), CAP);
 
   const verify = await runNode([VERIFY_SCRIPT, '--dry-run', '--json'], {
-    env: { ...baseEnv, MAYHEM_ETHERSCAN_API_KEY: 'etherscan-test-key' },
+    env: {
+      ...baseEnv,
+      MAYHEM_ETHERSCAN_API_KEY: 'etherscan-test-key',
+      MAYHEM_TAP_POOL_ADDRESS: '0x000000000000000000000000000000000000dEaD',
+    },
   });
   assert.equal(verify.status, 0, verify.stderr);
   const verifyReport = JSON.parse(verify.stdout);

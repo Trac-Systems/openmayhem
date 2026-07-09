@@ -151,7 +151,7 @@ export function buildVerificationRequest({
 } = {}) {
   const deploymentFile = deploymentFileFrom(args, env);
   const deployment = readJson(deploymentFile, 'deployment file');
-  const pool = normalizeAddress(args.pool || env.MAYHEM_TAP_POOL_ADDRESS || deployment.pool, 'pool address');
+  const pool = normalizeAddress(args.pool || deployment.pool || env.MAYHEM_TAP_POOL_ADDRESS, 'pool address');
   const token = normalizeAddress(deployment.token || env.MAYHEM_TAP_TOKEN_ADDRESS || env.MAYHEM_TAP_TOKEN_ADDR, 'TAP token');
   const owner = normalizeAddress(deployment.owner, 'pool owner');
   const maxEpochDelta = parseNonNegativeBigInt(deployment.maxEpochDelta ?? deployment.max_epoch_delta_wei, 'maxEpochDelta');
