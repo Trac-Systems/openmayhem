@@ -50,10 +50,11 @@ use mayhem_gateway::{
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
-        GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewayState,
-        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
-        MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
-        ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
+        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
+        GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore,
+        GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo,
+        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS,
+        MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     HardwareQuoteVerifierCommand, HeartbeatReceiver, ProbationCaps, ProbationPolicy,
@@ -19249,7 +19250,7 @@ async fn up(args: UpArgs) -> Result<()> {
         let client = client.clone();
         let gateway_url = plan.gateway_url.clone();
         async move {
-            let models = fetch_gateway_models(&client, &gateway_url).await?;
+            let models = fetch_gateway_models_allow_empty(&client, &gateway_url).await?;
             Ok(json!({
                 "count": models.len(),
                 "ids": models
@@ -21359,7 +21360,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             contract_param_at,
         )
         .await?;
-        let (catalog_doc, catalog_json, catalog_source) = if let Some(dev_catalog_path) =
+        let contract = read_contract_catalog(&rpc).await?;
+        let models = gateway_models_from_contract(&contract)?;
+        let (catalog_doc, canary_registry, catalog_source) = if let Some(dev_catalog_path) =
             args.dev_catalog_path.clone()
         {
             let catalog_path = absolutize(dev_catalog_path)?;
@@ -21402,46 +21405,60 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 .with_context(|| format!("loading local dev catalog {}", catalog_path.display()))?;
             let catalog_json = fs::read_to_string(&catalog_path)
                 .with_context(|| format!("reading local dev catalog {}", catalog_path.display()))?;
+            let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
+                .context("loading canary registry from local gateway catalog")?;
             let trust = if args.dev_skip_catalog_verify {
                 "dev-local-unverified"
             } else {
                 "dev-local-signed"
             };
             (
-                catalog_doc,
-                catalog_json,
+                Some(catalog_doc),
+                canary_registry,
                 format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
             )
         } else {
-            let catalog_client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .context("building catalog release HTTP client")?;
-            let release = read_catalog_release_anchor(&rpc).await?;
-            let catalog_files =
-                fetch_catalog_release_files(&catalog_client, &home, &release).await?;
-            let catalog_doc =
-                catalog::load_document(&catalog_files.catalog_path).with_context(|| {
-                    format!(
-                        "loading verified ledger catalog {}",
-                        catalog_files.catalog_path.display()
+            match read_optional_catalog_release_anchor(&rpc).await? {
+                Some(release) => {
+                    let catalog_client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .context("building catalog release HTTP client")?;
+                    let catalog_files =
+                        fetch_catalog_release_files(&catalog_client, &home, &release).await?;
+                    let catalog_doc = catalog::load_document(&catalog_files.catalog_path)
+                        .with_context(|| {
+                            format!(
+                                "loading verified ledger catalog {}",
+                                catalog_files.catalog_path.display()
+                            )
+                        })?;
+                    let catalog_json = fs::read_to_string(&catalog_files.catalog_path)
+                        .with_context(|| {
+                            format!(
+                                "reading verified ledger catalog {}",
+                                catalog_files.catalog_path.display()
+                            )
+                        })?;
+                    let canary_registry =
+                        GatewayState::canary_registry_from_catalog_json(&catalog_json)
+                            .context("loading canary registry from gateway catalog")?;
+                    (
+                        Some(catalog_doc),
+                        canary_registry,
+                        format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
                     )
-                })?;
-            let catalog_json =
-                fs::read_to_string(&catalog_files.catalog_path).with_context(|| {
-                    format!(
-                        "reading verified ledger catalog {}",
-                        catalog_files.catalog_path.display()
-                    )
-                })?;
-            (
-                catalog_doc,
-                catalog_json,
-                format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
-            )
+                }
+                None if models.is_empty() => (
+                    None,
+                    GatewayCanaryRegistry::default(),
+                    format!("contract:{rpc_url}; catalog:unpublished-empty"),
+                ),
+                None => bail!(
+                    "catalog/current not found; ask the admin to run `mayhem admin publish-catalog`"
+                ),
+            }
         };
-        let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
-            .context("loading canary registry from gateway catalog")?;
         let wallet_password = args.wallet_password.clone().unwrap_or_default();
         let wallet = resolve_cli_wallet_with_keypair(
             &home,
@@ -21461,10 +21478,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 )
             })?;
         let balance_au = read_user_balance_au(&rpc, &wallet.public_key, args.rail.as_str()).await?;
-        let contract = read_contract_catalog(&rpc).await?;
-        let models = gateway_models_from_contract(&contract)?;
-        let (models, blocked_version_gates) =
-            filter_gateway_models_by_app_version(models, &catalog_doc)?;
+        let (models, blocked_version_gates) = match catalog_doc.as_ref() {
+            Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
+            None => (models, Vec::new()),
+        };
         let hidden_update_models = gateway_update_models_from_version_gates(&blocked_version_gates);
         let hardware = probe(ProbeOptions {
             disk_path: home.clone(),
@@ -21472,13 +21489,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             disk_bench_mib: 1,
             fixture: None,
         });
-        let models = annotate_gateway_models_with_local_runs(
-            models,
-            &contract,
-            &catalog_doc,
-            &hardware,
-            &home,
-        );
+        let models = match catalog_doc.as_ref() {
+            Some(catalog_doc) => annotate_gateway_models_with_local_runs(
+                models,
+                &contract,
+                catalog_doc,
+                &hardware,
+                &home,
+            ),
+            None => models,
+        };
         let heartbeat_channels = gateway_provider_heartbeat_channels(&models);
         let model_count = models.len();
         let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
@@ -21784,7 +21804,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
 
     if args.gateway {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
-        let models = fetch_gateway_models(&client, &gateway_root).await?;
+        let models = fetch_gateway_models_allow_empty(&client, &gateway_root).await?;
         let summaries = filter_model_summaries_by_require_kyb(
             filter_model_summaries_by_quant(
                 filter_model_summaries_by_min_att_tier(
@@ -23642,12 +23662,22 @@ async fn fetch_gateway_json_with_token(
 }
 
 async fn fetch_gateway_models(client: &reqwest::Client, gateway_root: &str) -> Result<Vec<Value>> {
+    let models = fetch_gateway_models_allow_empty(client, gateway_root).await?;
+    if models.is_empty() {
+        bail!("gateway /v1/models returned no models");
+    }
+    Ok(models)
+}
+
+async fn fetch_gateway_models_allow_empty(
+    client: &reqwest::Client,
+    gateway_root: &str,
+) -> Result<Vec<Value>> {
     let value = fetch_gateway_json(client, &format!("{gateway_root}/v1/models")).await?;
     let models = value
         .get("data")
         .and_then(Value::as_array)
-        .filter(|models| !models.is_empty())
-        .context("gateway /v1/models returned no models")?
+        .context("gateway /v1/models response is missing the data array")?
         .clone();
     Ok(models)
 }
@@ -23665,9 +23695,17 @@ struct ProviderResolvedCatalog {
 }
 
 async fn read_catalog_release_anchor(rpc: &PeerRpcClient) -> Result<CatalogReleaseAnchor> {
-    let value = read_state_value(rpc, "catalog/current").await?.context(
-        "catalog/current not found; ask the admin to run `mayhem admin publish-catalog`",
-    )?;
+    read_optional_catalog_release_anchor(rpc)
+        .await?
+        .context("catalog/current not found; ask the admin to run `mayhem admin publish-catalog`")
+}
+
+async fn read_optional_catalog_release_anchor(
+    rpc: &PeerRpcClient,
+) -> Result<Option<CatalogReleaseAnchor>> {
+    let Some(value) = read_state_value(rpc, "catalog/current").await? else {
+        return Ok(None);
+    };
     let release: CatalogReleaseAnchor =
         serde_json::from_value(value).context("parsing catalog/current")?;
     if release.status != "active" {
@@ -23692,7 +23730,7 @@ async fn read_catalog_release_anchor(rpc: &PeerRpcClient) -> Result<CatalogRelea
     {
         bail!("catalog/current has invalid hash or public key fields");
     }
-    Ok(release)
+    Ok(Some(release))
 }
 
 async fn fetch_catalog_release_files(
@@ -33709,11 +33747,6 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 route_candidates,
             },
         });
-    }
-    if models.is_empty() {
-        bail!(
-            "no canonical contract-backed models found; ask the admin to register an enclave, set a current au_usd price, open a room, and confirm an active provider joined it, or use --dev-embedded-catalog for local smoke only"
-        );
     }
     Ok(models)
 }
@@ -47860,41 +47893,35 @@ mod tests {
         );
 
         contract.prices.clear();
-        let err = gateway_models_from_contract(&contract)
-            .expect_err("missing current contract price should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&contract).unwrap().is_empty());
 
         let mut contract = test_contract(&root);
         contract.roomserve.clear();
-        let err = gateway_models_from_contract(&contract)
-            .expect_err("missing active room participation should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&contract).unwrap().is_empty());
 
         let mut contract = test_contract(&root);
         contract.providers[0].status = "banned".to_owned();
-        let err =
-            gateway_models_from_contract(&contract).expect_err("banned provider should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&contract).unwrap().is_empty());
 
         let mut missing_role = test_contract(&root);
         missing_role.enclaves[0].created_by_role = None;
         missing_role.rooms[0].creator_role = None;
         missing_role.prices[0].current.as_mut().unwrap().set_by_role = None;
-        let err = gateway_models_from_contract(&missing_role)
-            .expect_err("missing admin role markers should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&missing_role)
+            .unwrap()
+            .is_empty());
 
         let mut provider_created = test_contract(&root);
         provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
-        let err = gateway_models_from_contract(&provider_created)
-            .expect_err("provider-created enclave marker should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&provider_created)
+            .unwrap()
+            .is_empty());
 
         let mut provider_room = test_contract(&root);
         provider_room.rooms[0].creator_role = Some("provider".to_owned());
-        let err = gateway_models_from_contract(&provider_room)
-            .expect_err("provider-created room marker should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&provider_room)
+            .unwrap()
+            .is_empty());
 
         let mut provider_priced = test_contract(&root);
         provider_priced.prices[0]
@@ -47902,24 +47929,24 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_by_role = Some("provider".to_owned());
-        let err = gateway_models_from_contract(&provider_priced)
-            .expect_err("provider-priced record marker should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&provider_priced)
+            .unwrap()
+            .is_empty());
 
         let mut noncanonical_room_id = test_contract(&root);
         noncanonical_room_id.rooms[0].room_id = "provider-local-only".to_owned();
         noncanonical_room_id.rooms[0].sidechannel = "mx/room/provider-local-only".to_owned();
         noncanonical_room_id.roomserve[0].room_id = "provider-local-only".to_owned();
         noncanonical_room_id.serves[0].rooms = vec!["provider-local-only".to_owned()];
-        let err = gateway_models_from_contract(&noncanonical_room_id)
-            .expect_err("raw Intercom room ids should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&noncanonical_room_id)
+            .unwrap()
+            .is_empty());
 
         let mut wrong_sidechannel = test_contract(&root);
         wrong_sidechannel.rooms[0].sidechannel = "mx/room/provider-made".to_owned();
-        let err = gateway_models_from_contract(&wrong_sidechannel)
-            .expect_err("wrong room sidechannel should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&wrong_sidechannel)
+            .unwrap()
+            .is_empty());
 
         let mut wrong_same_model_enclave = test_contract(&root);
         let other_enclave_id = "66".repeat(32);
@@ -47931,9 +47958,9 @@ mod tests {
         other_price.enclave_id = other_enclave_id.clone();
         wrong_same_model_enclave.prices.push(other_price);
         wrong_same_model_enclave.roomserve[0].enclave_id = other_enclave_id;
-        let err = gateway_models_from_contract(&wrong_same_model_enclave)
-            .expect_err("same-model wrong-enclave roomserve should hide model");
-        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+        assert!(gateway_models_from_contract(&wrong_same_model_enclave)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
