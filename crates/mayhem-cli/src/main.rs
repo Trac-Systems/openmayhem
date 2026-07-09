@@ -5040,6 +5040,24 @@ struct RulesRef {
 }
 
 #[derive(Debug, Serialize)]
+struct ConsentSigningEnvelope<'a> {
+    domain: &'static str,
+    signing_version: u32,
+    rules_ver: u64,
+    rules_hash: &'a str,
+}
+
+fn consent_message(rules: &RulesRef) -> String {
+    serde_json::to_string(&ConsentSigningEnvelope {
+        domain: "mayhem-consent",
+        signing_version: CONTRACT_SIGNING_MESSAGE_VERSION,
+        rules_ver: rules.ver,
+        rules_hash: &rules.hash,
+    })
+    .expect("consent signing message serializes")
+}
+
+#[derive(Debug, Serialize)]
 struct ConsentReport {
     skipped: bool,
     simulated: bool,
@@ -40322,8 +40340,7 @@ async fn submit_consent(
     rules: RulesRef,
     sim: bool,
 ) -> Result<ConsentReport> {
-    let consent_message = format!("mayhem-consent{}{}", rules.ver, rules.hash);
-    let consent_sig = sign_message(keypair_path, password, &consent_message).await?;
+    let consent_sig = sign_message(keypair_path, password, &consent_message(&rules)).await?;
     let key = format!("consent/{}/{}/{}", wallet.public_key, rules.ver, rules.hash);
     let value = json!({
         "op": "consent",
@@ -43538,6 +43555,18 @@ mod tests {
     #[test]
     fn shell_single_quote_handles_embedded_quotes_for_copy_paste_commands() {
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn consent_message_matches_contract_signing_version() {
+        let rules = RulesRef {
+            ver: 1,
+            hash: "66".repeat(32),
+        };
+        assert_eq!(
+            consent_message(&rules),
+            "{\"domain\":\"mayhem-consent\",\"signing_version\":2,\"rules_ver\":1,\"rules_hash\":\"6666666666666666666666666666666666666666666666666666666666666666\"}"
+        );
     }
 
     #[test]

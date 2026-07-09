@@ -38,6 +38,19 @@ const SSH_OPTS = [
   '-o', 'StrictHostKeyChecking=no',
   '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/e11-spark-known-hosts')}`,
 ];
+const KEY_SSH_OPTS = [
+  '-F', '/dev/null',
+  '-o', 'BatchMode=yes',
+  '-o', 'PreferredAuthentications=publickey',
+  '-o', 'PasswordAuthentication=no',
+  '-o', 'KbdInteractiveAuthentication=no',
+  '-o', 'ConnectTimeout=8',
+  '-o', 'ExitOnForwardFailure=yes',
+  '-o', 'ServerAliveInterval=15',
+  '-o', 'ServerAliveCountMax=3',
+  '-o', 'StrictHostKeyChecking=no',
+  '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/e11-spark-known-hosts')}`,
+];
 
 const children = [];
 const cleanupState = {
@@ -65,14 +78,22 @@ Runs the I3-E11 acceptance smoke:
 
 Environment:
   MAYHEM_E11_CLUSTER_FILE          Spark credential file (default: .mayhem-local/secrets/cluster.txt)
+  MAYHEM_E11_SSH_TARGET            Key-based SSH target, e.g. mayhem@52.230.164.69 (bypasses cluster file)
+  MAYHEM_E11_SSH_HOST              Key-based SSH host (with MAYHEM_E11_SSH_USER, default: current user)
+  MAYHEM_E11_SSH_KEY               Optional private-key path for key-based SSH; ssh-agent is used when unset
   MAYHEM_E11_TAG                   Reuse a named run directory/tag instead of generating one
   MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
   MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: $HOME/mayhem/i3-e11-operationmayhem)
+  MAYHEM_E11_REMOTE_TARGET_DIR     Remote Cargo target dir (default: <remote root>/target)
   MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: $HOME/mayhem/e11-provider-downloads)
   MAYHEM_E11_REMOTE_PROVIDER_CACHE Spark provider sealed-store cache root (default: <remote root>/.mayhem-local/i3-e11-spark-provider-cache)
+  MAYHEM_E11_REMOTE_ENV_PRELUDE    Shell prelude sourced before remote build/provider commands
+  MAYHEM_E11_NODE_BIN              Remote node binary for wallet-helper signing (default: command -v node)
+  MAYHEM_E11_NPM_BIN               Remote npm binary for one-time wallet-helper dependency install
   MAYHEM_E11_ACCEL_ARTIFACT        Accelerated catalog artifact to prove (default: ${DEFAULT_ACCEL_ARTIFACT}; E14 uses vllm-fp16)
   MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: $HOME/mayhem/bin/trtllm-python)
   MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: $HOME/mayhem/bin/vllm-python-e14)
+  MAYHEM_E11_VLLM_ENV_PRELUDE      Extra shell env assignments for remote vLLM/provider startup
   MAYHEM_E11_HF_TOKEN_FILE         HF token file copied temporarily to Spark if present (default: .mayhem-local/secrets/hf.txt)
   MAYHEM_E11_CATALOG_RELEASE_REPO  HF repo for the signed catalog release (default: ${DEFAULT_CATALOG_RELEASE_REPO})
   MAYHEM_E11_CATALOG_RELEASE_REVISION  40-hex signed catalog release revision (default: ${DEFAULT_CATALOG_RELEASE_REVISION})
@@ -86,6 +107,15 @@ Environment:
   MAYHEM_E11_CONCURRENT_MAX_TOKENS vLLM concurrent prompt max_tokens (default: 32)
   MAYHEM_E11_CONCURRENT_ABORT_AFTER_PROOF  Abort extra streams once heartbeat is captured (default: 0)
   MAYHEM_E11_PROVIDER_SESSION_REQUEST_TIMEOUT_MS  Provider accepted-open request timeout (default: 15000)
+  MAYHEM_E11_ACCEL_ATT_TIER        Attestation tier for the accelerated enclave (default: 1)
+  MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON  Launch measurements JSON required when att tier is 3
+  MAYHEM_E11_PROVIDER_HW_QUOTE_KIND      Provider hardware quote kind for Tier-2/3 smokes
+  MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND   Remote provider hardware quote command path
+  MAYHEM_E11_PROVIDER_HW_QUOTE_TIMEOUT_SECONDS  Provider hardware quote timeout (default: 120)
+  MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND Local gateway hardware quote verifier command path
+  MAYHEM_E11_GATEWAY_HW_VERIFIER_TIMEOUT_SECONDS Gateway verifier timeout (default: 120)
+  MAYHEM_E11_SKIP_MAC_FALLBACK     Skip the local Apple GGUF fallback assertion (default: 0)
+  MAYHEM_E11_SKIP_TOOL_CALL        Skip the vLLM guided tool-call smoke (default: 0)
   MAYHEM_E11_KEEP_REMOTE_RUN       Keep Spark run home/logs after cleanup (default: 0; token is always removed)
   MAYHEM_E11_KEEP_PROVIDER_CACHE   Keep Spark sealed-store cache on cleanup (default: 1)
 `);
@@ -250,6 +280,20 @@ async function freePort() {
 }
 
 function parseCluster(file) {
+  const target = process.env.MAYHEM_E11_SSH_TARGET || '';
+  const envHost = process.env.MAYHEM_E11_SSH_HOST || '';
+  if (target || envHost) {
+    const match = /^(?:(?<user>[^@]+)@)?(?<host>[^:]+)(?::\d+)?$/.exec(target || envHost);
+    const user = process.env.MAYHEM_E11_SSH_USER || match?.groups?.user || os.userInfo().username;
+    const host = match?.groups?.host || envHost;
+    if (!user || !host) fail('MAYHEM_E11_SSH_TARGET or MAYHEM_E11_SSH_HOST must include an SSH host');
+    return {
+      auth: 'key',
+      user,
+      host,
+      key: process.env.MAYHEM_E11_SSH_KEY ? path.resolve(ROOT, process.env.MAYHEM_E11_SSH_KEY) : null,
+    };
+  }
   const text = fs.readFileSync(file, 'utf8');
   const first = {};
   for (const line of text.split(/\r?\n/)) {
@@ -263,11 +307,24 @@ function parseCluster(file) {
   if (!first.user || !first.pass || !host) {
     fail(`${file} must include user, pass, and ssh host for the Spark`);
   }
-  return { user: first.user, pass: first.pass, host };
+  return { auth: 'password', user: first.user, pass: first.pass, host };
 }
 
-function sshBase(passFile, remote) {
-  return ['-f', passFile, 'ssh', ...SSH_OPTS, `${remote.user}@${remote.host}`];
+function remoteTarget(remote) {
+  return `${remote.user}@${remote.host}`;
+}
+
+function keySshOpts(remote) {
+  const opts = [...KEY_SSH_OPTS];
+  if (remote.key) opts.push('-i', remote.key, '-o', 'IdentitiesOnly=yes');
+  return opts;
+}
+
+function sshInvocation(remote, passFile) {
+  if (remote.auth === 'key') {
+    return { command: 'ssh', args: keySshOpts(remote) };
+  }
+  return { command: 'sshpass', args: ['-f', passFile, 'ssh', ...SSH_OPTS] };
 }
 
 function retryableRemoteError(error) {
@@ -291,11 +348,16 @@ async function withRemoteRetries(label, action, attempts = 3) {
 }
 
 async function ssh(remote, passFile, command, options = {}) {
-  return withRemoteRetries(`ssh ${remote.host}`, () => run('sshpass', [...sshBase(passFile, remote), command], options));
+  const invocation = sshInvocation(remote, passFile);
+  return withRemoteRetries(
+    `ssh ${remote.host}`,
+    () => run(invocation.command, [...invocation.args, remoteTarget(remote), command], options)
+  );
 }
 
 async function rsyncTo(remote, passFile, localPath, remotePath, options = {}) {
-  const rsh = ['sshpass', '-f', passFile, 'ssh', ...SSH_OPTS].map(sh).join(' ');
+  const invocation = sshInvocation(remote, passFile);
+  const rsh = [invocation.command, ...invocation.args].map(sh).join(' ');
   return withRemoteRetries(
     `rsync ${remote.host}`,
     () => run(
@@ -1064,6 +1126,24 @@ async function readStatePrefix(rpcUrl, prefix, limit = 500) {
   return body.values || body.result?.values || [];
 }
 
+async function readPriceSchedulesForEnclave(rpcUrl, enclaveId) {
+  const direct = await readStateValue(rpcUrl, `price/${enclaveId}`).catch(() => null);
+  const prefixed = await readStatePrefix(rpcUrl, `price/${enclaveId}/`).catch(() => []);
+  const schedules = [];
+  if (direct?.current || direct?.pending) {
+    schedules.push({ key: `price/${enclaveId}`, value: direct });
+  }
+  for (const entry of prefixed) {
+    const key = entry?.key || '';
+    const value = entry?.value || entry;
+    if (!key.startsWith(`price/${enclaveId}/`)) continue;
+    if (key.includes('/v/')) continue;
+    if (!value?.current && !value?.pending) continue;
+    schedules.push({ key, value });
+  }
+  return schedules;
+}
+
 async function waitForStateValue(rpcUrl, key, predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
@@ -1083,11 +1163,13 @@ async function waitForCanonicalEnclaveReady(rpcUrl, { enclaveId, modelId, backen
   const deadline = Date.now() + timeoutMs;
   let last = {};
   while (Date.now() < deadline) {
-    const [enclave, price, rooms] = await Promise.all([
+    const [enclave, priceSchedules, rooms] = await Promise.all([
       readStateValue(rpcUrl, `enclave/${enclaveId}`).catch((err) => ({ error: err.message })),
-      readStateValue(rpcUrl, `price/${enclaveId}`).catch((err) => ({ error: err.message })),
+      readPriceSchedulesForEnclave(rpcUrl, enclaveId).catch((err) => [{ error: err.message }]),
       readStatePrefix(rpcUrl, 'room/').catch((err) => [{ error: err.message }]),
     ]);
+    const priceEntry = priceSchedules.find((entry) => entry?.value?.current);
+    const price = priceEntry?.value || null;
     const roomEntry = rooms.find((entry) => {
       const value = entry?.value || entry;
       return value?.enclave_id === enclaveId && value?.model_id === modelId && value?.status === 'open';
@@ -1096,8 +1178,9 @@ async function waitForCanonicalEnclaveReady(rpcUrl, { enclaveId, modelId, backen
       enclave_status: enclave?.status,
       enclave_backend: enclave?.backend,
       price_current: Boolean(price?.current),
+      price_key: priceEntry?.key || null,
       room_id: roomEntry?.key?.replace(/^room\//, '') || roomEntry?.value?.room_id,
-      errors: [enclave?.error, price?.error, rooms.find((entry) => entry?.error)?.error].filter(Boolean),
+      errors: [enclave?.error, priceSchedules.find((entry) => entry?.error)?.error, rooms.find((entry) => entry?.error)?.error].filter(Boolean),
     };
     if (
       enclave?.status === 'active' &&
@@ -1332,8 +1415,10 @@ async function main() {
   const remote = parseCluster(clusterFile);
   const localTmpDir = path.join(ROOT, '.mayhem-local/tmp');
   await fsp.mkdir(localTmpDir, { recursive: true });
-  const passFile = path.join(localTmpDir, `spark-e11-${tag}-${process.pid}.pass`);
-  fs.writeFileSync(passFile, remote.pass, { mode: 0o600 });
+  const passFile = remote.auth === 'password'
+    ? path.join(localTmpDir, `spark-e11-${tag}-${process.pid}.pass`)
+    : null;
+  if (passFile) fs.writeFileSync(passFile, remote.pass, { mode: 0o600 });
   cleanupState.remote = remote;
   cleanupState.passFile = passFile;
   cleanupState.remoteRun = null;
@@ -1350,6 +1435,21 @@ async function main() {
   if (!ggufArtifact || ggufArtifact.engine !== 'llama.cpp') fail(`missing ${GGUF_ARTIFACT} llama.cpp artifact`);
   const accelBackend = accelArtifact.engine;
   const accelLabel = `${accelArtifactName}/${accelBackend}`;
+  const accelAttTier = envPositiveInt('MAYHEM_E11_ACCEL_ATT_TIER', 1);
+  if (accelAttTier > 3) fail(`MAYHEM_E11_ACCEL_ATT_TIER must be between 1 and 3, got ${accelAttTier}`);
+  const accelLaunchMeasurementsJson = process.env.MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON || '';
+  if (accelAttTier >= 3 && !accelLaunchMeasurementsJson) {
+    fail('MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON is required when MAYHEM_E11_ACCEL_ATT_TIER is 3');
+  }
+  const providerHwQuoteKind = process.env.MAYHEM_E11_PROVIDER_HW_QUOTE_KIND || '';
+  const providerHwQuoteCommand = process.env.MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND || '';
+  const gatewayHwVerifierCommand = process.env.MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND || '';
+  if (Boolean(providerHwQuoteKind) !== Boolean(providerHwQuoteCommand)) {
+    fail('MAYHEM_E11_PROVIDER_HW_QUOTE_KIND and MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND must be supplied together');
+  }
+  if (accelAttTier >= 3 && (!providerHwQuoteKind || !gatewayHwVerifierCommand)) {
+    fail('Tier-3 smoke requires MAYHEM_E11_PROVIDER_HW_QUOTE_* and MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND');
+  }
   const rateMapJson = textRateMapJson(model);
   const manifestHash = sha256File(path.join(ROOT, 'catalog/models.json'));
   const catalogReleaseRepo = process.env.MAYHEM_E11_CATALOG_RELEASE_REPO || DEFAULT_CATALOG_RELEASE_REPO;
@@ -1369,6 +1469,9 @@ async function main() {
   const remoteRoot = (process.env.MAYHEM_E11_REMOTE_ROOT || '$HOME/mayhem/i3-e11-operationmayhem')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
+  const remoteTargetDir = (process.env.MAYHEM_E11_REMOTE_TARGET_DIR || path.posix.join(remoteRoot, 'target'))
+    .replace(/^~(?=\/|$)/, remoteHome)
+    .replace('$HOME', remoteHome);
   const remoteDownloads = (process.env.MAYHEM_E11_REMOTE_DOWNLOADS || '$HOME/mayhem/e11-provider-downloads')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
@@ -1382,10 +1485,20 @@ async function main() {
   const remoteProviderHome = path.posix.join(remoteProviderCacheRoot, 'provider-home');
   const remoteKeypair = path.posix.join(remoteProviderHome, 'stores/main/db/keypair.json');
   const remoteHfToken = path.posix.join(remoteRun, 'secrets/hf.txt');
-  const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
-  const remoteEnclave = path.posix.join(remoteRoot, 'target/debug/mayhem-enclave');
+  const remoteMayhem = path.posix.join(remoteTargetDir, 'debug/mayhem');
+  const remoteEnclave = path.posix.join(remoteTargetDir, 'debug/mayhem-enclave');
   const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
-  const remoteNode = (await ssh(remote, passFile, 'command -v node || true')).stdout.trim() || '/usr/bin/node';
+  const remoteEnvPrelude = process.env.MAYHEM_E11_REMOTE_ENV_PRELUDE || '';
+  const remoteVllmEnvPrelude = process.env.MAYHEM_E11_VLLM_ENV_PRELUDE || '';
+  const remoteShell = (body) => remoteEnvPrelude.trim()
+    ? `bash -lc ${sh(`${remoteEnvPrelude}\n${body}`)}`
+    : body;
+  const remoteNode = process.env.MAYHEM_E11_NODE_BIN
+    || (await ssh(remote, passFile, remoteShell('command -v node || true'))).stdout.trim()
+    || '/usr/bin/node';
+  const remoteNpm = process.env.MAYHEM_E11_NPM_BIN
+    || (await ssh(remote, passFile, remoteShell('command -v npm || true'))).stdout.trim()
+    || 'npm';
   const remoteTrtPython = (process.env.MAYHEM_E11_TRTLLM_PYTHON || '$HOME/mayhem/bin/trtllm-python')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
@@ -1411,24 +1524,40 @@ async function main() {
       env: process.env,
     });
   }
+  const remoteHasEthers = (await ssh(
+    remote,
+    passFile,
+    remoteShell(`cd ${sh(remoteRoot)}\n${sh(remoteNode)} -e "const req=require('module').createRequire(process.cwd() + '/contracts/package.json'); req.resolve('ethers'); console.log('yes')" 2>/dev/null || true`)
+  )).stdout.trim() === 'yes';
+  if (syncNodeModules && !remoteHasEthers) {
+    log('installing remote contracts dependencies for wallet-helper signing');
+    await ssh(
+      remote,
+      passFile,
+      remoteShell(`cd ${sh(path.posix.join(remoteRoot, 'contracts'))}\n${sh(remoteNpm)} install --no-save --omit=optional --ignore-scripts ethers@6.15.0`),
+      { logFile: path.join(logsDir, 'remote-contracts-npm-ci.log'), timeoutMs: 20 * 60_000 }
+    );
+  }
 
   log('building remote Spark mayhem binary');
   await ssh(
     remote,
     passFile,
-    [
+    remoteShell([
       `cd ${sh(remoteRoot)}`,
-      'PATH="$HOME/.cargo/bin:$PATH"',
-      'CARGO_PROFILE_DEV_OPT_LEVEL="${CARGO_PROFILE_DEV_OPT_LEVEL:-3}"',
-      'CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"',
+      `mkdir -p ${sh(remoteTargetDir)}`,
+      `export CARGO_TARGET_DIR=${sh(remoteTargetDir)}`,
+      'export PATH="$HOME/.cargo/bin:$PATH"',
+      'export CARGO_PROFILE_DEV_OPT_LEVEL="${CARGO_PROFILE_DEV_OPT_LEVEL:-3}"',
+      'export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"',
       'cargo build -q -p mayhem-cli -p mayhem-enclave',
-    ].join(' && '),
+    ].join('\n')),
     { logFile: path.join(logsDir, 'remote-cargo-build.log'), timeoutMs: 30 * 60_000 }
   );
   const remoteBinaryHash = (await ssh(
     remote,
     passFile,
-    `cd ${sh(remoteRoot)} && ${sh(remoteEnclave)} measure-binary --binary ${sh(remoteMayhem)}`
+    remoteShell(`cd ${sh(remoteRoot)}\n${sh(remoteEnclave)} measure-binary --binary ${sh(remoteMayhem)}`)
   )).stdout.trim().replace(/^binary_hash=/, '');
 
   log('starting local Pear dev-net');
@@ -1556,6 +1685,8 @@ async function main() {
     '--catalog-path', path.join(ROOT, 'catalog/models.json'),
     '--manifest-hash', manifestHash,
     '--binary-hash', remoteBinaryHash,
+    '--att-tier', String(accelAttTier),
+    ...(accelLaunchMeasurementsJson ? ['--launch-measurements-json', accelLaunchMeasurementsJson] : []),
     '--caps-json', acceleratedCapsJson(accelBackend),
   ]);
   await waitForStateValue(
@@ -1617,16 +1748,15 @@ async function main() {
   const remoteAdminTunnelPort = await remoteFreePort(remote, passFile);
   const remoteBridgeTunnelPort = await remoteFreePort(remote, passFile);
   const tunnelLog = path.join(logsDir, 'ssh-reverse-tunnel.log');
+  const tunnelInvocation = sshInvocation(remote, passFile);
   const tunnel = spawnLogged(
-    'sshpass',
+    tunnelInvocation.command,
     [
-      '-f', passFile,
-      'ssh',
-      ...SSH_OPTS,
+      ...tunnelInvocation.args,
       '-N',
       '-R', `127.0.0.1:${remoteAdminTunnelPort}:127.0.0.1:${adminRpcPort}`,
       '-R', `127.0.0.1:${remoteBridgeTunnelPort}:127.0.0.1:${joinerBPort}`,
-      `${remote.user}@${remote.host}`,
+      remoteTarget(remote),
     ],
     tunnelLog
   );
@@ -1645,6 +1775,19 @@ async function main() {
     const vllmReady = (await ssh(remote, passFile, `test -x ${sh(remoteVllmPython)} && echo yes || true`)).stdout.trim() === 'yes';
     if (!vllmReady) fail(`vLLM Python wrapper is not executable on Spark: ${remoteVllmPython}`);
   }
+
+  log('configuring Spark provider home');
+  const remoteProviderSetupLog = path.posix.join(remoteLogs, 'provider-setup.log');
+  await ssh(
+    remote,
+    passFile,
+    remoteShell([
+      remoteVllmEnvPrelude,
+      `cd ${sh(remoteRoot)}`,
+      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminTunnelPort}/v1`)} --no-consent --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
+    ].filter(Boolean).join('\n')),
+    { logFile: path.join(logsDir, 'remote-provider-setup.log'), timeoutMs: 180_000 }
+  );
 
   log(`starting Spark provider start with auto backend selection for ${accelLabel}`);
   const remoteProviderLog = path.posix.join(remoteLogs, 'provider-start.log');
@@ -1670,6 +1813,9 @@ async function main() {
     `--catalog-path ${sh(path.posix.join(remoteRoot, 'catalog/models.json'))}`,
     `--downloads-dir ${sh(remoteDownloads)}`,
     fs.existsSync(hfTokenFile) ? `--hf-token-file ${sh(remoteHfToken)}` : '',
+    providerHwQuoteKind ? `--hardware-quote-kind ${sh(providerHwQuoteKind)}` : '',
+    providerHwQuoteCommand ? `--hardware-quote-command ${sh(providerHwQuoteCommand)}` : '',
+    providerHwQuoteKind ? `--hardware-quote-timeout-seconds ${envPositiveInt('MAYHEM_E11_PROVIDER_HW_QUOTE_TIMEOUT_SECONDS', 120)}` : '',
     '--skip-disk-bench',
     `--chunk-size ${CHUNK_SIZE}`,
     '--serve-sessions',
@@ -1677,6 +1823,8 @@ async function main() {
     '--print-json',
   ].filter(Boolean).join(' ');
   const providerScript = [
+    remoteEnvPrelude,
+    remoteVllmEnvPrelude,
     `mkdir -p ${sh(path.posix.dirname(remoteKeypair))} ${sh(remoteDownloads)} ${sh(remoteLogs)}`,
     `cd ${sh(remoteRoot)}`,
     `${providerArgs} > ${sh(remoteProviderLog)} 2>&1 < /dev/null &`,
@@ -1703,30 +1851,36 @@ async function main() {
     fail(`Spark provider did not auto-select ${accelLabel}: ${JSON.stringify(providerReport.artifact)}`);
   }
 
-  log('checking local Apple fallback provider-start selects GGUF');
-  const macProviderHome = path.join(runDir, 'mac-provider-home');
-  await fsp.mkdir(path.join(macProviderHome, 'stores'), { recursive: true });
-  await fsp.rm(path.join(macProviderHome, 'stores/main'), { recursive: true, force: true });
-  await fsp.symlink(path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a'), path.join(macProviderHome, 'stores/main'));
-  const macProviderPath = path.join(runDir, 'mac-provider-start.json');
-  const macArgs = [
-    'provider', 'start',
-    '--home', macProviderHome,
-    '--rpc-url', adminRpcUrl,
-    '--catalog-path', path.join(ROOT, 'catalog/models.json'),
-    '--downloads-dir', path.join(runDir, 'mac-provider-downloads'),
-    ...(fs.existsSync(hfTokenFile) ? ['--hf-token-file', hfTokenFile] : []),
-    '--fixture', 'apple-silicon',
-    '--skip-disk-bench',
-    '--no-heartbeat',
-    '--sim',
-    '--print-json',
-  ];
-  const macProviderReport = runJsonCommandToFile(mayhemBin, macArgs, macProviderPath, {
-    timeoutMs: 20 * 60_000,
-  });
-  if (macProviderReport.artifact?.name !== GGUF_ARTIFACT || macProviderReport.artifact?.engine !== 'llama.cpp') {
-    fail(`Apple fallback provider start did not select ${GGUF_ARTIFACT}/llama.cpp: ${JSON.stringify(macProviderReport.artifact)}`);
+  let macProviderPath = null;
+  let macProviderReport = null;
+  if (envFlag('MAYHEM_E11_SKIP_MAC_FALLBACK', false)) {
+    log('skipping local Apple fallback assertion');
+  } else {
+    log('checking local Apple fallback provider-start selects GGUF');
+    const macProviderHome = path.join(runDir, 'mac-provider-home');
+    await fsp.mkdir(path.join(macProviderHome, 'stores'), { recursive: true });
+    await fsp.rm(path.join(macProviderHome, 'stores/main'), { recursive: true, force: true });
+    await fsp.symlink(path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a'), path.join(macProviderHome, 'stores/main'));
+    macProviderPath = path.join(runDir, 'mac-provider-start.json');
+    const macArgs = [
+      'provider', 'start',
+      '--home', macProviderHome,
+      '--rpc-url', adminRpcUrl,
+      '--catalog-path', path.join(ROOT, 'catalog/models.json'),
+      '--downloads-dir', path.join(runDir, 'mac-provider-downloads'),
+      ...(fs.existsSync(hfTokenFile) ? ['--hf-token-file', hfTokenFile] : []),
+      '--fixture', 'apple-silicon',
+      '--skip-disk-bench',
+      '--no-heartbeat',
+      '--sim',
+      '--print-json',
+    ];
+    macProviderReport = runJsonCommandToFile(mayhemBin, macArgs, macProviderPath, {
+      timeoutMs: 20 * 60_000,
+    });
+    if (macProviderReport.artifact?.name !== GGUF_ARTIFACT || macProviderReport.artifact?.engine !== 'llama.cpp') {
+      fail(`Apple fallback provider start did not select ${GGUF_ARTIFACT}/llama.cpp: ${JSON.stringify(macProviderReport.artifact)}`);
+    }
   }
 
   log('waiting for direct session connectivity and starting gateway');
@@ -1754,6 +1908,10 @@ async function main() {
       '--canary-probe-min-interval-sessions', '1',
       '--canary-probe-max-interval-sessions', '1',
       '--canary-probe-epoch', '1',
+      ...(gatewayHwVerifierCommand ? [
+        '--hardware-quote-verifier-command', gatewayHwVerifierCommand,
+        '--hardware-quote-verifier-timeout-seconds', String(envPositiveInt('MAYHEM_E11_GATEWAY_HW_VERIFIER_TIMEOUT_SECONDS', 120)),
+      ] : []),
       '--bind', `127.0.0.1:${gatewayPort}`,
       '--json',
     ],
@@ -1769,7 +1927,7 @@ async function main() {
     maxTokens: envPositiveInt('MAYHEM_E11_CHAT_MAX_TOKENS', 24),
     fileStem: 'gateway-chat-stream',
   });
-  const toolCall = accelBackend === 'vllm'
+  const toolCall = accelBackend === 'vllm' && !envFlag('MAYHEM_E11_SKIP_TOOL_CALL', false)
     ? await runGuidedToolCallSmoke(gatewayUrl, MODEL_ID, runDir, {
         timeoutMs: envPositiveInt('MAYHEM_E11_TOOL_TIMEOUT_SECONDS', 600) * 1000,
       })
@@ -1830,6 +1988,8 @@ async function main() {
       manifest_hash: manifestHash,
       accelerated_artifact: accelArtifactName,
       accelerated_backend: accelBackend,
+      accelerated_att_tier: accelAttTier,
+      provider_hw_quote_kind: providerHwQuoteKind || null,
       gguf_artifact: GGUF_ARTIFACT,
       gateway_catalog_source: 'contract-plus-dev-local-current-signed',
     },
@@ -1843,6 +2003,7 @@ async function main() {
     remote: {
       host: remote.host,
       root: remoteRoot,
+      target_dir: remoteTargetDir,
       downloads: remoteDownloads,
       provider_log_local_copy: path.relative(ROOT, path.join(logsDir, 'provider-start.spark.log')),
     },
@@ -1862,6 +2023,7 @@ async function main() {
         enclave_id: accelEnclaveId,
         backend: accelBackend,
         artifact_name: accelArtifactName,
+        att_tier: accelAttTier,
         artifact_root: accelArtifact.artifact_root,
         binary_hash: remoteBinaryHash,
       },
@@ -1879,12 +2041,14 @@ async function main() {
       hardware: providerReport.hardware,
       attestation: providerReport.attestation,
       direct_ready: directReady,
+      hardware_quote_kind: providerHwQuoteKind || null,
     },
     mac_fallback: {
-      artifact: macProviderReport.artifact,
-      hardware: macProviderReport.hardware,
-      self_test: macProviderReport.self_test,
-      report: path.relative(ROOT, macProviderPath),
+      skipped: macProviderReport === null,
+      artifact: macProviderReport?.artifact || null,
+      hardware: macProviderReport?.hardware || null,
+      self_test: macProviderReport?.self_test || null,
+      report: macProviderPath ? path.relative(ROOT, macProviderPath) : null,
     },
     gateway: {
       url: gatewayUrl,
@@ -1896,6 +2060,7 @@ async function main() {
       guided_tool_call: toolCall,
       concurrent_heartbeat: concurrentHeartbeat,
       canary_probe: canaryProbe,
+      hardware_quote_verifier_command: gatewayHwVerifierCommand || null,
       latest_receipt: receiptBody,
       receipts: path.relative(ROOT, receiptsPath),
       epoch_settlement: epochSettlement,
@@ -1919,7 +2084,7 @@ async function cleanup(state) {
     if (child && child.exitCode === null) child.kill('SIGTERM');
   }
   const { remote, passFile } = state;
-  if (remote && passFile && fs.existsSync(passFile)) {
+  if (remote && (remote.auth === 'key' || (passFile && fs.existsSync(passFile)))) {
     if (state.remoteHfToken) {
       try {
         await ssh(remote, passFile, `rm -f ${sh(state.remoteHfToken)}`);
