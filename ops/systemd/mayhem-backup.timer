@@ -1,0 +1,12 @@
+[Unit]
+Description=Run a full Mayhem mainnet backup every 12 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+Persistent=true
+AccuracySec=1min
+Unit=mayhem-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Mayhem finalized TAP deposit watcher
+Requires=mayhem-stack.service
+After=mayhem-stack.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=mayhem
+Group=mayhem
+WorkingDirectory=/opt/mayhem/source
+EnvironmentFile=/opt/mayhem/.mayhem-local/secrets/GO-LIVE/mayhem-systemd.env
+UMask=0077
+ExecStartPre=/usr/bin/node /opt/mayhem/source/scripts/mainnet-proof.mjs --timeout-seconds 60 --json
+ExecStart=/opt/mayhem/source/scripts/ops/run-tap-deposit-watcher.sh
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

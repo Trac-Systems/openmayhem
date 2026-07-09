@@ -1,0 +1,22 @@
+[Unit]
+Description=Mayhem TNK/USD Gate primary and MEXC fallback watcher
+Requires=mayhem-stack.service
+After=mayhem-stack.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=mayhem
+Group=mayhem
+WorkingDirectory=/opt/mayhem/source/intercom
+EnvironmentFile=/opt/mayhem/.mayhem-local/secrets/GO-LIVE/mayhem-systemd.env
+UMask=0077
+ExecStartPre=/usr/bin/node /opt/mayhem/source/scripts/mainnet-proof.mjs --timeout-seconds 60 --json
+ExecStart=/usr/bin/node /opt/mayhem/source/intercom/scripts/tnk-rate-watcher.mjs --peer-rpc http://127.0.0.1:49223/v1 --interval-ms 1800000 --admin-home /opt/mayhem/.mayhem-local/live-home --mayhem-bin /opt/mayhem/source/target/release/mayhem --submit --json
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
