@@ -90,6 +90,7 @@
       "min_tier_notice_epochs": 24,
       "fee_bps": 1500,
       "dispute_deposit_au": "1000000000000000000",
+      "dispute_timeout_epochs": 168,
       "payout_min_au": "1000000000000000000",
       "price_min_bps": 2500,
       "price_max_bps": 40000,
@@ -110,6 +111,7 @@
       "max_apply_batch": 2000,
       "max_market_usage_entries": 5000,
       "max_tnk_settlement_outputs": 5000,
+      "max_fiat_settlement_outputs": 5000,
       "param_activation_delay_seconds": 86400
     }
   },
@@ -137,7 +139,7 @@
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
       "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
       "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
-      "max_epoch_delta_wei": "500000000000000000000",
+      "max_epoch_delta_wei": "10000000000000000000000",
       "operator_address": "<0x-operator-fee-address>"
     },
     "fiat": {

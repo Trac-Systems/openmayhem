@@ -202,6 +202,18 @@ function validateParams(add, params, warnings) {
   for (const [key, def] of Object.entries(defs)) {
     if (!(key in params)) continue;
     const value = params[key];
+    if (def.money) {
+      if (typeof value !== 'string' || !/^[0-9]+$/.test(value)) {
+        add('error', `contract.params.${key} must be a non-negative decimal string`);
+        continue;
+      }
+      const parsed = BigInt(value);
+      if (parsed < BigInt(def.min) || (def.max !== undefined && parsed > BigInt(def.max))) {
+        add('error', `contract.params.${key}=${value} outside contract bounds ${def.min}..${def.max ?? 'unbounded'}`);
+      }
+      if (value !== def.default) warnings.push(`contract.params.${key} differs from contract default ${def.default}`);
+      continue;
+    }
     if (!Number.isSafeInteger(value)) {
       add('error', `contract.params.${key} must be a safe integer`);
       continue;
