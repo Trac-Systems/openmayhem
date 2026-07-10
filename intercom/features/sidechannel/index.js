@@ -71,6 +71,18 @@ class Sidechannel extends Feature {
     this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes)
       ? config.maxMessageBytes
       : 1_000_000;
+    this.maxMessageBytesByChannel = new Map();
+    const channelLimitEntries = config.maxMessageBytesByChannel instanceof Map
+      ? Array.from(config.maxMessageBytesByChannel.entries())
+      : config.maxMessageBytesByChannel && typeof config.maxMessageBytesByChannel === 'object'
+        ? Object.entries(config.maxMessageBytesByChannel)
+        : [];
+    for (const [channel, value] of channelLimitEntries) {
+      const normalized = normalizeChannel(channel);
+      if (normalized && Number.isSafeInteger(value) && value > 0) {
+        this.maxMessageBytesByChannel.set(normalized, value);
+      }
+    }
     this.entryChannel = typeof config.entryChannel === 'string' ? config.entryChannel : null;
     this.allowRemoteOpen = config.allowRemoteOpen !== false;
     this.autoJoinOnOpen = config.autoJoinOnOpen === true;
@@ -177,6 +189,10 @@ class Sidechannel extends Feature {
     const normalized = normalizeChannel(channel);
     const entry = this.entryChannel ? normalizeChannel(this.entryChannel) : '';
     return normalized.length > 0 && entry.length > 0 && normalized === entry;
+  }
+
+  _maxMessageBytes(channel) {
+    return this.maxMessageBytesByChannel.get(normalizeChannel(channel)) ?? this.maxMessageBytes;
   }
 
   _getRemoteKey(connection) {
@@ -787,6 +803,16 @@ class Sidechannel extends Feature {
           return;
         }
         const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
+        const maxMessageBytes = this._maxMessageBytes(entry.name);
+        if (payloadBytes > maxMessageBytes) {
+          this._checkRate(connection, payloadBytes);
+          if (this.debug) {
+            console.log(
+              `[sidechannel:${entry.name}] drop (message too large: ${payloadBytes} > ${maxMessageBytes})`
+            );
+          }
+          return;
+        }
         if (this.debug) {
           console.log(
             `[sidechannel:${entry.name}] recv ${payloadBytes} bytes from ${this._getRemoteKey(connection)}`
@@ -1084,9 +1110,10 @@ class Sidechannel extends Feature {
       return false;
     }
     const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
-    if (payloadBytes > this.maxMessageBytes) {
+    const maxMessageBytes = this._maxMessageBytes(channel);
+    if (payloadBytes > maxMessageBytes) {
       console.log(
-        `[sidechannel:${channel}] message too large (${payloadBytes} bytes > ${this.maxMessageBytes}).`
+        `[sidechannel:${channel}] message too large (${payloadBytes} bytes > ${maxMessageBytes}).`
       );
       return false;
     }

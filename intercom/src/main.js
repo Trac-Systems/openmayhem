@@ -15,7 +15,10 @@ import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
-import MayhemFeature from '../features/mayhem/index.js';
+import MayhemFeature, {
+  MAYHEM_RELAY_CHANNEL,
+  MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+} from '../features/mayhem/index.js';
 
 const { env, storeLabel, flags } = getPearRuntime();
 
@@ -211,6 +214,14 @@ const sidechannelWelcomeRequired = parseBool(
     '',
   false
 );
+const mayhemRelayPowDifficulty = parseInteger(
+  flagValue('mayhem-relay-pow-difficulty', env.MAYHEM_RELAY_POW_DIFFICULTY || ''),
+  18
+);
+const mayhemRelayMaxMessageBytes = parseInteger(
+  flagValue('mayhem-relay-max-bytes', env.MAYHEM_RELAY_MAX_BYTES || ''),
+  MAYHEM_RELAY_MAX_MESSAGE_BYTES
+);
 const directSessionDebug = parseBool(
   (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',
   false
@@ -302,6 +313,14 @@ if (rpcEnabled && (!Number.isSafeInteger(rpcPort) || rpcPort < 1 || rpcPort > 65
 }
 if (rpcEnabled && (!Number.isSafeInteger(rpcMaxBodyBytes) || rpcMaxBodyBytes < 1)) {
   throw new Error('Invalid --rpc-max-body-bytes. Expected a positive integer.');
+}
+if (!Number.isSafeInteger(mayhemRelayPowDifficulty) || mayhemRelayPowDifficulty < 1 || mayhemRelayPowDifficulty > 30) {
+  throw new Error('Invalid --mayhem-relay-pow-difficulty. Expected integer 1-30.');
+}
+if (!Number.isSafeInteger(mayhemRelayMaxMessageBytes)
+  || mayhemRelayMaxMessageBytes < 4_096
+  || mayhemRelayMaxMessageBytes > 65_536) {
+  throw new Error('Invalid --mayhem-relay-max-bytes. Expected integer 4096-65536.');
 }
 
 const peerDhtBootstrap = parseCsvList(
@@ -412,7 +431,10 @@ await peer.ready();
 let mayhemFeature = null;
 {
   const admin = await peer.base.view.get('admin');
-  mayhemFeature = new MayhemFeature(peer, {});
+  mayhemFeature = new MayhemFeature(peer, {
+    channel: MAYHEM_RELAY_CHANNEL,
+    maxMessageBytes: mayhemRelayMaxMessageBytes,
+  });
   await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
   peer.mayhemFeature = mayhemFeature;
   if (admin && admin.value === peer.wallet.publicKey) {
@@ -461,6 +483,9 @@ console.log('Peer pubkey (hex):', peer.wallet.publicKey);
 console.log('Peer trac address (bech32m):', peer.wallet.address ?? null);
 console.log('Peer writer key (hex):', peerWriterKey);
 console.log('Sidechannel entry:', sidechannelEntry);
+console.log('Mayhem relay channel:', MAYHEM_RELAY_CHANNEL);
+console.log('Mayhem relay PoW difficulty:', mayhemRelayPowDifficulty);
+console.log('Mayhem relay max bytes:', mayhemRelayMaxMessageBytes);
 console.log('Headless:', headless);
 console.log('Peer interactive:', peerInteractive);
 console.log('Peer replicate:', peerReplicate);
@@ -503,6 +528,9 @@ if (scBridgeEnabled) {
       peerWriterKey,
       sidechannelEntry,
       sidechannelExtras: sidechannelExtras.slice(),
+      mayhemRelayChannel: MAYHEM_RELAY_CHANNEL,
+      mayhemRelayPowDifficulty,
+      mayhemRelayMaxMessageBytes,
     },
   });
 }
@@ -525,9 +553,15 @@ const directSession = new DirectSession(peer, {
 peer.directSession = directSession;
 
 const sidechannel = new Sidechannel(peer, {
-  channels: [sidechannelEntry, ...sidechannelExtras],
+  channels: [...new Set([sidechannelEntry, MAYHEM_RELAY_CHANNEL, ...sidechannelExtras])],
   debug: sidechannelDebug,
   maxMessageBytes: Number.isSafeInteger(sidechannelMaxBytes) ? sidechannelMaxBytes : undefined,
+  maxMessageBytesByChannel: {
+    [MAYHEM_RELAY_CHANNEL]: mayhemRelayMaxMessageBytes,
+  },
+  powEnabled: true,
+  powDifficulty: mayhemRelayPowDifficulty,
+  powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
   entryChannel: sidechannelEntry,
   allowRemoteOpen: sidechannelAllowRemoteOpen,
   autoJoinOnOpen: sidechannelAutoJoin,

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemFeature, { requestIdFor } from '../features/mayhem/index.js';
+import MayhemFeature, {
+  MAYHEM_RELAY_CHANNEL,
+  MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  requestIdFor,
+} from '../features/mayhem/index.js';
 import { createServer, submitMayhemFeature } from '../src/rpc.js';
 
 const adminKey = 'aa'.repeat(32);
@@ -133,8 +137,8 @@ test('admin writer deduplicates a retried relay request by deterministic request
     },
   };
 
-  await writerFeature.handleSidechannelMessage('0000intercom', payload);
-  await writerFeature.handleSidechannelMessage('0000intercom', payload);
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
   assert.equal(writer.appended.length, 1);
 });
@@ -210,6 +214,107 @@ test('relay rejects admin operations before network send', async () => {
     /Invalid relayed feature operation/
   );
   assert.equal(broadcasts, 0);
+});
+
+test('relay accepts only the dedicated channel and drops oversized feature envelopes', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const writerFeature = new MayhemFeature(writer.peer, { maxMessageBytes: 512 });
+  writerFeature.key = 'mayhem';
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: () => true,
+    broadcast: () => true,
+  };
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const message = {
+    control: 'mayhem_feature_request',
+    version: 1,
+    request_id: requestIdFor('mayhem', key, value),
+    feature: 'mayhem',
+    key,
+    value,
+  };
+  const payload = { from: providerKey, sig: `signed:${providerKey}`, message };
+
+  assert.equal(await writerFeature.handleSidechannelMessage('0000intercom', payload), false);
+  assert.equal(writer.appended.length, 0);
+  assert.equal(await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload), true);
+  assert.equal(writer.appended.length, 1);
+
+  const oversizedValue = { ...value, padding: 'x'.repeat(1_000) };
+  const oversizedPayload = {
+    from: providerKey,
+    sig: `signed:${providerKey}`,
+    message: {
+      ...message,
+      request_id: requestIdFor('mayhem', key, oversizedValue),
+      value: oversizedValue,
+    },
+  };
+  assert.equal(
+    await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, oversizedPayload),
+    true
+  );
+  assert.equal(writer.appended.length, 1);
+});
+
+test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
+  const participant = peerFor(providerKey);
+  const feature = new MayhemFeature(participant.peer, {});
+  feature.key = 'mayhem';
+  const lockedRateMap = Array.from({ length: 16 }, (_, index) => ({
+    unit: `unit_${String(index).padStart(2, '0')}_${'x'.repeat(53)}`,
+    per_unit_au: '99999999999999999999999999999999999999',
+    granularity: Number.MAX_SAFE_INTEGER,
+  }));
+  const voucher = {
+    session_id: '11'.repeat(32),
+    rail: 'tap',
+    enclave_id: '22'.repeat(32),
+    price_ver: Number.MAX_SAFE_INTEGER,
+    locked_rate_map: lockedRateMap,
+    locked_per_req_au: '99999999999999999999999999999999999999',
+    locked_min_session_au: '99999999999999999999999999999999999999',
+    served_ctx: Number.MAX_SAFE_INTEGER,
+    ctx_bracket: 'z'.repeat(64),
+    ctx_bracket_table_ver: Number.MAX_SAFE_INTEGER,
+    max_spend_au: '99999999999999999999999999999999999999',
+    checkpoint_every: { tokens: Number.MAX_SAFE_INTEGER, ms: Number.MAX_SAFE_INTEGER },
+    user_sig: '33'.repeat(64),
+  };
+  const value = {
+    op: 'spend_reserve',
+    contract_version: 7,
+    session_id: voucher.session_id,
+    epoch: Number.MAX_SAFE_INTEGER,
+    at: Number.MAX_SAFE_INTEGER,
+    rail: 'tap',
+    user: '44'.repeat(32),
+    provider: providerKey,
+    enclave_id: voucher.enclave_id,
+    price_ver: voucher.price_ver,
+    rules_ver: Number.MAX_SAFE_INTEGER,
+    served_ctx: voucher.served_ctx,
+    ctx_bracket: voucher.ctx_bracket,
+    ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
+    max_spend_au: voucher.max_spend_au,
+    voucher,
+    provider_sig: '55'.repeat(64),
+  };
+  const key = `spend/reserve/${voucher.session_id}`;
+  const message = {
+    control: 'mayhem_feature_request',
+    version: 1,
+    request_id: requestIdFor('mayhem', key, value),
+    feature: 'mayhem',
+    key,
+    value,
+  };
+
+  const measuredBytes = feature.relayMessageBytes(message);
+  assert.ok(measuredBytes < MAYHEM_RELAY_MAX_MESSAGE_BYTES);
+  assert.ok(measuredBytes > 4_000);
 });
 
 test('transport peer may relay an intent signed by an explicitly selected participant key', async () => {

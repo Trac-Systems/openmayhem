@@ -1,10 +1,12 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import crypto from 'crypto';
+import b4a from 'b4a';
 
 const RELAY_CONTROL_REQUEST = 'mayhem_feature_request';
 const RELAY_CONTROL_RESULT = 'mayhem_feature_result';
 const RELAY_VERSION = 1;
-const DEFAULT_CHANNEL = '0000intercom';
+const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
+const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CACHE_TTL_MS = 300_000;
@@ -60,7 +62,10 @@ const relayError = (message, requestId = null) => ({
 class MayhemFeature extends Feature {
   constructor(peer, config = {}) {
     super(peer, config);
-    this.channel = String(config.channel || DEFAULT_CHANNEL);
+    this.channel = String(config.channel || MAYHEM_RELAY_CHANNEL);
+    this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes) && config.maxMessageBytes > 0
+      ? config.maxMessageBytes
+      : MAYHEM_RELAY_MAX_MESSAGE_BYTES;
     this.timeoutMs = Number.isSafeInteger(config.timeoutMs) ? config.timeoutMs : DEFAULT_TIMEOUT_MS;
     this.retryMs = Number.isSafeInteger(config.retryMs) ? config.retryMs : DEFAULT_RETRY_MS;
     this.cacheTtlMs = Number.isSafeInteger(config.cacheTtlMs)
@@ -78,6 +83,10 @@ class MayhemFeature extends Feature {
   isRelayMessage(payload) {
     const control = payload?.message?.control;
     return control === RELAY_CONTROL_REQUEST || control === RELAY_CONTROL_RESULT;
+  }
+
+  relayMessageBytes(message) {
+    return b4a.byteLength(stableJson(message), 'utf8');
   }
 
   async relay(key, value) {
@@ -112,6 +121,9 @@ class MayhemFeature extends Feature {
       key,
       value: canonicalValue,
     };
+    if (this.relayMessageBytes(message) > this.maxMessageBytes) {
+      throw new Error(`Mayhem feature relay payload exceeds ${this.maxMessageBytes} bytes.`);
+    }
     const send = () => sidechannel.broadcast(this.channel, message);
     this.pending.set(requestId, { promise, resolve: resolvePending });
 
@@ -138,6 +150,7 @@ class MayhemFeature extends Feature {
 
   async handleSidechannelMessage(channel, payload) {
     if (channel !== this.channel || !this.isRelayMessage(payload)) return false;
+    if (this.relayMessageBytes(payload.message) > this.maxMessageBytes) return true;
     if (payload.message.control === RELAY_CONTROL_REQUEST) {
       await this._handleRequest(payload);
     } else {
@@ -296,5 +309,10 @@ class MayhemFeature extends Feature {
   }
 }
 
-export { participantFor, requestIdFor };
+export {
+  MAYHEM_RELAY_CHANNEL,
+  MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  participantFor,
+  requestIdFor,
+};
 export default MayhemFeature;
