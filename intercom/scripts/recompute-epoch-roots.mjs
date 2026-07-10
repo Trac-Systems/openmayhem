@@ -235,6 +235,7 @@ function receiptEnvelope(entry) {
   const bodySource = receipt.body ?? receipt;
   const {
     enclave_sig: _enclaveSig,
+    enclave_pubkey: _enclavePubkey,
     user_sig: _userSig,
     receipt_ack: _receiptAck,
     voucher: _voucher,

@@ -212,6 +212,19 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
   assert.equal(imageCanonicalRoll.totals.use_au, '1120');
 });
 
+test('epoch recompute treats enclave public key as receipt envelope metadata', async () => {
+  const { provider, user } = await setupEpochContract();
+  const withoutKey = receiptBundle(user, provider);
+  const withKey = receiptBundle(user, provider, {
+    receipts: withoutKey.receipts.map((receipt) => ({
+      ...receipt,
+      enclave_pubkey: 'd'.repeat(64),
+    })),
+  });
+
+  assert.deepEqual(await recomputeEpoch(withKey), await recomputeEpoch(withoutKey));
+});
+
 const signedReceipt = (user, provider, enclave, overrides = {}) => {
   const body = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,

@@ -36,7 +36,7 @@ export function signedTapReceipt({
     rail: 'tap',
     user: user.publicKeyHex,
     provider: providerIdentity.publicKeyHex,
-    enclave_id: enclave.publicKeyHex,
+    enclave_id: 'e'.repeat(64),
     model_id: 'mayhem/test-tap-model',
     price_ver: 1,
     locked_rate_map: [{ unit: 'input_token', per_unit_au: String(au), granularity: 1 }],
@@ -57,6 +57,7 @@ export function signedTapReceipt({
     receipt: {
       body,
       enclave_sig: crypto.sign(null, message, enclave.privateKey).toString('hex'),
+      enclave_pubkey: enclave.publicKeyHex,
       user_sig: crypto.sign(null, message, user.privateKey).toString('hex'),
     },
     ...extra,
