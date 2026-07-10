@@ -3376,14 +3376,22 @@ mod vllm_backend {
                 EngineError::Vllm("failed to start vLLM backend worker".to_owned())
             })?;
             worker.send(id, op, payload)?;
+            let mut sink_error = None;
 
             loop {
                 let message = if op == "load" {
-                    worker.read_load_message()?
+                    worker.read_load_message()
                 } else {
-                    worker.read_message()?
+                    worker.read_message()
                 };
-                if message.id != id {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(err) => return Err(sink_error.unwrap_or(err)),
+                };
+                if message.id < id {
+                    continue;
+                }
+                if message.id > id {
                     return Err(EngineError::Vllm(format!(
                         "worker response id {} did not match request id {id}",
                         message.id
@@ -3394,8 +3402,16 @@ mod vllm_backend {
                     let chunk = message.chunk.ok_or_else(|| {
                         EngineError::Vllm("worker token message missing chunk".to_owned())
                     })?;
-                    sink(chunk)?;
+                    if sink_error.is_none() {
+                        if let Err(err) = sink(chunk) {
+                            sink_error = Some(err);
+                        }
+                    }
                     continue;
+                }
+
+                if let Some(err) = sink_error {
+                    return Err(err);
                 }
 
                 if message.ok.unwrap_or(false) {
@@ -4043,6 +4059,62 @@ mod vllm_backend {
             assert_eq!(message.ok, Some(true));
 
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn vllm_stream_sink_failure_drains_response_and_keeps_request_ids_aligned() {
+            let root =
+                env::temp_dir().join(format!("mayhem-vllm-stream-drain-{}", std::process::id()));
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            fs::write(
+                &python,
+                r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+read first_generate
+printf '%s\n' '{"id":2,"type":"token","chunk":{"index":0,"token_id":10,"text":"first"}}'
+printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"text":"first","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+read second_generate
+printf '%s\n' '{"id":3,"type":"token","chunk":{"index":0,"token_id":11,"text":"second"}}'
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+"#,
+            )
+            .unwrap();
+            fs::write(&model, safetensors_fixture()).unwrap();
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&python, perms).unwrap();
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+
+            let mut disconnected = |_chunk: TokenChunk| {
+                Err(EngineError::InvalidConfig("client disconnected".to_owned()))
+            };
+            let err = backend
+                .generate(GenerateRequest::new("first"), &mut disconnected)
+                .expect_err("first stream sink disconnects");
+            assert!(err.to_string().contains("client disconnected"));
+
+            let mut chunks = Vec::new();
+            let output = backend
+                .generate(GenerateRequest::new("second"), &mut |chunk| {
+                    chunks.push(chunk);
+                    Ok(())
+                })
+                .expect("next request remains aligned");
+            assert_eq!(output.text, "second");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, "second");
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]

@@ -18717,7 +18717,7 @@ mod tests {
         );
         assert_eq!(config.min_tok_s, None);
         assert_eq!(config.open_timeout, Duration::from_secs(90));
-        assert_eq!(config.ttft_timeout, Duration::from_secs(30));
+        assert_eq!(config.ttft_timeout, Duration::from_secs(90));
         assert_eq!(config.frame_timeout, Duration::from_secs(30));
     }
 
@@ -18892,7 +18892,7 @@ mod tests {
             DEFAULT_OPEN_TIMEOUT_MILLIS
         );
         assert_eq!(invocation.failover.stall_timeout_ms, 30_000);
-        assert_eq!(invocation.failover.ttft_timeout_ms, 130_000);
+        assert_eq!(invocation.failover.ttft_timeout_ms, 190_000);
     }
 
     #[test]

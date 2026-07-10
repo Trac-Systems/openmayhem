@@ -1381,6 +1381,14 @@ pub fn build_tier1_attestation_report(
 pub fn build_hardware_attestation_report(
     options: &HardwareAttestationOptions,
 ) -> Result<Tier1AttestationReport> {
+    let binary_hash = measure_binary(&options.binary_path)?;
+    build_hardware_attestation_report_for_measured_binary(options, &binary_hash)
+}
+
+pub fn build_hardware_attestation_report_for_measured_binary(
+    options: &HardwareAttestationOptions,
+    binary_hash: &str,
+) -> Result<Tier1AttestationReport> {
     if options.hw_quote.evidence.is_empty() {
         return Err(EnclaveError::InvalidInput(
             "hardware quote evidence is required".to_owned(),
@@ -1398,7 +1406,7 @@ pub fn build_hardware_attestation_report(
         hw_quote_kind: options.hw_quote.kind.clone(),
         runtime_config: options.runtime_config.clone(),
     };
-    let mut body = hardware_attestation_body(&binding_options)?;
+    let mut body = hardware_attestation_body_for_measured_binary(&binding_options, binary_hash)?;
     let binding =
         hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
     if options.hw_quote.binding != binding {
@@ -1440,15 +1448,26 @@ pub fn build_hardware_attestation_report(
 }
 
 pub fn prepare_hardware_quote_binding(options: &HardwareQuoteBindingOptions) -> Result<String> {
-    let body = hardware_attestation_body(options)?;
+    let binary_hash = measure_binary(&options.binary_path)?;
+    prepare_hardware_quote_binding_for_measured_binary(options, &binary_hash)
+}
+
+pub fn prepare_hardware_quote_binding_for_measured_binary(
+    options: &HardwareQuoteBindingOptions,
+    binary_hash: &str,
+) -> Result<String> {
+    let body = hardware_attestation_body_for_measured_binary(options, binary_hash)?;
     hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))
 }
 
-fn hardware_attestation_body(options: &HardwareQuoteBindingOptions) -> Result<AttestationBody> {
+fn hardware_attestation_body_for_measured_binary(
+    options: &HardwareQuoteBindingOptions,
+    binary_hash: &str,
+) -> Result<AttestationBody> {
     validate_identity(&options.identity)?;
+    validate_hex_field("binary_hash", binary_hash, 32)?;
     validate_hex_field("nonce_u", &options.nonce_u, 32)?;
 
-    let binary_hash = measure_binary(&options.binary_path)?;
     if !options.identity.binary_hash.is_empty() && options.identity.binary_hash != binary_hash {
         return Err(EnclaveError::InvalidInput(format!(
             "identity binary_hash {} does not match measured binary hash {}",
@@ -1456,7 +1475,7 @@ fn hardware_attestation_body(options: &HardwareQuoteBindingOptions) -> Result<At
         )));
     }
     let identity = CatalogEnclaveIdentity {
-        binary_hash: binary_hash.clone(),
+        binary_hash: binary_hash.to_owned(),
         ..options.identity.clone()
     };
     let provider_signing_key = SigningKey::from_bytes(&options.provider_signing_seed);
@@ -1468,7 +1487,7 @@ fn hardware_attestation_body(options: &HardwareQuoteBindingOptions) -> Result<At
         enclave_pubkey: options.runtime_keypair.public_key_hex(),
         provider_pubkey,
         manifest_hash: identity.manifest_hash,
-        binary_hash,
+        binary_hash: binary_hash.to_owned(),
         att_tier: options.hw_quote_kind.attestation_tier(),
         hw_quote: None,
         boot_epoch: options.boot_epoch,
@@ -1481,11 +1500,19 @@ fn hardware_attestation_body(options: &HardwareQuoteBindingOptions) -> Result<At
 pub fn prepare_tier1_attestation_report(
     options: &Tier1ExternalProviderAttestationOptions,
 ) -> Result<Tier1AttestationDraft> {
+    let binary_hash = measure_binary(&options.binary_path)?;
+    prepare_tier1_attestation_report_for_measured_binary(options, &binary_hash)
+}
+
+pub fn prepare_tier1_attestation_report_for_measured_binary(
+    options: &Tier1ExternalProviderAttestationOptions,
+    binary_hash: &str,
+) -> Result<Tier1AttestationDraft> {
     validate_identity(&options.identity)?;
+    validate_hex_field("binary_hash", binary_hash, 32)?;
     validate_hex_field("provider_pubkey", &options.provider_pubkey, 32)?;
     validate_hex_field("nonce_u", &options.nonce_u, 32)?;
 
-    let binary_hash = measure_binary(&options.binary_path)?;
     if !options.identity.binary_hash.is_empty() && options.identity.binary_hash != binary_hash {
         return Err(EnclaveError::InvalidInput(format!(
             "identity binary_hash {} does not match measured binary hash {}",
@@ -1493,7 +1520,7 @@ pub fn prepare_tier1_attestation_report(
         )));
     }
     let identity = CatalogEnclaveIdentity {
-        binary_hash: binary_hash.clone(),
+        binary_hash: binary_hash.to_owned(),
         ..options.identity.clone()
     };
     let body = AttestationBody {
@@ -1503,7 +1530,7 @@ pub fn prepare_tier1_attestation_report(
         enclave_pubkey: options.runtime_keypair.public_key_hex(),
         provider_pubkey: options.provider_pubkey.clone(),
         manifest_hash: identity.manifest_hash,
-        binary_hash,
+        binary_hash: binary_hash.to_owned(),
         att_tier: TIER1_SOFTWARE_ATTESTATION_TIER,
         hw_quote: None,
         boot_epoch: options.boot_epoch,
@@ -2854,6 +2881,60 @@ mod tests {
         })
         .expect_err("wrong identity binary hash must fail before signing");
         assert!(err.to_string().contains("does not match measured"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_attestation_keeps_the_boot_binary_measurement_after_deployment() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("mayhem-enclave-test-bin");
+        fs::write(&binary, b"running release")?;
+        let boot_binary_hash = measure_binary(&binary)?;
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "admin".to_owned(),
+            model_id: "model".to_owned(),
+            artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: std::collections::BTreeMap::new(),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash: boot_binary_hash.clone(),
+        };
+        let options = Tier1ExternalProviderAttestationOptions {
+            identity: identity.clone(),
+            runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
+            provider_pubkey: "11".repeat(32),
+            binary_path: binary.clone(),
+            boot_epoch: 100,
+            report_ts: 200,
+            nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
+        };
+
+        fs::write(&binary, b"new release deployed at the same path")?;
+        let err = prepare_tier1_attestation_report(&options)
+            .expect_err("following the replaced path must detect the different release");
+        assert!(err.to_string().contains("does not match measured"));
+
+        let draft =
+            prepare_tier1_attestation_report_for_measured_binary(&options, &boot_binary_hash)?;
+        assert_eq!(draft.body.binary_hash, boot_binary_hash);
+
+        let binding_options = HardwareQuoteBindingOptions {
+            identity,
+            runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
+            provider_signing_seed: [7_u8; 32],
+            binary_path: binary,
+            boot_epoch: 100,
+            report_ts: 200,
+            nonce_u: "aa".repeat(32),
+            hw_quote_kind: mayhem_proto::HardwareQuoteKind::NvidiaNrasJwt,
+            runtime_config: AttestationRuntimeConfig::default(),
+        };
+        assert!(prepare_hardware_quote_binding(&binding_options).is_err());
+        assert!(!prepare_hardware_quote_binding_for_measured_binary(
+            &binding_options,
+            &boot_binary_hash,
+        )?
+        .is_empty());
         Ok(())
     }
 

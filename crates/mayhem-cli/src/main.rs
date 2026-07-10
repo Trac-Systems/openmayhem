@@ -31,14 +31,16 @@ use mayhem_bridge::{
     DEFAULT_SC_BRIDGE_URL,
 };
 use mayhem_enclave::{
-    build_hardware_attestation_report, build_merkle_manifest, build_merkle_manifest_with_progress,
-    download_resumable_with_progress, finalize_tier1_attestation_report,
-    load_or_create_runtime_keypair_store, measure_binary, prepare_hardware_quote_binding,
-    prepare_tier1_attestation_report, read_sealed_manifest, seal_artifact, DownloadReport,
-    DownloadRequest, DownloadSource, HardwareAttestationOptions, HardwareQuoteBindingOptions,
-    KeyContext, ProgressEvent, ProgressPhase, RuntimeKeyContext, RuntimeKeypair,
-    RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationReport,
-    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    build_hardware_attestation_report, build_hardware_attestation_report_for_measured_binary,
+    build_merkle_manifest, build_merkle_manifest_with_progress, download_resumable_with_progress,
+    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
+    prepare_hardware_quote_binding, prepare_hardware_quote_binding_for_measured_binary,
+    prepare_tier1_attestation_report, prepare_tier1_attestation_report_for_measured_binary,
+    read_sealed_manifest, seal_artifact, DownloadReport, DownloadRequest, DownloadSource,
+    HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext, ProgressEvent,
+    ProgressPhase, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions,
+    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
+    SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
@@ -60,8 +62,8 @@ use mayhem_gateway::{
     priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     HardwareQuoteVerifierCommand, HeartbeatReceiver, ProbationCaps, ProbationPolicy,
     ProviderProbation, RateMapEntry, ReputationEvent, ReputationEventKind,
-    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
-    INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
@@ -32747,6 +32749,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &keypair_path,
         &password,
         &binary_path,
+        None,
         now,
         now,
         nonce_u,
@@ -37223,12 +37226,13 @@ async fn collect_provider_hardware_quote(
     runtime_keypair: &RuntimeKeypair,
     provider_signing_seed: [u8; 32],
     binary_path: &Path,
+    measured_binary_hash: Option<&str>,
     boot_epoch: u64,
     report_ts: u64,
     nonce_u: &str,
     runtime_config: &AttestationRuntimeConfig,
 ) -> Result<HardwareQuote> {
-    let binding = prepare_hardware_quote_binding(&HardwareQuoteBindingOptions {
+    let binding_options = HardwareQuoteBindingOptions {
         identity: identity.clone(),
         runtime_keypair: runtime_keypair.clone(),
         provider_signing_seed,
@@ -37238,7 +37242,13 @@ async fn collect_provider_hardware_quote(
         nonce_u: nonce_u.to_owned(),
         hw_quote_kind: config.kind.clone(),
         runtime_config: runtime_config.clone(),
-    })
+    };
+    let binding = match measured_binary_hash {
+        Some(binary_hash) => {
+            prepare_hardware_quote_binding_for_measured_binary(&binding_options, binary_hash)
+        }
+        None => prepare_hardware_quote_binding(&binding_options),
+    }
     .context("preparing Mayhem hardware quote binding")?;
     let kind_name = hardware_quote_kind_name(&config.kind);
     let mut command = Command::new(&config.command);
@@ -37505,6 +37515,7 @@ async fn provider_attestation_report(
     keypair_path: &Path,
     password: &str,
     binary_path: &Path,
+    measured_binary_hash: Option<&str>,
     boot_epoch: u64,
     report_ts: u64,
     nonce_u: String,
@@ -37519,13 +37530,14 @@ async fn provider_attestation_report(
             runtime_keypair,
             provider_signing_seed,
             binary_path,
+            measured_binary_hash,
             boot_epoch,
             report_ts,
             &nonce_u,
             &runtime_config,
         )
         .await?;
-        return build_hardware_attestation_report(&HardwareAttestationOptions {
+        let report_options = HardwareAttestationOptions {
             identity,
             runtime_keypair: runtime_keypair.clone(),
             provider_signing_seed,
@@ -37535,11 +37547,17 @@ async fn provider_attestation_report(
             nonce_u,
             hw_quote,
             runtime_config,
-        })
+        };
+        return match measured_binary_hash {
+            Some(binary_hash) => {
+                build_hardware_attestation_report_for_measured_binary(&report_options, binary_hash)
+            }
+            None => build_hardware_attestation_report(&report_options),
+        }
         .context("building hardware provider attestation report");
     }
 
-    let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
+    let report_options = Tier1ExternalProviderAttestationOptions {
         identity,
         runtime_keypair: runtime_keypair.clone(),
         provider_pubkey: provider_pubkey.to_owned(),
@@ -37548,7 +37566,13 @@ async fn provider_attestation_report(
         report_ts,
         nonce_u,
         runtime_config,
-    })?;
+    };
+    let draft = match measured_binary_hash {
+        Some(binary_hash) => {
+            prepare_tier1_attestation_report_for_measured_binary(&report_options, binary_hash)
+        }
+        None => prepare_tier1_attestation_report(&report_options),
+    }?;
     let provider_attestation_sig =
         sign_hex(keypair_path, password, &draft.provider_signing_message_hex).await?;
     finalize_tier1_attestation_report(draft, provider_attestation_sig)
@@ -40051,14 +40075,25 @@ fn provider_session_request_body_from_frame(
 }
 
 fn provider_session_request_timeout() -> Duration {
-    Duration::from_millis(
-        std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
-            .unwrap_or(30_000)
-            .min(300_000),
-    )
+    let configured = std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS").ok();
+    provider_session_request_timeout_from(configured.as_deref())
+}
+
+fn provider_session_request_timeout_from(configured: Option<&str>) -> Duration {
+    let millis = configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS);
+    Duration::from_millis(millis)
+}
+
+fn record_provider_session_accept_sent(
+    pending_requests: &mut HashMap<String, Instant>,
+    session_id: &str,
+    sent_at: Instant,
+    request_timeout: Duration,
+) {
+    pending_requests.insert(session_id.to_owned(), sent_at + request_timeout);
 }
 
 async fn handle_provider_session_frame(
@@ -40194,10 +40229,6 @@ async fn handle_provider_session_frame(
                         },
                     );
                     protection.record_accept();
-                    pending_requests.insert(
-                        session_id.clone(),
-                        Instant::now() + provider_session_request_timeout(),
-                    );
                     heartbeat_load.set_active_sessions(sessions.len());
                     let ts = unix_epoch_millis()?;
                     let open_head =
@@ -40246,6 +40277,12 @@ async fn handle_provider_session_frame(
                         .session_send(&remote, &session_id, accept_frame)
                         .await
                         .context("sending s.accept")?;
+                    record_provider_session_accept_sent(
+                        pending_requests,
+                        &session_id,
+                        Instant::now(),
+                        provider_session_request_timeout(),
+                    );
                     provider_session_debug(format!("sent s.accept for session {session_id}"));
                 }
                 ProviderSessionDecision::Reject { code, reason } => {
@@ -41707,6 +41744,7 @@ async fn provider_session_attestation(
         runtime.keypair_path,
         runtime.password,
         runtime.binary_path,
+        Some(runtime.attestation_identity.binary_hash.as_str()),
         runtime.boot_epoch,
         report_ts,
         att_nonce.to_owned(),
@@ -51812,6 +51850,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &quote_command,
             "",
             &binary_path,
+            None,
             100,
             101,
             "88".repeat(32),
@@ -51828,6 +51867,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &quote_command,
             "",
             &binary_path,
+            None,
             200,
             201,
             "99".repeat(32),
@@ -53866,6 +53906,32 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             provider_session_expired_pending_ids(&pending, now),
             vec!["expired-a".to_owned(), "expired-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn provider_request_wait_starts_after_accept_and_uses_the_open_budget() {
+        assert_eq!(
+            provider_session_request_timeout_from(None),
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+        );
+        assert_eq!(
+            provider_session_request_timeout_from(Some("600000")),
+            Duration::from_secs(600)
+        );
+
+        let accept_sent_at = Instant::now();
+        let timeout = Duration::from_secs(90);
+        let mut pending = HashMap::new();
+        record_provider_session_accept_sent(
+            &mut pending,
+            "accepted-session",
+            accept_sent_at,
+            timeout,
+        );
+        assert_eq!(
+            pending.get("accepted-session"),
+            Some(&(accept_sent_at + timeout))
         );
     }
 
