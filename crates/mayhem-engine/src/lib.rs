@@ -241,6 +241,12 @@ pub struct LoadConfig {
     pub vllm_dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_gpu_memory_utilization_pct: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_gpu_memory_utilization_floor_pct: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_diffusion_backend: Option<String>,
     #[serde(default = "default_true")]
     pub use_mmap: bool,
     #[serde(default)]
@@ -318,6 +324,9 @@ impl Default for LoadConfig {
             vllm_tensor_parallel: None,
             vllm_dtype: None,
             vllm_gpu_memory_utilization_pct: None,
+            vllm_gpu_memory_utilization_floor_pct: None,
+            backend_cache_dir: None,
+            stable_diffusion_backend: None,
             use_mmap: true,
             use_mlock: false,
             memory_limit_bytes: None,
@@ -1873,7 +1882,8 @@ mod stable_diffusion_cpp_backend {
             let model_path = stable_diffusion_payload_path(&config.artifact.path)?;
             let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
                 .ok()
-                .filter(|value| !value.trim().is_empty());
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| config.stable_diffusion_backend.clone());
 
             for image_index in 0..image_count {
                 let output_path = stable_diffusion_output_path(image_index);
@@ -2866,6 +2876,7 @@ mod mlx_backend {
     use serde_json::{json, Value};
     use std::cell::{Cell, RefCell};
     use std::env;
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -2879,6 +2890,7 @@ mod mlx_backend {
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
         memory_limit_bytes: Cell<Option<u64>>,
+        cache_root: RefCell<Option<PathBuf>>,
     }
 
     impl MlxBackend {
@@ -2896,6 +2908,7 @@ mod mlx_backend {
                 loaded: None,
                 next_id: Cell::new(1),
                 memory_limit_bytes: Cell::new(None),
+                cache_root: RefCell::new(None),
             })
         }
 
@@ -2922,6 +2935,7 @@ mod mlx_backend {
                 *worker = Some(MlxWorker::spawn(
                     &self.python,
                     self.memory_limit_bytes.get(),
+                    self.cache_root.borrow().as_deref(),
                 )?);
             }
             let worker = worker
@@ -2975,6 +2989,7 @@ mod mlx_backend {
             }
             verify_artifact(&config.artifact)?;
             self.memory_limit_bytes.set(config.memory_limit_bytes);
+            self.cache_root.replace(config.backend_cache_dir.clone());
 
             let model_path = mlx_model_path(&config.artifact.path)?;
             let info: WorkerLoadInfo = self.call(
@@ -3057,8 +3072,13 @@ mod mlx_backend {
     }
 
     impl MlxWorker {
-        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
+        fn spawn(
+            python: &Path,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
             let mut command = engine_worker_command(python, memory_limit_bytes);
+            configure_mlx_worker_environment(&mut command, python, cache_root)?;
             command
                 .arg("-u")
                 .arg("-c")
@@ -3114,6 +3134,52 @@ mod mlx_backend {
             }
             Ok(serde_json::from_str(line.trim_end())?)
         }
+    }
+
+    fn configure_mlx_worker_environment(
+        command: &mut std::process::Command,
+        python: &Path,
+        cache_root: Option<&Path>,
+    ) -> Result<()> {
+        let cache_root = cache_root
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                env::var_os("MAYHEM_HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("cache/mlx"))
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".mayhem/cache/mlx"))
+            })
+            .unwrap_or_else(|| env::temp_dir().join("mayhem-mlx-cache"));
+        for (name, default_path) in [
+            ("XDG_CACHE_HOME", cache_root.join("xdg")),
+            ("HF_HOME", cache_root.join("huggingface")),
+            ("HF_HUB_CACHE", cache_root.join("huggingface/hub")),
+            ("TRANSFORMERS_CACHE", cache_root.join("transformers")),
+            ("MLX_METAL_CACHE_DIR", cache_root.join("metal")),
+        ] {
+            let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+            fs::create_dir_all(&path).map_err(|err| {
+                EngineError::Mlx(format!(
+                    "creating MLX cache directory {} failed: {err}",
+                    path.display()
+                ))
+            })?;
+            command.env(name, path);
+        }
+        if let Some(python_bin) = python.parent() {
+            let mut paths = vec![python_bin.to_path_buf()];
+            if let Some(current) = env::var_os("PATH") {
+                paths.extend(env::split_paths(&current));
+            }
+            if let Ok(path) = env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+        Ok(())
     }
 
     impl Drop for MlxWorker {
@@ -3174,6 +3240,7 @@ mod vllm_backend {
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
         memory_limit_bytes: Cell<Option<u64>>,
+        cache_root: RefCell<Option<PathBuf>>,
     }
 
     impl VllmBackend {
@@ -3191,6 +3258,7 @@ mod vllm_backend {
                 loaded: None,
                 next_id: Cell::new(1),
                 memory_limit_bytes: Cell::new(None),
+                cache_root: RefCell::new(None),
             })
         }
 
@@ -3217,6 +3285,7 @@ mod vllm_backend {
                 *worker = Some(VllmWorker::spawn(
                     &self.python,
                     self.memory_limit_bytes.get(),
+                    self.cache_root.borrow().as_deref(),
                 )?);
             }
             let worker = worker.as_mut().ok_or_else(|| {
@@ -3270,6 +3339,7 @@ mod vllm_backend {
             }
             verify_artifact(&config.artifact)?;
             self.memory_limit_bytes.set(config.memory_limit_bytes);
+            self.cache_root.replace(config.backend_cache_dir.clone());
 
             let model_path = vllm_model_path(&config.artifact.path)?;
             let info: WorkerLoadInfo =
@@ -3356,17 +3426,22 @@ mod vllm_backend {
     }
 
     impl VllmWorker {
-        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes)
+        fn spawn(
+            python: &Path,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
+            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes, cache_root)
         }
 
         fn spawn_with_timeout(
             python: &Path,
             request_timeout: Duration,
             memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
         ) -> Result<Self> {
             let mut command = engine_worker_command(python, memory_limit_bytes);
-            configure_vllm_worker_environment(&mut command, python)?;
+            configure_vllm_worker_environment(&mut command, python, cache_root)?;
             command
                 .arg("-u")
                 .arg("-c")
@@ -3493,8 +3568,9 @@ mod vllm_backend {
     fn configure_vllm_worker_environment(
         command: &mut std::process::Command,
         python: &Path,
+        configured_cache_root: Option<&Path>,
     ) -> Result<()> {
-        let cache_root = vllm_cache_root();
+        let cache_root = vllm_cache_root(configured_cache_root);
         let cache_dirs = [
             ("XDG_CACHE_HOME", cache_root.join("xdg")),
             ("TRITON_CACHE_DIR", cache_root.join("triton")),
@@ -3554,9 +3630,10 @@ mod vllm_backend {
         Ok(())
     }
 
-    fn vllm_cache_root() -> PathBuf {
+    fn vllm_cache_root(configured: Option<&Path>) -> PathBuf {
         env::var_os(CACHE_DIR_ENV)
             .map(PathBuf::from)
+            .or_else(|| configured.map(Path::to_path_buf))
             .or_else(|| {
                 env::var_os("MAYHEM_HOME")
                     .map(PathBuf::from)
@@ -3735,7 +3812,8 @@ mod vllm_backend {
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
             let mut worker =
-                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None).expect("spawn");
+                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None, None)
+                    .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
                 .expect("send request to fake worker");
@@ -3822,6 +3900,7 @@ mod trt_llm_backend {
     use serde_json::{json, Value};
     use std::cell::{Cell, RefCell};
     use std::env;
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -3832,6 +3911,8 @@ mod trt_llm_backend {
     const WORKER: &str = include_str!("trtllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
     const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS";
+    const CACHE_DIR_ENV: &str = "MAYHEM_TRTLLM_CACHE_DIR";
+    const CUDA_HOME_ENV: &str = "MAYHEM_TRTLLM_CUDA_HOME";
     const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub struct TrtLlmBackend {
@@ -3840,6 +3921,7 @@ mod trt_llm_backend {
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
         memory_limit_bytes: Cell<Option<u64>>,
+        cache_root: RefCell<Option<PathBuf>>,
     }
 
     impl TrtLlmBackend {
@@ -3857,6 +3939,7 @@ mod trt_llm_backend {
                 loaded: None,
                 next_id: Cell::new(1),
                 memory_limit_bytes: Cell::new(None),
+                cache_root: RefCell::new(None),
             })
         }
 
@@ -3883,6 +3966,7 @@ mod trt_llm_backend {
                 *worker = Some(TrtLlmWorker::spawn(
                     &self.python,
                     self.memory_limit_bytes.get(),
+                    self.cache_root.borrow().as_deref(),
                 )?);
             }
             let worker = worker.as_mut().ok_or_else(|| {
@@ -3947,6 +4031,7 @@ mod trt_llm_backend {
             }
             verify_artifact(&config.artifact)?;
             self.memory_limit_bytes.set(config.memory_limit_bytes);
+            self.cache_root.replace(config.backend_cache_dir.clone());
 
             let model_path = trt_llm_model_path(&config.artifact.path)?;
             if config.trt_require_engine_dir {
@@ -4035,16 +4120,22 @@ mod trt_llm_backend {
     }
 
     impl TrtLlmWorker {
-        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes)
+        fn spawn(
+            python: &Path,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
+            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes, cache_root)
         }
 
         fn spawn_with_timeout(
             python: &Path,
             request_timeout: Duration,
             memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
         ) -> Result<Self> {
             let mut command = engine_worker_command(python, memory_limit_bytes);
+            configure_trt_worker_environment(&mut command, python, cache_root)?;
             command
                 .arg("-u")
                 .arg("-c")
@@ -4159,6 +4250,139 @@ mod trt_llm_backend {
         }
     }
 
+    fn configure_trt_worker_environment(
+        command: &mut std::process::Command,
+        python: &Path,
+        configured_cache_root: Option<&Path>,
+    ) -> Result<()> {
+        let cache_root = env::var_os(CACHE_DIR_ENV)
+            .map(PathBuf::from)
+            .or_else(|| configured_cache_root.map(Path::to_path_buf))
+            .or_else(|| {
+                env::var_os("MAYHEM_HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("cache/trt-llm"))
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".mayhem/cache/trt-llm"))
+            })
+            .unwrap_or_else(|| env::temp_dir().join("mayhem-trt-llm-cache"));
+        for (name, default_path) in [
+            ("XDG_CACHE_HOME", cache_root.join("xdg")),
+            ("HF_HOME", cache_root.join("huggingface")),
+            ("HF_HUB_CACHE", cache_root.join("huggingface/hub")),
+            ("TRANSFORMERS_CACHE", cache_root.join("transformers")),
+            ("TORCHINDUCTOR_CACHE_DIR", cache_root.join("torchinductor")),
+            ("CUDA_CACHE_PATH", cache_root.join("cuda")),
+            ("TRTLLM_CACHE_DIR", cache_root.join("trtllm")),
+        ] {
+            let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+            fs::create_dir_all(&path).map_err(|err| {
+                EngineError::TrtLlm(format!(
+                    "creating TensorRT-LLM cache directory {} failed: {err}",
+                    path.display()
+                ))
+            })?;
+            command.env(name, path);
+        }
+
+        let cuda_home = resolve_trt_cuda_home(python).ok_or_else(|| {
+            EngineError::TrtLlm(
+                "TensorRT-LLM requires a CUDA toolkit containing bin/nvcc; install the toolkit or set MAYHEM_TRTLLM_CUDA_HOME"
+                    .to_owned(),
+            )
+        })?;
+        command.env("CUDA_HOME", &cuda_home);
+        command.env("CUDA_PATH", &cuda_home);
+        let cuda_lib = if cuda_home.join("lib").is_dir() {
+            cuda_home.join("lib")
+        } else {
+            cuda_home.join("lib64")
+        };
+        command.env(
+            "LD_LIBRARY_PATH",
+            trt_prepend_env_paths(&[cuda_lib], env::var_os("LD_LIBRARY_PATH")),
+        );
+        let mut path_prefixes = vec![cuda_home.join("bin")];
+        if let Some(python_bin) = python.parent() {
+            path_prefixes.push(python_bin.to_path_buf());
+        }
+        command.env(
+            "PATH",
+            trt_prepend_env_paths(&path_prefixes, env::var_os("PATH")),
+        );
+        Ok(())
+    }
+
+    fn resolve_trt_cuda_home(python: &Path) -> Option<PathBuf> {
+        if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
+            return trt_cuda_home_with_nvcc(explicit);
+        }
+        trt_bundled_cuda_home(python)
+            .or_else(|| {
+                env::var_os("CUDA_HOME")
+                    .map(PathBuf::from)
+                    .and_then(trt_cuda_home_with_nvcc)
+            })
+            .or_else(|| trt_cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda")))
+            .or_else(trt_newest_usr_local_cuda_home)
+    }
+
+    fn trt_bundled_cuda_home(python: &Path) -> Option<PathBuf> {
+        let venv = python.parent()?.parent()?;
+        let lib = venv.join("lib");
+        let mut candidates = fs::read_dir(lib)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path().join("site-packages/nvidia"))
+            .filter_map(|nvidia| fs::read_dir(nvidia).ok())
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter_map(trt_cuda_home_with_nvcc)
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.pop()
+    }
+
+    fn trt_newest_usr_local_cuda_home() -> Option<PathBuf> {
+        let mut candidates = fs::read_dir("/usr/local")
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("cuda-"))
+            })
+            .filter_map(trt_cuda_home_with_nvcc)
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.pop()
+    }
+
+    fn trt_cuda_home_with_nvcc(path: PathBuf) -> Option<PathBuf> {
+        path.join("bin/nvcc").is_file().then_some(path)
+    }
+
+    fn trt_prepend_env_paths(
+        prefixes: &[PathBuf],
+        current: Option<std::ffi::OsString>,
+    ) -> std::ffi::OsString {
+        let mut paths = prefixes.to_vec();
+        if let Some(current) = current {
+            paths.extend(env::split_paths(&current));
+        }
+        env::join_paths(paths).unwrap_or_else(|_| {
+            prefixes
+                .first()
+                .map(|path| path.as_os_str().to_owned())
+                .unwrap_or_default()
+        })
+    }
+
     fn request_timeout() -> Duration {
         env::var(REQUEST_TIMEOUT_ENV)
             .ok()
@@ -4269,15 +4493,21 @@ mod trt_llm_backend {
 
         #[test]
         fn trt_worker_read_timeout_kills_silent_child() {
-            let path =
+            let root =
                 env::temp_dir().join(format!("mayhem-silent-trt-worker-{}", std::process::id()));
+            let path = root.join("bin/python");
+            let nvcc = root.join("lib/python3.12/site-packages/nvidia/cu13/bin/nvcc");
+            fs::create_dir_all(path.parent().expect("python parent")).expect("python dir");
+            fs::create_dir_all(nvcc.parent().expect("nvcc parent")).expect("CUDA dir");
             fs::write(&path, "#!/bin/sh\nexec sleep 20\n").expect("write fake worker");
+            fs::write(&nvcc, "#!/bin/sh\nexit 0\n").expect("write fake nvcc");
             let mut perms = fs::metadata(&path).expect("metadata").permissions();
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
-            let mut worker = TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None)
-                .expect("spawn");
+            let mut worker =
+                TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None, None)
+                    .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
                 .expect("send request to fake worker");
@@ -4286,7 +4516,7 @@ mod trt_llm_backend {
             assert!(start.elapsed() < Duration::from_secs(5));
             assert!(format!("{err}").contains("timed out after 1s"), "{err}");
 
-            let _ = fs::remove_file(path);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]

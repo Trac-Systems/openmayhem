@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod python_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
@@ -63,8 +64,8 @@ use mayhem_gateway::{
     INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
-    human_report, probe, BackendVerdict, FixtureProfile, GpuInfo, GpuVendor, HardwareReport,
-    ProbeOptions, VerdictStatus,
+    human_report, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo, GpuVendor,
+    HardwareReport, ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
     catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
@@ -30398,12 +30399,23 @@ struct ProviderSessionContext<'a> {
     password: &'a str,
     wallet: &'a WalletInfo,
     selected: &'a ProviderCandidate,
+    backend_runtime: &'a ProviderBackendRuntime,
     artifact_paths: &'a ProviderArtifactPaths,
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
     identity_anchor: &'a str,
     rules: &'a RulesRef,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ProviderBackendRuntime {
+    python: Option<PathBuf>,
+    python_source: Option<String>,
+    requirements_sha256: Option<String>,
+    cache_dir: Option<PathBuf>,
+    external_binary: Option<PathBuf>,
+    stable_diffusion_backend: Option<String>,
 }
 
 #[derive(Clone)]
@@ -31026,6 +31038,169 @@ fn provider_auto_fit_up_command(
     parts.join(" ")
 }
 
+fn provider_backend_runtime_preflight(
+    home: &Path,
+    selected: &ProviderCandidate,
+    hardware: &HardwareReport,
+) -> Result<ProviderBackendRuntime> {
+    let backend = selected.artifact.engine.as_str();
+    let mut runtime = ProviderBackendRuntime::default();
+    match backend {
+        "vllm" | "trt-llm" | "mlx" => {
+            let python =
+                python_runtime::ensure_backend_python(home, backend).with_context(|| {
+                    format!(
+                        "preparing the managed {backend} runtime before downloading {}",
+                        selected.model.model_id
+                    )
+                })?;
+            let cache_dir = home.join("cache").join(backend);
+            fs::create_dir_all(&cache_dir).with_context(|| {
+                format!("creating managed {backend} cache {}", cache_dir.display())
+            })?;
+            runtime.python = Some(python.python);
+            runtime.python_source = Some(python.source);
+            runtime.requirements_sha256 = Some(python.requirements_sha256);
+            runtime.cache_dir = Some(cache_dir);
+        }
+        "stable-diffusion.cpp" => {
+            runtime.external_binary = Some(resolve_backend_binary(
+                "stable-diffusion.cpp",
+                "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
+                "sd-cli",
+            )?);
+            runtime.stable_diffusion_backend = stable_diffusion_accelerator(hardware)?;
+        }
+        "whisper.cpp" => {
+            runtime.external_binary = Some(resolve_backend_binary(
+                "whisper.cpp",
+                "MAYHEM_WHISPER_CPP_BIN",
+                "whisper-cli",
+            )?);
+        }
+        "piper" => {
+            runtime.external_binary = Some(resolve_backend_binary(
+                "piper",
+                "MAYHEM_PIPER_BIN",
+                "piper",
+            )?);
+        }
+        "llama.cpp" => provider_llama_accelerator_preflight(selected, hardware)?,
+        other => bail!("unsupported local provider session backend {other}"),
+    }
+    Ok(runtime)
+}
+
+fn stable_diffusion_accelerator(hardware: &HardwareReport) -> Result<Option<String>> {
+    if let Some(explicit) = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(explicit));
+    }
+    let selected = hardware.gpus.iter().find_map(|gpu| match gpu.vendor {
+        GpuVendor::Nvidia => Some("cuda"),
+        GpuVendor::Apple => Some("metal"),
+        GpuVendor::Amd if gpu.backend == GpuBackend::Rocm => Some("rocm"),
+        GpuVendor::Amd | GpuVendor::Intel | GpuVendor::Vulkan => Some("vulkan"),
+        GpuVendor::Unknown => None,
+    });
+    Ok(selected.map(str::to_owned))
+}
+
+fn provider_llama_accelerator_preflight(
+    selected: &ProviderCandidate,
+    hardware: &HardwareReport,
+) -> Result<()> {
+    if selected.verdict.n_layers_gpu.unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let has_nvidia = hardware
+        .gpus
+        .iter()
+        .any(|gpu| gpu.vendor == GpuVendor::Nvidia);
+    let has_vulkan = hardware
+        .gpus
+        .iter()
+        .any(|gpu| gpu.backend == GpuBackend::Vulkan);
+    if has_nvidia && cfg!(feature = "llama-cpp-cuda") {
+        return Ok(());
+    }
+    if has_vulkan && cfg!(feature = "llama-cpp-vulkan") {
+        return Ok(());
+    }
+    if has_nvidia {
+        bail!(
+            "llama.cpp selected GPU layers on NVIDIA hardware, but this Mayhem build lacks llama-cpp-cuda; rebuild from source with `--features llama-cpp-cuda`"
+        );
+    }
+    if has_vulkan {
+        bail!(
+            "llama.cpp selected GPU layers on Vulkan hardware, but this Mayhem build lacks llama-cpp-vulkan; rebuild from source with `--features llama-cpp-vulkan`"
+        );
+    }
+    bail!(
+        "llama.cpp selected {} GPU layers, but the current build has no accelerator matching the hwprobe verdict",
+        selected.verdict.n_layers_gpu.unwrap_or(0)
+    )
+}
+
+fn resolve_backend_binary(backend: &str, override_env: &str, default: &str) -> Result<PathBuf> {
+    if let Some(explicit) = env::var_os(override_env) {
+        let path = PathBuf::from(explicit);
+        return resolve_executable(&path).with_context(|| {
+            format!("{override_env} does not point to an executable {backend} binary")
+        });
+    }
+    resolve_executable(Path::new(default)).with_context(|| {
+        format!(
+            "{backend} requires `{default}` on PATH or an explicit {override_env} path before `mayhem up --provider`"
+        )
+    })
+}
+
+fn resolve_executable(program: &Path) -> Result<PathBuf> {
+    if program.components().count() > 1 || program.is_absolute() {
+        return executable_file(program)
+            .then(|| program.to_path_buf())
+            .context("path is missing or is not executable");
+    }
+    let path = env::var_os("PATH").unwrap_or_default();
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(program);
+        if executable_file(&candidate) {
+            return Ok(candidate);
+        }
+        #[cfg(windows)]
+        for extension in ["exe", "cmd", "bat"] {
+            let candidate = directory.join(program).with_extension(extension);
+            if executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("executable was not found on PATH")
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     validate_provider_start_security_mode(&args, cfg!(debug_assertions))?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
@@ -31163,6 +31338,33 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     if let Some(message) = &selected.feasibility.message {
         provider_log(&args, message);
     }
+    let backend_runtime = if args.serve_sessions {
+        provider_log(
+            &args,
+            &format!(
+                "Preflighting the {} runtime before artifact download",
+                selected.artifact.engine
+            ),
+        );
+        write_provider_load_progress_stage(
+            &args,
+            "preflight backend runtime",
+            "preflight",
+            "running",
+            0,
+        );
+        let runtime = provider_backend_runtime_preflight(&home, &selected, &hardware)?;
+        write_provider_load_progress_stage(
+            &args,
+            "preflight backend runtime",
+            "preflight",
+            "complete",
+            100,
+        );
+        runtime
+    } else {
+        ProviderBackendRuntime::default()
+    };
     let _memory_claim_guard = if args.serve_sessions {
         write_provider_memory_claim(&home, &wallet.public_key, &selected)?
     } else {
@@ -31309,6 +31511,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             password: &password,
             wallet: &wallet,
             selected: &selected,
+            backend_runtime: &backend_runtime,
             artifact_paths: &artifact_paths,
             rooms: &rooms,
             attestation: &attestation,
@@ -31425,6 +31628,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "sidecars": artifact_paths.sidecars.clone(),
             "root": selected.enclave.artifact_root.clone(),
         },
+        "backend_runtime": &backend_runtime,
         "sealed_store": {
             "path": sealed_store.clone(),
             "sealed": seal_report,
@@ -31502,6 +31706,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 password: &password,
                 wallet: &wallet,
                 selected: &selected,
+                backend_runtime: &backend_runtime,
                 artifact_paths: &artifact_paths,
                 rooms: &rooms,
                 attestation: &attestation,
@@ -40122,7 +40327,12 @@ fn provider_session_responder(
             ctx.artifact_paths.primary.display()
         ),
     );
-    let load_config = provider_engine_load_config(ctx.args, ctx.selected, ctx.artifact_paths)?;
+    let load_config = provider_engine_load_config(
+        ctx.args,
+        ctx.selected,
+        ctx.artifact_paths,
+        ctx.backend_runtime,
+    )?;
     match ctx.selected.artifact.engine.as_str() {
         "llama.cpp" => {
             let mut backend = mayhem_engine::LlamaCppBackend::new()
@@ -40137,7 +40347,12 @@ fn provider_session_responder(
             }))
         }
         "mlx" => {
-            let mut backend = mayhem_engine::MlxBackend::new()
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("MLX runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::MlxBackend::with_python(python)
                 .context("initializing MLX provider session engine")?;
             with_provider_progress_spinner(ctx.args, "MLX engine load", || {
                 backend
@@ -40149,7 +40364,12 @@ fn provider_session_responder(
             }))
         }
         "trt-llm" => {
-            let mut backend = mayhem_engine::TrtLlmBackend::new()
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("TensorRT-LLM runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::TrtLlmBackend::with_python(python)
                 .context("initializing TensorRT-LLM provider session engine")?;
             with_provider_progress_spinner(ctx.args, "TensorRT-LLM engine load", || {
                 backend
@@ -40161,7 +40381,12 @@ fn provider_session_responder(
             }))
         }
         "vllm" => {
-            let mut backend = mayhem_engine::VllmBackend::new()
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("vLLM runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::VllmBackend::with_python(python)
                 .context("initializing vLLM provider session engine")?;
             with_provider_progress_spinner(ctx.args, "vLLM engine load", || {
                 backend
@@ -40173,8 +40398,12 @@ fn provider_session_responder(
             }))
         }
         "stable-diffusion.cpp" => {
-            let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
-                .context("initializing stable-diffusion.cpp provider session engine")?;
+            let binary = ctx
+                .backend_runtime
+                .external_binary
+                .as_ref()
+                .context("stable-diffusion.cpp runtime preflight did not resolve sd-cli")?;
+            let mut backend = mayhem_engine::StableDiffusionCppBackend::with_binary(binary);
             with_provider_progress_spinner(ctx.args, "stable-diffusion.cpp engine load", || {
                 backend
                     .load(load_config)
@@ -40185,8 +40414,12 @@ fn provider_session_responder(
             }))
         }
         "whisper.cpp" => {
-            let mut backend = mayhem_engine::WhisperCppBackend::new()
-                .context("initializing whisper.cpp provider session engine")?;
+            let binary = ctx
+                .backend_runtime
+                .external_binary
+                .as_ref()
+                .context("whisper.cpp runtime preflight did not resolve whisper-cli")?;
+            let mut backend = mayhem_engine::WhisperCppBackend::with_binary(binary);
             with_provider_progress_spinner(ctx.args, "whisper.cpp engine load", || {
                 backend
                     .load(load_config)
@@ -40197,8 +40430,12 @@ fn provider_session_responder(
             }))
         }
         "piper" => {
-            let mut backend = mayhem_engine::PiperBackend::new()
-                .context("initializing piper provider session engine")?;
+            let binary = ctx
+                .backend_runtime
+                .external_binary
+                .as_ref()
+                .context("Piper runtime preflight did not resolve piper")?;
+            let mut backend = mayhem_engine::PiperBackend::with_binary(binary);
             with_provider_progress_spinner(ctx.args, "piper engine load", || {
                 backend
                     .load(load_config)
@@ -40218,6 +40455,7 @@ fn provider_engine_load_config(
     args: &ProviderStartArgs,
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
+    backend_runtime: &ProviderBackendRuntime,
 ) -> Result<LoadConfig> {
     let ctx_size = u32::try_from(selected.served_ctx).with_context(|| {
         format!(
@@ -40269,6 +40507,8 @@ fn provider_engine_load_config(
     };
     config.memory_limit_bytes = (selected.feasibility.memory_budget.budget_bytes > 0)
         .then_some(selected.feasibility.memory_budget.budget_bytes);
+    config.backend_cache_dir = backend_runtime.cache_dir.clone();
+    config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
         let sidecar = selected
             .artifact
@@ -50925,7 +51165,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             primary: PathBuf::from("/tmp/admin-approved.gguf"),
             sidecars: BTreeMap::new(),
         };
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             config.artifact.path,
@@ -50957,7 +51203,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             sidecars: BTreeMap::new(),
         };
 
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.gpu_layers, Some(0));
     }
@@ -51061,7 +51313,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             primary: primary.clone(),
             sidecars: sidecar_paths,
         };
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
         let checkpoint_dir = temp.join(".trtllm-checkpoints/nvfp4");
         let engine_dir = temp.join(".trtllm-engines/nvfp4");
 
@@ -51204,7 +51462,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             primary: primary.clone(),
             sidecars: sidecar_paths,
         };
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
         let checkpoint_dir = temp.join(".vllm-checkpoints/vllm-fp16");
 
         assert_eq!(selected.artifact_name, "vllm-fp16");
@@ -51304,7 +51568,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             )]),
         };
 
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
 
         let projector = config.vision_projector.expect("vision projector");
         assert_eq!(
@@ -51395,7 +51665,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         };
 
         let args = test_provider_start_args();
-        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             config.artifact.format,
