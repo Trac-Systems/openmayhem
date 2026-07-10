@@ -65,6 +65,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_payments') {
+      return {
+        type: 'setPayments',
+        value: json,
+      };
+    }
     if (json?.op === 'read_params') {
       return {
         type: 'readParams',
@@ -257,6 +263,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command "gated_noop" --sim 1 | validates current-rules consent before no-op.');
     console.log('- /tx --command \'{ "op": "set_rules", "ver": 1, "hash": "<hash>" }\' --sim 1 | sets the active rules version.');
     console.log('- /tx --command \'{ "op": "set_params", "submitted_at": 0, "effective_at": 86400, "values": { "fee_bps": 1500 } }\' --sim 1 | schedules parameter changes.');
+    console.log('- /tx --command \'{ "op": "set_payments", "ver": 1, "fiat": { "processor": "stripe", "currencies": ["usd","eur"], "locale": "en" }, "tap": { "chain_id": 1, "token_address": "<address>", "pool_address": "<address>" }, "tnk": { "network": "mainnet", "treasury_address": "<trac1-address>" } }\' --sim 1 | admin publishes canonical payment-rail discovery at payments/current.');
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- Consent, provider lifecycle, spend reservations, epoch apply, rate updates, TNK settlement evidence, and reputation anchors are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
     console.log('- /tx --command \'{ "op": "set_provider_rails", "rails": ["fiat","tap","tnk"] }\' --sim 1 | provider declares the payment rails they accept for serving.');

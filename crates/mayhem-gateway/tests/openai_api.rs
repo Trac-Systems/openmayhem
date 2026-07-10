@@ -3589,7 +3589,7 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("set-cookie").is_some());
     let body = String::from_utf8(bytes).expect("dashboard html");
-    assert!(body.contains("Runs entirely on this machine. No external network calls."));
+    assert!(body.contains("payment and routing evidence synced from Trac"));
     assert_no_external_urls(&body);
 
     let cookie = headers
@@ -3716,7 +3716,20 @@ async fn dashboard_price_chart_follow_list_persists_in_cookie() {
 async fn user_dashboard_renders_live_gateway_data() {
     let state = GatewayState::from_embedded_catalog()
         .with_dev_session_shim()
-        .with_receipt_balance_au(1_000_000_000_000_000_000);
+        .with_receipt_balance_au(1_000_000_000_000_000_000)
+        .with_receipt_rail("tap")
+        .with_payment_directory(json!({
+            "payments": {
+                "fiat": { "currencies": ["usd", "eur"] }
+            },
+            "rates": {
+                "tap": {
+                    "usd": "0.123456",
+                    "source": "uniswap-v2",
+                    "age_seconds": 12
+                }
+            }
+        }));
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
@@ -3743,7 +3756,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     let body = String::from_utf8(bytes).expect("dashboard html");
     assert!(body.contains("User dashboard"));
     assert!(body.contains("$1.00"));
-    assert!(body.contains("TAP rate not loaded"));
+    assert!(body.contains("TAP credit · $0.123456/TAP · uniswap-v2 · 12s old"));
     assert!(body.contains("http://127.0.0.1:11435/v1"));
     assert!(body.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
     assert!(body.contains("Sessions"));

@@ -146,6 +146,8 @@ pub struct GatewayState {
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
     receipt_config: ReceiptConfig,
+    ledger_balance_au: Arc<Mutex<MoneyAu>>,
+    payment_directory: Arc<Mutex<Option<Value>>>,
     session_backend: Arc<dyn GatewaySessionBackend>,
     hardware_quote_trust: Arc<HardwareQuoteTrust>,
     canaries: Arc<GatewayCanaryRegistry>,
@@ -1614,6 +1616,7 @@ impl GatewayState {
     ) -> Self {
         let models = sanitize_gateway_models(models);
         let receipt_config = ReceiptConfig::default();
+        let ledger_balance_au = receipt_config.balance_au;
         let provider_table = provider_table_from_models(&models, receipt_config.rules_ver);
         Self {
             models: Arc::new(models),
@@ -1622,6 +1625,8 @@ impl GatewayState {
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config,
+            ledger_balance_au: Arc::new(Mutex::new(ledger_balance_au)),
+            payment_directory: Arc::new(Mutex::new(None)),
             session_backend: Arc::new(NoProviderSessionBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
             canaries: Arc::new(canaries),
@@ -1662,7 +1667,44 @@ impl GatewayState {
 
     pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
         self.receipt_config.balance_au = balance_au;
+        *self
+            .ledger_balance_au
+            .lock()
+            .expect("gateway balance store poisoned") = balance_au;
         self
+    }
+
+    pub fn with_payment_directory(self, payment_directory: Value) -> Self {
+        *self
+            .payment_directory
+            .lock()
+            .expect("gateway payment directory poisoned") = Some(payment_directory);
+        self
+    }
+
+    pub fn update_ledger_payment_state(&self, balance_au: MoneyAu, payment_directory: Value) {
+        *self
+            .ledger_balance_au
+            .lock()
+            .expect("gateway balance store poisoned") = balance_au;
+        *self
+            .payment_directory
+            .lock()
+            .expect("gateway payment directory poisoned") = Some(payment_directory);
+    }
+
+    fn ledger_balance_au(&self) -> MoneyAu {
+        *self
+            .ledger_balance_au
+            .lock()
+            .expect("gateway balance store poisoned")
+    }
+
+    fn payment_directory(&self) -> Option<Value> {
+        self.payment_directory
+            .lock()
+            .expect("gateway payment directory poisoned")
+            .clone()
     }
 
     pub fn with_receipt_checkpoint_every(mut self, checkpoint_every: CheckpointPolicy) -> Self {
@@ -2545,8 +2587,10 @@ async fn mayhem_balance(State(state): State<SharedState>, headers: HeaderMap) ->
     }
     Json(json!({
         "denom": "au_usd",
-        "balance_au": money_au_json(state.receipt_config.balance_au),
-        "held_au": money_au_json(0)
+        "rail": state.receipt_config.rail,
+        "balance_au": money_au_json(state.ledger_balance_au()),
+        "held_au": money_au_json(0),
+        "payments": state.payment_directory(),
     }))
     .into_response()
 }
@@ -2904,6 +2948,60 @@ fn gateway_update_model_message(
     )
 }
 
+fn dashboard_payment_status(state: &GatewayState) -> String {
+    let rail = state.receipt_config.rail.as_str();
+    let Some(directory) = state.payment_directory() else {
+        return html_escape(&format!(
+            "{} credit · ledger directory unavailable",
+            rail.to_uppercase()
+        ));
+    };
+    let text = match rail {
+        "tap" | "tnk" => {
+            let rate = directory.get("rates").and_then(|rates| rates.get(rail));
+            let usd = rate
+                .and_then(|rate| rate.get("usd"))
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            let source = rate
+                .and_then(|rate| rate.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or("ledger");
+            let age = rate
+                .and_then(|rate| rate.get("age_seconds"))
+                .and_then(Value::as_u64)
+                .map(|value| format!(" · {value}s old"))
+                .unwrap_or_default();
+            format!(
+                "{} credit · ${}/{} · {}{}",
+                rail.to_uppercase(),
+                usd,
+                rail.to_uppercase(),
+                source,
+                age
+            )
+        }
+        "fiat" => {
+            let currencies = directory
+                .pointer("/payments/fiat/currencies")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_uppercase)
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "USD/EUR".to_owned());
+            format!("Fiat credit · Stripe hosted checkout · {currencies}")
+        }
+        other => format!("{} credit · canonical Trac ledger", other.to_uppercase()),
+    };
+    html_escape(&text)
+}
+
 fn dashboard_user_html(
     state: &GatewayState,
     expires_in_seconds: u64,
@@ -2942,7 +3040,8 @@ fn dashboard_user_html(
     } else {
         "Optional local"
     };
-    let balance_usd = format_au_usd(state.receipt_config.balance_au);
+    let balance_usd = format_au_usd(state.ledger_balance_au());
+    let payment_status = dashboard_payment_status(state);
     let lifetime_spend = format_au_usd(lifetime_spend_au);
     let api_key_masked = "mayhem-local";
     let tier_tooltip = html_escape(dashboard_tier_tooltip());
@@ -2951,8 +3050,8 @@ fn dashboard_user_html(
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
-OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">{payment_status}</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Local gateway · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
     )
@@ -3079,7 +3178,7 @@ fn dashboard_provider_html(
     dashboard_html_document(
         "Provider Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
             earned = format_au_usd(earned_au),
             earned_source = if earning_totals.loaded {
                 "ledger earn/* rows"
@@ -15215,7 +15314,7 @@ impl GatewayState {
         });
         let max_spend_au = estimate_max_spend_au(price, request, &prompt_text);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
-        if max_spend_au > self.receipt_config.balance_au {
+        if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
@@ -15317,7 +15416,7 @@ impl GatewayState {
         });
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
-        if max_spend_au > self.receipt_config.balance_au {
+        if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
@@ -15418,7 +15517,7 @@ impl GatewayState {
         });
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
-        if max_spend_au > self.receipt_config.balance_au {
+        if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
@@ -15519,7 +15618,7 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
-        if max_spend_au > self.receipt_config.balance_au {
+        if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
@@ -15620,7 +15719,7 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
-        if max_spend_au > self.receipt_config.balance_au {
+        if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),

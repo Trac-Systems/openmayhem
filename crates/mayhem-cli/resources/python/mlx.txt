@@ -1,1 +1,5 @@
 mlx-lm==0.31.3
+mlx==0.32.0
+transformers==5.12.1
+tokenizers==0.22.2
+safetensors==0.8.0

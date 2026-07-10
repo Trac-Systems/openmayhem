@@ -222,8 +222,8 @@ function validatePaymentRailEvidence(add, value, requiredRails = canonicalLedger
       add('error', `payment_rails.evidence must include file-bound au_usd credit evidence for ${rail}`);
     }
   }
-  if (!value.some((item) => isFileEvidence(item) && hasEvidenceTag(item, 'paygate_admin_controls'))) {
-    add('error', 'payment_rails.evidence must include file-bound paygate admin-control health evidence');
+  if (!value.some((item) => isFileEvidence(item) && hasEvidenceTag(item, 'admin_payment_directory'))) {
+    add('error', 'payment_rails.evidence must include file-bound admin payment-directory evidence');
   }
 }
 
@@ -338,9 +338,9 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.payment_rails.rails_credit_au_usd, true, 'payment_rails.rails_credit_au_usd');
     requireBoolean(
       add,
-      metrics.payment_rails.paygate_admin_controls_verified,
+      metrics.payment_rails.admin_payment_directory_verified,
       true,
-      'payment_rails.paygate_admin_controls_verified',
+      'payment_rails.admin_payment_directory_verified',
     );
     validatePaymentRailEvidence(add, metrics.payment_rails.evidence);
   }

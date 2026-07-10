@@ -1,5 +1,6 @@
 /** @typedef {import('pear-interface')} */
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
@@ -21,6 +22,123 @@ import MayhemFeature, {
 } from '../features/mayhem/index.js';
 
 const { argv, env, storeLabel, flags } = getPearRuntime();
+
+const stripeWorkerEndpoint = (raw = 'http://127.0.0.1:11436') => {
+  const parsed = new URL(String(raw));
+  const loopback = parsed.hostname === '127.0.0.1' ||
+    parsed.hostname === 'localhost' ||
+    parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'http:' || !loopback || parsed.username || parsed.password) {
+    throw new Error('MAYHEM_STRIPE_WORKER_URL must be an unauthenticated loopback HTTP URL.');
+  }
+  parsed.pathname = `${parsed.pathname.replace(/\/$/, '')}/v1/stripe/checkout-sessions`;
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed;
+};
+
+const postInternalStripeCheckout = (endpoint, value) => new Promise((resolve, reject) => {
+  const body = JSON.stringify(value);
+  const request = http.request(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': String(b4a.byteLength(body, 'utf8')),
+    },
+  }, (response) => {
+    const chunks = [];
+    let bytes = 0;
+    response.on('data', (chunk) => {
+      bytes += chunk.length;
+      if (bytes > 1_000_000) {
+        request.destroy(new Error('Stripe worker response exceeded 1000000 bytes.'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    response.on('end', () => {
+      const text = b4a.toString(b4a.concat(chunks), 'utf8');
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        reject(new Error('Stripe worker returned invalid JSON.'));
+        return;
+      }
+      if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
+        reject(new Error(parsed?.error || `Stripe worker returned HTTP ${response.statusCode}.`));
+        return;
+      }
+      resolve(parsed);
+    });
+  });
+  request.setTimeout(30_000, () => request.destroy(new Error('Stripe worker request timed out.')));
+  request.on('error', reject);
+  request.end(body);
+});
+
+const stripeCheckoutService = (peer) => async (service, value) => {
+  if (service !== 'stripe_checkout') throw new Error('Unsupported Mayhem admin service.');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid Stripe checkout request.');
+  }
+  const allowedKeys = new Set([
+    'who',
+    'au',
+    'currency',
+    'locale',
+    'idempotency_key',
+    'success_url',
+    'cancel_url',
+  ]);
+  const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length > 0) {
+    throw new Error(`Stripe checkout request does not accept fields: ${unknownKeys.join(', ')}.`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(String(value.who || '').toLowerCase())) {
+    throw new Error('Invalid Stripe checkout participant.');
+  }
+  if (!/^[1-9][0-9]*$/.test(String(value.au || ''))) {
+    throw new Error('Invalid Stripe checkout amount.');
+  }
+  for (const field of ['success_url', 'cancel_url']) {
+    let parsed;
+    try {
+      parsed = new URL(String(value[field] || ''));
+    } catch {
+      throw new Error(`Invalid Stripe checkout ${field}.`);
+    }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+      throw new Error(`Stripe checkout ${field} must be an unauthenticated HTTPS URL.`);
+    }
+  }
+  if (value.idempotency_key !== undefined &&
+      (typeof value.idempotency_key !== 'string' || value.idempotency_key.length > 255)) {
+    throw new Error('Invalid Stripe checkout idempotency key.');
+  }
+
+  const payments = (await peer.base.view.get('payments/current'))?.value;
+  if (!payments || payments.denom !== 'au_usd' || payments.set_by_role !== 'admin') {
+    throw new Error('Canonical payment configuration is unavailable.');
+  }
+  const currency = String(value.currency || '').toLowerCase();
+  const locale = String(value.locale || '');
+  if (payments.fiat?.processor !== 'stripe' ||
+      !Array.isArray(payments.fiat.currencies) ||
+      !payments.fiat.currencies.includes(currency)) {
+    throw new Error('Stripe checkout currency is not enabled by the admin.');
+  }
+  if (payments.fiat.locale !== locale) {
+    throw new Error('Stripe checkout locale is not enabled by the admin.');
+  }
+
+  const endpoint = stripeWorkerEndpoint(env.MAYHEM_STRIPE_WORKER_URL);
+  return await postInternalStripeCheckout(endpoint, {
+    ...value,
+    currency,
+    locale,
+  });
+};
 
 if (flags['msb-transfer-helper']) {
   try {
@@ -454,6 +572,7 @@ let mayhemFeature = null;
   mayhemFeature = new MayhemFeature(peer, {
     channel: MAYHEM_RELAY_CHANNEL,
     maxMessageBytes: mayhemRelayMaxMessageBytes,
+    serviceHandler: stripeCheckoutService(peer),
   });
   await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
   peer.mayhemFeature = mayhemFeature;

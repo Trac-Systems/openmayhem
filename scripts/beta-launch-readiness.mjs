@@ -14,25 +14,20 @@ function usage() {
   console.log(`Usage: node scripts/beta-launch-readiness.mjs --manifest PATH [options]
 
 Checks whether a P8.4 beta manifest is backed by real launch evidence instead
-of template or smoke-only proofs. This is read-only: it validates files, calls
-the strict launch validator, and reports the configured paygate health URL as
-advisory evidence. Payment acceptance is the CLI/browser handoff proof; final
-checkout follow-through can be verified manually by the operator.
+of template or smoke-only proofs. This is read-only: it validates files and
+calls the strict launch validator. Stripe acceptance is the CLI/browser handoff
+proof; final checkout follow-through can be verified manually by the operator.
 
 Options:
   --manifest PATH                 Launch manifest (default: ${defaultManifest})
-  --skip-paygate-health           Do not fetch the advisory paygate health URL
   --require-bundle-hash-fetch     Require collector evidence from --verify-bundle-hash
-  --http-timeout SECONDS          Paygate health timeout (default: 20)
   --json                          Print JSON report`);
 }
 
 function parseArgs(argv) {
   const args = {
     manifest: defaultManifest,
-    skipPaygateHealth: false,
     requireBundleHashFetch: false,
-    httpTimeout: 20,
     json: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -43,9 +38,7 @@ function parseArgs(argv) {
       return argv[i];
     };
     if (arg === '--manifest') args.manifest = next();
-    else if (arg === '--skip-paygate-health') args.skipPaygateHealth = true;
     else if (arg === '--require-bundle-hash-fetch') args.requireBundleHashFetch = true;
-    else if (arg === '--http-timeout') args.httpTimeout = Number.parseInt(next(), 10);
     else if (arg === '--json') args.json = true;
     else if (arg === '-h' || arg === '--help') {
       usage();
@@ -100,16 +93,6 @@ function missing(id, message, extra = {}) {
     id,
     status: 'missing',
     message,
-    ...extra,
-  };
-}
-
-function advisory(id, message, extra = {}) {
-  return {
-    id,
-    status: 'advisory',
-    message,
-    blocking: false,
     ...extra,
   };
 }
@@ -308,107 +291,6 @@ function checkCanary(manifest) {
   );
 }
 
-function expectedPaygateControls(manifest) {
-  return {
-    ok: true,
-    denom: 'au_usd',
-    stripe_enabled: manifest.paygate?.stripe_enabled,
-    controls: manifest.controls || {},
-  };
-}
-
-async function fetchJson(url, timeoutSec) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutSec * 1000);
-  try {
-    const response = await fetch(url, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    let json = null;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      // Keep the raw status. The caller will fail the JSON-specific checks.
-    }
-    return {
-      ok: response.ok,
-      status: response.status,
-      content_type: response.headers.get('content-type'),
-      json,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function checkPaygate(manifest, args) {
-  if (args.skipPaygateHealth) {
-    return advisory('paygate.public_health', 'paygate health fetch skipped; Stripe checkout handoff evidence is the beta gate', {
-      skipped: true,
-    });
-  }
-  if (!manifest.paygate?.public_base_url || !manifest.paygate?.health_path) {
-    return advisory('paygate.public_health', 'paygate.public_base_url and paygate.health_path are not set; use Stripe checkout handoff evidence instead');
-  }
-  let url = null;
-  try {
-    url = new URL(manifest.paygate.health_path, manifest.paygate.public_base_url);
-  } catch (error) {
-    return advisory('paygate.public_health', `invalid paygate health URL: ${error.message}`);
-  }
-  try {
-    const response = await fetchJson(url, args.httpTimeout);
-    const expected = expectedPaygateControls(manifest);
-    const controls = response.json?.controls || {};
-    const rails = response.json?.rails || {};
-    const ok = (
-      response.ok === true &&
-      response.json?.ok === expected.ok &&
-      response.json?.denom === expected.denom &&
-      rails.stripe?.enabled === expected.stripe_enabled &&
-      controls.admin_controls_economy === expected.controls.admin_controls_economy &&
-      controls.admin_sets_prices === expected.controls.admin_sets_prices &&
-      controls.admin_sets_rules === expected.controls.admin_sets_rules &&
-      controls.admin_sets_params === expected.controls.admin_sets_params &&
-      controls.admin_sets_provider_payout_targets === expected.controls.admin_sets_provider_payout_targets &&
-      controls.admin_can_ban_providers === expected.controls.admin_can_ban_providers &&
-      controls.providers_set_prices === expected.controls.providers_set_prices &&
-      controls.providers_set_rules === expected.controls.providers_set_rules &&
-      controls.providers_set_params === expected.controls.providers_set_params &&
-      controls.providers_set_payout_terms === expected.controls.providers_set_payout_terms &&
-      controls.providers_submit_models === expected.controls.providers_submit_models &&
-      controls.providers_create_canonical_rooms === expected.controls.providers_create_canonical_rooms &&
-      controls.providers_only_join_admin_rooms === expected.controls.providers_only_join_admin_rooms &&
-      controls.provider_payout_targets_admin_verified === expected.controls.provider_payout_targets_admin_verified
-    );
-    return ok
-      ? check(
-        'paygate.public_health',
-        true,
-        `public paygate health matches active processors and admin-control flags (${url.href})`,
-        {
-          url: url.href,
-          status_code: response.status,
-        }
-      )
-      : advisory(
-        'paygate.public_health',
-        'public paygate health did not match au_usd processor/admin-control flags; Stripe checkout handoff evidence remains sufficient for beta',
-        {
-          url: url.href,
-          status_code: response.status,
-        }
-      );
-  } catch (error) {
-    return advisory('paygate.public_health', `public paygate health fetch failed: ${error.message}; Stripe checkout handoff evidence remains sufficient for beta`, {
-      url: url.href,
-    });
-  }
-}
-
 async function readiness(args) {
   const manifestPath = resolveRepo(args.manifest);
   const report = {
@@ -448,8 +330,7 @@ async function readiness(args) {
   report.checks.push(checkSeedProviders(manifest));
   report.checks.push(checkDownloads(manifest, args));
   report.checks.push(checkCanary(manifest));
-  report.checks.push(await checkPaygate(manifest, args));
-  report.ok = report.checks.every((item) => item.status === 'ok' || item.status === 'advisory');
+  report.ok = report.checks.every((item) => item.status === 'ok');
   return report;
 }
 

@@ -86,7 +86,6 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
-const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 const MAINNET_MSB_NETWORK_ID: u64 = 918;
 const MAINNET_MSB_BOOTSTRAP: &str =
     "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685";
@@ -225,6 +224,8 @@ enum Commands {
         #[command(subcommand)]
         command: PriceCommands,
     },
+    /// Show the admin-published payment rails and current conversion evidence.
+    Payments(PaymentsArgs),
     /// Buy Mayhem credits through fiat/crypto rails.
     Pay {
         #[command(subcommand)]
@@ -392,6 +393,8 @@ enum AdminCommands {
     SetRules(AdminSetRulesArgs),
     /// Schedule admin-owned contract parameters.
     SetParams(AdminSetParamsArgs),
+    /// Publish canonical discovery for fiat, TAP, and TNK payment rails.
+    SetPayments(AdminSetPaymentsArgs),
     /// Set the admin model reference price used to bound enclave prices.
     SetModelRef(AdminSetModelRefArgs),
     /// Publish the latest signed catalog release anchor for network discovery.
@@ -538,6 +541,8 @@ enum PayCommands {
     Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
+    /// Prepare a TAP approve+deposit transaction plan.
+    Tap(DepositTapArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -776,6 +781,21 @@ struct BalanceArgs {
     rail: GatewayLedgerRail,
 
     /// Print a machine-readable balance report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PaymentsArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local Mayhem.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Print a machine-readable payment directory.
     #[arg(long)]
     json: bool,
 }
@@ -1673,10 +1693,6 @@ struct PayRailArgs {
     #[arg(long, default_value = "en")]
     locale: String,
 
-    /// Paygate base URL. Defaults to config.toml, MAYHEM_PAYGATE_URL, or local paygate.
-    #[arg(long)]
-    paygate_url: Option<String>,
-
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
     rpc_url: Option<String>,
@@ -1732,14 +1748,6 @@ struct PayTnkArgs {
     #[arg(long)]
     amount: String,
 
-    /// Network treasury address that receives the TNK transfer.
-    #[arg(long)]
-    treasury_address: Option<String>,
-
-    /// Override TNK/USD rate in integer atto-USD per 1 TNK. Defaults to contract rate/latest.
-    #[arg(long)]
-    tnk_usd_au: Option<MoneyAu>,
-
     /// 32-byte hex nonce used with the wallet public key to derive the deposit binding.
     #[arg(long)]
     nonce: Option<String>,
@@ -1771,10 +1779,6 @@ struct PayTnkArgs {
     /// Broadcast the matching MSB transfer from this local wallet. Requires --submit-intent.
     #[arg(long)]
     submit_transfer: bool,
-
-    /// MSB network for --submit-transfer. Defaults to testnet1 for testtrac1... treasury addresses and mainnet for trac1...
-    #[arg(long)]
-    msb_network: Option<String>,
 
     /// Maximum seconds to wait for MSB account sync and validator connection when --submit-transfer is used.
     #[arg(long, default_value_t = 180)]
@@ -1814,25 +1818,13 @@ struct DepositTapArgs {
     #[arg(long)]
     amount_wei: Option<String>,
 
-    /// TAP token contract address. Defaults to env/local addresses file.
-    #[arg(long)]
-    token: Option<String>,
-
-    /// TAP MayhemInferencePool contract address. Defaults to env/local addresses file.
-    #[arg(long)]
-    pool: Option<String>,
-
-    /// TAP chain id.
-    #[arg(long)]
-    chain_id: Option<u64>,
-
-    /// JSON file containing local TAP token/pool addresses.
-    #[arg(long, value_name = "PATH")]
-    addresses: Option<PathBuf>,
-
     /// Ethereum JSON-RPC URL for TAP balance checks, simulation, and broadcast.
-    #[arg(long = "rpc-url", alias = "eth-rpc")]
-    rpc_url: Option<String>,
+    #[arg(long)]
+    eth_rpc: Option<String>,
+
+    /// Local Intercom peer JSON-RPC base URL, including /v1.
+    #[arg(long)]
+    peer_rpc_url: Option<String>,
 
     /// Bind this wallet's Ethereum account to its Mayhem identity without broadcasting a deposit.
     #[arg(long, conflicts_with_all = ["amount_tap", "amount_wei"])]
@@ -1935,21 +1927,9 @@ struct WithdrawArgs {
     #[arg(long)]
     eth_rpc: Option<String>,
 
-    /// TAP MayhemInferencePool contract address. Defaults to env/local addresses file.
+    /// Local Intercom peer JSON-RPC base URL, including /v1.
     #[arg(long)]
-    pool: Option<String>,
-
-    /// TAP token contract address. Defaults to env/local addresses file.
-    #[arg(long)]
-    token: Option<String>,
-
-    /// TAP chain id.
-    #[arg(long)]
-    chain_id: Option<u64>,
-
-    /// JSON file containing local TAP token/pool addresses.
-    #[arg(long, value_name = "PATH")]
-    addresses: Option<PathBuf>,
+    peer_rpc_url: Option<String>,
 
     /// Build and simulate even if the proof helper cannot confirm a live claimable amount.
     #[arg(long)]
@@ -2447,6 +2427,14 @@ struct RulesReviewArgs {
 
 #[derive(Debug, Parser)]
 struct DoctorArgs {
+    /// Mayhem home used for managed provider runtimes. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, whisper.cpp, or piper.
+    #[arg(long, value_name = "BACKEND")]
+    provider_backend: Option<String>,
+
     /// Print the hardware report as JSON.
     #[arg(long)]
     json: bool,
@@ -3484,6 +3472,44 @@ struct AdminSetParamsArgs {
     /// Path to a JSON file containing parameter keys and values.
     #[arg(long, value_name = "PATH")]
     values_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetPaymentsArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Monotonic admin-published payment directory version.
+    #[arg(long)]
+    ver: u64,
+
+    /// Canonical Ethereum chain id for TAP deposits and claims.
+    #[arg(long)]
+    tap_chain_id: u64,
+
+    /// Canonical TAP ERC-20 token address.
+    #[arg(long)]
+    tap_token_address: String,
+
+    /// Canonical Mayhem TAP deposit and claim pool address.
+    #[arg(long)]
+    tap_pool_address: String,
+
+    /// Canonical TNK MSB network: mainnet or testnet1.
+    #[arg(long)]
+    tnk_network: String,
+
+    /// Canonical TNK treasury address on the selected MSB network.
+    #[arg(long)]
+    tnk_treasury_address: String,
+
+    /// Stripe presentment currencies administered by Mayhem.
+    #[arg(long, value_delimiter = ',', default_value = "usd,eur")]
+    stripe_currencies: Vec<String>,
+
+    /// Stripe hosted-checkout locale.
+    #[arg(long, default_value = "en")]
+    stripe_locale: String,
 }
 
 #[derive(Debug, Parser)]
@@ -5268,7 +5294,6 @@ struct ConfigNetwork {
     sc_bridge_token: Option<String>,
     gateway_bind: Option<String>,
     gateway_url: Option<String>,
-    paygate_url: Option<String>,
     tnk_treasury_address: Option<String>,
 }
 
@@ -5410,9 +5435,11 @@ async fn mayhem_main() -> Result<()> {
         Commands::Price { command } => match command {
             PriceCommands::Show(args) => price_show(args).await,
         },
+        Commands::Payments(args) => payments(args).await,
         Commands::Pay { command } => match command {
             PayCommands::Tnk(args) => pay_tnk(args).await,
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
+            PayCommands::Tap(args) => deposit_tap(args).await,
         },
         Commands::Balance(args) => balance(args).await,
         Commands::Status(args) => status(args).await,
@@ -6034,12 +6061,91 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     options.fixture = fixture;
 
     let report = probe(options);
+    let provider_runtime = if let Some(requested) = args.provider_backend.as_deref() {
+        let backend = resolve_doctor_provider_backend(requested, &report)?;
+        let verdict = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == backend)
+            .with_context(|| format!("hwprobe did not report backend {backend}"))?;
+        ensure!(
+            verdict.status != VerdictStatus::Insufficient,
+            "{backend} is not feasible on this host: {}",
+            verdict
+                .reason
+                .as_deref()
+                .unwrap_or("hwprobe marked it insufficient")
+        );
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        let runtime = provider_backend_runtime_preflight_for_backend(
+            &home,
+            &backend,
+            Some(verdict),
+            &report,
+        )?;
+        Some((backend, home, runtime))
+    } else {
+        None
+    };
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some((backend, home, runtime)) = provider_runtime {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "hardware": report,
+                    "provider_preflight": {
+                        "ok": true,
+                        "backend": backend,
+                        "home": home,
+                        "runtime": runtime,
+                    },
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     } else {
         print!("{}", human_report(&report));
+        if let Some((backend, home, runtime)) = provider_runtime {
+            println!("Provider backend preflight: {backend} ready");
+            println!("Managed home: {}", home.display());
+            if let Some(python) = runtime.python {
+                println!("Python: {}", python.display());
+            }
+            if let Some(cuda_home) = runtime.cuda_home {
+                println!("CUDA toolkit: {}", cuda_home.display());
+            }
+            if let Some(binary) = runtime.external_binary {
+                println!("Backend binary: {}", binary.display());
+            }
+        }
     }
     Ok(())
+}
+
+fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> Result<String> {
+    if requested == "auto" {
+        return report
+            .selected_backend
+            .clone()
+            .context("hwprobe did not select a provider backend on this host");
+    }
+    ensure!(
+        matches!(
+            requested,
+            "llama.cpp"
+                | "mlx"
+                | "vllm"
+                | "trt-llm"
+                | "stable-diffusion.cpp"
+                | "whisper.cpp"
+                | "piper"
+        ),
+        "unsupported provider backend {requested}"
+    );
+    Ok(requested.to_owned())
 }
 
 #[derive(Debug, Serialize)]
@@ -13455,7 +13561,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
         }
         AdminCommands::PayoutConfirm(_) => {
             bail!(
-                "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or fiat paygate settlement"
+                "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or Stripe settlement"
             );
         }
         _ => {}
@@ -15141,6 +15247,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         }
         AdminCommands::SetRules(args) => &args.tx,
         AdminCommands::SetParams(args) => &args.tx,
+        AdminCommands::SetPayments(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
         AdminCommands::PublishCatalog(args) => &args.tx,
         AdminCommands::RegisterEnclave(args) => &args.tx,
@@ -15197,6 +15304,7 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         }
         AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
         AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
+        AdminCommands::SetPayments(args) => Ok(("setPayments", admin_set_payments_payload(args)?)),
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
         AdminCommands::PublishCatalog(args) => {
             Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
@@ -15338,6 +15446,73 @@ fn admin_set_params_payload(args: &AdminSetParamsArgs) -> Result<Value> {
         "submitted_at": args.submitted_at,
         "effective_at": args.effective_at,
         "values": values,
+    }))
+}
+
+fn admin_set_payments_payload(args: &AdminSetPaymentsArgs) -> Result<Value> {
+    ensure!(args.tap_chain_id > 0, "--tap-chain-id must be positive");
+    ensure!(
+        is_eth_address(&args.tap_token_address),
+        "--tap-token-address must be an Ethereum address"
+    );
+    ensure!(
+        is_eth_address(&args.tap_pool_address),
+        "--tap-pool-address must be an Ethereum address"
+    );
+    let tnk_network = args.tnk_network.trim().to_ascii_lowercase();
+    ensure!(
+        matches!(tnk_network.as_str(), "mainnet" | "testnet1"),
+        "--tnk-network must be mainnet or testnet1"
+    );
+    let treasury = args.tnk_treasury_address.trim();
+    ensure!(
+        !treasury.is_empty() && treasury.split_whitespace().count() == 1,
+        "--tnk-treasury-address must be one address"
+    );
+    ensure!(
+        (tnk_network == "mainnet" && treasury.starts_with("trac1"))
+            || (tnk_network == "testnet1" && treasury.starts_with("testtrac1")),
+        "--tnk-treasury-address does not match --tnk-network"
+    );
+    let mut currencies = Vec::new();
+    for currency in &args.stripe_currencies {
+        let currency = currency.trim().to_ascii_lowercase();
+        ensure!(
+            matches!(currency.as_str(), "usd" | "eur"),
+            "--stripe-currencies supports only usd and eur"
+        );
+        ensure!(
+            !currencies.contains(&currency),
+            "--stripe-currencies contains duplicate {currency}"
+        );
+        currencies.push(currency);
+    }
+    ensure!(
+        !currencies.is_empty(),
+        "--stripe-currencies must not be empty"
+    );
+    currencies.sort_by_key(|currency| if currency == "usd" { 0 } else { 1 });
+    ensure!(
+        args.stripe_locale.trim().eq_ignore_ascii_case("en"),
+        "--stripe-locale must be en"
+    );
+    Ok(json!({
+        "op": "set_payments",
+        "ver": args.ver,
+        "fiat": {
+            "processor": "stripe",
+            "currencies": currencies,
+            "locale": "en",
+        },
+        "tap": {
+            "chain_id": args.tap_chain_id,
+            "token_address": args.tap_token_address.to_ascii_lowercase(),
+            "pool_address": args.tap_pool_address.to_ascii_lowercase(),
+        },
+        "tnk": {
+            "network": tnk_network,
+            "treasury_address": treasury,
+        },
     }))
 }
 
@@ -16941,7 +17116,7 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
 
 fn admin_payout_confirm_payload(_args: &AdminPayoutConfirmArgs) -> Result<Value> {
     bail!(
-        "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or fiat paygate settlement"
+        "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or Stripe settlement"
     )
 }
 
@@ -17753,6 +17928,78 @@ struct PayTnkRate {
     ts: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalPayments {
+    denom: String,
+    rails: Vec<String>,
+    fiat: CanonicalFiatRail,
+    tap: CanonicalTapRail,
+    tnk: CanonicalTnkRail,
+    ver: u64,
+    updated_at: String,
+    set_by: String,
+    set_by_role: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalFiatRail {
+    processor: String,
+    currencies: Vec<String>,
+    locale: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTapRail {
+    chain_id: u64,
+    token_address: String,
+    pool_address: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTnkRail {
+    network: String,
+    treasury_address: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTapRate {
+    denom: String,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    tap_usd_au: MoneyAu,
+    source: String,
+    ts: u64,
+    updated_at: String,
+    posted_by: String,
+    posted_by_role: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTnkRate {
+    denom: String,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    tnk_usd_au: MoneyAu,
+    source: String,
+    ts: u64,
+    updated_at: String,
+    posted_by: String,
+    posted_by_role: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalPaymentState {
+    payments: CanonicalPayments,
+    tap_rate: CanonicalTapRate,
+    tnk_rate: CanonicalTnkRate,
+    rate_staleness_seconds: u64,
+    observed_at: u64,
+}
+
 async fn deposit_command(command: DepositCommands) -> Result<()> {
     match command {
         DepositCommands::Tnk(args) => pay_tnk(args).await,
@@ -17984,6 +18231,17 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         .map(Ok)
         .unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
+    let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
+    let payment_state = read_canonical_payment_state(&peer_rpc).await?;
+    let tap = payment_state.payments.tap.clone();
+    let tap_rate = payment_state.tap_rate.clone();
+    let tap_rate_age = require_fresh_payment_rate(
+        payment_state.observed_at,
+        tap_rate.ts,
+        payment_state.rate_staleness_seconds,
+        "TAP/USD rate",
+    )?;
     let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password)
@@ -18019,15 +18277,9 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     if args.bind_only {
         script_args.extend(["--amount-wei".to_owned(), "1".to_owned()]);
     }
-    push_tap_contract_args(
-        &mut script_args,
-        args.token.as_deref(),
-        args.pool.as_deref(),
-        args.chain_id,
-        args.addresses.as_deref(),
-    );
-    if let Some(rpc_url) = &args.rpc_url {
-        script_args.extend(["--eth-rpc".to_owned(), rpc_url.clone()]);
+    push_tap_contract_args(&mut script_args, &tap);
+    if let Some(eth_rpc) = &args.eth_rpc {
+        script_args.extend(["--eth-rpc".to_owned(), eth_rpc.clone()]);
     }
     let preflight = run_contracts_script_json_with_env(
         "contracts/scripts/tap-calldata-builder.mjs",
@@ -18057,8 +18309,16 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         .get("chain_id")
         .and_then(Value::as_u64)
         .context("TAP deposit preflight missing chain id")?;
-    let peer_rpc_url = resolve_cli_rpc_url(Some(&home), None)?;
-    let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
+    let token_address = preflight
+        .get("token")
+        .and_then(Value::as_str)
+        .context("TAP deposit preflight missing token address")?;
+    ensure!(
+        token_address.eq_ignore_ascii_case(&tap.token_address)
+            && pool_address.eq_ignore_ascii_case(&tap.pool_address)
+            && chain_id == tap.chain_id,
+        "TAP deposit preflight did not preserve canonical payments/current addresses"
+    );
     let binding = ensure_tap_account_binding(
         &peer_rpc,
         &keypair_path,
@@ -18076,6 +18336,13 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
             "ok": true,
             "bind_only": true,
             "submitted": binding.get("submitted").and_then(Value::as_bool).unwrap_or(false),
+            "payment_config": {
+                "source": "payments/current",
+                "peer_rpc_url": peer_rpc_url,
+                "chain_id": tap.chain_id,
+                "token_address": tap.token_address,
+                "pool_address": tap.pool_address,
+            },
             "tap_account_binding": binding,
         });
         if args.json {
@@ -18116,6 +18383,30 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         preflight
     };
     report["tap_account_binding"] = binding;
+    let amount_wei = report
+        .get("amount_wei")
+        .and_then(Value::as_str)
+        .context("TAP deposit report missing amount_wei")?
+        .parse::<u128>()
+        .context("TAP deposit amount_wei exceeds u128")?;
+    let quoted_credit_au = token_e18_to_au_floor(amount_wei, tap_rate.tap_usd_au)?;
+    report["payment_config"] = json!({
+        "source": "payments/current",
+        "peer_rpc_url": peer_rpc_url,
+        "chain_id": tap.chain_id,
+        "token_address": tap.token_address,
+        "pool_address": tap.pool_address,
+    });
+    report["rate"] = json!({
+        "source_key": "tap/rate/latest",
+        "denom": tap_rate.denom,
+        "tap_usd_au": money_au_json(tap_rate.tap_usd_au),
+        "usd": au_to_usd_decimal(tap_rate.tap_usd_au),
+        "source": tap_rate.source,
+        "ts": tap_rate.ts,
+        "age_seconds": tap_rate_age,
+    });
+    report["quoted_credit_au"] = money_au_json(quoted_credit_au);
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -18253,6 +18544,17 @@ fn deposit_status_rail(args: &DepositStatusArgs) -> GatewayLedgerRail {
 }
 
 async fn withdraw(args: WithdrawArgs) -> Result<()> {
+    let home = args
+        .wallet
+        .home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
+    let payment_state = read_canonical_payment_state(&peer_rpc).await?;
+    let tap = payment_state.payments.tap.clone();
     let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
     let eth_key = ethereum_wallet_key(&keypair_path, &password)
@@ -18275,7 +18577,7 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         );
     }
 
-    let proof_report = resolve_withdraw_proof(&args, &account).await?;
+    let proof_report = resolve_withdraw_proof(&args, &account, &tap.pool_address).await?;
     if proof_report.get("claimable").and_then(Value::as_bool) == Some(false)
         && !args.allow_not_claimable
     {
@@ -18312,13 +18614,7 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         proof_to_script_arg(&proof)?,
         "--json".to_owned(),
     ];
-    push_tap_contract_args(
-        &mut script_args,
-        args.token.as_deref(),
-        args.pool.as_deref(),
-        args.chain_id,
-        args.addresses.as_deref(),
-    );
+    push_tap_contract_args(&mut script_args, &tap);
     script_args.push("--local-wallet".to_owned());
     if args.confirm {
         script_args.push("--confirm".to_owned());
@@ -18342,6 +18638,13 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         "custody": "local_wallet",
         "server_signs": false,
         "account": account,
+        "payment_config": {
+            "source": "payments/current",
+            "peer_rpc_url": peer_rpc_url,
+            "chain_id": tap.chain_id,
+            "token_address": tap.token_address,
+            "pool_address": tap.pool_address,
+        },
         "submitted": claim.get("submitted").and_then(Value::as_bool).unwrap_or(false),
         "proof": proof_report,
         "claim": claim,
@@ -19134,7 +19437,11 @@ fn print_participant_report(report: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_withdraw_proof(args: &WithdrawArgs, account: &str) -> Result<Value> {
+async fn resolve_withdraw_proof(
+    args: &WithdrawArgs,
+    account: &str,
+    pool_address: &str,
+) -> Result<Value> {
     match (&args.settlement, &args.claim_proof) {
         (Some(_), Some(_)) => bail!("pass only one of --settlement or --claim-proof"),
         (None, Some(path)) => read_json_file(path)
@@ -19147,9 +19454,7 @@ async fn resolve_withdraw_proof(args: &WithdrawArgs, account: &str) -> Result<Va
                 account.to_owned(),
                 "--json".to_owned(),
             ];
-            if let Some(pool) = &args.pool {
-                script_args.extend(["--pool".to_owned(), pool.clone()]);
-            }
+            script_args.extend(["--pool".to_owned(), pool_address.to_owned()]);
             let script_env = args
                 .eth_rpc
                 .as_ref()
@@ -19181,25 +19486,10 @@ async fn resolve_withdraw_proof(args: &WithdrawArgs, account: &str) -> Result<Va
     }
 }
 
-fn push_tap_contract_args(
-    out: &mut Vec<String>,
-    token: Option<&str>,
-    pool: Option<&str>,
-    chain_id: Option<u64>,
-    addresses: Option<&Path>,
-) {
-    if let Some(token) = token {
-        out.extend(["--token".to_owned(), token.to_owned()]);
-    }
-    if let Some(pool) = pool {
-        out.extend(["--pool".to_owned(), pool.to_owned()]);
-    }
-    if let Some(chain_id) = chain_id {
-        out.extend(["--chain-id".to_owned(), chain_id.to_string()]);
-    }
-    if let Some(addresses) = addresses {
-        out.extend(["--addresses".to_owned(), addresses.display().to_string()]);
-    }
+fn push_tap_contract_args(out: &mut Vec<String>, tap: &CanonicalTapRail) {
+    out.extend(["--token".to_owned(), tap.token_address.clone()]);
+    out.extend(["--pool".to_owned(), tap.pool_address.clone()]);
+    out.extend(["--chain-id".to_owned(), tap.chain_id.to_string()]);
 }
 
 async fn run_contracts_script_json_with_env<I>(
@@ -19322,6 +19612,18 @@ fn print_tap_deposit_report(report: &Value) -> Result<()> {
     println!("From: {}", report["from"].as_str().unwrap_or(""));
     println!("TAP token: {}", report["token"].as_str().unwrap_or(""));
     println!("Deposit address: {}", report["pool"].as_str().unwrap_or(""));
+    if let Some(rate) = report.get("rate") {
+        println!(
+            "TAP/USD: ${} ({}; age {}s)",
+            rate.get("usd").and_then(Value::as_str).unwrap_or(""),
+            rate.get("source").and_then(Value::as_str).unwrap_or(""),
+            rate.get("age_seconds").and_then(Value::as_u64).unwrap_or(0)
+        );
+        println!(
+            "Quoted credit: {} au_usd",
+            report["quoted_credit_au"].as_str().unwrap_or("0")
+        );
+    }
     println!(
         "Amount wei: {}",
         report["amount_wei"].as_str().unwrap_or("")
@@ -19454,19 +19756,22 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     )
     .await?;
     let amount_au = parse_usd_amount_to_au(&args.amount)?;
-    let treasury_address =
-        resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
-    let needs_rpc = args.tnk_usd_au.is_none() || args.submit_intent || args.wait;
-    let rpc_url = if needs_rpc {
-        Some(resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?)
-    } else {
-        args.rpc_url.clone()
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let payment_state = read_canonical_payment_state(&rpc).await?;
+    let treasury_address = payment_state.payments.tnk.treasury_address.clone();
+    let msb_network = payment_state.payments.tnk.network.clone();
+    let rate_age = require_fresh_payment_rate(
+        payment_state.observed_at,
+        payment_state.tnk_rate.ts,
+        payment_state.rate_staleness_seconds,
+        "TNK/USD rate",
+    )?;
+    let rate = PayTnkRate {
+        tnk_usd_au: payment_state.tnk_rate.tnk_usd_au,
+        source: payment_state.tnk_rate.source.clone(),
+        ts: Some(payment_state.tnk_rate.ts),
     };
-    let rpc = match rpc_url.as_deref() {
-        Some(url) if needs_rpc => Some(PeerRpcClient::new(url)?),
-        _ => None,
-    };
-    let rate = resolve_tnk_rate(rpc.as_ref(), args.tnk_usd_au).await?;
     let nonce = resolve_tnk_nonce(
         &wallet.public_key,
         amount_au,
@@ -19488,11 +19793,9 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let msb_transfer_command = format!("/transfer {} {}", treasury_address, tnk_decimal);
     let deposit_intent_command = pay_tnk_deposit_intent_command(
         &args.amount,
-        &treasury_address,
         &nonce,
-        rate.tnk_usd_au,
         args.keypair.as_deref(),
-        rpc_url.as_deref(),
+        Some(&rpc_url),
     );
     let keypair_path = PathBuf::from(wallet.keypair_path.clone());
     let intent_sig = sign_message(
@@ -19513,13 +19816,14 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         "value": intent_feature_value,
     });
     let intent_feature_json = serde_json::to_string(&intent_feature)?;
-    let intent_feature_rpc_command = rpc_url.as_deref().map(|url| {
-        format!(
-            "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
-            shell_single_quote(&format!("{}/contract/feature", url.trim_end_matches('/'))),
-            shell_single_quote(&intent_feature_json)
-        )
-    });
+    let intent_feature_rpc_command = Some(format!(
+        "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
+        shell_single_quote(&format!(
+            "{}/contract/feature",
+            rpc_url.trim_end_matches('/')
+        )),
+        shell_single_quote(&intent_feature_json)
+    ));
     let admin_confirm_command = format!(
         "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
         shell_single_quote(&memo_hash),
@@ -19535,14 +19839,12 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     )?;
 
     let before_au = if args.wait {
-        let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
-        Some(read_user_balance_au(rpc, &wallet.public_key, "tnk").await?)
+        Some(read_user_balance_au(&rpc, &wallet.public_key, "tnk").await?)
     } else {
         None
     };
 
     let submitted = if args.submit_intent {
-        let rpc = rpc.as_ref().context("--submit-intent requires peer RPC")?;
         if args.sim {
             Some(json!({ "sim": true, "submitted": false }))
         } else {
@@ -19562,10 +19864,9 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let msb_transfer = if args.submit_transfer {
         let keypair_path = PathBuf::from(wallet.keypair_path.clone());
         let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
-        let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
         Some(
             submit_msb_transfer(
-                &network,
+                &msb_network,
                 &stores_directory,
                 &store_name,
                 &treasury_address,
@@ -19581,13 +19882,12 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     };
 
     let credit = if args.wait {
-        let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
         let before_au = before_au.context("--wait balance snapshot missing")?;
         let target_au = before_au
             .checked_add(amount_au)
             .context("target balance overflowed")?;
         let status = wait_for_credit(
-            rpc,
+            &rpc,
             &wallet.public_key,
             "tnk",
             before_au,
@@ -19611,11 +19911,18 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         "who": wallet.public_key,
         "rpc_url": rpc_url,
         "treasury_address": treasury_address,
+        "payment_config": {
+            "source": "payments/current",
+            "msb_network": msb_network,
+            "treasury_address": treasury_address,
+        },
         "rate": {
+            "source_key": "rate/latest",
             "denom": "tnk_usd_au",
             "tnk_usd_au": money_au_json(rate.tnk_usd_au),
             "source": rate.source,
             "ts": rate.ts,
+            "age_seconds": rate_age,
         },
         "deposit_intent": {
             "feature": intent_feature,
@@ -19732,22 +20039,37 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     .await?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let paygate_url = resolve_cli_paygate_url(config.as_ref(), args.paygate_url.as_deref());
+    let payment_state = read_canonical_payment_state(&rpc).await?;
+    let currency = args.currency.trim().to_ascii_lowercase();
+    let locale = args.locale.trim().to_ascii_lowercase();
+    ensure!(
+        payment_state
+            .payments
+            .fiat
+            .currencies
+            .iter()
+            .any(|enabled| enabled == &currency),
+        "Stripe currency {currency} is not enabled by the admin"
+    );
+    ensure!(
+        locale == payment_state.payments.fiat.locale,
+        "Stripe locale {locale} is not enabled by the admin"
+    );
     let amount_au = parse_usd_amount_to_au(&args.amount)?;
     let before_au = read_user_balance_au(&rpc, &wallet.public_key, rail.balance_rail()).await?;
     let checkout = create_pay_checkout(PayCheckoutRequest {
         rail,
-        paygate_url: &paygate_url,
+        rpc: &rpc,
         who: &wallet.public_key,
         amount_au,
-        currency: &args.currency,
-        locale: &args.locale,
+        currency: &currency,
+        locale: &locale,
         idempotency_key: args.idempotency_key.as_deref(),
         success_url: args.success_url.as_deref(),
         cancel_url: args.cancel_url.as_deref(),
     })
     .await?;
-    emit_checkout_handoff(args.json, rail, amount_au, &args.currency, &checkout.url)?;
+    emit_checkout_handoff(args.json, rail, amount_au, &currency, &checkout.url)?;
     let opened = open_checkout_url(&checkout.url, args.no_open).await;
     let target_au = before_au
         .checked_add(amount_au)
@@ -19779,10 +20101,16 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         "denom": "au_usd",
         "amount_au": money_au_json(amount_au),
         "amount_usd": au_to_usd_amount(amount_au),
-        "currency": args.currency.to_ascii_lowercase(),
+        "currency": currency,
         "who": wallet.public_key,
-        "paygate_url": paygate_url,
         "rpc_url": rpc_url,
+        "payment_config": {
+            "source": "payments/current",
+            "processor": payment_state.payments.fiat.processor,
+            "currencies": payment_state.payments.fiat.currencies,
+            "locale": payment_state.payments.fiat.locale,
+            "checkout_host": "checkout.stripe.com",
+        },
         "checkout": {
             "id": checkout.id,
             "url": checkout.url,
@@ -21824,6 +22152,50 @@ struct GatewayProviderHeartbeatWatcherConfig {
     channels: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct GatewayLedgerWatcherConfig {
+    rpc_url: String,
+    wallet_public_key: String,
+    rail: String,
+}
+
+fn spawn_gateway_ledger_watcher(state: GatewayState, config: GatewayLedgerWatcherConfig) {
+    tokio::spawn(async move {
+        let rpc = match PeerRpcClient::new(&config.rpc_url) {
+            Ok(rpc) => rpc,
+            Err(err) => {
+                eprintln!("Gateway ledger watcher disabled: {err:#}");
+                return;
+            }
+        };
+        let mut last_error = None;
+        loop {
+            let refresh = async {
+                let balance =
+                    read_user_balance_au(&rpc, &config.wallet_public_key, &config.rail).await?;
+                let payments =
+                    canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
+                Result::<_, anyhow::Error>::Ok((balance, payments))
+            }
+            .await;
+            match refresh {
+                Ok((balance, payments)) => {
+                    state.update_ledger_payment_state(balance, payments);
+                    last_error = None;
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("Gateway ledger watcher retrying: {message}");
+                        last_error = Some(message);
+                    }
+                }
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 fn gateway_provider_heartbeat_channels(models: &[GatewayModel]) -> Vec<String> {
     models
         .iter()
@@ -22067,6 +22439,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         balance_au,
         blocked_version_gates,
         heartbeat_watcher,
+        payment_directory,
+        ledger_watcher,
     ) = if args.dev_embedded_catalog {
         let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
         (
@@ -22077,6 +22451,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             None,
             None,
             Vec::new(),
+            None,
+            None,
             None,
         )
     } else {
@@ -22208,6 +22584,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 )
             })?;
         let balance_au = read_user_balance_au(&rpc, &wallet.public_key, args.rail.as_str()).await?;
+        let payment_directory =
+            canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
         let (models, blocked_version_gates) = match catalog_doc.as_ref() {
             Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
             None => (models, Vec::new()),
@@ -22299,10 +22677,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             catalog_source,
             Some(model_count),
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
-            Some(wallet.public_key),
+            Some(wallet.public_key.clone()),
             Some(balance_au),
             blocked_version_gates,
             heartbeat_watcher,
+            Some(payment_directory),
+            Some(GatewayLedgerWatcherConfig {
+                rpc_url,
+                wallet_public_key: wallet.public_key,
+                rail: args.rail.as_str().to_owned(),
+            }),
         )
     };
     let state = match apple_app_attest_jwks {
@@ -22334,8 +22718,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"))
         .with_access_control(access_control);
+    let state = match payment_directory {
+        Some(directory) => state.with_payment_directory(directory),
+        None => state,
+    };
     if let Some(config) = heartbeat_watcher {
         spawn_gateway_provider_heartbeat_watcher(state.clone(), config);
+    }
+    if let Some(config) = ledger_watcher {
+        spawn_gateway_ledger_watcher(state.clone(), config);
     }
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
@@ -22605,6 +22996,264 @@ async fn models(args: ModelsArgs) -> Result<()> {
             println!("Live routable provider capacity: run `mayhem models --gateway`.");
         }
     }
+    Ok(())
+}
+
+async fn read_canonical_payment_state(rpc: &PeerRpcClient) -> Result<CanonicalPaymentState> {
+    let observed_at = unix_epoch_seconds()?;
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("contract admin is not initialized")?
+        .to_ascii_lowercase();
+    let payments_value = read_state_value(rpc, "payments/current").await?.context(
+        "canonical payments/current is missing; the admin must publish all payment rails",
+    )?;
+    let payments: CanonicalPayments = serde_json::from_value(payments_value)
+        .context("canonical payments/current has an invalid schema")?;
+    validate_canonical_payments(&payments, &admin)?;
+
+    let tap_rate: CanonicalTapRate = serde_json::from_value(
+        read_state_value(rpc, "tap/rate/latest")
+            .await?
+            .context("canonical tap/rate/latest is missing")?,
+    )
+    .context("canonical tap/rate/latest has an invalid schema")?;
+    validate_tap_rate(&tap_rate, &admin)?;
+
+    let tnk_rate: CanonicalTnkRate = serde_json::from_value(
+        read_state_value(rpc, "rate/latest")
+            .await?
+            .context("canonical rate/latest is missing")?,
+    )
+    .context("canonical rate/latest has an invalid schema")?;
+    validate_tnk_rate(&tnk_rate, &admin)?;
+
+    let rate_staleness_seconds = read_param_u64_at(
+        rpc,
+        "rate_staleness_seconds",
+        DEFAULT_RATE_STALENESS_SECONDS,
+        observed_at,
+    )
+    .await?;
+    Ok(CanonicalPaymentState {
+        payments,
+        tap_rate,
+        tnk_rate,
+        rate_staleness_seconds,
+        observed_at,
+    })
+}
+
+fn validate_canonical_payments(payments: &CanonicalPayments, admin: &str) -> Result<()> {
+    ensure!(
+        payments.denom == "au_usd",
+        "payments/current denom must be au_usd"
+    );
+    ensure!(
+        payments.rails == ["fiat", "tap", "tnk"],
+        "payments/current rails must be exactly fiat,tap,tnk"
+    );
+    ensure!(
+        payments.ver > 0,
+        "payments/current version must be positive"
+    );
+    ensure!(
+        payments.set_by_role == "admin" && payments.set_by.eq_ignore_ascii_case(admin),
+        "payments/current was not published by the current admin"
+    );
+    ensure!(
+        payments.fiat.processor == "stripe",
+        "canonical fiat processor must be stripe"
+    );
+    ensure!(
+        payments.fiat.locale == "en",
+        "canonical Stripe locale must be en"
+    );
+    ensure!(
+        !payments.fiat.currencies.is_empty(),
+        "canonical Stripe currencies must not be empty"
+    );
+    let mut seen = BTreeSet::new();
+    for currency in &payments.fiat.currencies {
+        ensure!(
+            matches!(currency.as_str(), "usd" | "eur"),
+            "unsupported canonical Stripe currency {currency}"
+        );
+        ensure!(
+            seen.insert(currency),
+            "duplicate canonical Stripe currency {currency}"
+        );
+    }
+    ensure!(
+        payments.tap.chain_id > 0,
+        "canonical TAP chain id must be positive"
+    );
+    ensure!(
+        is_eth_address(&payments.tap.token_address),
+        "canonical TAP token address is invalid"
+    );
+    ensure!(
+        is_eth_address(&payments.tap.pool_address),
+        "canonical TAP pool address is invalid"
+    );
+    ensure!(
+        matches!(payments.tnk.network.as_str(), "mainnet" | "testnet1"),
+        "canonical TNK network must be mainnet or testnet1"
+    );
+    ensure!(
+        (payments.tnk.network == "mainnet" && payments.tnk.treasury_address.starts_with("trac1"))
+            || (payments.tnk.network == "testnet1"
+                && payments.tnk.treasury_address.starts_with("testtrac1")),
+        "canonical TNK treasury does not match its MSB network"
+    );
+    Ok(())
+}
+
+fn validate_tap_rate(rate: &CanonicalTapRate, admin: &str) -> Result<()> {
+    ensure!(
+        rate.denom == "tap_usd_au",
+        "TAP rate denom must be tap_usd_au"
+    );
+    ensure!(rate.tap_usd_au > 0, "TAP/USD rate must be positive");
+    ensure!(
+        matches!(rate.source.as_str(), "uniswap-v2" | "config" | "stale"),
+        "unsupported TAP/USD rate source {}",
+        rate.source
+    );
+    ensure!(
+        rate.posted_by_role == "admin" && rate.posted_by.eq_ignore_ascii_case(admin),
+        "TAP/USD rate was not posted by the current admin"
+    );
+    Ok(())
+}
+
+fn validate_tnk_rate(rate: &CanonicalTnkRate, admin: &str) -> Result<()> {
+    ensure!(
+        rate.denom == "tnk_usd_au",
+        "TNK rate denom must be tnk_usd_au"
+    );
+    ensure!(rate.tnk_usd_au > 0, "TNK/USD rate must be positive");
+    ensure!(
+        matches!(rate.source.as_str(), "gate-spot" | "mexc-spot"),
+        "unsupported TNK/USD rate source {}",
+        rate.source
+    );
+    ensure!(
+        rate.posted_by_role == "admin" && rate.posted_by.eq_ignore_ascii_case(admin),
+        "TNK/USD rate was not posted by the current admin"
+    );
+    Ok(())
+}
+
+fn canonical_rate_age(observed_at: u64, rate_at: u64, label: &str) -> Result<u64> {
+    observed_at
+        .checked_sub(rate_at)
+        .with_context(|| format!("{label} timestamp is in the future"))
+}
+
+fn require_fresh_payment_rate(
+    observed_at: u64,
+    rate_at: u64,
+    max_age: u64,
+    label: &str,
+) -> Result<u64> {
+    let age = canonical_rate_age(observed_at, rate_at, label)?;
+    ensure!(
+        age <= max_age,
+        "{label} is stale: age {age}s exceeds {max_age}s"
+    );
+    Ok(age)
+}
+
+fn canonical_payment_state_json(state: &CanonicalPaymentState) -> Result<Value> {
+    let tap_age = canonical_rate_age(state.observed_at, state.tap_rate.ts, "TAP/USD rate")?;
+    let tnk_age = canonical_rate_age(state.observed_at, state.tnk_rate.ts, "TNK/USD rate")?;
+    Ok(json!({
+        "ok": tap_age <= state.rate_staleness_seconds && tnk_age <= state.rate_staleness_seconds,
+        "denom": "au_usd",
+        "observed_at": state.observed_at,
+        "rate_staleness_seconds": state.rate_staleness_seconds,
+        "payments": state.payments,
+        "rates": {
+            "tap": {
+                "denom": state.tap_rate.denom,
+                "tap_usd_au": money_au_json(state.tap_rate.tap_usd_au),
+                "usd": au_to_usd_decimal(state.tap_rate.tap_usd_au),
+                "source": state.tap_rate.source,
+                "ts": state.tap_rate.ts,
+                "age_seconds": tap_age,
+                "fresh": tap_age <= state.rate_staleness_seconds,
+                "updated_at": state.tap_rate.updated_at,
+                "posted_by": state.tap_rate.posted_by,
+                "posted_by_role": state.tap_rate.posted_by_role,
+            },
+            "tnk": {
+                "denom": state.tnk_rate.denom,
+                "tnk_usd_au": money_au_json(state.tnk_rate.tnk_usd_au),
+                "usd": au_to_usd_decimal(state.tnk_rate.tnk_usd_au),
+                "source": state.tnk_rate.source,
+                "ts": state.tnk_rate.ts,
+                "age_seconds": tnk_age,
+                "fresh": tnk_age <= state.rate_staleness_seconds,
+                "updated_at": state.tnk_rate.updated_at,
+                "posted_by": state.tnk_rate.posted_by,
+                "posted_by_role": state.tnk_rate.posted_by_role,
+            },
+        },
+    }))
+}
+
+async fn payments(args: PaymentsArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let state = read_canonical_payment_state(&rpc).await?;
+    let report = canonical_payment_state_json(&state)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canonical payment denomination: au_usd");
+        println!(
+            "Stripe: {} checkout in {} (hosted by checkout.stripe.com)",
+            state
+                .payments
+                .fiat
+                .currencies
+                .iter()
+                .map(|currency| currency.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(", "),
+            state.payments.fiat.locale
+        );
+        println!(
+            "TAP: chain {} token {} pool {}",
+            state.payments.tap.chain_id,
+            state.payments.tap.token_address,
+            state.payments.tap.pool_address
+        );
+        println!(
+            "TAP/USD: ${} ({}, age {}s)",
+            au_to_usd_decimal(state.tap_rate.tap_usd_au),
+            state.tap_rate.source,
+            report["rates"]["tap"]["age_seconds"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "TNK: MSB {} treasury {}",
+            state.payments.tnk.network, state.payments.tnk.treasury_address
+        );
+        println!(
+            "TNK/USD: ${} ({}, age {}s)",
+            au_to_usd_decimal(state.tnk_rate.tnk_usd_au),
+            state.tnk_rate.source,
+            report["rates"]["tnk"]["age_seconds"].as_u64().unwrap_or(0)
+        );
+    }
+    ensure!(
+        report["ok"].as_bool() == Some(true),
+        "one or more canonical crypto rates are stale"
+    );
     Ok(())
 }
 
@@ -26552,27 +27201,6 @@ fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<
         .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()))
 }
 
-fn resolve_cli_paygate_url(config: Option<&MayhemConfig>, paygate_url: Option<&str>) -> String {
-    if let Some(paygate_url) = paygate_url {
-        let paygate_url = paygate_url.trim();
-        if !paygate_url.is_empty() {
-            return paygate_url.trim_end_matches('/').to_owned();
-        }
-    }
-    if let Ok(paygate_url) = env::var("MAYHEM_PAYGATE_URL") {
-        let paygate_url = paygate_url.trim();
-        if !paygate_url.is_empty() {
-            return paygate_url.trim_end_matches('/').to_owned();
-        }
-    }
-    config
-        .and_then(|config| config.network.as_ref())
-        .and_then(|network| network.paygate_url.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim_end_matches('/').to_owned())
-        .unwrap_or_else(|| DEFAULT_PAYGATE_URL.to_owned())
-}
-
 fn resolve_cli_tnk_treasury_address(
     config: Option<&MayhemConfig>,
     treasury_address: Option<&str>,
@@ -26730,30 +27358,6 @@ fn pay_tnk_deposit_intent_payload(
 
 fn deposit_tnk_intent_message(intent: &Value) -> String {
     format!("mayhem-deposit-tnk-intent-v1{}", stable_json_value(intent))
-}
-
-async fn resolve_tnk_rate(
-    rpc: Option<&PeerRpcClient>,
-    override_rate: Option<MoneyAu>,
-) -> Result<PayTnkRate> {
-    if let Some(tnk_usd_au) = override_rate {
-        if tnk_usd_au == 0 {
-            bail!("--tnk-usd-au must be positive");
-        }
-        return Ok(PayTnkRate {
-            tnk_usd_au,
-            source: "cli-override".to_owned(),
-            ts: None,
-        });
-    }
-
-    let rpc = rpc.context(
-        "contract rate/latest requires peer RPC; pass --tnk-usd-au for offline preparation",
-    )?;
-    let value = read_state_value(rpc, "rate/latest").await?.context(
-        "contract rate/latest not found; run mayhem admin rate-oracle or pass --tnk-usd-au",
-    )?;
-    parse_tnk_rate(&value)
 }
 
 fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
@@ -27912,11 +28516,14 @@ fn au_to_tnk_e18_ceil_u128(au: MoneyAu, rate_tnk_usd_au: MoneyAu) -> Result<u128
 }
 
 fn tnk_e18_to_au_floor(tnk_e18: u128, rate_tnk_usd_au: MoneyAu) -> Result<MoneyAu> {
-    let au = tnk_e18
-        .checked_mul(rate_tnk_usd_au)
-        .context("TNK credit conversion overflow")?
-        / TNK_E18;
-    Ok(au)
+    token_e18_to_au_floor(tnk_e18, rate_tnk_usd_au).context("TNK credit conversion failed")
+}
+
+fn token_e18_to_au_floor(amount_e18: u128, token_usd_au: MoneyAu) -> Result<MoneyAu> {
+    amount_e18
+        .checked_mul(token_usd_au)
+        .context("token credit conversion overflow")
+        .map(|value| value / TNK_E18)
 }
 
 fn tnk_e18_to_decimal(tnk_e18: u128) -> String {
@@ -27934,18 +28541,14 @@ fn tnk_e18_to_decimal(tnk_e18: u128) -> String {
 
 fn pay_tnk_deposit_intent_command(
     amount: &str,
-    treasury_address: &str,
     nonce: &str,
-    tnk_usd_au: MoneyAu,
     keypair: Option<&Path>,
     rpc_url: Option<&str>,
 ) -> String {
     let mut command = format!(
-        "mayhem pay tnk --amount {} --treasury-address {} --nonce {} --tnk-usd-au {} --submit-intent",
+        "mayhem pay tnk --amount {} --nonce {} --submit-intent",
         shell_single_quote(amount),
-        shell_single_quote(treasury_address),
         shell_single_quote(nonce),
-        tnk_usd_au
     );
     if let Some(keypair) = keypair {
         command.push_str(" --keypair ");
@@ -28115,7 +28718,7 @@ struct PayCreditStatus {
 
 struct PayCheckoutRequest<'a> {
     rail: PayRail,
-    paygate_url: &'a str,
+    rpc: &'a PeerRpcClient,
     who: &'a str,
     amount_au: MoneyAu,
     currency: &'a str,
@@ -28178,18 +28781,16 @@ fn emit_checkout_handoff(
 }
 
 async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheckout> {
-    let client = reqwest::Client::new();
-    let endpoint = "v1/stripe/checkout-sessions";
     let success_url = request
         .success_url
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| default_checkout_success_url(request.paygate_url, request.rail));
+        .unwrap_or_else(default_checkout_return_url);
     let cancel_url = request
         .cancel_url
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| default_checkout_cancel_url(request.paygate_url, request.rail));
+        .unwrap_or_else(default_checkout_return_url);
     let mut body = json!({
         "who": request.who,
         "au": money_au_json(request.amount_au),
@@ -28202,38 +28803,28 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
         body["idempotency_key"] = Value::String(idempotency_key.to_owned());
     }
 
-    let response = client
-        .post(format!(
-            "{}/{}",
-            request.paygate_url.trim_end_matches('/'),
-            endpoint
-        ))
-        .json(&body)
-        .send()
-        .await?;
-    let status = response.status();
-    let response_body = response.text().await?;
-    if !status.is_success() {
-        bail!("paygate returned {status}: {response_body}");
-    }
-    let value: Value = serde_json::from_str(&response_body)?;
-    checkout_from_paygate_response(request.rail, &value)
+    let value = request
+        .rpc
+        .post("payment/stripe/checkout", &body)
+        .await
+        .context("requesting Stripe hosted checkout through the local Intercom peer")?;
+    checkout_from_stripe_response(request.rail, &value)
 }
 
-fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayCheckout> {
+fn checkout_from_stripe_response(rail: PayRail, value: &Value) -> Result<PayCheckout> {
     match rail {
         PayRail::Stripe => {
             let response_rail = required_json_string(value, "rail")?;
             if response_rail != "fiat" {
-                bail!("paygate response rail must be fiat for Stripe checkout");
+                bail!("Stripe checkout response rail must be fiat");
             }
             let processor_rail = required_json_string(value, "processor_rail")?;
             if processor_rail != "stripe" {
-                bail!("paygate response processor_rail must be stripe for Stripe checkout");
+                bail!("Stripe checkout response processor_rail must be stripe");
             }
-            let session = value
-                .get("checkout_session")
-                .ok_or_else(|| anyhow::anyhow!("paygate response missing checkout_session"))?;
+            let session = value.get("checkout_session").ok_or_else(|| {
+                anyhow::anyhow!("Stripe checkout response missing checkout_session")
+            })?;
             Ok(PayCheckout {
                 id: required_json_string(session, "id")?,
                 url: {
@@ -28256,15 +28847,15 @@ fn required_json_string(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("paygate response missing {field}"))
+        .ok_or_else(|| anyhow::anyhow!("Stripe checkout response missing {field}"))
 }
 
 fn required_hosted_checkout_url(value: &Value, field: &str, expected_host: &str) -> Result<String> {
     let url = required_json_string(value, field)?;
     let parsed = reqwest::Url::parse(&url)
-        .with_context(|| format!("paygate response {field} is not a valid URL"))?;
+        .with_context(|| format!("Stripe checkout response {field} is not a valid URL"))?;
     if parsed.scheme() != "https" || parsed.host_str() != Some(expected_host) {
-        bail!("paygate response {field} must be an HTTPS URL on {expected_host}");
+        bail!("Stripe checkout response {field} must be an HTTPS URL on {expected_host}");
     }
     Ok(url)
 }
@@ -28276,26 +28867,14 @@ fn validate_response_copy_paste_url(value: &Value, url: &str) -> Result<()> {
         .and_then(Value::as_str)
     {
         if copy_paste_url != url {
-            bail!("paygate response copy_paste.checkout_url does not match hosted checkout URL");
+            bail!("Stripe checkout response copy_paste.checkout_url does not match hosted checkout URL");
         }
     }
     Ok(())
 }
 
-fn default_checkout_success_url(paygate_url: &str, rail: PayRail) -> String {
-    let base = paygate_url.trim_end_matches('/');
-    match rail {
-        PayRail::Stripe => {
-            format!("{base}/v1/stripe/return?session_id={{CHECKOUT_SESSION_ID}}")
-        }
-    }
-}
-
-fn default_checkout_cancel_url(paygate_url: &str, rail: PayRail) -> String {
-    let base = paygate_url.trim_end_matches('/');
-    match rail {
-        PayRail::Stripe => format!("{base}/v1/stripe/cancel"),
-    }
+fn default_checkout_return_url() -> String {
+    "https://stripe.com".to_owned()
 }
 
 async fn open_checkout_url(url: &str, disabled: bool) -> bool {
@@ -31114,16 +31693,26 @@ fn provider_backend_runtime_preflight(
     hardware: &HardwareReport,
 ) -> Result<ProviderBackendRuntime> {
     let backend = selected.artifact.engine.as_str();
+    provider_backend_runtime_preflight_for_backend(home, backend, Some(&selected.verdict), hardware)
+        .with_context(|| {
+            format!(
+                "preparing the {backend} runtime for {}",
+                selected.model.model_id
+            )
+        })
+}
+
+fn provider_backend_runtime_preflight_for_backend(
+    home: &Path,
+    backend: &str,
+    verdict: Option<&BackendVerdict>,
+    hardware: &HardwareReport,
+) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
         "vllm" | "trt-llm" | "mlx" => {
-            let python =
-                python_runtime::ensure_backend_python(home, backend).with_context(|| {
-                    format!(
-                        "preparing the managed {backend} runtime before downloading {}",
-                        selected.model.model_id
-                    )
-                })?;
+            let python = python_runtime::ensure_backend_python(home, backend)
+                .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
             fs::create_dir_all(&cache_dir).with_context(|| {
                 format!("creating managed {backend} cache {}", cache_dir.display())
@@ -31178,7 +31767,10 @@ fn provider_backend_runtime_preflight(
                 "piper",
             )?);
         }
-        "llama.cpp" => provider_llama_accelerator_preflight(selected, hardware)?,
+        "llama.cpp" => provider_llama_accelerator_preflight(
+            verdict.and_then(|verdict| verdict.n_layers_gpu),
+            hardware,
+        )?,
         other => bail!("unsupported local provider session backend {other}"),
     }
     Ok(runtime)
@@ -31203,10 +31795,10 @@ fn stable_diffusion_accelerator(hardware: &HardwareReport) -> Result<Option<Stri
 }
 
 fn provider_llama_accelerator_preflight(
-    selected: &ProviderCandidate,
+    n_layers_gpu: Option<u32>,
     hardware: &HardwareReport,
 ) -> Result<()> {
-    if selected.verdict.n_layers_gpu.unwrap_or(0) == 0 {
+    if n_layers_gpu.unwrap_or(0) == 0 {
         return Ok(());
     }
     let has_nvidia = hardware
@@ -31235,7 +31827,7 @@ fn provider_llama_accelerator_preflight(
     }
     bail!(
         "llama.cpp selected {} GPU layers, but the current build has no accelerator matching the hwprobe verdict",
-        selected.verdict.n_layers_gpu.unwrap_or(0)
+        n_layers_gpu.unwrap_or(0)
     )
 }
 
@@ -43064,7 +43656,6 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         }
         "rpc_url" | "network.rpc_url" => Ok("network.rpc_url"),
         "gateway_url" | "network.gateway_url" => Ok("network.gateway_url"),
-        "paygate_url" | "network.paygate_url" => Ok("network.paygate_url"),
         "sc_bridge_url" | "network.sc_bridge_url" => Ok("network.sc_bridge_url"),
         "sc_bridge_token" | "network.sc_bridge_token" => Ok("network.sc_bridge_token"),
         "tnk_treasury_address" | "network.tnk_treasury_address" => {
@@ -43094,7 +43685,7 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -43708,8 +44299,7 @@ fn write_config(
             "mode = {}\n\n",
             "[network]\n",
             "rpc_url = {}\n",
-            "gateway_url = {}\n",
-            "paygate_url = {}\n"
+            "gateway_url = {}\n"
         ),
         toml_string(&wallet.public_key),
         toml_string(address),
@@ -43720,7 +44310,6 @@ fn write_config(
         toml_string(role.as_str()),
         toml_string(rpc_url),
         toml_string(DEFAULT_GATEWAY_URL),
-        toml_string(DEFAULT_PAYGATE_URL),
     );
     fs::write(&config_path, contents)
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -44172,14 +44761,10 @@ mod tests {
             "/tmp/mayhem-wallet/db/keypair.json",
             "--amount",
             "1.25",
-            "--token",
-            "0x2222222222222222222222222222222222222222",
-            "--pool",
-            "0x3333333333333333333333333333333333333333",
-            "--chain-id",
-            "61000",
-            "--rpc-url",
+            "--eth-rpc",
             "http://127.0.0.1:61000",
+            "--peer-rpc-url",
+            "http://127.0.0.1:49223/v1",
             "--confirm",
             "--json",
         ])
@@ -44195,8 +44780,11 @@ mod tests {
             args.wallet.keypair.as_deref(),
             Some(Path::new("/tmp/mayhem-wallet/db/keypair.json"))
         );
-        assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:61000"));
-        assert_eq!(args.chain_id, Some(61_000));
+        assert_eq!(args.eth_rpc.as_deref(), Some("http://127.0.0.1:61000"));
+        assert_eq!(
+            args.peer_rpc_url.as_deref(),
+            Some("http://127.0.0.1:49223/v1")
+        );
         assert!(!args.bind_only);
         assert!(args.confirm);
         assert!(args.json);
@@ -44256,12 +44844,8 @@ mod tests {
             "100",
             "--proof",
             "[]",
-            "--pool",
-            "0x3333333333333333333333333333333333333333",
-            "--token",
-            "0x2222222222222222222222222222222222222222",
-            "--chain-id",
-            "61000",
+            "--peer-rpc-url",
+            "http://127.0.0.1:49223/v1",
             "--json",
         ])
         .unwrap();
@@ -44274,6 +44858,10 @@ mod tests {
         );
         assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
         assert_eq!(args.proof.as_deref(), Some("[]"));
+        assert_eq!(
+            args.peer_rpc_url.as_deref(),
+            Some("http://127.0.0.1:49223/v1")
+        );
         assert!(!args.confirm);
         assert!(args.json);
 
@@ -53196,7 +53784,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn pay_checkout_extraction_requires_hosted_urls() {
-        let stripe = checkout_from_paygate_response(
+        let stripe = checkout_from_stripe_response(
             PayRail::Stripe,
             &json!({
                 "rail": "fiat",
@@ -53215,7 +53803,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(stripe.id, "cs_test");
         assert_eq!(stripe.reference.as_deref(), Some("pi_test"));
 
-        assert!(checkout_from_paygate_response(
+        assert!(checkout_from_stripe_response(
             PayRail::Stripe,
             &json!({
                 "rail": "fiat",
@@ -53227,7 +53815,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
         )
         .is_err());
-        assert!(checkout_from_paygate_response(
+        assert!(checkout_from_stripe_response(
             PayRail::Stripe,
             &json!({
                 "rail": "fiat",
@@ -53239,7 +53827,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
         )
         .is_err());
-        assert!(checkout_from_paygate_response(
+        assert!(checkout_from_stripe_response(
             PayRail::Stripe,
             &json!({
                 "rail": "fiat",
@@ -53338,18 +53926,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn pay_tnk_handoff_uses_deposit_binding_not_transfer_memo() {
-        let command = pay_tnk_deposit_intent_command(
-            "10.00",
-            "testtrac1treasury",
-            &"cd".repeat(32),
-            50_000_000_000_000_000,
-            None,
-            None,
-        );
+        let command = pay_tnk_deposit_intent_command("10.00", &"cd".repeat(32), None, None);
         assert!(!command.to_lowercase().contains("memo"));
         assert_eq!(
             command,
-            "mayhem pay tnk --amount '10.00' --treasury-address 'testtrac1treasury' --nonce 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd' --tnk-usd-au 50000000000000000 --submit-intent"
+            "mayhem pay tnk --amount '10.00' --nonce 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd' --submit-intent"
         );
     }
 
@@ -53357,17 +53938,15 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn pay_tnk_copy_paste_command_is_replayable() {
         let command = pay_tnk_deposit_intent_command(
             "10.25",
-            "testtrac1treasury",
             &"ab".repeat(32),
-            50_000_000_000_000_000,
             Some(Path::new("/tmp/mayhem/stores/main/db/keypair.json")),
             Some("http://127.0.0.1:49223/v1"),
         );
 
         assert!(command.starts_with("mayhem pay tnk "));
         assert!(command.contains("--amount '10.25'"));
-        assert!(command.contains("--treasury-address 'testtrac1treasury'"));
-        assert!(command.contains("--tnk-usd-au 50000000000000000"));
+        assert!(!command.contains("--treasury-address"));
+        assert!(!command.contains("--tnk-usd-au"));
         assert!(command.contains(" --submit-intent"));
         assert!(command.contains(" --keypair '/tmp/mayhem/stores/main/db/keypair.json'"));
         assert!(command.ends_with(" --rpc-url 'http://127.0.0.1:49223/v1'"));
@@ -53383,7 +53962,6 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 sc_bridge_token: None,
                 gateway_bind: None,
                 gateway_url: None,
-                paygate_url: None,
                 tnk_treasury_address: Some("testtrac1treasury".to_owned()),
             }),
             provider: None,
@@ -53588,7 +54166,6 @@ State initialization...
                 sc_bridge_token: None,
                 gateway_bind: None,
                 gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
-                paygate_url: None,
                 tnk_treasury_address: None,
             }),
             provider: None,
@@ -56941,6 +57518,42 @@ State initialization...
             .unwrap_err()
             .to_string()
             .contains("duplicate"));
+    }
+
+    #[test]
+    fn doctor_cli_parses_non_mutating_provider_runtime_preflight() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "doctor",
+            "--home",
+            "/tmp/mayhem-doctor",
+            "--provider-backend",
+            "auto",
+            "--skip-disk-bench",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-doctor")));
+        assert_eq!(args.provider_backend.as_deref(), Some("auto"));
+        assert!(args.skip_disk_bench);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn doctor_provider_backend_auto_uses_hwprobe_without_aliases() {
+        let linux = test_hardware(FixtureProfile::LinuxNvidia);
+        assert_eq!(
+            resolve_doctor_provider_backend("auto", &linux).unwrap(),
+            "vllm"
+        );
+        assert_eq!(
+            resolve_doctor_provider_backend("trt-llm", &linux).unwrap(),
+            "trt-llm"
+        );
+        assert!(resolve_doctor_provider_backend("trt_llm", &linux).is_err());
     }
 
     #[test]

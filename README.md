@@ -504,7 +504,31 @@ Attestation tiers describe what trust evidence a provider has. They don't all me
 
 The model catalog is signed and canonical: `mayhem models` reads the ledger anchor and verifies the signed catalog release, so you always discover current models without requiring a repo update. Providers opt into canonical enclaves the network operator creates — they do not set prices, create canonical rooms, or submit arbitrary models — which is what keeps every listed model a verified, hash-pinned artifact instead of a claim.
 
-The launch roster is being onboarded model by model right now; `mayhem models --gateway` is always the live truth. This section gets the full roster table once onboarding completes.
+The launch roster is being onboarded model by model right now; `mayhem models --gateway` is always the live truth. The table below lists the launch set in onboarding order, newest live model on top. Status moves to **live** as each model finishes calibration and its signed catalog entry is published.
+
+| Model | Category | Class | Status |
+|-------|----------|-------|--------|
+| `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
+| `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
+| `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
+| `deepreinforce-ai/Ornith-1.0-9B` | LLM, agentic | B | onboarding |
+| `mistralai/Devstral-Small-2-24B-Instruct-2512` | LLM, coding | C | onboarding |
+| `openai/gpt-oss-120b` | LLM, flagship | D | onboarding |
+| `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | onboarding |
+| `wepiqx/Qwythos-9B-Claude-Mythos-5-1M-MTP-SHQ8-GGUF` | LLM, 1M ctx, MTP | B | onboarding |
+| `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | onboarding |
+| `black-forest-labs/FLUX.2-klein-4B` | Image | B/C | onboarding |
+| `lodestones/Chroma1-HD` | Image, uncensored | C | onboarding |
+| `Qwen/Qwen-Image-2512` | Image, text rendering | C | onboarding |
+| `hexgrad/Kokoro-82M` | TTS (CPU-friendly) | A | onboarding |
+| `openai/whisper-large-v3-turbo` | ASR | A/B | onboarding |
+| `nvidia/parakeet-tdt-0.6b-v3` | ASR | A | onboarding |
+| `ACE-Step/Ace-Step1.5` | Music generation | B/C | onboarding |
+| `BAAI/bge-m3` | Embeddings (CPU-friendly) | A | onboarding |
+| `Qwen/Qwen3-Embedding-0.6B` | Embeddings (CPU-friendly) | A | onboarding |
+| `BAAI/bge-reranker-v2-m3` | Reranker (CPU-friendly) | A | onboarding |
+
+Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. All launch models are Apache/MIT/CC-BY licensed. Larger flagships join after launch as capable hardware comes online.
 
 **Routes:**
 

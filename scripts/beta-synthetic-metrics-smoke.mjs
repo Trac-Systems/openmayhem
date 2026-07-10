@@ -268,9 +268,9 @@ function buildParticipants(outDir, providerIds) {
 }
 
 function buildPaymentRailEvidence(outDir) {
-  const paygateHealth = writeJson(path.join(outDir, 'paygate-health.json'), {
+  const paymentDirectory = writeJson(path.join(outDir, 'payment-directory.json'), {
     ok: true,
-    paygate_admin_controls_verified: true,
+    admin_payment_directory_verified: true,
     fiat_enabled: true,
     tap_enabled: true,
     stripe_processor_enabled: true,
@@ -303,9 +303,9 @@ function buildPaymentRailEvidence(outDir) {
       tnk_enabled: true,
       stripe_processor_enabled: true,
       rails_credit_au_usd: true,
-      paygate_admin_controls_verified: true,
+      admin_payment_directory_verified: true,
       evidence: [
-        fileEvidence(paygateHealth, ['paygate_admin_controls']),
+        fileEvidence(paymentDirectory, ['admin_payment_directory']),
         fileEvidence(fiatCredit, ['rail:fiat', 'processor:stripe', 'credits_au_usd']),
         fileEvidence(tapCredit, ['rail:tap', 'credits_au_usd']),
         fileEvidence(tnkCredit, ['rail:tnk', 'credits_au_usd']),
@@ -491,16 +491,22 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
     catalog: {
       path: relativeFile(syntheticCatalog.catalogPath),
     },
-    paygate: {
-      public_base_url: 'https://paygate.trac.network',
-      health_path: '/v1/health',
-      tnk_treasury_address: testtracAddress,
-      stripe_enabled: true,
-      checkout_urls: {
-        stripe: {
-          success_url: 'https://paygate.trac.network/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}',
-          cancel_url: 'https://paygate.trac.network/v1/stripe/cancel',
-        },
+    payments: {
+      version: 1,
+      rails: ['fiat', 'tap', 'tnk'],
+      fiat: {
+        processor: 'stripe',
+        currencies: ['usd', 'eur'],
+        locale: 'en',
+      },
+      tap: {
+        chain_id: 1,
+        token_address: `0x${'11'.repeat(20)}`,
+        pool_address: `0x${'22'.repeat(20)}`,
+      },
+      tnk: {
+        network: 'testnet1',
+        treasury_address: testtracAddress,
       },
     },
     epoch_wallet: {

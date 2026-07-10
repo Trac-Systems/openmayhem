@@ -35,12 +35,24 @@ export async function submitMayhemFeature(peer, body) {
   return await registered.relay(key, body.value);
 }
 
+export async function requestStripeCheckout(peer, body) {
+  if (!isObject(body)) throw new Error('Missing JSON body.');
+  if (typeof body.who !== 'string' || !body.who.trim()) throw new Error('Missing who.');
+  const registered = peer.protocol?.instance?.features?.mayhem;
+  if (!registered || typeof registered.requestService !== 'function') {
+    throw new Error('Mayhem service relay is not ready.');
+  }
+  return await registered.requestService('stripe_checkout', body);
+}
+
 const errorResponse = (error) => {
   if (error?.code === 'BODY_TOO_LARGE') return [413, error.message];
   if (error?.code === 'BAD_JSON') return [400, error.message];
   const message = String(error?.message || '');
   if (/^(Missing|Invalid|Empty|Peer subnet is not writable)/.test(message)) return [400, message];
-  if (message.startsWith('Mayhem feature relay')) return [503, message];
+  if (message.startsWith('Mayhem feature relay') || message.startsWith('Mayhem service relay')) {
+    return [503, message];
+  }
   return [500, 'An internal error occurred.'];
 };
 
@@ -67,6 +79,10 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/contract/feature') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await submitMayhemFeature(peer, body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/payment/stripe/checkout') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestStripeCheckout(peer, body));
       }
       for (const route of sortedRoutes) {
         if (req.method !== route.method || requestPath !== route.path) continue;

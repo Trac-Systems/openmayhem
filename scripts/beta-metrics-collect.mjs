@@ -515,10 +515,10 @@ function collectCanonicalService(args) {
   };
 }
 
-function paygateAdminControlsVerified(value) {
+function paymentDirectoryAdminControlsVerified(value) {
   const controls = firstDefined(value, [
     'payment_rails.controls',
-    'paygate.controls',
+    'payments.controls',
     'controls',
   ]);
   if (!controls || typeof controls !== 'object' || Array.isArray(controls)) return false;
@@ -550,8 +550,8 @@ function collectPaymentRails(args) {
   const value = source.value;
   const record = firstDefined(value, ['payment_rails']) ?? value;
   const stripeProcessorEnabled =
-    firstDefined(record, ['stripe_processor_enabled', 'stripe.enabled', 'paygate.stripe_enabled', 'rails.stripe.enabled']) === true
-    || firstDefined(value, ['paygate.stripe_enabled', 'rails.stripe.enabled']) === true
+    firstDefined(record, ['stripe_processor_enabled', 'stripe.enabled', 'rails.stripe.enabled']) === true
+    || firstDefined(value, ['rails.stripe.enabled']) === true
     || firstDefined(record, ['stripe_enabled']) === true;
   return {
     ledger_denom: firstDefined(record, ['ledger_denom', 'denom', 'network.denom']) ?? firstDefined(value, ['network.denom']),
@@ -562,9 +562,9 @@ function collectPaymentRails(args) {
     tnk_enabled: firstDefined(record, ['tnk_enabled', 'tnk.enabled', 'rails.tnk.enabled']) === true,
     stripe_processor_enabled: stripeProcessorEnabled,
     rails_credit_au_usd: firstDefined(record, ['rails_credit_au_usd', 'credit_au_usd', 'credits_au_usd']) === true,
-    paygate_admin_controls_verified:
-      firstDefined(record, ['paygate_admin_controls_verified', 'admin_economy_controls_verified']) === true
-      || paygateAdminControlsVerified(value),
+    admin_payment_directory_verified:
+      firstDefined(record, ['admin_payment_directory_verified']) === true
+      || paymentDirectoryAdminControlsVerified(value),
     evidence: [
       source.evidence,
       ...asEvidenceArray(value, ['payment_rails.evidence', 'evidence']),

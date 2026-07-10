@@ -565,6 +565,17 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('setPayments', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        fiat: { type: 'any' },
+        tap: { type: 'any' },
+        tnk: { type: 'any' },
+      },
+    });
+
     this.addSchema('readParams', {
       value: {
         $$strict: true,
@@ -1832,6 +1843,30 @@ class MayhemContract extends Contract {
     });
     console.log('mayhem setParams', update);
     return { ok: true, op: 'setParams', ver, effective_at: this.value.effective_at, keys };
+  }
+
+  async setPayments() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const normalized = this.normalizePaymentConfig(this.value);
+    if (normalized instanceof Error) return normalized;
+    const current = await this.get('payments/current');
+    if (current && this.value.ver <= current.ver) {
+      return new Error('Payment config version must increase.');
+    }
+    const record = {
+      denom: PRICE_DENOMINATION,
+      rails: PROVIDER_ACCEPTED_RAIL_ORDER.slice(),
+      ...normalized,
+      ver: this.value.ver,
+      updated_at: this.tx,
+      set_by: this.address,
+      set_by_role: 'admin',
+    };
+    await this.put('payments/current', record);
+    console.log('mayhem setPayments', record);
+    return { ok: true, op: 'setPayments', ver: record.ver };
   }
 
   async readParams() {
@@ -6843,6 +6878,92 @@ class MayhemContract extends Contract {
       return new Error('Invalid model reference source hash.');
     }
     return null;
+  }
+
+  normalizePaymentConfig(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'ver', 'fiat', 'tap', 'tnk'],
+      'payment config'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'set_payments') return new Error('Invalid set_payments op.');
+    if (!Number.isSafeInteger(value.ver) || value.ver <= 0) {
+      return new Error('Payment config version must be a positive safe integer.');
+    }
+
+    const fiatShape = this.validateExactObjectKeys(
+      value.fiat,
+      ['processor', 'currencies', 'locale'],
+      'fiat payment config'
+    );
+    if (fiatShape) return fiatShape;
+    if (value.fiat.processor !== 'stripe') return new Error('Fiat processor must be stripe.');
+    if (!Array.isArray(value.fiat.currencies) || value.fiat.currencies.length < 1) {
+      return new Error('Fiat currencies must be a non-empty array.');
+    }
+    const fiatCurrencies = [];
+    for (const currency of value.fiat.currencies) {
+      const normalized = this.normalizeFiatCurrency(currency);
+      if (normalized instanceof Error) return normalized;
+      if (fiatCurrencies.includes(normalized)) return new Error('Duplicate fiat currency.');
+      fiatCurrencies.push(normalized);
+    }
+    fiatCurrencies.sort((left, right) => ['usd', 'eur'].indexOf(left) - ['usd', 'eur'].indexOf(right));
+    if (value.fiat.locale !== 'en') return new Error('Stripe checkout locale must be en.');
+
+    const tapShape = this.validateExactObjectKeys(
+      value.tap,
+      ['chain_id', 'token_address', 'pool_address'],
+      'TAP payment config'
+    );
+    if (tapShape) return tapShape;
+    if (!Number.isSafeInteger(value.tap.chain_id) || value.tap.chain_id <= 0) {
+      return new Error('Invalid TAP chain id.');
+    }
+    if (!this.isEthHexBytes(value.tap.token_address, 20)) {
+      return new Error('Invalid TAP token address.');
+    }
+    if (!this.isEthHexBytes(value.tap.pool_address, 20)) {
+      return new Error('Invalid TAP pool address.');
+    }
+
+    const tnkShape = this.validateExactObjectKeys(
+      value.tnk,
+      ['network', 'treasury_address'],
+      'TNK payment config'
+    );
+    if (tnkShape) return tnkShape;
+    if (!['mainnet', 'testnet1'].includes(value.tnk.network)) {
+      return new Error('TNK network must be mainnet or testnet1.');
+    }
+    if (typeof value.tnk.treasury_address !== 'string' ||
+        !/^(trac1|testtrac1)[a-z0-9]{20,120}$/.test(value.tnk.treasury_address)) {
+      return new Error('Invalid TNK treasury address.');
+    }
+    if (value.tnk.network === 'mainnet' && !value.tnk.treasury_address.startsWith('trac1')) {
+      return new Error('TNK mainnet treasury must use a trac1 address.');
+    }
+    if (value.tnk.network === 'testnet1' && !value.tnk.treasury_address.startsWith('testtrac1')) {
+      return new Error('TNK testnet1 treasury must use a testtrac1 address.');
+    }
+
+    return {
+      fiat: {
+        processor: 'stripe',
+        currencies: fiatCurrencies,
+        locale: 'en',
+      },
+      tap: {
+        chain_id: value.tap.chain_id,
+        token_address: value.tap.token_address.toLowerCase(),
+        pool_address: value.tap.pool_address.toLowerCase(),
+      },
+      tnk: {
+        network: value.tnk.network,
+        treasury_address: value.tnk.treasury_address,
+      },
+    };
   }
 
   validateCatalogRelease(value) {

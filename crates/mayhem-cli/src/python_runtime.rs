@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
@@ -184,7 +185,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             import_name: "vllm",
             version: "0.24.0",
             requirements: VLLM_REQUIREMENTS,
-            requirements_sha256: "13bac7dc6e708d6176792e5e93c9067ebf4f772960cba7a626b71d4aae4a1d2c",
+            requirements_sha256: "51826622021f8d2fb22495b12bb9d2724b7ed1245c149754af9def3f41fad4b2",
             min_free_bytes: 8 * GIB,
         }),
         "trt-llm" => Some(PythonRuntimeSpec {
@@ -204,7 +205,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             import_name: "mlx_lm",
             version: "0.31.3",
             requirements: MLX_REQUIREMENTS,
-            requirements_sha256: "5dc4a038a260c2db6e72a1025842f2d8d229bd4e87f95f2f757ac61ec49aaa40",
+            requirements_sha256: "d3167fca548be3265d62c6397f6ded6a688017b3d37de1ed4eed5eabf16b9747",
             min_free_bytes: 2 * GIB,
         }),
         _ => None,
@@ -224,9 +225,18 @@ fn verify_requirements(spec: &PythonRuntimeSpec) -> Result<()> {
     let text = std::str::from_utf8(spec.requirements)
         .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
     let expected = format!("{}=={}", spec.distribution, spec.version);
-    if text.lines().filter(|line| !line.trim().is_empty()).count() != 1 || text.trim() != expected {
+    let pairs = exact_requirement_pairs(text).with_context(|| {
+        format!(
+            "embedded {} requirements must contain only exact name==version pins",
+            spec.backend
+        )
+    })?;
+    if !pairs
+        .iter()
+        .any(|(distribution, version)| distribution == spec.distribution && version == spec.version)
+    {
         bail!(
-            "embedded {} requirements must contain exactly {}",
+            "embedded {} requirements must include {}",
             spec.backend,
             expected
         );
@@ -234,9 +244,39 @@ fn verify_requirements(spec: &PythonRuntimeSpec) -> Result<()> {
     Ok(())
 }
 
+fn exact_requirement_pairs(text: &str) -> Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (distribution, version) = line
+            .split_once("==")
+            .with_context(|| format!("requirement {line:?} is not exactly pinned"))?;
+        if distribution.is_empty()
+            || version.is_empty()
+            || version.contains("==")
+            || distribution.contains(char::is_whitespace)
+            || version.contains(char::is_whitespace)
+        {
+            bail!("requirement {line:?} is not a plain name==version pin");
+        }
+        let normalized = distribution.to_ascii_lowercase().replace('_', "-");
+        if !seen.insert(normalized) {
+            bail!("duplicate requirement distribution {distribution}");
+        }
+        pairs.push((distribution.to_owned(), version.to_owned()));
+    }
+    if pairs.is_empty() {
+        bail!("requirements manifest is empty");
+    }
+    Ok(pairs)
+}
+
 fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
+    let text = std::str::from_utf8(spec.requirements)
+        .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
+    let expected_versions = serde_json::to_string(&exact_requirement_pairs(text)?)?;
     let script = format!(
-        "import importlib.metadata as m; import {}; print(m.version({:?}))",
+        "import importlib.metadata as m; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); import {}; print(m.version({:?}))",
         spec.import_name, spec.distribution
     );
     let output = Command::new(python)
@@ -245,11 +285,17 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
         .output()
         .with_context(|| format!("starting {}", python.display()))?;
     if !output.status.success() {
+        let detail = command_output_detail(&output);
         bail!(
-            "{} could not import {}=={}",
+            "{} could not validate {}=={}{}",
             python.display(),
             spec.distribution,
-            spec.version
+            spec.version,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         );
     }
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -263,6 +309,19 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn command_output_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    let mut chars = detail.chars().rev().take(2_000).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 fn resolve_base_python() -> Result<PathBuf> {
@@ -301,11 +360,17 @@ mod tests {
         for backend in ["vllm", "trt-llm", "mlx"] {
             let spec = python_runtime_spec(backend).expect("known backend");
             verify_requirements(&spec).expect("requirements verify");
-            assert!(std::str::from_utf8(spec.requirements)
-                .unwrap()
-                .trim()
-                .contains("=="));
+            let pairs = exact_requirement_pairs(std::str::from_utf8(spec.requirements).unwrap())
+                .expect("all requirements are exact");
+            assert!(!pairs.is_empty());
         }
+    }
+
+    #[test]
+    fn requirements_reject_ranges_options_and_duplicates() {
+        assert!(exact_requirement_pairs("mlx-lm>=0.31.3\n").is_err());
+        assert!(exact_requirement_pairs("--extra-index-url https://example.invalid\n").is_err());
+        assert!(exact_requirement_pairs("mlx-lm==0.31.3\nmlx_lm==0.31.3\n").is_err());
     }
 
     #[test]

@@ -4,8 +4,9 @@ import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
   requestIdFor,
+  serviceRequestIdFor,
 } from '../features/mayhem/index.js';
-import { createServer, submitMayhemFeature } from '../src/rpc.js';
+import { createServer, requestStripeCheckout, submitMayhemFeature } from '../src/rpc.js';
 
 const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
@@ -76,6 +77,16 @@ const consentValue = (sender = providerKey) => ({
   ver: 1,
   hash: 'rules-hash',
   sig: 'dd'.repeat(64),
+});
+
+const stripeCheckoutValue = (who = providerKey) => ({
+  who,
+  au: '1000000000000000000',
+  currency: 'usd',
+  locale: 'en',
+  success_url: 'https://stripe.com',
+  cancel_url: 'https://stripe.com',
+  idempotency_key: 'checkout-test-1',
 });
 
 test('read-only participant relays a signed feature to the sole admin writer', async () => {
@@ -409,6 +420,102 @@ test('read-only user relays a dual-signed TAP account binding to the admin appen
   assert.equal(writer.appended.length, 1);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+});
+
+test('read-only user requests Stripe checkout from the admin service without appending', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async serviceHandler(service, value) {
+      serviceCalls += 1;
+      assert.equal(service, 'stripe_checkout');
+      assert.deepEqual(value, stripeCheckoutValue());
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        checkout_session: {
+          id: 'cs_live_test',
+          url: 'https://checkout.stripe.com/c/pay/cs_live_test',
+        },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await requestStripeCheckout(participant.peer, stripeCheckoutValue());
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(result.checkout_session.url, 'https://checkout.stripe.com/c/pay/cs_live_test');
+  assert.equal(serviceCalls, 1);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+  assert.equal(writer.flushes.length, 0);
+});
+
+test('Stripe service relay binds the request identity and deduplicates retries', async () => {
+  const participant = peerFor(providerKey);
+  const participantFeature = new MayhemFeature(participant.peer, {});
+  participantFeature.key = 'mayhem';
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+  await assert.rejects(
+    participantFeature.requestService('stripe_checkout', stripeCheckoutValue(otherKey)),
+    /Invalid Mayhem service request identity/
+  );
+  assert.equal(broadcasts, 0);
+
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const writerFeature = new MayhemFeature(writer.peer, {
+    async serviceHandler() {
+      serviceCalls += 1;
+      return { ok: true, checkout_session: { url: 'https://checkout.stripe.com/c/pay/test' } };
+    },
+  });
+  writerFeature.key = 'mayhem';
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: () => true,
+    broadcast: () => true,
+  };
+  const value = stripeCheckoutValue();
+  const requestId = serviceRequestIdFor('stripe_checkout', value);
+  const payload = {
+    from: providerKey,
+    sig: `signed:${providerKey}`,
+    message: {
+      control: 'mayhem_service_request',
+      version: 1,
+      request_id: requestId,
+      service: 'stripe_checkout',
+      value,
+    },
+  };
+
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  assert.equal(serviceCalls, 1);
+  assert.equal(writer.appended.length, 0);
 });
 
 test('admin-writer RPC keeps the local append path', async () => {

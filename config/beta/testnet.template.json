@@ -55,16 +55,22 @@
     "sc_bridge_url": "ws://127.0.0.1:49222",
     "sc_bridge_token_env": "MAYHEM_BETA_SC_TOKEN"
   },
-  "paygate": {
-    "public_base_url": "<https://paygate.testnet.example>",
-    "health_path": "/v1/health",
-    "tnk_treasury_address": "<testtrac1-network-treasury-address>",
-    "stripe_enabled": true,
-    "checkout_urls": {
-      "stripe": {
-        "success_url": "<https://paygate.testnet.example/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}>",
-        "cancel_url": "<https://paygate.testnet.example/v1/stripe/cancel>"
-      }
+  "payments": {
+    "version": 1,
+    "rails": ["fiat", "tap", "tnk"],
+    "fiat": {
+      "processor": "stripe",
+      "currencies": ["usd", "eur"],
+      "locale": "en"
+    },
+    "tap": {
+      "chain_id": 1,
+      "token_address": "<0x-canonical-TAP-token-address>",
+      "pool_address": "<0x-MayhemInferencePool-address>"
+    },
+    "tnk": {
+      "network": "testnet1",
+      "treasury_address": "<testtrac1-network-treasury-address>"
     }
   },
   "epoch_wallet": {

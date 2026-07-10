@@ -26,9 +26,9 @@
     "tnk_enabled": true,
     "stripe_processor_enabled": true,
     "rails_credit_au_usd": true,
-    "paygate_admin_controls_verified": true,
+    "admin_payment_directory_verified": true,
     "evidence": [
-      "<file:paygate-health.json#sha256:64-hex#paygate_admin_controls>",
+      "<file:payment-directory.json#sha256:64-hex#admin_payment_directory>",
       "<file:fiat-credit-proof.json#sha256:64-hex#rail:fiat#processor:stripe#credits_au_usd>",
       "<file:tap-credit-proof.json#sha256:64-hex#rail:tap#credits_au_usd>",
       "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_au_usd>"

@@ -62,7 +62,7 @@
     "key_env": {
       "admin_trac_keypair_path": "MAYHEM_TRAC_ADMIN_KEYPAIR_PATH",
       "tnk_epoch_treasury_keypair_path": "MAYHEM_TNK_TREASURY_KEYPAIR_PATH",
-      "paygate_oracle_key_path": "MAYHEM_PAYGATE_ORACLE_KEY_PATH",
+      "stripe_oracle_key_path": "MAYHEM_STRIPE_ORACLE_KEY_PATH",
       "catalog_admin_seed_hex": "MAYHEM_CATALOG_ADMIN_SEED_HEX",
       "tap_deployer_private_key": "MAYHEM_TAP_DEPLOYER_PRIVATE_KEY",
       "tap_roller_private_key": "MAYHEM_TAP_ROLLER_PRIVATE_KEY",
@@ -145,8 +145,9 @@
     "fiat": {
       "processor": "stripe",
       "mode": "live",
-      "public_base_url": "<https://paygate.mainnet.example>",
-      "webhook_path": "/v1/stripe/webhook",
+      "currencies": ["usd", "eur"],
+      "locale": "en",
+      "event_collection": "stripe_api_polling",
       "connect_enabled": true
     }
   },

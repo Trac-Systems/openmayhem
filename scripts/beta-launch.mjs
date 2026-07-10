@@ -296,39 +296,6 @@ function validatePublicLaunchHostname(add, parsed, name) {
   }
 }
 
-function validatePaygatePublicBase(add, paygate) {
-  requireString(add, paygate.public_base_url, 'paygate.public_base_url', httpsUrl);
-  const parsed = parseCheckedUrl(add, paygate.public_base_url, 'paygate.public_base_url');
-  if (!parsed) return null;
-  if (parsed.protocol !== 'https:') {
-    add('error', 'paygate.public_base_url must use https');
-  }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    add('error', 'paygate.public_base_url must not include credentials, query, or fragment');
-  }
-  validatePublicLaunchHostname(add, parsed, 'paygate.public_base_url');
-  return parsed.origin;
-}
-
-function requireProcessorCheckoutUrl(add, value, name, processor, expectedPathSegment, expectedOrigin = null) {
-  requireString(add, value, name, httpsUrl);
-  const parsed = parseCheckedUrl(add, value, name);
-  if (!parsed) return;
-  if (parsed.protocol !== 'https:') {
-    add('error', `${name} must use https`);
-  }
-  if (expectedOrigin && parsed.origin !== expectedOrigin) {
-    add('error', `${name} must use the paygate public_base_url origin ${expectedOrigin}`);
-  }
-  validatePublicLaunchHostname(add, parsed, name);
-  const segments = parsed.pathname.split('/').filter(Boolean);
-  const last = segments.at(-1);
-  const previous = segments.at(-2);
-  if (previous !== processor || last !== expectedPathSegment) {
-    add('error', `${name} must end with /${processor}/${expectedPathSegment}`);
-  }
-}
-
 function validateHttpsDownloadUrl(add, value, name) {
   requireString(add, value, name, httpsUrl);
   const parsed = parseCheckedUrl(add, value, name);
@@ -446,20 +413,6 @@ function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
     }
   } catch (error) {
     add('error', `${name}.admin_signature verification failed: ${error.message}`);
-  }
-}
-
-function validateCheckoutUrls(add, paygate, expectedOrigin = null) {
-  if (!requireObject(add, paygate.checkout_urls, 'paygate.checkout_urls')) return;
-  const activeProcessors = ['stripe'];
-  requireOnlyKeys(add, paygate.checkout_urls, 'paygate.checkout_urls', activeProcessors);
-  for (const processor of activeProcessors) {
-    const processorConfig = paygate.checkout_urls[processor];
-    const prefix = `paygate.checkout_urls.${processor}`;
-    if (!requireObject(add, processorConfig, prefix)) continue;
-    requireOnlyKeys(add, processorConfig, prefix, ['success_url', 'cancel_url']);
-    requireProcessorCheckoutUrl(add, processorConfig.success_url, `${prefix}.success_url`, processor, 'return', expectedOrigin);
-    requireProcessorCheckoutUrl(add, processorConfig.cancel_url, `${prefix}.cancel_url`, processor, 'cancel', expectedOrigin);
   }
 }
 
@@ -793,7 +746,7 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     'catalog',
     'controls',
     'admin',
-    'paygate',
+    'payments',
     'epoch_wallet',
     'canary',
     'evidence',
@@ -882,19 +835,30 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     requireString(add, manifest.admin.sc_bridge_url, 'admin.sc_bridge_url');
   }
 
-  if (requireObject(add, manifest.paygate, 'paygate')) {
-    requireOnlyKeys(add, manifest.paygate, 'paygate', [
-      'public_base_url',
-      'health_path',
-      'tnk_treasury_address',
-      'stripe_enabled',
-      'checkout_urls',
-    ]);
-    const paygateOrigin = validatePaygatePublicBase(add, manifest.paygate);
-    requireString(add, manifest.paygate.health_path, 'paygate.health_path');
-    requireString(add, manifest.paygate.tnk_treasury_address, 'paygate.tnk_treasury_address', testtracAddress);
-    requireLiteral(add, manifest.paygate.stripe_enabled, true, 'paygate.stripe_enabled');
-    validateCheckoutUrls(add, manifest.paygate, paygateOrigin);
+  if (requireObject(add, manifest.payments, 'payments')) {
+    requireOnlyKeys(add, manifest.payments, 'payments', ['version', 'rails', 'fiat', 'tap', 'tnk']);
+    requirePositiveInteger(add, manifest.payments.version, 'payments.version');
+    requireStringArray(add, manifest.payments.rails, 'payments.rails', 3);
+    if (stableJson(manifest.payments.rails) !== stableJson(['fiat', 'tap', 'tnk'])) {
+      add('error', 'payments.rails must be exactly fiat,tap,tnk');
+    }
+    if (requireObject(add, manifest.payments.fiat, 'payments.fiat')) {
+      requireOnlyKeys(add, manifest.payments.fiat, 'payments.fiat', ['processor', 'currencies', 'locale']);
+      requireLiteral(add, manifest.payments.fiat.processor, 'stripe', 'payments.fiat.processor');
+      requireStringArray(add, manifest.payments.fiat.currencies, 'payments.fiat.currencies', 1);
+      requireLiteral(add, manifest.payments.fiat.locale, 'en', 'payments.fiat.locale');
+    }
+    if (requireObject(add, manifest.payments.tap, 'payments.tap')) {
+      requireOnlyKeys(add, manifest.payments.tap, 'payments.tap', ['chain_id', 'token_address', 'pool_address']);
+      requireNumberRange(add, manifest.payments.tap.chain_id, 'payments.tap.chain_id', { min: 1 });
+      requireString(add, manifest.payments.tap.token_address, 'payments.tap.token_address', /^0x[0-9a-fA-F]{40}$/);
+      requireString(add, manifest.payments.tap.pool_address, 'payments.tap.pool_address', /^0x[0-9a-fA-F]{40}$/);
+    }
+    if (requireObject(add, manifest.payments.tnk, 'payments.tnk')) {
+      requireOnlyKeys(add, manifest.payments.tnk, 'payments.tnk', ['network', 'treasury_address']);
+      requireLiteral(add, manifest.payments.tnk.network, 'testnet1', 'payments.tnk.network');
+      requireString(add, manifest.payments.tnk.treasury_address, 'payments.tnk.treasury_address', testtracAddress);
+    }
   }
 
   if (requireObject(add, manifest.epoch_wallet, 'epoch_wallet')) {
@@ -1206,22 +1170,6 @@ function commaList(values) {
   return Array.isArray(values) && values.length > 0 ? values.join(',') : '';
 }
 
-function joinUrl(base, suffix) {
-  if (!base) return '';
-  const rawSuffix = suffix.startsWith('/') ? suffix : `/${suffix}`;
-  if (base.startsWith('<') && base.endsWith('>')) {
-    const inner = base.slice(1, -1).replace(/\/+$/, '');
-    return `<${inner}${rawSuffix}>`;
-  }
-  return `${base.replace(/\/+$/, '')}${rawSuffix}`;
-}
-
-function railCheckoutUrl(paygate, rail, field) {
-  return paygate.checkout_urls?.[rail]?.[field]
-    || paygate[field]
-    || `<${rail}-${field.replace('_', '-')}>`;
-}
-
 async function deriveRoomId(enclaveId, creator, nonce) {
   const digest = await blake3(Buffer.from(`${enclaveId}${creator}${nonce}`));
   return Buffer.from(digest).toString('hex').slice(0, 32);
@@ -1248,13 +1196,11 @@ async function buildCommands(manifest) {
   const subnet = network.subnet || {};
   const dht = network.dht || {};
   const admin = manifest.admin || {};
-  const paygate = manifest.paygate || {};
+  const payments = manifest.payments || {};
   const scTokenEnv = admin.sc_bridge_token_env || 'MAYHEM_BETA_SC_TOKEN';
   const peerDht = commaList(dht.peer_bootstrap);
   const msbDht = commaList(dht.msb_bootstrap);
   const adminStore = admin.store_name || 'mayhem-beta-admin';
-  const paygateBase = String(paygate.public_base_url || '').replace(/\/+$/, '');
-  const healthPath = String(paygate.health_path || '/v1/health');
   const roomByLabel = new Map();
   for (const enclave of manifest.canonical_enclaves || []) {
     for (const room of enclave.rooms || []) {
@@ -1278,6 +1224,13 @@ async function buildCommands(manifest) {
   const adminSetupTxs = [];
   const adminPayoutTxs = [];
   const providerLifecycleCommands = [];
+  adminSetupTxs.push(txCommand({
+    op: 'set_payments',
+    ver: payments.version,
+    fiat: payments.fiat,
+    tap: payments.tap,
+    tnk: payments.tnk,
+  }));
   for (const enclave of manifest.canonical_enclaves || []) {
     adminSetupTxs.push(txCommand({
       op: 'set_model_ref',
@@ -1344,10 +1297,11 @@ async function buildCommands(manifest) {
     }
   }
 
-  const paygateHealthUrl = paygateBase ? joinUrl(paygateBase, healthPath) : '';
   const checkoutCommands = [
-    `mayhem pay tnk --rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')} --treasury-address ${sh(paygate.tnk_treasury_address || '<tnk-treasury-address>')} --amount 10`,
-    `mayhem pay stripe --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(railCheckoutUrl(paygate, 'stripe', 'success_url'))} --cancel-url ${sh(railCheckoutUrl(paygate, 'stripe', 'cancel_url'))}`,
+    `mayhem payments --rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')}`,
+    `mayhem pay tnk --rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')} --amount 10`,
+    `mayhem pay tap --peer-rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')} --amount-tap 10`,
+    `mayhem pay stripe --rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')} --amount 10 --no-open`,
   ];
 
   return {
@@ -1371,7 +1325,6 @@ async function buildCommands(manifest) {
       { label: 'provider lifecycle feature commands', commands: providerLifecycleCommands },
       { label: 'admin provider payout commands', commands: adminPayoutTxs },
     ],
-    paygateHealthUrl,
     checkoutCommands,
     emergencyBan: txCommand({
       op: 'ban_provider',
@@ -1400,11 +1353,6 @@ function printHuman(report, commands, { args }) {
     console.log('');
     console.log(`Copy/paste ${step.label}:`);
     for (const command of step.commands) console.log(command);
-  }
-
-  if (commands.paygateHealthUrl) {
-    console.log('');
-    console.log(`Copy/paste paygate health URL: ${commands.paygateHealthUrl}`);
   }
 
   console.log('');
