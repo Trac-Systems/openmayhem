@@ -4878,6 +4878,10 @@ struct ProviderServeAddArgs {
     #[arg(long)]
     gpu_layers: Option<u32>,
 
+    /// Maximum context tokens this provider commits to serve for the selected enclave.
+    #[arg(long)]
+    ctx: Option<u64>,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
@@ -30340,7 +30344,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         fixture: None,
         disk_path: None,
         skip_disk_bench: false,
-        ctx: None,
+        ctx: args.ctx,
         memory_reserve: None,
         json: true,
         dev_skip_catalog_verify: false,
@@ -46872,6 +46876,8 @@ mod tests {
             "enclave-a",
             "--gpu-layers",
             "35",
+            "--ctx",
+            "131072",
             "--json",
         ])
         .unwrap();
@@ -46886,6 +46892,7 @@ mod tests {
         };
         assert_eq!(args.enclave, "enclave-a");
         assert_eq!(args.gpu_layers, Some(35));
+        assert_eq!(args.ctx, Some(131_072));
         assert!(args.json);
 
         let serve_remove = Cli::try_parse_from([
