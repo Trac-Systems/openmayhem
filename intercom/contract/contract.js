@@ -1749,6 +1749,13 @@ class MayhemContract extends Contract {
     };
     await this.put(`rules/${rules.ver}`, rules);
     await this.put(CURRENT_RULES_KEY, rules);
+    if ((await this.get('epoch/apply/state')) === null) {
+      await this.put('epoch/apply/state', {
+        updated_epoch: 0,
+        updated_at: null,
+        last_apply_hash: null,
+      });
+    }
     console.log('mayhem setRules', rules);
     return { ok: true, op: 'setRules', rules };
   }

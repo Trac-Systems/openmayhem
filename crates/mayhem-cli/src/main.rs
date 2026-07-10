@@ -40819,10 +40819,18 @@ async fn provider_session_spend_reservation_decision(
 }
 
 async fn active_billing_epoch(rpc: &PeerRpcClient) -> Result<u64> {
-    let updated_epoch = read_state_value(rpc, "epoch/apply/state")
-        .await?
-        .and_then(|value| value.get("updated_epoch").and_then(Value::as_u64))
-        .unwrap_or(0);
+    let state = read_state_value(rpc, "epoch/apply/state").await?;
+    active_billing_epoch_from_state(state.as_ref())
+}
+
+fn active_billing_epoch_from_state(state: Option<&Value>) -> Result<u64> {
+    let updated_epoch = state
+        .context(
+            "epoch/apply/state is unavailable; the read-only contract replica is not synchronized",
+        )?
+        .get("updated_epoch")
+        .and_then(Value::as_u64)
+        .context("epoch/apply/state missing updated_epoch")?;
     updated_epoch
         .checked_add(1)
         .context("active billing epoch overflowed")
@@ -49612,6 +49620,20 @@ mod tests {
             }
             other => panic!("bracketed non-text session should reject: {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_billing_epoch_requires_synchronized_contract_state() {
+        let missing = active_billing_epoch_from_state(None).unwrap_err();
+        assert!(missing.to_string().contains("replica is not synchronized"));
+
+        let malformed = active_billing_epoch_from_state(Some(&json!({}))).unwrap_err();
+        assert!(malformed.to_string().contains("missing updated_epoch"));
+
+        assert_eq!(
+            active_billing_epoch_from_state(Some(&json!({ "updated_epoch": 7 }))).unwrap(),
+            8
+        );
     }
 
     #[test]

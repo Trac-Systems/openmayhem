@@ -36,6 +36,13 @@ test('MayhemContract consent gates ops and requires re-consent after rules bump'
       activated_at: makeTxKey(1),
     },
   });
+  assert.deepEqual(await storage.get('epoch/apply/state'), {
+    value: {
+      updated_epoch: 0,
+      updated_at: null,
+      last_apply_hash: null,
+    },
+  });
 
   const beforeConsent = await execute(
     contract,
