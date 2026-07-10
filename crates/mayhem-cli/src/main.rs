@@ -1901,9 +1901,12 @@ struct DepositStatusArgs {
 
 #[derive(Debug, Parser)]
 struct WithdrawArgs {
-    /// External TAP wallet address receiving the claim.
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
+
+    /// TAP wallet receiving the claim. Defaults to the local wallet's Ethereum address.
     #[arg(long)]
-    account: String,
+    account: Option<String>,
 
     /// Posted settlement report containing the account distribution and proof.
     #[arg(long, value_name = "PATH")]
@@ -1921,7 +1924,7 @@ struct WithdrawArgs {
     #[arg(long)]
     proof: Option<String>,
 
-    /// Ethereum RPC URL used only for optional live claimability checks.
+    /// Ethereum RPC URL used for claimability checks, simulation, and optional broadcast.
     #[arg(long)]
     eth_rpc: Option<String>,
 
@@ -1941,11 +1944,15 @@ struct WithdrawArgs {
     #[arg(long, value_name = "PATH")]
     addresses: Option<PathBuf>,
 
-    /// Build calldata even if the proof helper reports no live claimable amount.
+    /// Build and simulate even if the proof helper cannot confirm a live claimable amount.
     #[arg(long)]
     allow_not_claimable: bool,
 
-    /// Print machine-readable withdrawal calldata.
+    /// Sign with the local encrypted Ethereum wallet and broadcast after simulation passes.
+    #[arg(long)]
+    confirm: bool,
+
+    /// Print a machine-readable withdrawal report.
     #[arg(long)]
     json: bool,
 }
@@ -18219,7 +18226,29 @@ fn deposit_status_rail(args: &DepositStatusArgs) -> GatewayLedgerRail {
 }
 
 async fn withdraw(args: WithdrawArgs) -> Result<()> {
-    let proof_report = resolve_withdraw_proof(&args).await?;
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let eth_key = ethereum_wallet_key(&keypair_path, &password)
+        .await
+        .with_context(|| {
+            format!(
+                "reading Ethereum account from wallet {}",
+                keypair_path.display()
+            )
+        })?;
+    let account = args
+        .account
+        .clone()
+        .unwrap_or_else(|| eth_key.address.clone());
+    if !account.eq_ignore_ascii_case(&eth_key.address) {
+        bail!(
+            "local Ethereum wallet {} does not match claim account {}",
+            eth_key.address,
+            account
+        );
+    }
+
+    let proof_report = resolve_withdraw_proof(&args, &account).await?;
     if proof_report.get("claimable").and_then(Value::as_bool) == Some(false)
         && !args.allow_not_claimable
     {
@@ -18227,7 +18256,7 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("claim is not currently claimable");
-        bail!("{reason}; pass --allow-not-claimable to build calldata anyway");
+        bail!("{reason}; pass --allow-not-claimable to attempt the simulation anyway");
     }
     let cumulative = proof_report
         .get("cumulative_wei")
@@ -18249,7 +18278,7 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
     let mut script_args = vec![
         "claim".to_owned(),
         "--account".to_owned(),
-        args.account.clone(),
+        account.clone(),
         "--cumulative-wei".to_owned(),
         cumulative,
         "--proof".to_owned(),
@@ -18263,17 +18292,32 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         args.chain_id,
         args.addresses.as_deref(),
     );
-    let calldata =
-        run_contracts_script_json("contracts/scripts/tap-calldata-builder.mjs", script_args)
-            .await?;
+    script_args.push("--local-wallet".to_owned());
+    if args.confirm {
+        script_args.push("--confirm".to_owned());
+    }
+    let mut script_env = vec![(
+        "MAYHEM_TAP_WALLET_PRIVATE_KEY".to_owned(),
+        eth_key.private_key,
+    )];
+    if let Some(eth_rpc) = &args.eth_rpc {
+        script_env.push(("MAYHEM_TAP_ETH_RPC".to_owned(), eth_rpc.clone()));
+    }
+    let claim = run_contracts_script_json_with_env(
+        "contracts/scripts/tap-calldata-builder.mjs",
+        script_args,
+        script_env,
+    )
+    .await?;
     let report = json!({
         "ok": true,
         "rail": "tap",
-        "custody": "external_wallet",
+        "custody": "local_wallet",
         "server_signs": false,
-        "account": args.account,
+        "account": account,
+        "submitted": claim.get("submitted").and_then(Value::as_bool).unwrap_or(false),
         "proof": proof_report,
-        "calldata": calldata,
+        "claim": claim,
     });
 
     if args.json {
@@ -19063,7 +19107,7 @@ fn print_participant_report(report: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_withdraw_proof(args: &WithdrawArgs) -> Result<Value> {
+async fn resolve_withdraw_proof(args: &WithdrawArgs, account: &str) -> Result<Value> {
     match (&args.settlement, &args.claim_proof) {
         (Some(_), Some(_)) => bail!("pass only one of --settlement or --claim-proof"),
         (None, Some(path)) => read_json_file(path)
@@ -19073,16 +19117,23 @@ async fn resolve_withdraw_proof(args: &WithdrawArgs) -> Result<Value> {
                 "--settlement".to_owned(),
                 path.display().to_string(),
                 "--account".to_owned(),
-                args.account.clone(),
+                account.to_owned(),
                 "--json".to_owned(),
             ];
-            if let Some(eth_rpc) = &args.eth_rpc {
-                script_args.extend(["--eth-rpc".to_owned(), eth_rpc.clone()]);
-            }
             if let Some(pool) = &args.pool {
                 script_args.extend(["--pool".to_owned(), pool.clone()]);
             }
-            run_contracts_script_json("contracts/scripts/tap-claim-proof.mjs", script_args).await
+            let script_env = args
+                .eth_rpc
+                .as_ref()
+                .map(|eth_rpc| vec![("MAYHEM_TAP_ETH_RPC".to_owned(), eth_rpc.clone())])
+                .unwrap_or_default();
+            run_contracts_script_json_with_env(
+                "contracts/scripts/tap-claim-proof.mjs",
+                script_args,
+                script_env,
+            )
+            .await
         }
         (None, None) => {
             let cumulative = args
@@ -19122,15 +19173,6 @@ fn push_tap_contract_args(
     if let Some(addresses) = addresses {
         out.extend(["--addresses".to_owned(), addresses.display().to_string()]);
     }
-}
-
-async fn run_contracts_script_json(relative_script: &str, args: Vec<String>) -> Result<Value> {
-    run_contracts_script_json_with_env(
-        relative_script,
-        args,
-        std::iter::empty::<(String, String)>(),
-    )
-    .await
 }
 
 async fn run_contracts_script_json_with_env<I>(
@@ -19284,7 +19326,14 @@ fn print_deposit_status_report(report: &Value) -> Result<()> {
 }
 
 fn print_withdraw_report(report: &Value) -> Result<()> {
-    println!("TAP withdrawal calldata ready.");
+    println!(
+        "TAP withdrawal {}.",
+        if report["submitted"].as_bool() == Some(true) {
+            "submitted"
+        } else {
+            "dry-run complete"
+        }
+    );
     println!("Account: {}", report["account"].as_str().unwrap_or(""));
     println!(
         "Claimable wei: {}",
@@ -19294,22 +19343,18 @@ fn print_withdraw_report(report: &Value) -> Result<()> {
     );
     println!(
         "Cumulative wei: {}",
-        report["calldata"]["cumulative_wei"].as_str().unwrap_or("")
+        report["claim"]["cumulative_wei"].as_str().unwrap_or("")
     );
-    println!(
-        "Pool: {}",
-        report["calldata"]["pool"].as_str().unwrap_or("")
-    );
-    println!("Copy/paste claim tx JSON:");
-    println!(
-        "{}",
-        report["calldata"]["copy_paste"]["claim_tx_json"]
-            .as_str()
-            .unwrap_or("")
-    );
-    if let Some(command) = report["calldata"]["copy_paste_replay_command"].as_str() {
-        println!("Copy/paste replay command:");
-        println!("{command}");
+    println!("Pool: {}", report["claim"]["pool"].as_str().unwrap_or(""));
+    if let Some(gas) = report["claim"]["simulation"]["gas_estimate"].as_str() {
+        println!("Claim simulation gas: {gas}");
+    }
+    if let Some(tx) = report["claim"]["claim_tx_hash"].as_str() {
+        println!("Claim tx: {tx}");
+    } else {
+        println!(
+            "Dry run only. Re-run with --confirm to broadcast after reviewing the simulation."
+        );
     }
     Ok(())
 }
@@ -43635,9 +43680,35 @@ mod tests {
         let Commands::Withdraw(args) = withdraw.command else {
             panic!("expected withdraw command");
         };
+        assert_eq!(
+            args.account.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
         assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
         assert_eq!(args.proof.as_deref(), Some("[]"));
+        assert!(!args.confirm);
         assert!(args.json);
+
+        let local_withdraw = Cli::try_parse_from([
+            "mayhem",
+            "withdraw",
+            "--keypair",
+            "/tmp/mayhem-provider/db/keypair.json",
+            "--settlement",
+            "/tmp/epoch-1.settlement.json",
+            "--confirm",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Withdraw(args) = local_withdraw.command else {
+            panic!("expected local withdraw command");
+        };
+        assert!(args.account.is_none());
+        assert_eq!(
+            args.wallet.keypair.as_deref(),
+            Some(Path::new("/tmp/mayhem-provider/db/keypair.json"))
+        );
+        assert!(args.confirm);
     }
 
     #[test]

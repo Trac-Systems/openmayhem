@@ -19,6 +19,7 @@ export const TAP_TOKEN_CALLDATA_ABI = [
 export const TAP_POOL_CALLDATA_ABI = [
   'function deposit(uint256 amount)',
   'function claim(address account, uint256 cumulativeAmount, bytes32[] proof)',
+  'function claimed(address account) view returns (uint256)',
 ];
 
 const tokenIface = new ethers.Interface(TAP_TOKEN_CALLDATA_ABI);
@@ -337,7 +338,7 @@ export async function executeTapDeposit({
     server_signs: false,
     submitted: false,
     confirm: Boolean(confirm),
-    eth_rpc: rpc,
+    eth_rpc_configured: true,
     from,
     chain_id: chain,
     pool: addresses.pool,
@@ -458,6 +459,124 @@ export function buildTapClaimCalldata({
   };
 }
 
+export async function executeTapClaim({
+  privateKey,
+  ethRpc,
+  account,
+  cumulativeWei,
+  proof,
+  pool,
+  token,
+  chainId,
+  addressesFile,
+  confirm = false,
+  provider: injectedProvider = null,
+  env = process.env,
+} = {}) {
+  const addresses = resolveTapAddresses({ token, pool, chainId, addressesFile, env });
+  const claimAccount = normalizeAddress(account, 'claim account');
+  const cumulative = parseWei(cumulativeWei, 'cumulative wei');
+  const proofItems = parseProof(proof);
+  const rpc = injectedProvider ? null : normalizeRpcUrl(ethRpc, env);
+  const provider = injectedProvider ?? new ethers.JsonRpcProvider(rpc);
+  const signer = new ethers.NonceManager(new ethers.Wallet(normalizePrivateKey(privateKey), provider));
+  const from = await signer.getAddress();
+  if (normalizeAddress(from, 'wallet address') !== claimAccount) {
+    throw new Error(`local Ethereum wallet ${from} does not match claim account ${claimAccount}`);
+  }
+
+  const network = await provider.getNetwork();
+  const chain = Number(network.chainId);
+  if (addresses.chain_id !== null && addresses.chain_id !== undefined && chain !== addresses.chain_id) {
+    throw new Error(`Ethereum RPC chain id ${chain} does not match TAP chain id ${addresses.chain_id}`);
+  }
+
+  const poolContract = new ethers.Contract(addresses.pool, TAP_POOL_CALLDATA_ABI, signer);
+  const tokenContract = new ethers.Contract(addresses.token, TAP_TOKEN_CALLDATA_ABI, provider);
+  const [ethBalance, tapBalanceBefore, alreadyClaimed, gasPriceWei] = await Promise.all([
+    provider.getBalance(claimAccount),
+    tokenContract.balanceOf(claimAccount),
+    poolContract.claimed(claimAccount),
+    feePriceWei(provider),
+  ]);
+  if (cumulative <= alreadyClaimed) {
+    throw new Error('nothing to claim');
+  }
+
+  const simulation = await simulateContractStep(poolContract.claim, [
+    claimAccount,
+    cumulative,
+    proofItems,
+  ]);
+  if (!simulation.static_call_ok || !simulation.gas_estimate_ok) {
+    throw new Error(`TAP claim simulation failed: ${simulation.error || 'unknown error'}`);
+  }
+  const estimatedMaxCostWei = bufferedGasCost(BigInt(simulation.gas_estimate), gasPriceWei);
+  const gasPrecheck = {
+    ok: ethBalance >= estimatedMaxCostWei,
+    eth_balance_wei: ethBalance.toString(),
+    gas_price_wei: gasPriceWei.toString(),
+    estimated_gas: simulation.gas_estimate,
+    estimated_max_cost_wei: estimatedMaxCostWei.toString(),
+    estimated_max_cost_eth: weiToEthDecimal(estimatedMaxCostWei),
+    shortfall_wei: ethBalance >= estimatedMaxCostWei ? '0' : (estimatedMaxCostWei - ethBalance).toString(),
+    shortfall_eth: ethBalance >= estimatedMaxCostWei ? '0.0' : weiToEthDecimal(estimatedMaxCostWei - ethBalance),
+  };
+  if (!gasPrecheck.ok) {
+    throw new Error(
+      `not enough ETH for claim gas - send about ${gasPrecheck.shortfall_eth} ETH to ${from}`
+    );
+  }
+
+  const report = {
+    rail: 'tap',
+    kind: 'claim',
+    custody: 'local_wallet',
+    server_signs: false,
+    submitted: false,
+    confirm: Boolean(confirm),
+    eth_rpc_configured: true,
+    from,
+    chain_id: chain,
+    pool: addresses.pool,
+    token: addresses.token,
+    account: claimAccount,
+    cumulative_wei: cumulative.toString(),
+    previously_claimed_wei: alreadyClaimed.toString(),
+    claimable_wei: (cumulative - alreadyClaimed).toString(),
+    proof: proofItems,
+    balances: {
+      eth_wei: ethBalance.toString(),
+      tap_wei_before: tapBalanceBefore.toString(),
+    },
+    gas_precheck: gasPrecheck,
+    simulation,
+    transaction: null,
+  };
+  if (!confirm) return report;
+
+  const tx = await poolContract.claim(claimAccount, cumulative, proofItems);
+  const receipt = await tx.wait();
+  report.transaction = {
+    step: 'claim',
+    tx_hash: tx.hash,
+    status: Number(receipt?.status ?? 0),
+    gas_used: bigintString(receipt?.gasUsed),
+    block_number: receipt?.blockNumber ?? null,
+  };
+  if (receipt?.status !== 1) throw new Error(`TAP claim tx failed: ${tx.hash}`);
+  const [tapBalanceAfter, claimedAfter] = await Promise.all([
+    tokenContract.balanceOf(claimAccount),
+    poolContract.claimed(claimAccount),
+  ]);
+  report.submitted = true;
+  report.claim_tx_hash = tx.hash;
+  report.claimed_wei = claimedAfter.toString();
+  report.balances.tap_wei_after = tapBalanceAfter.toString();
+  report.balances.tap_delta_wei = (tapBalanceAfter - tapBalanceBefore).toString();
+  return report;
+}
+
 async function claimFromSettlement(args) {
   if (!args.settlement && !args.report) return null;
   const settlement = readJson(path.resolve(args.settlement || args.report), 'settlement report');
@@ -523,12 +642,22 @@ async function main() {
     const proof = args['claim-proof']
       ? readJson(path.resolve(args['claim-proof']), 'claim proof')
       : await claimFromSettlement(args);
-    report = buildTapClaimCalldata({
+    const claim = {
       ...common,
       account: args.account || args.provider || args.address || proof?.account,
       cumulativeWei: args['cumulative-wei'] ?? args.cumulative ?? proof?.cumulative_wei ?? proof?.cumulative,
       proof: args.proof ?? proof?.proof,
-    });
+    };
+    if (boolArg(args['local-wallet'], false) || boolArg(args.execute, false) || boolArg(args.confirm, false)) {
+      report = await executeTapClaim({
+        ...claim,
+        privateKey: args['private-key'] || process.env.MAYHEM_TAP_WALLET_PRIVATE_KEY,
+        ethRpc: args['eth-rpc'] || args['rpc-url'] || args.rpc,
+        confirm: boolArg(args.confirm, false),
+      });
+    } else {
+      report = buildTapClaimCalldata(claim);
+    }
   }
   if (report.custody !== 'local_wallet') {
     report.copy_paste_replay_command = replayCommand(args, kind, report);
@@ -561,6 +690,19 @@ async function main() {
     console.log(report.copy_paste.deposit_tx_json);
     console.log('Copy/paste TAP calldata replay command:');
     console.log(report.copy_paste_replay_command);
+  } else if (report.custody === 'local_wallet') {
+    console.log(report.submitted ? '[tap:claim] submitted' : '[tap:claim] dry-run');
+    console.log('[tap:claim] account:', report.account);
+    console.log('[tap:claim] cumulative_wei:', report.cumulative_wei);
+    console.log('[tap:claim] claimable_wei:', report.claimable_wei);
+    console.log('[tap:claim] pool:', report.pool);
+    console.log('[tap:claim] gas_precheck:', report.gas_precheck?.ok ? 'ok' : 'failed');
+    console.log('[tap:claim] claim gas:', report.simulation?.gas_estimate ?? '');
+    if (report.transaction) {
+      console.log('[tap:claim] claim:', report.transaction.tx_hash);
+    } else {
+      console.log('Dry run only. Re-run with --confirm to broadcast after reviewing the simulation.');
+    }
   } else {
     console.log('[tap:calldata] claim account:', report.account);
     console.log('[tap:calldata] cumulative_wei:', report.cumulative_wei);

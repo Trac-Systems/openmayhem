@@ -7,6 +7,7 @@ import { ethers } from 'ethers';
 import {
   buildTapClaimCalldata,
   buildTapDepositCalldata,
+  executeTapClaim,
   executeTapDeposit,
   tapAmountToWei,
 } from '../scripts/tap-calldata-builder.mjs';
@@ -207,4 +208,71 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
 
   const expectedClaim = providerShareWei(auToTapWei(usdAu(2), TAP_USD_AU));
   assert.equal(await token.balanceOf(providerAccount), expectedClaim);
+});
+
+test('local wallet TAP claim simulates, then confirms from the provider wallet', async () => {
+  const { provider, operator, token, pool, poolAddr } = await localPoolWithKnownKeys();
+  const providerWallet = new ethers.Wallet(BUYER_KEY, provider);
+  const providerAccount = await providerWallet.getAddress();
+  await (await token.mint(await operator.getAddress(), U('3'))).wait();
+  await (await token.connect(operator).approve(poolAddr, U('3'))).wait();
+  await (await pool.connect(operator).deposit(U('3'))).wait();
+
+  const providerId = makeReceiptIdentity();
+  const rolled = await rollTapSettlement({
+    bundle: {
+      epoch: 1,
+      receipts: [receipt({ session: 'local-claim', provider: providerId, au: usdAu(2) })],
+    },
+    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
+    pool,
+    ownerSigner: operator,
+    operatorAddress: await operator.getAddress(),
+    post: true,
+  });
+  const proof = await claimProofForAccount({
+    settlement: rolled,
+    account: providerAccount,
+    pool,
+  });
+
+  const dryRun = await executeTapClaim({
+    privateKey: BUYER_KEY,
+    provider,
+    account: providerAccount,
+    cumulativeWei: proof.cumulative_wei,
+    proof: proof.proof,
+    pool: poolAddr,
+    token: await token.getAddress(),
+    chainId: 61_000,
+    confirm: false,
+  });
+  assert.equal(dryRun.custody, 'local_wallet');
+  assert.equal(dryRun.submitted, false);
+  assert.equal(dryRun.simulation.static_call_ok, true);
+  assert.equal(dryRun.simulation.gas_estimate_ok, true);
+  assert.equal(dryRun.gas_precheck.ok, true);
+  assert.equal(await token.balanceOf(providerAccount), 0n);
+
+  const confirmed = await executeTapClaim({
+    privateKey: BUYER_KEY,
+    provider,
+    account: providerAccount,
+    cumulativeWei: proof.cumulative_wei,
+    proof: proof.proof,
+    pool: poolAddr,
+    token: await token.getAddress(),
+    chainId: 61_000,
+    confirm: true,
+  });
+  const expectedClaim = providerShareWei(auToTapWei(usdAu(2), TAP_USD_AU));
+  assert.equal(confirmed.submitted, true);
+  assert.equal(confirmed.transaction.status, 1);
+  assert.match(confirmed.claim_tx_hash, /^0x[0-9a-f]{64}$/i);
+  assert.equal(confirmed.balances.tap_delta_wei, expectedClaim.toString());
+  assert.equal(await token.balanceOf(providerAccount), expectedClaim);
+  assert.equal(await pool.claimed(providerAccount), expectedClaim);
 });

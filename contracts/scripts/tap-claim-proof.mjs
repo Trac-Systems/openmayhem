@@ -175,6 +175,7 @@ async function main() {
     pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, provider);
   }
   const report = await claimProofForAccount({ settlement, account, pool });
+  report.eth_rpc_configured = Boolean(ethRpc);
   report.copy_paste_replay_command = [
     'node',
     'contracts/scripts/tap-claim-proof.mjs',
@@ -182,7 +183,6 @@ async function main() {
     settlementPath,
     '--account',
     report.account,
-    ...(ethRpc ? ['--eth-rpc', ethRpc] : []),
     ...(poolAddress ? ['--pool', poolAddress] : []),
     '--json',
   ].map(shellQuote).join(' ');
