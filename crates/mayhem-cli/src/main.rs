@@ -4080,6 +4080,15 @@ struct AdminTnkSettlementArgs {
     #[arg(long)]
     treasury_address: Option<String>,
 
+    /// Exact funded treasury keypair.json used for MSB settlement transfers.
+    /// Defaults to MAYHEM_TNK_TREASURY_KEYPAIR_PATH.
+    #[arg(long, value_name = "PATH")]
+    treasury_keypair: Option<PathBuf>,
+
+    /// Password for the funded treasury keypair. Defaults to MAYHEM_TNK_WALLET_PASSWORD or empty.
+    #[arg(long)]
+    treasury_wallet_password: Option<String>,
+
     /// Operator/admin TNK address receiving the aggregate TNK operator fee.
     #[arg(long)]
     operator_tnk_address: Option<String>,
@@ -16380,6 +16389,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let treasury_address =
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
+    let treasury_keypair_path =
+        resolve_tnk_treasury_keypair_path(args.treasury_keypair.as_deref())?;
     let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
     let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
     let provided_msb_tx_hashes = args
@@ -16417,27 +16428,28 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
 
     let mut msb_transfers = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
-        let wallet = resolve_cli_wallet(
-            &home,
-            config.as_ref(),
-            &args.tx.peer_store_name,
-            args.tx.wallet_password.as_deref().unwrap_or(""),
-        )
-        .await?;
+        let keypair_path = treasury_keypair_path.as_ref().context(
+            "treasury keypair required for --submit-transfer; pass --treasury-keypair or set MAYHEM_TNK_TREASURY_KEYPAIR_PATH",
+        )?;
+        let treasury_password = args
+            .treasury_wallet_password
+            .clone()
+            .or_else(|| env::var("MAYHEM_TNK_WALLET_PASSWORD").ok())
+            .unwrap_or_default();
         let wallet = inspect_wallet_for_network_prefix(
-            Path::new(&wallet.keypair_path),
-            args.tx.wallet_password.as_deref().unwrap_or(""),
+            keypair_path,
+            &treasury_password,
             msb_network_address_prefix(&network)?,
         )
-        .await?;
+        .await
+        .with_context(|| format!("reading TNK treasury wallet {}", keypair_path.display()))?;
         if wallet.address.as_deref() != Some(&treasury_address) {
             bail!(
                 "local MSB wallet address {} does not match --treasury-address {treasury_address}",
                 wallet.address.as_deref().unwrap_or("<unknown>")
             );
         }
-        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
-        let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
+        let (stores_directory, store_name) = msb_store_from_keypair_path(keypair_path)?;
         let mut hashes = Vec::with_capacity(plan.msb_outputs.len());
         for (index, output) in plan.msb_outputs.iter().enumerate() {
             let transfer = submit_msb_transfer(
@@ -16513,7 +16525,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     }
 
     let copy_paste_submit = format!(
-        "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}{}",
+        "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}{}{}",
         epoch,
         at,
         shell_single_quote(&treasury_address),
@@ -16523,6 +16535,13 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .home
             .as_ref()
             .map(|home| format!(" --home {}", shell_single_quote(&home.display().to_string())))
+            .unwrap_or_default(),
+        treasury_keypair_path
+            .as_ref()
+            .map(|path| format!(
+                " --treasury-keypair {}",
+                shell_single_quote(&path.display().to_string())
+            ))
             .unwrap_or_default(),
         (args.tx.peer_store_name != "main")
             .then(|| format!(
@@ -26748,6 +26767,14 @@ fn resolve_tnk_operator_address(operator_tnk_address: Option<&str>) -> Result<St
         bail!("operator TNK address must not contain whitespace");
     }
     Ok(value)
+}
+
+fn resolve_tnk_treasury_keypair_path(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os("MAYHEM_TNK_TREASURY_KEYPAIR_PATH").map(PathBuf::from))
+        .map(absolutize)
+        .transpose()
 }
 
 fn validate_msb_tx_hash(value: &str) -> Result<String> {
@@ -46421,6 +46448,8 @@ mod tests {
                 epoch: None,
                 at: None,
                 treasury_address: None,
+                treasury_keypair: None,
+                treasury_wallet_password: None,
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
@@ -46449,6 +46478,8 @@ mod tests {
                 epoch: None,
                 at: None,
                 treasury_address: None,
+                treasury_keypair: None,
+                treasury_wallet_password: None,
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
