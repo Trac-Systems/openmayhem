@@ -1878,7 +1878,7 @@ struct DepositStatusArgs {
     #[arg(long)]
     eth_tx_hash: Option<String>,
 
-    /// TAP escrow Deposit log index. Defaults to 0 when --eth-tx-hash is set.
+    /// TAP escrow Deposit log index. Auto-discovered from the ledger when omitted.
     #[arg(long)]
     log_index: Option<u64>,
 
@@ -18110,6 +18110,9 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     if args.wait && args.target_au.is_none() {
         bail!("--wait requires --target-au");
     }
+    if args.log_index.is_some() && args.eth_tx_hash.is_none() {
+        bail!("--log-index requires --eth-tx-hash");
+    }
 
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -18161,18 +18164,16 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         Some(memo_hash) => read_state_value(&rpc, &format!("dep/pending/{memo_hash}")).await?,
         None => None,
     };
-    let tap_seen = match args.eth_tx_hash.as_deref() {
-        Some(hash) => {
-            let key = tap_deposit_seen_key(hash, args.log_index.unwrap_or(0));
-            read_state_value(&rpc, &key).await?
-        }
-        None => None,
+    let (tap_log_index, tap_seen) = match args.eth_tx_hash.as_deref() {
+        Some(hash) => read_tap_deposit_confirmation(&rpc, hash, args.log_index, &who).await?,
+        None => (None, None),
     };
     let status = classify_deposit_status(
         current_au,
         args.target_au,
         pending_tnk.as_ref(),
         tap_seen.as_ref(),
+        args.eth_tx_hash.is_some(),
     );
     let report = json!({
         "ok": status != "unknown",
@@ -18195,7 +18196,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         },
         "tap": {
             "eth_tx_hash": args.eth_tx_hash.as_ref().map(|value| value.to_ascii_lowercase()),
-            "log_index": args.eth_tx_hash.as_ref().map(|_| args.log_index.unwrap_or(0)),
+            "log_index": tap_log_index,
             "confirmed_event": tap_seen,
         },
     });
@@ -19232,15 +19233,58 @@ fn tap_deposit_seen_key(eth_tx_hash: &str, log_index: u64) -> String {
     format!("dep/tap/{}/{log_index}", eth_tx_hash.to_ascii_lowercase())
 }
 
+async fn read_tap_deposit_confirmation(
+    rpc: &PeerRpcClient,
+    eth_tx_hash: &str,
+    log_index: Option<u64>,
+    who: &str,
+) -> Result<(Option<u64>, Option<Value>)> {
+    if let Some(log_index) = log_index {
+        let key = tap_deposit_seen_key(eth_tx_hash, log_index);
+        return Ok((Some(log_index), read_state_value(rpc, &key).await?));
+    }
+
+    let normalized_hash = eth_tx_hash.to_ascii_lowercase();
+    let prefix = format!("dep/tap/{normalized_hash}/");
+    let mut matches = read_prefix_entries(rpc, &prefix)
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            entry.value.get("who").and_then(Value::as_str) == Some(who)
+                && entry
+                    .value
+                    .get("eth_tx_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&normalized_hash))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.key.cmp(&right.key));
+    if matches.len() > 1 {
+        bail!(
+            "TAP transaction {eth_tx_hash} contains multiple deposits for this wallet; pass --log-index"
+        );
+    }
+    let Some(entry) = matches.pop() else {
+        return Ok((None, None));
+    };
+    let log_index = entry
+        .value
+        .get("log_index")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("TAP deposit record {} is missing log_index", entry.key))?;
+    Ok((Some(log_index), Some(entry.value)))
+}
+
 fn classify_deposit_status(
     balance_au: MoneyAu,
     target_au: Option<MoneyAu>,
     pending_tnk: Option<&Value>,
     tap_seen: Option<&Value>,
+    tap_submitted: bool,
 ) -> &'static str {
     if target_au.is_some_and(|target| balance_au >= target) || tap_seen.is_some() {
         "confirmed"
-    } else if pending_tnk.is_some() || target_au.is_some() {
+    } else if pending_tnk.is_some() || target_au.is_some() || tap_submitted {
         "pending"
     } else {
         "unknown"
@@ -44485,22 +44529,29 @@ mod tests {
 
     #[test]
     fn deposit_status_classifies_pending_and_confirmed() {
-        assert_eq!(classify_deposit_status(0, None, None, None), "unknown");
         assert_eq!(
-            classify_deposit_status(0, None, Some(&json!({"status":"pending"})), None),
+            classify_deposit_status(0, None, None, None, false),
+            "unknown"
+        );
+        assert_eq!(
+            classify_deposit_status(0, None, Some(&json!({"status":"pending"})), None, false,),
             "pending"
         );
         assert_eq!(
-            classify_deposit_status(999, Some(1000), None, None),
+            classify_deposit_status(999, Some(1000), None, None, false),
             "pending"
         );
         assert_eq!(
-            classify_deposit_status(1000, Some(1000), None, None),
+            classify_deposit_status(1000, Some(1000), None, None, false),
             "confirmed"
         );
         assert_eq!(
-            classify_deposit_status(0, None, None, Some(&json!({"rail":"tap"}))),
+            classify_deposit_status(0, None, None, Some(&json!({"rail":"tap"})), true),
             "confirmed"
+        );
+        assert_eq!(
+            classify_deposit_status(0, None, None, None, true),
+            "pending"
         );
         assert_eq!(tap_deposit_seen_key("0xABCDEF", 7), "dep/tap/0xabcdef/7");
     }
