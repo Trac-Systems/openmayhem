@@ -115,10 +115,6 @@ test('TAP settlement reads challenge and maturity epochs from active ledger stat
       current: { value: 8, effective_at: 0 },
       pending: { value: 12, effective_at: Math.floor(Date.now() / 1_000) + 3_600 },
     }],
-    ['params/holdback_epochs', {
-      current: { value: 3, effective_at: 0 },
-      pending: null,
-    }],
   ]);
   const fetchImpl = async (url) => ({
     ok: true,
@@ -130,7 +126,7 @@ test('TAP settlement reads challenge and maturity epochs from active ledger stat
       peerRpcUrl: 'http://127.0.0.1:49223/v1',
       fetchImpl,
     }),
-    { settleThroughEpoch: 19, challengeEpochs: 8, holdbackEpochs: 3 }
+    { settleThroughEpoch: 19, challengeEpochs: 8 }
   );
 });
 
@@ -624,7 +620,6 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     ['admin', admin],
     ['epoch/apply/state', { updated_epoch: 7 }],
     ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
-    ['params/holdback_epochs', { current: { value: 0, effective_at: 0 }, pending: null }],
     [`prov/${providerId.publicKeyHex}`, {
       status: 'active',
       payout: {

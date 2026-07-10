@@ -23,7 +23,6 @@ const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
-const DEFAULT_TAP_HOLDBACK_EPOCHS = 24;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export const POOL_SETTLEMENT_ABI = [
@@ -1173,16 +1172,9 @@ export async function resolveTapSettlementEpochPolicy({
     fallback: DEFAULT_TAP_CHALLENGE_EPOCHS,
     fetchImpl,
   });
-  const resolvedHoldback = await resolveActiveEpochParam({
-    peerRpcUrl,
-    key: 'holdback_epochs',
-    fallback: DEFAULT_TAP_HOLDBACK_EPOCHS,
-    fetchImpl,
-  });
   return {
     settleThroughEpoch: resolvedThrough,
     challengeEpochs: parseNonNegativeInt(resolvedChallenge, 'TAP settlement challenge_epochs'),
-    holdbackEpochs: parseNonNegativeInt(resolvedHoldback, 'TAP settlement holdback_epochs'),
   };
 }
 
@@ -1287,7 +1279,7 @@ async function main() {
     ledgerFeeBps,
     settleThroughEpoch: epochPolicy.settleThroughEpoch,
     challengeEpochs: epochPolicy.challengeEpochs,
-    holdbackEpochs: epochPolicy.holdbackEpochs,
+    holdbackEpochs: 0,
     pool,
     ownerSigner,
     operatorAddress,
