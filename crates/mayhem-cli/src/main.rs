@@ -34487,22 +34487,32 @@ fn default_provider_served_ctx(ctx_max: u64) -> u64 {
     half.min(128_000).clamp(1, ctx_max)
 }
 
-fn resolve_provider_served_ctx(model: &catalog::CatalogModel, requested_ctx: Option<u64>) -> u64 {
+fn resolve_provider_served_ctx(
+    model: &catalog::CatalogModel,
+    requested_ctx: Option<u64>,
+) -> Result<u64> {
     let ctx_max = model.caps.ctx_max;
     if ctx_max == 0 {
-        return 0;
+        return Ok(0);
     }
-    requested_ctx
-        .unwrap_or_else(|| default_provider_served_ctx(ctx_max))
-        .clamp(1, ctx_max)
+    match requested_ctx {
+        Some(0) => bail!("--ctx must be greater than zero"),
+        Some(requested) if requested > ctx_max => bail!(
+            "explicit --ctx {requested} exceeds catalog maximum {ctx_max} for {}",
+            model.model_id
+        ),
+        Some(requested) => Ok(requested),
+        None => Ok(default_provider_served_ctx(ctx_max)),
+    }
 }
 
 fn provider_context_source(args: &ProviderStartArgs, selected: &ProviderCandidate) -> &'static str {
-    match (args.ctx.is_some(), selected.feasibility.fallback_applied) {
-        (true, true) => "cli_auto_memory_fallback",
-        (false, true) => "default_auto_memory_fallback",
-        (true, false) => "cli",
-        (false, false) => "default",
+    if args.ctx.is_some() {
+        "cli"
+    } else if selected.feasibility.fallback_applied {
+        "default_auto_memory_fallback"
+    } else {
+        "default"
     }
 }
 
@@ -34831,7 +34841,13 @@ fn provider_kv_bytes_per_token(
     enclave: &LedgerEnclave,
     model: &catalog::CatalogModel,
     artifact: &catalog::CatalogArtifact,
-) -> u64 {
+) -> Result<u64> {
+    if let Some(value) = enclave.caps.get("kv_bytes_per_token") {
+        return value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .context("enclave caps kv_bytes_per_token must be a positive integer");
+    }
     let base_per_billion = if matches!(artifact.engine.as_str(), "trt-llm" | "vllm")
         && matches!(enclave.quant.as_str(), "nvfp4" | "fp8" | "int4")
     {
@@ -34839,7 +34855,7 @@ fn provider_kv_bytes_per_token(
     } else {
         24 * 1024
     };
-    ((model.params_b.max(0.1) * base_per_billion as f64).ceil() as u64).max(1024)
+    Ok(((model.params_b.max(0.1) * base_per_billion as f64).ceil() as u64).max(1024))
 }
 
 fn provider_memory_estimate(
@@ -34847,18 +34863,19 @@ fn provider_memory_estimate(
     model: &catalog::CatalogModel,
     artifact: &catalog::CatalogArtifact,
     served_ctx: u64,
-) -> ProviderMemoryEstimate {
+) -> Result<ProviderMemoryEstimate> {
     let weights_bytes = artifact.weights_bytes;
-    let kv_bytes = served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact));
+    let kv_bytes =
+        served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact)?);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024);
-    ProviderMemoryEstimate {
+    Ok(ProviderMemoryEstimate {
         required_bytes: weights_bytes
             .saturating_add(kv_bytes)
             .saturating_add(overhead_bytes),
         weights_bytes,
         kv_bytes,
         overhead_bytes,
-    }
+    })
 }
 
 fn provider_bucket_aligned_ctx_candidates(
@@ -34969,12 +34986,12 @@ fn provider_context_feasibility(
     schedule: &CtxBracketSchedule,
     at: u64,
 ) -> Result<ProviderCtxFeasibility> {
-    let requested_ctx = resolve_provider_served_ctx(model, args.ctx);
+    let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
         let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
         let memory_budget =
             provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
-        let estimate = provider_memory_estimate(enclave, model, artifact, requested_ctx);
+        let estimate = provider_memory_estimate(enclave, model, artifact, requested_ctx)?;
         if estimate.required_bytes > memory_budget.budget_bytes {
             bail!(
                 "model {} needs {} (weights {}, working memory {}, overhead {}) but only {} is usable after reserve {} and local claims {} in {}",
@@ -35005,17 +35022,20 @@ fn provider_context_feasibility(
     let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
     let memory_budget =
         provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
-    let candidates =
-        provider_bucket_aligned_ctx_candidates(model.caps.ctx_max, requested_ctx, schedule, at);
+    let candidates = if args.ctx.is_some() {
+        vec![requested_ctx]
+    } else {
+        provider_bucket_aligned_ctx_candidates(model.caps.ctx_max, requested_ctx, schedule, at)
+    };
     let Some(min_ctx) = candidates.last().copied() else {
         bail!(
             "no active context bucket can serve model {}",
             model.model_id
         );
     };
-    let mut min_estimate = provider_memory_estimate(enclave, model, artifact, min_ctx);
+    let mut min_estimate = provider_memory_estimate(enclave, model, artifact, min_ctx)?;
     for served_ctx in candidates {
-        let estimate = provider_memory_estimate(enclave, model, artifact, served_ctx);
+        let estimate = provider_memory_estimate(enclave, model, artifact, served_ctx)?;
         if served_ctx == min_ctx {
             min_estimate = estimate;
         }
@@ -35042,6 +35062,20 @@ fn provider_context_feasibility(
                 memory_budget,
             });
         }
+    }
+    if args.ctx.is_some() {
+        bail!(
+            "explicit --ctx {} cannot fit: estimated required {} (weights {}, KV {}, overhead {}) exceeds usable {} after reserve {} and local claims {} in {}; choose a fitting context explicitly or change the admin enclave profile",
+            requested_ctx,
+            human_bytes(min_estimate.required_bytes),
+            human_bytes(min_estimate.weights_bytes),
+            human_bytes(min_estimate.kv_bytes),
+            human_bytes(min_estimate.overhead_bytes),
+            human_bytes(memory_budget.budget_bytes),
+            human_bytes(memory_budget.reserve_bytes),
+            human_bytes(memory_budget.claimed_bytes),
+            memory_budget.pool
+        );
     }
     bail!(
         "minimum context {} tokens cannot fit: estimated required {} (weights {}, KV {}, overhead {}) exceeds usable {} after reserve {} and local claims {} in {}",
@@ -47291,7 +47325,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_candidates_auto_fallback_context_to_largest_fitting_bucket() {
+    fn provider_candidates_default_context_falls_back_to_largest_fitting_bucket() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
         catalog.models[0].caps.ctx_max = 131_072;
@@ -47300,13 +47334,12 @@ mod tests {
         let mut hardware = test_hardware(FixtureProfile::CpuOnly);
         hardware.memory.total_bytes = 4 * GIB_BYTES;
         hardware.memory.available_bytes = Some(3 * GIB_BYTES);
-        let mut args = test_provider_start_args();
-        args.ctx = Some(131_072);
+        let args = test_provider_start_args();
 
         let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
         let selected = &candidates[0];
 
-        assert_eq!(selected.feasibility.requested_ctx, 131_072);
+        assert_eq!(selected.feasibility.requested_ctx, 65_536);
         assert_eq!(selected.served_ctx, 8_192);
         assert!(selected.feasibility.fallback_applied);
         assert!(selected
@@ -47319,6 +47352,48 @@ mod tests {
             selected.price.as_ref().unwrap().ctx_bracket.as_deref(),
             Some(ctx_bracket_for_tokens(8_192))
         );
+    }
+
+    #[test]
+    fn provider_candidates_explicit_context_never_silently_falls_back() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 131_072;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 131_072 });
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
+        hardware.memory.total_bytes = 4 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(3 * GIB_BYTES);
+        let mut args = test_provider_start_args();
+        args.ctx = Some(131_072);
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect_err("explicit context must fail instead of falling back");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("explicit --ctx 131072 cannot fit"));
+        assert!(!message.contains("Context auto-fallback"));
+    }
+
+    #[test]
+    fn provider_memory_estimate_uses_admin_signed_kv_bytes_per_token() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 262_144;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 262_144,
+            "kv_bytes_per_token": 20_480,
+        });
+        let artifact = catalog.models[0].artifacts.get("gguf-q4_k_m").unwrap();
+
+        let estimate =
+            provider_memory_estimate(&contract.enclaves[0], &catalog.models[0], artifact, 262_144)
+                .unwrap();
+
+        assert_eq!(estimate.kv_bytes, 262_144 * 20_480);
     }
 
     #[test]
@@ -47375,14 +47450,13 @@ mod tests {
         hardware.gpus[0].dedicated_memory_bytes = Some(24 * GIB_BYTES);
         hardware.gpus[0].shared_memory_bytes = Some(32 * GIB_BYTES);
         hardware.gpus[0].unified_memory = false;
-        let mut args = test_provider_start_args();
-        args.ctx = Some(131_072);
+        let args = test_provider_start_args();
 
         let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
         let selected = &candidates[0];
         let message = selected.feasibility.message.as_deref().unwrap();
 
-        assert_eq!(selected.feasibility.requested_ctx, 131_072);
+        assert_eq!(selected.feasibility.requested_ctx, 65_536);
         assert_eq!(selected.served_ctx, 8_192);
         assert!(selected.feasibility.fallback_applied);
         assert_eq!(
@@ -47414,7 +47488,6 @@ mod tests {
         hardware.memory.total_bytes = 3 * GIB_BYTES;
         hardware.memory.available_bytes = Some(2 * GIB_BYTES);
         let mut args = test_provider_start_args();
-        args.ctx = Some(131_072);
         args.enclave = Some("test/model@4bit".to_owned());
 
         let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
@@ -47543,6 +47616,7 @@ mod tests {
         let gguf_root = "aa".repeat(32);
         let vllm_root = "bb".repeat(32);
         let mut catalog = test_catalog(&gguf_root);
+        catalog.models[0].caps.ctx_max = 262_144;
         let mut vllm_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
         vllm_artifact.engine = "vllm".to_owned();
         vllm_artifact.path = "model.safetensors".to_owned();
@@ -47568,10 +47642,11 @@ mod tests {
             "chat": true,
             "tools": true,
             "json": true,
-            "ctx": 1024,
+            "ctx": 262144,
             "tp_degree": 1,
             "max_batch_size": 2,
             "max_num_tokens": 1024,
+            "kv_bytes_per_token": 20480,
             "vllm_dtype": "bfloat16"
         });
         contract.enclaves.push(vllm_enclave);
@@ -47589,12 +47664,12 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             denom: "au_usd".to_owned(),
-            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket: Some(ctx_bracket_for_tokens(262_144).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 1,
                 denom: "au_usd".to_owned(),
-                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket: Some(ctx_bracket_for_tokens(262_144).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(1, 2),
                 per_req_au: 0,
@@ -47613,8 +47688,8 @@ mod tests {
         hardware.host.arch = "aarch64".to_owned();
         hardware.gpus.truncate(1);
         hardware.gpus[0].name = "NVIDIA GB10".to_owned();
-        hardware.gpus[0].memory_bytes = None;
-        hardware.gpus[0].unified_memory = false;
+        hardware.gpus[0].memory_bytes = Some(120 * GIB_BYTES);
+        hardware.gpus[0].unified_memory = true;
         hardware.gpus[0].compute_capability = Some("12.1".to_owned());
         hardware.backend_verdicts = probe(ProbeOptions {
             fixture: Some(FixtureProfile::LinuxNvidia),
@@ -47633,7 +47708,8 @@ mod tests {
             );
             verdict.max_sessions = 8;
         }
-        let args = test_provider_start_args();
+        let mut args = test_provider_start_args();
+        args.ctx = Some(262_144);
 
         let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
         assert!(candidates
@@ -47642,6 +47718,9 @@ mod tests {
         let selected = select_provider_candidate(&candidates, None).unwrap();
         assert_eq!(selected.enclave.backend, "vllm");
         assert_eq!(selected.artifact_name, "vllm-fp16");
+        assert_eq!(selected.served_ctx, 262_144);
+        assert!(!selected.feasibility.fallback_applied);
+        assert_eq!(selected.feasibility.estimated_kv_bytes, 262_144 * 20_480);
     }
 
     #[test]

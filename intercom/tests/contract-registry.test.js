@@ -1192,6 +1192,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         tp_degree: 1,
         max_batch_size: 2,
         max_num_tokens: 1024,
+        kv_bytes_per_token: 20480,
         vllm_dtype: 'bfloat16',
         vllm_gpu_memory_utilization_pct: 40,
       },

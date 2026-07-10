@@ -279,6 +279,7 @@ const ENCLAVE_CAP_INTEGER_FIELDS = [
   'tp_degree',
   'max_batch_size',
   'max_num_tokens',
+  'kv_bytes_per_token',
   'vllm_gpu_memory_utilization_pct',
   'max_image_width',
   'max_image_height',
