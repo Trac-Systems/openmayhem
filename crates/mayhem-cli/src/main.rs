@@ -37791,9 +37791,31 @@ fn provider_heartbeat_tok_s(
 }
 
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
+    let mut retry_delay = Duration::from_millis(250);
+    while !ctx.load.is_stopped() {
+        match run_provider_session_heartbeat_connection(&ctx).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                provider_session_debug(format!(
+                    "live provider heartbeat bridge failed; reconnecting: {err:#}"
+                ));
+                if ctx.load.is_stopped() {
+                    return Ok(());
+                }
+                sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_provider_session_heartbeat_connection(
+    ctx: &ProviderSessionHeartbeatTask,
+) -> Result<()> {
     let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
         &ctx.sc_bridge_url,
-        ctx.sc_bridge_token,
+        ctx.sc_bridge_token.clone(),
     )?)
     .await
     .context("connecting to SC-Bridge for live provider session heartbeats")?;
