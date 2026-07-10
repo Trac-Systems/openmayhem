@@ -20,7 +20,7 @@ const viewFor = (state) => ({
 const peerFor = (publicKey, { writable = false } = {}) => {
   const state = new Map([['admin', adminKey]]);
   const appended = [];
-  const updates = [];
+  const flushes = [];
   const peer = {
     wallet: {
       publicKey,
@@ -33,6 +33,10 @@ const peerFor = (publicKey, { writable = false } = {}) => {
       writable,
       view: viewFor(state),
       async append(op) {
+        if (op === null) {
+          flushes.push(true);
+          return;
+        }
         appended.push(op);
         const hash = op.value.dispatch.hash;
         state.set(`fr/${hash}`, {
@@ -42,13 +46,10 @@ const peerFor = (publicKey, { writable = false } = {}) => {
           result: { ok: true, op: op.value.dispatch.value.op },
         });
       },
-      async update() {
-        updates.push(true);
-      },
     },
     protocol: { instance: { features: {} } },
   };
-  return { peer, state, appended, updates };
+  return { peer, state, appended, flushes };
 };
 
 const connect = (leftPeer, leftFeature, rightPeer, rightFeature) => {
@@ -110,7 +111,7 @@ test('read-only participant relays a signed feature to the sole admin writer', a
   assert.equal(result.ok, true);
   assert.equal(result.relayed, true);
   assert.equal(writer.appended.length, 1);
-  assert.equal(writer.updates.length, 1);
+  assert.equal(writer.flushes.length, 1);
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
@@ -153,6 +154,10 @@ test('admin writer retries a previously rejected deterministic relay request', a
   const writer = peerFor(adminKey, { writable: true });
   let attempts = 0;
   writer.peer.base.append = async (op) => {
+    if (op === null) {
+      writer.flushes.push(true);
+      return;
+    }
     writer.appended.push(op);
     attempts += 1;
     const hash = op.value.dispatch.hash;
