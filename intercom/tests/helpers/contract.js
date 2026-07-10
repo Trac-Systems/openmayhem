@@ -1,5 +1,7 @@
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
+import { keccak256 } from 'ethereum-cryptography/keccak';
+import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
 import {
   consentMessage,
@@ -9,6 +11,7 @@ import {
   providerLifecycleIntentMessage,
   spendReservationMessage,
   spendVoucherMessage,
+  tapAccountBindingMessage,
 } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
@@ -144,6 +147,14 @@ export async function executeDepositFeature(contract, storage, value, sender) {
     value,
     sender
   );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
+export async function executeTapAccountBindingFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const key = await contract.tapAccountBindingFeatureKey(value);
+  if (key instanceof Error) throw key;
+  const result = await executeFeature(contract, storage, 'mayhem_feature', key, value, sender);
   return result ?? contract._mayhemLastFeatureResult;
 }
 
@@ -321,6 +332,15 @@ export async function makeIdentity() {
   };
 }
 
+export function makeEthereumIdentity() {
+  const privateKey = secp256k1.utils.randomPrivateKey();
+  const publicKey = secp256k1.getPublicKey(privateKey, false);
+  return {
+    privateKey,
+    address: `0x${b4a.toString(keccak256(publicKey.subarray(1)).subarray(12), 'hex')}`,
+  };
+}
+
 export const makeVerifier = (wallet) => ({
   verify(signature, message, publicKey) {
     return wallet.verify(
@@ -336,6 +356,23 @@ export const signConsent = (wallet, ver, hash, signingVersion) =>
 
 export const signDepositTnkIntent = (wallet, intent) =>
   b4a.toString(wallet.sign(b4a.from(depositTnkIntentMessage(intent))), 'hex');
+
+export const signTapAccountBinding = (wallet, ethereum, value) => {
+  const message = tapAccountBindingMessage(value);
+  const body = b4a.from(message, 'utf8');
+  const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  const signature = secp256k1.sign(keccak256(b4a.concat([prefix, body])), ethereum.privateKey, {
+    lowS: true,
+  });
+  const ethereumSignature = b4a.alloc(65);
+  ethereumSignature.set(signature.toCompactRawBytes(), 0);
+  ethereumSignature[64] = 27 + signature.recovery;
+  return {
+    ...value,
+    user_sig: b4a.toString(wallet.sign(b4a.from(message)), 'hex'),
+    ethereum_sig: `0x${b4a.toString(ethereumSignature, 'hex')}`,
+  };
+};
 
 export const signSpendVoucher = (wallet, body, signingVersion) =>
   b4a.toString(wallet.sign(b4a.from(spendVoucherMessage(body, signingVersion))), 'hex');

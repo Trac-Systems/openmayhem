@@ -1827,6 +1827,10 @@ struct DepositTapArgs {
     #[arg(long = "rpc-url", alias = "eth-rpc")]
     rpc_url: Option<String>,
 
+    /// Bind this wallet's Ethereum account to its Mayhem identity without broadcasting a deposit.
+    #[arg(long, conflicts_with_all = ["amount_tap", "amount_wei"])]
+    bind_only: bool,
+
     /// Broadcast after the gas precheck and simulation pass. Without this, only dry-run.
     #[arg(long)]
     confirm: bool,
@@ -5142,6 +5146,12 @@ struct WalletSeedOutput {
 struct EthereumKeyOutput {
     address: String,
     private_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EthereumSignOutput {
+    address: String,
+    signature: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -17717,13 +17727,199 @@ async fn deposit_command(command: DepositCommands) -> Result<()> {
     }
 }
 
+fn tap_account_binding_message(
+    user: &str,
+    ethereum_address: &str,
+    chain_id: u64,
+    pool_address: &str,
+) -> String {
+    format!(
+        "mayhem-tap-account-bind-v1{{\"chain_id\":{chain_id},\"ethereum_address\":\"{}\",\"pool_address\":\"{}\",\"user\":\"{}\"}}",
+        ethereum_address.to_ascii_lowercase(),
+        pool_address.to_ascii_lowercase(),
+        user.to_ascii_lowercase(),
+    )
+}
+
+fn is_eth_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn tap_account_binding_state_key(user: &str, chain_id: u64, pool_address: &str) -> String {
+    format!(
+        "tap/account/{chain_id}/{}/{}",
+        pool_address.to_ascii_lowercase(),
+        user.to_ascii_lowercase()
+    )
+}
+
+fn tap_account_address_state_key(
+    ethereum_address: &str,
+    chain_id: u64,
+    pool_address: &str,
+) -> String {
+    format!(
+        "tap/account-by-address/{chain_id}/{}/{}",
+        pool_address.to_ascii_lowercase(),
+        ethereum_address.to_ascii_lowercase()
+    )
+}
+
+async fn ensure_tap_account_binding(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    ethereum_address: &str,
+    chain_id: u64,
+    pool_address: &str,
+    submit: bool,
+) -> Result<Value> {
+    let user = wallet.public_key.to_ascii_lowercase();
+    let ethereum_address = ethereum_address.to_ascii_lowercase();
+    let pool_address = pool_address.to_ascii_lowercase();
+    if !is_hex_len(&user, 32) {
+        bail!("wallet public key is not a 32-byte hex Mayhem identity");
+    }
+    if !is_eth_address(&ethereum_address) {
+        bail!("wallet Ethereum account is invalid");
+    }
+    if !is_eth_address(&pool_address) {
+        bail!("TAP pool address is invalid");
+    }
+    let binding_key = tap_account_binding_state_key(&user, chain_id, &pool_address);
+    let address_key = tap_account_address_state_key(&ethereum_address, chain_id, &pool_address);
+    let binding = read_state_value(rpc, &binding_key).await?;
+    let reverse = read_state_value(rpc, &address_key).await?;
+    let binding_matches = binding.as_ref().is_some_and(|record| {
+        record.get("status").and_then(Value::as_str) == Some("active")
+            && record.get("user").and_then(Value::as_str) == Some(user.as_str())
+            && record.get("ethereum_address").and_then(Value::as_str)
+                == Some(ethereum_address.as_str())
+    });
+    let reverse_matches = reverse.as_ref().is_some_and(|record| {
+        record.get("status").and_then(Value::as_str) == Some("active")
+            && record.get("user").and_then(Value::as_str) == Some(user.as_str())
+            && record.get("ethereum_address").and_then(Value::as_str)
+                == Some(ethereum_address.as_str())
+    });
+    if binding.is_some() && !binding_matches {
+        bail!("Mayhem wallet is already bound to a different TAP account for this pool");
+    }
+    if reverse.is_some() && !reverse_matches {
+        bail!("TAP account is already bound to a different Mayhem wallet for this pool");
+    }
+    if binding_matches && reverse_matches {
+        return Ok(json!({
+            "ok": true,
+            "status": "active",
+            "existing": true,
+            "submitted": false,
+            "user": user,
+            "ethereum_address": ethereum_address,
+            "chain_id": chain_id,
+            "pool_address": pool_address,
+            "state_key": binding_key,
+        }));
+    }
+
+    let message = tap_account_binding_message(&user, &ethereum_address, chain_id, &pool_address);
+    let user_sig = sign_message(keypair_path, password, &message).await?;
+    let ethereum = sign_ethereum_message(keypair_path, password, &message).await?;
+    if !ethereum.address.eq_ignore_ascii_case(&ethereum_address) {
+        bail!(
+            "Ethereum binding signature came from {}, expected {}",
+            ethereum.address,
+            ethereum_address
+        );
+    }
+    let value = json!({
+        "op": "tap_account_bind",
+        "user": user,
+        "ethereum_address": ethereum_address,
+        "chain_id": chain_id,
+        "pool_address": pool_address,
+        "user_sig": user_sig,
+        "ethereum_sig": ethereum.signature,
+    });
+    let feature_key = format!(
+        "tap_account/{}/{}",
+        wallet.public_key.to_ascii_lowercase(),
+        blake3::hash(message.as_bytes()).to_hex()
+    );
+    let feature = json!({
+        "feature": "mayhem",
+        "key": feature_key,
+        "value": value,
+    });
+    if !submit {
+        return Ok(json!({
+            "ok": true,
+            "status": "ready",
+            "existing": false,
+            "submitted": false,
+            "user": wallet.public_key.to_ascii_lowercase(),
+            "ethereum_address": ethereum_address,
+            "chain_id": chain_id,
+            "pool_address": pool_address,
+            "state_key": binding_key,
+        }));
+    }
+
+    let response = rpc
+        .submit_feature(&feature)
+        .await
+        .context("submitting free dual-signed TAP account binding")?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("TAP account binding was not accepted: {response}");
+    }
+    let mut applied = None;
+    for _ in 0..200 {
+        let current = read_state_value(rpc, &binding_key).await?;
+        if current.as_ref().is_some_and(|record| {
+            record.get("status").and_then(Value::as_str) == Some("active")
+                && record.get("user").and_then(Value::as_str)
+                    == Some(wallet.public_key.to_ascii_lowercase().as_str())
+                && record.get("ethereum_address").and_then(Value::as_str)
+                    == Some(ethereum_address.as_str())
+        }) {
+            applied = current;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let state = applied.context("TAP account binding was accepted but did not become visible")?;
+    Ok(json!({
+        "ok": true,
+        "status": "active",
+        "existing": false,
+        "submitted": true,
+        "user": wallet.public_key.to_ascii_lowercase(),
+        "ethereum_address": ethereum_address,
+        "chain_id": chain_id,
+        "pool_address": pool_address,
+        "state_key": binding_key,
+        "result": response,
+        "state": state,
+    }))
+}
+
 async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     match (&args.amount_tap, &args.amount_wei) {
         (Some(_), Some(_)) => bail!("pass only one of --amount-tap or --amount-wei"),
-        (None, None) => bail!("pass --amount-tap or --amount-wei"),
+        (None, None) if !args.bind_only => bail!("pass --amount-tap or --amount-wei"),
         _ => {}
     }
 
+    let home = args
+        .wallet
+        .home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
     let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password)
@@ -17756,6 +17952,9 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     if let Some(amount_wei) = &args.amount_wei {
         script_args.extend(["--amount-wei".to_owned(), amount_wei.clone()]);
     }
+    if args.bind_only {
+        script_args.extend(["--amount-wei".to_owned(), "1".to_owned()]);
+    }
     push_tap_contract_args(
         &mut script_args,
         args.token.as_deref(),
@@ -17766,19 +17965,93 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     if let Some(rpc_url) = &args.rpc_url {
         script_args.extend(["--eth-rpc".to_owned(), rpc_url.clone()]);
     }
-    if args.confirm {
-        script_args.push("--confirm".to_owned());
-    }
-
-    let report = run_contracts_script_json_with_env(
+    let preflight = run_contracts_script_json_with_env(
         "contracts/scripts/tap-calldata-builder.mjs",
-        script_args,
+        script_args.clone(),
         [(
             "MAYHEM_TAP_WALLET_PRIVATE_KEY".to_owned(),
-            eth_key.private_key,
+            eth_key.private_key.clone(),
         )],
     )
     .await?;
+    let resolved_from = preflight
+        .get("from")
+        .and_then(Value::as_str)
+        .context("TAP deposit preflight missing sender address")?;
+    if !resolved_from.eq_ignore_ascii_case(&eth_key.address) {
+        bail!(
+            "TAP deposit preflight sender {} does not match wallet {}",
+            resolved_from,
+            eth_key.address
+        );
+    }
+    let pool_address = preflight
+        .get("pool")
+        .and_then(Value::as_str)
+        .context("TAP deposit preflight missing pool address")?;
+    let chain_id = preflight
+        .get("chain_id")
+        .and_then(Value::as_u64)
+        .context("TAP deposit preflight missing chain id")?;
+    let peer_rpc_url = resolve_cli_rpc_url(Some(&home), None)?;
+    let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
+    let binding = ensure_tap_account_binding(
+        &peer_rpc,
+        &keypair_path,
+        &password,
+        &wallet,
+        &eth_key.address,
+        chain_id,
+        pool_address,
+        args.confirm,
+    )
+    .await?;
+
+    if args.bind_only {
+        let report = json!({
+            "ok": true,
+            "bind_only": true,
+            "submitted": binding.get("submitted").and_then(Value::as_bool).unwrap_or(false),
+            "tap_account_binding": binding,
+        });
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "TAP account binding: {}",
+                report["tap_account_binding"]["status"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "Mayhem wallet: {}",
+                report["tap_account_binding"]["user"].as_str().unwrap_or("")
+            );
+            println!(
+                "Ethereum account: {}",
+                report["tap_account_binding"]["ethereum_address"]
+                    .as_str()
+                    .unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+
+    let mut report = if args.confirm {
+        script_args.push("--confirm".to_owned());
+        run_contracts_script_json_with_env(
+            "contracts/scripts/tap-calldata-builder.mjs",
+            script_args,
+            [(
+                "MAYHEM_TAP_WALLET_PRIVATE_KEY".to_owned(),
+                eth_key.private_key,
+            )],
+        )
+        .await?
+    } else {
+        preflight
+    };
+    report["tap_account_binding"] = binding;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -42615,6 +42888,24 @@ async fn ethereum_wallet_key(keypair_path: &Path, password: &str) -> Result<Ethe
     run_wallet_helper(args).await
 }
 
+async fn sign_ethereum_message(
+    keypair_path: &Path,
+    password: &str,
+    message: &str,
+) -> Result<EthereumSignOutput> {
+    let mut args = vec![
+        "eth-sign".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+        "--message".to_owned(),
+        message.to_owned(),
+    ];
+    if !password.is_empty() {
+        args.extend(["--password".to_owned(), password.to_owned()]);
+    }
+    run_wallet_helper(args).await
+}
+
 async fn sign_message(keypair_path: &Path, password: &str, message: &str) -> Result<String> {
     let mut args = vec![
         "sign".to_owned(),
@@ -43229,8 +43520,29 @@ mod tests {
         );
         assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:61000"));
         assert_eq!(args.chain_id, Some(61_000));
+        assert!(!args.bind_only);
         assert!(args.confirm);
         assert!(args.json);
+
+        let bind = Cli::try_parse_from([
+            "mayhem",
+            "deposit",
+            "tap",
+            "--bind-only",
+            "--confirm",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Deposit { command } = bind.command else {
+            panic!("expected deposit command");
+        };
+        let DepositCommands::Tap(args) = command else {
+            panic!("expected deposit tap command");
+        };
+        assert!(args.bind_only);
+        assert!(args.amount_tap.is_none());
+        assert!(args.amount_wei.is_none());
+        assert!(args.confirm);
 
         let status = Cli::try_parse_from([
             "mayhem",
@@ -44420,6 +44732,32 @@ mod tests {
             Some("m/44'/60'/0'/0/0")
         );
         assert_eq!(created.ethereum_source.as_deref(), Some("mnemonic"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn wallet_ethereum_account_signs_tap_binding_messages() {
+        let temp = test_temp_dir("mayhem-wallet-tap-binding");
+        let keypair_path = temp.join("main").join("db").join("keypair.json");
+        fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
+        let wallet = create_wallet(&keypair_path, "", None, false, None, None)
+            .await
+            .unwrap();
+        let ethereum = wallet.ethereum_address.as_deref().unwrap();
+        let message = tap_account_binding_message(
+            &wallet.public_key,
+            ethereum,
+            1,
+            "0x2222222222222222222222222222222222222222",
+        );
+        let signed = sign_ethereum_message(&keypair_path, "", &message)
+            .await
+            .unwrap();
+
+        assert_eq!(signed.address, ethereum);
+        assert!(signed.signature.starts_with("0x"));
+        assert_eq!(signed.signature.len(), 132);
 
         let _ = fs::remove_dir_all(temp);
     }

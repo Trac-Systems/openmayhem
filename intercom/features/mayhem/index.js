@@ -42,6 +42,7 @@ const requestIdFor = (feature, key, value) =>
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.op === 'consent' || value.op === 'deposit_tnk') return normalizeKey(value.sender);
+  if (value.op === 'tap_account_bind') return normalizeKey(value.user);
   if (value.op === 'provider_lifecycle') return normalizeKey(value.intent?.provider);
   if (value.op === 'spend_reserve') return normalizeKey(value.provider);
   return null;

@@ -71,7 +71,11 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'consent' || json?.op === 'register_provider') {
+    if (
+      json?.op === 'consent' ||
+      json?.op === 'register_provider' ||
+      json?.op === 'tap_account_bind'
+    ) {
       return null;
     }
     if (json?.op === 'set_provider_payout') {

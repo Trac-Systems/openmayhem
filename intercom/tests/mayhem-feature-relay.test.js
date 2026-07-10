@@ -211,6 +211,38 @@ test('read-only provider relays a signed rails preference through the existing l
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
 });
 
+test('read-only user relays a dual-signed TAP account binding to the admin appender', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, { timeoutMs: 1_000, retryMs: 100 });
+  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 1_000, retryMs: 100 });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const key = `tap_account/${providerKey}/${'44'.repeat(32)}`;
+  const value = {
+    op: 'tap_account_bind',
+    user: providerKey,
+    ethereum_address: `0x${'55'.repeat(20)}`,
+    chain_id: 1,
+    pool_address: `0x${'66'.repeat(20)}`,
+    user_sig: '77'.repeat(64),
+    ethereum_sig: `0x${'88'.repeat(65)}`,
+  };
+  const result = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.appended[0].value.dispatch.address, adminKey);
+  assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+});
+
 test('admin-writer RPC keeps the local append path', async () => {
   const writer = peerFor(adminKey, { writable: true });
   let appendCalls = 0;

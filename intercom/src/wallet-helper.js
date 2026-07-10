@@ -48,6 +48,23 @@ const ethereumAddress = (privateKeyBytes) => {
   return `0x${address}`;
 };
 
+const ethereumPersonalMessageHash = (message) => {
+  const body = b4a.from(message, 'utf8');
+  const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  return keccak256(b4a.concat([prefix, body]));
+};
+
+const ethereumSignMessage = (account, message) => {
+  const privateKey = b4a.from(account.private_key.slice(2), 'hex');
+  const signature = secp256k1.sign(ethereumPersonalMessageHash(message), privateKey, {
+    lowS: true,
+  });
+  const bytes = b4a.alloc(65);
+  bytes.set(signature.toCompactRawBytes(), 0);
+  bytes[64] = 27 + signature.recovery;
+  return `0x${b4a.toString(bytes, 'hex')}`;
+};
+
 const ethereumFromPrivateKey = (
   privateKey,
   source = 'imported_private_key',
@@ -272,6 +289,21 @@ export async function runWalletHelper(flags) {
       private_key: ethereum.private_key,
       derivation_path: ethereum.derivation_path,
       source: ethereum.source,
+    };
+  }
+
+  if (command === 'eth-sign') {
+    if (message === null || messageHex !== null) {
+      throw new Error('Ethereum signing requires --message and does not accept --message-hex.');
+    }
+    const wallet = await loadWallet();
+    const ethereum = resolveEthereumAccount(wallet);
+    if (!ethereum?.private_key) {
+      throw new Error('Wallet does not contain a restorable Ethereum account.');
+    }
+    return {
+      address: ethereum.address,
+      signature: ethereumSignMessage(ethereum, message),
     };
   }
 

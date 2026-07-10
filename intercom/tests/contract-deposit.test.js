@@ -7,11 +7,14 @@ import {
   execute,
   executeDepositFeature,
   executeRateFeature,
+  executeTapAccountBindingFeature,
+  makeEthereumIdentity,
   makeIdentity,
   makeTxKey,
   makeVerifier,
   signConsent,
   signDepositTnkIntent,
+  signTapAccountBinding,
 } from './helpers/contract.js';
 
 const rulesHash = '5'.repeat(64);
@@ -282,9 +285,91 @@ test('MayhemContract deposit root accumulation is deterministic and root-only', 
   assert.equal(rootJson.includes('2'.repeat(64)), false);
 });
 
+test('MayhemContract dual-signs TAP account bindings and claims pre-binding credit once', async () => {
+  const ctx = await setupDepositContract();
+  const ethereum = makeEthereumIdentity();
+  const pool = '0x2222222222222222222222222222222222222222';
+  await consentUser(ctx, 2);
+  const unsigned = {
+    op: 'tap_account_bind',
+    user: ctx.user.publicKey,
+    ethereum_address: ethereum.address,
+    chain_id: 1,
+    pool_address: pool,
+  };
+  const valid = signTapAccountBinding(ctx.user.wallet, ethereum, unsigned);
+
+  const badUser = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    { ...valid, user_sig: '0'.repeat(128) },
+    ctx.admin.publicKey
+  );
+  assert.match(badUser.message, /user signature/i);
+  const badEthereum = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    { ...valid, ethereum_sig: `0x${'0'.repeat(130)}` },
+    ctx.admin.publicKey
+  );
+  assert.match(badEthereum.message, /Ethereum signature/i);
+
+  await ctx.storage.put(`bal/${ethereum.address}/tap`, {
+    user: ethereum.address,
+    rail: 'tap',
+    denom: 'au_usd',
+    au: '86018945004270602',
+    updated_epoch: 1,
+    updated_at: makeTxKey(4),
+  });
+  const bound = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    valid,
+    ctx.admin.publicKey
+  );
+  assert.equal(bound.ok, true, bound.message);
+  assert.equal(bound.claimed_au, '86018945004270602');
+  assert.equal(bound.balance_au, '86018945004270602');
+  assert.equal((await ctx.storage.get(`bal/${ethereum.address}/tap`)).value.au, '0');
+  assert.equal(
+    (await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au,
+    '86018945004270602'
+  );
+
+  const repeated = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    valid,
+    ctx.admin.publicKey
+  );
+  assert.equal(repeated.ok, true, repeated.message);
+  assert.equal(repeated.idempotent, true);
+  assert.equal(repeated.claimed_au, '0');
+
+  const other = await makeIdentity();
+  const otherConsent = await execute(
+    ctx.contract,
+    ctx.storage,
+    'consent',
+    { op: 'consent', ver: 1, hash: rulesHash, sig: signConsent(other.wallet, 1, rulesHash) },
+    other.publicKey,
+    5
+  );
+  assert.equal(otherConsent.ok, true, otherConsent.message);
+  const conflict = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    signTapAccountBinding(other.wallet, ethereum, { ...unsigned, user: other.publicKey }),
+    ctx.admin.publicKey
+  );
+  assert.match(conflict.message, /different Mayhem wallet/i);
+});
+
 test('MayhemContract tapDeposit credits a finalized event exactly once under replay', async () => {
   const ctx = await setupDepositContract();
-  const buyer = '0x1111111111111111111111111111111111111111';
+  const ethereum = makeEthereumIdentity();
+  const buyer = ethereum.address;
   const pool = '0x2222222222222222222222222222222222222222';
   const ethTxHash = `0x${'a'.repeat(64)}`;
   const value = {
@@ -379,12 +464,34 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   );
   assert.equal(rate.ok, true, rate.message);
 
+  const unbound = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
+  assert.match(unbound.message, /account binding required/i);
+  await consentUser(ctx, 3);
+  const bindingValue = signTapAccountBinding(ctx.user.wallet, ethereum, {
+    op: 'tap_account_bind',
+    user: ctx.user.publicKey,
+    ethereum_address: buyer,
+    chain_id: 61_000,
+    pool_address: pool,
+  });
+  const binding = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    bindingValue,
+    ctx.admin.publicKey
+  );
+  assert.equal(binding.ok, true, binding.message);
+  assert.equal(binding.user, ctx.user.publicKey);
+  assert.equal(binding.ethereum_address, buyer);
+  assert.equal(binding.claimed_au, '0');
+
   const confirmedKey = await depositFeatureKey(ctx.contract, value);
   const confirmed = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'tapDeposit');
   assert.equal(confirmed.duplicate, false);
-  assert.equal(confirmed.who, buyer);
+  assert.equal(confirmed.who, ctx.user.publicKey);
+  assert.equal(confirmed.ethereum_address, buyer);
   assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(confirmed.eth_tx_hash, ethTxHash);
   assert.equal(confirmed.log_index, 0);
@@ -394,7 +501,8 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   const seenKey = `dep/tap/${ethTxHash}/0`;
   assert.deepEqual((await ctx.storage.get(seenKey)).value, {
     rail: 'tap',
-    who: buyer,
+    who: ctx.user.publicKey,
+    ethereum_address: buyer,
     tap_wei: oneTnkE18,
     tap_usd_au: '2000000000000000000',
     rate_ts: 1_000,
@@ -417,8 +525,8 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     credited_by: ctx.admin.publicKey,
     credited_by_role: 'admin',
   });
-  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value, {
-    user: buyer,
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value, {
+    user: ctx.user.publicKey,
     rail: 'tap',
     denom: 'au_usd',
     au: '2000000000000000000',
@@ -443,7 +551,10 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(replay.au, '0');
   assert.equal(replay.credited_au, '2000000000000000000');
   assert.equal(replay.deposit_root, confirmed.deposit_root);
-  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value.au, '2000000000000000000');
+  assert.deepEqual(
+    (await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au,
+    '2000000000000000000'
+  );
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 });
 

@@ -7,11 +7,14 @@ import {
   execute,
   executeDepositFeature,
   executeRateFeature,
+  executeTapAccountBindingFeature,
+  makeEthereumIdentity,
   makeIdentity,
   makeVerifier,
   rateFeatureKey,
   signConsent,
   signDepositTnkIntent,
+  signTapAccountBinding,
 } from './helpers/contract.js';
 
 const rulesHash = '6'.repeat(64);
@@ -172,8 +175,9 @@ test('MayhemContract rateOracle feature is admin controlled and monotonic', asyn
 });
 
 test('MayhemContract tapRateOracle drives TAP deposits and fails closed when stale', async () => {
-  const { admin, outsider, storage, contract } = await setupRateContract();
-  const buyer = '0x3333333333333333333333333333333333333333';
+  const { admin, user, outsider, storage, contract } = await setupRateContract();
+  const ethereum = makeEthereumIdentity();
+  const buyer = ethereum.address;
   const pool = '0x4444444444444444444444444444444444444444';
   const tapDeposit = {
     op: 'tap_deposit',
@@ -256,6 +260,29 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   assert.match(staleDeposit.message, /TAP rate oracle is stale/i);
   assert.equal(await storage.get(`bal/${buyer}/tap`), null);
 
+  const userConsent = await execute(
+    contract,
+    storage,
+    'consent',
+    { op: 'consent', ver: 1, hash: rulesHash, sig: signConsent(user.wallet, 1, rulesHash) },
+    user.publicKey,
+    5
+  );
+  assert.equal(userConsent.ok, true, userConsent.message);
+  const binding = await executeTapAccountBindingFeature(
+    contract,
+    storage,
+    signTapAccountBinding(user.wallet, ethereum, {
+      op: 'tap_account_bind',
+      user: user.publicKey,
+      ethereum_address: buyer,
+      chain_id: 61_000,
+      pool_address: pool,
+    }),
+    admin.publicKey
+  );
+  assert.equal(binding.ok, true, binding.message);
+
   const freshTapValue = { ...tapDeposit, at: 1_900 };
   const freshTapKey = await depositFeatureKey(contract, freshTapValue);
   const freshDeposit = await executeDepositFeature(
@@ -267,8 +294,8 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
   assert.equal(freshDeposit.au, '2000000000000000000');
   assert.equal(freshDeposit.rate_ts, 1_000);
-  assert.deepEqual((await storage.get(`bal/${buyer}/tap`)).value, {
-    user: buyer,
+  assert.deepEqual((await storage.get(`bal/${user.publicKey}/tap`)).value, {
+    user: user.publicKey,
     rail: 'tap',
     denom: 'au_usd',
     au: '2000000000000000000',

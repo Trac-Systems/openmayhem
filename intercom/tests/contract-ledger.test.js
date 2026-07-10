@@ -332,6 +332,15 @@ test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
     { op: 'deposit_tnk', memo_hash: 'memo-1' },
     { op: 'deposit_tnk', memo_hash: 'memo-2' },
     {
+      op: 'tap_account_bind',
+      user: '11'.repeat(32),
+      ethereum_address: `0x${'22'.repeat(20)}`,
+      chain_id: 1,
+      pool_address: `0x${'33'.repeat(20)}`,
+      user_sig: '44'.repeat(64),
+      ethereum_sig: `0x${'55'.repeat(65)}`,
+    },
+    {
       op: 'tnk_deposit',
       memo_hash: 'memo-1',
       tnk_e18: '1000000000000000000',

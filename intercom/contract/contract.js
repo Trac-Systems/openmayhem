@@ -1,5 +1,7 @@
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
+import { keccak256 } from 'ethereum-cryptography/keccak';
+import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 
 export const CONTRACT_VERSION = 7;
@@ -325,6 +327,14 @@ export const providerLifecycleIntentMessage = (intent, signingVersion = SIGNING_
 };
 export const depositTnkIntentMessage = (intent) =>
   `mayhem-deposit-tnk-intent-v1${stableJson(intent)}`;
+export const tapAccountBindingEvidence = (value) => ({
+  user: value.user,
+  ethereum_address: value.ethereum_address.toLowerCase(),
+  chain_id: value.chain_id,
+  pool_address: value.pool_address.toLowerCase(),
+});
+export const tapAccountBindingMessage = (value) =>
+  `mayhem-tap-account-bind-v1${stableJson(tapAccountBindingEvidence(value))}`;
 const canonicalSpendVoucherBody = (body) => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const canonical = {
@@ -465,6 +475,13 @@ const stableValue = (value) => {
   return value;
 };
 const stableJson = (value) => JSON.stringify(stableValue(value));
+const ethereumPersonalMessageHash = (message) => {
+  const body = b4a.from(message, 'utf8');
+  const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  return keccak256(b4a.concat([prefix, body]));
+};
+const ethereumAddressFromPublicKey = (publicKey) =>
+  `0x${b4a.toString(keccak256(publicKey.subarray(1)).subarray(12), 'hex')}`;
 
 export const contractParamDefinitions = () => cloneValue(PARAM_DEFINITIONS);
 export const contractEpochAdminParamKeys = () => [...EPOCH_ADMIN_PARAM_KEYS];
@@ -1105,6 +1122,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'tap_account_bind') {
+      const result = await this.applyTapAccountBindingFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     const adminError = await this.requireAdmin(this.address);
     if (adminError) {
       this._mayhemLastFeatureResult = adminError;
@@ -1170,6 +1192,103 @@ class MayhemContract extends Contract {
     await this.put(`consent/${value.sender}`, record);
     console.log('mayhem consent feature', { address: value.sender, ...record });
     return { ok: true, op: 'consentFeature', address: value.sender, ...record };
+  }
+
+  async applyTapAccountBindingFeature(key, value) {
+    const normalized = this.normalizeTapAccountBinding(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.tapAccountBindingFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid TAP account binding key.');
+
+    const consentError = await this.requireConsent(normalized.user);
+    if (consentError) return consentError;
+    if (!this.verifyTapAccountUserSignature(normalized)) {
+      return new Error('Invalid TAP account user signature.');
+    }
+    if (!this.verifyTapAccountEthereumSignature(normalized)) {
+      return new Error('Invalid TAP account Ethereum signature.');
+    }
+
+    const bindingKey = this.tapAccountBindingKey(
+      normalized.user,
+      normalized.chain_id,
+      normalized.pool_address
+    );
+    const addressKey = this.tapAccountAddressKey(
+      normalized.ethereum_address,
+      normalized.chain_id,
+      normalized.pool_address
+    );
+    const existingBinding = await this.get(bindingKey);
+    if (existingBinding && existingBinding.ethereum_address !== normalized.ethereum_address) {
+      return new Error('Mayhem wallet is already bound to a different TAP account.');
+    }
+    const existingAddress = await this.get(addressKey);
+    if (existingAddress && existingAddress.user !== normalized.user) {
+      return new Error('TAP account is already bound to a different Mayhem wallet.');
+    }
+
+    const source = await this.balanceRecord(normalized.ethereum_address, 'tap');
+    if (source instanceof Error) return source;
+    const sourceError = this.guardianValidateBalanceRecord(
+      source,
+      normalized.ethereum_address,
+      'tap'
+    );
+    if (sourceError) return sourceError;
+    const target = await this.balanceRecord(normalized.user, 'tap');
+    if (target instanceof Error) return target;
+    const targetError = this.guardianValidateBalanceRecord(target, normalized.user, 'tap');
+    if (targetError) return targetError;
+    const nextAu = this.safeAddAu(target.au, source.au);
+    if (nextAu instanceof Error) return nextAu;
+
+    const record = {
+      type: 'tap_account_binding',
+      user: normalized.user,
+      ethereum_address: normalized.ethereum_address,
+      chain_id: normalized.chain_id,
+      pool_address: normalized.pool_address,
+      user_sig: normalized.user_sig,
+      ethereum_sig: normalized.ethereum_sig,
+      status: 'active',
+      bound_at: this.tx,
+    };
+    await this.put(bindingKey, record);
+    await this.put(addressKey, record);
+
+    if (!this.isZeroAu(source.au)) {
+      await this.put(this.balanceKey(normalized.user, 'tap'), {
+        ...target,
+        user: normalized.user,
+        rail: 'tap',
+        au: nextAu,
+        updated_epoch: Math.max(target.updated_epoch, source.updated_epoch),
+        updated_at: this.tx,
+        last_tap_account_claim_au: source.au,
+        last_tap_account_claim_from: normalized.ethereum_address,
+      });
+      await this.put(this.balanceKey(normalized.ethereum_address, 'tap'), {
+        ...source,
+        au: ZERO_AU,
+        updated_at: this.tx,
+        tap_account_bound_to: normalized.user,
+        tap_account_binding_key: bindingKey,
+      });
+    }
+
+    return {
+      ok: true,
+      op: 'tapAccountBind',
+      user: normalized.user,
+      ethereum_address: normalized.ethereum_address,
+      chain_id: normalized.chain_id,
+      pool_address: normalized.pool_address,
+      claimed_au: source.au,
+      balance_au: nextAu,
+      idempotent: existingBinding !== null && existingAddress !== null && this.isZeroAu(source.au),
+    };
   }
 
   async applyProviderLifecycleFeature(key, value) {
@@ -5463,6 +5582,49 @@ class MayhemContract extends Contract {
     };
   }
 
+  normalizeTapAccountBinding(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'user',
+        'ethereum_address',
+        'chain_id',
+        'pool_address',
+        'user_sig',
+        'ethereum_sig',
+      ],
+      'TAP account binding'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tap_account_bind') return new Error('Invalid TAP account binding op.');
+    if (!this.isHexBytes(value.user, 32)) return new Error('Invalid TAP account user.');
+    if (!this.isEthHexBytes(value.ethereum_address, 20)) {
+      return new Error('Invalid TAP Ethereum account.');
+    }
+    if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) {
+      return new Error('Invalid TAP account chain id.');
+    }
+    if (!this.isEthHexBytes(value.pool_address, 20)) {
+      return new Error('Invalid TAP account pool address.');
+    }
+    if (!this.isHexBytes(value.user_sig, 64)) {
+      return new Error('Invalid TAP account user signature.');
+    }
+    if (!this.isEthHexBytes(value.ethereum_sig, 65)) {
+      return new Error('Invalid TAP account Ethereum signature.');
+    }
+    return {
+      op: 'tap_account_bind',
+      user: value.user.toLowerCase(),
+      ethereum_address: value.ethereum_address.toLowerCase(),
+      chain_id: value.chain_id,
+      pool_address: value.pool_address.toLowerCase(),
+      user_sig: value.user_sig.toLowerCase(),
+      ethereum_sig: value.ethereum_sig.toLowerCase(),
+    };
+  }
+
   async tapDeposit() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -5477,7 +5639,7 @@ class MayhemContract extends Contract {
     if (au instanceof Error) return au;
     if (this.isZeroAu(au)) return new Error('TAP deposit converts to zero au.');
 
-    const who = this.value.who.toLowerCase();
+    const ethereumAddress = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
     const blockHash = this.value.block_hash.toLowerCase();
     const poolAddress = this.value.pool_address.toLowerCase();
@@ -5490,12 +5652,31 @@ class MayhemContract extends Contract {
         op: 'tapDeposit',
         duplicate: true,
         who: existing.who,
+        ethereum_address: existing.ethereum_address ?? this.value.who.toLowerCase(),
         au: ZERO_AU,
         credited_au: existing.au ?? null,
         epoch: existing.epoch ?? this.value.epoch,
         deposit_root: (await this.get(`ev/dep/${existing.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
       };
     }
+
+    const binding = await this.get(
+      this.tapAccountAddressKey(ethereumAddress, this.value.chain_id, poolAddress)
+    );
+    if (!binding || binding.status !== 'active') {
+      return new Error('TAP account binding required before deposit credit.');
+    }
+    if (!this.isHexBytes(binding.user, 32)) {
+      return new Error('Invalid TAP account binding user.');
+    }
+    if (
+      binding.ethereum_address !== ethereumAddress ||
+      binding.chain_id !== this.value.chain_id ||
+      binding.pool_address !== poolAddress
+    ) {
+      return new Error('TAP account binding does not match deposit evidence.');
+    }
+    const who = binding.user;
 
     const ledgerRail = 'tap';
     const balance = await this.balanceRecord(who, ledgerRail);
@@ -5507,6 +5688,7 @@ class MayhemContract extends Contract {
     const leaf = await this.depositLeafHash({
       rail: 'tap',
       user_hash: await this.opaqueHash('deposit-user', who),
+      ethereum_address_hash: await this.opaqueHash('deposit-ethereum-account', ethereumAddress),
       au,
       tap_wei: this.value.tap_wei,
       tap_usd_au: rate.tap_usd_au,
@@ -5535,6 +5717,7 @@ class MayhemContract extends Contract {
     const seen = {
       rail: 'tap',
       who,
+      ethereum_address: ethereumAddress,
       tap_wei: this.value.tap_wei,
       tap_usd_au: rate.tap_usd_au,
       rate_ts: rate.ts,
@@ -5574,6 +5757,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem tapDeposit', {
       who,
+      ethereum_address: ethereumAddress,
       au,
       tap_wei: this.value.tap_wei,
       tap_usd_au: rate.tap_usd_au,
@@ -5587,6 +5771,7 @@ class MayhemContract extends Contract {
       op: 'tapDeposit',
       duplicate: false,
       who,
+      ethereum_address: ethereumAddress,
       au,
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
@@ -10375,6 +10560,21 @@ class MayhemContract extends Contract {
     return `epoch/apply/${value.epoch}/${b4a.toString(digest, 'hex')}`;
   }
 
+  async tapAccountBindingFeatureKey(value) {
+    const normalized = this.normalizeTapAccountBinding(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(tapAccountBindingMessage(normalized)));
+    return `tap_account/${normalized.user}/${b4a.toString(digest, 'hex')}`;
+  }
+
+  tapAccountBindingKey(user, chainId, poolAddress) {
+    return `tap/account/${chainId}/${poolAddress.toLowerCase()}/${user}`;
+  }
+
+  tapAccountAddressKey(ethereumAddress, chainId, poolAddress) {
+    return `tap/account-by-address/${chainId}/${poolAddress.toLowerCase()}/${ethereumAddress.toLowerCase()}`;
+  }
+
   async depositFeatureKey(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Deposit feature value must be an object.');
@@ -10697,6 +10897,36 @@ class MayhemContract extends Contract {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
     return verify.call(this.protocol.peer.wallet, sig, depositTnkIntentMessage(intent), sender) === true;
+  }
+
+  verifyTapAccountUserSignature(value) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return verify.call(
+      this.protocol.peer.wallet,
+      value.user_sig,
+      tapAccountBindingMessage(value),
+      value.user
+    ) === true;
+  }
+
+  verifyTapAccountEthereumSignature(value) {
+    try {
+      const bytes = b4a.from(value.ethereum_sig.slice(2), 'hex');
+      let recovery = bytes[64];
+      if (recovery === 27 || recovery === 28) recovery -= 27;
+      if (recovery !== 0 && recovery !== 1) return false;
+      const signature = secp256k1.Signature
+        .fromCompact(bytes.subarray(0, 64))
+        .addRecoveryBit(recovery);
+      if (signature.hasHighS()) return false;
+      const publicKey = signature
+        .recoverPublicKey(ethereumPersonalMessageHash(tapAccountBindingMessage(value)))
+        .toRawBytes(false);
+      return ethereumAddressFromPublicKey(publicKey) === value.ethereum_address.toLowerCase();
+    } catch {
+      return false;
+    }
   }
 
   verifySpendVoucherSignature(user, body, sig) {
