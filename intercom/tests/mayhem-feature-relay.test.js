@@ -56,6 +56,7 @@ const peerFor = (publicKey, { writable = false } = {}) => {
 const connect = (leftPeer, leftFeature, rightPeer, rightFeature) => {
   leftPeer.sidechannel = {
     started: true,
+    connectDirectPeer: async () => true,
     verifyPayload(payload, expectedKey) {
       return payload.from === expectedKey && payload.sig === `signed:${payload.from}`;
     },
@@ -234,6 +235,55 @@ test('relay rejects admin operations before network send', async () => {
     feature.relay('rate/tnk/1', { op: 'rate_oracle', at: 1 }),
     /Invalid relayed feature operation/
   );
+  assert.equal(broadcasts, 0);
+});
+
+test('participant waits for the direct admin relay channel before sending', async () => {
+  const participant = peerFor(providerKey);
+  const events = [];
+  participant.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer(remote, channel, waitMs) {
+      events.push(['connect', remote, channel, waitMs]);
+      return true;
+    },
+    broadcast() {
+      events.push(['broadcast']);
+      return false;
+    },
+  };
+  const feature = new MayhemFeature(participant.peer, { timeoutMs: 2_000 });
+  feature.key = 'mayhem';
+
+  await feature.relay(`consent/${providerKey}/1/rules-hash`, consentValue());
+
+  assert.deepEqual(events, [
+    ['connect', adminKey, MAYHEM_RELAY_CHANNEL, 2_000],
+    ['broadcast'],
+  ]);
+});
+
+test('participant does not broadcast when the canonical admin channel is unavailable', async () => {
+  const participant = peerFor(providerKey);
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => false,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+  const feature = new MayhemFeature(participant.peer, { timeoutMs: 10 });
+  feature.key = 'mayhem';
+
+  const result = await feature.relay(
+    `consent/${providerKey}/1/rules-hash`,
+    consentValue()
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /direct channel to the canonical admin/);
   assert.equal(broadcasts, 0);
 });
 

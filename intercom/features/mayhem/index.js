@@ -9,7 +9,7 @@ const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
 const RELAY_VERSION = 1;
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
-const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
@@ -151,6 +151,12 @@ class MayhemFeature extends Feature {
     if (this.relayMessageBytes(message) > this.maxMessageBytes) {
       throw new Error(`Mayhem feature relay payload exceeds ${this.maxMessageBytes} bytes.`);
     }
+    if (!(await this._connectAdminTransport(admin, sidechannel))) {
+      return relayError(
+        'Mayhem feature relay could not establish its direct channel to the canonical admin.',
+        requestId
+      );
+    }
     const send = () => sidechannel.broadcast(this.channel, message);
     this.pending.set(requestId, { promise, resolve: resolvePending });
 
@@ -210,6 +216,12 @@ class MayhemFeature extends Feature {
     if (this.relayMessageBytes(message) > this.maxMessageBytes) {
       throw new Error(`Mayhem service relay payload exceeds ${this.maxMessageBytes} bytes.`);
     }
+    if (!(await this._connectAdminTransport(admin, sidechannel))) {
+      return relayError(
+        'Mayhem service relay could not establish its direct channel to the canonical admin.',
+        requestId
+      );
+    }
     const send = () => sidechannel.broadcast(this.channel, message);
     this.servicePending.set(requestId, { promise, resolve: resolvePending });
     if (!send()) {
@@ -250,6 +262,14 @@ class MayhemFeature extends Feature {
   async _adminKey() {
     const admin = await this.peer?.base?.view?.get('admin');
     return normalizeKey(admin?.value);
+  }
+
+  async _connectAdminTransport(admin, sidechannel) {
+    const target = normalizeKey(admin);
+    if (!/^[0-9a-f]{64}$/.test(target) ||
+        typeof sidechannel?.connectDirectPeer !== 'function') return false;
+    const waitMs = Math.max(1, Math.min(this.timeoutMs, 15_000));
+    return await sidechannel.connectDirectPeer(target, this.channel, waitMs);
   }
 
   _verifyEnvelope(payload, expectedKey) {

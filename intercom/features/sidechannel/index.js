@@ -1007,6 +1007,43 @@ class Sidechannel extends Feature {
     return true;
   }
 
+  _directPeerChannelReady(remote, channel) {
+    const target = normalizeKeyHex(remote);
+    if (!target) return false;
+    for (const [connection, perConn] of this.connections) {
+      if (this._getRemoteKey(connection) !== target) continue;
+      const record = perConn.get(channel);
+      if (record?.message && record.channel?.opened === true) return true;
+    }
+    return false;
+  }
+
+  async connectDirectPeer(remote, channel, waitMs = 15_000) {
+    const target = normalizeKeyHex(remote);
+    const entry = this._registerChannel(channel);
+    if (!target || !entry || typeof this.peer?.swarm?.joinPeer !== 'function') return false;
+    if (this._directPeerChannelReady(target, entry.name)) return true;
+
+    try {
+      this.peer.swarm.joinPeer(b4a.from(target, 'hex'));
+    } catch (_error) {
+      return false;
+    }
+
+    const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 15_000, 120_000));
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      for (const connection of this.peer.swarm.connections || []) {
+        if (this._getRemoteKey(connection) === target) {
+          this._openChannelForConnection(connection, entry);
+        }
+      }
+      if (this._directPeerChannelReady(target, entry.name)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return false;
+  }
+
   async removeChannel(name) {
     const channel = String(name || '').trim();
     if (!channel) return false;
