@@ -17767,6 +17767,31 @@ fn tap_account_address_state_key(
     )
 }
 
+fn tap_account_binding_identity_matches(
+    record: Option<&Value>,
+    user: &str,
+    ethereum_address: &str,
+) -> bool {
+    record.is_some_and(|record| {
+        record.get("status").and_then(Value::as_str) == Some("active")
+            && record.get("user").and_then(Value::as_str) == Some(user)
+            && record.get("ethereum_address").and_then(Value::as_str) == Some(ethereum_address)
+    })
+}
+
+fn tap_account_binding_is_complete(
+    record: Option<&Value>,
+    user: &str,
+    ethereum_address: &str,
+    feature_key: &str,
+) -> bool {
+    tap_account_binding_identity_matches(record, user, ethereum_address)
+        && record
+            .and_then(|record| record.get("bound_at"))
+            .and_then(Value::as_str)
+            == Some(feature_key)
+}
+
 async fn ensure_tap_account_binding(
     rpc: &PeerRpcClient,
     keypair_path: &Path,
@@ -17789,29 +17814,36 @@ async fn ensure_tap_account_binding(
     if !is_eth_address(&pool_address) {
         bail!("TAP pool address is invalid");
     }
+    let message = tap_account_binding_message(&user, &ethereum_address, chain_id, &pool_address);
+    let feature_key = format!(
+        "tap_account/{}/{}",
+        wallet.public_key.to_ascii_lowercase(),
+        blake3::hash(message.as_bytes()).to_hex()
+    );
     let binding_key = tap_account_binding_state_key(&user, chain_id, &pool_address);
     let address_key = tap_account_address_state_key(&ethereum_address, chain_id, &pool_address);
     let binding = read_state_value(rpc, &binding_key).await?;
     let reverse = read_state_value(rpc, &address_key).await?;
-    let binding_matches = binding.as_ref().is_some_and(|record| {
-        record.get("status").and_then(Value::as_str) == Some("active")
-            && record.get("user").and_then(Value::as_str) == Some(user.as_str())
-            && record.get("ethereum_address").and_then(Value::as_str)
-                == Some(ethereum_address.as_str())
-    });
-    let reverse_matches = reverse.as_ref().is_some_and(|record| {
-        record.get("status").and_then(Value::as_str) == Some("active")
-            && record.get("user").and_then(Value::as_str) == Some(user.as_str())
-            && record.get("ethereum_address").and_then(Value::as_str)
-                == Some(ethereum_address.as_str())
-    });
-    if binding.is_some() && !binding_matches {
+    let binding_identity_matches =
+        tap_account_binding_identity_matches(binding.as_ref(), &user, &ethereum_address);
+    let reverse_identity_matches =
+        tap_account_binding_identity_matches(reverse.as_ref(), &user, &ethereum_address);
+    if binding.is_some() && !binding_identity_matches {
         bail!("Mayhem wallet is already bound to a different TAP account for this pool");
     }
-    if reverse.is_some() && !reverse_matches {
+    if reverse.is_some() && !reverse_identity_matches {
         bail!("TAP account is already bound to a different Mayhem wallet for this pool");
     }
-    if binding_matches && reverse_matches {
+    let was_existing = binding_identity_matches && reverse_identity_matches;
+    let binding_complete =
+        tap_account_binding_is_complete(binding.as_ref(), &user, &ethereum_address, &feature_key)
+            && tap_account_binding_is_complete(
+                reverse.as_ref(),
+                &user,
+                &ethereum_address,
+                &feature_key,
+            );
+    if binding_complete {
         return Ok(json!({
             "ok": true,
             "status": "active",
@@ -17825,7 +17857,6 @@ async fn ensure_tap_account_binding(
         }));
     }
 
-    let message = tap_account_binding_message(&user, &ethereum_address, chain_id, &pool_address);
     let user_sig = sign_message(keypair_path, password, &message).await?;
     let ethereum = sign_ethereum_message(keypair_path, password, &message).await?;
     if !ethereum.address.eq_ignore_ascii_case(&ethereum_address) {
@@ -17844,11 +17875,6 @@ async fn ensure_tap_account_binding(
         "user_sig": user_sig,
         "ethereum_sig": ethereum.signature,
     });
-    let feature_key = format!(
-        "tap_account/{}/{}",
-        wallet.public_key.to_ascii_lowercase(),
-        blake3::hash(message.as_bytes()).to_hex()
-    );
     let feature = json!({
         "feature": "mayhem",
         "key": feature_key,
@@ -17858,7 +17884,8 @@ async fn ensure_tap_account_binding(
         return Ok(json!({
             "ok": true,
             "status": "ready",
-            "existing": false,
+            "existing": was_existing,
+            "reasserted": false,
             "submitted": false,
             "user": wallet.public_key.to_ascii_lowercase(),
             "ethereum_address": ethereum_address,
@@ -17884,6 +17911,7 @@ async fn ensure_tap_account_binding(
                     == Some(wallet.public_key.to_ascii_lowercase().as_str())
                 && record.get("ethereum_address").and_then(Value::as_str)
                     == Some(ethereum_address.as_str())
+                && record.get("bound_at").and_then(Value::as_str) == Some(feature_key.as_str())
         }) {
             applied = current;
             break;
@@ -17894,7 +17922,8 @@ async fn ensure_tap_account_binding(
     Ok(json!({
         "ok": true,
         "status": "active",
-        "existing": false,
+        "existing": was_existing,
+        "reasserted": was_existing,
         "submitted": true,
         "user": wallet.public_key.to_ascii_lowercase(),
         "ethereum_address": ethereum_address,
@@ -43611,6 +43640,38 @@ mod tests {
                 "mayhem-tap-account-bind-v1{{\"chain_id\":1,\"ethereum_address\":\"0x2222222222222222222222222222222222222222\",\"pool_address\":\"0x3333333333333333333333333333333333333333\",\"user\":\"{user}\"}}"
             )
         );
+    }
+
+    #[test]
+    fn tap_account_binding_requires_canonical_evidence_key() {
+        let user = "11".repeat(32);
+        let ethereum_address = "0x2222222222222222222222222222222222222222";
+        let feature_key = "tap_account/test/evidence";
+        let mut record = json!({
+            "status": "active",
+            "user": user.clone(),
+            "ethereum_address": ethereum_address,
+        });
+
+        assert!(tap_account_binding_identity_matches(
+            Some(&record),
+            &user,
+            ethereum_address
+        ));
+        assert!(!tap_account_binding_is_complete(
+            Some(&record),
+            &user,
+            ethereum_address,
+            feature_key
+        ));
+
+        record["bound_at"] = Value::String(feature_key.to_owned());
+        assert!(tap_account_binding_is_complete(
+            Some(&record),
+            &user,
+            ethereum_address,
+            feature_key
+        ));
     }
 
     #[test]
