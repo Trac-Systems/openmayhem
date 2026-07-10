@@ -23,6 +23,7 @@ const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
+const DEFAULT_TAP_HOLDBACK_EPOCHS = 24;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export const POOL_SETTLEMENT_ABI = [
@@ -1112,6 +1113,79 @@ async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
+export async function resolveProviderAccountsFromLedger({ bundle, peerRpcUrl, fetchImpl } = {}) {
+  const admin = String(await readContractStateValue(peerRpcUrl, 'admin', { fetchImpl }) ?? '')
+    .trim()
+    .toLowerCase();
+  if (!isHexBytes(admin, 32)) throw new Error('ledger admin key is missing or invalid');
+
+  const providerIds = new Set();
+  for (const entry of normalizedReceipts(bundle)) {
+    const { body, envelope } = receiptEnvelope(entry);
+    verifyReceiptEnvelope(envelope);
+    const provider = String(body.provider ?? '').trim().toLowerCase();
+    if (!isHexBytes(provider, 32)) throw new Error('receipt provider must be a 32-byte public key');
+    providerIds.add(provider);
+  }
+
+  const accounts = {};
+  for (const provider of [...providerIds].sort()) {
+    const record = await readContractStateValue(peerRpcUrl, `prov/${provider}`, { fetchImpl });
+    if (!record || record.status !== 'active') {
+      throw new Error(`active provider record is missing for ${provider}`);
+    }
+    const payout = record.payout;
+    if (!payout || payout.method !== 'tap') {
+      throw new Error(`admin-set TAP payout target is missing for provider ${provider}`);
+    }
+    if (String(payout.set_by ?? '').toLowerCase() !== admin || payout.set_by_role !== 'admin') {
+      throw new Error(`TAP payout target was not set by the current admin for provider ${provider}`);
+    }
+    accounts[provider] = normalizeAddress(payout.addr, `provider account for ${provider}`);
+  }
+  return accounts;
+}
+
+async function resolveActiveEpochParam({ peerRpcUrl, key, fallback, fetchImpl } = {}) {
+  const record = await readContractStateValue(peerRpcUrl, `params/${key}`, { fetchImpl });
+  const now = Math.floor(Date.now() / 1_000);
+  const active = record?.pending && Number(record.pending.effective_at) <= now
+    ? record.pending
+    : record?.current;
+  return parseNonNegativeInt(active?.value ?? fallback, `active ${key}`);
+}
+
+export async function resolveTapSettlementEpochPolicy({
+  peerRpcUrl,
+  fetchImpl,
+} = {}) {
+  const applyState = await readContractStateValue(peerRpcUrl, 'epoch/apply/state', { fetchImpl });
+  const resolvedThrough = parseOptionalNonNegativeInt(
+    applyState?.updated_epoch,
+    'settle through epoch'
+  );
+  if (resolvedThrough === null) {
+    throw new Error('epoch/apply/state.updated_epoch is required for TAP settlement');
+  }
+  const resolvedChallenge = await resolveActiveEpochParam({
+    peerRpcUrl,
+    key: 'challenge_epochs',
+    fallback: DEFAULT_TAP_CHALLENGE_EPOCHS,
+    fetchImpl,
+  });
+  const resolvedHoldback = await resolveActiveEpochParam({
+    peerRpcUrl,
+    key: 'holdback_epochs',
+    fallback: DEFAULT_TAP_HOLDBACK_EPOCHS,
+    fetchImpl,
+  });
+  return {
+    settleThroughEpoch: resolvedThrough,
+    challengeEpochs: parseNonNegativeInt(resolvedChallenge, 'TAP settlement challenge_epochs'),
+    holdbackEpochs: parseNonNegativeInt(resolvedHoldback, 'TAP settlement holdback_epochs'),
+  };
+}
+
 async function resolveTapUsdAu({ tapUsdAu, peerRpcUrl, fetchImpl } = {}) {
   if (tapUsdAu !== undefined && tapUsdAu !== null && tapUsdAu !== '') {
     return safeAu(tapUsdAu, '--tap-usd-au').toString();
@@ -1122,14 +1196,11 @@ async function resolveTapUsdAu({ tapUsdAu, peerRpcUrl, fetchImpl } = {}) {
 
 function buildReplayCommand({
   bundlePath,
-  providerAccountsPath,
+  peerRpcUrl,
   buyerAccountsPath,
   tapUsdAu,
   ledgerFeeBps,
   priorPath,
-  settleThroughEpoch,
-  challengeEpochs,
-  holdbackEpochs,
   ethRpc,
   poolAddress,
   operatorAddress,
@@ -1139,20 +1210,11 @@ function buildReplayCommand({
 } = {}) {
   const args = ['node', 'contracts/scripts/tap-settlement-roller.mjs'];
   if (bundlePath) args.push('--bundle', bundlePath);
-  if (providerAccountsPath) args.push('--provider-accounts', providerAccountsPath);
+  if (peerRpcUrl) args.push('--peer-rpc', peerRpcUrl);
   if (buyerAccountsPath) args.push('--buyer-accounts', buyerAccountsPath);
   if (tapUsdAu) args.push('--tap-usd-au', String(tapUsdAu));
   if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
   if (priorPath) args.push('--prior', priorPath);
-  if (settleThroughEpoch !== undefined && settleThroughEpoch !== null) {
-    args.push('--settle-through-epoch', String(settleThroughEpoch));
-  }
-  if (challengeEpochs !== undefined && challengeEpochs !== null) {
-    args.push('--challenge-epochs', String(challengeEpochs));
-  }
-  if (holdbackEpochs !== undefined && holdbackEpochs !== null) {
-    args.push('--holdback-epochs', String(holdbackEpochs));
-  }
   if (ethRpc) args.push('--eth-rpc', ethRpc);
   if (poolAddress) args.push('--pool', poolAddress);
   if (operatorAddress) args.push('--operator-address', operatorAddress);
@@ -1173,10 +1235,14 @@ async function main() {
   const bundlePath = args.bundle || args['receipts-file'];
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
   const bundle = readJson(path.resolve(bundlePath), 'receipt bundle');
-  const providerAccountsPath = args['provider-accounts'];
-  const providerAccounts = providerAccountsPath
-    ? readJson(path.resolve(providerAccountsPath), 'provider accounts')
-    : {};
+  if (args['provider-accounts'] !== undefined) {
+    throw new Error('--provider-accounts is not supported; set the TAP payout target with mayhem admin set-provider-payout');
+  }
+  for (const key of ['settle-through-epoch', 'challenge-epochs', 'holdback-epochs']) {
+    if (args[key] !== undefined) {
+      throw new Error(`--${key} is not supported; TAP epoch policy comes from active admin ledger state`);
+    }
+  }
   const buyerAccountsPath = args['buyer-accounts'];
   const buyerAccounts = buyerAccountsPath
     ? readJson(path.resolve(buyerAccountsPath), 'buyer accounts')
@@ -1184,6 +1250,10 @@ async function main() {
   const priorPath = args.prior;
   const prior = priorPath ? readJson(path.resolve(priorPath), 'prior settlement') : null;
   const peerRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
+  const providerAccounts = await resolveProviderAccountsFromLedger({ bundle, peerRpcUrl });
+  const epochPolicy = await resolveTapSettlementEpochPolicy({
+    peerRpcUrl,
+  });
   const tapUsdAu = await resolveTapUsdAu({
     tapUsdAu: args['tap-usd-au'],
     peerRpcUrl,
@@ -1215,9 +1285,9 @@ async function main() {
     prior,
     tapUsdAu,
     ledgerFeeBps,
-    settleThroughEpoch: args['settle-through-epoch'],
-    challengeEpochs: args['challenge-epochs'],
-    holdbackEpochs: args['holdback-epochs'] ?? 0,
+    settleThroughEpoch: epochPolicy.settleThroughEpoch,
+    challengeEpochs: epochPolicy.challengeEpochs,
+    holdbackEpochs: epochPolicy.holdbackEpochs,
     pool,
     ownerSigner,
     operatorAddress,
@@ -1227,14 +1297,11 @@ async function main() {
   if (signerEnvName) report.signer_env = signerEnvName;
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
-    providerAccountsPath,
+    peerRpcUrl,
     buyerAccountsPath,
     tapUsdAu,
     ledgerFeeBps,
     priorPath,
-    settleThroughEpoch: args['settle-through-epoch'],
-    challengeEpochs: args['challenge-epochs'],
-    holdbackEpochs: args['holdback-epochs'],
     ethRpc,
     poolAddress,
     operatorAddress,
@@ -1245,14 +1312,11 @@ async function main() {
   if (!confirm && report.root && ethRpc && poolAddress) {
     report.copy_paste_confirm_command = buildReplayCommand({
       bundlePath,
-      providerAccountsPath,
+      peerRpcUrl,
       buyerAccountsPath,
       tapUsdAu,
       ledgerFeeBps,
       priorPath,
-      settleThroughEpoch: args['settle-through-epoch'],
-      challengeEpochs: args['challenge-epochs'],
-      holdbackEpochs: args['holdback-epochs'],
       ethRpc,
       poolAddress,
       operatorAddress,

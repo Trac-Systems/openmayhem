@@ -2996,6 +2996,7 @@ struct CatalogApplyCanaryReportsArgs {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminPayoutMethod {
     Tnk,
+    Tap,
     Stripe,
 }
 
@@ -3003,6 +3004,7 @@ impl AdminPayoutMethod {
     fn as_str(self) -> &'static str {
         match self {
             Self::Tnk => "tnk",
+            Self::Tap => "tap",
             Self::Stripe => "stripe",
         }
     }
@@ -16111,9 +16113,9 @@ fn admin_set_provider_payout_payload(args: &AdminSetProviderPayoutArgs) -> Resul
         "payout_addr": &args.payout_addr,
     });
     match args.payout_method {
-        AdminPayoutMethod::Tnk => {
+        AdminPayoutMethod::Tnk | AdminPayoutMethod::Tap => {
             if args.payout_currency.is_some() {
-                bail!("TNK payout targets must not include --payout-currency");
+                bail!("crypto payout targets must not include --payout-currency");
             }
         }
         AdminPayoutMethod::Stripe => {
@@ -46028,6 +46030,26 @@ mod tests {
                 "payout_method": "stripe",
                 "payout_addr": "acct_adminapproved",
                 "payout_currency": "eur",
+            })
+        );
+
+        let (_, tap_payload) = admin_command_payload(&AdminCommands::SetProviderPayout(
+            AdminSetProviderPayoutArgs {
+                tx: test_admin_tx_args(),
+                provider: "provider-a".to_owned(),
+                payout_method: AdminPayoutMethod::Tap,
+                payout_addr: "0x1111111111111111111111111111111111111111".to_owned(),
+                payout_currency: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            tap_payload,
+            json!({
+                "op": "set_provider_payout",
+                "provider": "provider-a",
+                "payout_method": "tap",
+                "payout_addr": "0x1111111111111111111111111111111111111111",
             })
         );
     }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -18,6 +19,8 @@ import {
   guardianPreSignReport,
   auToTapWei,
   providerShareWei,
+  resolveProviderAccountsFromLedger,
+  resolveTapSettlementEpochPolicy,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
 import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
@@ -59,6 +62,77 @@ function runNode(args, options = {}) {
 }
 
 const receipt = signedTapReceipt;
+
+test('TAP settlement resolves provider claim addresses only from current admin ledger state', async () => {
+  const providerId = makeReceiptIdentity();
+  const providerAccount = ethers.Wallet.createRandom().address;
+  const admin = 'aa'.repeat(32);
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({ session: 'ledger-payout', provider: providerId, au: usdAu(1) })],
+  };
+  const state = new Map([
+    ['admin', admin],
+    [`prov/${providerId.publicKeyHex}`, {
+      status: 'active',
+      payout: {
+        method: 'tap',
+        addr: providerAccount,
+        set_by: admin,
+        set_by_role: 'admin',
+      },
+    }],
+  ]);
+  const fetchImpl = async (url) => ({
+    ok: true,
+    json: async () => ({ value: state.get(new URL(url).searchParams.get('key')) ?? null }),
+  });
+
+  assert.deepEqual(
+    await resolveProviderAccountsFromLedger({
+      bundle,
+      peerRpcUrl: 'http://127.0.0.1:49223/v1',
+      fetchImpl,
+    }),
+    { [providerId.publicKeyHex]: providerAccount.toLowerCase() }
+  );
+
+  state.get(`prov/${providerId.publicKeyHex}`).payout.set_by = 'bb'.repeat(32);
+  await assert.rejects(
+    resolveProviderAccountsFromLedger({
+      bundle,
+      peerRpcUrl: 'http://127.0.0.1:49223/v1',
+      fetchImpl,
+    }),
+    /current admin/
+  );
+});
+
+test('TAP settlement reads challenge and maturity epochs from active ledger state', async () => {
+  const state = new Map([
+    ['epoch/apply/state', { updated_epoch: 19 }],
+    ['params/challenge_epochs', {
+      current: { value: 8, effective_at: 0 },
+      pending: { value: 12, effective_at: Math.floor(Date.now() / 1_000) + 3_600 },
+    }],
+    ['params/holdback_epochs', {
+      current: { value: 3, effective_at: 0 },
+      pending: null,
+    }],
+  ]);
+  const fetchImpl = async (url) => ({
+    ok: true,
+    json: async () => ({ value: state.get(new URL(url).searchParams.get('key')) ?? null }),
+  });
+
+  assert.deepEqual(
+    await resolveTapSettlementEpochPolicy({
+      peerRpcUrl: 'http://127.0.0.1:49223/v1',
+      fetchImpl,
+    }),
+    { settleThroughEpoch: 19, challengeEpochs: 8, holdbackEpochs: 3 }
+  );
+});
 
 test('TAP settlement roller posts root and provider proof verifies independently', async () => {
   const ganache = Ganache.provider({
@@ -540,30 +614,57 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-tap-roller-'));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const bundlePath = path.join(tmp, 'bundle.json');
-  const providerAccountsPath = path.join(tmp, 'providers.json');
   const providerId = makeReceiptIdentity();
   fs.writeFileSync(bundlePath, JSON.stringify({
     epoch: 1,
     receipts: [receipt({ session: 'cli-s1', provider: providerId, au: usdAu(1) })],
   }, null, 2));
-  fs.writeFileSync(providerAccountsPath, JSON.stringify({
-    [providerId.publicKeyHex]: await providerSigner.getAddress(),
-  }, null, 2));
+  const admin = 'aa'.repeat(32);
+  const ledgerState = new Map([
+    ['admin', admin],
+    ['epoch/apply/state', { updated_epoch: 7 }],
+    ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
+    ['params/holdback_epochs', { current: { value: 0, effective_at: 0 }, pending: null }],
+    [`prov/${providerId.publicKeyHex}`, {
+      status: 'active',
+      payout: {
+        method: 'tap',
+        addr: providerSigner.address,
+        set_by: admin,
+        set_by_role: 'admin',
+      },
+    }],
+  ]);
+  const ledgerServer = http.createServer((request, response) => {
+    const key = new URL(request.url, 'http://127.0.0.1').searchParams.get('key');
+    const value = ledgerState.get(key) ?? null;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ value }));
+  });
+  await new Promise((resolve) => ledgerServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => ledgerServer.close());
+  const ledgerRpc = `http://127.0.0.1:${ledgerServer.address().port}/v1`;
 
   const baseArgs = [
     SCRIPT_PATH,
     '--bundle', bundlePath,
-    '--provider-accounts', providerAccountsPath,
+    '--peer-rpc', ledgerRpc,
     '--tap-usd-au', String(TAP_USD_AU),
     '--ledger-fee-bps', '1500',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
     '--operator-address', await operatorTreasury.getAddress(),
-    '--settle-through-epoch', '7',
     '--json',
   ];
   const baseEnv = { ...process.env };
   delete baseEnv.MAYHEM_TAP_ROLLER_PRIVATE_KEY;
+  const localPolicyOverride = await runNode([...baseArgs, '--challenge-epochs', '1'], {
+    cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
+    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+  });
+  assert.notEqual(localPolicyOverride.status, 0);
+  assert.match(localPolicyOverride.stderr, /active admin ledger state/);
+
   const missingKey = await runNode(baseArgs, {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
     env: baseEnv,
@@ -597,6 +698,10 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(report.operator_fee.auto_sent, false);
   assert.match(report.copy_paste_confirm_command, /--confirm/);
   assert.match(report.copy_paste_confirm_command, /--operator-address/);
+  assert.doesNotMatch(
+    report.copy_paste_confirm_command,
+    /--(?:settle-through-epoch|challenge-epochs|holdback-epochs)/
+  );
   assert.doesNotMatch(JSON.stringify(report), new RegExp(OPERATOR_KEY.slice(2), 'i'));
   assert.equal(await pool.epoch(), 0n);
 

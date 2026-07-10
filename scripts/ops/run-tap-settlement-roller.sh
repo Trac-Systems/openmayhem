@@ -19,7 +19,6 @@ while true; do
   fi
 
   name="$(basename "$bundle" .receipts.json)"
-  provider_accounts="$ready/$name.providers.json"
   buyer_accounts="$ready/$name.buyers.json"
   dry_report="$working/$name.dry-run.json"
   final_report="$working/$name.settlement.json"
@@ -39,7 +38,6 @@ while true; do
     --operator-address "$MAYHEM_TAP_OPERATOR_ADDRESS"
     --json
   )
-  [[ -f "$provider_accounts" ]] && args+=(--provider-accounts "$provider_accounts")
   [[ -f "$buyer_accounts" ]] && args+=(--buyer-accounts "$buyer_accounts")
   [[ -f "$processed/latest.json" ]] && args+=(--prior "$processed/latest.json")
 
@@ -67,7 +65,6 @@ while true; do
   install -m 600 "$final_report" "$processed/$name.settlement.json"
   install -m 600 "$final_report" "$processed/latest.json"
   mv "$bundle" "$processed/"
-  [[ -f "$provider_accounts" ]] && mv "$provider_accounts" "$processed/"
   [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
   rm -f "$dry_report" "$final_report"
 done
