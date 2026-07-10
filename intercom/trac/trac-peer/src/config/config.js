@@ -94,6 +94,7 @@ export class Config {
         if (channelRaw === null || channelRaw === undefined || channelRaw === "") {
             throw new Error("Peer: channel is required.");
         }
+        this.channelName = String(channelRaw);
         this.channel = b4a.alloc(32).fill(channelRaw);
 
         const dhtBootstrap = this.#select("dhtBootstrap", options, defaults);

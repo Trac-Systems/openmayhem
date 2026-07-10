@@ -90,6 +90,19 @@ const MAINNET_MSB_NETWORK_ID: u64 = 918;
 const MAINNET_MSB_BOOTSTRAP: &str =
     "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685";
 const MAINNET_MSB_CHANNEL: &str = "0000trac0network0msb0mainnet0000";
+const MAINNET_TAP_CHAIN_ID: u64 = 1;
+const MAINNET_TAP_TOKEN_ADDRESS: &str = "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454";
+const MAINNET_TAP_POOL_ADDRESS: &str = "0x9B254d37C28Fb5893F46513a61925eDC2F300615";
+const MAINNET_TNK_TREASURY_ADDRESS: &str =
+    "trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh";
+const MAINNET_MANIFEST_JSON: &str = include_str!("../../../config/beta/mainnet.json");
+const OFFICIAL_DHT_BOOTSTRAP: [&str; 5] = [
+    "116.202.214.149:10001",
+    "157.180.12.214:10001",
+    "node1.hyperdht.org:49737",
+    "node2.hyperdht.org:49737",
+    "node3.hyperdht.org:49737",
+];
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
@@ -103,6 +116,80 @@ const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
 const DEFAULT_RATE_STALENESS_SECONDS: u64 = 45 * 60;
 const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS: u64 = 86_400;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifest {
+    schema_version: u64,
+    network: MainnetManifestNetwork,
+    contract: MainnetManifestContract,
+    payments: MainnetManifestPayments,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestNetwork {
+    name: String,
+    denom: String,
+    msb: MainnetManifestMsb,
+    subnet: MainnetManifestSubnet,
+    dht: MainnetManifestDht,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestMsb {
+    address_prefix: String,
+    network_id: u64,
+    bootstrap: String,
+    channel: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestSubnet {
+    channel: String,
+    bootstrap: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestDht {
+    peer_bootstrap: Vec<String>,
+    msb_bootstrap: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestContract {
+    admin_peer_pubkey: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestPayments {
+    directory_min_version: u64,
+    rails: Vec<String>,
+    tap: MainnetManifestTap,
+    tnk: MainnetManifestTnk,
+    fiat: MainnetManifestFiat,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestTap {
+    chain_id: u64,
+    token_address: String,
+    pool_address: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestTnk {
+    address_prefix: String,
+    treasury_address: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MainnetManifestFiat {
+    processor: String,
+    mode: String,
+    currencies: Vec<String>,
+    locale: String,
+    event_collection: String,
+    connect_enabled: bool,
+}
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
@@ -777,8 +864,8 @@ struct BalanceArgs {
     who: Option<String>,
 
     /// Ledger rail to inspect.
-    #[arg(long, value_enum, default_value_t = GatewayLedgerRail::Fiat)]
-    rail: GatewayLedgerRail,
+    #[arg(long, value_enum)]
+    rail: Option<GatewayLedgerRail>,
 
     /// Print a machine-readable balance report.
     #[arg(long)]
@@ -1127,6 +1214,10 @@ struct UpArgs {
     /// OpenAI-compatible gateway bind address. Defaults to 127.0.0.1:<gateway-port>.
     #[arg(long)]
     gateway_bind: Option<String>,
+
+    /// Payment rail spent by the supervised user gateway. Persists as user.rail.
+    #[arg(long, value_enum)]
+    rail: Option<GatewayLedgerRail>,
 
     /// Require gateway bearer tokens even on loopback.
     #[arg(long)]
@@ -5142,7 +5233,8 @@ enum PayRail {
     Stripe,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum GatewayLedgerRail {
     Fiat,
     Tap,
@@ -5156,6 +5248,15 @@ impl GatewayLedgerRail {
             Self::Tap => "tap",
             Self::Tnk => "tnk",
         }
+    }
+}
+
+fn parse_gateway_ledger_rail(value: &str) -> Result<GatewayLedgerRail> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fiat" => Ok(GatewayLedgerRail::Fiat),
+        "tap" => Ok(GatewayLedgerRail::Tap),
+        "tnk" => Ok(GatewayLedgerRail::Tnk),
+        _ => bail!("user.rail must be fiat, tap, or tnk"),
     }
 }
 
@@ -5321,6 +5422,7 @@ struct ConfigProviderLimits {
 
 #[derive(Debug, Deserialize)]
 struct ConfigUser {
+    rail: Option<GatewayLedgerRail>,
     #[serde(default, deserialize_with = "deserialize_optional_money_au")]
     max_price_au: Option<MoneyAu>,
     max_wait_seconds: Option<u64>,
@@ -20175,6 +20277,7 @@ struct UpPlan {
     role: Role,
     provider: bool,
     network: String,
+    mainnet_manifest: Option<MainnetManifest>,
     subnet_channel: Option<String>,
     subnet_bootstrap: Option<String>,
     msb_bootstrap: Option<String>,
@@ -20190,6 +20293,7 @@ struct UpPlan {
     supervisor_bind: String,
     supervisor_url: String,
     gateway_bind: SocketAddr,
+    rail: GatewayLedgerRail,
     gateway_require_auth: bool,
     gateway_token_count: usize,
     gateway_active_token_count: usize,
@@ -20205,6 +20309,139 @@ struct UpPlan {
     hardware_quote_verifier_timeout_seconds: u64,
     fraud_challenger: bool,
     fraud_challenger_poll_interval_seconds: u64,
+}
+
+async fn canonical_mainnet_readiness(
+    rpc: &PeerRpcClient,
+    manifest: &MainnetManifest,
+) -> Result<Value> {
+    let status = rpc
+        .status()
+        .await
+        .context("reading peer network identity")?;
+    let peer = status
+        .get("peer")
+        .and_then(Value::as_object)
+        .context("peer status is missing peer identity")?;
+    let msb = status
+        .get("msb")
+        .and_then(Value::as_object)
+        .context("peer status is missing MSB identity")?;
+    let subnet_bootstrap = peer
+        .get("subnetBootstrapHex")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let subnet_channel = peer
+        .get("subnetChannelUtf8")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let subnet_signed_length = peer
+        .get("subnetSignedLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let admin = peer.get("admin").and_then(Value::as_str).unwrap_or("");
+    let network_id = msb.get("networkId").and_then(Value::as_u64).unwrap_or(0);
+    let msb_bootstrap = msb
+        .get("bootstrapHex")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let msb_channel = msb.get("channel").and_then(Value::as_str).unwrap_or("");
+    let validators = msb
+        .get("connectedValidators")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let string_array = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let peer_dht = string_array(peer.get("dhtBootstrap"));
+    let msb_dht = string_array(msb.get("dhtBootstrap"));
+    ensure!(
+        subnet_bootstrap.eq_ignore_ascii_case(&manifest.network.subnet.bootstrap)
+            && subnet_channel == manifest.network.subnet.channel,
+        "peer joined the wrong Mayhem subnet"
+    );
+    ensure!(
+        subnet_signed_length > 0,
+        "canonical Mayhem subnet has not synchronized signed state"
+    );
+    ensure!(
+        admin.eq_ignore_ascii_case(&manifest.contract.admin_peer_pubkey),
+        "canonical Mayhem admin identity is missing or mismatched"
+    );
+    ensure!(
+        network_id == manifest.network.msb.network_id
+            && msb_bootstrap.eq_ignore_ascii_case(&manifest.network.msb.bootstrap)
+            && msb_channel == manifest.network.msb.channel
+            && validators > 0,
+        "peer is not synchronized with the official Trac mainnet MSB"
+    );
+    ensure!(
+        peer_dht == manifest.network.dht.peer_bootstrap
+            && msb_dht == manifest.network.dht.msb_bootstrap,
+        "peer is not using the canonical official HyperDHT bootstrap set"
+    );
+
+    let payment_state = read_canonical_payment_state(rpc).await?;
+    let payments = &payment_state.payments;
+    ensure!(
+        payments.ver >= manifest.payments.directory_min_version,
+        "payments/current v{} is older than required mainnet v{}",
+        payments.ver,
+        manifest.payments.directory_min_version
+    );
+    ensure!(
+        payments.tap.chain_id == manifest.payments.tap.chain_id
+            && payments
+                .tap
+                .token_address
+                .eq_ignore_ascii_case(&manifest.payments.tap.token_address)
+            && payments
+                .tap
+                .pool_address
+                .eq_ignore_ascii_case(&manifest.payments.tap.pool_address),
+        "payments/current TAP deployment does not match canonical mainnet"
+    );
+    ensure!(
+        payments.tnk.network == "mainnet"
+            && payments.tnk.treasury_address == manifest.payments.tnk.treasury_address,
+        "payments/current TNK deployment does not match canonical mainnet"
+    );
+    ensure!(
+        payments.fiat.processor == manifest.payments.fiat.processor
+            && payments.fiat.currencies == manifest.payments.fiat.currencies
+            && payments.fiat.locale == manifest.payments.fiat.locale,
+        "payments/current Stripe configuration does not match canonical mainnet"
+    );
+    let catalog = read_catalog_release_anchor(rpc).await?;
+    ensure!(
+        catalog.model_count > 0,
+        "canonical mainnet catalog is empty"
+    );
+    ensure!(
+        read_state_value(rpc, "rules/current").await?.is_some(),
+        "canonical mainnet rules/current is missing"
+    );
+    Ok(json!({
+        "subnet_bootstrap": subnet_bootstrap,
+        "subnet_channel": subnet_channel,
+        "subnet_signed_length": subnet_signed_length,
+        "admin": admin,
+        "msb_network_id": network_id,
+        "msb_signed_length": msb.get("signedLength").cloned().unwrap_or(Value::Null),
+        "connected_validators": validators,
+        "payments_version": payments.ver,
+        "catalog_hash": catalog.catalog_hash,
+        "catalog_model_count": catalog.model_count,
+    }))
 }
 
 async fn up(args: UpArgs) -> Result<()> {
@@ -20240,6 +20477,21 @@ async fn up(args: UpArgs) -> Result<()> {
         }
     })
     .await?;
+    let mainnet_readiness = if let Some(manifest) = plan.mainnet_manifest.clone() {
+        Some(
+            wait_until_ready("canonical mainnet ledger", deadline, || {
+                let rpc_url = plan.rpc_url.clone();
+                let manifest = manifest.clone();
+                async move {
+                    let rpc = PeerRpcClient::new(&rpc_url)?;
+                    canonical_mainnet_readiness(&rpc, &manifest).await
+                }
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
     let bridge_health = wait_until_ready("SC-Bridge", deadline, || {
         let url = plan.sc_bridge_url.clone();
         let token = plan.sc_bridge_token.clone();
@@ -20254,11 +20506,15 @@ async fn up(args: UpArgs) -> Result<()> {
         }
     })
     .await?;
+    let require_live_models = plan.mainnet_manifest.is_some();
     let models = wait_until_ready("gateway /v1/models", deadline, || {
         let client = client.clone();
         let gateway_url = plan.gateway_url.clone();
         async move {
             let models = fetch_gateway_models_allow_empty(&client, &gateway_url).await?;
+            if require_live_models && models.is_empty() {
+                bail!("canonical mainnet gateway returned an empty model list");
+            }
             Ok(json!({
                 "count": models.len(),
                 "ids": models
@@ -20318,6 +20574,7 @@ async fn up(args: UpArgs) -> Result<()> {
             "dashboard_url": dashboard_url.clone(),
             "provider_dashboard_url": provider_dashboard_url.clone(),
             "models": models,
+            "rail": plan.rail.as_str(),
             "access": {
                 "require_auth": plan.gateway_require_auth,
                 "token_count": plan.gateway_token_count,
@@ -20336,9 +20593,10 @@ async fn up(args: UpArgs) -> Result<()> {
         "network": {
             "name": &plan.network,
             "subnet_channel": &plan.subnet_channel,
-            "subnet_bootstrap_configured": plan.subnet_bootstrap.is_some(),
-            "msb_bootstrap_configured": plan.msb_bootstrap.is_some(),
+            "subnet_bootstrap": &plan.subnet_bootstrap,
+            "msb_bootstrap": &plan.msb_bootstrap,
             "msb_channel": &plan.msb_channel,
+            "readiness": mainnet_readiness,
         },
         "copy_paste": {
             "openai_base_url": plan.openai_base_url,
@@ -20353,6 +20611,7 @@ async fn up(args: UpArgs) -> Result<()> {
     } else {
         println!("Mayhem is up.");
         println!("Gateway bind: {}", plan.gateway_bind);
+        println!("Spending rail: {}", plan.rail.as_str());
         println!("Copy/paste OpenAI base URL: {}", plan.openai_base_url);
         println!("Copy/paste dashboard URL: {dashboard_url}");
         if plan.provider {
@@ -20758,23 +21017,58 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let openai_base_url = gateway_v1_url(&gateway_url);
     let dashboard_url = format!("{gateway_url}/mayhem/dashboard");
     let network = resolve_up_network(args, &config)?;
-    let subnet_channel = resolve_up_config_value(
+    let mainnet_manifest = (network == "mainnet")
+        .then(canonical_mainnet_manifest)
+        .transpose()?;
+    let configured_subnet_channel = resolve_up_config_value(
         args.subnet_channel.as_deref(),
         &config,
         "network.subnet_channel",
     );
-    let subnet_bootstrap = resolve_up_config_value(
+    let configured_subnet_bootstrap = resolve_up_config_value(
         args.subnet_bootstrap.as_deref(),
         &config,
         "network.subnet_bootstrap",
     );
-    let msb_bootstrap = resolve_up_config_value(
+    let configured_msb_bootstrap = resolve_up_config_value(
         args.msb_bootstrap.as_deref(),
         &config,
         "network.msb_bootstrap",
     );
-    let msb_channel =
+    let configured_msb_channel =
         resolve_up_config_value(args.msb_channel.as_deref(), &config, "network.msb_channel");
+    let (subnet_channel, subnet_bootstrap, msb_bootstrap, msb_channel) =
+        if let Some(manifest) = mainnet_manifest.as_ref() {
+            (
+                Some(enforce_canonical_mainnet_value(
+                    "network.subnet_channel",
+                    configured_subnet_channel,
+                    &manifest.network.subnet.channel,
+                )?),
+                Some(enforce_canonical_mainnet_value(
+                    "network.subnet_bootstrap",
+                    configured_subnet_bootstrap,
+                    &manifest.network.subnet.bootstrap,
+                )?),
+                Some(enforce_canonical_mainnet_value(
+                    "network.msb_bootstrap",
+                    configured_msb_bootstrap,
+                    &manifest.network.msb.bootstrap,
+                )?),
+                Some(enforce_canonical_mainnet_value(
+                    "network.msb_channel",
+                    configured_msb_channel,
+                    &manifest.network.msb.channel,
+                )?),
+            )
+        } else {
+            (
+                configured_subnet_channel,
+                configured_subnet_bootstrap,
+                configured_msb_bootstrap,
+                configured_msb_channel,
+            )
+        };
     validate_hex32_config("network.subnet_bootstrap", subnet_bootstrap.as_deref())?;
     validate_hex32_config("network.msb_bootstrap", msb_bootstrap.as_deref())?;
     if let (Some(subnet), Some(msb)) = (subnet_bootstrap.as_deref(), msb_bootstrap.as_deref()) {
@@ -20787,6 +21081,14 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
             "testnet1 requires network.msb_bootstrap and network.msb_channel; set them with `mayhem config set` or pass --msb-bootstrap/--msb-channel"
         );
     }
+    let configured_rail = toml_get_path(&config, "user.rail")
+        .and_then(toml::Value::as_str)
+        .map(parse_gateway_ledger_rail)
+        .transpose()?;
+    let rail = args
+        .rail
+        .or(configured_rail)
+        .unwrap_or(GatewayLedgerRail::Fiat);
 
     let sc_bridge_token = args
         .sc_bridge_token
@@ -20817,6 +21119,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
             subnet_bootstrap: subnet_bootstrap.as_deref(),
             msb_bootstrap: msb_bootstrap.as_deref(),
             msb_channel: msb_channel.as_deref(),
+            rail,
         },
     )?;
 
@@ -20863,6 +21166,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         role,
         provider: args.provider,
         network,
+        mainnet_manifest,
         subnet_channel,
         subnet_bootstrap,
         msb_bootstrap,
@@ -20878,6 +21182,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         supervisor_bind,
         supervisor_url,
         gateway_bind,
+        rail,
         gateway_require_auth,
         gateway_token_count,
         gateway_active_token_count,
@@ -20908,6 +21213,7 @@ struct UpConfigPatch<'a> {
     subnet_bootstrap: Option<&'a str>,
     msb_bootstrap: Option<&'a str>,
     msb_channel: Option<&'a str>,
+    rail: GatewayLedgerRail,
 }
 
 async fn ensure_up_identity_config(
@@ -21010,6 +21316,7 @@ fn repair_up_config(
     if let Some(value) = optional_non_empty_string(patch.msb_channel) {
         toml_set_string(config, "network.msb_channel", value)?;
     }
+    toml_set_string(config, "user.rail", patch.rail.as_str().to_owned())?;
     write_config_toml_value(config_path, config)?;
     Ok(())
 }
@@ -21045,6 +21352,110 @@ fn normalize_intercom_network(raw: &str) -> Result<String> {
         "" => bail!("network must not be empty"),
         _ => bail!("unsupported network {raw}; expected mainnet, testnet1, local, or development"),
     }
+}
+
+fn canonical_mainnet_manifest() -> Result<MainnetManifest> {
+    let manifest: MainnetManifest = serde_json::from_str(MAINNET_MANIFEST_JSON)
+        .context("parsing embedded canonical mainnet manifest")?;
+    validate_mainnet_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_mainnet_manifest(manifest: &MainnetManifest) -> Result<()> {
+    ensure!(
+        manifest.schema_version == 1,
+        "unsupported mainnet manifest schema"
+    );
+    ensure!(
+        manifest.network.name == "mainnet",
+        "mainnet manifest network mismatch"
+    );
+    ensure!(
+        manifest.network.denom == "au_usd",
+        "mainnet manifest denom mismatch"
+    );
+    ensure!(
+        manifest.network.msb.address_prefix == "trac"
+            && manifest.network.msb.network_id == MAINNET_MSB_NETWORK_ID
+            && manifest
+                .network
+                .msb
+                .bootstrap
+                .eq_ignore_ascii_case(MAINNET_MSB_BOOTSTRAP)
+            && manifest.network.msb.channel == MAINNET_MSB_CHANNEL,
+        "mainnet manifest does not pin the official Trac MSB"
+    );
+    ensure!(
+        !manifest.network.subnet.channel.trim().is_empty()
+            && is_hex_len(&manifest.network.subnet.bootstrap, 64)
+            && !manifest
+                .network
+                .subnet
+                .bootstrap
+                .eq_ignore_ascii_case(MAINNET_MSB_BOOTSTRAP),
+        "mainnet manifest has an invalid Mayhem subnet identity"
+    );
+    let official_dht = OFFICIAL_DHT_BOOTSTRAP
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    ensure!(
+        manifest.network.dht.peer_bootstrap == official_dht
+            && manifest.network.dht.msb_bootstrap == official_dht,
+        "mainnet manifest must pin the complete official HyperDHT bootstrap set"
+    );
+    ensure!(
+        is_hex_len(&manifest.contract.admin_peer_pubkey, 64),
+        "mainnet manifest admin key is invalid"
+    );
+    ensure!(
+        manifest.payments.directory_min_version > 0
+            && manifest.payments.rails == ["fiat", "tap", "tnk"],
+        "mainnet manifest payment directory is invalid"
+    );
+    ensure!(
+        manifest.payments.tap.chain_id == MAINNET_TAP_CHAIN_ID
+            && manifest
+                .payments
+                .tap
+                .token_address
+                .eq_ignore_ascii_case(MAINNET_TAP_TOKEN_ADDRESS)
+            && manifest
+                .payments
+                .tap
+                .pool_address
+                .eq_ignore_ascii_case(MAINNET_TAP_POOL_ADDRESS),
+        "mainnet manifest does not pin the canonical Ethereum TAP deployment"
+    );
+    ensure!(
+        manifest.payments.tnk.address_prefix == "trac"
+            && manifest.payments.tnk.treasury_address == MAINNET_TNK_TREASURY_ADDRESS,
+        "mainnet manifest does not pin the canonical TNK treasury"
+    );
+    ensure!(
+        manifest.payments.fiat.processor == "stripe"
+            && manifest.payments.fiat.mode == "live"
+            && manifest.payments.fiat.currencies == ["usd", "eur"]
+            && manifest.payments.fiat.locale == "en"
+            && manifest.payments.fiat.event_collection == "stripe_api_polling"
+            && manifest.payments.fiat.connect_enabled,
+        "mainnet manifest Stripe directory is invalid"
+    );
+    Ok(())
+}
+
+fn enforce_canonical_mainnet_value(
+    name: &str,
+    configured: Option<String>,
+    expected: &str,
+) -> Result<String> {
+    if let Some(configured) = configured {
+        ensure!(
+            configured.eq_ignore_ascii_case(expected),
+            "{name} is {configured}, but OpenMayhem mainnet requires {expected}; refusing to join a different or private subnet"
+        );
+    }
+    Ok(expected.to_owned())
 }
 
 fn resolve_up_config_value(
@@ -21142,6 +21553,14 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     {
         peer_args.extend(["--msb-channel".to_owned(), channel.to_owned()]);
     }
+    if let Some(manifest) = plan.mainnet_manifest.as_ref() {
+        peer_args.extend([
+            "--peer-dht-bootstrap".to_owned(),
+            manifest.network.dht.peer_bootstrap.join(","),
+            "--msb-dht-bootstrap".to_owned(),
+            manifest.network.dht.msb_bootstrap.join(","),
+        ]);
+    }
     peer_args.extend([
         "--headless".to_owned(),
         "1".to_owned(),
@@ -21192,6 +21611,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         plan.sc_bridge_token.clone(),
         "--bind".to_owned(),
         plan.gateway_bind.to_string(),
+        "--rail".to_owned(),
+        plan.rail.as_str().to_owned(),
     ];
     if plan.gateway_require_auth {
         gateway_args.push("--require-auth".to_owned());
@@ -23274,8 +23695,17 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         .await?
         .public_key
     };
+    let rail = args
+        .rail
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.user.as_ref())
+                .and_then(|user| user.rail)
+        })
+        .unwrap_or(GatewayLedgerRail::Fiat);
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let rail = args.rail.as_str();
+    let rail = rail.as_str();
     let balance_record = read_balance_record(&rpc, &who, rail).await?;
     let au = balance_record
         .get("au")
@@ -23311,6 +23741,11 @@ async fn status(args: StatusArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let configured_rail = config
+        .as_ref()
+        .and_then(|config| config.user.as_ref())
+        .and_then(|user| user.rail)
+        .unwrap_or(GatewayLedgerRail::Fiat);
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
     let client = reqwest::Client::builder()
@@ -23351,7 +23786,7 @@ async fn status(args: StatusArgs) -> Result<()> {
                 Err(err) => component_error(err),
             };
             let balance = if let Some(who) = wallet.get("public_key").and_then(Value::as_str) {
-                match read_balance_record(&rpc, who, "fiat").await {
+                match read_balance_record(&rpc, who, configured_rail.as_str()).await {
                     Ok(value) => value,
                     Err(err) => component_error(err),
                 }
@@ -23889,6 +24324,9 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
             );
         }
         toml_set_u64(&mut config, key, value)?;
+    } else if key == "user.rail" {
+        let rail = parse_gateway_ledger_rail(&args.value)?;
+        toml_set_string(&mut config, key, rail.as_str().to_owned())?;
     } else {
         toml_set_string(&mut config, key, args.value.clone())?;
     }
@@ -43683,9 +44121,10 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
             Ok("user.max_wait_seconds")
         }
         "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
+        "rail" | "user.rail" => Ok("user.rail"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.rail, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -57362,6 +57801,7 @@ State initialization...
             role: Role::Both,
             provider: !provider_workers.is_empty(),
             network: "mainnet".to_owned(),
+            mainnet_manifest: None,
             subnet_channel: Some("mayhem-mainnet-v1".to_owned()),
             subnet_bootstrap: Some("a".repeat(64)),
             msb_bootstrap: Some("b".repeat(64)),
@@ -57377,6 +57817,7 @@ State initialization...
             supervisor_bind: "127.0.0.1:11437".to_owned(),
             supervisor_url: "http://127.0.0.1:11437".to_owned(),
             gateway_bind: "0.0.0.0:11435".parse().unwrap(),
+            rail: GatewayLedgerRail::Tap,
             gateway_require_auth: true,
             gateway_token_count: 1,
             gateway_active_token_count: 1,
@@ -57432,6 +57873,8 @@ State initialization...
         assert!(text.contains(&"b".repeat(64)));
         assert!(text.contains("--msb-channel"));
         assert!(text.contains("mayhem-msb-mainnet-v1"));
+        assert!(text.contains("--rail"));
+        assert!(text.contains("tap"));
         assert!(text.contains("--peer-stores-directory"));
         assert!(text.contains("--msb-stores-directory"));
         assert!(text.contains(&home.join("stores").display().to_string()));
@@ -57442,6 +57885,67 @@ State initialization...
         assert!(!text.contains("--enclave"));
         assert!(!text.contains("--gpu-layers"));
         assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[test]
+    fn canonical_mainnet_manifest_pins_public_network_and_payment_identity() {
+        let manifest = canonical_mainnet_manifest().expect("canonical mainnet manifest");
+        assert_eq!(manifest.network.name, "mainnet");
+        assert_eq!(manifest.network.msb.network_id, MAINNET_MSB_NETWORK_ID);
+        assert_eq!(manifest.network.msb.bootstrap, MAINNET_MSB_BOOTSTRAP);
+        assert_eq!(manifest.network.msb.channel, MAINNET_MSB_CHANNEL);
+        assert_eq!(manifest.network.dht.peer_bootstrap.len(), 5);
+        assert_eq!(manifest.network.dht.msb_bootstrap.len(), 5);
+        assert_eq!(manifest.payments.directory_min_version, 3);
+        assert_eq!(manifest.payments.tap.chain_id, MAINNET_TAP_CHAIN_ID);
+        assert_eq!(
+            manifest.payments.tap.token_address,
+            MAINNET_TAP_TOKEN_ADDRESS
+        );
+        assert_eq!(manifest.payments.tap.pool_address, MAINNET_TAP_POOL_ADDRESS);
+        assert_eq!(
+            manifest.payments.tnk.treasury_address,
+            MAINNET_TNK_TREASURY_ADDRESS
+        );
+        assert_eq!(manifest.payments.rails, ["fiat", "tap", "tnk"]);
+        assert!(enforce_canonical_mainnet_value(
+            "network.subnet_bootstrap",
+            Some("ff".repeat(32)),
+            &manifest.network.subnet.bootstrap,
+        )
+        .is_err());
+
+        let mut wrong_ethereum = manifest.clone();
+        wrong_ethereum.payments.tap.token_address =
+            "0x0000000000000000000000000000000000000001".to_owned();
+        assert!(validate_mainnet_manifest(&wrong_ethereum).is_err());
+
+        let mut wrong_tnk = manifest;
+        wrong_tnk.payments.tnk.treasury_address = "trac1wrong".to_owned();
+        assert!(validate_mainnet_manifest(&wrong_tnk).is_err());
+    }
+
+    #[test]
+    fn canonical_mainnet_supervisor_forwards_network_identity_dht_and_rail() {
+        let home = test_temp_dir("mayhem-mainnet-supervisor");
+        let manifest = canonical_mainnet_manifest().unwrap();
+        let mut plan = test_up_supervisor_plan(home.clone(), Vec::new());
+        plan.mainnet_manifest = Some(manifest.clone());
+        plan.subnet_channel = Some(manifest.network.subnet.channel.clone());
+        plan.subnet_bootstrap = Some(manifest.network.subnet.bootstrap.clone());
+        plan.msb_bootstrap = Some(manifest.network.msb.bootstrap.clone());
+        plan.msb_channel = Some(manifest.network.msb.channel.clone());
+        plan.rail = GatewayLedgerRail::Tnk;
+
+        let text = up_supervisor_config(&plan).unwrap();
+
+        assert!(text.contains("--peer-dht-bootstrap"));
+        assert!(text.contains("--msb-dht-bootstrap"));
+        assert!(text.contains("node3.hyperdht.org:49737"));
+        assert!(text.contains(&manifest.network.subnet.bootstrap));
+        assert!(text.contains(MAINNET_MSB_BOOTSTRAP));
+        assert!(text.contains("\"--rail\", \"tnk\""));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -57677,6 +58181,7 @@ State initialization...
                 subnet_bootstrap: Some("c"),
                 msb_bootstrap: Some("d"),
                 msb_channel: Some("mayhem-test-msb"),
+                rail: GatewayLedgerRail::Tnk,
             },
         )
         .unwrap();
@@ -57716,6 +58221,10 @@ State initialization...
         assert_eq!(
             toml_get_path(&saved, "network.msb_channel").and_then(toml::Value::as_str),
             Some("mayhem-test-msb")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "user.rail").and_then(toml::Value::as_str),
+            Some("tnk")
         );
     }
 
@@ -57761,6 +58270,7 @@ State initialization...
             sc_bridge_port: 51_002,
             gateway_port: 51_003,
             gateway_bind: None,
+            rail: None,
             gateway_require_auth: false,
             supervisor_port: 51_004,
             sc_bridge_token: None,
@@ -57792,6 +58302,7 @@ State initialization...
                 subnet_bootstrap: Some(&bootstrap),
                 msb_bootstrap: None,
                 msb_channel: None,
+                rail: GatewayLedgerRail::Fiat,
             },
         )
         .unwrap();

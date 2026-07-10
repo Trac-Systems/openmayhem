@@ -86,11 +86,28 @@ Every command below assumes you are in the repository directory (or have `mayhem
 
 ```bash
 ./install.sh --from-source        # Windows: .\install.ps1 -FromSource
-mayhem up --yes
+mayhem up --rail fiat --yes       # or: --rail tap / --rail tnk
 curl http://127.0.0.1:11435/v1/models
 ```
 
 Point any OpenAI client at `http://127.0.0.1:11435/v1` and go.
+
+`mainnet` is the default and is fail-closed. The release embeds the official
+Trac MSB and DHT bootstrap set, the canonical Mayhem subnet/admin identity, and
+the mainnet TAP, TNK, and Stripe directory identities. `mayhem up` refuses a
+conflicting bootstrap or deployment and does not report ready until the signed
+rules, payment directory, catalog, and at least one live model route have
+synchronized. Users and providers do not paste network addresses or Ethereum
+contract addresses into normal setup commands.
+
+The selected rail is persisted for later starts. Rails never borrow, convert,
+or settle across one another. To switch a running gateway, restart it with the
+new rail:
+
+```bash
+mayhem down
+mayhem up --rail tap --yes
+```
 
 **Provide to the network** (earn on your hardware):
 
@@ -174,13 +191,12 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
 
 1. **Detect OS + GPU** (`uname -a` / `systeminfo`; `nvidia-smi`, or on macOS assume Metal).
 2. **Install the per-OS prerequisites above and verify each**: `rustc --version`, `node --version` (≥20), `cmake --version`, and on Linux confirm libclang (`ldconfig -p | grep libclang`) — a missing libclang is the single most common build failure and only surfaces mid-`cargo build`.
-3. **NVIDIA machines**: `nvidia-smi` proves the driver, **not** the toolkit. If the provider will serve GPU models, also verify `nvcc --version`. ⚠ Without the CUDA pieces the install still succeeds and `mayhem up` reports healthy — the failure appears later as a model that never loads and a provider that silently earns nothing. Catch it now, not then.
+3. **NVIDIA machines**: `nvidia-smi` proves the driver, **not** the toolkit. If the provider will serve GPU models, also verify `nvcc --version`. A missing CUDA component is rejected by the provider preflight before a worker starts.
 4. **Build/install**: `./install.sh --from-source` (Windows: `.\install.ps1 -FromSource`). Expect 20–40 min of compiling; that is normal.
 5. **Preflight before serving**: run `mayhem doctor` and read its verdicts. It reports per-backend feasibility for this machine (which engines can run, expected tok/s, memory fit). Do not start a provider whose chosen backend the doctor marks insufficient.
 6. **Backend-specific extras — install only what the hardware/models need:**
-   - **vLLM or TensorRT-LLM artifacts** (Linux + NVIDIA only): Python 3.10+ with `venv`/`pip`, and the packages installed into a venv the engine can find (`MAYHEM_VLLM_PYTHON` / `MAYHEM_TRTLLM_PYTHON` point at its `python`). vLLM configures its own CUDA/cache environment; **TensorRT-LLM currently does not** — `CUDA_HOME` must be valid in the environment the provider starts from.
-   - **MLX** (Apple Silicon): `python3 -m venv ~/.mayhem/venv-mlx && ~/.mayhem/venv-mlx/bin/pip install mlx-lm`, then set `MAYHEM_MLX_PYTHON=~/.mayhem/venv-mlx/bin/python`.
-   - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Text-only providers can ignore this.
+   - **vLLM, TensorRT-LLM, and MLX**: Mayhem creates exact-version Python environments under `~/.mayhem/venvs`, discovers CUDA when applicable, and owns the backend caches. The `MAYHEM_*_PYTHON` variables are diagnostic overrides, not setup steps.
+   - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
 7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
 8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.
 
@@ -207,7 +223,7 @@ What people actually use it for:
 ### Start, look around
 
 ```bash
-mayhem up --yes                   # start the local stack, print URLs
+mayhem up --rail fiat --yes       # fiat, tap, or tnk; persists across restarts
 mayhem models --gateway           # models with live routes right now
 mayhem status                     # component health, ports, balances
 mayhem price show <model-id> --tier 1   # live market price + its derivation
@@ -216,6 +232,11 @@ mayhem price show <model-id> --tier 1   # live market price + its derivation
 ### Pay — card first, one price everywhere
 
 Everything you see is in dollars. Internally the ledger counts in atto-USD (`au`, 10⁻¹⁸ dollars), which is why a $0.01-per-million-token embedding model still has an exact integer price per single token and the market can move prices in tiny steps. You'll never handle raw `au`; the CLI and dashboards show dollars. The price is the same dollar figure on every rail, and rails never mix during settlement.
+
+The gateway spends only the rail selected by `mayhem up --rail <fiat|tap|tnk>`;
+it never falls through to another rail. `mayhem balance`
+defaults to that selected rail, and `mayhem balance --rail <rail>` inspects a
+different bucket without changing routing.
 
 **Card via Stripe (the default — no wallet, no token, nothing to learn):**
 
@@ -244,6 +265,12 @@ fiat: 10.000000 USD    tap: 0.000000 USD    tnk: 0.000000 USD
 
 For most people, that is the whole payments story.
 
+There is no public Mayhem paygate website. The local CLI relays a signed
+checkout request to the admin service and always prints the resulting
+`https://checkout.stripe.com/...` URL for copy/paste before trying to open a
+browser. Pass `--no-open` on a remote terminal. Stripe hosts checkout and its
+confirmation UI; Mayhem does not invent a redirect domain.
+
 <details>
 <summary><b>On-chain rails (optional): TAP and TNK</b></summary>
 
@@ -258,17 +285,17 @@ mayhem wallet import      # bring an existing Trac and/or Ethereum key instead
 mayhem wallet passwd      # re-encrypt with a new password
 ```
 
-**TAP:** send TAP to your in-app Ethereum address, then deposit. The app checks balances and gas, simulates the transaction, and only then signs approve+deposit over an Ethereum RPC (`--rpc-url` overrides the public default):
+**TAP:** send TAP to your in-app Ethereum address, then deposit. The app checks balances and gas, simulates the transaction, and only then signs approve+deposit over an Ethereum RPC (`--eth-rpc` overrides the public default):
 
 ```bash
-mayhem deposit tap --amount 10.00            # dry-run: balances, gas check, simulation
-mayhem deposit tap --amount 10.00 --confirm  # sign + broadcast
+mayhem pay tap --amount-tap 10.00            # dry-run: balances, gas check, simulation
+mayhem pay tap --amount-tap 10.00 --confirm  # sign + broadcast
 ```
 
 **TNK:** send TNK to your in-app Trac address, then deposit. Signed locally, confirmed through the local MSB that ships with the node. No external RPC at all:
 
 ```bash
-mayhem deposit tnk --amount 10.00
+mayhem pay tnk --amount 10.00 --submit-intent --submit-transfer --wait
 ```
 
 Either way, `mayhem deposit status` and `mayhem balance` show the credit land. The ETH that comes along when you top up an Ethereum address covers your own deposit gas, and the network's settlement rollups are sponsored by the operator. Use the on-chain rails if you want them; the card rail is there so nobody has to.

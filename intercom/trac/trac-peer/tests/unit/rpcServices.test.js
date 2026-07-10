@@ -53,8 +53,11 @@ test("rpc services: getStatePrefix returns bounded prefix records", async (t) =>
 
 test("rpc services: status exposes the MSB boot-proof fields", async (t) => {
   const peer = {
-    bootstrap: b4a.from("aa".repeat(32), "hex"),
-    channel: b4a.from("mayhem-router-subnet"),
+    config: {
+      bootstrap: b4a.from("aa".repeat(32), "hex"),
+      channelName: "mayhem-router-subnet",
+      dhtBootstrap: ["node1.hyperdht.org:49737"],
+    },
     wallet: { publicKey: "11".repeat(32) },
     writerLocalKey: "22".repeat(32),
     base: {
@@ -72,6 +75,7 @@ test("rpc services: status exposes the MSB boot-proof fields", async (t) => {
       getSignedLength: () => 54_349,
       getConnectedValidatorsCount: () => 3,
       pubKeyHexToAddress: () => "trac1status",
+      dhtBootstrap: ["node2.hyperdht.org:49737"],
     },
   };
 
@@ -83,5 +87,9 @@ test("rpc services: status exposes the MSB boot-proof fields", async (t) => {
     networkId: 918,
     signedLength: 54_349,
     connectedValidators: 3,
+    dhtBootstrap: ["node2.hyperdht.org:49737"],
   });
+  t.is(status.peer.subnetBootstrapHex, "aa".repeat(32));
+  t.is(status.peer.subnetChannelUtf8, "mayhem-router-subnet");
+  t.alike(status.peer.dhtBootstrap, ["node1.hyperdht.org:49737"]);
 });

@@ -52,6 +52,12 @@ export class MsbClient extends ReadyResource {
         return channel == null ? null : String(channel);
     }
 
+    get dhtBootstrap() {
+        return Array.isArray(this.#msb.config.dhtBootstrap)
+            ? [...this.#msb.config.dhtBootstrap]
+            : [];
+    }
+
     async getTxvHex() {
         const txv = await this.#msb.state.getIndexerSequenceState();
         return txv.toString('hex');

@@ -305,7 +305,10 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
   }
 
   if (requireObject(add, manifest.payments, 'payments')) {
-    requireOnlyKeys(add, manifest.payments, 'payments', ['rails', 'tnk', 'tap', 'fiat']);
+    requireOnlyKeys(add, manifest.payments, 'payments', ['directory_min_version', 'rails', 'tnk', 'tap', 'fiat']);
+    if (!Number.isSafeInteger(manifest.payments.directory_min_version) || manifest.payments.directory_min_version < 1) {
+      add('error', 'payments.directory_min_version must be a positive safe integer');
+    }
     const rails = Array.isArray(manifest.payments.rails) ? manifest.payments.rails : [];
     if (rails.join(',') !== 'fiat,tap,tnk') add('error', 'payments.rails must be exactly ["fiat","tap","tnk"]');
     if (requireObject(add, manifest.payments.tnk, 'payments.tnk')) {
@@ -349,15 +352,19 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireOnlyKeys(add, manifest.payments.fiat, 'payments.fiat', [
         'processor',
         'mode',
-        'public_base_url',
-        'webhook_path',
+        'currencies',
+        'locale',
+        'event_collection',
         'connect_enabled',
       ]);
       requireLiteral(add, manifest.payments.fiat.processor, 'stripe', 'payments.fiat.processor');
       requireLiteral(add, manifest.payments.fiat.mode, 'live', 'payments.fiat.mode');
       requireLiteral(add, manifest.payments.fiat.connect_enabled, true, 'payments.fiat.connect_enabled');
-      requireString(add, manifest.payments.fiat.public_base_url, 'payments.fiat.public_base_url', /^https:\/\//);
-      requireLiteral(add, manifest.payments.fiat.webhook_path, '/v1/stripe/webhook', 'payments.fiat.webhook_path');
+      if (!Array.isArray(manifest.payments.fiat.currencies) || manifest.payments.fiat.currencies.join(',') !== 'usd,eur') {
+        add('error', 'payments.fiat.currencies must be exactly ["usd","eur"]');
+      }
+      requireLiteral(add, manifest.payments.fiat.locale, 'en', 'payments.fiat.locale');
+      requireLiteral(add, manifest.payments.fiat.event_collection, 'stripe_api_polling', 'payments.fiat.event_collection');
     }
   }
 

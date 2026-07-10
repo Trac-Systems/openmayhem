@@ -12,7 +12,7 @@
     },
     "subnet": {
       "channel": "mayhem-router-subnet",
-      "bootstrap": "<mainnet-mayhem-subnet-bootstrap-64-hex-after-admin-start>"
+      "bootstrap": "de05c29747ad223881cab6e7b6791a38ad19cab805d21ba9da1b968dbf356203"
     },
     "dht": {
       "peer_bootstrap": [
@@ -58,7 +58,7 @@
     "browser_handoffs_print_copy_paste_url": true
   },
   "contract": {
-    "admin_peer_pubkey": "<admin-peer-public-key-64-hex>",
+    "admin_peer_pubkey": "afcb230d61d3fe4dd4903a58be6d2cbe997baae0f89344c3cac8abc32c460a68",
     "key_env": {
       "admin_trac_keypair_path": "MAYHEM_TRAC_ADMIN_KEYPAIR_PATH",
       "tnk_epoch_treasury_keypair_path": "MAYHEM_TNK_TREASURY_KEYPAIR_PATH",
@@ -92,8 +92,8 @@
       "dispute_deposit_au": "1000000000000000000",
       "dispute_timeout_epochs": 168,
       "payout_min_au": "1000000000000000000",
-      "price_min_bps": 2500,
-      "price_max_bps": 40000,
+      "price_min_bps": 1,
+      "price_max_bps": 1000000,
       "price_rate_limit_seconds": 21600,
       "market_target_utilization_bps": 8500,
       "market_ema_alpha_bps": 2500,
@@ -116,7 +116,7 @@
     }
   },
   "payments": {
-    "directory_min_version": 1,
+    "directory_min_version": 3,
     "rails": [
       "fiat",
       "tap",
@@ -124,8 +124,8 @@
     ],
     "tnk": {
       "address_prefix": "trac",
-      "treasury_address": "<trac1-funded-epoch-treasury-address>",
-      "operator_fee_address": "<trac1-operator-fee-address>",
+      "treasury_address": "trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh",
+      "operator_fee_address": "trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh",
       "min_epoch_wallet_balance_tnk_e18": "1000000000000000000",
       "sponsors_only": [
         "epoch_commit",
@@ -135,13 +135,13 @@
     },
     "tap": {
       "chain_id": 1,
-      "token_address": "<0x-canonical-TAP-token-address>",
-      "pool_address": "<MayhemInferencePool-mainnet-address-after-C5>",
+      "token_address": "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454",
+      "pool_address": "0x9B254d37C28Fb5893F46513a61925eDC2F300615",
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
       "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
       "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
       "max_epoch_delta_wei": "10000000000000000000000",
-      "operator_address": "<0x-operator-fee-address>"
+      "operator_address": "0x3F9404848cc6E13Bdd9a59150Aa8D26481566acd"
     },
     "fiat": {
       "processor": "stripe",

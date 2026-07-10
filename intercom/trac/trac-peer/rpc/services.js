@@ -17,10 +17,11 @@ const requireApi = (peer) => {
 };
 
 export async function getStatus(peer) {
-  const subnetBootstrapHex = b4a.isBuffer(peer.bootstrap)
-    ? b4a.toString(peer.bootstrap, "hex")
-    : peer.bootstrap != null
-      ? String(peer.bootstrap)
+  const subnetBootstrap = peer.config?.bootstrap;
+  const subnetBootstrapHex = b4a.isBuffer(subnetBootstrap)
+    ? b4a.toString(subnetBootstrap, "hex")
+    : subnetBootstrap != null
+      ? String(subnetBootstrap)
       : null;
 
   const peerMsbAddress = peer.msbClient.pubKeyHexToAddress(peer.wallet.publicKey);
@@ -37,7 +38,8 @@ export async function getStatus(peer) {
       isIndexer: !!peer.base?.isIndexer,
       isWriter: !!peer.base?.writable,
       subnetBootstrapHex,
-      subnetChannelUtf8: peer.channel ? b4a.toString(peer.channel, "utf8") : null,
+      subnetChannelUtf8: peer.config?.channelName ?? null,
+      dhtBootstrap: Array.isArray(peer.config?.dhtBootstrap) ? peer.config.dhtBootstrap : [],
       subnetSignedLength: peer.base?.view?.core?.signedLength ?? null,
       subnetUnsignedLength: peer.base?.view?.core?.length ?? null,
       admin: admin?.value ?? null,
@@ -49,7 +51,8 @@ export async function getStatus(peer) {
       channel: peer.msbClient.channelUtf8,
       networkId: peer.msbClient.networkId,
       signedLength: peer.msbClient.getSignedLength(),
-      connectedValidators: peer.msbClient.getConnectedValidatorsCount()
+      connectedValidators: peer.msbClient.getConnectedValidatorsCount(),
+      dhtBootstrap: peer.msbClient.dhtBootstrap,
     },
   };
 }
