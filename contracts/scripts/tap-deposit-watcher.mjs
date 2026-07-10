@@ -277,10 +277,11 @@ export function tapDepositStateMatches(deposit, {
   const rootCount = Number(depositRoot?.count);
   const expectedAu = readAu(deposit?.au);
   const hasExpectedAu = expectedAu !== null && expectedAu > 0n;
+  const canonicalWho = seen?.who;
   return seen !== null
     && seen?.eth_tx_hash === deposit.eth_tx_hash
     && Number(seen?.log_index) === deposit.log_index
-    && seen?.who === deposit.who
+    && seen?.ethereum_address === deposit.who
     && seen?.tap_wei === deposit.tap_wei
     && seen?.block_hash === deposit.block_hash
     && Number(seen?.finalized_block_number) === Number(deposit.finalized_block_number)
@@ -289,7 +290,8 @@ export function tapDepositStateMatches(deposit, {
     && seen?.event_signature === deposit.event_signature
     && seen?.watcher_id === deposit.watcher_id
     && (!hasExpectedAu || readAu(seen?.au) === expectedAu)
-    && balance?.user === deposit.who
+    && typeof canonicalWho === 'string'
+    && balance?.user === canonicalWho
     && balance?.rail === 'tap'
     && balance?.denom === 'au_usd'
     && balanceAu !== null
@@ -313,11 +315,12 @@ export async function waitForTapDepositState(deposit, {
   const seenKey = `dep/tap/${tapDepositKey(deposit)}`;
   let state = null;
   while (Date.now() <= deadline) {
-    const [seen, balance, depositRoot] = await Promise.all([
+    const [seen, depositRoot] = await Promise.all([
       readContractStateValue(rpcUrl, seenKey, { fetchImpl }),
-      readContractStateValue(rpcUrl, `bal/${deposit.who}/tap`, { fetchImpl }),
       readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
     ]);
+    const balanceWho = seen?.who ?? deposit.who;
+    const balance = await readContractStateValue(rpcUrl, `bal/${balanceWho}/tap`, { fetchImpl });
     state = { seen, balance, depositRoot };
     if (tapDepositStateMatches(deposit, { ...state, epoch })) {
       return { verified: true, state };
@@ -443,7 +446,9 @@ async function main() {
     : undefined;
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const epoch = await resolveActiveBillingEpoch(args.epoch, adminRpcUrl);
-  const at = parseNonNegativeInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
+  const explicitAt = args.at === undefined
+    ? null
+    : parseNonNegativeInt(args.at, '--at');
   const cursorPath = path.resolve(args.cursor || DEFAULT_CURSOR);
   const cursor = normalizeCursor(readJsonIfExists(cursorPath, {}));
   const fromBlock = args['from-block'] !== undefined
@@ -477,7 +482,6 @@ async function main() {
     .filter((deposit) => !seen.has(tapDepositKey(deposit)));
   const adminOptions = {
     epoch,
-    at,
     submit: true,
     sim,
     json: true,
@@ -493,20 +497,43 @@ async function main() {
   const confirmationsOut = [];
   const submittedKeys = new Set();
   for (const deposit of unsubmitted) {
-    const command = buildAdminCommand(deposit, adminOptions);
+    let submitOptions = {
+      ...adminOptions,
+      at: explicitAt ?? Math.floor(Date.now() / 1000),
+    };
     const confirmation = {
       ...deposit,
-      copy_paste_admin_submit_command: command,
+      at: submitOptions.at,
+      copy_paste_admin_submit_command: buildAdminCommand(deposit, submitOptions),
       submitted: false,
       preflighted: false,
       verified: false,
     };
     if (submit) {
-      const child = spawnSync(
-        args['mayhem-bin'] || 'mayhem',
-        buildAdminCommandArgs(deposit, adminOptions),
-        { encoding: 'utf8' }
-      );
+      let child;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        submitOptions = {
+          ...submitOptions,
+          at: explicitAt ?? Math.floor(Date.now() / 1000),
+        };
+        child = spawnSync(
+          args['mayhem-bin'] || 'mayhem',
+          buildAdminCommandArgs(deposit, submitOptions),
+          { encoding: 'utf8' }
+        );
+        const output = `${child.stdout ?? ''}\n${child.stderr ?? ''}`;
+        if (
+          child.status === 0
+          || explicitAt !== null
+          || !output.includes('TAP rate oracle timestamp is in the future')
+          || attempt === 1
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_100));
+      }
+      confirmation.at = submitOptions.at;
+      confirmation.copy_paste_admin_submit_command = buildAdminCommand(deposit, submitOptions);
       if (sim) {
         confirmation.preflighted = child.status === 0;
       } else {
@@ -554,7 +581,7 @@ async function main() {
     rpc,
     pool: normalizeAddress(poolAddress, 'pool'),
     epoch,
-    at,
+    at: confirmationsOut.at(-1)?.at ?? explicitAt ?? Math.floor(Date.now() / 1000),
     tap_usd_au: tapUsdAu,
     confirmations,
     from_block: scan.from,

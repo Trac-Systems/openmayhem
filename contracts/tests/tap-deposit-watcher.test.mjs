@@ -113,6 +113,7 @@ test('tap deposit watcher scans MayhemInferencePool Deposit logs and builds admi
 });
 
 test('tap deposit watcher helpers compute policy au and verify replay-safe state shape', () => {
+  const canonicalWho = 'c'.repeat(64);
   const deposit = {
     who: '0x1111111111111111111111111111111111111111',
     tap_wei: U(1).toString(),
@@ -134,14 +135,14 @@ test('tap deposit watcher helpers compute policy au and verify replay-safe state
   assert.equal(tapWeiToAu(deposit.tap_wei, deposit.tap_usd_au), '2000000000000000000');
   assert.equal(tapDepositStateMatches(deposit, {
     epoch: 9,
-    seen: { ...deposit },
-    balance: { user: deposit.who, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
+    seen: { ...deposit, who: canonicalWho, ethereum_address: deposit.who },
+    balance: { user: canonicalWho, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
     depositRoot: { type: 'deposit_root', epoch: 9, count: 1, au_total: '2000000000000000000' },
   }), true);
   assert.equal(tapDepositStateMatches(deposit, {
     epoch: 9,
     seen: null,
-    balance: { user: deposit.who, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
+    balance: { user: canonicalWho, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
     depositRoot: { type: 'deposit_root', epoch: 9, count: 1, au_total: '2000000000000000000' },
   }), false);
 });

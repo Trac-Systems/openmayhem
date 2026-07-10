@@ -18548,7 +18548,16 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let rail = deposit_status_rail(&args);
     let rail_name = rail.as_str();
-    let before_balance = read_balance_record(&rpc, &who, rail_name).await?;
+    let requested_who = who;
+    let mut before_balance = read_balance_record(&rpc, &requested_who, rail_name).await?;
+    let balance_who = if rail == GatewayLedgerRail::Tap {
+        canonical_tap_balance_who(&requested_who, &before_balance)
+    } else {
+        requested_who.clone()
+    };
+    if balance_who != requested_who {
+        before_balance = read_balance_record(&rpc, &balance_who, rail_name).await?;
+    }
     let before_au = before_balance
         .get("au")
         .and_then(value_money_au)
@@ -18558,7 +18567,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         Some(
             wait_for_credit(
                 &rpc,
-                &who,
+                &balance_who,
                 rail_name,
                 before_au,
                 args.target_au.expect("--wait checked target_au"),
@@ -18570,7 +18579,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     } else {
         None
     };
-    let balance = read_balance_record(&rpc, &who, rail_name).await?;
+    let balance = read_balance_record(&rpc, &balance_who, rail_name).await?;
     let current_au = balance
         .get("au")
         .and_then(value_money_au)
@@ -18580,7 +18589,9 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         None => None,
     };
     let (tap_log_index, tap_seen) = match args.eth_tx_hash.as_deref() {
-        Some(hash) => read_tap_deposit_confirmation(&rpc, hash, args.log_index, &who).await?,
+        Some(hash) => {
+            read_tap_deposit_confirmation(&rpc, hash, args.log_index, &balance_who).await?
+        }
         None => (None, None),
     };
     let status = classify_deposit_status(
@@ -18594,7 +18605,8 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         "ok": status != "unknown",
         "status": status,
         "rpc_url": rpc_url,
-        "who": who,
+        "who": balance_who,
+        "requested_who": (requested_who != balance_who).then_some(requested_who),
         "rail": rail_name,
         "target_au": args.target_au.map(money_au_json),
         "balance": balance,
@@ -18630,6 +18642,15 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn canonical_tap_balance_who(requested_who: &str, balance: &Value) -> String {
+    balance
+        .get("tap_account_bound_to")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .unwrap_or(requested_who)
+        .to_owned()
 }
 
 fn deposit_status_rail(args: &DepositStatusArgs) -> GatewayLedgerRail {
@@ -46074,6 +46095,26 @@ mod tests {
             "pending"
         );
         assert_eq!(tap_deposit_seen_key("0xABCDEF", 7), "dep/tap/0xabcdef/7");
+    }
+
+    #[test]
+    fn tap_deposit_status_resolves_the_bound_mayhem_balance() {
+        let requested = "0x1111111111111111111111111111111111111111";
+        let canonical = "ab".repeat(32);
+        assert_eq!(
+            canonical_tap_balance_who(
+                requested,
+                &json!({"tap_account_bound_to": canonical.clone()})
+            ),
+            canonical
+        );
+        assert_eq!(
+            canonical_tap_balance_who(
+                requested,
+                &json!({"tap_account_bound_to": "not-a-public-key"})
+            ),
+            requested
+        );
     }
 
     #[test]

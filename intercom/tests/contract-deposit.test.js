@@ -558,6 +558,19 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(JSON.stringify(root).includes(buyer), false);
   assert.equal(root.merkle_root.includes(ethTxHash), false);
 
+  const newerRate = await executeRateFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      op: 'tap_rate_oracle',
+      tap_usd_au: '2100000000000000000',
+      source: 'uniswap-v2',
+      ts: value.at + 1,
+    },
+    ctx.admin.publicKey,
+  );
+  assert.equal(newerRate.ok, true, newerRate.message);
+
   const replay = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
   assert.equal(replay.ok, true, replay.message);
   assert.equal(replay.duplicate, true);

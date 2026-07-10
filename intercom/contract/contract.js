@@ -5741,14 +5741,6 @@ class MayhemContract extends Contract {
     const shapeError = this.validateTapDepositValue(this.value);
     if (shapeError) return shapeError;
 
-    const tapWei = this.parseTapWei(this.value.tap_wei);
-    if (tapWei instanceof Error) return tapWei;
-    const rate = await this.guardianRequireFreshTapRate(this.value.at);
-    if (rate instanceof Error) return rate;
-    const au = this.tapWeiToAu(tapWei, rate.tap_usd_au);
-    if (au instanceof Error) return au;
-    if (this.isZeroAu(au)) return new Error('TAP deposit converts to zero au.');
-
     const ethereumAddress = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
     const blockHash = this.value.block_hash.toLowerCase();
@@ -5769,6 +5761,14 @@ class MayhemContract extends Contract {
         deposit_root: (await this.get(`ev/dep/${existing.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
       };
     }
+
+    const tapWei = this.parseTapWei(this.value.tap_wei);
+    if (tapWei instanceof Error) return tapWei;
+    const rate = await this.guardianRequireFreshTapRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    const au = this.tapWeiToAu(tapWei, rate.tap_usd_au);
+    if (au instanceof Error) return au;
+    if (this.isZeroAu(au)) return new Error('TAP deposit converts to zero au.');
 
     const binding = await this.get(
       this.tapAccountAddressKey(ethereumAddress, this.value.chain_id, poolAddress)

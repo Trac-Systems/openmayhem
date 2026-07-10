@@ -428,7 +428,9 @@ async function main() {
 
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const epoch = await resolveActiveBillingEpoch(args.epoch, adminRpcUrl);
-  const at = parsePositiveInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
+  const explicitAt = args.at === undefined
+    ? null
+    : parsePositiveInt(args.at, '--at');
   const timeoutSec = parsePositiveInt(args.timeout ?? 30, '--timeout', 30);
   const finalitySignedLengths = parsePositiveInt(
     args['finality-signed-lengths'] ?? process.env.MAYHEM_TNK_FINALITY_SIGNED_LENGTHS ?? 0,
@@ -496,7 +498,6 @@ async function main() {
 
   const adminOptions = {
     epoch,
-    at,
     submit: true,
     sim,
     json: true,
@@ -511,20 +512,43 @@ async function main() {
   const confirmations = [];
   const submittedHashes = new Set();
   for (const match of matches) {
-    const command = buildAdminCommand(match, adminOptions);
+    let submitOptions = {
+      ...adminOptions,
+      at: explicitAt ?? Math.floor(Date.now() / 1000),
+    };
     const confirmation = {
       ...match,
-      copy_paste_admin_submit_command: command,
+      at: submitOptions.at,
+      copy_paste_admin_submit_command: buildAdminCommand(match, submitOptions),
       submitted: false,
       preflighted: false,
       verified: false,
     };
     if (submit) {
-      const child = spawnSync(
-        args['mayhem-bin'] || 'mayhem',
-        buildAdminCommandArgs(match, adminOptions),
-        { encoding: 'utf8' }
-      );
+      let child;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        submitOptions = {
+          ...submitOptions,
+          at: explicitAt ?? Math.floor(Date.now() / 1000),
+        };
+        child = spawnSync(
+          args['mayhem-bin'] || 'mayhem',
+          buildAdminCommandArgs(match, submitOptions),
+          { encoding: 'utf8' }
+        );
+        const output = `${child.stdout ?? ''}\n${child.stderr ?? ''}`;
+        if (
+          child.status === 0
+          || explicitAt !== null
+          || !output.includes('Rate oracle timestamp is in the future')
+          || attempt === 1
+        ) {
+          break;
+        }
+        await sleep(1_100);
+      }
+      confirmation.at = submitOptions.at;
+      confirmation.copy_paste_admin_submit_command = buildAdminCommand(match, submitOptions);
       if (sim) {
         confirmation.preflighted = child.status === 0;
       } else {
@@ -576,7 +600,7 @@ async function main() {
     address_prefix: config.addressPrefix,
     treasury_address: treasuryAddress,
     epoch,
-    at,
+    at: confirmations.at(-1)?.at ?? explicitAt ?? Math.floor(Date.now() / 1000),
     finality_signed_lengths: finalitySignedLengths,
     from_signed_length: fromSignedLength,
     safe_end_signed_length: scan.safeEnd,
