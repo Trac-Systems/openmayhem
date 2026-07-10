@@ -111,12 +111,19 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal(deployReport.deployed, true);
   assert.equal(deployReport.submitted, true);
   assert.equal(deployReport.pool, dryReport.predicted_pool_address);
+  assert.equal(ethers.isHexString(deployReport.deployment_tx_hash, 32), true);
+  assert.equal(Number.isSafeInteger(deployReport.deployment_block_number), true);
+  assert.equal(BigInt(deployReport.deployment_gas_used) > 0n, true);
+  assert.equal(deployReport.explorer_tx_url.endsWith(`/tx/${deployReport.deployment_tx_hash}`), true);
   assert.equal(deployReport.deployment.contractName, 'MayhemInferencePool.sol:MayhemInferencePool');
   assert.equal(fs.existsSync(deploymentFile), true);
   const written = JSON.parse(fs.readFileSync(deploymentFile, 'utf8'));
   assert.equal(written.pool, deployReport.pool);
   assert.equal(written.token, ethers.getAddress(tokenAddr));
   assert.equal(written.maxEpochDelta, CAP);
+  assert.equal(written.deploymentTxHash, deployReport.deployment_tx_hash);
+  assert.equal(written.deploymentBlockNumber, deployReport.deployment_block_number);
+  assert.equal(written.deploymentGasUsed, deployReport.deployment_gas_used);
   assert.equal(written.rpc, undefined);
   assert.equal(written.rpcEnv, 'MAYHEM_TAP_ETH_RPC');
 

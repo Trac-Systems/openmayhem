@@ -276,6 +276,12 @@ export async function deployMainnet({
 
     const art = compileAll();
     const { pool, poolAddr } = await deployPoolWithToken(signer, token, owner, maxEpochDelta, art);
+    const deploymentTx = pool.deploymentTransaction();
+    if (!deploymentTx) throw new Error('Deployment transaction is unavailable');
+    const deploymentReceipt = await deploymentTx.wait();
+    if (!deploymentReceipt || deploymentReceipt.status !== 1) {
+      throw new Error(`Deployment transaction ${deploymentTx.hash} did not succeed`);
+    }
     const onToken = normalizeAddress(await pool.token(), 'token()');
     const onOwner = normalizeAddress(await pool.owner(), 'owner()');
     const onCap = await pool.maxEpochDelta();
@@ -295,6 +301,9 @@ export async function deployMainnet({
       rpcEnv: plan.rpc_env,
       rpcUrl: plan.rpc_url_redacted,
       maxEpochDelta: maxEpochDelta.toString(),
+      deploymentTxHash: deploymentTx.hash,
+      deploymentBlockNumber: deploymentReceipt.blockNumber,
+      deploymentGasUsed: deploymentReceipt.gasUsed.toString(),
     };
     writeDeploymentFile(plan.deployment_file, out);
 
@@ -305,6 +314,10 @@ export async function deployMainnet({
       pool: out.pool,
       deployment: out,
       explorer_url: `${plan.explorer_url_base}/address/${out.pool}#code`,
+      explorer_tx_url: `${plan.explorer_url_base}/tx/${out.deploymentTxHash}`,
+      deployment_tx_hash: out.deploymentTxHash,
+      deployment_block_number: out.deploymentBlockNumber,
+      deployment_gas_used: out.deploymentGasUsed,
       env_lines: {
         MAYHEM_TAP_TOKEN_ADDR: token,
         MAYHEM_TAP_POOL_ADDRESS: out.pool,
@@ -320,6 +333,7 @@ export async function deployMainnet({
       console.log('  token()        :', onToken);
       console.log('  owner()        :', onOwner);
       console.log('  maxEpochDelta():', onCap.toString());
+      console.log('  deployment tx  :', out.deploymentTxHash);
       console.log('  wrote          :', plan.deployment_file);
       console.log('\nCopy/paste env lines:');
       for (const [key, value] of Object.entries(report.env_lines)) console.log(`  ${key}=${value}`);
