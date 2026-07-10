@@ -1333,6 +1333,28 @@ fn verification_rejects_wrong_binary_hash() {
 }
 
 #[test]
+fn verification_accepts_approved_non_primary_runtime_release_for_same_enclave() {
+    let (_temp, report, mut contract, mut trusted) = test_report();
+    let primary_hash = "11".repeat(32);
+    contract.binary_hash = primary_hash.clone();
+    trusted.insert(primary_hash);
+
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let verified = verify_tier1_attestation(&request)
+        .expect("an approved runtime release must keep the canonical enclave identity");
+    assert_eq!(verified.enclave_id, contract.enclave_id);
+    assert_ne!(report.binary_hash, contract.binary_hash);
+}
+
+#[test]
 fn verification_rejects_wrong_manifest() {
     let (_temp, report, mut contract, trusted) = test_report();
     contract.manifest_hash = "manifest-hash-v2".to_owned();

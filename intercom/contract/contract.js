@@ -191,20 +191,13 @@ const EPOCH_TOTAL_KEYS = [
 ];
 const EPOCH_TOTAL_MONEY_KEYS = new Set(['dep_au', 'use_au', 'earn_au', 'fee_au', 'fee_cum_au']);
 const ENCLAVE_UPDATE_FIELDS = [
-  'model_class',
-  'backend',
-  'artifact_root',
-  'artifact_root_kind',
-  'artifact_source',
-  'artifact_sidecars',
-  'source_sha256',
-  'manifest_hash',
   'att_tier',
-  'quant',
   'binary_hash',
+  'approved_binary_hashes',
   'launch_measurements',
   'caps',
 ];
+const ENCLAVE_APPROVED_BINARY_HASHES_MAX = 64;
 const TIER3_MEASUREMENT_MAX_NAMES = 32;
 const TIER3_MEASUREMENT_MAX_VALUES = 128;
 const ENCLAVE_BACKENDS = new Set([
@@ -2374,6 +2367,18 @@ class MayhemContract extends Contract {
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(this.value);
     if (artifactError) return artifactError;
+    if (hasOwn(this.value, 'approved_binary_hashes') && !Array.isArray(this.value.approved_binary_hashes)) {
+      return new Error('Enclave approved_binary_hashes must be an array.');
+    }
+    const approvedBinaryHashes = this.normalizeApprovedBinaryHashes(
+      this.value.binary_hash,
+      this.value.approved_binary_hashes
+    );
+    const binaryHashesError = this.validateApprovedBinaryHashes(
+      this.value.binary_hash,
+      approvedBinaryHashes
+    );
+    if (binaryHashesError) return binaryHashesError;
     const launchMeasurements = this.normalizeEnclaveLaunchMeasurements(this.value.launch_measurements);
     const measurementsError = this.validateEnclaveLaunchMeasurements(launchMeasurements, this.value.att_tier);
     if (measurementsError) return measurementsError;
@@ -2397,6 +2402,7 @@ class MayhemContract extends Contract {
       pending_min_att_tier: null,
       quant,
       binary_hash: this.value.binary_hash,
+      approved_binary_hashes: approvedBinaryHashes,
       launch_measurements: launchMeasurements,
       caps: cloneValue(this.value.caps),
       status: 'active',
@@ -2416,6 +2422,11 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
+    const allowedFields = new Set(['op', 'enclave_id', ...ENCLAVE_UPDATE_FIELDS]);
+    const unknownFields = Object.keys(this.value).filter((field) => !allowedFields.has(field)).sort();
+    if (unknownFields.length > 0) {
+      return new Error(`update_enclave does not accept immutable fields: ${unknownFields.join(', ')}.`);
+    }
 
     const key = `enclave/${this.value.enclave_id}`;
     const record = await this.get(key);
@@ -2442,6 +2453,25 @@ class MayhemContract extends Contract {
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(updated);
     if (artifactError) return artifactError;
+    if (hasOwn(this.value, 'approved_binary_hashes')) {
+      if (!Array.isArray(this.value.approved_binary_hashes)) {
+        return new Error('Enclave approved_binary_hashes must be an array.');
+      }
+      updated.approved_binary_hashes = this.normalizeApprovedBinaryHashes(
+        updated.binary_hash,
+        this.value.approved_binary_hashes
+      );
+    } else {
+      updated.approved_binary_hashes = this.normalizeApprovedBinaryHashes(
+        updated.binary_hash,
+        [record.binary_hash, ...(record.approved_binary_hashes ?? [])]
+      );
+    }
+    const binaryHashesError = this.validateApprovedBinaryHashes(
+      updated.binary_hash,
+      updated.approved_binary_hashes
+    );
+    if (binaryHashesError) return binaryHashesError;
     updated.launch_measurements = this.normalizeEnclaveLaunchMeasurements(updated.launch_measurements);
     const measurementsError = this.validateEnclaveLaunchMeasurements(updated.launch_measurements, updated.att_tier);
     if (measurementsError) return measurementsError;
@@ -6735,6 +6765,38 @@ class MayhemContract extends Contract {
     return this.validateEnclaveArtifactSidecars(value.artifact_sidecars ?? {});
   }
 
+  normalizeApprovedBinaryHashes(primary, values) {
+    const hashes = [primary, ...(Array.isArray(values) ? values : [])]
+      .filter((value) => typeof value === 'string')
+      .map((value) => value.toLowerCase());
+    return [...new Set(hashes)].sort();
+  }
+
+  validateApprovedBinaryHashes(primary, values) {
+    if (!Array.isArray(values) || values.length === 0) {
+      return new Error('Enclave approved_binary_hashes must be a non-empty array.');
+    }
+    if (values.length > ENCLAVE_APPROVED_BINARY_HASHES_MAX) {
+      return new Error(`Enclave approved_binary_hashes may contain at most ${ENCLAVE_APPROVED_BINARY_HASHES_MAX} entries.`);
+    }
+    const normalizedPrimary = typeof primary === 'string' ? primary.toLowerCase() : primary;
+    const seen = new Set();
+    for (const hash of values) {
+      if (!this.isHexBytes(hash, 32)) {
+        return new Error('Enclave approved_binary_hashes entries must be 32-byte hex.');
+      }
+      const normalized = hash.toLowerCase();
+      if (seen.has(normalized)) {
+        return new Error('Enclave approved_binary_hashes must not contain duplicates.');
+      }
+      seen.add(normalized);
+    }
+    if (!seen.has(normalizedPrimary)) {
+      return new Error('Enclave approved_binary_hashes must include binary_hash.');
+    }
+    return null;
+  }
+
   normalizeEnclaveLaunchMeasurements(value) {
     if (value === undefined || value === null) return null;
     if (!value || typeof value !== 'object' || Array.isArray(value)) return cloneValue(value);
@@ -8013,8 +8075,12 @@ class MayhemContract extends Contract {
 
     const enclave = await this.get(`enclave/${value.enclave_id}`);
     if (!enclave) return new Error('Canary probe enclave not found.');
-    if (enclave.binary_hash !== value.binary_hash) {
-      return new Error('Canary probe binary_hash does not match enclave.');
+    const approvedBinaryHashes = this.normalizeApprovedBinaryHashes(
+      enclave.binary_hash,
+      enclave.approved_binary_hashes
+    );
+    if (!approvedBinaryHashes.includes(value.binary_hash.toLowerCase())) {
+      return new Error('Canary probe binary_hash is not approved for enclave.');
     }
 
     if (!this.verifyProbeResultSignature(auditor, value)) {

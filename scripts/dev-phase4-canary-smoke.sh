@@ -279,7 +279,7 @@ async function merkleRoot(file) {
   fs.mkdirSync(path.dirname(catalogOut), { recursive: true });
   fs.writeFileSync(catalogOut, `${JSON.stringify(catalog, null, 2)}\n`);
   const manifestHash = crypto.createHash('sha256').update(fs.readFileSync(catalogOut)).digest('hex');
-  const enclaveId = (await b3(Buffer.from(`${adminPubkey}${modelId}${merkle.root}${manifestHash}${binaryHash}`, 'utf8'))).toString('hex');
+  const enclaveId = (await b3(Buffer.from(`${adminPubkey}${modelId}${merkle.root}${manifestHash}`, 'utf8'))).toString('hex');
   console.log(JSON.stringify({
     model_id: modelId,
     artifact_name: artifactName,

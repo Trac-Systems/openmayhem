@@ -435,13 +435,12 @@ async function catalogEnclaveId({
   artifactRoot,
   artifactSidecarRoots = {},
   manifestHash,
-  binaryHash,
 }) {
   const sidecarParts = Object.entries(artifactSidecarRoots)
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([name, root]) => [name, root]);
   return (await b3(Buffer.from(
-    [adminPubkey, modelId, artifactRoot, ...sidecarParts, manifestHash, binaryHash].join(''),
+    [adminPubkey, modelId, artifactRoot, ...sidecarParts, manifestHash].join(''),
     'utf8'
   ))).toString('hex');
 }

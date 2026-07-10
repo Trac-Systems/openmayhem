@@ -462,11 +462,6 @@ pub fn verify_tier1_attestation(
         &report.manifest_hash,
     )?;
     compare_field(
-        "binary_hash",
-        &request.contract.binary_hash,
-        &report.binary_hash,
-    )?;
-    compare_field(
         "att_tier",
         &request.contract.att_tier.to_string(),
         &report.att_tier.to_string(),

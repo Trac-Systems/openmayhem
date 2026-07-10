@@ -477,8 +477,12 @@ function catalogArtifactForEnclave(catalogProof, enclave) {
 }
 
 async function deriveCatalogEnclaveId(admin, enclave) {
+  const sidecarBinding = Object.entries(enclave.artifact_sidecars || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, sidecar]) => `${name}${sidecar.artifact_root}`)
+    .join('');
   const digest = await blake3(Buffer.from(
-    `${admin}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`
+    `${admin}${enclave.model_id}${enclave.artifact_root}${sidecarBinding}${enclave.manifest_hash}`
   ));
   return Buffer.from(digest).toString('hex');
 }

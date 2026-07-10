@@ -117,7 +117,11 @@ async function blake3HexBytes(bytes) {
 }
 
 async function deriveCatalogEnclaveId(adminPubkey, enclave) {
-  return blake3Hex(`${adminPubkey}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`);
+  const sidecarBinding = Object.entries(enclave.artifact_sidecars || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, sidecar]) => `${name}${sidecar.artifact_root}`)
+    .join('');
+  return blake3Hex(`${adminPubkey}${enclave.model_id}${enclave.artifact_root}${sidecarBinding}${enclave.manifest_hash}`);
 }
 
 async function deriveRoomId(enclaveId, adminPubkey, nonce) {

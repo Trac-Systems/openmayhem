@@ -655,7 +655,6 @@ pub fn catalog_enclave_id(identity: &CatalogEnclaveIdentity) -> String {
         hasher.update(root.as_bytes());
     }
     hasher.update(identity.manifest_hash.as_bytes());
-    hasher.update(identity.binary_hash.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -1272,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_enclave_id_changes_when_bound_fields_change() {
+    fn catalog_enclave_id_binds_model_identity_but_not_runtime_release() {
         let base = CatalogEnclaveIdentity {
             admin_pubkey: "admin".to_owned(),
             model_id: "model".to_owned(),
@@ -1285,6 +1284,13 @@ mod tests {
         changed.manifest_hash = "other-manifest".to_owned();
 
         assert_ne!(catalog_enclave_id(&base), catalog_enclave_id(&changed));
+
+        let mut changed_binary = base.clone();
+        changed_binary.binary_hash = "other-binary".to_owned();
+        assert_eq!(
+            catalog_enclave_id(&base),
+            catalog_enclave_id(&changed_binary)
+        );
     }
 
     #[test]

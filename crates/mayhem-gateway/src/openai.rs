@@ -298,6 +298,8 @@ pub struct GatewayRouteCandidate {
     pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub approved_binary_hashes: BTreeSet<String>,
     #[serde(default)]
     pub launch_measurements: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,6 +336,17 @@ fn default_reputation_bps() -> u32 {
 
 fn default_quant_bucket() -> String {
     DEFAULT_QUANT_BUCKET.to_owned()
+}
+
+fn route_candidate_approved_binary_hashes(candidate: &GatewayRouteCandidate) -> BTreeSet<String> {
+    std::iter::once(candidate.binary_hash.to_ascii_lowercase())
+        .chain(
+            candidate
+                .approved_binary_hashes
+                .iter()
+                .map(|hash| hash.to_ascii_lowercase()),
+        )
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -15190,7 +15203,7 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -15292,7 +15305,7 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -15393,7 +15406,7 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -15494,7 +15507,7 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -15595,7 +15608,7 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -20018,6 +20031,7 @@ mod tests {
             artifact_sidecar_roots: BTreeMap::new(),
             manifest_hash: format!("{:02x}", idx.wrapping_add(190)).repeat(32),
             binary_hash: format!("{:02x}", idx.wrapping_add(200)).repeat(32),
+            approved_binary_hashes: BTreeSet::new(),
             launch_measurements: Value::Null,
             kyb: None,
             reputation_bps: 10_000,

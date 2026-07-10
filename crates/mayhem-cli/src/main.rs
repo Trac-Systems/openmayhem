@@ -3592,6 +3592,14 @@ struct AdminRegisterEnclaveArgs {
     #[arg(long)]
     binary_hash: String,
 
+    /// JSON array of admin-approved runtime binary BLAKE3 hashes. The primary --binary-hash is always included.
+    #[arg(long)]
+    approved_binary_hashes_json: Option<String>,
+
+    /// Path to a JSON array of admin-approved runtime binary BLAKE3 hashes.
+    #[arg(long, value_name = "PATH")]
+    approved_binary_hashes_file: Option<PathBuf>,
+
     /// Admin-published Tier-3 launch measurements JSON.
     #[arg(long)]
     launch_measurements_json: Option<String>,
@@ -3625,51 +3633,19 @@ struct AdminUpdateEnclaveArgs {
     enclave_id: String,
 
     #[arg(long)]
-    model_class: Option<String>,
-
-    #[arg(long)]
-    backend: Option<String>,
-
-    #[arg(long)]
-    artifact_root: Option<String>,
-
-    #[arg(long)]
-    artifact_root_kind: Option<String>,
-
-    /// Hugging Face artifact repo in namespace/name form.
-    #[arg(long)]
-    artifact_repo: Option<String>,
-
-    /// Hugging Face artifact git commit revision.
-    #[arg(long)]
-    artifact_revision: Option<String>,
-
-    /// Hugging Face artifact path inside the repo.
-    #[arg(long)]
-    artifact_path: Option<String>,
-
-    /// Optional JSON object for artifact sidecars.
-    #[arg(long)]
-    artifact_sidecars_json: Option<String>,
-
-    /// Path to a JSON object containing artifact sidecars.
-    #[arg(long, value_name = "PATH")]
-    artifact_sidecars_file: Option<PathBuf>,
-
-    #[arg(long)]
-    source_sha256: Option<String>,
-
-    #[arg(long)]
-    manifest_hash: Option<String>,
-
-    #[arg(long)]
     att_tier: Option<u8>,
 
-    #[arg(long)]
-    quant: Option<String>,
-
+    /// Make this the preferred admin-approved runtime binary; the prior preferred hash remains approved.
     #[arg(long)]
     binary_hash: Option<String>,
+
+    /// Replace the exact admin-approved runtime binary set with this JSON array.
+    #[arg(long)]
+    approved_binary_hashes_json: Option<String>,
+
+    /// Replace the exact admin-approved runtime binary set from this JSON array file.
+    #[arg(long, value_name = "PATH")]
+    approved_binary_hashes_file: Option<PathBuf>,
 
     /// Admin-published Tier-3 launch measurements JSON.
     #[arg(long)]
@@ -5524,7 +5500,7 @@ fn provider_friendly_error(error: &anyhow::Error) -> String {
     }
     if lower.contains("binary hash") || lower.contains("measured enclave binary") {
         return detail(
-            "This Mayhem binary does not match the admin-signed enclave; update or rebuild Mayhem, then retry.",
+            "This Mayhem binary is not an admin-approved runtime release; update Mayhem, then retry.",
         );
     }
     if lower.contains("hash")
@@ -15446,6 +15422,11 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         args.launch_measurements_file.as_ref(),
         "launch measurements",
     )?;
+    let approved_binary_hashes = optional_json_arg_or_file(
+        args.approved_binary_hashes_json.as_deref(),
+        args.approved_binary_hashes_file.as_ref(),
+        "approved binary hashes",
+    )?;
     if args.att_tier >= 3 && launch_measurements.is_none() {
         bail!("Tier-3 enclave registration requires --launch-measurements-json or --launch-measurements-file");
     }
@@ -15469,6 +15450,12 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "binary_hash": &args.binary_hash,
         "caps": caps,
     });
+    if let Some(approved_binary_hashes) = approved_binary_hashes {
+        if !approved_binary_hashes.is_array() {
+            bail!("approved binary hashes JSON must be an array");
+        }
+        payload["approved_binary_hashes"] = approved_binary_hashes;
+    }
     if let Some(launch_measurements) = launch_measurements {
         if !launch_measurements.is_object() {
             bail!("launch measurements JSON must be an object");
@@ -15495,59 +15482,22 @@ fn admin_update_enclave_payload(args: &AdminUpdateEnclaveArgs) -> Result<Value> 
         "enclave_id": &args.enclave_id,
     });
     let mut changed = false;
-
-    changed |=
-        insert_optional_payload_string(&mut payload, "model_class", &args.model_class, false);
-    changed |= insert_optional_payload_string(&mut payload, "backend", &args.backend, false);
-    changed |=
-        insert_optional_payload_string(&mut payload, "artifact_root", &args.artifact_root, true);
-    changed |= insert_optional_payload_string(
-        &mut payload,
-        "artifact_root_kind",
-        &args.artifact_root_kind,
-        false,
-    );
-    changed |=
-        insert_optional_payload_string(&mut payload, "source_sha256", &args.source_sha256, true);
-    changed |=
-        insert_optional_payload_string(&mut payload, "manifest_hash", &args.manifest_hash, true);
-    changed |= insert_optional_payload_string(&mut payload, "quant", &args.quant, false);
     changed |= insert_optional_payload_string(&mut payload, "binary_hash", &args.binary_hash, true);
 
-    if let Some(att_tier) = args.att_tier {
-        payload["att_tier"] = json!(att_tier);
+    if let Some(approved_binary_hashes) = optional_json_arg_or_file(
+        args.approved_binary_hashes_json.as_deref(),
+        args.approved_binary_hashes_file.as_ref(),
+        "approved binary hashes",
+    )? {
+        if !approved_binary_hashes.is_array() {
+            bail!("approved binary hashes JSON must be an array");
+        }
+        payload["approved_binary_hashes"] = approved_binary_hashes;
         changed = true;
     }
 
-    match (
-        args.artifact_repo.as_ref(),
-        args.artifact_revision.as_ref(),
-        args.artifact_path.as_ref(),
-    ) {
-        (None, None, None) => {}
-        (Some(repo), Some(revision), Some(path)) => {
-            payload["artifact_source"] = json!({
-                "kind": "huggingface",
-                "repo": repo,
-                "revision": revision.to_ascii_lowercase(),
-                "path": path,
-            });
-            changed = true;
-        }
-        _ => bail!(
-            "pass all of --artifact-repo, --artifact-revision, and --artifact-path when updating artifact_source"
-        ),
-    }
-
-    if let Some(sidecars) = optional_json_arg_or_file(
-        args.artifact_sidecars_json.as_deref(),
-        args.artifact_sidecars_file.as_ref(),
-        "artifact sidecars",
-    )? {
-        if !sidecars.is_object() {
-            bail!("artifact sidecars JSON must be an object");
-        }
-        payload["artifact_sidecars"] = sidecars;
+    if let Some(att_tier) = args.att_tier {
+        payload["att_tier"] = json!(att_tier);
         changed = true;
     }
 
@@ -15567,16 +15517,13 @@ fn admin_update_enclave_payload(args: &AdminUpdateEnclaveArgs) -> Result<Value> 
         changed = true;
     }
 
-    if let Some(mut caps) = optional_json_arg_or_file(
+    if let Some(caps) = optional_json_arg_or_file(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
         "enclave caps",
     )? {
         if !caps.is_object() {
             bail!("enclave caps JSON must be an object");
-        }
-        if let Some(backend) = args.backend.as_deref() {
-            enforce_backend_caps(backend, &mut caps)?;
         }
         payload["caps"] = caps;
         changed = true;
@@ -28587,6 +28534,8 @@ struct LedgerEnclave {
     quant: String,
     binary_hash: String,
     #[serde(default)]
+    approved_binary_hashes: Vec<String>,
+    #[serde(default)]
     launch_measurements: Value,
     #[serde(default)]
     caps: Value,
@@ -30819,11 +30768,11 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .transpose()?
         .unwrap_or(std::env::current_exe()?);
     let binary_hash = measure_binary(&binary_path)?;
-    if binary_hash != selected.enclave.binary_hash {
+    let approved_binary_hashes = enclave_approved_binary_hashes(&selected.enclave);
+    if !approved_binary_hashes.contains(&binary_hash) {
         bail!(
-            "measured enclave binary hash {} does not match admin enclave record {}; rebuild or ask the admin to update the enclave",
+            "measured enclave binary hash {} is not in the admin-approved runtime release set; update Mayhem or ask the admin to approve this release",
             binary_hash,
-            selected.enclave.binary_hash
         );
     }
     let now = unix_epoch_seconds()?;
@@ -33998,6 +33947,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
+                    approved_binary_hashes: enclave_approved_binary_hashes(enclave),
                     launch_measurements: launch_measurements_with_tier3_registry(
                         enclave,
                         &contract.tier3_measurements,
@@ -35952,6 +35902,17 @@ fn enclave_artifact_sidecar_roots(enclave: &LedgerEnclave) -> BTreeMap<String, S
         .artifact_sidecars
         .iter()
         .map(|(name, sidecar)| (name.clone(), sidecar.artifact_root.clone()))
+        .collect()
+}
+
+fn enclave_approved_binary_hashes(enclave: &LedgerEnclave) -> BTreeSet<String> {
+    std::iter::once(enclave.binary_hash.to_ascii_lowercase())
+        .chain(
+            enclave
+                .approved_binary_hashes
+                .iter()
+                .map(|hash| hash.to_ascii_lowercase()),
+        )
         .collect()
 }
 
@@ -44975,24 +44936,14 @@ mod tests {
     }
 
     #[test]
-    fn admin_update_enclave_requires_changed_field_and_complete_artifact_source() {
+    fn admin_update_enclave_requires_changed_mutable_field() {
         let no_change = AdminUpdateEnclaveArgs {
             tx: test_admin_tx_args(),
             enclave_id: "enclave-a".to_owned(),
-            model_class: None,
-            backend: None,
-            artifact_root: None,
-            artifact_root_kind: None,
-            artifact_repo: None,
-            artifact_revision: None,
-            artifact_path: None,
-            artifact_sidecars_json: None,
-            artifact_sidecars_file: None,
-            source_sha256: None,
-            manifest_hash: None,
             att_tier: None,
-            quant: None,
             binary_hash: None,
+            approved_binary_hashes_json: None,
+            approved_binary_hashes_file: None,
             launch_measurements_json: None,
             launch_measurements_file: None,
             caps_json: None,
@@ -45002,15 +44953,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least one enclave field"));
-
-        let partial_source = AdminUpdateEnclaveArgs {
-            artifact_repo: Some("admin/model".to_owned()),
-            ..no_change
-        };
-        assert!(admin_update_enclave_payload(&partial_source)
-            .unwrap_err()
-            .to_string()
-            .contains("pass all of --artifact-repo"));
     }
 
     #[test]
@@ -45101,7 +45043,7 @@ mod tests {
     #[test]
     fn provider_friendly_error_keeps_binary_hash_mismatch_actionable() {
         let err = anyhow::anyhow!(
-            "measured enclave binary hash aa does not match admin enclave record bb"
+            "measured enclave binary hash aa is not in the admin-approved runtime release set"
         );
 
         let message = provider_friendly_error(&err);
@@ -45538,6 +45480,8 @@ mod tests {
             dev_skip_catalog_verify: true,
             manifest_hash: "55".repeat(32),
             binary_hash: "66".repeat(32),
+            approved_binary_hashes_json: None,
+            approved_binary_hashes_file: None,
             launch_measurements_json: None,
             launch_measurements_file: None,
             att_tier: 1,
@@ -46491,6 +46435,7 @@ mod tests {
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
+            approved_binary_hashes: Vec::new(),
             launch_measurements: Value::Null,
             caps: json!({}),
             status: "active".to_owned(),
@@ -46576,6 +46521,7 @@ mod tests {
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
+            approved_binary_hashes: Vec::new(),
             launch_measurements: Value::Null,
             caps: json!({}),
             status: "retired".to_owned(),
@@ -47017,6 +46963,7 @@ mod tests {
                 att_tier: 1,
                 quant: "int4".to_owned(),
                 binary_hash: "33".repeat(32),
+                approved_binary_hashes: Vec::new(),
                 launch_measurements: Value::Null,
                 caps: json!({ "ctx": 8192 }),
                 status: "active".to_owned(),
@@ -56191,6 +56138,7 @@ State initialization...
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "33".repeat(32),
+            approved_binary_hashes: Vec::new(),
             launch_measurements: Value::Null,
             caps: json!({ "tools": true, "json": true, "ctx": 8192 }),
             status: "active".to_owned(),

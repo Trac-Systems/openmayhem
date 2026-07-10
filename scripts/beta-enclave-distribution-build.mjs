@@ -602,18 +602,16 @@ async function build(args) {
     source_sha256: artifactSha256,
     catalog_binding: catalogBindingEvidence,
     artifact_root_verified: artifactRootVerified,
-    binary_hash: binaryHash,
     artifact: {
       path: `artifacts/${artifactName}`,
       bytes: artifactStat.size,
       sha256: artifactSha256,
       merkle,
     },
-    ...(caps === undefined ? {} : { caps }),
   };
   const enclaveManifestBytes = Buffer.from(`${stableJson(enclaveManifest)}\n`);
   const manifestHash = await blake3HexBytes(enclaveManifestBytes);
-  const enclaveId = await blake3HexText(`${adminKey.publicKeyHex}${args.modelId}${artifactRoot}${manifestHash}${binaryHash}`);
+  const enclaveId = await blake3HexText(`${adminKey.publicKeyHex}${args.modelId}${artifactRoot}${manifestHash}`);
 
   const outDir = resolveRepo(args.outDir);
   const enclaveOutDir = path.join(outDir, enclaveId);

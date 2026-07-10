@@ -785,8 +785,8 @@ async function merkleRoot(file, chunkSize = CHUNK_SIZE) {
   };
 }
 
-async function catalogEnclaveId({ adminPubkey, modelId, artifactRoot, manifestHash, binaryHash }) {
-  return (await b3(Buffer.from(`${adminPubkey}${modelId}${artifactRoot}${manifestHash}${binaryHash}`, 'utf8'))).toString('hex');
+async function catalogEnclaveId({ adminPubkey, modelId, artifactRoot, manifestHash }) {
+  return (await b3(Buffer.from(`${adminPubkey}${modelId}${artifactRoot}${manifestHash}`, 'utf8'))).toString('hex');
 }
 
 function runSync(command, args, options = {}) {

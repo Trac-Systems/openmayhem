@@ -486,12 +486,12 @@ async function b3(buffer) {
   return Buffer.from(await blake3(buffer));
 }
 
-async function catalogEnclaveId({ adminPubkey, modelId, artifactRoot, artifactSidecarRoots = {}, manifestHash, binaryHash }) {
+async function catalogEnclaveId({ adminPubkey, modelId, artifactRoot, artifactSidecarRoots = {}, manifestHash }) {
   const sidecarBinding = Object.entries(artifactSidecarRoots)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, root]) => `${name}${root}`)
     .join('');
-  return (await b3(Buffer.from(`${adminPubkey}${modelId}${artifactRoot}${sidecarBinding}${manifestHash}${binaryHash}`, 'utf8'))).toString('hex');
+  return (await b3(Buffer.from(`${adminPubkey}${modelId}${artifactRoot}${sidecarBinding}${manifestHash}`, 'utf8'))).toString('hex');
 }
 
 function artifactSidecarRoots(artifact) {

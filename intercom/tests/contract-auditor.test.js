@@ -307,7 +307,7 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     auditor.publicKey,
     9
   );
-  assert.match(wrongBinary.message, /binary_hash does not match/i);
+  assert.match(wrongBinary.message, /binary_hash is not approved/i);
 
   const unpublishedCanary = await execute(
     contract,

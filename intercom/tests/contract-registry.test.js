@@ -85,11 +85,6 @@ const enclaveRegistration = {
 const enclaveUpdate = {
   op: 'update_enclave',
   enclave_id: enclaveId,
-  artifact_root: updatedArtifactRoot,
-  artifact_source: {
-    ...artifactSource,
-    path: 'qwen2.5-4b-instruct-Q4_K_M.v2.gguf',
-  },
   caps: {
     chat: true,
     embeddings: false,
@@ -278,9 +273,9 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.created_by_role, 'admin');
   assert.equal(enclaveEntry.value.model_class, 'text-generation');
   assert.equal(enclaveEntry.value.quant, 'int4');
-  assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
+  assert.equal(enclaveEntry.value.artifact_root, artifactRoot);
   assert.equal(enclaveEntry.value.artifact_root_kind, 'blake3_merkle_v1');
-  assert.deepEqual(enclaveEntry.value.artifact_source, enclaveUpdate.artifact_source);
+  assert.deepEqual(enclaveEntry.value.artifact_source, artifactSource);
   assert.equal(enclaveEntry.value.source_sha256, null);
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
   assert.equal(enclaveEntry.value.updated_by, admin.publicKey);
@@ -1337,6 +1332,57 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.equal(stored.value.updated_by, admin.publicKey);
   assert.equal(stored.value.updated_by_role, 'admin');
   assert.equal(stored.value.updated_at, makeTxKey(11));
+
+  const nextBinaryHash = 'e'.repeat(64);
+  const releaseUpdate = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'a'.repeat(64),
+      binary_hash: nextBinaryHash,
+    },
+    admin.publicKey,
+    12
+  );
+  assert.equal(releaseUpdate.ok, true, releaseUpdate.message);
+  const afterRelease = await storage.get(`enclave/${'a'.repeat(64)}`);
+  assert.equal(afterRelease.value.binary_hash, nextBinaryHash);
+  assert.deepEqual(afterRelease.value.approved_binary_hashes, [binaryHash, nextBinaryHash]);
+
+  const releaseRevoke = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'a'.repeat(64),
+      approved_binary_hashes: [nextBinaryHash],
+    },
+    admin.publicKey,
+    13
+  );
+  assert.equal(releaseRevoke.ok, true, releaseRevoke.message);
+  assert.deepEqual(
+    (await storage.get(`enclave/${'a'.repeat(64)}`)).value.approved_binary_hashes,
+    [nextBinaryHash]
+  );
+
+  const immutableUpdate = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'a'.repeat(64),
+      artifact_root: updatedArtifactRoot,
+    },
+    admin.publicKey,
+    14
+  );
+  assert.match(immutableUpdate.message, /does not accept immutable fields: artifact_root/i);
+  assert.equal((await storage.get(`enclave/${'a'.repeat(64)}`)).value.artifact_root, artifactRoot);
 });
 
 test('MayhemContract allows launch enclave hardware tiers and rejects KYB-only tier', async () => {

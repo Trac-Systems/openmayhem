@@ -3242,6 +3242,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         artifact_sidecar_roots: BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: identity.binary_hash,
+        approved_binary_hashes: BTreeSet::new(),
         launch_measurements: serde_json::Value::Null,
         kyb: None,
         reputation_bps: 10_000,
