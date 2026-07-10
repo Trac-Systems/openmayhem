@@ -29626,12 +29626,20 @@ impl Default for ProviderLoadSnapshot {
 }
 
 impl ProviderLoadSnapshot {
-    #[cfg(test)]
-    fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>) -> Self {
+    fn idle(max_sessions: u32) -> Self {
         Self {
-            active_slots: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            free_slots: u64::from(max_sessions),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>, max_sessions: u32) -> Self {
+        let active_slots = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+        Self {
+            active_slots,
             active_requests: 0,
-            free_slots: 0,
+            free_slots: u64::from(max_sessions).saturating_sub(active_slots),
             engine_backlog: 0,
             est_wait_ms: 0,
             ttft_ms: 0,
@@ -29667,11 +29675,12 @@ impl Default for ProviderHeartbeatLoad {
 }
 
 impl ProviderHeartbeatLoad {
-    fn snapshot(&self) -> ProviderLoadSnapshot {
+    fn snapshot(&self, max_sessions: u32) -> ProviderLoadSnapshot {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
-        let free_slots = active_slots.saturating_sub(active_requests);
-        let engine_backlog = active_requests.saturating_sub(active_slots);
+        let session_capacity = u64::from(max_sessions);
+        let free_slots = session_capacity.saturating_sub(active_slots);
+        let engine_backlog = active_requests.saturating_sub(session_capacity);
         let rolling_turn_ms = self.rolling_turn_ms.load(Ordering::Relaxed);
         let est_wait_ms = if engine_backlog > 0 && rolling_turn_ms > 0 {
             rolling_turn_ms.saturating_mul(engine_backlog)
@@ -37700,7 +37709,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 Some(transport_peer.as_str()),
                 seq,
                 seq == 0,
-                ProviderLoadSnapshot::default(),
+                ProviderLoadSnapshot::idle(protection.max_sessions),
             )
             .await?,
         );
@@ -37866,7 +37875,7 @@ async fn run_provider_session_heartbeat_connection(
             Some(transport_peer.as_str()),
             seq,
             join_rooms,
-            ctx.load.snapshot(),
+            ctx.load.snapshot(ctx.max_sessions),
         )
         .await
         .with_context(|| format!("sending live provider heartbeat seq {seq}"))?;
@@ -51499,10 +51508,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             );
         }
 
-        let snapshot = ProviderLoadSnapshot::from_sessions(&sessions);
+        let snapshot = ProviderLoadSnapshot::from_sessions(&sessions, 4);
 
         assert_eq!(snapshot.active_slots, 2);
-        assert_eq!(snapshot.free_slots, 0);
+        assert_eq!(snapshot.free_slots, 2);
         assert_eq!(snapshot.engine_backlog, 0);
         assert_eq!(snapshot.est_wait_ms, 0);
         assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
@@ -51564,7 +51573,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(sessions.is_empty());
         assert!(pending_requests.is_empty());
         assert!(pending_payloads.is_empty());
-        assert_eq!(load.snapshot().active_slots, 0);
+        assert_eq!(load.snapshot(4).active_slots, 0);
     }
 
     #[test]
@@ -51742,10 +51751,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_load_tracks_live_active_slots() {
         let load = ProviderHeartbeatLoad::default();
-        assert_eq!(load.snapshot(), ProviderLoadSnapshot::default());
+        assert_eq!(load.snapshot(0), ProviderLoadSnapshot::default());
+        assert_eq!(load.snapshot(8), ProviderLoadSnapshot::idle(8));
         load.set_active_sessions(2);
         assert_eq!(
-            load.snapshot(),
+            load.snapshot(4),
             ProviderLoadSnapshot {
                 active_slots: 2,
                 active_requests: 0,
@@ -51758,7 +51768,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }
         );
         load.set_accepting_new(false);
-        assert!(!load.snapshot().accepting_new);
+        assert!(!load.snapshot(4).accepting_new);
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());
@@ -51770,10 +51780,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         load.set_active_sessions(3);
         let mut request = load.begin_request();
 
-        let busy = load.snapshot();
+        let busy = load.snapshot(4);
         assert_eq!(busy.active_slots, 3);
         assert_eq!(busy.active_requests, 1);
-        assert_eq!(busy.free_slots, 2);
+        assert_eq!(busy.free_slots, 1);
         assert_eq!(busy.engine_backlog, 0);
         assert_eq!(busy.ttft_ms, 0);
 
@@ -51781,9 +51791,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         load.record_turn_result(Duration::from_millis(500), 10);
         request.finish();
 
-        let measured = load.snapshot();
+        let measured = load.snapshot(4);
         assert_eq!(measured.active_requests, 0);
-        assert_eq!(measured.free_slots, 3);
+        assert_eq!(measured.free_slots, 1);
         assert_eq!(measured.engine_backlog, 0);
         assert_eq!(measured.ttft_ms, 125);
         assert_eq!(measured.measured_tok_s_milli, Some(20_000));

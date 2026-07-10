@@ -10637,7 +10637,7 @@ fn route_static_filters_have_candidates(
 fn route_wait_expired_error(options: &GatewayRequestOptions) -> ApiError {
     ApiError::service_unavailable(
         format!(
-            "network busy: no provider capacity became available before X-Mayhem-Max-Wait-Ms ({})",
+            "no eligible provider became available before X-Mayhem-Max-Wait-Ms ({})",
             options.max_wait_ms
         ),
         Some("model"),
@@ -19221,6 +19221,10 @@ mod tests {
         .await;
         assert!(!outcome.waited);
         assert!(outcome.routes.is_empty());
+
+        let error = route_wait_expired_error(&options);
+        assert!(error.message.contains("no eligible provider"));
+        assert!(!error.message.contains("capacity"));
     }
 
     #[test]
