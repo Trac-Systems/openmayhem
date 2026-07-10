@@ -4802,6 +4802,10 @@ struct ProviderLimitsSetArgs {
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
 
+    /// Local vLLM memory target as a percentage of accelerator memory.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization: Option<u32>,
+
     /// Disk reserve kept free for downloads/sealed stores, e.g. 20GB.
     #[arg(long, value_name = "GB")]
     disk_reserve: Option<String>,
@@ -5154,6 +5158,10 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
 
+    /// Local vLLM memory target as a percentage of accelerator memory.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization: Option<u32>,
+
     /// Disk reserve kept free for downloads/sealed stores, e.g. 20GB.
     #[arg(long, value_name = "GB")]
     disk_reserve: Option<String>,
@@ -5420,6 +5428,7 @@ struct ConfigProviderLimits {
     serve_budget_units: Option<u64>,
     serve_budget_period_seconds: Option<u64>,
     memory_reserve: Option<String>,
+    vllm_memory_utilization_pct: Option<u32>,
     disk_reserve: Option<String>,
 }
 
@@ -6865,6 +6874,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         min_ask_au: 0,
         ctx: None,
         memory_reserve: None,
+        vllm_memory_utilization: None,
         disk_reserve: None,
         max_sessions: None,
         accept_rate_per_minute: 0,
@@ -26998,6 +27008,14 @@ fn print_provider_limits_report(report: &Value) {
             .unwrap_or("auto")
     );
     println!(
+        "vllm_memory_utilization: {}",
+        limits
+            .get("vllm_memory_utilization_pct")
+            .and_then(Value::as_u64)
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "auto".to_owned())
+    );
+    println!(
         "disk_reserve: {}",
         limits
             .get("disk_reserve")
@@ -30614,6 +30632,7 @@ struct ProviderMemoryBudget {
     available_bytes: u64,
     reserve_bytes: u64,
     claimed_bytes: u64,
+    worker_limit_bytes: u64,
     budget_bytes: u64,
 }
 
@@ -30628,6 +30647,7 @@ impl ProviderMemoryBudget {
             available_bytes: 0,
             reserve_bytes: 0,
             claimed_bytes: 0,
+            worker_limit_bytes: 0,
             budget_bytes: 0,
         }
     }
@@ -32199,6 +32219,7 @@ fn provider_start_args_for_serve_plan(
         min_ask_au: 0,
         ctx: args.ctx,
         memory_reserve: args.memory_reserve.clone(),
+        vllm_memory_utilization: None,
         disk_reserve: None,
         max_sessions: None,
         accept_rate_per_minute: 0,
@@ -33279,9 +33300,10 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         && args.accept_rate.is_none()
         && args.budget.is_none()
         && args.memory_reserve.is_none()
+        && args.vllm_memory_utilization.is_none()
         && args.disk_reserve.is_none()
     {
-        bail!("set at least one of --max-concurrent, --accept-rate, --budget, --memory-reserve, or --disk-reserve");
+        bail!("set at least one of --max-concurrent, --accept-rate, --budget, --memory-reserve, --vllm-memory-utilization, or --disk-reserve");
     }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -33292,8 +33314,12 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         .as_deref()
         .map(normalize_provider_market_target)
         .transpose()?;
-    if target.is_some() && (args.memory_reserve.is_some() || args.disk_reserve.is_some()) {
-        bail!("--memory-reserve and --disk-reserve are machine-level limits; set them without --enclave");
+    if target.is_some()
+        && (args.memory_reserve.is_some()
+            || args.vllm_memory_utilization.is_some()
+            || args.disk_reserve.is_some())
+    {
+        bail!("--memory-reserve, --vllm-memory-utilization, and --disk-reserve are machine-level limits; set them without --enclave");
     }
     let table = if let Some(target) = target.as_deref() {
         ensure_provider_enclave_limits_table(&mut config, target)?
@@ -33334,6 +33360,10 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
     if let Some(memory_reserve) = args.memory_reserve.as_deref() {
         provider_memory_reserve_bytes(Some(memory_reserve), 16 * GIB_BYTES, false)?;
         toml_table_set_string(table, "memory_reserve", memory_reserve.to_owned());
+    }
+    if let Some(pct) = args.vllm_memory_utilization {
+        let pct = validate_provider_vllm_memory_utilization_pct(pct)?;
+        toml_table_set_u64(table, "vllm_memory_utilization_pct", u64::from(pct))?;
     }
     if let Some(disk_reserve) = args.disk_reserve.as_deref() {
         provider_disk_reserve_bytes(Some(disk_reserve))?;
@@ -33620,6 +33650,9 @@ fn apply_provider_resource_config_defaults(
     if args.memory_reserve.is_none() {
         args.memory_reserve = limits.memory_reserve.clone();
     }
+    if args.vllm_memory_utilization.is_none() {
+        args.vllm_memory_utilization = limits.vllm_memory_utilization_pct;
+    }
     if args.disk_reserve.is_none() {
         args.disk_reserve = limits.disk_reserve.clone();
     }
@@ -33671,6 +33704,7 @@ fn provider_limits_value(config: &toml::Value, target: Option<&str>) -> Value {
         "serve_budget_units": get_u64("serve_budget_units").unwrap_or(0),
         "serve_budget_period_seconds": get_u64("serve_budget_period_seconds").unwrap_or(86_400),
         "memory_reserve": get_str("memory_reserve"),
+        "vllm_memory_utilization_pct": get_u64("vllm_memory_utilization_pct"),
         "disk_reserve": get_str("disk_reserve"),
     })
 }
@@ -36688,10 +36722,11 @@ fn provider_memory_budget(
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, _reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
-    let mut budget_bytes = pool
+    let worker_limit_bytes = pool
         .available_bytes
         .saturating_sub(reserve_bytes)
         .saturating_sub(claimed_bytes);
+    let mut budget_bytes = worker_limit_bytes;
     if enclave.backend == "vllm" {
         let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&enclave.caps)?;
         let admin_max_bytes =
@@ -36707,6 +36742,7 @@ fn provider_memory_budget(
         available_bytes: pool.available_bytes,
         reserve_bytes,
         claimed_bytes,
+        worker_limit_bytes,
         budget_bytes,
     })
 }
@@ -37052,8 +37088,18 @@ struct VllmMemoryUtilizationPlan {
     max_pct: u32,
 }
 
+fn validate_provider_vllm_memory_utilization_pct(pct: u32) -> Result<u32> {
+    ensure!(
+        (1..=VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT).contains(&pct),
+        "vLLM memory utilization must be between 1 and {} percent",
+        VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT
+    );
+    Ok(pct)
+}
+
 fn provider_vllm_memory_utilization(
     selected: &ProviderCandidate,
+    local_target_pct: Option<u32>,
 ) -> Result<VllmMemoryUtilizationPlan> {
     let total_bytes = selected.feasibility.memory_budget.total_bytes;
     ensure!(
@@ -37073,8 +37119,15 @@ fn provider_vllm_memory_utilization(
         u32::try_from((u128::from(required_bytes) * 100).div_ceil(u128::from(total_bytes)))
             .unwrap_or(u32::MAX)
             .max(1);
-    let budget_pct = u32::try_from((u128::from(budget_bytes) * 100) / u128::from(total_bytes))
+    let mut budget_pct = u32::try_from((u128::from(budget_bytes) * 100) / u128::from(total_bytes))
         .unwrap_or(u32::MAX);
+    let next_budget_pct = budget_pct.saturating_add(1);
+    let next_budget_bytes =
+        u64::try_from((u128::from(total_bytes) * u128::from(next_budget_pct)) / 100)
+            .unwrap_or(u64::MAX);
+    if next_budget_pct <= 100 && next_budget_bytes <= budget_bytes {
+        budget_pct = next_budget_pct;
+    }
     let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&selected.enclave.caps)?;
     let max_pct = budget_pct
         .min(admin_max_pct)
@@ -37083,10 +37136,24 @@ fn provider_vllm_memory_utilization(
         floor_pct <= max_pct,
         "vLLM model and context require at least {floor_pct}% GPU memory, but the F13/admin ceiling is {max_pct}%"
     );
-    Ok(VllmMemoryUtilizationPlan {
-        target_pct: floor_pct
+    let target_pct = if let Some(pct) = local_target_pct {
+        let pct = validate_provider_vllm_memory_utilization_pct(pct)?;
+        ensure!(
+            pct >= floor_pct,
+            "local vLLM memory utilization {pct}% is below the estimated {floor_pct}% required for this model and context"
+        );
+        ensure!(
+            pct <= max_pct,
+            "local vLLM memory utilization {pct}% exceeds the current usable ceiling {max_pct}%"
+        );
+        pct
+    } else {
+        floor_pct
             .saturating_add(VLLM_MEMORY_UTILIZATION_CUSHION_PCT)
-            .min(max_pct),
+            .min(max_pct)
+    };
+    Ok(VllmMemoryUtilizationPlan {
+        target_pct,
         floor_pct,
         max_pct,
     })
@@ -41874,8 +41941,8 @@ fn provider_engine_load_config(
     } else {
         selected.verdict.n_layers_gpu
     };
-    config.memory_limit_bytes = (selected.feasibility.memory_budget.budget_bytes > 0)
-        .then_some(selected.feasibility.memory_budget.budget_bytes);
+    config.memory_limit_bytes = (selected.feasibility.memory_budget.worker_limit_bytes > 0)
+        .then_some(selected.feasibility.memory_budget.worker_limit_bytes);
     config.backend_cache_dir = backend_runtime.cache_dir.clone();
     config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
@@ -41925,7 +41992,7 @@ fn provider_engine_load_config(
             .get("vllm_dtype")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let utilization = provider_vllm_memory_utilization(selected)?;
+        let utilization = provider_vllm_memory_utilization(selected, args.vllm_memory_utilization)?;
         config.vllm_gpu_memory_utilization_pct = Some(utilization.target_pct);
         config.vllm_gpu_memory_utilization_floor_pct = Some(utilization.floor_pct);
     }
@@ -45939,6 +46006,7 @@ mod tests {
             serve_budget_au = "1000"
             serve_budget_period_seconds = 3600
             memory_reserve = "15%"
+            vllm_memory_utilization_pct = 40
             disk_reserve = "20GB"
 
             [provider.enclave_limits."test/model@4bit:T1"]
@@ -45959,6 +46027,7 @@ mod tests {
         assert_eq!(args.serve_budget_units, 2500);
         assert_eq!(args.serve_budget_period_seconds, 1800);
         assert_eq!(args.memory_reserve.as_deref(), Some("15%"));
+        assert_eq!(args.vllm_memory_utilization, Some(40));
         assert_eq!(args.disk_reserve.as_deref(), Some("20GB"));
 
         let mut cli_args = test_provider_start_args();
@@ -45979,6 +46048,7 @@ mod tests {
             accept_rate: Some("6/min".to_owned()),
             budget: Some("42tokens/day".to_owned()),
             memory_reserve: None,
+            vllm_memory_utilization: None,
             disk_reserve: None,
             json: true,
         })
@@ -45999,6 +46069,7 @@ mod tests {
             accept_rate: None,
             budget: None,
             memory_reserve: Some("15%".to_owned()),
+            vllm_memory_utilization: None,
             disk_reserve: None,
             json: true,
         })
@@ -49351,6 +49422,7 @@ mod tests {
                     available_bytes: (budget_gib + 1) * GIB_BYTES,
                     reserve_bytes: GIB_BYTES,
                     claimed_bytes: 0,
+                    worker_limit_bytes: budget_gib * GIB_BYTES,
                     budget_bytes: budget_gib * GIB_BYTES,
                 },
             },
@@ -49697,6 +49769,29 @@ mod tests {
     }
 
     #[test]
+    fn vllm_allocation_ceiling_does_not_shrink_worker_address_space() {
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 1, 2, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 40 });
+        selected.verdict.backend = "vllm".to_owned();
+
+        let budget = provider_memory_budget(
+            &hardware,
+            &selected.verdict,
+            &selected.enclave,
+            &test_provider_start_args(),
+            0,
+        )
+        .unwrap();
+        let admin_allocation_ceiling =
+            u64::try_from((u128::from(budget.total_bytes) * 40) / 100).unwrap();
+
+        assert_eq!(budget.budget_bytes, admin_allocation_ceiling);
+        assert!(budget.worker_limit_bytes > budget.budget_bytes);
+    }
+
+    #[test]
     fn vllm_utilization_is_derived_between_fit_floor_and_admin_ceiling() {
         let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 60, 85, 1, 30.0);
         selected.enclave.backend = "vllm".to_owned();
@@ -49707,18 +49802,47 @@ mod tests {
         selected.feasibility.estimated_required_bytes = 60 * GIB_BYTES;
 
         assert_eq!(
-            provider_vllm_memory_utilization(&selected).unwrap(),
+            provider_vllm_memory_utilization(&selected, None).unwrap(),
             VllmMemoryUtilizationPlan {
                 target_pct: 65,
                 floor_pct: 60,
                 max_pct: 80,
             }
         );
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, Some(70))
+                .unwrap()
+                .target_pct,
+            70
+        );
 
         selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 55 });
-        assert!(provider_vllm_memory_utilization(&selected).is_err());
+        assert!(provider_vllm_memory_utilization(&selected, None).is_err());
         selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 91 });
-        assert!(provider_vllm_memory_utilization(&selected).is_err());
+        assert!(provider_vllm_memory_utilization(&selected, None).is_err());
+    }
+
+    #[test]
+    fn vllm_utilization_preserves_non_divisible_percentage_ceiling() {
+        let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 30, 40, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 40 });
+        let total_bytes = 119_690 * 1024 * 1024;
+        selected.feasibility.memory_budget.total_bytes = total_bytes;
+        selected.feasibility.memory_budget.budget_bytes =
+            u64::try_from((u128::from(total_bytes) * 40) / 100).unwrap();
+        selected.feasibility.estimated_required_bytes =
+            u64::try_from((u128::from(total_bytes) * 30) / 100).unwrap();
+
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, Some(40)).unwrap(),
+            VllmMemoryUtilizationPlan {
+                target_pct: 40,
+                floor_pct: 30,
+                max_pct: 40,
+            }
+        );
     }
 
     #[test]
@@ -52597,7 +52721,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.gpu_layers, Some(0));
         assert_eq!(
             config.memory_limit_bytes,
-            Some(selected.feasibility.memory_budget.budget_bytes)
+            Some(selected.feasibility.memory_budget.worker_limit_bytes)
         );
     }
 
@@ -52909,6 +53033,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
         assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(7));
         assert_eq!(config.vllm_gpu_memory_utilization_floor_pct, Some(2));
+        assert_eq!(
+            config.memory_limit_bytes,
+            Some(selected.feasibility.memory_budget.worker_limit_bytes)
+        );
+        assert!(
+            selected.feasibility.memory_budget.worker_limit_bytes
+                > selected.feasibility.memory_budget.budget_bytes
+        );
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {
@@ -57454,6 +57586,7 @@ State initialization...
             min_ask_au: 0,
             ctx: None,
             memory_reserve: None,
+            vllm_memory_utilization: None,
             disk_reserve: None,
             max_sessions: None,
             accept_rate_per_minute: 0,

@@ -536,6 +536,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
+| `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | onboarding next |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
 | `deepreinforce-ai/Ornith-1.0-9B` | LLM, agentic | B | onboarding |

@@ -30,6 +30,7 @@ struct PythonRuntimeSpec {
     version: &'static str,
     requirements: &'static [u8],
     requirements_sha256: &'static str,
+    extra_index_urls: &'static [&'static str],
     min_free_bytes: u64,
 }
 
@@ -131,12 +132,19 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             )
         })?;
         let managed_python = venv_python(&venv);
-        let install = Command::new(&managed_python)
+        let mut install_command = Command::new(&managed_python);
+        install_command
             .arg("-m")
             .arg("pip")
             .arg("install")
             .arg("--disable-pip-version-check")
-            .arg("--no-input")
+            .arg("--no-input");
+        for extra_index_url in spec.extra_index_urls {
+            install_command
+                .arg("--extra-index-url")
+                .arg(extra_index_url);
+        }
+        let install = install_command
             .arg("--requirement")
             .arg(&requirements_path)
             .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
@@ -186,6 +194,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             version: "0.24.0",
             requirements: VLLM_REQUIREMENTS,
             requirements_sha256: "51826622021f8d2fb22495b12bb9d2724b7ed1245c149754af9def3f41fad4b2",
+            extra_index_urls: &[],
             min_free_bytes: 8 * GIB,
         }),
         "trt-llm" => Some(PythonRuntimeSpec {
@@ -193,9 +202,13 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             override_env: "MAYHEM_TRTLLM_PYTHON",
             distribution: "tensorrt_llm",
             import_name: "tensorrt_llm",
-            version: "1.2.1",
+            version: "1.3.0rc20",
             requirements: TRT_LLM_REQUIREMENTS,
-            requirements_sha256: "50ca3c97d922f6687224aeb44a2b5e4530d450c2e9e1df793f9a111e12df6703",
+            requirements_sha256: "349e16bfabb93bf450befe2a2d214e074560af3ede4baba1ccfebe0298476332",
+            extra_index_urls: &[
+                "https://pypi.nvidia.com",
+                "https://download.pytorch.org/whl/cu130",
+            ],
             min_free_bytes: 12 * GIB,
         }),
         "mlx" => Some(PythonRuntimeSpec {
@@ -206,6 +219,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             version: "0.31.3",
             requirements: MLX_REQUIREMENTS,
             requirements_sha256: "d3167fca548be3265d62c6397f6ded6a688017b3d37de1ed4eed5eabf16b9747",
+            extra_index_urls: &[],
             min_free_bytes: 2 * GIB,
         }),
         _ => None,
@@ -388,6 +402,25 @@ mod tests {
             Some("MAYHEM_MLX_PYTHON")
         );
         assert!(python_runtime_spec("llama.cpp").is_none());
+    }
+
+    #[test]
+    fn only_trt_uses_the_cuda_pytorch_index() {
+        assert!(python_runtime_spec("vllm")
+            .unwrap()
+            .extra_index_urls
+            .is_empty());
+        assert!(python_runtime_spec("mlx")
+            .unwrap()
+            .extra_index_urls
+            .is_empty());
+        assert_eq!(
+            python_runtime_spec("trt-llm").unwrap().extra_index_urls,
+            &[
+                "https://pypi.nvidia.com",
+                "https://download.pytorch.org/whl/cu130"
+            ]
+        );
     }
 
     #[test]

@@ -6,7 +6,12 @@ use thiserror::Error;
 
 use crate::{text_generation_rate_map, usage_map_au, ProviderKey, RateMapEntry};
 
-pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = 10_000;
+pub const ADMIN_RELAY_CONNECT_BUDGET_MILLIS: u64 = 15_000;
+pub const ADMIN_RELAY_RESULT_BUDGET_MILLIS: u64 = 60_000;
+pub const OPEN_TIMEOUT_SAFETY_MARGIN_MILLIS: u64 = 15_000;
+pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = ADMIN_RELAY_CONNECT_BUDGET_MILLIS
+    + ADMIN_RELAY_RESULT_BUDGET_MILLIS
+    + OPEN_TIMEOUT_SAFETY_MARGIN_MILLIS;
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
 pub const DEFAULT_PROVIDER_COOLOFF_MILLIS: u64 = 30_000;
 pub const DEFAULT_STALL_TIMEOUT_MILLIS: u64 = 30_000;
@@ -545,27 +550,37 @@ mod tests {
             .start_open_attempt(providers[0].clone(), 1_000)
             .expect("first attempt");
         assert_eq!(first.attempt, 1);
-        assert_eq!(first.deadline_at_millis, 11_000);
-        assert!(!state.open_attempt_timed_out(&first, 10_999));
-        assert!(state.open_attempt_timed_out(&first, 11_000));
+        let first_deadline = 1_000 + DEFAULT_OPEN_TIMEOUT_MILLIS;
+        assert_eq!(first.deadline_at_millis, first_deadline);
+        assert!(!state.open_attempt_timed_out(&first, first_deadline - 1));
+        assert!(state.open_attempt_timed_out(&first, first_deadline));
 
         assert_eq!(
-            state.record_open_timeout(&providers[0], 11_000),
+            state.record_open_timeout(&providers[0], first_deadline),
             OpenRetryDecision::Retry {
                 next_attempt: 2,
-                cooled_until_millis: 41_000,
+                cooled_until_millis: first_deadline + DEFAULT_PROVIDER_COOLOFF_MILLIS,
             }
         );
-        assert!(state.provider_in_cooloff(&providers[0], 40_999));
-        assert!(!state.provider_in_cooloff(&providers[0], 41_000));
+        assert!(state.provider_in_cooloff(
+            &providers[0],
+            first_deadline + DEFAULT_PROVIDER_COOLOFF_MILLIS - 1
+        ));
+        assert!(!state.provider_in_cooloff(
+            &providers[0],
+            first_deadline + DEFAULT_PROVIDER_COOLOFF_MILLIS
+        ));
         assert_eq!(
-            state.available_candidates(&providers, 40_999),
+            state.available_candidates(
+                &providers,
+                first_deadline + DEFAULT_PROVIDER_COOLOFF_MILLIS - 1,
+            ),
             providers[1..].to_vec()
         );
 
         for (attempt_idx, provider) in providers[1..4].iter().enumerate() {
             let attempt = state
-                .start_open_attempt(provider.clone(), 10_000 + attempt_idx as u64)
+                .start_open_attempt(provider.clone(), first_deadline + attempt_idx as u64)
                 .expect("retry attempt");
             assert_eq!(attempt.attempt, attempt_idx as u8 + 2);
             let decision = state.record_open_timeout(provider, attempt.deadline_at_millis);

@@ -18716,7 +18716,7 @@ mod tests {
             Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
         );
         assert_eq!(config.min_tok_s, None);
-        assert_eq!(config.open_timeout, Duration::from_secs(10));
+        assert_eq!(config.open_timeout, Duration::from_secs(90));
         assert_eq!(config.ttft_timeout, Duration::from_secs(30));
         assert_eq!(config.frame_timeout, Duration::from_secs(30));
     }
@@ -18887,7 +18887,10 @@ mod tests {
                 &GatewayRequestOptions::default(),
             )
             .expect("invocation");
-        assert_eq!(invocation.failover.open_timeout_ms, 10_000);
+        assert_eq!(
+            invocation.failover.open_timeout_ms,
+            DEFAULT_OPEN_TIMEOUT_MILLIS
+        );
         assert_eq!(invocation.failover.stall_timeout_ms, 30_000);
         assert_eq!(invocation.failover.ttft_timeout_ms, 130_000);
     }

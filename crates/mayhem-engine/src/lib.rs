@@ -1361,6 +1361,78 @@ pub fn discover_trt_llm_cuda_home(python: &Path) -> Option<PathBuf> {
     trt_llm_backend::resolve_trt_cuda_home(python)
 }
 
+#[cfg(any(feature = "trt-llm", feature = "vllm"))]
+fn select_runtime_compatible_cuda_home(
+    python: &Path,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    let mut candidates = candidates
+        .into_iter()
+        .filter(|path| path.join("bin/nvcc").is_file())
+        .collect::<Vec<_>>();
+    candidates.dedup();
+
+    let Some(runtime_version) = python_torch_cuda_version(python) else {
+        return candidates.into_iter().next();
+    };
+    candidates
+        .into_iter()
+        .find(|path| nvcc_cuda_version(path) == Some(runtime_version))
+}
+
+#[cfg(any(feature = "trt-llm", feature = "vllm"))]
+fn python_torch_cuda_version(python: &Path) -> Option<(u32, u32)> {
+    let venv = python.parent()?.parent()?;
+    let mut roots = vec![venv.join("Lib/site-packages")];
+    for lib in [venv.join("lib"), venv.join("lib64")] {
+        roots.extend(
+            std::fs::read_dir(lib)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path().join("site-packages")),
+        );
+    }
+    roots.into_iter().find_map(|root| {
+        let version = std::fs::read_to_string(root.join("torch/version.py")).ok()?;
+        version
+            .lines()
+            .find(|line| line.trim_start().starts_with("cuda"))
+            .and_then(parse_cuda_major_minor)
+    })
+}
+
+#[cfg(any(feature = "trt-llm", feature = "vllm"))]
+fn nvcc_cuda_version(cuda_home: &Path) -> Option<(u32, u32)> {
+    let output = std::process::Command::new(cuda_home.join("bin/nvcc"))
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .split_once("release ")
+        .and_then(|(_, version)| parse_cuda_major_minor(version))
+}
+
+#[cfg(any(feature = "trt-llm", feature = "vllm"))]
+fn parse_cuda_major_minor(value: &str) -> Option<(u32, u32)> {
+    let start = value.find(|ch: char| ch.is_ascii_digit())?;
+    let mut parts = value[start..].splitn(2, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
 pub use piper_backend::PiperBackend;
 pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
 pub use whisper_cpp_backend::WhisperCppBackend;
@@ -3217,10 +3289,11 @@ mod mlx_backend {
 #[cfg(feature = "vllm")]
 mod vllm_backend {
     use super::{
-        attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
-        vllm_safetensors_payload_path, ArtifactFormat, EngineBackend, EngineError, FinishReason,
-        GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk,
-        TokenSink, Tokenization, UsageCounters, WorkerContainment,
+        attach_worker_containment, engine_worker_command, select_runtime_compatible_cuda_home,
+        validate_load_config, verify_artifact, vllm_safetensors_payload_path, ArtifactFormat,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -3305,7 +3378,11 @@ mod vllm_backend {
             worker.send(id, op, payload)?;
 
             loop {
-                let message = worker.read_message()?;
+                let message = if op == "load" {
+                    worker.read_load_message()?
+                } else {
+                    worker.read_message()?
+                };
                 if message.id != id {
                     return Err(EngineError::Vllm(format!(
                         "worker response id {} did not match request id {id}",
@@ -3530,14 +3607,8 @@ mod vllm_backend {
         }
 
         fn read_message(&mut self) -> Result<WorkerMessage> {
-            let line = match self.stdout_rx.recv_timeout(self.request_timeout) {
-                Ok(WorkerRead::Line(line)) => line,
-                Ok(WorkerRead::Eof) => {
-                    return Err(EngineError::Vllm(
-                        "vLLM backend worker exited before replying".to_owned(),
-                    ));
-                }
-                Ok(WorkerRead::Error(error)) => return Err(EngineError::Vllm(error)),
+            let read = match self.stdout_rx.recv_timeout(self.request_timeout) {
+                Ok(read) => read,
                 Err(RecvTimeoutError::Timeout) => {
                     self.terminate();
                     return Err(EngineError::Vllm(format!(
@@ -3550,6 +3621,26 @@ mod vllm_backend {
                         "vLLM backend worker stdout reader stopped".to_owned(),
                     ));
                 }
+            };
+            Self::decode_read(read)
+        }
+
+        fn read_load_message(&mut self) -> Result<WorkerMessage> {
+            let read = self.stdout_rx.recv().map_err(|_| {
+                EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
+            })?;
+            Self::decode_read(read)
+        }
+
+        fn decode_read(read: WorkerRead) -> Result<WorkerMessage> {
+            let line = match read {
+                WorkerRead::Line(line) => line,
+                WorkerRead::Eof => {
+                    return Err(EngineError::Vllm(
+                        "vLLM backend worker exited before replying".to_owned(),
+                    ));
+                }
+                WorkerRead::Error(error) => return Err(EngineError::Vllm(error)),
             };
             Ok(serde_json::from_str(line.trim_end())?)
         }
@@ -3703,21 +3794,27 @@ mod vllm_backend {
         if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
             return cuda_home_with_nvcc(explicit);
         }
-        bundled_cuda_home(python)
-            .or_else(|| {
-                env::var_os("CUDA_HOME")
-                    .map(PathBuf::from)
-                    .and_then(cuda_home_with_nvcc)
-            })
-            .or_else(|| cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda")))
-            .or_else(newest_usr_local_cuda_home)
+        if let Some(explicit) = env::var_os("CUDA_HOME").map(PathBuf::from) {
+            return cuda_home_with_nvcc(explicit);
+        }
+
+        let mut candidates = cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda"))
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidates.extend(usr_local_cuda_homes());
+        candidates.extend(bundled_cuda_homes(python));
+        select_runtime_compatible_cuda_home(python, candidates)
     }
 
-    fn bundled_cuda_home(python: &Path) -> Option<PathBuf> {
-        let venv = python.parent()?.parent()?;
+    fn bundled_cuda_homes(python: &Path) -> Vec<PathBuf> {
+        let Some(venv) = python.parent().and_then(Path::parent) else {
+            return Vec::new();
+        };
         let lib = venv.join("lib");
         let mut candidates = fs::read_dir(lib)
-            .ok()?
+            .ok()
+            .into_iter()
+            .flatten()
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path().join("site-packages/nvidia"))
             .filter_map(|nvidia| fs::read_dir(nvidia).ok())
@@ -3727,12 +3824,15 @@ mod vllm_backend {
             .filter_map(cuda_home_with_nvcc)
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates.pop()
+        candidates.reverse();
+        candidates
     }
 
-    fn newest_usr_local_cuda_home() -> Option<PathBuf> {
+    fn usr_local_cuda_homes() -> Vec<PathBuf> {
         let mut candidates = fs::read_dir("/usr/local")
-            .ok()?
+            .ok()
+            .into_iter()
+            .flatten()
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
@@ -3743,7 +3843,8 @@ mod vllm_backend {
             .filter_map(cuda_home_with_nvcc)
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates.pop()
+        candidates.reverse();
+        candidates
     }
 
     fn cuda_home_with_nvcc(path: PathBuf) -> Option<PathBuf> {
@@ -3913,6 +4014,38 @@ mod vllm_backend {
         }
 
         #[test]
+        fn vllm_load_wait_ignores_inference_timeout() {
+            let path = env::temp_dir().join(format!(
+                "mayhem-slow-loading-vllm-worker-{}",
+                std::process::id()
+            ));
+            fs::write(
+                &path,
+                "#!/bin/sh\nread request\nsleep 1\nprintf '%s\\n' '{\"id\":1,\"type\":\"response\",\"ok\":true,\"result\":{}}'\n",
+            )
+            .expect("write fake worker");
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&path, perms).expect("chmod fake worker");
+
+            let mut worker =
+                VllmWorker::spawn_with_timeout(&path, Duration::from_millis(50), None, None)
+                    .expect("spawn");
+            worker
+                .send(1, "load", Value::Null)
+                .expect("send load request to fake worker");
+            let start = Instant::now();
+            let message = worker
+                .read_load_message()
+                .expect("load waits beyond inference timeout");
+            assert!(start.elapsed() >= Duration::from_millis(500));
+            assert_eq!(message.id, 1);
+            assert_eq!(message.ok, Some(true));
+
+            let _ = fs::remove_file(path);
+        }
+
+        #[test]
         fn vllm_load_payload_carries_capacity_knobs() {
             let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
             config.ctx_size = 1024;
@@ -4018,7 +4151,7 @@ fi
             fs::write(&python, b"").unwrap();
             fs::write(cuda.join("bin/nvcc"), b"").unwrap();
 
-            assert_eq!(bundled_cuda_home(&python).as_deref(), Some(cuda.as_path()));
+            assert_eq!(bundled_cuda_homes(&python), vec![cuda]);
 
             let _ = fs::remove_dir_all(root);
         }
@@ -4057,10 +4190,10 @@ fi
 #[cfg(feature = "trt-llm")]
 mod trt_llm_backend {
     use super::{
-        attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
-        ArtifactFormat, EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest,
-        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
-        WorkerContainment,
+        attach_worker_containment, engine_worker_command, select_runtime_compatible_cuda_home,
+        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
+        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
+        TokenChunk, TokenSink, Tokenization, UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -4142,7 +4275,11 @@ mod trt_llm_backend {
             worker.send(id, op, payload)?;
 
             loop {
-                let message = worker.read_message()?;
+                let message = if op == "load" {
+                    worker.read_load_message()?
+                } else {
+                    worker.read_message()?
+                };
                 if message.id != id {
                     return Err(EngineError::TrtLlm(format!(
                         "worker response id {} did not match request id {id}",
@@ -4354,14 +4491,8 @@ mod trt_llm_backend {
         }
 
         fn read_message(&mut self) -> Result<WorkerMessage> {
-            let line = match self.stdout_rx.recv_timeout(self.request_timeout) {
-                Ok(WorkerRead::Line(line)) => line,
-                Ok(WorkerRead::Eof) => {
-                    return Err(EngineError::TrtLlm(
-                        "TensorRT-LLM backend worker exited before replying".to_owned(),
-                    ));
-                }
-                Ok(WorkerRead::Error(error)) => return Err(EngineError::TrtLlm(error)),
+            let read = match self.stdout_rx.recv_timeout(self.request_timeout) {
+                Ok(read) => read,
                 Err(RecvTimeoutError::Timeout) => {
                     self.terminate();
                     return Err(EngineError::TrtLlm(format!(
@@ -4374,6 +4505,26 @@ mod trt_llm_backend {
                         "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
                     ));
                 }
+            };
+            Self::decode_read(read)
+        }
+
+        fn read_load_message(&mut self) -> Result<WorkerMessage> {
+            let read = self.stdout_rx.recv().map_err(|_| {
+                EngineError::TrtLlm("TensorRT-LLM backend worker stdout reader stopped".to_owned())
+            })?;
+            Self::decode_read(read)
+        }
+
+        fn decode_read(read: WorkerRead) -> Result<WorkerMessage> {
+            let line = match read {
+                WorkerRead::Line(line) => line,
+                WorkerRead::Eof => {
+                    return Err(EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker exited before replying".to_owned(),
+                    ));
+                }
+                WorkerRead::Error(error) => return Err(EngineError::TrtLlm(error)),
             };
             Ok(serde_json::from_str(line.trim_end())?)
         }
@@ -4487,21 +4638,27 @@ mod trt_llm_backend {
         if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
             return trt_cuda_home_with_nvcc(explicit);
         }
-        trt_bundled_cuda_home(python)
-            .or_else(|| {
-                env::var_os("CUDA_HOME")
-                    .map(PathBuf::from)
-                    .and_then(trt_cuda_home_with_nvcc)
-            })
-            .or_else(|| trt_cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda")))
-            .or_else(trt_newest_usr_local_cuda_home)
+        if let Some(explicit) = env::var_os("CUDA_HOME").map(PathBuf::from) {
+            return trt_cuda_home_with_nvcc(explicit);
+        }
+
+        let mut candidates = trt_cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda"))
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidates.extend(trt_usr_local_cuda_homes());
+        candidates.extend(trt_bundled_cuda_homes(python));
+        select_runtime_compatible_cuda_home(python, candidates)
     }
 
-    fn trt_bundled_cuda_home(python: &Path) -> Option<PathBuf> {
-        let venv = python.parent()?.parent()?;
+    fn trt_bundled_cuda_homes(python: &Path) -> Vec<PathBuf> {
+        let Some(venv) = python.parent().and_then(Path::parent) else {
+            return Vec::new();
+        };
         let lib = venv.join("lib");
         let mut candidates = fs::read_dir(lib)
-            .ok()?
+            .ok()
+            .into_iter()
+            .flatten()
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path().join("site-packages/nvidia"))
             .filter_map(|nvidia| fs::read_dir(nvidia).ok())
@@ -4511,12 +4668,15 @@ mod trt_llm_backend {
             .filter_map(trt_cuda_home_with_nvcc)
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates.pop()
+        candidates.reverse();
+        candidates
     }
 
-    fn trt_newest_usr_local_cuda_home() -> Option<PathBuf> {
+    fn trt_usr_local_cuda_homes() -> Vec<PathBuf> {
         let mut candidates = fs::read_dir("/usr/local")
-            .ok()?
+            .ok()
+            .into_iter()
+            .flatten()
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
@@ -4527,7 +4687,8 @@ mod trt_llm_backend {
             .filter_map(trt_cuda_home_with_nvcc)
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates.pop()
+        candidates.reverse();
+        candidates
     }
 
     fn trt_cuda_home_with_nvcc(path: PathBuf) -> Option<PathBuf> {
@@ -4764,6 +4925,58 @@ mod trt_llm_backend {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(any(feature = "trt-llm", feature = "vllm"))]
+    #[test]
+    fn cuda_version_parser_reads_runtime_and_nvcc_forms() {
+        assert_eq!(parse_cuda_major_minor("13.0"), Some((13, 0)));
+        assert_eq!(
+            parse_cuda_major_minor("Cuda compilation tools, release 13.2, V13.2.78"),
+            Some((13, 2))
+        );
+        assert_eq!(parse_cuda_major_minor("None"), None);
+    }
+
+    #[cfg(all(any(feature = "trt-llm", feature = "vllm"), unix))]
+    #[test]
+    fn cuda_home_selection_matches_the_torch_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "mayhem-cuda-runtime-selection-{}",
+            std::process::id()
+        ));
+        let python = root.join("venv/bin/python");
+        let torch_version = root.join("venv/lib/python3.12/site-packages/torch/version.py");
+        let cuda_13_2 = root.join("cuda-13.2");
+        let cuda_13_0 = root.join("cuda-13.0");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(torch_version.parent().unwrap()).unwrap();
+        std::fs::write(&python, b"").unwrap();
+        std::fs::write(&torch_version, "cuda: Optional[str] = '13.0'\n").unwrap();
+
+        for (cuda, version) in [(&cuda_13_2, "13.2"), (&cuda_13_0, "13.0")] {
+            let nvcc = cuda.join("bin/nvcc");
+            std::fs::create_dir_all(nvcc.parent().unwrap()).unwrap();
+            std::fs::write(
+                &nvcc,
+                format!(
+                    "#!/bin/sh\necho 'Cuda compilation tools, release {version}, V{version}'\n"
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&nvcc).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&nvcc, permissions).unwrap();
+        }
+
+        assert_eq!(
+            select_runtime_compatible_cuda_home(&python, [cuda_13_2.clone(), cuda_13_0.clone()]),
+            Some(cuda_13_0)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     struct EchoBackend;
 
