@@ -15808,6 +15808,7 @@ impl GatewayState {
             SessionReceipt {
                 body,
                 enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
                 user_sig,
             }
         };
@@ -15903,6 +15904,7 @@ impl GatewayState {
             SessionReceipt {
                 body,
                 enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
                 user_sig,
             }
         };
@@ -15998,6 +16000,7 @@ impl GatewayState {
             SessionReceipt {
                 body,
                 enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
                 user_sig,
             }
         };
@@ -16155,6 +16158,7 @@ impl GatewayState {
             SessionReceipt {
                 body,
                 enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
                 user_sig,
             }
         };
@@ -16250,6 +16254,7 @@ impl GatewayState {
             SessionReceipt {
                 body,
                 enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
                 user_sig,
             }
         };
@@ -16285,6 +16290,7 @@ impl GatewayState {
         Ok(SessionReceipt {
             body: body.clone(),
             enclave_sig: provider_receipt.enclave_sig.clone(),
+            enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
             user_sig: receipt_ack.user_sig,
         })
     }
@@ -19347,6 +19353,10 @@ mod tests {
             )
             .expect("matching provider receipt is co-signed");
         assert_eq!(stored.receipt.enclave_sig, provider_receipt.enclave_sig);
+        assert_eq!(
+            stored.receipt.enclave_pubkey,
+            provider_receipt.enclave_pubkey
+        );
         assert_eq!(stored.receipt.body, provider_receipt.body);
         assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
 

@@ -595,6 +595,7 @@ pub struct SessionReceipt {
     #[serde(flatten)]
     pub body: ReceiptBody,
     pub enclave_sig: String,
+    pub enclave_pubkey: String,
     pub user_sig: String,
 }
 
