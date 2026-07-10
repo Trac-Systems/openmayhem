@@ -30293,6 +30293,7 @@ impl Drop for ProviderRequestLoadGuard {
 
 #[derive(Clone, Debug)]
 struct ProviderSessionHeartbeatTask {
+    home: PathBuf,
     sc_bridge_url: String,
     sc_bridge_token: String,
     keypair_path: PathBuf,
@@ -37753,8 +37754,9 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
     let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
     let mut seq = 0_u64;
     let mut join_rooms = true;
+    let mut heartbeat_cache_updated_at = None::<Instant>;
     while !ctx.load.is_stopped() {
-        send_provider_heartbeat_round(
+        let sent = send_provider_heartbeat_round(
             &mut bridge,
             &ctx.keypair_path,
             &ctx.password,
@@ -37773,6 +37775,26 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
         )
         .await
         .with_context(|| format!("sending live provider heartbeat seq {seq}"))?;
+        let refresh_cache = heartbeat_cache_updated_at
+            .map(|updated_at| {
+                updated_at.elapsed()
+                    >= Duration::from_millis(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS / 2)
+            })
+            .unwrap_or(true);
+        if refresh_cache {
+            if let Err(err) = write_provider_heartbeat_cache(
+                &ctx.home,
+                &ctx.provider_pubkey,
+                &ctx.selected.enclave.enclave_id,
+                &sent,
+            ) {
+                provider_session_debug(format!(
+                    "refreshing provider heartbeat health cache failed: {err:#}"
+                ));
+            } else {
+                heartbeat_cache_updated_at = Some(Instant::now());
+            }
+        }
         join_rooms = false;
         seq = seq.saturating_add(1);
         sleep(Duration::from_secs(2)).await;
@@ -37834,6 +37856,7 @@ async fn serve_provider_sessions(
     let heartbeat_task = heartbeat_enabled.then(|| {
         tokio::spawn(run_provider_session_heartbeats(
             ProviderSessionHeartbeatTask {
+                home: ctx.home.to_path_buf(),
                 sc_bridge_url: sc_bridge_url.clone(),
                 sc_bridge_token: sc_bridge_token.clone(),
                 keypair_path: ctx.keypair_path.to_path_buf(),
