@@ -38115,7 +38115,7 @@ async fn serve_provider_sessions(
                         break;
                     }
                 }
-                Err(BridgeError::Closed) => {
+                Err(BridgeError::Closed) | Err(BridgeError::WebSocket(_)) => {
                     let dropped = clear_provider_sessions_after_bridge_drop(
                         &mut sessions,
                         &mut pending_requests,
