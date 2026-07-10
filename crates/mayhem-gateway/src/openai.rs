@@ -716,6 +716,7 @@ impl GatewayAccessControl {
         let token_hash = gateway_token_hash(&raw_token);
         let now = now_secs();
         let mut store = self.store.lock().expect("gateway token store poisoned");
+        self.reload_store(&mut store)?;
         let token = store
             .tokens
             .iter_mut()
@@ -888,6 +889,30 @@ impl GatewayAccessControl {
         fs::write(path, bytes).map_err(|err| {
             ApiError::internal_message(format!("writing gateway token store failed: {err}"))
         })
+    }
+
+    fn reload_store(&self, store: &mut GatewayTokenStore) -> Result<(), ApiError> {
+        let Some(path) = self.store_path.as_ref() else {
+            return Ok(());
+        };
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                *store = GatewayTokenStore::empty();
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(ApiError::internal_message(format!(
+                    "reading gateway token store failed: {err}"
+                )))
+            }
+        };
+        *store = serde_json::from_slice::<GatewayTokenStore>(&bytes)
+            .map(GatewayTokenStore::normalized)
+            .map_err(|err| {
+                ApiError::internal_message(format!("parsing gateway token store failed: {err}"))
+            })?;
+        Ok(())
     }
 }
 
@@ -1396,10 +1421,12 @@ impl GatewaySessionInvocation {
     }
 
     fn direct_peer(&self) -> Result<&str, GatewaySessionError> {
-        Ok(self
-            .transport_peer
-            .as_deref()
-            .unwrap_or(self.provider_pubkey_required()?))
+        self.transport_peer.as_deref().ok_or_else(|| {
+            GatewaySessionError::retryable(format!(
+                "provider {} has no fresh signed transport peer heartbeat",
+                self.provider_pubkey.as_deref().unwrap_or("unknown")
+            ))
+        })
     }
 
     fn with_hedge_probe_outcome(mut self, outcome: &GatewayHedgeProbeOutcome) -> Self {
@@ -1725,6 +1752,7 @@ impl GatewayState {
     pub fn with_dev_session_shim(mut self) -> Self {
         self.session_backend = Arc::new(LocalOpenAiShapeBackend);
         self.dev_session_shim = true;
+        seed_dev_fallback_heartbeats(&self.provider_table, &self.models);
         self
     }
 
@@ -6186,14 +6214,25 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
 
 fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> ProviderTable {
     let mut table = ProviderTable::new();
-    let now = now_millis_u64();
     for model in models {
         for candidate in &model.mayhem.route_candidates {
             table.upsert_contract(contract_snapshot_for_route(model, candidate, rules_ver));
-            table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
         }
     }
     table
+}
+
+fn seed_dev_fallback_heartbeats(
+    provider_table: &Arc<Mutex<ProviderTable>>,
+    models: &[GatewayModel],
+) {
+    let now = now_millis_u64();
+    let mut table = provider_table.lock().expect("provider table poisoned");
+    for model in models {
+        for candidate in &model.mayhem.route_candidates {
+            table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
+        }
+    }
 }
 
 fn contract_snapshot_for_route(
@@ -6254,12 +6293,12 @@ fn heartbeat_for_route(
         },
         price_ver: price.ver,
         min_ask_au: candidate.min_ask_au,
-        transport_peer: None,
+        transport_peer: Some(candidate.provider.clone()),
         identity_anchor: route_identity_anchor(candidate),
         accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
-            epoch: 0,
+            epoch: 1,
             head: candidate.binary_hash.clone(),
         },
         ts: now_millis / 1000,
@@ -12918,7 +12957,9 @@ impl GatewayState {
                 candidate,
                 self.receipt_config.rules_ver,
             ));
-            table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
+            if self.dev_session_shim {
+                table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
+            }
         }
     }
 
@@ -13132,6 +13173,7 @@ fn request_requirements_for_chat(
     let output_tokens = chat_output_headroom_tokens(request);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
         requires_tools: request
             .tools
             .as_ref()
@@ -13196,6 +13238,7 @@ fn request_requirements_for_embedding(
     let input_tokens = embedding_input_token_count(inputs);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
@@ -13221,6 +13264,7 @@ fn request_requirements_for_image_generation(
     let input_tokens = rough_tokens(&request.prompt);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
@@ -13246,6 +13290,7 @@ fn request_requirements_for_audio_speech(
     let input_tokens = rough_tokens(&request.input);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
@@ -13270,6 +13315,7 @@ fn request_requirements_for_audio_transcription(
 ) -> RequestRequirements {
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
@@ -19355,6 +19401,71 @@ mod tests {
     }
 
     #[test]
+    fn gateway_access_control_reloads_tokens_created_after_startup() {
+        let raw_token = "sk-mayhem-hot-reload";
+        let path = std::env::temp_dir().join(format!(
+            "mayhem-gateway-token-reload-{}-{}.json",
+            std::process::id(),
+            now_millis_u64()
+        ));
+        let access =
+            GatewayAccessControl::new(true, GatewayTokenStore::empty(), Some(path.clone()));
+        let store = GatewayTokenStore {
+            version: 1,
+            tokens: vec![GatewayTokenRecord {
+                name: "opencode-local".to_owned(),
+                token_hash: gateway_token_hash(raw_token),
+                token_id: "tok_hot_reload".to_owned(),
+                created_at: 1,
+                expires_at: None,
+                budget_au: None,
+                budget_period: None,
+                spent_total_au: 0,
+                spent_period_au: 0,
+                period_started_at: Some(1),
+                max_rate_per_minute: None,
+                models: Vec::new(),
+                last_used_at: None,
+                revoked_at: None,
+            }],
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {raw_token}")).unwrap(),
+        );
+
+        let attribution = access
+            .authorize(&headers, Some("mayhem/dev-chat-tools"))
+            .expect("new token is reloaded")
+            .expect("token attribution");
+        assert_eq!(attribution.name, "opencode-local");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_route_has_no_synthetic_heartbeat_or_transport_identity() {
+        let model = test_routed_model(1);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let options = GatewayRequestOptions::default();
+
+        assert!(ordered_route_candidates_for_request_with_options(
+            &state, &model, &request, &options
+        )
+        .is_empty());
+        let entry = state
+            .provider_table
+            .lock()
+            .expect("provider table")
+            .entries(now_millis_u64())
+            .pop()
+            .expect("contract route remains discoverable");
+        assert!(entry.heartbeat.is_none());
+    }
+
+    #[test]
     fn gateway_receipt_attribution_records_token_spend_delta() {
         let model = test_model();
         let request = test_chat_request(&model.id);
@@ -20575,6 +20686,21 @@ mod tests {
         providers: Arc<Mutex<Vec<String>>>,
     }
 
+    fn test_gateway_state_from_models(models: Vec<GatewayModel>) -> GatewayState {
+        let now = now_millis_u64();
+        let heartbeats = models
+            .iter()
+            .flat_map(|model| {
+                model.mayhem.route_candidates.iter().map(|route| {
+                    let mut heartbeat = heartbeat_for_route(model, route, now);
+                    heartbeat.sig = "aa".repeat(64);
+                    heartbeat
+                })
+            })
+            .collect::<Vec<_>>();
+        GatewayState::from_models(models).with_provider_heartbeats(heartbeats)
+    }
+
     impl GatewaySessionBackend for SuccessBackend {
         fn name(&self) -> &str {
             "test-success"
@@ -20620,7 +20746,7 @@ mod tests {
     #[test]
     fn route_selection_uses_weighted_p2c_not_array_order() {
         let model = test_routed_model(4);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let request = test_chat_request(&model.id);
         let mut counts = BTreeMap::new();
 
@@ -20649,7 +20775,7 @@ mod tests {
     #[test]
     fn route_selection_uses_anchored_reputation_weight() {
         let neutral_model = test_routed_model(2);
-        let neutral_state = GatewayState::from_models(vec![neutral_model.clone()]);
+        let neutral_state = test_gateway_state_from_models(vec![neutral_model.clone()]);
         let request = test_chat_request(&neutral_model.id);
         let penalized_provider = neutral_model.mayhem.route_candidates[0].provider.clone();
         let neutral_wins = (0..512)
@@ -20670,7 +20796,7 @@ mod tests {
 
         let mut anchored_model = neutral_model.clone();
         anchored_model.mayhem.route_candidates[0].reputation_bps = 3_100;
-        let anchored_state = GatewayState::from_models(vec![anchored_model.clone()]);
+        let anchored_state = test_gateway_state_from_models(vec![anchored_model.clone()]);
         let anchored_wins = (0..512)
             .filter(|seed| {
                 ordered_route_candidates_for_request_with_seed(
@@ -20707,7 +20833,7 @@ mod tests {
     #[test]
     fn route_selection_penalizes_observed_slow_error_provider() {
         let model = test_routed_model(4);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let request = test_chat_request(&model.id);
         let penalized_provider = model.mayhem.route_candidates[0].provider.clone();
         let before = (0..256)
@@ -20763,7 +20889,7 @@ mod tests {
     #[test]
     fn route_selection_prefers_previous_provider_for_same_conversation_model() {
         let model = test_routed_model(4);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let mut request = test_chat_request(&model.id);
         request
             .metadata
@@ -20796,7 +20922,7 @@ mod tests {
         let model_a = test_routed_model_with_id("mayhem/model-a", 0, 4);
         let mut model_b = model_a.clone();
         model_b.id = "mayhem/model-b".to_owned();
-        let state = GatewayState::from_models(vec![model_a.clone(), model_b.clone()]);
+        let state = test_gateway_state_from_models(vec![model_a.clone(), model_b.clone()]);
         let mut request_a = test_chat_request(&model_a.id);
         request_a
             .metadata
@@ -20834,7 +20960,7 @@ mod tests {
     #[test]
     fn route_selection_ignores_conversation_affinity_for_cooled_provider() {
         let model = test_routed_model(3);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let mut request = test_chat_request(&model.id);
         request
             .metadata
@@ -20855,7 +20981,7 @@ mod tests {
     #[test]
     fn route_selection_excludes_provider_during_cooloff_and_readmits_after_expiry() {
         let model = test_routed_model(3);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let request = test_chat_request(&model.id);
         let cooled_route = &model.mayhem.route_candidates[0];
         let cooled_provider = cooled_route.provider.clone();
@@ -20888,7 +21014,7 @@ mod tests {
             "ctx": 8192,
             "vision": false,
         });
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let mut request = test_chat_request(&model.id);
         request.tools = Some(vec![json!({
             "type": "function",
@@ -20916,7 +21042,7 @@ mod tests {
             "ctx": 8192,
             "vision": false,
         });
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let selected =
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
         assert_eq!(selected.len(), 1);
@@ -20929,7 +21055,7 @@ mod tests {
         let request = test_chat_request(&model.id);
         let high_ask_provider = model.mayhem.route_candidates[0].provider.clone();
         model.mayhem.route_candidates[0].min_ask_au = u128::MAX;
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
 
         let selected =
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
@@ -20967,7 +21093,7 @@ mod tests {
     fn route_selection_honors_user_generation_throughput_floor() {
         let model = test_routed_model(2);
         let request = test_chat_request(&model.id);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
 
         let default_routes = ordered_route_candidates_for_request_with_options(
             &state,
@@ -21014,7 +21140,7 @@ mod tests {
     #[test]
     fn route_selection_applies_modality_throughput_floors() {
         let model = test_routed_model(2);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let inputs = vec!["alpha beta".to_owned(), "gamma".to_owned()];
 
         assert_eq!(
@@ -21155,7 +21281,7 @@ mod tests {
     #[test]
     fn underdelivery_streak_emits_contract_ready_reputation_event() {
         let model = test_routed_model(1);
-        let state = GatewayState::from_models(vec![model.clone()]).with_epoch_seconds(7_200);
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_epoch_seconds(7_200);
         let route = &model.mayhem.route_candidates[0];
 
         for _ in 0..3 {
@@ -21219,7 +21345,8 @@ mod tests {
             derivation: None,
             history: Vec::new(),
         });
-        let state = GatewayState::from_models(vec![model.clone()]).with_receipt_balance_au(10_000);
+        let state =
+            test_gateway_state_from_models(vec![model.clone()]).with_receipt_balance_au(10_000);
 
         let selected = ordered_route_candidates_for_request_with_max_price_seed(
             &state,
@@ -21280,7 +21407,7 @@ mod tests {
         let mut heartbeat = heartbeat_for_route(&model, route, now_millis_u64());
         heartbeat.transport_peer = Some(transport_peer.clone());
         heartbeat.sig = "aa".repeat(64);
-        let state = GatewayState::from_models(vec![model.clone()])
+        let state = test_gateway_state_from_models(vec![model.clone()])
             .with_receipt_balance_au(10_000)
             .with_provider_heartbeats(vec![heartbeat]);
 
@@ -21310,7 +21437,7 @@ mod tests {
         let request = test_chat_request(&model.id);
         model.mayhem.route_candidates[0].quant = "int4".to_owned();
         model.mayhem.route_candidates[1].quant = "fp16".to_owned();
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
 
         let selected = ordered_route_candidates_for_request_with_max_price_seed(
             &state,
@@ -21343,7 +21470,7 @@ mod tests {
     #[test]
     fn route_selection_excludes_circuit_open_provider_and_readmits_after_expiry() {
         let model = test_routed_model(3);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let request = test_chat_request(&model.id);
         let circuit_route = &model.mayhem.route_candidates[0];
         let circuit_provider = circuit_route.provider.clone();
@@ -21410,7 +21537,7 @@ mod tests {
         let mut large = heartbeat_for_route(&model, &model.mayhem.route_candidates[1], now);
         large.att.epoch = 1;
         large.sig = "bb".repeat(64);
-        let state = GatewayState::from_models(vec![model.clone()])
+        let state = test_gateway_state_from_models(vec![model.clone()])
             .with_provider_heartbeats(vec![small, large]);
         let request = test_chat_request(&model.id);
         let options = GatewayRequestOptions {
@@ -21435,11 +21562,11 @@ mod tests {
         let mut model = test_routed_model(1);
         model.mayhem.route_candidates[0].served_ctx = Some(8_192);
         let providers = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            SuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
                 providers: providers.clone(),
-            },
-        ));
+            }),
+        );
         let mut request = test_chat_request(&model.id);
         request.messages[0].content = json!("word ".repeat(9_000));
         request.max_tokens = Some(64);
@@ -21475,12 +21602,12 @@ mod tests {
         let skipped_small_key = route_key(&model.mayhem.route_candidates[1]);
         let providers = Arc::new(Mutex::new(Vec::new()));
         let served_contexts = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            ExactContextPartialThenSuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(ExactContextPartialThenSuccessBackend {
                 providers: providers.clone(),
                 served_contexts: served_contexts.clone(),
-            },
-        ));
+            }),
+        );
         let mut request = test_chat_request(&model.id);
         request.messages[0].content = json!("word ".repeat(7_600));
         request.max_tokens = Some(512);
@@ -21529,12 +21656,12 @@ mod tests {
         let model = test_routed_model(2);
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let providers = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            PartialThenSuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(PartialThenSuccessBackend {
                 attempts: attempts.clone(),
                 providers: providers.clone(),
-            },
-        ));
+            }),
+        );
         let mut request = test_chat_request(&model.id);
         request.max_tokens = Some(8);
 
@@ -21586,11 +21713,11 @@ mod tests {
     async fn route_retry_abandons_below_floor_provider_and_reroutes() {
         let model = test_routed_model(2);
         let providers = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            SlowQualityThenSuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SlowQualityThenSuccessBackend {
                 providers: providers.clone(),
-            },
-        ));
+            }),
+        );
         let request = test_chat_request(&model.id);
         let options = GatewayRequestOptions {
             failover_overrides: GatewayFailoverPolicyConfig {
@@ -21654,7 +21781,7 @@ mod tests {
     #[test]
     fn capacity_refusal_only_penalizes_sustained_false_free_capacity() {
         let model = test_routed_model(1);
-        let state = GatewayState::from_models(vec![model.clone()]);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
         let route = model.mayhem.route_candidates.first().expect("route");
         let capacity = GatewaySessionError::clean_refusal_with_code(
             "provider rejected session session-a with CAPACITY: full",
@@ -21675,7 +21802,7 @@ mod tests {
             json!("mayhem-gateway-capacity-mismatch-v1")
         );
 
-        let honest_state = GatewayState::from_models(vec![model.clone()]);
+        let honest_state = test_gateway_state_from_models(vec![model.clone()]);
         let mut saturated = heartbeat_for_route(&model, route, now_millis_u64());
         saturated.sat = 1.0;
         saturated.slots.active = 1;
@@ -21713,11 +21840,11 @@ mod tests {
     async fn route_retry_clean_refusal_reroutes_without_failure_penalty() {
         let model = test_routed_model(2);
         let providers = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            CleanRefusalThenSuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(CleanRefusalThenSuccessBackend {
                 providers: providers.clone(),
-            },
-        ));
+            }),
+        );
         let request = test_chat_request(&model.id);
 
         let run =
@@ -21754,11 +21881,11 @@ mod tests {
     async fn route_retry_records_conversation_affinity_after_success() {
         let model = test_routed_model(4);
         let providers = Arc::new(Mutex::new(Vec::new()));
-        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            SuccessBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
                 providers: providers.clone(),
-            },
-        ));
+            }),
+        );
         let mut request = test_chat_request(&model.id);
         request
             .metadata

@@ -140,6 +140,7 @@ pub struct ProviderTableEntry {
 pub struct RequestRequirements {
     pub current_rules_ver: u64,
     pub min_reputation: f64,
+    pub requires_transport_peer: bool,
     pub requires_tools: bool,
     pub requires_json: bool,
     pub requires_vision: bool,
@@ -169,6 +170,7 @@ pub enum IneligibilityReason {
     Reputation,
     HeartbeatMissing,
     HeartbeatStale,
+    TransportPeerMissing,
     Draining,
     Saturated,
     Capabilities,
@@ -280,6 +282,7 @@ impl Default for RequestRequirements {
         Self {
             current_rules_ver: 1,
             min_reputation: 0.0,
+            requires_transport_peer: false,
             requires_tools: false,
             requires_json: false,
             requires_vision: false,
@@ -612,6 +615,9 @@ pub fn evaluate_eligibility(
         .ok_or(IneligibilityReason::HeartbeatMissing)?;
     if heartbeat_age >= request.heartbeat_ttl_millis {
         return Err(IneligibilityReason::HeartbeatStale);
+    }
+    if request.requires_transport_peer && heartbeat.transport_peer.is_none() {
+        return Err(IneligibilityReason::TransportPeerMissing);
     }
     if !heartbeat.accepting_new {
         return Err(IneligibilityReason::Draining);
@@ -1302,6 +1308,25 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    #[test]
+    fn transport_peer_is_required_when_direct_routing_requests_it() {
+        let now = 1_000_000;
+        let entry = entry_for(1, now, 0.2, 100);
+        let request = RequestRequirements {
+            requires_transport_peer: true,
+            ..eligible_request(now + 1)
+        };
+
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::TransportPeerMissing)
+        );
+
+        let mut with_transport = entry;
+        with_transport.heartbeat.as_mut().unwrap().transport_peer = Some("77".repeat(32));
+        assert!(evaluate_eligibility(&with_transport, &request).is_ok());
     }
 
     #[test]

@@ -128,7 +128,7 @@ mayhem opencode                   # wire (or repair) opencode for the local gate
 opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
 ```
 
-When the catalog changes, `mayhem opencode` re-syncs the model list. Now your own agent loops run against models served from the network — including your own hardware.
+`mayhem opencode` issues or reuses a dedicated local gateway bearer and repairs it if it was revoked or expired; the gateway token store keeps only its hash. When the catalog changes, the same command re-syncs the model list. Now your own agent loops run against models served from the network — including your own hardware.
 
 ---
 

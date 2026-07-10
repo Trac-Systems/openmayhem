@@ -193,7 +193,10 @@ struct MainnetManifestFiat {
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+const OPENCODE_GATEWAY_TOKEN_NAME: &str = "opencode-local";
 const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
+const PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
@@ -5746,11 +5749,14 @@ async fn setup(args: SetupArgs) -> Result<()> {
         &args.peer_store_name,
         &rpc_url,
     )?;
+    let opencode_config_path = default_opencode_config_path()?;
+    let opencode_api_key = ensure_opencode_gateway_token(&home, &opencode_config_path)?;
     let opencode_config = merge_mayhem_opencode_config(
-        &default_opencode_config_path()?,
+        &opencode_config_path,
         DEFAULT_GATEWAY_URL,
         None,
         false,
+        &opencode_api_key,
     )?;
 
     let consent = if args.no_consent {
@@ -24499,8 +24505,9 @@ async fn opencode(args: OpencodeArgs) -> Result<()> {
 
     let timeout = Duration::from_secs(args.timeout_seconds);
     let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let opencode_api_key = ensure_opencode_gateway_token(&home, &opencode_config_path)?;
     let models = if args.sync_models || args.run_smoke {
-        Some(fetch_gateway_models(&client, &gateway_root).await?)
+        Some(fetch_gateway_models_with_token(&client, &gateway_root, &opencode_api_key).await?)
     } else {
         None
     };
@@ -24509,6 +24516,7 @@ async fn opencode(args: OpencodeArgs) -> Result<()> {
         &gateway_root,
         models.as_deref(),
         args.sync_models,
+        &opencode_api_key,
     )?;
     let run = if args.run_smoke {
         let selected = select_test_model(
@@ -24650,6 +24658,11 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
         || existing_opencode_models == 0
         || !opencode_model_exists(&opencode_config_path, &selected_model.id).unwrap_or(false);
 
+    let opencode_api_key = if args.skip_opencode {
+        None
+    } else {
+        Some(ensure_opencode_gateway_token(&home, &opencode_config_path)?)
+    };
     let opencode_merge = if args.skip_opencode {
         json!({ "skipped": true })
     } else {
@@ -24662,6 +24675,7 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
                 None
             },
             should_write_models,
+            opencode_api_key.as_deref().expect("opencode token ensured"),
         )?)?
     };
 
@@ -25500,7 +25514,20 @@ async fn fetch_gateway_json_with_token(
 }
 
 async fn fetch_gateway_models(client: &reqwest::Client, gateway_root: &str) -> Result<Vec<Value>> {
-    let models = fetch_gateway_models_allow_empty(client, gateway_root).await?;
+    let models = fetch_gateway_models_allow_empty_with_token(client, gateway_root, None).await?;
+    if models.is_empty() {
+        bail!("gateway /v1/models returned no models");
+    }
+    Ok(models)
+}
+
+async fn fetch_gateway_models_with_token(
+    client: &reqwest::Client,
+    gateway_root: &str,
+    token: &str,
+) -> Result<Vec<Value>> {
+    let models =
+        fetch_gateway_models_allow_empty_with_token(client, gateway_root, Some(token)).await?;
     if models.is_empty() {
         bail!("gateway /v1/models returned no models");
     }
@@ -25511,7 +25538,16 @@ async fn fetch_gateway_models_allow_empty(
     client: &reqwest::Client,
     gateway_root: &str,
 ) -> Result<Vec<Value>> {
-    let value = fetch_gateway_json(client, &format!("{gateway_root}/v1/models")).await?;
+    fetch_gateway_models_allow_empty_with_token(client, gateway_root, None).await
+}
+
+async fn fetch_gateway_models_allow_empty_with_token(
+    client: &reqwest::Client,
+    gateway_root: &str,
+    token: Option<&str>,
+) -> Result<Vec<Value>> {
+    let value =
+        fetch_gateway_json_with_token(client, &format!("{gateway_root}/v1/models"), token).await?;
     let models = value
         .get("data")
         .and_then(Value::as_array)
@@ -26203,11 +26239,70 @@ fn default_opencode_config_path() -> Result<PathBuf> {
         .join("opencode.json"))
 }
 
+fn ensure_opencode_gateway_token(home: &Path, opencode_config_path: &Path) -> Result<String> {
+    let store_path = gateway_token_store_path(home);
+    let mut store = read_gateway_token_store(&store_path)?;
+    let now = unix_epoch_seconds()?;
+    let configured = read_opencode_gateway_token(opencode_config_path)?;
+    if let Some(token) = configured.as_deref() {
+        let token_hash = gateway_token_hash(token);
+        if store
+            .tokens
+            .iter()
+            .any(|record| record.token_hash == token_hash && record.is_active(now))
+        {
+            return Ok(token.to_owned());
+        }
+    }
+
+    let token = new_gateway_token()?;
+    let token_hash = gateway_token_hash(&token);
+    let token_id = gateway_token_id(&token_hash);
+    store
+        .tokens
+        .retain(|record| record.name != OPENCODE_GATEWAY_TOKEN_NAME);
+    store.tokens.push(GatewayTokenRecord {
+        name: OPENCODE_GATEWAY_TOKEN_NAME.to_owned(),
+        token_hash,
+        token_id,
+        created_at: now,
+        expires_at: None,
+        budget_au: None,
+        budget_period: None,
+        spent_total_au: 0,
+        spent_period_au: 0,
+        period_started_at: Some(now),
+        max_rate_per_minute: None,
+        models: Vec::new(),
+        last_used_at: None,
+        revoked_at: None,
+    });
+    write_gateway_token_store(&store_path, &store)?;
+    Ok(token)
+}
+
+fn read_opencode_gateway_token(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let root: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(root
+        .pointer("/provider/mayhem/options/apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned))
+}
+
 fn merge_mayhem_opencode_config(
     path: &Path,
     gateway_root: &str,
     models: Option<&[Value]>,
     write_models: bool,
+    api_key: &str,
 ) -> Result<OpencodeMergeReport> {
     let created = !path.exists();
     let mut root = if created {
@@ -26257,7 +26352,7 @@ fn merge_mayhem_opencode_config(
             "name": OPENCODE_PROVIDER_NAME,
             "options": {
                 "baseURL": gateway_v1_url(gateway_root),
-                "apiKey": "mayhem-local",
+                "apiKey": api_key,
                 "timeout": false,
                 "headerTimeout": false,
                 "chunkTimeout": 300000
@@ -39289,36 +39384,47 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
 async fn run_provider_session_heartbeat_connection(
     ctx: &ProviderSessionHeartbeatTask,
 ) -> Result<()> {
-    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-        &ctx.sc_bridge_url,
-        ctx.sc_bridge_token.clone(),
-    )?)
+    let mut bridge = timeout(
+        PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+        ScBridgeClient::connect(ScBridgeConfig::new(
+            &ctx.sc_bridge_url,
+            ctx.sc_bridge_token.clone(),
+        )?),
+    )
     .await
-    .context("connecting to SC-Bridge for live provider session heartbeats")?;
-    let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
+    .context("timed out connecting to SC-Bridge for live provider session heartbeats")??;
+    let transport_peer = timeout(
+        PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+        sc_bridge_transport_peer(&mut bridge),
+    )
+    .await
+    .context("timed out reading the live provider transport peer")??;
     let mut seq = 0_u64;
     let mut join_rooms = true;
     let mut heartbeat_cache_updated_at = None::<Instant>;
     while !ctx.load.is_stopped() {
-        let sent = send_provider_heartbeat_round(
-            &mut bridge,
-            &ctx.keypair_path,
-            &ctx.password,
-            &ctx.provider_pubkey,
-            &ctx.selected,
-            &ctx.rooms,
-            &ctx.attestation,
-            &ctx.attestation_head,
-            &ctx.identity_anchor,
-            ctx.min_ask_au,
-            ctx.max_sessions,
-            Some(transport_peer.as_str()),
-            seq,
-            join_rooms,
-            ctx.load.snapshot(ctx.max_sessions),
+        let sent = timeout(
+            PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+            send_provider_heartbeat_round(
+                &mut bridge,
+                &ctx.keypair_path,
+                &ctx.password,
+                &ctx.provider_pubkey,
+                &ctx.selected,
+                &ctx.rooms,
+                &ctx.attestation,
+                &ctx.attestation_head,
+                &ctx.identity_anchor,
+                ctx.min_ask_au,
+                ctx.max_sessions,
+                Some(transport_peer.as_str()),
+                seq,
+                join_rooms,
+                ctx.load.snapshot(ctx.max_sessions),
+            ),
         )
         .await
-        .with_context(|| format!("sending live provider heartbeat seq {seq}"))?;
+        .with_context(|| format!("timed out sending live provider heartbeat seq {seq}"))??;
         let refresh_cache = heartbeat_cache_updated_at
             .map(|updated_at| {
                 updated_at.elapsed()
@@ -39375,6 +39481,7 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_token.as_deref(),
     )?;
     let mut bridge = connect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token).await?;
+    let mut bridge_liveness_checked_at = Instant::now();
 
     provider_log(
         ctx.args,
@@ -39433,6 +39540,32 @@ async fn serve_provider_sessions(
     );
     let serve_result: Result<()> = async {
         loop {
+            if bridge_liveness_checked_at.elapsed() >= PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL {
+                match timeout(PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT, bridge.ping()).await {
+                    Ok(Ok(_)) => {
+                        bridge_liveness_checked_at = Instant::now();
+                    }
+                    liveness => {
+                        let dropped = clear_provider_sessions_after_bridge_drop(
+                            &mut sessions,
+                            &mut pending_requests,
+                            &mut pending_payloads,
+                            &heartbeat_load,
+                        );
+                        provider_session_debug(format!(
+                            "SC-Bridge provider session liveness failed ({liveness:?}); dropped {dropped} active session(s), reconnecting"
+                        ));
+                        bridge = reconnect_provider_session_bridge(
+                            &sc_bridge_url,
+                            &sc_bridge_token,
+                            deadline,
+                        )
+                        .await?;
+                        bridge_liveness_checked_at = Instant::now();
+                        continue;
+                    }
+                }
+            }
             expire_provider_pending_sessions(
                 &mut bridge,
                 &mut sessions,
@@ -39626,6 +39759,7 @@ async fn serve_provider_sessions(
                     bridge =
                         reconnect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token, deadline)
                             .await?;
+                    bridge_liveness_checked_at = Instant::now();
                 }
                 Err(err) => return Err(err).context("reading provider session frame"),
             }
@@ -54705,6 +54839,28 @@ State initialization...
     }
 
     #[test]
+    fn opencode_uses_a_reusable_real_gateway_token() {
+        let home = temp_work_dir("mayhem-opencode-token").unwrap();
+        let config_path = home.join("opencode").join("opencode.json");
+        let first = ensure_opencode_gateway_token(&home, &config_path).unwrap();
+        assert!(first.starts_with("sk-mayhem-"));
+        merge_mayhem_opencode_config(&config_path, "http://127.0.0.1:11435", None, false, &first)
+            .unwrap();
+        let second = ensure_opencode_gateway_token(&home, &config_path).unwrap();
+        assert_eq!(second, first);
+
+        let store_path = gateway_token_store_path(&home);
+        let raw_store = fs::read_to_string(&store_path).unwrap();
+        assert!(!raw_store.contains(&first));
+        let store = read_gateway_token_store(&store_path).unwrap();
+        assert_eq!(store.tokens.len(), 1);
+        assert_eq!(store.tokens[0].name, OPENCODE_GATEWAY_TOKEN_NAME);
+        assert_eq!(store.tokens[0].token_hash, gateway_token_hash(&first));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn use_gateway_accepts_wallet_and_rail_flags() {
         let cli = Cli::try_parse_from([
             "mayhem",
@@ -57102,9 +57258,14 @@ State initialization...
             }
         })];
 
-        let report =
-            merge_mayhem_opencode_config(&path, "http://127.0.0.1:11435", Some(&models), true)
-                .unwrap();
+        let report = merge_mayhem_opencode_config(
+            &path,
+            "http://127.0.0.1:11435",
+            Some(&models),
+            true,
+            "sk-mayhem-test",
+        )
+        .unwrap();
         let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
         assert!(!report.created);
@@ -57115,6 +57276,10 @@ State initialization...
         assert_eq!(
             merged["provider"]["mayhem"]["options"]["baseURL"],
             "http://127.0.0.1:11435/v1"
+        );
+        assert_eq!(
+            merged["provider"]["mayhem"]["options"]["apiKey"],
+            "sk-mayhem-test"
         );
         assert_eq!(
             merged["provider"]["mayhem"]["models"]["mayhem/test-model"]["tool_call"],
@@ -57147,9 +57312,14 @@ State initialization...
             }
         })];
 
-        let report =
-            merge_mayhem_opencode_config(&path, "http://127.0.0.1:11435", Some(&models), true)
-                .unwrap();
+        let report = merge_mayhem_opencode_config(
+            &path,
+            "http://127.0.0.1:11435",
+            Some(&models),
+            true,
+            "sk-mayhem-test",
+        )
+        .unwrap();
         let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
         assert!(report.created);

@@ -1125,7 +1125,7 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
 
 #[tokio::test]
 async fn embeddings_endpoint_uses_routed_engine_and_records_receipt() {
-    let state = GatewayState::from_models(vec![routed_embedding_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_embedding_test_model()])
         .with_session_backend(Arc::new(EmbeddingDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1165,7 +1165,7 @@ async fn embeddings_endpoint_uses_routed_engine_and_records_receipt() {
 #[tokio::test]
 async fn automatic_embedding_cosine_probe_records_pass() {
     let expected = vec![0.12, 0.34, 0.56];
-    let state = GatewayState::from_models(vec![routed_embedding_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_embedding_test_model()])
         .with_canary_registry(test_embedding_canary_registry(expected))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(EmbeddingDirectSessionBackend));
@@ -1193,7 +1193,7 @@ async fn automatic_embedding_cosine_probe_records_pass() {
 
 #[tokio::test]
 async fn embeddings_endpoint_supports_base64_float32_encoding() {
-    let state = GatewayState::from_models(vec![routed_embedding_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_embedding_test_model()])
         .with_session_backend(Arc::new(EmbeddingDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1244,7 +1244,7 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
 
 #[tokio::test]
 async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
-    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
         .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1295,7 +1295,7 @@ async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
     let substituted_image = png_average_hash_fixture(true);
     let expected_hash = image_average_hash_hex(&expected_image).expect("expected image hash");
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
         .with_canary_registry(test_image_canary_registry(expected_hash.clone()))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(ImageCanarySessionBackend {
@@ -1355,7 +1355,7 @@ async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
 
 #[tokio::test]
 async fn image_generation_scales_step_usage_by_resolution_and_validates_size() {
-    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
         .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1401,7 +1401,7 @@ async fn image_generation_endpoint_real_sd_cli_records_receipt_when_enabled() {
     if std::env::var_os("MAYHEM_RUN_STABLE_DIFFUSION_CPP_REAL").is_none() {
         return;
     }
-    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
         .with_session_backend(Arc::new(RealSdCliImageGenerationBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1441,7 +1441,7 @@ async fn image_generation_endpoint_real_sd_cli_records_receipt_when_enabled() {
 
 #[tokio::test]
 async fn audio_speech_endpoint_uses_routed_engine_and_records_receipt() {
-    let state = GatewayState::from_models(vec![routed_audio_speech_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_audio_speech_test_model()])
         .with_session_backend(Arc::new(AudioSpeechDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1480,7 +1480,7 @@ async fn audio_speech_endpoint_uses_routed_engine_and_records_receipt() {
 #[tokio::test]
 async fn automatic_audio_fingerprint_probe_records_pass() {
     let expected_audio = tiny_wav_bytes(16_000);
-    let state = GatewayState::from_models(vec![routed_audio_speech_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_audio_speech_test_model()])
         .with_canary_registry(test_audio_fingerprint_canary_registry(audio_fingerprint(
             &expected_audio,
         )))
@@ -1511,7 +1511,7 @@ async fn automatic_audio_fingerprint_probe_records_pass() {
 
 #[tokio::test]
 async fn audio_transcription_endpoint_uses_routed_engine_and_records_receipt() {
-    let state = GatewayState::from_models(vec![routed_audio_transcription_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_audio_transcription_test_model()])
         .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
     let app = openai_router(state.clone());
     let boundary = "mayhem-test-boundary";
@@ -1575,7 +1575,7 @@ async fn audio_transcription_endpoint_uses_routed_engine_and_records_receipt() {
 
 #[tokio::test]
 async fn automatic_transcript_match_probe_records_pass() {
-    let state = GatewayState::from_models(vec![routed_audio_transcription_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_audio_transcription_test_model()])
         .with_canary_registry(test_transcript_canary_registry(tiny_wav_bytes(16_000)))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
@@ -1680,7 +1680,7 @@ async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
 
 #[tokio::test]
 async fn chat_completion_can_use_direct_session_backend() {
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_session_backend(Arc::new(TestDirectSessionBackend));
     let app = openai_router(state.clone());
     let model = "mayhem/routed-test".to_owned();
@@ -1719,7 +1719,7 @@ async fn chat_completion_can_use_direct_session_backend() {
 
 #[tokio::test]
 async fn chat_completion_rejects_image_content_for_non_vision_model() {
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_session_backend(Arc::new(TestDirectSessionBackend));
     let app = openai_router(state);
     let request = json!({
@@ -1748,7 +1748,7 @@ async fn chat_completion_preserves_image_content_for_vision_direct_session() {
     let mut model = routed_test_model();
     model.mayhem.caps.vision = true;
     let seen_content = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         VisionInspectBackend {
             seen_content: seen_content.clone(),
         },
@@ -1777,7 +1777,7 @@ async fn chat_completion_preserves_image_content_for_vision_direct_session() {
 
 #[tokio::test]
 async fn chat_completion_exposes_direct_session_artifact_summary() {
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_session_backend(Arc::new(ArtifactDirectSessionBackend));
     let app = openai_router(state);
     let image = b"\x89PNG mayhem artifact".to_vec();
@@ -1800,7 +1800,7 @@ async fn chat_completion_exposes_direct_session_artifact_summary() {
 #[tokio::test]
 async fn automatic_canary_probe_catches_substituted_served_enclave() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_canary_registry(test_canary_registry(&[1, 2, 3]))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(CanarySubstitutionBackend {
@@ -1866,7 +1866,7 @@ async fn automatic_canary_probe_catches_substituted_served_enclave() {
 
 #[tokio::test]
 async fn automatic_canary_probe_accepts_exact_catalog_token_prefix() {
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_canary_registry(test_canary_registry(&[9, 9, 9]))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(CanarySubstitutionBackend {
@@ -1896,7 +1896,7 @@ async fn automatic_context_needle_probe_marks_long_context_truncation_slashable(
     let mut model = routed_test_model();
     model.mayhem.caps.ctx = 131_072;
     model.mayhem.route_candidates[0].caps = json!({ "ctx": 131_072 });
-    let state = GatewayState::from_models(vec![model])
+    let state = test_gateway_state_from_models(vec![model])
         .with_receipt_balance_au(10_000_000)
         .with_canary_registry(test_canary_registry(&[9, 9, 9]))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
@@ -1950,7 +1950,7 @@ async fn automatic_context_needle_probe_marks_long_context_truncation_slashable(
 async fn contract_model_with_noncanonical_route_is_unavailable() {
     let mut model = routed_test_model();
     model.mayhem.route_candidates[0].room_id = "provider-local-only".to_owned();
-    let state = GatewayState::from_models(vec![model])
+    let state = test_gateway_state_from_models(vec![model])
         .with_session_backend(Arc::new(TestDirectSessionBackend));
     let app = openai_router(state);
     let request = json!({
@@ -1972,7 +1972,7 @@ async fn chat_completion_retries_retryable_direct_session_route_before_metering(
     let first_provider = "55".repeat(32);
     let second_provider = "66".repeat(32);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         first_provider.clone(),
         second_provider.clone(),
     ])])
@@ -2009,7 +2009,7 @@ async fn chat_completion_caps_retryable_direct_session_routes_at_four_without_re
         .map(|idx| format!("{idx:02x}").repeat(32))
         .collect::<Vec<_>>();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&providers)])
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&providers)])
         .with_session_backend(Arc::new(AlwaysRetryDirectSessionBackend {
             calls: calls.clone(),
         }));
@@ -2042,7 +2042,7 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     let probes = Arc::new(Mutex::new(Vec::new()));
     let probe_delays_ms =
         BTreeMap::from([(first_provider.clone(), 25), (second_provider.clone(), 1)]);
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         first_provider.clone(),
         second_provider.clone(),
     ])])
@@ -2096,7 +2096,7 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
 #[tokio::test]
 async fn invalid_x_mayhem_hedge_header_is_rejected_before_session_start() {
     let invocations = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         "55".repeat(32),
         "66".repeat(32),
     ])])
@@ -2133,7 +2133,7 @@ async fn invalid_x_mayhem_hedge_header_is_rejected_before_session_start() {
 #[tokio::test]
 async fn invalid_x_mayhem_min_att_tier_header_is_rejected_before_session_start() {
     let invocations = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         "55".repeat(32),
         "66".repeat(32),
     ])])
@@ -2177,7 +2177,7 @@ async fn chat_completion_min_att_tier_filters_route_candidates() {
     model.mayhem.route_candidates[1].att_tier = 3;
     model.mayhem.attestation_tiers = BTreeMap::from([("T1".to_owned(), 1), ("T3".to_owned(), 1)]);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         RetryThenDirectSessionBackend {
             retry_provider: "ff".repeat(32),
             calls: calls.clone(),
@@ -2247,7 +2247,7 @@ async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() 
         history: Vec::new(),
     });
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         RetryThenDirectSessionBackend {
             retry_provider: "ff".repeat(32),
             calls: calls.clone(),
@@ -2304,7 +2304,7 @@ async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() 
 #[tokio::test]
 async fn chat_completion_min_att_tier_rejects_when_no_route_meets_pin() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         "55".repeat(32),
         "66".repeat(32),
     ])])
@@ -2347,7 +2347,7 @@ async fn chat_completion_quant_filters_route_candidates() {
     model.mayhem.route_candidates[1].quant = "fp16".to_owned();
     model.mayhem.quant_buckets = BTreeMap::from([("int4".to_owned(), 1), ("fp16".to_owned(), 1)]);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         RetryThenDirectSessionBackend {
             retry_provider: "ff".repeat(32),
             calls: calls.clone(),
@@ -2384,7 +2384,7 @@ async fn chat_completion_quant_filters_route_candidates() {
 #[tokio::test]
 async fn chat_completion_quant_rejects_when_no_route_matches() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(&[
         "55".repeat(32),
         "66".repeat(32),
     ])])
@@ -3283,7 +3283,7 @@ fn test_provider_heartbeat(
         perf: HeartbeatPerf { tok_s, ttft_ms },
         price_ver: candidate.price_ver,
         min_ask_au: 0,
-        transport_peer: None,
+        transport_peer: Some(candidate.provider.clone()),
         identity_anchor: None,
         accepting_new: true,
         caps: HeartbeatCaps {
@@ -3318,6 +3318,18 @@ fn test_provider_heartbeat(
         nonce: format!("network-dashboard-test-{}", candidate.room_id),
         sig: "11".repeat(64),
     }
+}
+
+fn test_gateway_state_from_models(models: Vec<GatewayModel>) -> GatewayState {
+    let heartbeats = models
+        .iter()
+        .flat_map(|model| {
+            model.mayhem.route_candidates.iter().map(|candidate| {
+                test_provider_heartbeat(model, candidate, 0.0, 0, 8, Some(50.0), 150)
+            })
+        })
+        .collect::<Vec<_>>();
+    GatewayState::from_models(models).with_provider_heartbeats(heartbeats)
 }
 
 fn routed_test_identity() -> CatalogEnclaveIdentity {
@@ -3373,7 +3385,7 @@ async fn chat_completion_streams_normalized_tool_call_delta() {
         tool_call_strategy: "openai_tool_calls".to_owned(),
         ..ShapeAdapterInfo::default()
     };
-    let state = GatewayState::from_models(vec![model])
+    let state = test_gateway_state_from_models(vec![model])
         .with_session_backend(Arc::new(ToolCallDirectSessionBackend));
     let request = json!({
         "model": "mayhem/routed-test",
@@ -3447,7 +3459,7 @@ async fn streaming_dev_chat_is_unbillable_and_stores_no_receipt() {
 
 #[tokio::test]
 async fn refused_receipt_cosign_pauses_session_without_storing_receipt() {
-    let state = GatewayState::from_models(vec![routed_test_model()])
+    let state = test_gateway_state_from_models(vec![routed_test_model()])
         .with_session_backend(Arc::new(TestDirectSessionBackend))
         .with_receipt_cosign_enabled(false);
     let app = openai_router(state.clone());
@@ -3668,7 +3680,7 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
 
 #[tokio::test]
 async fn dashboard_price_chart_follow_list_persists_in_cookie() {
-    let state = GatewayState::from_models(vec![routed_test_model()]);
+    let state = test_gateway_state_from_models(vec![routed_test_model()]);
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
@@ -3778,7 +3790,7 @@ async fn user_dashboard_shows_model_worker_route_counts() {
     let providers = vec!["41".repeat(32), "42".repeat(32), "43".repeat(32)];
     let mut model = routed_test_model_with_providers(&providers);
     model.mayhem.providers_online = 2;
-    let state = GatewayState::from_models(vec![model]);
+    let state = test_gateway_state_from_models(vec![model]);
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
@@ -3802,7 +3814,7 @@ async fn user_dashboard_shows_model_worker_route_counts() {
 #[tokio::test]
 async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     let provider = "55".repeat(32);
-    let state = GatewayState::from_models(vec![routed_test_model_with_providers(
+    let state = test_gateway_state_from_models(vec![routed_test_model_with_providers(
         std::slice::from_ref(&provider),
     )])
     .with_provider_earnings(vec![json!({
@@ -3882,7 +3894,7 @@ async fn provider_dashboard_counts_multi_enclave_workers_and_markets() {
     embedding.mayhem.caps.output_modalities = vec!["embedding".to_owned()];
     embedding.mayhem.route_candidates[0].enclave_id = "22".repeat(32);
     embedding.mayhem.route_candidates[0].room_id = "bb".repeat(16);
-    let state = GatewayState::from_models(vec![chat, embedding]);
+    let state = test_gateway_state_from_models(vec![chat, embedding]);
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
@@ -3934,7 +3946,7 @@ async fn provider_dashboard_renders_local_load_progress() {
         .expect("progress json"),
     )
     .expect("write progress");
-    let state = GatewayState::from_models(vec![model])
+    let state = test_gateway_state_from_models(vec![model])
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -3987,7 +3999,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
         .expect("progress json"),
     )
     .expect("write progress");
-    let state = GatewayState::from_models(Vec::new())
+    let state = test_gateway_state_from_models(Vec::new())
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -4042,7 +4054,7 @@ async fn provider_dashboard_hides_stale_progress_before_route_exists() {
         .expect("progress json"),
     )
     .expect("write progress");
-    let state = GatewayState::from_models(Vec::new())
+    let state = test_gateway_state_from_models(Vec::new())
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
