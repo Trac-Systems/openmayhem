@@ -519,6 +519,24 @@ async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
 
     *capture.events.lock().await = vec![
         json!({
+            "id": "evt_backfill_unrelated_payment",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "created": 1_800,
+            "data": {
+                "object": {
+                    "id": "pi_unrelated",
+                    "object": "payment_intent",
+                    "latest_charge": "ch_unrelated",
+                    "amount_received": 500,
+                    "currency": "usd",
+                    "metadata": {
+                        "other_product": "shared-stripe-account"
+                    }
+                }
+            }
+        }),
+        json!({
             "id": "evt_backfill_dispute",
             "object": "event",
             "type": "charge.dispute.created",
@@ -531,6 +549,24 @@ async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
                     "currency": "usd",
                     "charge": "ch_backfill",
                     "payment_intent": "pi_backfill",
+                    "reason": "fraudulent",
+                    "status": "needs_response"
+                }
+            }
+        }),
+        json!({
+            "id": "evt_backfill_unrelated_dispute",
+            "object": "event",
+            "type": "charge.dispute.created",
+            "created": 5_400,
+            "data": {
+                "object": {
+                    "id": "dp_unrelated",
+                    "object": "dispute",
+                    "amount": 500,
+                    "currency": "usd",
+                    "charge": "ch_unrelated",
+                    "payment_intent": "pi_unrelated",
                     "reason": "fraudulent",
                     "status": "needs_response"
                 }
@@ -564,11 +600,12 @@ async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
         .await
         .expect("first backfill");
     assert_eq!(first.ok, true);
-    assert_eq!(first.fetched, 2);
-    assert_eq!(first.processed, 2);
+    assert_eq!(first.fetched, 4);
+    assert_eq!(first.processed, 4);
     assert_eq!(first.duplicates, 0);
     assert_eq!(first.credited, 1);
     assert_eq!(first.clawed_back, 1);
+    assert_eq!(first.ignored, 2);
     assert_eq!(first.previous_last_created, 0);
     assert_eq!(first.last_created, 7_200);
 
@@ -606,6 +643,49 @@ async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
     assert_eq!(event_log.lines().count(), 2);
     assert!(event_log.contains("evt_backfill_deposit"));
     assert!(event_log.contains("evt_backfill_dispute"));
+}
+
+#[tokio::test]
+async fn stripe_backfill_rejects_partial_mayhem_metadata_without_advancing_cursor() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let event_store_path = temp.path().join("stripe-events.jsonl");
+    let cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(stripe_base, event_store_path),
+        OracleKeypair::from_seed_hex(&"57".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+
+    *capture.events.lock().await = vec![json!({
+        "id": "evt_backfill_partial_mayhem",
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": "pi_partial_mayhem",
+                "object": "payment_intent",
+                "latest_charge": "ch_partial_mayhem",
+                "amount_received": 100,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_au": "1000000000000000000"
+                }
+            }
+        }
+    })];
+
+    let error = run_stripe_backfill_once(&state)
+        .await
+        .expect_err("partial Mayhem metadata must fail closed");
+    assert!(error
+        .to_string()
+        .contains("PaymentIntent missing mayhem_who metadata"));
+    assert!(!cursor_path.exists());
+    assert!(poster.deposits.lock().await.is_empty());
 }
 
 #[tokio::test]

@@ -1458,20 +1458,10 @@ async fn handle_stripe_event(
 ) -> Result<StripeWebhookResponse> {
     let handles_event = HANDLED_STRIPE_EVENT_TYPES.contains(&event.event_type.as_str());
     if !handles_event {
-        return Ok(StripeWebhookResponse {
-            ok: true,
-            event_id: event.id,
-            event_type: event.event_type,
-            duplicate: false,
-            credited: false,
-            clawed_back: false,
-            ignored: true,
-            payment_intent: None,
-            charge: None,
-            dispute: None,
-            au: None,
-            contract: None,
-        });
+        return Ok(ignored_stripe_event_response(event));
+    }
+    if stripe_event_is_unrelated(state, &event).await? {
+        return Ok(ignored_stripe_event_response(event));
     }
 
     {
@@ -1523,6 +1513,56 @@ async fn handle_stripe_event(
             store.fail(&event.id);
             Err(err)
         }
+    }
+}
+
+fn ignored_stripe_event_response(event: StripeEventEnvelope) -> StripeWebhookResponse {
+    StripeWebhookResponse {
+        ok: true,
+        event_id: event.id,
+        event_type: event.event_type,
+        duplicate: false,
+        credited: false,
+        clawed_back: false,
+        ignored: true,
+        payment_intent: None,
+        charge: None,
+        dispute: None,
+        au: None,
+        contract: None,
+    }
+}
+
+async fn stripe_event_is_unrelated(
+    state: &PaygateState,
+    event: &StripeEventEnvelope,
+) -> Result<bool> {
+    match event.event_type.as_str() {
+        "payment_intent.succeeded" => {
+            let metadata = match event.data.object.get("metadata") {
+                None | Some(Value::Null) => return Ok(true),
+                Some(Value::Object(metadata)) => metadata,
+                Some(_) => {
+                    return Err(PaygateError::Stripe(
+                        "PaymentIntent metadata must be an object".to_owned(),
+                    ))
+                }
+            };
+            Ok(!metadata.keys().any(|key| key.starts_with("mayhem_")))
+        }
+        "charge.dispute.created" => {
+            let object = &event.data.object;
+            let charge = stripe_expandable_id(object.get("charge"));
+            let payment_intent = stripe_expandable_id(object.get("payment_intent"));
+            if charge.is_none() && payment_intent.is_none() {
+                return Ok(false);
+            }
+            let store = state.stripe_events.lock().await;
+            Ok(store
+                .lookup_deposit(payment_intent.as_deref(), charge.as_deref())
+                .is_none())
+        }
+        _ => Ok(false),
     }
 }
 
