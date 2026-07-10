@@ -179,6 +179,45 @@ pub struct BackendVerdict {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelMemoryFit {
+    pub requested_context: u64,
+    pub max_safe_context: u64,
+    pub required_bytes: u64,
+    pub usable_bytes: u64,
+    pub status: VerdictStatus,
+}
+
+pub fn model_memory_fit(
+    usable_bytes: u64,
+    weights_bytes: u64,
+    runtime_overhead_bytes: u64,
+    kv_bytes_per_token: u64,
+    requested_context: u64,
+) -> ModelMemoryFit {
+    let fixed_bytes = weights_bytes.saturating_add(runtime_overhead_bytes);
+    let max_safe_context = if fixed_bytes > usable_bytes {
+        0
+    } else if kv_bytes_per_token == 0 {
+        u64::MAX
+    } else {
+        usable_bytes.saturating_sub(fixed_bytes) / kv_bytes_per_token
+    };
+    let required_bytes =
+        fixed_bytes.saturating_add(requested_context.saturating_mul(kv_bytes_per_token));
+    ModelMemoryFit {
+        requested_context,
+        max_safe_context,
+        required_bytes,
+        usable_bytes,
+        status: if required_bytes <= usable_bytes {
+            VerdictStatus::FullOffload
+        } else {
+            VerdictStatus::Insufficient
+        },
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictStatus {
     FullOffload,
@@ -1957,6 +1996,25 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-hwprobe");
+    }
+
+    #[test]
+    fn model_memory_fit_exposes_the_context_ceiling() {
+        let fit = model_memory_fit(10_000, 4_000, 1_000, 10, 500);
+        assert_eq!(fit.max_safe_context, 500);
+        assert_eq!(fit.required_bytes, 10_000);
+        assert_eq!(fit.status, VerdictStatus::FullOffload);
+
+        let too_large = model_memory_fit(10_000, 4_000, 1_000, 10, 501);
+        assert_eq!(too_large.max_safe_context, 500);
+        assert_eq!(too_large.status, VerdictStatus::Insufficient);
+    }
+
+    #[test]
+    fn model_memory_fit_refuses_when_fixed_memory_does_not_fit() {
+        let fit = model_memory_fit(4_999, 4_000, 1_000, 10, 0);
+        assert_eq!(fit.max_safe_context, 0);
+        assert_eq!(fit.status, VerdictStatus::Insufficient);
     }
 
     #[test]

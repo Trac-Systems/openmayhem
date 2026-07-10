@@ -64,8 +64,8 @@ use mayhem_gateway::{
     INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
-    human_report, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo, GpuVendor,
-    HardwareReport, ProbeOptions, VerdictStatus,
+    human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
+    GpuVendor, HardwareReport, ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
     catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
@@ -126,6 +126,8 @@ const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
 const PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES: u32 = 3;
 const PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS: u64 = 30;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
+const VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT: u32 = 90;
+const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
@@ -20107,7 +20109,7 @@ async fn up(args: UpArgs) -> Result<()> {
 }
 
 fn up_provider_workers_deferred(plan: &UpPlan) -> bool {
-    plan.provider_auto_fit || plan.provider_workers.len() > 1
+    plan.provider
 }
 
 fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
@@ -20136,7 +20138,14 @@ async fn up_auto_fit_add_provider_workers(
 ) -> Result<Value> {
     let serve_plan_args = up_provider_serve_plan_args(plan);
     let computed = compute_provider_serve_plan(&plan.home, &serve_plan_args).await?;
-    let added = up_add_selected_provider_workers(plan, client, &computed.selection, None).await?;
+    let added = up_add_selected_provider_workers(
+        plan,
+        client,
+        &computed.selection,
+        &computed.hardware,
+        None,
+    )
+    .await?;
     Ok(json!({
         "ok": true,
         "selected_count": computed.selection.candidates.len(),
@@ -20158,26 +20167,32 @@ async fn up_explicit_add_provider_workers(
     let requested = plan
         .provider_workers
         .iter()
-        .map(|worker| {
-            worker.enclave.clone().with_context(|| {
-                format!(
-                    "deferred provider worker {} is missing an explicit admin enclave/model id",
-                    worker.name
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|worker| worker.enclave.clone())
+        .collect::<Vec<_>>();
     let serve_plan_args = up_provider_serve_plan_args(plan);
-    let computed =
-        compute_provider_explicit_serve_plan(&plan.home, &serve_plan_args, &requested).await?;
+    let computed = if requested.iter().all(Option::is_some) {
+        let requested = requested.into_iter().flatten().collect::<Vec<_>>();
+        compute_provider_explicit_serve_plan(&plan.home, &serve_plan_args, &requested).await?
+    } else {
+        ensure!(
+            requested.len() == 1 && requested[0].is_none(),
+            "automatic provider selection is valid only for one unnamed provider worker"
+        );
+        compute_provider_default_serve_plan(&plan.home, &serve_plan_args).await?
+    };
     let worker_names = plan
         .provider_workers
         .iter()
         .map(|worker| worker.name.clone())
         .collect::<Vec<_>>();
-    let added =
-        up_add_selected_provider_workers(plan, client, &computed.selection, Some(&worker_names))
-            .await?;
+    let added = up_add_selected_provider_workers(
+        plan,
+        client,
+        &computed.selection,
+        &computed.hardware,
+        Some(&worker_names),
+    )
+    .await?;
     Ok(json!({
         "ok": true,
         "selected_count": computed.selection.candidates.len(),
@@ -20196,10 +20211,24 @@ async fn up_add_selected_provider_workers(
     plan: &UpPlan,
     client: &reqwest::Client,
     selection: &ProviderAutoFitSelection,
+    hardware: &HardwareReport,
     worker_names: Option<&[String]>,
 ) -> Result<Vec<Value>> {
+    let runtimes = selection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            provider_backend_runtime_preflight(&plan.home, candidate, hardware).with_context(|| {
+                format!(
+                    "provider runtime preflight failed for {} ({})",
+                    candidate.model.model_id, candidate.artifact.engine
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut added = Vec::new();
     for (index, candidate) in selection.candidates.iter().enumerate() {
+        let runtime = &runtimes[index];
         let worker_name = worker_names.and_then(|names| names.get(index)).cloned();
         let child = provider_serve_child_config(
             &plan.home,
@@ -20226,6 +20255,7 @@ async fn up_add_selected_provider_workers(
             "model_id": &candidate.enclave.model_id,
             "backend": &candidate.enclave.backend,
             "required_bytes": candidate.feasibility.estimated_required_bytes,
+            "runtime": runtime,
             "response": response,
         }));
     }
@@ -29412,6 +29442,7 @@ struct ProviderAutoFitSelection {
 struct ProviderCtxFeasibility {
     requested_ctx: u64,
     served_ctx: u64,
+    max_safe_context: u64,
     catalog_ctx_max: u64,
     fallback_applied: bool,
     message: Option<String>,
@@ -29428,6 +29459,7 @@ impl ProviderCtxFeasibility {
         Self {
             requested_ctx: served_ctx,
             served_ctx,
+            max_safe_context: catalog_ctx_max,
             catalog_ctx_max,
             fallback_applied: false,
             message: None,
@@ -30413,6 +30445,7 @@ struct ProviderBackendRuntime {
     python: Option<PathBuf>,
     python_source: Option<String>,
     requirements_sha256: Option<String>,
+    cuda_home: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     external_binary: Option<PathBuf>,
     stable_diffusion_backend: Option<String>,
@@ -30582,6 +30615,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 struct ProviderServePlanComputed {
     rpc_url: String,
     provider_catalog: ProviderResolvedCatalog,
+    hardware: HardwareReport,
     candidates: Vec<ProviderCandidate>,
     selection: ProviderAutoFitSelection,
     gpu_layers: Option<u32>,
@@ -30591,12 +30625,13 @@ async fn compute_provider_serve_plan(
     home: &Path,
     args: &ProviderServePlanArgs,
 ) -> Result<ProviderServePlanComputed> {
-    let (rpc_url, provider_catalog, candidates, gpu_layers) =
+    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
         compute_provider_serve_candidates(home, args).await?;
     let selection = select_provider_auto_fit_set(&candidates)?;
     Ok(ProviderServePlanComputed {
         rpc_url,
         provider_catalog,
+        hardware,
         candidates,
         selection,
         gpu_layers,
@@ -30611,12 +30646,32 @@ async fn compute_provider_explicit_serve_plan(
     if requested.is_empty() {
         bail!("explicit provider serve plan requires at least one admin enclave/model id");
     }
-    let (rpc_url, provider_catalog, candidates, gpu_layers) =
+    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
         compute_provider_serve_candidates(home, args).await?;
     let selection = select_provider_explicit_set(&candidates, requested)?;
     Ok(ProviderServePlanComputed {
         rpc_url,
         provider_catalog,
+        hardware,
+        candidates,
+        selection,
+        gpu_layers,
+    })
+}
+
+async fn compute_provider_default_serve_plan(
+    home: &Path,
+    args: &ProviderServePlanArgs,
+) -> Result<ProviderServePlanComputed> {
+    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
+        compute_provider_serve_candidates(home, args).await?;
+    let selected = select_provider_candidate(&candidates, None)?;
+    let requested = vec![selected.enclave.enclave_id.clone()];
+    let selection = select_provider_explicit_set(&candidates, &requested)?;
+    Ok(ProviderServePlanComputed {
+        rpc_url,
+        provider_catalog,
+        hardware,
         candidates,
         selection,
         gpu_layers,
@@ -30629,6 +30684,7 @@ async fn compute_provider_serve_candidates(
 ) -> Result<(
     String,
     ProviderResolvedCatalog,
+    HardwareReport,
     Vec<ProviderCandidate>,
     Option<u32>,
 )> {
@@ -30672,7 +30728,13 @@ async fn compute_provider_serve_candidates(
         &hardware,
         &start_args,
     )?;
-    Ok((rpc_url, provider_catalog, candidates, start_args.gpu_layers))
+    Ok((
+        rpc_url,
+        provider_catalog,
+        hardware,
+        candidates,
+        start_args.gpu_layers,
+    ))
 }
 
 async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
@@ -30791,6 +30853,13 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         .candidates
         .first()
         .context("explicit provider add did not select a candidate")?;
+    let runtime = provider_backend_runtime_preflight(&home, selected, &computed.hardware)
+        .with_context(|| {
+            format!(
+                "provider runtime preflight failed for {} ({})",
+                selected.model.model_id, selected.artifact.engine
+            )
+        })?;
     let child = provider_serve_child_config(
         &home,
         &selected.enclave.enclave_id,
@@ -30809,6 +30878,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         "enclave": selected.enclave.enclave_id,
         "model_id": selected.enclave.model_id,
         "served_ctx": selected.served_ctx,
+        "runtime": runtime,
         "child": child,
         "response": response,
     });
@@ -31061,6 +31131,29 @@ fn provider_backend_runtime_preflight(
             runtime.python = Some(python.python);
             runtime.python_source = Some(python.source);
             runtime.requirements_sha256 = Some(python.requirements_sha256);
+            if matches!(backend, "vllm" | "trt-llm") {
+                let python = runtime
+                    .python
+                    .as_deref()
+                    .context("managed CUDA backend preflight lost its Python path")?;
+                runtime.cuda_home = Some(
+                    if backend == "vllm" {
+                        mayhem_engine::discover_vllm_cuda_home(python)
+                    } else {
+                        mayhem_engine::discover_trt_llm_cuda_home(python)
+                    }
+                    .with_context(|| {
+                        format!(
+                            "{backend} requires a CUDA toolkit containing bin/nvcc; install CUDA or set {} before `mayhem up --provider`",
+                            if backend == "vllm" {
+                                "MAYHEM_VLLM_CUDA_HOME"
+                            } else {
+                                "MAYHEM_TRTLLM_CUDA_HOME"
+                            }
+                        )
+                    })?,
+                );
+            }
             runtime.cache_dir = Some(cache_dir);
         }
         "stable-diffusion.cpp" => {
@@ -35441,18 +35534,25 @@ fn provider_memory_pool(
 fn provider_memory_budget(
     hardware: &HardwareReport,
     verdict: &BackendVerdict,
-    backend: &str,
+    enclave: &LedgerEnclave,
     args: &ProviderStartArgs,
     claimed_bytes: u64,
 ) -> Result<ProviderMemoryBudget> {
-    let pool = provider_memory_pool(hardware, verdict, backend);
+    let pool = provider_memory_pool(hardware, verdict, &enclave.backend);
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, _reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
-    let budget_bytes = pool
+    let mut budget_bytes = pool
         .available_bytes
         .saturating_sub(reserve_bytes)
         .saturating_sub(claimed_bytes);
+    if enclave.backend == "vllm" {
+        let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&enclave.caps)?;
+        let admin_max_bytes =
+            u64::try_from((u128::from(pool.total_bytes) * u128::from(admin_max_pct)) / 100)
+                .unwrap_or(u64::MAX);
+        budget_bytes = budget_bytes.min(admin_max_bytes);
+    }
     Ok(ProviderMemoryBudget {
         pool: pool.pool,
         source: pool.source,
@@ -35504,6 +35604,23 @@ fn provider_memory_estimate(
         kv_bytes,
         overhead_bytes,
     })
+}
+
+fn provider_model_memory_fit(
+    enclave: &LedgerEnclave,
+    model: &catalog::CatalogModel,
+    artifact: &catalog::CatalogArtifact,
+    usable_bytes: u64,
+    requested_ctx: u64,
+) -> Result<mayhem_hwprobe::ModelMemoryFit> {
+    let overhead_bytes = (artifact.weights_bytes / 5).max(512 * 1024 * 1024);
+    Ok(model_memory_fit(
+        usable_bytes,
+        artifact.weights_bytes,
+        overhead_bytes,
+        provider_kv_bytes_per_token(enclave, model, artifact)?,
+        requested_ctx,
+    ))
 }
 
 fn provider_bucket_aligned_ctx_candidates(
@@ -35618,8 +35735,15 @@ fn provider_context_feasibility(
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
         let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
         let memory_budget =
-            provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
+            provider_memory_budget(hardware, verdict, enclave, args, claimed_bytes)?;
         let estimate = provider_memory_estimate(enclave, model, artifact, requested_ctx)?;
+        let fit = provider_model_memory_fit(
+            enclave,
+            model,
+            artifact,
+            memory_budget.budget_bytes,
+            requested_ctx,
+        )?;
         if estimate.required_bytes > memory_budget.budget_bytes {
             bail!(
                 "model {} needs {} (weights {}, working memory {}, overhead {}) but only {} is usable after reserve {} and local claims {} in {}",
@@ -35637,6 +35761,7 @@ fn provider_context_feasibility(
         return Ok(ProviderCtxFeasibility {
             requested_ctx,
             served_ctx: requested_ctx,
+            max_safe_context: fit.max_safe_context,
             catalog_ctx_max: model.caps.ctx_max,
             fallback_applied: false,
             message: None,
@@ -35648,8 +35773,14 @@ fn provider_context_feasibility(
         });
     }
     let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
-    let memory_budget =
-        provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
+    let memory_budget = provider_memory_budget(hardware, verdict, enclave, args, claimed_bytes)?;
+    let requested_fit = provider_model_memory_fit(
+        enclave,
+        model,
+        artifact,
+        memory_budget.budget_bytes,
+        requested_ctx,
+    )?;
     let candidates = if args.ctx.is_some() {
         vec![requested_ctx]
     } else {
@@ -35680,6 +35811,7 @@ fn provider_context_feasibility(
             return Ok(ProviderCtxFeasibility {
                 requested_ctx,
                 served_ctx,
+                max_safe_context: requested_fit.max_safe_context,
                 catalog_ctx_max: model.caps.ctx_max,
                 fallback_applied,
                 message,
@@ -35748,18 +35880,70 @@ fn enclave_max_num_tokens(caps: &Value) -> Result<Option<u32>> {
     }
 }
 
-fn enclave_vllm_gpu_memory_utilization_pct(caps: &Value) -> Result<Option<u32>> {
+fn enclave_vllm_gpu_memory_utilization_pct(caps: &Value) -> Result<u32> {
     match caps.get("vllm_gpu_memory_utilization_pct") {
-        None => Ok(None),
+        None => Ok(VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT),
         Some(_) => {
-            let pct = enclave_cap_u32(caps, "vllm_gpu_memory_utilization_pct", 90)?;
+            let pct = enclave_cap_u32(
+                caps,
+                "vllm_gpu_memory_utilization_pct",
+                VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT,
+            )?;
             ensure!(
-                pct <= 100,
-                "enclave caps vllm_gpu_memory_utilization_pct must be between 1 and 100"
+                pct <= VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT,
+                "enclave caps vllm_gpu_memory_utilization_pct must be between 1 and {}",
+                VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT
             );
-            Ok(Some(pct))
+            Ok(pct)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct VllmMemoryUtilizationPlan {
+    target_pct: u32,
+    floor_pct: u32,
+    max_pct: u32,
+}
+
+fn provider_vllm_memory_utilization(
+    selected: &ProviderCandidate,
+) -> Result<VllmMemoryUtilizationPlan> {
+    let total_bytes = selected.feasibility.memory_budget.total_bytes;
+    ensure!(
+        total_bytes > 0,
+        "cannot derive vLLM memory utilization without a non-zero accelerator memory total"
+    );
+    let required_bytes = selected.feasibility.estimated_required_bytes;
+    let budget_bytes = selected.feasibility.memory_budget.budget_bytes;
+    ensure!(
+        required_bytes <= budget_bytes,
+        "vLLM model and context require {}, exceeding the usable memory budget {}",
+        human_bytes(required_bytes),
+        human_bytes(budget_bytes)
+    );
+
+    let floor_pct =
+        u32::try_from((u128::from(required_bytes) * 100).div_ceil(u128::from(total_bytes)))
+            .unwrap_or(u32::MAX)
+            .max(1);
+    let budget_pct = u32::try_from((u128::from(budget_bytes) * 100) / u128::from(total_bytes))
+        .unwrap_or(u32::MAX);
+    let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&selected.enclave.caps)?;
+    let max_pct = budget_pct
+        .min(admin_max_pct)
+        .min(VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT);
+    ensure!(
+        floor_pct <= max_pct,
+        "vLLM model and context require at least {floor_pct}% GPU memory, but the F13/admin ceiling is {max_pct}%"
+    );
+    Ok(VllmMemoryUtilizationPlan {
+        target_pct: floor_pct
+            .saturating_add(VLLM_MEMORY_UTILIZATION_CUSHION_PCT)
+            .min(max_pct),
+        floor_pct,
+        max_pct,
+    })
 }
 
 fn tensor_parallel_capable_gpu_count(hardware: &HardwareReport) -> usize {
@@ -40556,8 +40740,9 @@ fn provider_engine_load_config(
             .get("vllm_dtype")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        config.vllm_gpu_memory_utilization_pct =
-            enclave_vllm_gpu_memory_utilization_pct(&selected.enclave.caps)?;
+        let utilization = provider_vllm_memory_utilization(selected)?;
+        config.vllm_gpu_memory_utilization_pct = Some(utilization.target_pct);
+        config.vllm_gpu_memory_utilization_floor_pct = Some(utilization.floor_pct);
     }
     Ok(config)
 }
@@ -47948,6 +48133,7 @@ mod tests {
             feasibility: ProviderCtxFeasibility {
                 requested_ctx: 8192,
                 served_ctx: 8192,
+                max_safe_context: 8192,
                 catalog_ctx_max: 8192,
                 fallback_applied: false,
                 message: None,
@@ -48251,6 +48437,8 @@ mod tests {
 
         assert_eq!(selected.feasibility.requested_ctx, 65_536);
         assert_eq!(selected.served_ctx, 8_192);
+        assert!(selected.feasibility.max_safe_context >= selected.served_ctx);
+        assert!(selected.feasibility.max_safe_context < selected.feasibility.requested_ctx);
         assert!(selected.feasibility.fallback_applied);
         assert!(selected
             .feasibility
@@ -48304,6 +48492,31 @@ mod tests {
                 .unwrap();
 
         assert_eq!(estimate.kv_bytes, 262_144 * 20_480);
+    }
+
+    #[test]
+    fn vllm_utilization_is_derived_between_fit_floor_and_admin_ceiling() {
+        let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 60, 85, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 80 });
+        selected.feasibility.memory_budget.total_bytes = 100 * GIB_BYTES;
+        selected.feasibility.memory_budget.budget_bytes = 85 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 60 * GIB_BYTES;
+
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected).unwrap(),
+            VllmMemoryUtilizationPlan {
+                target_pct: 65,
+                floor_pct: 60,
+                max_pct: 80,
+            }
+        );
+
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 55 });
+        assert!(provider_vllm_memory_utilization(&selected).is_err());
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 91 });
+        assert!(provider_vllm_memory_utilization(&selected).is_err());
     }
 
     #[test]
@@ -51492,7 +51705,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.batch_size, 3);
         assert_eq!(config.ubatch_size, 4096);
         assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
-        assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(45));
+        assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(7));
+        assert_eq!(config.vllm_gpu_memory_utilization_floor_pct, Some(2));
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {
@@ -56605,7 +56819,7 @@ State initialization...
     }
 
     #[test]
-    fn up_supervisor_config_contains_peer_gateway_and_provider_children() {
+    fn up_supervisor_config_defers_single_provider_until_live_preflight() {
         let home = std::env::temp_dir().join(format!(
             "mayhem-up-config-test-{}-{}",
             std::process::id(),
@@ -56629,7 +56843,8 @@ State initialization...
             .iter()
             .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["peer", "gateway", "provider"]);
+        assert_eq!(names, vec!["peer", "gateway"]);
+        assert!(up_provider_workers_deferred(&plan));
         assert!(text.contains("--sc-bridge-token"));
         assert!(text.contains("test-token"));
         assert!(text.contains("--subnet-channel"));
@@ -56646,11 +56861,9 @@ State initialization...
         assert!(text.contains("--bind"));
         assert!(text.contains("0.0.0.0:11435"));
         assert!(text.contains("--require-auth"));
-        assert!(text.contains("--serve-sessions"));
-        assert!(text.contains("--enclave"));
-        assert!(text.contains("qwen/qwen2.5-1.5b-instruct@small"));
-        assert!(text.contains("--gpu-layers"));
-        assert!(text.contains("\"0\""));
+        assert!(!text.contains("--serve-sessions"));
+        assert!(!text.contains("--enclave"));
+        assert!(!text.contains("--gpu-layers"));
         assert!(!text.contains("--peer-dht-bootstrap"));
     }
 

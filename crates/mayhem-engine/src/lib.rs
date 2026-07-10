@@ -1351,6 +1351,16 @@ pub use trt_llm_backend::TrtLlmBackend;
 #[cfg(feature = "vllm")]
 pub use vllm_backend::VllmBackend;
 
+#[cfg(feature = "vllm")]
+pub fn discover_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
+    vllm_backend::resolve_vllm_cuda_home(python)
+}
+
+#[cfg(feature = "trt-llm")]
+pub fn discover_trt_llm_cuda_home(python: &Path) -> Option<PathBuf> {
+    trt_llm_backend::resolve_trt_cuda_home(python)
+}
+
 pub use piper_backend::PiperBackend;
 pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
 pub use whisper_cpp_backend::WhisperCppBackend;
@@ -3232,6 +3242,7 @@ mod vllm_backend {
     const CUDA_HOME_ENV: &str = "MAYHEM_VLLM_CUDA_HOME";
     const BUILD_JOBS_ENV: &str = "MAYHEM_VLLM_BUILD_JOBS";
     const DEFAULT_BUILD_JOBS: usize = 2;
+    const MEMORY_UTILIZATION_BACKOFF_STEP_PCT: u32 = 5;
     const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub struct VllmBackend {
@@ -3322,6 +3333,10 @@ mod vllm_backend {
                 ));
             }
         }
+
+        fn reset_worker(&self) {
+            self.worker.borrow_mut().take();
+        }
     }
 
     impl EngineBackend for VllmBackend {
@@ -3342,8 +3357,30 @@ mod vllm_backend {
             self.cache_root.replace(config.backend_cache_dir.clone());
 
             let model_path = vllm_model_path(&config.artifact.path)?;
-            let info: WorkerLoadInfo =
-                self.call("load", vllm_load_payload(&config, &model_path))?;
+            let attempts = vllm_memory_utilization_attempts(
+                config.vllm_gpu_memory_utilization_pct,
+                config.vllm_gpu_memory_utilization_floor_pct,
+            )?;
+            let mut info = None;
+            for (index, utilization_pct) in attempts.iter().enumerate() {
+                let mut attempt_config = config.clone();
+                attempt_config.vllm_gpu_memory_utilization_pct = *utilization_pct;
+                match self
+                    .call::<WorkerLoadInfo>("load", vllm_load_payload(&attempt_config, &model_path))
+                {
+                    Ok(loaded) => {
+                        info = Some(loaded);
+                        break;
+                    }
+                    Err(err) if is_vllm_oom_error(&err) && index + 1 < attempts.len() => {
+                        self.reset_worker();
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            let info = info.ok_or_else(|| {
+                EngineError::Vllm("vLLM load exhausted memory-utilization attempts".to_owned())
+            })?;
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
                 artifact: config.artifact,
@@ -3662,7 +3699,7 @@ mod vllm_backend {
         value.parse::<usize>().ok().filter(|jobs| *jobs > 0)
     }
 
-    fn resolve_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
+    pub(super) fn resolve_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
         if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
             return cuda_home_with_nvcc(explicit);
         }
@@ -3790,6 +3827,56 @@ mod vllm_backend {
         payload
     }
 
+    fn vllm_memory_utilization_attempts(
+        target_pct: Option<u32>,
+        floor_pct: Option<u32>,
+    ) -> Result<Vec<Option<u32>>> {
+        let Some(target_pct) = target_pct else {
+            if floor_pct.is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "vLLM memory-utilization floor requires a target".to_owned(),
+                ));
+            }
+            return Ok(vec![None]);
+        };
+        if target_pct == 0 || target_pct > 100 {
+            return Err(EngineError::InvalidConfig(
+                "vLLM memory-utilization target must be between 1 and 100".to_owned(),
+            ));
+        }
+        let floor_pct = floor_pct.unwrap_or(target_pct);
+        if floor_pct == 0 || floor_pct > target_pct {
+            return Err(EngineError::InvalidConfig(
+                "vLLM memory-utilization floor must be between 1 and the target".to_owned(),
+            ));
+        }
+
+        let mut attempts = vec![Some(target_pct)];
+        let mut current = target_pct;
+        while current > floor_pct {
+            current = current
+                .saturating_sub(MEMORY_UTILIZATION_BACKOFF_STEP_PCT)
+                .max(floor_pct);
+            attempts.push(Some(current));
+        }
+        Ok(attempts)
+    }
+
+    fn is_vllm_oom_error(error: &EngineError) -> bool {
+        let EngineError::Vllm(message) = error else {
+            return false;
+        };
+        let message = message.to_ascii_lowercase();
+        [
+            "out of memory",
+            "cuda oom",
+            "cannot allocate memory",
+            "not enough memory",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+    }
+
     fn default_message_kind() -> String {
         "response".to_owned()
     }
@@ -3850,6 +3937,77 @@ mod vllm_backend {
         }
 
         #[test]
+        fn vllm_memory_utilization_backoff_stops_at_the_fit_floor() {
+            assert_eq!(
+                vllm_memory_utilization_attempts(Some(42), Some(31)).unwrap(),
+                vec![Some(42), Some(37), Some(32), Some(31)]
+            );
+            assert_eq!(
+                vllm_memory_utilization_attempts(Some(42), Some(42)).unwrap(),
+                vec![Some(42)]
+            );
+            assert!(vllm_memory_utilization_attempts(Some(30), Some(31)).is_err());
+        }
+
+        #[test]
+        fn vllm_load_retries_oom_without_changing_context() {
+            let root =
+                env::temp_dir().join(format!("mayhem-vllm-oom-retry-{}", std::process::id()));
+            let python = root.join("bin/python");
+            let state = root.join("first-attempt-seen");
+            let requests = root.join("requests.jsonl");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read request
+printf '%s\n' "$request" >> "__REQUESTS__"
+if [ ! -f "__STATE__" ]; then
+  : > "__STATE__"
+  printf '%s\n' '{"id":1,"type":"response","ok":false,"error":"CUDA out of memory"}'
+else
+  printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+fi
+"#
+            .replace("__STATE__", &state.display().to_string())
+            .replace("__REQUESTS__", &requests.display().to_string());
+            fs::write(&python, script).unwrap();
+            fs::write(&model, safetensors_fixture()).unwrap();
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&python, perms).unwrap();
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_gpu_memory_utilization_pct = Some(42);
+            config.vllm_gpu_memory_utilization_floor_pct = Some(32);
+            config.backend_cache_dir = Some(root.join("cache"));
+            let loaded = backend.load(config).expect("second load attempt succeeds");
+            assert_eq!(loaded.ctx_size, 4096);
+
+            let requests = fs::read_to_string(&requests).unwrap();
+            let payloads = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(payloads.len(), 2);
+            assert_eq!(payloads[0]["payload"]["ctx_size"], json!(4096));
+            assert_eq!(payloads[1]["payload"]["ctx_size"], json!(4096));
+            assert_eq!(
+                payloads[0]["payload"]["gpu_memory_utilization"],
+                json!(0.42)
+            );
+            assert_eq!(
+                payloads[1]["payload"]["gpu_memory_utilization"],
+                json!(0.37)
+            );
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
         fn bundled_cuda_home_follows_the_vllm_python_environment() {
             let root =
                 env::temp_dir().join(format!("mayhem-vllm-cuda-home-{}", std::process::id()));
@@ -3883,6 +4041,15 @@ mod vllm_backend {
             assert_eq!(parse_build_jobs("3"), Some(3));
             assert_eq!(parse_build_jobs("0"), None);
             assert_eq!(parse_build_jobs("many"), None);
+        }
+
+        fn safetensors_fixture() -> Vec<u8> {
+            let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[0_u8; 4]);
+            bytes
         }
     }
 }
@@ -4316,7 +4483,7 @@ mod trt_llm_backend {
         Ok(())
     }
 
-    fn resolve_trt_cuda_home(python: &Path) -> Option<PathBuf> {
+    pub(super) fn resolve_trt_cuda_home(python: &Path) -> Option<PathBuf> {
         if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
             return trt_cuda_home_with_nvcc(explicit);
         }
