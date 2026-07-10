@@ -253,6 +253,7 @@ class MayhemFeature extends Feature {
         },
       },
     });
+    await this.peer.base.update();
     const featureResult =
       (await this._waitForResult(resultKey, 10_000, previousResult)) ?? previousResult;
     if (!featureResult) {

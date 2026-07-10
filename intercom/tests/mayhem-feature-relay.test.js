@@ -20,6 +20,7 @@ const viewFor = (state) => ({
 const peerFor = (publicKey, { writable = false } = {}) => {
   const state = new Map([['admin', adminKey]]);
   const appended = [];
+  const updates = [];
   const peer = {
     wallet: {
       publicKey,
@@ -41,10 +42,13 @@ const peerFor = (publicKey, { writable = false } = {}) => {
           result: { ok: true, op: op.value.dispatch.value.op },
         });
       },
+      async update() {
+        updates.push(true);
+      },
     },
     protocol: { instance: { features: {} } },
   };
-  return { peer, state, appended };
+  return { peer, state, appended, updates };
 };
 
 const connect = (leftPeer, leftFeature, rightPeer, rightFeature) => {
@@ -106,6 +110,7 @@ test('read-only participant relays a signed feature to the sole admin writer', a
   assert.equal(result.ok, true);
   assert.equal(result.relayed, true);
   assert.equal(writer.appended.length, 1);
+  assert.equal(writer.updates.length, 1);
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
