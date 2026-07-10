@@ -1253,30 +1253,30 @@ class MayhemContract extends Contract {
       user_sig: normalized.user_sig,
       ethereum_sig: normalized.ethereum_sig,
       status: 'active',
-      bound_at: this.tx,
+      bound_at: key,
     };
     await this.put(bindingKey, record);
     await this.put(addressKey, record);
 
-    if (!this.isZeroAu(source.au)) {
-      await this.put(this.balanceKey(normalized.user, 'tap'), {
-        ...target,
-        user: normalized.user,
-        rail: 'tap',
-        au: nextAu,
-        updated_epoch: Math.max(target.updated_epoch, source.updated_epoch),
-        updated_at: this.tx,
+    await this.put(this.balanceKey(normalized.user, 'tap'), {
+      ...target,
+      user: normalized.user,
+      rail: 'tap',
+      au: nextAu,
+      updated_epoch: Math.max(target.updated_epoch, source.updated_epoch),
+      updated_at: key,
+      ...(!this.isZeroAu(source.au) ? {
         last_tap_account_claim_au: source.au,
         last_tap_account_claim_from: normalized.ethereum_address,
-      });
-      await this.put(this.balanceKey(normalized.ethereum_address, 'tap'), {
-        ...source,
-        au: ZERO_AU,
-        updated_at: this.tx,
-        tap_account_bound_to: normalized.user,
-        tap_account_binding_key: bindingKey,
-      });
-    }
+      } : {}),
+    });
+    await this.put(this.balanceKey(normalized.ethereum_address, 'tap'), {
+      ...source,
+      au: ZERO_AU,
+      updated_at: key,
+      tap_account_bound_to: normalized.user,
+      tap_account_binding_key: bindingKey,
+    });
 
     return {
       ok: true,

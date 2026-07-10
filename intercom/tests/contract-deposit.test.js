@@ -322,6 +322,7 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
     updated_epoch: 1,
     updated_at: makeTxKey(4),
   });
+  const bindingFeatureKey = await ctx.contract.tapAccountBindingFeatureKey(valid);
   const bound = await executeTapAccountBindingFeature(
     ctx.contract,
     ctx.storage,
@@ -333,8 +334,20 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
   assert.equal(bound.balance_au, '86018945004270602');
   assert.equal((await ctx.storage.get(`bal/${ethereum.address}/tap`)).value.au, '0');
   assert.equal(
+    (await ctx.storage.get(`bal/${ethereum.address}/tap`)).value.updated_at,
+    bindingFeatureKey
+  );
+  assert.equal(
     (await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au,
     '86018945004270602'
+  );
+  assert.equal(
+    (await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.updated_at,
+    bindingFeatureKey
+  );
+  assert.equal(
+    (await ctx.storage.get(`tap/account/1/${pool}/${ctx.user.publicKey}`)).value.bound_at,
+    bindingFeatureKey
   );
 
   const repeated = await executeTapAccountBindingFeature(
