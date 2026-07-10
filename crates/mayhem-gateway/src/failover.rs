@@ -14,6 +14,17 @@ pub const DEFAULT_TTFT_BASE_TIMEOUT_MILLIS: u64 = 30_000;
 pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP: u64 = 1_000;
 pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP_MILLIS: u64 = 1_000;
 
+pub fn effective_context_floor(
+    user_min_ctx: Option<u32>,
+    conversation_tokens: u64,
+    output_headroom_tokens: u64,
+) -> u32 {
+    let conversation_floor = conversation_tokens
+        .saturating_add(output_headroom_tokens)
+        .min(u64::from(u32::MAX)) as u32;
+    user_min_ctx.unwrap_or(0).max(conversation_floor)
+}
+
 pub fn default_ttft_timeout_millis(prompt_tokens: u64) -> u64 {
     let prompt_steps = prompt_tokens.saturating_add(DEFAULT_TTFT_PROMPT_TOKEN_STEP - 1)
         / DEFAULT_TTFT_PROMPT_TOKEN_STEP;
@@ -513,6 +524,16 @@ mod tests {
 
     fn price() -> SessionPriceAu {
         SessionPriceAu::text(10, 100)
+    }
+
+    #[test]
+    fn effective_context_floor_uses_conversation_usage_and_user_minimum() {
+        assert_eq!(effective_context_floor(None, 7_500, 500), 8_000);
+        assert_eq!(effective_context_floor(Some(16_384), 7_500, 500), 16_384);
+        assert_eq!(
+            effective_context_floor(Some(16_384), u64::MAX, u64::MAX),
+            u32::MAX
+        );
     }
 
     #[test]

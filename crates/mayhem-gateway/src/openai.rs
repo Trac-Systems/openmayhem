@@ -25,10 +25,11 @@ use crate::{
         DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
-        default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
-        FailoverPolicy, RedispatchMode, SessionFailoverState, SessionPriceAu,
-        DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
-        DEFAULT_STALL_TIMEOUT_MILLIS, DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
+        default_ttft_timeout_millis, effective_context_floor, midstream_stalled_after,
+        x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode, SessionFailoverState,
+        SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+        DEFAULT_PROVIDER_COOLOFF_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
+        DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
     },
     pricing::{
         normalize_rate_map, priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
@@ -109,6 +110,7 @@ const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
 pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
+const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
 const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
@@ -10640,6 +10642,53 @@ fn no_eligible_route_error(
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
 }
 
+fn chat_context_capacity_error(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    options: &GatewayRequestOptions,
+) -> Option<ApiError> {
+    let required_ctx = effective_context_floor(
+        options.min_ctx,
+        rough_tokens(&chat_prompt_text(request)),
+        chat_output_headroom_tokens(request),
+    );
+    let now_millis = now_millis_u64();
+    state.refresh_provider_table_routes(model);
+    let candidates = eligible_route_candidates(
+        model,
+        options.min_att_tier,
+        options.quant.as_deref(),
+        &state.receipt_config.rail,
+    )
+    .into_iter()
+    .filter(|candidate| !state.route_provider_in_cooloff(candidate, now_millis))
+    .collect::<Vec<_>>();
+    (!candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| state.served_ctx_for_route(model, Some(candidate)) < required_ctx))
+    .then(|| {
+        ApiError::service_unavailable(
+            format!(
+                "this conversation needs at least {required_ctx} context tokens; no provider with that context is currently serving {}",
+                model.id
+            ),
+            Some("model"),
+        )
+    })
+}
+
+fn no_eligible_chat_route_error(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    options: &GatewayRequestOptions,
+) -> ApiError {
+    chat_context_capacity_error(state, model, request, options)
+        .unwrap_or_else(|| no_eligible_route_error(state, model, options))
+}
+
 struct RouteWaitOutcome<'a> {
     routes: Vec<&'a GatewayRouteCandidate>,
     waited: bool,
@@ -10923,10 +10972,15 @@ async fn prepare_live_direct_chat_session(
     })
     .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
+        if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
+            return Err(error);
+        }
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(&state, &model, &options));
+        return Err(no_eligible_chat_route_error(
+            &state, &model, &request, &options,
+        ));
     }
     if eligible_route_refs.is_empty() {
         return Err(ApiError::service_unavailable(
@@ -11371,6 +11425,12 @@ async fn recover_live_direct_chat_after_partial(
 
     let partials = vec![partial];
     let retry_request = redispatch_request_with_partials(&session.request, &partials);
+    let mut retry_options = session.options.clone();
+    retry_options.min_ctx = Some(exact_conversation_floor_after_partials(
+        &retry_request,
+        &partials,
+        session.options.min_ctx,
+    ));
     let GatewaySessionRun {
         result,
         invocation,
@@ -11380,7 +11440,7 @@ async fn recover_live_direct_chat_after_partial(
         &session.state,
         &session.model,
         &retry_request,
-        session.options.clone(),
+        retry_options,
     )
     .await
     .map_err(|err| GatewaySessionError::new(err.message))?;
@@ -12144,10 +12204,15 @@ async fn run_chat_with_route_retry(
     })
     .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
+            return Err(error);
+        }
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(state, model, &options));
+        return Err(no_eligible_chat_route_error(
+            state, model, request, &options,
+        ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -12156,6 +12221,7 @@ async fn run_chat_with_route_retry(
         ));
     }
     let mut attempt_request = request.clone();
+    let mut attempt_options = options.clone();
     let hedge_probe =
         run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, &options)
             .await?;
@@ -12168,20 +12234,51 @@ async fn run_chat_with_route_retry(
             eligible_routes.insert(0, winner_route);
         }
     }
-    let attempt_count = if eligible_routes.is_empty() {
+    let max_attempts = if eligible_routes.is_empty() {
         1
     } else {
-        eligible_routes
+        model
+            .mayhem
+            .route_candidates
             .len()
             .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
     };
     let mut last_retryable_error = None;
     let mut partials = Vec::new();
+    let mut attempted_route_keys = BTreeSet::new();
+    let mut attempts_made = 0usize;
 
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
-        let invocation =
-            state.prepare_chat_invocation_for_route(model, &attempt_request, route, &options)?;
+    for attempt_index in 0..max_attempts {
+        if attempt_index > 0 {
+            eligible_routes = ordered_route_candidates_for_request_with_options(
+                state,
+                model,
+                &attempt_request,
+                &attempt_options,
+            );
+        }
+        eligible_routes.retain(|candidate| !attempted_route_keys.contains(&route_key(candidate)));
+        let route = eligible_routes.first().copied();
+        if route.is_none() {
+            if let Some(error) =
+                chat_context_capacity_error(state, model, &attempt_request, &attempt_options)
+            {
+                return Err(error);
+            }
+            if !model.mayhem.route_candidates.is_empty() || !state.dev_session_shim {
+                break;
+            }
+        }
+        if let Some(route) = route {
+            attempted_route_keys.insert(route_key(route));
+        }
+        attempts_made = attempts_made.saturating_add(1);
+        let invocation = state.prepare_chat_invocation_for_route(
+            model,
+            &attempt_request,
+            route,
+            &attempt_options,
+        )?;
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match state
@@ -12241,6 +12338,11 @@ async fn run_chat_with_route_retry(
                 if let Some(partial) = err.partial {
                     partials.push(*partial);
                     attempt_request = redispatch_request_with_partials(request, &partials);
+                    attempt_options.min_ctx = Some(exact_conversation_floor_after_partials(
+                        &attempt_request,
+                        &partials,
+                        options.min_ctx,
+                    ));
                 }
                 last_retryable_error = Some(err.message);
             }
@@ -12253,7 +12355,7 @@ async fn run_chat_with_route_retry(
 
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {attempts_made} route attempt(s) failed before spend; last error: {}",
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -13027,10 +13129,7 @@ fn request_requirements_for_chat(
 ) -> RequestRequirements {
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
-    let output_tokens = u64::from(request.max_tokens.unwrap_or(1024).max(1));
-    let prompt_min_ctx = input_tokens
-        .saturating_add(output_tokens)
-        .min(u64::from(u32::MAX)) as u32;
+    let output_tokens = chat_output_headroom_tokens(request);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_tools: request
@@ -13039,7 +13138,7 @@ fn request_requirements_for_chat(
             .is_some_and(|tools| !tools.is_empty()),
         requires_json: request.response_format.is_some(),
         requires_vision: chat_input_modalities(&request.messages).image,
-        min_ctx: explicit_min_ctx.unwrap_or(0).max(prompt_min_ctx),
+        min_ctx: effective_context_floor(explicit_min_ctx, input_tokens, output_tokens),
         input_tokens,
         output_tokens,
         usage: ReceiptUsage::text(input_tokens, output_tokens),
@@ -13048,6 +13147,42 @@ fn request_requirements_for_chat(
         max_price_au,
         ..RequestRequirements::default()
     }
+}
+
+fn chat_output_headroom_tokens(request: &ChatCompletionRequest) -> u64 {
+    u64::from(
+        request
+            .max_tokens
+            .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS as u32)
+            .max(1),
+    )
+}
+
+fn exact_conversation_floor_after_partials(
+    request: &ChatCompletionRequest,
+    partials: &[GatewaySessionPartial],
+    user_min_ctx: Option<u32>,
+) -> u32 {
+    let rough_floor = effective_context_floor(
+        user_min_ctx,
+        rough_tokens(&chat_prompt_text(request)),
+        chat_output_headroom_tokens(request),
+    );
+    let exact_floor = partials
+        .last()
+        .map(|partial| {
+            effective_context_floor(
+                user_min_ctx,
+                partial
+                    .output
+                    .usage
+                    .prompt_tokens
+                    .saturating_add(partial.output.usage.completion_tokens),
+                chat_output_headroom_tokens(request),
+            )
+        })
+        .unwrap_or(0);
+    rough_floor.max(exact_floor)
 }
 
 fn request_requirements_for_embedding(
@@ -20247,6 +20382,89 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ExactContextPartialThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+        served_contexts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl GatewaySessionBackend for ExactContextPartialThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-exact-context-partial-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let attempt = {
+                    self.providers
+                        .lock()
+                        .expect("providers lock")
+                        .push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    self.served_contexts
+                        .lock()
+                        .expect("served contexts lock")
+                        .push(invocation.served_ctx);
+                    self.providers.lock().expect("providers lock").len()
+                };
+                if attempt == 1 {
+                    let output = ChatOutput {
+                        content: Some("checkpoint ".to_owned()),
+                        tool_call: None,
+                        artifacts: Vec::new(),
+                        finish_reason: "interrupted".to_owned(),
+                        usage: Usage {
+                            prompt_tokens: 7_700,
+                            completion_tokens: 200,
+                            total_tokens: 7_900,
+                        },
+                    };
+                    let provider_receipt = test_provider_receipt_with_finality(
+                        model, request, &output, invocation, 1, false,
+                    );
+                    return Err(GatewaySessionError::retryable_partial(
+                        "simulated checkpoint after exact context accounting",
+                        GatewaySessionPartial {
+                            output,
+                            provider_receipt,
+                            token_ids: vec![11],
+                            quality: None,
+                            reason: "mid_stream_stall".to_owned(),
+                            redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+                        },
+                    ));
+                }
+
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                let output = ChatOutput {
+                    content: Some("continued".to_owned()),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens: 1,
+                        total_tokens: prompt_tokens + 1,
+                    },
+                };
+                Ok(GatewaySessionResult {
+                    output: output.clone(),
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: Some(test_provider_receipt(
+                        model, request, &output, invocation,
+                    )),
+                    token_ids: vec![22],
+                    quality: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct SlowQualityThenSuccessBackend {
         providers: Arc<Mutex<Vec<String>>>,
     }
@@ -21175,6 +21393,135 @@ mod tests {
         assert!(readmitted_order
             .iter()
             .any(|candidate| candidate.provider == circuit_provider));
+    }
+
+    #[test]
+    fn chat_route_selection_uses_latest_advertised_served_context() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.ctx = 262_144;
+        for route in &mut model.mayhem.route_candidates {
+            route.served_ctx = Some(262_144);
+        }
+        let now = now_millis_u64();
+        let mut small = heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now);
+        small.caps.ctx = 8_192;
+        small.att.epoch = 1;
+        small.sig = "aa".repeat(64);
+        let mut large = heartbeat_for_route(&model, &model.mayhem.route_candidates[1], now);
+        large.att.epoch = 1;
+        large.sig = "bb".repeat(64);
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_provider_heartbeats(vec![small, large]);
+        let request = test_chat_request(&model.id);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            min_ctx: Some(131_072),
+            ..GatewayRequestOptions::default()
+        };
+
+        let routes =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].provider,
+            model.mayhem.route_candidates[1].provider
+        );
+        assert_eq!(state.served_ctx_for_route(&model, Some(routes[0])), 262_144);
+    }
+
+    #[tokio::test]
+    async fn context_capacity_failure_is_plain_and_does_not_touch_provider_reputation() {
+        let mut model = test_routed_model(1);
+        model.mayhem.route_candidates[0].served_ctx = Some(8_192);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            SuccessBackend {
+                providers: providers.clone(),
+            },
+        ));
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!("word ".repeat(9_000));
+        request.max_tokens = Some(64);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+
+        let err = match run_chat_with_route_retry(&state, &model, &request, options).await {
+            Ok(_) => panic!("an 8k provider cannot hold this conversation"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("needs at least 9064 context tokens"));
+        assert!(err.message.contains(&model.id));
+        assert!(!err.message.contains("PromptTooLong"));
+        assert!(!err.message.contains("attempt"));
+        assert!(providers.lock().expect("providers lock").is_empty());
+        assert!(state.reputation_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_receipt_raises_context_floor_before_failover_routing() {
+        let mut model = test_routed_model(3);
+        model.mayhem.caps.ctx = 262_144;
+        model.mayhem.route_candidates[0].served_ctx = Some(8_192);
+        model.mayhem.route_candidates[0].reputation_bps = 10_000;
+        model.mayhem.route_candidates[1].served_ctx = Some(8_192);
+        model.mayhem.route_candidates[1].reputation_bps = 9_000;
+        model.mayhem.route_candidates[2].served_ctx = Some(262_144);
+        model.mayhem.route_candidates[2].reputation_bps = 1_000;
+        let skipped_small_key = route_key(&model.mayhem.route_candidates[1]);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let served_contexts = Arc::new(Mutex::new(Vec::new()));
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            ExactContextPartialThenSuccessBackend {
+                providers: providers.clone(),
+                served_contexts: served_contexts.clone(),
+            },
+        ));
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!("word ".repeat(7_600));
+        request.max_tokens = Some(512);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+
+        let run = run_chat_with_route_retry(&state, &model, &request, options)
+            .await
+            .expect("the exact receipt floor should reroute to the 256k provider");
+
+        assert_eq!(
+            run.result.output.content.as_deref(),
+            Some("checkpoint continued")
+        );
+        assert_eq!(
+            providers.lock().expect("providers lock").as_slice(),
+            &[
+                model.mayhem.route_candidates[0].provider.clone(),
+                model.mayhem.route_candidates[2].provider.clone(),
+            ]
+        );
+        assert_eq!(
+            served_contexts
+                .lock()
+                .expect("served contexts lock")
+                .as_slice(),
+            &[8_192, 262_144]
+        );
+        let skipped_observation = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == skipped_small_key)
+            .expect("skipped small provider remains in the table")
+            .observed;
+        assert_eq!(skipped_observation.samples, 0);
+        assert_eq!(state.receipts().len(), 1);
     }
 
     #[tokio::test]
