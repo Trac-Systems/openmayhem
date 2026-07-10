@@ -25868,11 +25868,22 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
     let receipts = read_receipts_for_export(&args).await?;
     let payouts = read_optional_json_array(args.payouts_file.as_deref(), "payouts")?;
     let prior_earnings = read_prior_earnings(args.prior_earnings_file.as_deref())?;
+    let evidence = if !args.no_verify || args.deposits_file.is_none() {
+        Some(read_evidence_for_export(&args).await?)
+    } else {
+        None
+    };
+    let deposit_root = if args.deposits_file.is_none() {
+        evidence.as_ref().and_then(|snapshot| snapshot.dep.clone())
+    } else {
+        None
+    };
     let bundle = EpochAuditBundle {
         epoch: args.epoch,
         params: EpochAuditParams {
             fee_bps: args.fee_bps,
         },
+        deposit_root,
         deposits,
         receipts,
         payouts,
@@ -25918,7 +25929,7 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
             .unwrap_or_else(|| repo_path("intercom/scripts/recompute-epoch-roots.mjs"))?;
         let verifier_script = absolutize(verifier_script)?;
         let recomputed = run_epoch_recompute_script(&verifier_script, &verifier_input_path).await?;
-        let evidence = read_evidence_for_export(&args).await?;
+        let evidence = evidence.context("epoch evidence snapshot is unavailable")?;
         let checks = verify_epoch_evidence(args.epoch, &recomputed, &evidence);
         let verified = checks.iter().all(|check| check.ok);
         report.recomputed = Some(recomputed);
@@ -29168,6 +29179,8 @@ struct EarningsView {
 struct EpochAuditBundle {
     epoch: u64,
     params: EpochAuditParams,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deposit_root: Option<Value>,
     #[serde(default)]
     deposits: Vec<Value>,
     #[serde(default)]
@@ -47613,6 +47626,30 @@ mod tests {
         };
         assert_eq!(args.fee_bps, 1_500);
         assert!(args.json);
+    }
+
+    #[test]
+    fn epoch_audit_bundle_carries_ledger_deposit_root() {
+        let deposit_root = json!({
+            "type": "deposit_root",
+            "epoch": 1,
+            "merkle_root": "ab".repeat(32),
+            "count": 2,
+            "au_total": "123",
+        });
+        let bundle = EpochAuditBundle {
+            epoch: 1,
+            params: EpochAuditParams { fee_bps: 1_500 },
+            deposit_root: Some(deposit_root.clone()),
+            deposits: Vec::new(),
+            receipts: Vec::new(),
+            payouts: Vec::new(),
+            prior_earnings: BTreeMap::new(),
+            prior_fee_cum_au: 0,
+        };
+
+        let value = serde_json::to_value(bundle).unwrap();
+        assert_eq!(value["deposit_root"], deposit_root);
     }
 
     #[test]
