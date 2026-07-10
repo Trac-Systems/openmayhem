@@ -17780,7 +17780,7 @@ async fn ensure_tap_account_binding(
     let user = wallet.public_key.to_ascii_lowercase();
     let ethereum_address = ethereum_address.to_ascii_lowercase();
     let pool_address = pool_address.to_ascii_lowercase();
-    if !is_hex_len(&user, 32) {
+    if !is_hex_len(&user, 64) {
         bail!("wallet public key is not a 32-byte hex Mayhem identity");
     }
     if !is_eth_address(&ethereum_address) {
@@ -43594,6 +43594,23 @@ mod tests {
         assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
         assert_eq!(args.proof.as_deref(), Some("[]"));
         assert!(args.json);
+    }
+
+    #[test]
+    fn tap_account_binding_uses_canonical_32_byte_wallet_id() {
+        let user = "11".repeat(32);
+        assert!(is_hex_len(&user, 64));
+        assert_eq!(
+            tap_account_binding_message(
+                &user,
+                "0x2222222222222222222222222222222222222222",
+                1,
+                "0x3333333333333333333333333333333333333333",
+            ),
+            format!(
+                "mayhem-tap-account-bind-v1{{\"chain_id\":1,\"ethereum_address\":\"0x2222222222222222222222222222222222222222\",\"pool_address\":\"0x3333333333333333333333333333333333333333\",\"user\":\"{user}\"}}"
+            )
+        );
     }
 
     #[test]
