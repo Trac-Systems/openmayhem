@@ -14,6 +14,7 @@ import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
 import {
   buildTapSettlement,
+  encodeBurnCalldata,
   encodeSetRootCalldata,
   encodeWithdrawOperatorCalldata,
   guardianPreSignReport,
@@ -33,6 +34,7 @@ const OPERATOR_KEY = `0x${'11'.repeat(32)}`;
 const BUYER_KEY = `0x${'22'.repeat(32)}`;
 const PROVIDER_KEY = `0x${'33'.repeat(32)}`;
 const GANACHE_BALANCE = ethers.toBeHex(ethers.parseEther('100'));
+const BURN_SINK = '0x000000000000000000000000000000000000dEaD';
 
 function runNode(args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -196,6 +198,14 @@ test('TAP settlement roller posts root and provider proof verifies independently
   assert.match(rolled.operator_fee.tx, /^0x[0-9a-f]{64}$/i);
   assert.equal(await token.balanceOf(await operatorTreasury.getAddress()), (spentA + spentB) * 1500n / 10_000n);
   assert.equal(await pool.operatorClaimable(), 0n);
+  assert.equal(rolled.burn.auto_sent, true);
+  assert.equal(rolled.burn.completed, true);
+  assert.equal(rolled.burn.predicted_claimable_wei, ((spentA + spentB) * 1000n / 10_000n).toString());
+  assert.equal(rolled.burn.actual_claimable_wei, rolled.burn.predicted_claimable_wei);
+  assert.equal(rolled.burn.calldata, encodeBurnCalldata());
+  assert.match(rolled.burn.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(await token.balanceOf(BURN_SINK), (spentA + spentB) * 1000n / 10_000n);
+  assert.equal(await pool.burnClaimable(), 0n);
 
   await (await pool.connect(providerA).claim(
     providerAccounts[providerAId.publicKeyHex],
@@ -348,8 +358,68 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     post: true,
   });
   assert.equal(replay.posted, false);
-  assert.equal(replay.blocked, true);
-  assert.deepEqual(replay.reasons, ['no new spend since last root']);
+  assert.equal(replay.root_confirmed, true);
+  assert.equal(replay.root_already_posted, true);
+  assert.equal(replay.blocked, undefined);
+  assert.equal(replay.operator_fee.completed, true);
+  assert.equal(replay.burn.completed, true);
+});
+
+test('TAP settlement roller resumes fee and burn after an exact root-only partial run', async () => {
+  const ganache = Ganache.provider({
+    logging: { quiet: true },
+    chain: { chainId: 61_000 },
+    wallet: { totalAccounts: 4 },
+  });
+  const provider = new ethers.BrowserProvider(ganache);
+  const operator = await provider.getSigner(0);
+  const buyer = await provider.getSigner(1);
+  const providerSigner = await provider.getSigner(2);
+  const operatorTreasury = await provider.getSigner(3);
+  const { token, pool, poolAddr } = await deployPool(operator);
+  await (await token.mint(await buyer.getAddress(), U(5))).wait();
+  await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
+  await (await pool.connect(buyer).deposit(U(5))).wait();
+
+  const providerId = makeReceiptIdentity();
+  const providerAccounts = { [providerId.publicKeyHex]: await providerSigner.getAddress() };
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({ session: 'partial-root', provider: providerId, au: usdAu(1) })],
+  };
+  const settlement = buildTapSettlement({
+    bundle,
+    providerAccounts,
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
+  });
+  await (await pool.setRoot(settlement.root, 1, BigInt(settlement.cumulative_spent_wei))).wait();
+  assert((await pool.operatorClaimable()) > 0n);
+  assert((await pool.burnClaimable()) > 0n);
+
+  const resumed = await rollTapSettlement({
+    bundle,
+    providerAccounts,
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
+    pool,
+    ownerSigner: operator,
+    operatorAddress: await operatorTreasury.getAddress(),
+    post: true,
+  });
+
+  assert.equal(resumed.posted, false);
+  assert.equal(resumed.root_confirmed, true);
+  assert.equal(resumed.root_already_posted, true);
+  assert.equal(resumed.set_root_dry_run.skipped, true);
+  assert.equal(resumed.operator_fee.auto_sent, true);
+  assert.equal(resumed.operator_fee.completed, true);
+  assert.equal(resumed.burn.auto_sent, true);
+  assert.equal(resumed.burn.completed, true);
+  assert.equal(await pool.operatorClaimable(), 0n);
+  assert.equal(await pool.burnClaimable(), 0n);
 });
 
 test('TAP settlement roller refuses unsigned multi-provider split controls', () => {
@@ -691,6 +761,9 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     amountWei: report.operator_fee.predicted_claimable_wei,
   }));
   assert.equal(report.operator_fee.auto_sent, false);
+  assert.equal(report.burn.predicted_claimable_wei, (auToTapWei(usdAu(1), TAP_USD_AU) * 1000n / 10_000n).toString());
+  assert.equal(report.burn.calldata, encodeBurnCalldata());
+  assert.equal(report.burn.auto_sent, false);
   assert.match(report.copy_paste_confirm_command, /--confirm/);
   assert.match(report.copy_paste_confirm_command, /--operator-address/);
   assert.doesNotMatch(
@@ -714,5 +787,11 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(posted.operator_fee.actual_claimable_wei, posted.operator_fee.predicted_claimable_wei);
   assert.equal(await token.balanceOf(await operatorTreasury.getAddress()), BigInt(posted.operator_fee.predicted_claimable_wei));
   assert.equal(await pool.operatorClaimable(), 0n);
+  assert.equal(posted.burn.auto_sent, true);
+  assert.equal(posted.burn.completed, true);
+  assert.match(posted.burn.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(posted.burn.actual_claimable_wei, posted.burn.predicted_claimable_wei);
+  assert.equal(await token.balanceOf(BURN_SINK), BigInt(posted.burn.predicted_claimable_wei));
+  assert.equal(await pool.burnClaimable(), 0n);
   assert.equal(await pool.epoch(), 1n);
 });

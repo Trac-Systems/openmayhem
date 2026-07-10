@@ -7,6 +7,7 @@ const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'price'];
 const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
+const TAP_BURN_BPS = 1_000;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
 
 export const stableValue = (value) => {
@@ -321,6 +322,10 @@ export async function recomputeEpoch(bundle) {
     ? bundle.prior_earnings
     : {};
   const priorFeeCumAu = safeAu(bundle.prior_fee_cum_au ?? '0', 'prior_fee_cum_au', { allowZero: true });
+  if (!Object.prototype.hasOwnProperty.call(bundle, 'prior_burn_cum_au')) {
+    throw new Error('prior_burn_cum_au is required by the current epoch bundle');
+  }
+  const priorBurnCumAu = safeAu(bundle.prior_burn_cum_au, 'prior_burn_cum_au', { allowZero: true });
 
   const dep = depositRootFromEvidence(bundle.deposit_root) ?? await depositRoot(deposits);
   const usageLeaves = [];
@@ -357,13 +362,19 @@ export async function recomputeEpoch(bundle) {
 
   const earningEntries = [];
   let feeAu = 0n;
+  let burnAu = 0n;
   let earnCumAu = 0n;
   for (const entry of sortedRailEntries(grossEarningMap)) {
     const { rail, id: provider, au: grossAu } = entry;
     const providerFeeAu = (grossAu * BigInt(feeBps)) / 10_000n;
-    const netAu = grossAu - providerFeeAu;
+    const providerBurnAu = rail === 'tap'
+      ? (grossAu * BigInt(TAP_BURN_BPS)) / 10_000n
+      : 0n;
+    const netAu = grossAu - providerFeeAu - providerBurnAu;
     feeAu += providerFeeAu;
     safeAu(feeAu, 'fee_au', { allowZero: true });
+    burnAu += providerBurnAu;
+    safeAu(burnAu, 'burn_au', { allowZero: true });
     const priorAu = safeAu(priorEarnings[`${rail}/${provider}`] ?? '0', 'prior provider earning', { allowZero: true });
     const cumulativeAu = priorAu + netAu;
     safeAu(cumulativeAu, 'provider cumulative earning', { allowZero: true });
@@ -379,6 +390,8 @@ export async function recomputeEpoch(bundle) {
   }
   const feeCumAu = priorFeeCumAu + feeAu;
   safeAu(feeCumAu, 'fee_cum_au', { allowZero: true });
+  const burnCumAu = priorBurnCumAu + burnAu;
+  safeAu(burnCumAu, 'burn_cum_au', { allowZero: true });
 
   const roots = {
     dep: dep.root,
@@ -391,6 +404,9 @@ export async function recomputeEpoch(bundle) {
       epoch,
       fee_au: canonicalAu(feeAu),
       fee_cum_au: canonicalAu(feeCumAu),
+      burn_au: canonicalAu(burnAu),
+      burn_cum_au: canonicalAu(burnCumAu),
+      tap_burn_bps: TAP_BURN_BPS,
     }),
     price: await merkleRoot(
       'price',
@@ -419,10 +435,20 @@ export async function recomputeEpoch(bundle) {
     earn_au: canonicalAu(earnCumAu),
     fee_au: canonicalAu(feeAu),
     fee_cum_au: canonicalAu(feeCumAu),
+    burn_au: canonicalAu(burnAu),
+    burn_cum_au: canonicalAu(burnCumAu),
     price_count: priceDerivations.length,
   };
 
-  return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings, market_usage };
+  return {
+    epoch,
+    params: { fee_bps: feeBps, tap_burn_bps: TAP_BURN_BPS },
+    roots,
+    totals,
+    debits,
+    earnings,
+    market_usage,
+  };
 }
 
 function priceDerivationLeafValue(derivation) {

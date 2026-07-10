@@ -56,8 +56,18 @@ while true; do
     sleep "$interval"
     continue
   fi
-  if ! jq -e '.posted == true and (.tx | type == "string")' "$final_report" >/dev/null; then
-    echo "TAP settlement report is not a confirmed broadcast for $name" >&2
+  if ! jq -e '
+    .blocked != true and
+    .root_confirmed == true and
+    ((.posted == true and (.tx | type == "string")) or .root_already_posted == true) and
+    .operator_fee.completed == true and
+    .operator_fee.remaining_claimable_wei == "0" and
+    (.operator_fee.predicted_claimable_wei == "0" or .operator_fee.auto_sent == true) and
+    .burn.completed == true and
+    .burn.remaining_claimable_wei == "0" and
+    (.burn.predicted_claimable_wei == "0" or .burn.auto_sent == true)
+  ' "$final_report" >/dev/null; then
+    echo "TAP settlement report did not confirm root, fee, and burn completion for $name" >&2
     sleep "$interval"
     continue
   fi

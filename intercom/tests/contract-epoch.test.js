@@ -120,6 +120,7 @@ async function setupEpochContract() {
 
 const receiptBundle = (user, provider, overrides = {}) => ({
   epoch: 1,
+  prior_burn_cum_au: '0',
   params: {
     fee_bps: 1_500,
   },
@@ -210,6 +211,29 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
   await assert.rejects(() => recomputeEpoch(imageAliasBundle), /receipt usage must be canonical/);
   assert.equal(imageCanonicalRoll.totals.use_count, 1);
   assert.equal(imageCanonicalRoll.totals.use_au, '1120');
+});
+
+test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async () => {
+  const { provider, user } = await setupEpochContract();
+  const base = receiptBundle(user, provider).receipts[0];
+  const roll = await recomputeEpoch(receiptBundle(user, provider, {
+    prior_burn_cum_au: '200',
+    receipts: ['fiat', 'tap', 'tnk'].map((rail, index) => ({
+      ...base,
+      session_id: `session-${rail}`,
+      seq: index + 1,
+      rail,
+      au_owed_cum: '10000',
+    })),
+  }));
+
+  assert.deepEqual(roll.params, { fee_bps: 1_500, tap_burn_bps: 1_000 });
+  assert.equal(roll.totals.use_au, '30000');
+  assert.equal(roll.totals.earn_au, '24500');
+  assert.equal(roll.totals.fee_au, '4500');
+  assert.equal(roll.totals.fee_cum_au, '4500');
+  assert.equal(roll.totals.burn_au, '1000');
+  assert.equal(roll.totals.burn_cum_au, '1200');
 });
 
 test('epoch recompute treats enclave public key as receipt envelope metadata', async () => {
@@ -353,6 +377,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     debited_au: '2000',
     earned_au: '1700',
     fee_au: '300',
+    burn_au: '0',
     rails: ['fiat'],
   });
 
@@ -414,6 +439,9 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     merkle_root: roll.roots.fee,
     au_fee_epoch: '300',
     au_fee_cum: '300',
+    au_burn_epoch: '0',
+    au_burn_cum: '0',
+    tap_burn_bps: 1_000,
     sweep_msb_tx_hash: null,
     ts: 3_600,
     updated_at: applyKey,
@@ -480,6 +508,7 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
       debited_au: '0',
       earned_au: '0',
       fee_au: '0',
+      burn_au: '0',
     },
     seal_hash: sealed.seal_hash,
     sealed_at: makeTxKey(8),
@@ -752,6 +781,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
 
   const emptyEpoch = await recomputeEpoch({
     epoch: 2,
+    prior_burn_cum_au: '0',
     params: {
       fee_bps: 1_500,
     },
@@ -809,6 +839,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
 
   const emptyEpoch3 = await recomputeEpoch({
     epoch: 3,
+    prior_burn_cum_au: '0',
     params: {
       fee_bps: 1_500,
     },
@@ -1079,7 +1110,12 @@ test('epoch root recompute script CLI matches the imported independent recompute
 test('epoch root recompute requires admin params fee_bps and rejects loose fee_bps', async () => {
   const { provider, user } = await setupEpochContract();
   const bundle = receiptBundle(user, provider);
+  const { prior_burn_cum_au: _priorBurnCumAu, ...missingBurnBundle } = bundle;
 
+  await assert.rejects(
+    recomputeEpoch(missingBurnBundle),
+    /prior_burn_cum_au is required/
+  );
   await assert.rejects(
     recomputeEpoch({
       ...bundle,

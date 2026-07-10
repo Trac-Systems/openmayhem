@@ -94,6 +94,7 @@ const epochApply = (epoch, user, provider, grossAu, overrides = {}) => ({
 
 const receiptBundle = (user, provider, overrides = {}) => ({
   epoch: 1,
+  prior_burn_cum_au: '0',
   params: {
     fee_bps: 1_500,
   },
@@ -245,6 +246,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     debited_au: '2000000',
     earned_au: '1700000',
     fee_au: '300000',
+    burn_au: '0',
     rails: ['fiat'],
   });
 
@@ -277,6 +279,9 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     merkle_root: roll.roots.fee,
     au_fee_epoch: '300000',
     au_fee_cum: '300000',
+    au_burn_epoch: '0',
+    au_burn_cum: '0',
+    tap_burn_bps: 1_000,
     sweep_msb_tx_hash: null,
     ts: 3_600,
     updated_at: applyKey,

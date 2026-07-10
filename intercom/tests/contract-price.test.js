@@ -736,6 +736,8 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
     earn_au: '1700000',
     fee_au: '300000',
     fee_cum_au: '300000',
+    burn_au: '0',
+    burn_cum_au: '0',
     price_count: 1,
   };
 
@@ -819,6 +821,8 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
     earn_au: '1700000',
     fee_au: '300000',
     fee_cum_au: '300000',
+    burn_au: '0',
+    burn_cum_au: '0',
     price_count: 1,
   };
   const commit = await execute(
@@ -940,9 +944,11 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   assert.equal((await storage.get(`bal/${fiatUser.publicKey}/fiat`)).value.au, '1500000');
   assert.equal((await storage.get(`bal/${tapUser.publicKey}/tap`)).value.au, '1500000');
   assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, '425000');
-  assert.equal((await storage.get(`earn/tap/${tapProvider.publicKey}`)).value.total_au, '425000');
+  assert.equal((await storage.get(`earn/tap/${tapProvider.publicKey}`)).value.total_au, '375000');
   assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '75000');
   assert.equal((await storage.get('fee/tap/cum')).value.cum_au, '75000');
+  assert.equal((await storage.get('burn/fiat/cum')).value.cum_au, '0');
+  assert.equal((await storage.get('burn/tap/cum')).value.cum_au, '50000');
 
   const crossRailMismatchValue = {
     op: 'epoch_apply',

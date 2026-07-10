@@ -36,6 +36,9 @@ export const POOL_SETTLEMENT_ABI = [
   'function operatorClaimable() view returns (uint256)',
   'function operatorWithdrawn() view returns (uint256)',
   'function withdrawOperator(address to, uint256 amount)',
+  'function burnClaimable() view returns (uint256)',
+  'function totalBurned() view returns (uint256)',
+  'function burn() returns (uint256 amount)',
 ];
 const POOL_SETTLEMENT_INTERFACE = new ethers.Interface(POOL_SETTLEMENT_ABI);
 export const TAP_ROLLER_SIGNER_ENVS = [TAP_ROLLER_SIGNER_ENV];
@@ -71,6 +74,10 @@ export function encodeWithdrawOperatorCalldata({
   const amount = parseBigIntString(amountWei, 'operator fee amount wei');
   if (amount <= 0n) throw new Error('operator fee amount wei must be positive');
   return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('withdrawOperator', [destination, amount]);
+}
+
+export function encodeBurnCalldata() {
+  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('burn');
 }
 
 function shellQuote(value) {
@@ -782,6 +789,24 @@ export async function dryRunWithdrawOperator({
   }
 }
 
+export async function dryRunBurn({ writablePool } = {}) {
+  if (!writablePool?.burn) throw new Error('Missing writable pool contract');
+  const out = { ok: false, static_call_ok: false, gas_estimate: null };
+  try {
+    if (writablePool.burn.staticCall) {
+      out.amount_wei = (await writablePool.burn.staticCall()).toString();
+      out.static_call_ok = true;
+    }
+    if (writablePool.burn.estimateGas) {
+      out.gas_estimate = (await writablePool.burn.estimateGas()).toString();
+    }
+    out.ok = true;
+    return out;
+  } catch (error) {
+    return { ...out, error: errorMessage(error) };
+  }
+}
+
 function bpsOf(value, bps) {
   return (value * BigInt(bps)) / BPS;
 }
@@ -962,7 +987,49 @@ export async function rollTapSettlement({
     holdbackEpochs,
   });
   if (!settlement.root) return settlement;
-  const screen = await guardianScreenSettlement({ settlement, pool, epoch, previous: prior });
+  const expectedRoot = String(settlement.root).toLowerCase();
+  const expectedSpentWei = parseBigIntString(
+    settlement.cumulative_spent_wei,
+    'settlement cumulative spent wei'
+  );
+  let chainEpoch = null;
+  let chainSpentWei = null;
+  let chainRoot = null;
+  let rootAlreadyPosted = false;
+  if (pool) {
+    chainEpoch = Number(await pool.epoch());
+    chainSpentWei = parseBigIntString(await pool.cumulativeSpent(), 'pool cumulative spent wei');
+    chainRoot = await poolRootOrNull(pool);
+    rootAlreadyPosted = (
+      chainEpoch > 0 &&
+      chainSpentWei === expectedSpentWei &&
+      chainRoot === expectedRoot &&
+      (epoch === undefined || parseNonNegativeInt(epoch, 'setRoot epoch') === chainEpoch)
+    );
+  }
+
+  let screen;
+  if (rootAlreadyPosted) {
+    const checked = await guardianPreSignReport({
+      settlement,
+      pool,
+      epoch: chainEpoch,
+      previous: prior,
+      currentEpoch: chainEpoch - 1,
+      prevSpentWei: chainSpentWei,
+    });
+    const reasons = checked.reasons.filter((reason) => reason !== 'no new spend since last root');
+    screen = {
+      ...checked,
+      ok: reasons.length === 0,
+      reasons,
+      flags: [...checked.flags, 'exact settlement root already confirmed on-chain'],
+      epoch: chainEpoch,
+      resumed: true,
+    };
+  } else {
+    screen = await guardianScreenSettlement({ settlement, pool, epoch, previous: prior });
+  }
   if (!screen.ok) {
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }
@@ -978,12 +1045,15 @@ export async function rollTapSettlement({
   let writable = null;
   let setRootDryRun = null;
   let operatorFee = null;
+  let burn = null;
   if (pool && ownerSigner) {
     writable = pool.connect ? pool.connect(ownerSigner) : pool;
     const operatorWithdrawn = pool.operatorWithdrawn ? await pool.operatorWithdrawn() : 0n;
-    const cumulativeSpentWei = parseBigIntString(settlement.cumulative_spent_wei, 'settlement cumulative spent wei');
-    const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
+    const operatorCapWei = bpsOf(expectedSpentWei, OPERATOR_BPS);
     const predictedClaimableWei = operatorCapWei > operatorWithdrawn ? operatorCapWei - operatorWithdrawn : 0n;
+    const totalBurned = pool.totalBurned ? await pool.totalBurned() : 0n;
+    const burnCapWei = bpsOf(expectedSpentWei, BURN_BPS);
+    const predictedBurnWei = burnCapWei > totalBurned ? burnCapWei - totalBurned : 0n;
     const destination = operatorAddress
       ? normalizeAddress(operatorAddress, 'operator fee address')
       : null;
@@ -996,6 +1066,15 @@ export async function rollTapSettlement({
         : null,
       dry_run: null,
       tx: null,
+      completed: false,
+    };
+    burn = {
+      auto_sent: false,
+      predicted_claimable_wei: predictedBurnWei.toString(),
+      calldata: predictedBurnWei > 0n ? encodeBurnCalldata() : null,
+      dry_run: null,
+      tx: null,
+      completed: false,
     };
     if (predictedClaimableWei > 0n && !destination) {
       return {
@@ -1007,15 +1086,24 @@ export async function rollTapSettlement({
         signing_address: signingAddress,
         set_root_calldata: setRootCalldata,
         operator_fee: operatorFee,
+        burn,
         screen,
       };
     }
-    setRootDryRun = await dryRunSetRoot({
-      writablePool: writable,
-      root: settlement.root,
-      epoch: screen.epoch,
-      cumulativeSpentWei: settlement.cumulative_spent_wei,
-    });
+    setRootDryRun = rootAlreadyPosted
+      ? {
+          ok: true,
+          static_call_ok: false,
+          gas_estimate: null,
+          skipped: true,
+          reason: 'exact settlement root already confirmed on-chain',
+        }
+      : await dryRunSetRoot({
+          writablePool: writable,
+          root: settlement.root,
+          epoch: screen.epoch,
+          cumulativeSpentWei: settlement.cumulative_spent_wei,
+        });
     if (!setRootDryRun.ok) {
       return {
         ...settlement,
@@ -1027,21 +1115,68 @@ export async function rollTapSettlement({
         set_root_calldata: setRootCalldata,
         set_root_dry_run: setRootDryRun,
         operator_fee: operatorFee,
+        burn,
         screen,
       };
     }
   }
   let tx = null;
+  let rootConfirmed = rootAlreadyPosted;
   if (post && pool) {
     if (!ownerSigner) throw new Error('Missing TAP settlement owner signer for broadcast');
     if (!writable) writable = pool.connect ? pool.connect(ownerSigner) : pool;
-    const sent = await writable.setRoot(settlement.root, screen.epoch, BigInt(settlement.cumulative_spent_wei));
-    await sent.wait();
-    tx = sent.hash;
-    if (operatorFee?.destination) {
+    if (!rootAlreadyPosted) {
+      const sent = await writable.setRoot(settlement.root, screen.epoch, expectedSpentWei);
+      await sent.wait();
+      tx = sent.hash;
+      const confirmedEpoch = Number(await pool.epoch());
+      const confirmedSpentWei = parseBigIntString(await pool.cumulativeSpent(), 'confirmed cumulative spent wei');
+      const confirmedRoot = await poolRootOrNull(pool);
+      rootConfirmed = (
+        confirmedEpoch === screen.epoch &&
+        confirmedSpentWei === expectedSpentWei &&
+        confirmedRoot === expectedRoot
+      );
+      if (!rootConfirmed) {
+        return {
+          ...settlement,
+          posted: true,
+          root_confirmed: false,
+          blocked: true,
+          reasons: ['setRoot transaction did not produce the exact expected on-chain state'],
+          epoch: screen.epoch,
+          tx,
+          signing_address: signingAddress,
+          set_root_calldata: setRootCalldata,
+          set_root_dry_run: setRootDryRun,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
+    }
+
+    if (operatorFee) {
       const claimable = pool.operatorClaimable ? await pool.operatorClaimable() : 0n;
       operatorFee.actual_claimable_wei = claimable.toString();
       if (claimable > 0n) {
+        if (!operatorFee.destination) {
+          return {
+            ...settlement,
+            posted: Boolean(tx),
+            root_confirmed: rootConfirmed,
+            blocked: true,
+            reasons: ['operator fee destination is required for TAP auto-withdraw'],
+            epoch: screen.epoch,
+            tx,
+            signing_address: signingAddress,
+            set_root_calldata: setRootCalldata,
+            set_root_dry_run: setRootDryRun,
+            operator_fee: operatorFee,
+            burn,
+            screen,
+          };
+        }
         operatorFee.calldata = encodeWithdrawOperatorCalldata({
           to: operatorFee.destination,
           amountWei: claimable,
@@ -1054,7 +1189,8 @@ export async function rollTapSettlement({
         if (!operatorFee.dry_run.ok) {
           return {
             ...settlement,
-            posted: true,
+            posted: Boolean(tx),
+            root_confirmed: rootConfirmed,
             blocked: true,
             reasons: [`withdrawOperator dry-run failed: ${operatorFee.dry_run.error}`],
             epoch: screen.epoch,
@@ -1063,6 +1199,7 @@ export async function rollTapSettlement({
             set_root_calldata: setRootCalldata,
             set_root_dry_run: setRootDryRun,
             operator_fee: operatorFee,
+            burn,
             screen,
           };
         }
@@ -1071,17 +1208,90 @@ export async function rollTapSettlement({
         operatorFee.tx = feeSent.hash;
         operatorFee.auto_sent = true;
       }
+      const remainingFee = pool.operatorClaimable ? await pool.operatorClaimable() : 0n;
+      operatorFee.remaining_claimable_wei = remainingFee.toString();
+      operatorFee.completed = remainingFee === 0n;
+      if (!operatorFee.completed) {
+        return {
+          ...settlement,
+          posted: Boolean(tx),
+          root_confirmed: rootConfirmed,
+          blocked: true,
+          reasons: ['operator fee remained claimable after auto-withdraw'],
+          epoch: screen.epoch,
+          tx,
+          signing_address: signingAddress,
+          set_root_calldata: setRootCalldata,
+          set_root_dry_run: setRootDryRun,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
+    }
+
+    if (burn) {
+      const claimable = pool.burnClaimable ? await pool.burnClaimable() : 0n;
+      burn.actual_claimable_wei = claimable.toString();
+      if (claimable > 0n) {
+        burn.dry_run = await dryRunBurn({ writablePool: writable });
+        if (!burn.dry_run.ok) {
+          return {
+            ...settlement,
+            posted: Boolean(tx),
+            root_confirmed: rootConfirmed,
+            blocked: true,
+            reasons: [`burn dry-run failed: ${burn.dry_run.error}`],
+            epoch: screen.epoch,
+            tx,
+            signing_address: signingAddress,
+            set_root_calldata: setRootCalldata,
+            set_root_dry_run: setRootDryRun,
+            operator_fee: operatorFee,
+            burn,
+            screen,
+          };
+        }
+        const burnSent = await writable.burn();
+        await burnSent.wait();
+        burn.tx = burnSent.hash;
+        burn.auto_sent = true;
+      }
+      const remainingBurn = pool.burnClaimable ? await pool.burnClaimable() : 0n;
+      burn.remaining_claimable_wei = remainingBurn.toString();
+      burn.total_burned_wei = pool.totalBurned ? (await pool.totalBurned()).toString() : null;
+      burn.completed = remainingBurn === 0n;
+      if (!burn.completed) {
+        return {
+          ...settlement,
+          posted: Boolean(tx),
+          root_confirmed: rootConfirmed,
+          blocked: true,
+          reasons: ['TAP burn remained claimable after automatic burn'],
+          epoch: screen.epoch,
+          tx,
+          signing_address: signingAddress,
+          set_root_calldata: setRootCalldata,
+          set_root_dry_run: setRootDryRun,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
     }
   }
   return {
     ...settlement,
     posted: Boolean(tx),
+    root_confirmed: rootConfirmed,
+    root_already_posted: rootAlreadyPosted,
     epoch: screen.epoch,
     tx,
     signing_address: signingAddress,
     set_root_calldata: setRootCalldata,
     set_root_dry_run: setRootDryRun,
     operator_fee: operatorFee,
+    burn,
     screen,
   };
 }

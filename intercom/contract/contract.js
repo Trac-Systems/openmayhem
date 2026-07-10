@@ -52,6 +52,7 @@ const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
 const DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS = 5_000;
 const MIN_TAP_CONFIRMATION_DEPTH = 12;
+const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
@@ -189,9 +190,19 @@ const EPOCH_TOTAL_KEYS = [
   'earn_au',
   'fee_au',
   'fee_cum_au',
+  'burn_au',
+  'burn_cum_au',
   'price_count',
 ];
-const EPOCH_TOTAL_MONEY_KEYS = new Set(['dep_au', 'use_au', 'earn_au', 'fee_au', 'fee_cum_au']);
+const EPOCH_TOTAL_MONEY_KEYS = new Set([
+  'dep_au',
+  'use_au',
+  'earn_au',
+  'fee_au',
+  'fee_cum_au',
+  'burn_au',
+  'burn_cum_au',
+]);
 const ENCLAVE_UPDATE_FIELDS = [
   'att_tier',
   'binary_hash',
@@ -1993,6 +2004,10 @@ class MayhemContract extends Contract {
     return `fee/${rail}/cum`;
   }
 
+  burnCumKey(rail) {
+    return `burn/${rail}/cum`;
+  }
+
   async setProviderRails() {
     const shapeError = this.validateExactCommandValue(['op', 'rails'], 'set_provider_rails');
     if (shapeError) return shapeError;
@@ -3669,6 +3684,7 @@ class MayhemContract extends Contract {
       at: this.value.at,
       epoch_seconds: params.epoch_seconds,
       fee_bps: params.fee_bps,
+      tap_burn_bps: TAP_BURN_BPS,
       debits: this.mapRailEntriesForHash(debitMap, 'user', 'au'),
       earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_au'),
       roots,
@@ -3690,6 +3706,7 @@ class MayhemContract extends Contract {
         debited_au: ZERO_AU,
         earned_au: ZERO_AU,
         fee_au: ZERO_AU,
+        burn_au: ZERO_AU,
       };
       if (pagedApply) {
         result.page = page;
@@ -3725,7 +3742,9 @@ class MayhemContract extends Contract {
 
     const earningDeltas = new Map();
     const feeDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
+    const burnDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
     let feeDeltaTotalAu = ZERO_AU;
+    let burnDeltaTotalAu = ZERO_AU;
     for (const earning of grossEarningMap.values()) {
       const { rail, provider, gross_au: grossAu } = earning;
       const providerRecord = await this.get(`prov/${provider}`);
@@ -3739,13 +3758,24 @@ class MayhemContract extends Contract {
 
       const feeAu = this.safeMulDivAu(grossAu, params.fee_bps, 10_000);
       if (feeAu instanceof Error) return feeAu;
-      const providerAu = this.safeSubAu(grossAu, feeAu);
+      const burnAu = rail === 'tap'
+        ? this.safeMulDivAu(grossAu, TAP_BURN_BPS, 10_000)
+        : ZERO_AU;
+      if (burnAu instanceof Error) return burnAu;
+      const afterFeeAu = this.safeSubAu(grossAu, feeAu);
+      if (afterFeeAu instanceof Error) return afterFeeAu;
+      const providerAu = this.safeSubAu(afterFeeAu, burnAu);
       if (providerAu instanceof Error) return providerAu;
       feeDeltaTotalAu = this.safeAddAu(feeDeltaTotalAu, feeAu);
       if (feeDeltaTotalAu instanceof Error) return feeDeltaTotalAu;
       const nextRailFee = this.safeAddAu(feeDeltaByRail.get(rail) ?? ZERO_AU, feeAu);
       if (nextRailFee instanceof Error) return nextRailFee;
       feeDeltaByRail.set(rail, nextRailFee);
+      burnDeltaTotalAu = this.safeAddAu(burnDeltaTotalAu, burnAu);
+      if (burnDeltaTotalAu instanceof Error) return burnDeltaTotalAu;
+      const nextRailBurn = this.safeAddAu(burnDeltaByRail.get(rail) ?? ZERO_AU, burnAu);
+      if (nextRailBurn instanceof Error) return nextRailBurn;
+      burnDeltaByRail.set(rail, nextRailBurn);
       const key = stableJson([rail, provider]);
       const current = earningDeltas.get(key) ?? { rail, provider, provider_record: providerRecord, au: ZERO_AU };
       const next = this.safeAddAu(current.au, providerAu);
@@ -3798,7 +3828,10 @@ class MayhemContract extends Contract {
 
     const feeRecords = new Map();
     const nextFeeRecords = new Map();
+    const burnRecords = new Map();
+    const nextBurnRecords = new Map();
     let nextFeeCumTotal = ZERO_AU;
+    let nextBurnCumTotal = ZERO_AU;
     const touchedRails = new Set([
       ...Array.from(debitRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
       ...Array.from(grossRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
@@ -3825,20 +3858,47 @@ class MayhemContract extends Contract {
       nextFeeRecords.set(rail, nextFee);
       nextFeeCumTotal = this.safeAddAu(nextFeeCumTotal, nextFee.cum_au);
       if (nextFeeCumTotal instanceof Error) return nextFeeCumTotal;
+
+      const burn = await this.burnCumRecord(rail);
+      if (burn instanceof Error) return burn;
+      const burnError = this.guardianValidateBurnRecord(burn, rail);
+      if (burnError) return burnError;
+      burnRecords.set(rail, burn);
+      const burnDeltaAu = burnDeltaByRail.get(rail) ?? ZERO_AU;
+      const nextBurnCum = this.safeAddAu(burn.cum_au, burnDeltaAu);
+      if (nextBurnCum instanceof Error) return nextBurnCum;
+      const nextBurn = touchedRails.has(rail)
+        ? {
+            ...burn,
+            cum_au: nextBurnCum,
+            updated_epoch: this.value.epoch,
+            updated_at: this.tx,
+            last_apply_hash: applyHash,
+            burn_bps: rail === 'tap' ? TAP_BURN_BPS : 0,
+          }
+        : burn;
+      nextBurnRecords.set(rail, nextBurn);
+      nextBurnCumTotal = this.safeAddAu(nextBurnCumTotal, nextBurn.cum_au);
+      if (nextBurnCumTotal instanceof Error) return nextBurnCumTotal;
     }
 
-    const providerDeltaTotal = this.safeSubAu(grossTotal, feeDeltaTotalAu);
+    const grossAfterFees = this.safeSubAu(grossTotal, feeDeltaTotalAu);
+    if (grossAfterFees instanceof Error) return grossAfterFees;
+    const providerDeltaTotal = this.safeSubAu(grossAfterFees, burnDeltaTotalAu);
     if (providerDeltaTotal instanceof Error) return providerDeltaTotal;
     const guardian = this.guardianCheckEpochApply({
       epoch: this.value.epoch,
       page,
       applyState,
       feeRecords,
+      burnRecords,
       debitTotal,
       debitRailTotals,
       feeDeltaByRail,
+      burnDeltaByRail,
       providerDeltaTotal,
       nextFeeRecords,
+      nextBurnRecords,
       balances,
       earnings,
     });
@@ -3869,6 +3929,8 @@ class MayhemContract extends Contract {
         debitTotal,
         feeDeltaAu: feeDeltaTotalAu,
         nextFeeCum: nextFeeCumTotal,
+        burnDeltaAu: burnDeltaTotalAu,
+        nextBurnCum: nextBurnCumTotal,
         providerCount: grossEarningMap.size,
         earnCumTotal,
         epochSeconds: params.epoch_seconds,
@@ -3889,6 +3951,7 @@ class MayhemContract extends Contract {
         settled_cum_au: guardian.next_settled_cum_by_rail.get(rail),
       };
       await this.put(this.feeCumKey(rail), feeRecord);
+      await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
     }
     await this.put('epoch/apply/state', this.nextEpochApplyState({
       applyState,
@@ -3908,6 +3971,8 @@ class MayhemContract extends Contract {
         totals,
         feeDeltaAu: feeDeltaTotalAu,
         feeCumAu: nextFeeCumTotal,
+        burnDeltaAu: burnDeltaTotalAu,
+        burnCumAu: nextBurnCumTotal,
         priceDerivations,
       });
     } else if (priceDerivations.length > 0) {
@@ -3933,6 +3998,7 @@ class MayhemContract extends Contract {
       debited_au: debitTotal,
       earned_au: providerDeltaTotal,
       fee_au: feeDeltaTotalAu,
+      burn_au: burnDeltaTotalAu,
       rails: Array.from(touchedRails).sort(
         (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
       ),
@@ -4028,6 +4094,7 @@ class MayhemContract extends Contract {
         debited_au: ZERO_AU,
         earned_au: ZERO_AU,
         fee_au: ZERO_AU,
+        burn_au: ZERO_AU,
       },
     };
     const sealHash = await this.epochEmptySealHash(sealValue);
@@ -8545,15 +8612,41 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  guardianValidateBurnRecord(record, rail = null) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return new Error('Guardian burn conservation invariant failed.');
+    }
+    if (rail !== null && record.rail !== rail) {
+      return new Error('Guardian burn rail invariant failed.');
+    }
+    if (record.denom !== PRICE_DENOMINATION) {
+      return new Error('Guardian burn denomination invariant failed.');
+    }
+    if (this.normalizeAu(record.cum_au, 'burn cumulative amount') instanceof Error) {
+      return new Error('Guardian burn conservation invariant failed.');
+    }
+    if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    const expectedBps = record.rail === 'tap' ? TAP_BURN_BPS : 0;
+    if (record.burn_bps !== expectedBps) {
+      return new Error('Guardian burn policy invariant failed.');
+    }
+    return null;
+  }
+
   guardianCheckEpochApply({
     epoch,
     applyState,
     feeRecords,
+    burnRecords,
     debitTotal,
     debitRailTotals,
     feeDeltaByRail,
+    burnDeltaByRail,
     providerDeltaTotal,
     nextFeeRecords,
+    nextBurnRecords,
     balances,
     earnings,
   }) {
@@ -8564,6 +8657,7 @@ class MayhemContract extends Contract {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
     let feeDeltaAu = ZERO_AU;
+    let burnDeltaAu = ZERO_AU;
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
       const fee = feeRecords.get(rail);
       const feeError = this.guardianValidateFeeRecord(fee, rail);
@@ -8579,8 +8673,24 @@ class MayhemContract extends Contract {
       if (this.compareAu(nextFee.cum_au, expectedFeeCumAu) !== 0) {
         return new Error('Guardian fee conservation invariant failed.');
       }
+      const burn = burnRecords.get(rail);
+      const burnError = this.guardianValidateBurnRecord(burn, rail);
+      if (burnError) return burnError;
+      const nextBurn = nextBurnRecords.get(rail);
+      const nextBurnError = this.guardianValidateBurnRecord(nextBurn, rail);
+      if (nextBurnError) return nextBurnError;
+      const railBurnDelta = burnDeltaByRail.get(rail) ?? ZERO_AU;
+      burnDeltaAu = this.safeAddAu(burnDeltaAu, railBurnDelta);
+      if (burnDeltaAu instanceof Error) return burnDeltaAu;
+      const expectedBurnCumAu = this.safeAddAu(burn.cum_au, railBurnDelta);
+      if (expectedBurnCumAu instanceof Error) return expectedBurnCumAu;
+      if (this.compareAu(nextBurn.cum_au, expectedBurnCumAu) !== 0) {
+        return new Error('Guardian burn conservation invariant failed.');
+      }
     }
-    const grossDeltaTotal = this.safeAddAu(providerDeltaTotal, feeDeltaAu);
+    const providerAndFeeAu = this.safeAddAu(providerDeltaTotal, feeDeltaAu);
+    if (providerAndFeeAu instanceof Error) return providerAndFeeAu;
+    const grossDeltaTotal = this.safeAddAu(providerAndFeeAu, burnDeltaAu);
     if (grossDeltaTotal instanceof Error) return grossDeltaTotal;
     if (this.compareAu(grossDeltaTotal, debitTotal) !== 0) {
       return new Error('Guardian conservation invariant failed.');
@@ -9829,6 +9939,8 @@ class MayhemContract extends Contract {
     debitTotal,
     feeDeltaAu,
     nextFeeCum,
+    burnDeltaAu,
+    nextBurnCum,
     providerCount,
     earnCumTotal,
     epochSeconds,
@@ -9853,6 +9965,12 @@ class MayhemContract extends Contract {
     if (this.compareAu(totals.fee_au, feeDeltaAu) !== 0) return new Error('Epoch fee total does not match computed fee.');
     if (this.compareAu(totals.fee_cum_au, nextFeeCum) !== 0) {
       return new Error('Epoch cumulative fee total does not match fee state.');
+    }
+    if (this.compareAu(totals.burn_au, burnDeltaAu) !== 0) {
+      return new Error('Epoch burn total does not match computed TAP burn.');
+    }
+    if (this.compareAu(totals.burn_cum_au, nextBurnCum) !== 0) {
+      return new Error('Epoch cumulative burn total does not match burn state.');
     }
     if (totals.provider_count !== providerCount) {
       return new Error('Epoch provider count does not match earnings.');
@@ -9906,7 +10024,18 @@ class MayhemContract extends Contract {
     }
   }
 
-  async writeEpochEvidenceRoots({ epoch, at, epoch_seconds, roots, totals, feeDeltaAu, feeCumAu, priceDerivations }) {
+  async writeEpochEvidenceRoots({
+    epoch,
+    at,
+    epoch_seconds,
+    roots,
+    totals,
+    feeDeltaAu,
+    feeCumAu,
+    burnDeltaAu,
+    burnCumAu,
+    priceDerivations,
+  }) {
     if ((await this.get(`ev/dep/${epoch}`)) === null) {
       await this.put(`ev/dep/${epoch}`, {
         type: 'deposit_root',
@@ -9947,6 +10076,9 @@ class MayhemContract extends Contract {
       merkle_root: roots.fee,
       au_fee_epoch: feeDeltaAu,
       au_fee_cum: feeCumAu,
+      au_burn_epoch: burnDeltaAu,
+      au_burn_cum: burnCumAu,
+      tap_burn_bps: TAP_BURN_BPS,
       sweep_msb_tx_hash: null,
       ts: at,
       updated_at: this.tx,
@@ -10336,6 +10468,20 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       last_fee_bps: null,
+    };
+  }
+
+  async burnCumRecord(rail) {
+    const normalizedRail = this.normalizeLedgerRail(rail, 'burn rail');
+    if (normalizedRail instanceof Error) return normalizedRail;
+    return (await this.get(this.burnCumKey(normalizedRail))) ?? {
+      rail: normalizedRail,
+      denom: PRICE_DENOMINATION,
+      cum_au: ZERO_AU,
+      updated_epoch: 0,
+      updated_at: null,
+      last_apply_hash: null,
+      burn_bps: normalizedRail === 'tap' ? TAP_BURN_BPS : 0,
     };
   }
 

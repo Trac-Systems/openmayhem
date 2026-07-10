@@ -1553,6 +1553,10 @@ struct ReceiptsExportArgs {
     #[arg(long, default_value_t = 0)]
     prior_fee_cum_au: MoneyAu,
 
+    /// Prior cumulative TAP burn before this epoch.
+    #[arg(long, default_value_t = 0)]
+    prior_burn_cum_au: MoneyAu,
+
     /// Path to intercom/scripts/recompute-epoch-roots.mjs.
     #[arg(long, value_name = "PATH")]
     verifier_script: Option<PathBuf>,
@@ -25936,6 +25940,7 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
         payouts,
         prior_earnings,
         prior_fee_cum_au: args.prior_fee_cum_au,
+        prior_burn_cum_au: args.prior_burn_cum_au,
     };
 
     let output_path = args
@@ -28852,6 +28857,27 @@ fn verify_epoch_evidence(
         evidence.fee.as_ref(),
         "au_fee_cum",
     );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.au_burn_epoch"),
+        &totals["burn_au"],
+        evidence.fee.as_ref(),
+        "au_burn_epoch",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.au_burn_cum"),
+        &totals["burn_cum_au"],
+        evidence.fee.as_ref(),
+        "au_burn_cum",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.tap_burn_bps"),
+        &json!(1_000),
+        evidence.fee.as_ref(),
+        "tap_burn_bps",
+    );
     checks
 }
 
@@ -29239,6 +29265,8 @@ struct EpochAuditBundle {
     #[serde(default)]
     #[serde(with = "mayhem_proto::decimal_u128")]
     prior_fee_cum_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    prior_burn_cum_au: MoneyAu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46615,6 +46643,8 @@ mod tests {
             "earn_au": "1700",
             "fee_au": "300",
             "fee_cum_au": "300",
+            "burn_au": "0",
+            "burn_cum_au": "0",
         });
 
         let commit = admin_epoch_commit_payload(&AdminEpochCommitArgs {
@@ -47739,6 +47769,7 @@ mod tests {
             payouts: Vec::new(),
             prior_earnings: BTreeMap::new(),
             prior_fee_cum_au: 0,
+            prior_burn_cum_au: 0,
         };
 
         let value = serde_json::to_value(bundle).unwrap();
@@ -52374,6 +52405,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "earn_au": "6",
                 "fee_au": "7",
                 "fee_cum_au": "8",
+                "burn_au": "9",
+                "burn_cum_au": "10",
             }
         });
         let evidence = EpochEvidenceSnapshot {
@@ -52397,11 +52430,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "merkle_root": "d".repeat(64),
                 "au_fee_epoch": "7",
                 "au_fee_cum": "8",
+                "au_burn_epoch": "9",
+                "au_burn_cum": "10",
+                "tap_burn_bps": 1_000,
             })),
         };
 
         let checks = verify_epoch_evidence(4, &recomputed, &evidence);
-        assert_eq!(checks.len(), 13);
+        assert_eq!(checks.len(), 16);
         assert!(checks.iter().all(|check| check.ok));
 
         let mismatched = EpochEvidenceSnapshot {
@@ -52409,6 +52445,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "merkle_root": "d".repeat(64),
                 "au_fee_epoch": "7",
                 "au_fee_cum": "9",
+                "au_burn_epoch": "9",
+                "au_burn_cum": "10",
+                "tap_burn_bps": 1_000,
             })),
             ..evidence
         };

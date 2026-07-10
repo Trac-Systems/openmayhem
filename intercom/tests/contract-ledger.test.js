@@ -55,7 +55,12 @@ const seededBalance = (user, au, rail = 'fiat') => ({
 
 const paymentKeys = (storage) =>
   Array.from(storage.values.keys())
-    .filter((key) => key.startsWith('bal/') || key.startsWith('earn/') || key.startsWith('fee/'))
+    .filter((key) => (
+      key.startsWith('bal/') ||
+      key.startsWith('earn/') ||
+      key.startsWith('fee/') ||
+      key.startsWith('burn/')
+    ))
     .sort();
 
 const makeEpochApply = (epoch, user, provider, grossAu) => {
@@ -1001,6 +1006,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     debited_au: '1500',
     earned_au: '1275',
     fee_au: '225',
+    burn_au: '0',
     rails: ['fiat'],
   });
 
@@ -1048,6 +1054,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     debited_au: '0',
     earned_au: '0',
     fee_au: '0',
+    burn_au: '0',
   });
   assert.equal(storage.snapshotBytes(), snapshotBeforeReplay);
 
@@ -1166,6 +1173,7 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   assert.deepEqual(paymentKeys(left.storage), paymentKeysAfterFirst);
   assert.deepEqual(paymentKeysAfterFirst, [
     `bal/${identities.user.publicKey}/fiat`,
+    'burn/fiat/cum',
     `earn/fiat/${identities.provider.publicKey}`,
     'fee/fiat/cum',
   ].sort());
@@ -1275,6 +1283,53 @@ test('MayhemContract epochApply computes large fee bps with exact BigInt math', 
   assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '0');
   assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, expectedProvider.toString());
   assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, expectedFee.toString());
+});
+
+test('MayhemContract applies TAP 75/15/10 without burning fiat or TNK', async () => {
+  const { admin, provider, user, storage, contract } = await setupLedgerContract();
+  const rails = ['fiat', 'tap', 'tnk'];
+  const setRails = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    { op: 'set_provider_rails', rails },
+    provider.publicKey,
+    6
+  );
+  assert.equal(setRails.ok, true, setRails.message);
+  for (const rail of rails) {
+    await storage.put(`bal/${user.publicKey}/${rail}`, seededBalance(user.publicKey, 10_000, rail));
+  }
+  const apply = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: rails.map((rail) => ({ rail, user: user.publicKey, au: '10000' })),
+    earnings: rails.map((rail) => ({ rail, provider: provider.publicKey, gross_au: '10000' })),
+  };
+  await seedSpendHoldsForApply(storage, apply);
+
+  const result = await executeEpochApplyFeature(contract, storage, apply, admin.publicKey);
+  assert.deepEqual(result, {
+    ok: true,
+    op: 'epochApply',
+    epoch: 1,
+    idempotent: false,
+    debited_au: '30000',
+    earned_au: '24500',
+    fee_au: '4500',
+    burn_au: '1000',
+    rails,
+  });
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, '8500');
+  assert.equal((await storage.get(`earn/tap/${provider.publicKey}`)).value.total_au, '7500');
+  assert.equal((await storage.get(`earn/tnk/${provider.publicKey}`)).value.total_au, '8500');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '1500');
+  assert.equal((await storage.get('fee/tap/cum')).value.cum_au, '1500');
+  assert.equal((await storage.get('fee/tnk/cum')).value.cum_au, '1500');
+  assert.equal((await storage.get('burn/fiat/cum')).value.cum_au, '0');
+  assert.equal((await storage.get('burn/tap/cum')).value.cum_au, '1000');
+  assert.equal((await storage.get('burn/tnk/cum')).value.cum_au, '0');
 });
 
 test('MayhemContract au helpers reject numeric money inputs', async () => {
