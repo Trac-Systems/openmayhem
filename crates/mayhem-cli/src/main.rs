@@ -16555,13 +16555,13 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             shell_single_quote(&feature_json)
         )
     });
-    let msb_app_path = repo_path("intercom/trac/msb")?;
+    let msb_app_path = repo_path("intercom")?;
     let msb_transfer_commands = plan
         .msb_outputs
         .iter()
         .map(|output| {
             format!(
-                "pear-runtime run {} --transfer-helper transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --to {} --amount {} --timeout-seconds {} --max-retries {}",
+                "pear-runtime run {} --msb-transfer-helper=transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --to {} --amount {} --timeout-seconds {} --max-retries {}",
                 shell_single_quote(&msb_app_path.display().to_string()),
                 shell_single_quote(&network),
                 shell_single_quote(&output.to),
@@ -27969,20 +27969,22 @@ async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let msb_app = repo_path("intercom/trac/msb")?;
+    let (command, helper_args) = args
+        .split_first()
+        .context("MSB transfer helper command is required")?;
+    let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
-    let mut helper_args = vec!["--transfer-helper".to_owned()];
-    helper_args.extend(args);
     let output = Command::new(&pear_runtime)
         .arg("run")
-        .arg(&msb_app)
+        .arg(&intercom_app)
+        .arg(format!("--msb-transfer-helper={command}"))
         .args(helper_args)
         .output()
         .await
         .with_context(|| {
             format!(
                 "running MSB transfer helper via pear-runtime app {}",
-                msb_app.display()
+                intercom_app.display()
             )
         })?;
     if !output.status.success() {

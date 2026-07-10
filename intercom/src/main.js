@@ -20,7 +20,27 @@ import MayhemFeature, {
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
 } from '../features/mayhem/index.js';
 
-const { env, storeLabel, flags } = getPearRuntime();
+const { argv, env, storeLabel, flags } = getPearRuntime();
+
+if (flags['msb-transfer-helper']) {
+  try {
+    const marker = argv.findIndex((arg) =>
+      String(arg).startsWith('--msb-transfer-helper')
+    );
+    const rawMarker = marker >= 0 ? String(argv[marker]) : '';
+    const command = rawMarker.includes('=')
+      ? rawMarker.slice(rawMarker.indexOf('=') + 1)
+      : String(argv[marker + 1] || '');
+    const helperArgs = argv.slice(marker + (rawMarker.includes('=') ? 1 : 2));
+    const { runRootMsbTransferHelper } = await import('./msb-transfer-helper.js');
+    const output = await runRootMsbTransferHelper(command, helperArgs);
+    console.log(JSON.stringify(output));
+    Bare.exit(0);
+  } catch (error) {
+    console.error(error?.message ?? error);
+    Bare.exit(1);
+  }
+}
 
 if (flags['wallet-helper']) {
   try {
