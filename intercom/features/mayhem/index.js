@@ -189,6 +189,7 @@ class MayhemFeature extends Feature {
       this.processed.set(expectedId, cached);
     }
     const response = await cached.promise;
+    if (response?.ok !== true) this.processed.delete(expectedId);
     this.peer.sidechannel.broadcast(this.channel, {
       control: RELAY_CONTROL_RESULT,
       version: RELAY_VERSION,
@@ -220,6 +221,11 @@ class MayhemFeature extends Feature {
   async _applyRelayed(key, value, requestId) {
     const nonce = requestId;
     const hash = this.peer.wallet.sign(`${JSON.stringify(value)}${nonce}`);
+    const resultKey = `fr/${hash}`;
+    const previousResult = (await this.peer.base.view.get(resultKey))?.value ?? null;
+    if (previousResult?.ok === true) {
+      return this._featureResponse(key, hash, resultKey, previousResult);
+    }
     await this.peer.base.append({
       type: 'feature',
       key: `${this.key}_${key}`,
@@ -234,8 +240,8 @@ class MayhemFeature extends Feature {
         },
       },
     });
-    const resultKey = `fr/${hash}`;
-    const featureResult = await this._waitForResult(resultKey);
+    const featureResult =
+      (await this._waitForResult(resultKey, 10_000, previousResult)) ?? previousResult;
     if (!featureResult) {
       return {
         ok: false,
@@ -248,6 +254,10 @@ class MayhemFeature extends Feature {
         result_key: resultKey,
       };
     }
+    return this._featureResponse(key, hash, resultKey, featureResult);
+  }
+
+  _featureResponse(key, hash, resultKey, featureResult) {
     const ok = featureResult.ok === true;
     return {
       ok,
@@ -262,11 +272,14 @@ class MayhemFeature extends Feature {
     };
   }
 
-  async _waitForResult(key, timeoutMs = 10_000) {
+  async _waitForResult(key, timeoutMs = 10_000, previousResult = null) {
     const deadline = Date.now() + timeoutMs;
+    const previousJson = previousResult === null ? null : stableJson(previousResult);
     while (Date.now() <= deadline) {
       const result = await this.peer.base.view.get(key);
-      if (result !== null) return result.value;
+      if (result !== null && (previousJson === null || stableJson(result.value) !== previousJson)) {
+        return result.value;
+      }
       await this.sleep(50);
     }
     return null;

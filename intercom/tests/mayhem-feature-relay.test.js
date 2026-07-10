@@ -139,6 +139,59 @@ test('admin writer deduplicates a retried relay request by deterministic request
   assert.equal(writer.appended.length, 1);
 });
 
+test('admin writer retries a previously rejected deterministic relay request', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let attempts = 0;
+  writer.peer.base.append = async (op) => {
+    writer.appended.push(op);
+    attempts += 1;
+    const hash = op.value.dispatch.hash;
+    writer.state.set(
+      `fr/${hash}`,
+      attempts === 1
+        ? {
+            type: 'feature_result',
+            status: 'rejected',
+            ok: false,
+            result: null,
+            error: { message: 'Consent required for rules version 1.' },
+          }
+        : {
+            type: 'feature_result',
+            status: 'applied',
+            ok: true,
+            result: { ok: true, op: op.value.dispatch.value.op },
+            error: null,
+          }
+    );
+  };
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 1_000, retryMs: 100 });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const first = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+  const second = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+
+  assert.equal(first.ok, false);
+  assert.equal(second.ok, true);
+  assert.equal(writer.appended.length, 2);
+  assert.equal(
+    writer.appended[0].value.dispatch.hash,
+    writer.appended[1].value.dispatch.hash
+  );
+});
+
 test('relay rejects admin operations before network send', async () => {
   const participant = peerFor(providerKey);
   const feature = new MayhemFeature(participant.peer, {});
