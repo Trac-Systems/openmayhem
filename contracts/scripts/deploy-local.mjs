@@ -4,16 +4,13 @@
 // the same contracts without a standing node. No external network.
 import { ethers } from 'ethers';
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { compileAll } from './compile.mjs';
+import { ADDRESSES_FILE } from './paths.mjs';
 import {
   TAP_DEPLOYER_SIGNER_ENV,
   walletFromEnv,
 } from './signer-env.mjs';
-
-const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-export const ADDRESSES_FILE = join(REPO, '.mayhem-local', 'contracts', 'eth-addresses.json');
 
 /** Deploy ONLY the MayhemInferencePool bound to an EXISTING token (no mock). Public deployments should call this
  *  with canonical TAP. `maxEpochDelta` is the C1 per-epoch spend cap (0 = disabled). */

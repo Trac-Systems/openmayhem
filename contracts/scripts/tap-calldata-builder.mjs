@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ethers } from 'ethers';
 
-import { ADDRESSES_FILE } from './deploy-local.mjs';
+import { ADDRESSES_FILE } from './paths.mjs';
 import { claimProofForAccount } from './tap-claim-proof.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
