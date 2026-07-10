@@ -1388,22 +1388,143 @@ export async function resolveTapSettlementEpochPolicy({
   };
 }
 
-async function resolveTapUsdAu({ tapUsdAu, peerRpcUrl, fetchImpl } = {}) {
-  if (tapUsdAu !== undefined && tapUsdAu !== null && tapUsdAu !== '') {
-    return safeAu(tapUsdAu, '--tap-usd-au').toString();
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isObject(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(',')}}`;
   }
-  const rate = await readContractStateValue(peerRpcUrl, 'tap/rate/latest', { fetchImpl });
-  return safeAu(rate?.tap_usd_au, 'tap/rate/latest.tap_usd_au').toString();
+  return JSON.stringify(value);
+}
+
+function settlementBundleSha256(bundle) {
+  return crypto.createHash('sha256').update(stableJson(bundle)).digest('hex');
+}
+
+function tapRateRecordToLock(rate, bundle, admin) {
+  const epoch = parsePositiveInt(bundle?.epoch, 'settlement bundle epoch');
+  if (!isObject(rate) || rate.denom !== 'tap_usd_au') {
+    throw new Error('confirmed tap/rate/latest is missing or invalid');
+  }
+  const tapUsdAu = safeAu(rate.tap_usd_au, 'tap/rate/latest.tap_usd_au').toString();
+  const rateTs = parseNonNegativeInt(rate.ts, 'tap/rate/latest.ts');
+  const source = String(rate.source ?? '').trim();
+  if (!source || source.length > 64) throw new Error('tap/rate/latest.source is invalid');
+  if (!isHexBytes(rate.posted_by, 32) || rate.posted_by_role !== 'admin') {
+    throw new Error('tap/rate/latest is not admin-posted');
+  }
+  if (!isHexBytes(admin, 32) || rate.posted_by.toLowerCase() !== admin.toLowerCase()) {
+    throw new Error('tap/rate/latest was not posted by the current admin');
+  }
+  const rateRecordKey = String(rate.updated_at ?? '').trim();
+  const expectedPrefix = `rate/tap/${rateTs}/`;
+  if (!rateRecordKey.startsWith(expectedPrefix) || !isHexBytes(rateRecordKey.slice(expectedPrefix.length), 32)) {
+    throw new Error('tap/rate/latest.updated_at is not a canonical TAP rate evidence key');
+  }
+  return {
+    type: 'tap_settlement_rate_lock',
+    epoch,
+    bundle_sha256: settlementBundleSha256(bundle),
+    denom: 'tap_usd_au',
+    tap_usd_au: tapUsdAu,
+    source,
+    rate_ts: rateTs,
+    rate_record_key: rateRecordKey,
+    posted_by: rate.posted_by.toLowerCase(),
+    posted_by_role: 'admin',
+  };
+}
+
+function validateTapRateLock(lock, bundle) {
+  if (!isObject(lock)) throw new Error('TAP settlement rate lock must be an object');
+  const expectedKeys = [
+    'bundle_sha256',
+    'denom',
+    'epoch',
+    'posted_by',
+    'posted_by_role',
+    'rate_record_key',
+    'rate_ts',
+    'source',
+    'tap_usd_au',
+    'type',
+  ];
+  const actualKeys = Object.keys(lock).sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)) {
+    throw new Error('TAP settlement rate lock has an invalid shape');
+  }
+  if (lock.type !== 'tap_settlement_rate_lock' || lock.denom !== 'tap_usd_au') {
+    throw new Error('TAP settlement rate lock type or denomination is invalid');
+  }
+  const epoch = parsePositiveInt(bundle?.epoch, 'settlement bundle epoch');
+  if (lock.epoch !== epoch) throw new Error('TAP settlement rate lock epoch does not match bundle');
+  const bundleSha256 = settlementBundleSha256(bundle);
+  if (lock.bundle_sha256 !== bundleSha256) {
+    throw new Error('TAP settlement rate lock does not match bundle content');
+  }
+  safeAu(lock.tap_usd_au, 'TAP settlement rate lock tap_usd_au');
+  const rateTs = parseNonNegativeInt(lock.rate_ts, 'TAP settlement rate lock rate_ts');
+  const expectedPrefix = `rate/tap/${rateTs}/`;
+  if (!String(lock.rate_record_key).startsWith(expectedPrefix)
+    || !isHexBytes(String(lock.rate_record_key).slice(expectedPrefix.length), 32)) {
+    throw new Error('TAP settlement rate lock evidence key is invalid');
+  }
+  if (!isHexBytes(lock.posted_by, 32) || lock.posted_by_role !== 'admin') {
+    throw new Error('TAP settlement rate lock admin evidence is invalid');
+  }
+  if (typeof lock.source !== 'string' || !lock.source || lock.source.length > 64) {
+    throw new Error('TAP settlement rate lock source is invalid');
+  }
+  return lock;
+}
+
+function createRateLockFile(lockPath, lock) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const tempPath = `${lockPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(lock, null, 2)}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o600,
+  });
+  try {
+    fs.linkSync(tempPath, lockPath);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
+}
+
+export async function resolveTapSettlementRate({
+  bundle,
+  tapRateLockPath,
+  peerRpcUrl,
+  fetchImpl,
+} = {}) {
+  if (!tapRateLockPath) {
+    throw new Error('TAP settlement requires --tap-rate-lock <path>');
+  }
+  const lockPath = path.resolve(tapRateLockPath);
+  if (fs.existsSync(lockPath)) {
+    return validateTapRateLock(readJson(lockPath, 'TAP settlement rate lock'), bundle);
+  }
+  const [rate, admin] = await Promise.all([
+    readContractStateValue(peerRpcUrl, 'tap/rate/latest', { confirmed: true, fetchImpl }),
+    readContractStateValue(peerRpcUrl, 'admin', { confirmed: true, fetchImpl }),
+  ]);
+  createRateLockFile(lockPath, tapRateRecordToLock(rate, bundle, admin));
+  return validateTapRateLock(readJson(lockPath, 'TAP settlement rate lock'), bundle);
 }
 
 function buildReplayCommand({
   bundlePath,
   peerRpcUrl,
   buyerAccountsPath,
-  tapUsdAu,
+  tapRateLockPath,
   ledgerFeeBps,
   priorPath,
-  ethRpc,
   poolAddress,
   operatorAddress,
   epoch,
@@ -1414,10 +1535,9 @@ function buildReplayCommand({
   if (bundlePath) args.push('--bundle', bundlePath);
   if (peerRpcUrl) args.push('--peer-rpc', peerRpcUrl);
   if (buyerAccountsPath) args.push('--buyer-accounts', buyerAccountsPath);
-  if (tapUsdAu) args.push('--tap-usd-au', String(tapUsdAu));
+  if (tapRateLockPath) args.push('--tap-rate-lock', tapRateLockPath);
   if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
   if (priorPath) args.push('--prior', priorPath);
-  if (ethRpc) args.push('--eth-rpc', ethRpc);
   if (poolAddress) args.push('--pool', poolAddress);
   if (operatorAddress) args.push('--operator-address', operatorAddress);
   if (epoch) args.push('--epoch', String(epoch));
@@ -1433,6 +1553,9 @@ async function main() {
   }
   if (args['owner-index'] !== undefined) {
     throw new Error(`--owner-index has been retired. Set ${TAP_ROLLER_SIGNER_ENV} in the environment instead.`);
+  }
+  if (args['tap-usd-au'] !== undefined) {
+    throw new Error('--tap-usd-au is not supported; settlement must use --tap-rate-lock backed by confirmed ledger evidence');
   }
   const bundlePath = args.bundle || args['receipts-file'];
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
@@ -1456,10 +1579,13 @@ async function main() {
   const epochPolicy = await resolveTapSettlementEpochPolicy({
     peerRpcUrl,
   });
-  const tapUsdAu = await resolveTapUsdAu({
-    tapUsdAu: args['tap-usd-au'],
+  const tapRateLockPath = args['tap-rate-lock'];
+  const tapRateLock = await resolveTapSettlementRate({
+    bundle,
+    tapRateLockPath,
     peerRpcUrl,
   });
+  const tapUsdAu = tapRateLock.tap_usd_au;
   const ledgerFeeBps = args['ledger-fee-bps'];
 
   const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
@@ -1497,14 +1623,14 @@ async function main() {
     post: confirm,
   });
   if (signerEnvName) report.signer_env = signerEnvName;
+  report.tap_rate_lock = tapRateLock;
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
     peerRpcUrl,
     buyerAccountsPath,
-    tapUsdAu,
+    tapRateLockPath,
     ledgerFeeBps,
     priorPath,
-    ethRpc,
     poolAddress,
     operatorAddress,
     epoch: report.epoch,
@@ -1516,10 +1642,9 @@ async function main() {
       bundlePath,
       peerRpcUrl,
       buyerAccountsPath,
-      tapUsdAu,
+      tapRateLockPath,
       ledgerFeeBps,
       priorPath,
-      ethRpc,
       poolAddress,
       operatorAddress,
       epoch: report.epoch,

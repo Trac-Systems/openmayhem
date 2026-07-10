@@ -20,6 +20,7 @@ while true; do
 
   name="$(basename "$bundle" .receipts.json)"
   buyer_accounts="$ready/$name.buyers.json"
+  rate_lock="$working/$name.tap-rate.json"
   dry_report="$working/$name.dry-run.json"
   final_report="$working/$name.settlement.json"
   fee_bps="$(jq -er '.params.fee_bps' "$bundle")" || {
@@ -31,6 +32,7 @@ while true; do
   args=(
     /usr/bin/node "$repo/contracts/scripts/tap-settlement-roller.mjs"
     --bundle "$bundle"
+    --tap-rate-lock "$rate_lock"
     --ledger-fee-bps "$fee_bps"
     --peer-rpc "${MAYHEM_PEER_RPC:-http://127.0.0.1:49223/v1}"
     --eth-rpc "$MAYHEM_TAP_ETH_RPC"
@@ -74,7 +76,8 @@ while true; do
 
   install -m 600 "$final_report" "$processed/$name.settlement.json"
   install -m 600 "$final_report" "$processed/latest.json"
+  install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
   mv "$bundle" "$processed/"
   [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
-  rm -f "$dry_report" "$final_report"
+  rm -f "$rate_lock" "$dry_report" "$final_report"
 done

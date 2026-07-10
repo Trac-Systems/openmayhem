@@ -21,6 +21,7 @@ import {
   auToTapWei,
   providerShareWei,
   resolveProviderAccountsFromLedger,
+  resolveTapSettlementRate,
   resolveTapSettlementEpochPolicy,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
@@ -107,6 +108,70 @@ test('TAP settlement resolves provider claim addresses only from current admin l
       fetchImpl,
     }),
     /current admin/
+  );
+});
+
+test('TAP settlement rate lock survives oracle updates and rejects a different bundle', async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-tap-rate-lock-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const lockPath = path.join(tmp, 'epoch-1.tap-rate.json');
+  const admin = 'aa'.repeat(32);
+  const rateKey = `rate/tap/3600/${'bb'.repeat(32)}`;
+  const bundle = { epoch: 1, receipts: [] };
+  let fetches = 0;
+  const fetchImpl = async (url) => {
+    fetches += 1;
+    const key = new URL(url).searchParams.get('key');
+    return {
+      ok: true,
+      async json() {
+        if (key === 'admin') return { value: admin };
+        if (key === 'tap/rate/latest') {
+          return {
+            value: {
+              denom: 'tap_usd_au',
+              tap_usd_au: TAP_USD_AU,
+              source: 'uniswap-v2',
+              ts: 3_600,
+              updated_at: rateKey,
+              posted_by: admin,
+              posted_by_role: 'admin',
+            },
+          };
+        }
+        return { value: null };
+      },
+    };
+  };
+
+  const first = await resolveTapSettlementRate({
+    bundle,
+    tapRateLockPath: lockPath,
+    peerRpcUrl: 'http://127.0.0.1:1/v1',
+    fetchImpl,
+  });
+  assert.equal(first.tap_usd_au, TAP_USD_AU);
+  assert.equal(first.rate_record_key, rateKey);
+  assert.equal(fetches, 2);
+  assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
+
+  const replay = await resolveTapSettlementRate({
+    bundle,
+    tapRateLockPath: lockPath,
+    peerRpcUrl: 'http://127.0.0.1:1/v1',
+    fetchImpl: async () => {
+      throw new Error('a replay must never refetch mutable tap/rate/latest');
+    },
+  });
+  assert.deepEqual(replay, first);
+  await assert.rejects(
+    resolveTapSettlementRate({
+      bundle: { epoch: 1, receipts: [{ changed: true }] },
+      tapRateLockPath: lockPath,
+      peerRpcUrl: 'http://127.0.0.1:1/v1',
+      fetchImpl,
+    }),
+    /does not match bundle content/
   );
 });
 
@@ -690,6 +755,15 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     ['admin', admin],
     ['epoch/apply/state', { updated_epoch: 7 }],
     ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
+    ['tap/rate/latest', {
+      denom: 'tap_usd_au',
+      tap_usd_au: String(TAP_USD_AU),
+      source: 'uniswap-v2',
+      ts: 3_600,
+      updated_at: `rate/tap/3600/${'bb'.repeat(32)}`,
+      posted_by: admin,
+      posted_by_role: 'admin',
+    }],
     [`prov/${providerId.publicKeyHex}`, {
       status: 'active',
       payout: {
@@ -714,7 +788,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     SCRIPT_PATH,
     '--bundle', bundlePath,
     '--peer-rpc', ledgerRpc,
-    '--tap-usd-au', String(TAP_USD_AU),
+    '--tap-rate-lock', path.join(tmp, 'epoch-1.tap-rate.json'),
     '--ledger-fee-bps', '1500',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
@@ -730,6 +804,13 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.notEqual(localPolicyOverride.status, 0);
   assert.match(localPolicyOverride.stderr, /active admin ledger state/);
 
+  const rawRateOverride = await runNode([...baseArgs, '--tap-usd-au', TAP_USD_AU], {
+    cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
+    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+  });
+  assert.notEqual(rawRateOverride.status, 0);
+  assert.match(rawRateOverride.stderr, /not supported.*rate-lock/i);
+
   const missingKey = await runNode(baseArgs, {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
     env: baseEnv,
@@ -744,6 +825,8 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(dryRun.status, 0, dryRun.stderr);
   const report = JSON.parse(dryRun.stdout);
   assert.equal(report.posted, false);
+  assert.equal(report.tap_rate_lock.tap_usd_au, TAP_USD_AU);
+  assert.equal(report.tap_rate_lock.epoch, 1);
   assert.equal(report.signer_env, 'MAYHEM_TAP_ROLLER_PRIVATE_KEY');
   assert.equal(report.signing_address, (await operator.getAddress()).toLowerCase());
   assert.equal(report.set_root_dry_run.ok, true);
@@ -771,6 +854,8 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     /--(?:settle-through-epoch|challenge-epochs|holdback-epochs)/
   );
   assert.doesNotMatch(JSON.stringify(report), new RegExp(OPERATOR_KEY.slice(2), 'i'));
+  assert.doesNotMatch(report.copy_paste_replay_command, /--eth-rpc/);
+  assert.doesNotMatch(report.copy_paste_replay_command, new RegExp(rpc.replaceAll('.', '\\.')));
   assert.equal(await pool.epoch(), 0n);
 
   const confirmed = await runNode([...baseArgs, '--confirm'], {
