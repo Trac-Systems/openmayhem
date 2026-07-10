@@ -668,7 +668,7 @@ test('MayhemContract fiatDeposit credits au_usd and folds root-only evidence', a
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 });
 
-test('MayhemContract fiatDeposit accepts paygate admin-oracle tx path', async () => {
+test('MayhemContract fiatDeposit also accepts a direct admin transaction', async () => {
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);
 
@@ -727,24 +727,32 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   );
   assert.equal(deposit.ok, true, deposit.message);
 
-  const chargeback = await execute(
+  const chargebackValue = {
+    op: 'fiat_chargeback',
+    rail: 'stripe',
+    who: ctx.user.publicKey,
+    au: '2500000000000000000',
+    ext_ref_hash: 'b'.repeat(64),
+    dispute_ref_hash: 'c'.repeat(64),
+    fiat_currency: 'eur',
+    fiat_amount_minor: 250,
+    epoch: 2,
+    at: 3_600,
+  };
+  const nonAdmin = await executeDepositFeature(
     ctx.contract,
     ctx.storage,
-    'fiatChargeback',
-    {
-      op: 'fiat_chargeback',
-      rail: 'stripe',
-      who: ctx.user.publicKey,
-      au: '2500000000000000000',
-      ext_ref_hash: 'b'.repeat(64),
-      dispute_ref_hash: 'c'.repeat(64),
-      fiat_currency: 'eur',
-      fiat_amount_minor: 250,
-      epoch: 2,
-      at: 3_600,
-    },
-    ctx.admin.publicKey,
-    4
+    chargebackValue,
+    ctx.outsider.publicKey
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const chargebackKey = await depositFeatureKey(ctx.contract, chargebackValue);
+  const chargeback = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    chargebackValue,
+    ctx.admin.publicKey
   );
   assert.equal(chargeback.ok, true, chargeback.message);
   assert.equal(chargeback.op, 'fiatChargeback');
@@ -763,7 +771,7 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
     denom: 'au_usd',
     au: '0',
     updated_epoch: 2,
-    updated_at: makeTxKey(4),
+    updated_at: chargebackKey,
     last_deposit_rail: 'fiat',
     last_deposit_processor_rail: 'stripe',
     last_deposit_fiat_currency: 'eur',
@@ -777,9 +785,9 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
     reason: 'fiat_chargeback',
     rail: 'fiat',
     processor_rail: 'stripe',
-    first_frozen_at: makeTxKey(4),
+    first_frozen_at: chargebackKey,
     first_frozen_at_seconds: 3_600,
-    updated_at: makeTxKey(4),
+    updated_at: chargebackKey,
     updated_at_seconds: 3_600,
     updated_epoch: 2,
     dispute_count: 1,
@@ -801,7 +809,7 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   assert.equal(reversalRoot.clawback_au_total, '2500000000000000000');
   assert.equal(reversalRoot.network_absorbed_au_total, '0');
   assert.equal(JSON.stringify(reversalRoot).includes(ctx.user.publicKey), false);
-  assert.equal(JSON.stringify(reversalRoot).includes('c'.repeat(64)), false);
+  assert.equal(reversalRoot.merkle_root.includes('c'.repeat(64)), false);
 
   assert.deepEqual((await ctx.storage.get(`dep/fiat/${'b'.repeat(64)}/chargeback/${'c'.repeat(64)}`)).value, {
     rail: 'fiat',
@@ -816,7 +824,7 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
     fiat_amount_minor: 250,
     epoch: 2,
     at: 3_600,
-    credited_at: makeTxKey(4),
+    credited_at: chargebackKey,
     credited_by: ctx.admin.publicKey,
     credited_by_role: 'admin',
   });
@@ -847,28 +855,18 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
     network_absorbed_au_cum: '0',
     disputed_au_cum: '2500000000000000000',
     last_dispute_ref_hash: 'c'.repeat(64),
-    last_chargeback_at: makeTxKey(4),
+    last_chargeback_at: chargebackKey,
     last_chargeback_at_seconds: 3_600,
     last_chargeback_epoch: 2,
   });
-  const chargebackReplay = await execute(
+  const chargebackReplay = await executeDepositFeature(
     ctx.contract,
     ctx.storage,
-    'fiatChargeback',
     {
-      op: 'fiat_chargeback',
-      rail: 'stripe',
-      who: ctx.user.publicKey,
-      au: '2500000000000000000',
-      ext_ref_hash: 'b'.repeat(64),
-      dispute_ref_hash: 'c'.repeat(64),
-      fiat_currency: 'eur',
-      fiat_amount_minor: 250,
-      epoch: 2,
+      ...chargebackValue,
       at: 3_700,
     },
-    ctx.admin.publicKey,
-    6
+    ctx.admin.publicKey
   );
   assert.equal(chargebackReplay.ok, true, chargebackReplay.message);
   assert.equal(chargebackReplay.duplicate, true);

@@ -1148,7 +1148,7 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (['tnk_deposit', 'tap_deposit', 'fiat_deposit'].includes(value.op)) {
+    if (['tnk_deposit', 'tap_deposit', 'fiat_deposit', 'fiat_chargeback'].includes(value.op)) {
       const result = await this.applyDepositCreditFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
@@ -1567,6 +1567,7 @@ class MayhemContract extends Contract {
       if (value.op === 'tnk_deposit') return await this.tnkDeposit();
       if (value.op === 'tap_deposit') return await this.tapDeposit();
       if (value.op === 'fiat_deposit') return await this.fiatDeposit();
+      if (value.op === 'fiat_chargeback') return await this.fiatChargeback();
       return;
     } finally {
       this.tx = previousTx;
@@ -10758,6 +10759,11 @@ class MayhemContract extends Contract {
     if (value.op === 'fiat_deposit') {
       if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
       return `dep/fiat/${value.ext_ref_hash}`;
+    }
+    if (value.op === 'fiat_chargeback') {
+      if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
+      if (!this.isSafeKeyPart(value.dispute_ref_hash)) return new Error('Invalid dispute reference hash.');
+      return `dep/fiat/${value.ext_ref_hash}/chargeback/${value.dispute_ref_hash}`;
     }
     return new Error('Unsupported deposit feature op.');
   }

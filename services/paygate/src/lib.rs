@@ -939,82 +939,82 @@ impl PeerRpcContractPoster {
         })
     }
 
-    async fn post_feature_value(
+    async fn post_admin_feature_value(
         &self,
-        oracle: &OracleKeypair,
-        command_type: &str,
+        feature_key: &str,
         value: Value,
     ) -> Result<ContractPostResult> {
-        let nonce_response: Value = self
-            .http
-            .get(self.endpoint("contract/nonce"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let nonce = nonce_response
-            .get("nonce")
-            .and_then(Value::as_str)
-            .ok_or_else(|| PaygateError::Contract("nonce response missing nonce".to_owned()))?;
-        let prepared_command = json!({
-            "type": command_type,
-            "value": value,
-        });
-        let prepared: Value = self
-            .http
-            .post(self.endpoint("contract/tx/prepare"))
-            .json(&json!({
-                "prepared_command": prepared_command,
-                "address": oracle.public_key_hex(),
-                "nonce": nonce,
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let tx = prepared
-            .get("tx")
-            .and_then(Value::as_str)
-            .ok_or_else(|| PaygateError::Contract("prepare response missing tx".to_owned()))?
-            .to_owned();
-        let command_hash = prepared
-            .get("command_hash")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let signature = oracle.sign_tx_hex(&tx)?;
+        if self.dry_run {
+            return Err(PaygateError::Contract(
+                "admin feature submission cannot run with contract.dry_run enabled".to_owned(),
+            ));
+        }
         let submitted: Value = self
             .http
-            .post(self.endpoint("contract/tx"))
+            .post(self.endpoint("contract/feature"))
             .json(&json!({
-                "tx": tx,
-                "prepared_command": prepared_command,
-                "address": oracle.public_key_hex(),
-                "signature": signature,
-                "nonce": nonce,
-                "sim": self.dry_run,
+                "feature": "mayhem",
+                "key": feature_key,
+                "value": value,
             }))
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-        let result = submitted
-            .get("result")
-            .cloned()
-            .unwrap_or_else(|| submitted.clone());
-        let accepted = result.get("ok").and_then(Value::as_bool) == Some(true)
-            || (result.get("local").and_then(Value::as_bool) == Some(true)
-                && result.get("txo").is_some());
-        if !accepted {
-            return Err(PaygateError::Contract(result.to_string()));
+        let applied = submitted.get("ok").and_then(Value::as_bool) == Some(true)
+            && submitted.get("status").and_then(Value::as_str) == Some("applied")
+            && submitted.get("key").and_then(Value::as_str) == Some(feature_key);
+        if !applied {
+            return Err(PaygateError::Contract(format!(
+                "admin feature was not applied: {submitted}"
+            )));
         }
+        let feature_result = submitted.get("result").ok_or_else(|| {
+            PaygateError::Contract("applied feature response missing result".to_owned())
+        })?;
+        if feature_result.get("ok").and_then(Value::as_bool) != Some(true)
+            || feature_result.get("status").and_then(Value::as_str) != Some("applied")
+            || feature_result.get("feature_key").and_then(Value::as_str) != Some(feature_key)
+        {
+            return Err(PaygateError::Contract(format!(
+                "admin feature result was not applied: {feature_result}"
+            )));
+        }
+        let result = feature_result.get("result").cloned().ok_or_else(|| {
+            PaygateError::Contract("applied feature response missing contract result".to_owned())
+        })?;
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(PaygateError::Contract(format!(
+                "admin feature contract result was not successful: {result}"
+            )));
+        }
+        let tx = submitted
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PaygateError::Contract("feature response missing hash".to_owned()))?
+            .to_owned();
         Ok(ContractPostResult {
             tx,
-            command_hash,
+            command_hash: None,
             result,
         })
+    }
+
+    async fn require_state_fields(&self, key: &str, expected: &[(&str, Value)]) -> Result<()> {
+        let record = self.read_state_value(key).await?.ok_or_else(|| {
+            PaygateError::Contract(format!(
+                "applied feature did not create expected ledger state {key}"
+            ))
+        })?;
+        for (field, expected_value) in expected {
+            if record.get(*field) != Some(expected_value) {
+                return Err(PaygateError::Contract(format!(
+                    "ledger state {key} field {field} mismatch"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1035,23 +1035,67 @@ impl ContractPoster for PeerRpcContractPoster {
 
     fn post_fiat_deposit<'a>(
         &'a self,
-        oracle: &'a OracleKeypair,
+        _oracle: &'a OracleKeypair,
         feature: FiatDepositFeature,
     ) -> BoxFuture<'a, Result<ContractPostResult>> {
         Box::pin(async move {
-            self.post_feature_value(oracle, "fiatDeposit", serde_json::to_value(feature)?)
-                .await
+            let feature_key = format!("dep/fiat/{}", feature.ext_ref_hash);
+            let result = self
+                .post_admin_feature_value(&feature_key, serde_json::to_value(&feature)?)
+                .await?;
+            self.require_state_fields(
+                &feature_key,
+                &[
+                    ("rail", json!("fiat")),
+                    ("processor_rail", json!(feature.rail)),
+                    ("who", json!(&feature.who)),
+                    ("au", json!(feature.au.to_string())),
+                    ("ext_ref_hash", json!(&feature.ext_ref_hash)),
+                    ("fiat_currency", json!(&feature.fiat_currency)),
+                    ("fiat_amount_minor", json!(feature.fiat_amount_minor)),
+                    ("epoch", json!(feature.epoch)),
+                    ("at", json!(feature.at)),
+                    ("credited_at", json!(&feature_key)),
+                    ("credited_by_role", json!("admin")),
+                ],
+            )
+            .await?;
+            Ok(result)
         })
     }
 
     fn post_fiat_chargeback<'a>(
         &'a self,
-        oracle: &'a OracleKeypair,
+        _oracle: &'a OracleKeypair,
         feature: FiatChargebackFeature,
     ) -> BoxFuture<'a, Result<ContractPostResult>> {
         Box::pin(async move {
-            self.post_feature_value(oracle, "fiatChargeback", serde_json::to_value(feature)?)
-                .await
+            let feature_key = format!(
+                "dep/fiat/{}/chargeback/{}",
+                feature.ext_ref_hash, feature.dispute_ref_hash
+            );
+            let result = self
+                .post_admin_feature_value(&feature_key, serde_json::to_value(&feature)?)
+                .await?;
+            self.require_state_fields(
+                &feature_key,
+                &[
+                    ("rail", json!("fiat")),
+                    ("processor_rail", json!(feature.rail)),
+                    ("who", json!(&feature.who)),
+                    ("au", json!(feature.au.to_string())),
+                    ("ext_ref_hash", json!(&feature.ext_ref_hash)),
+                    ("dispute_ref_hash", json!(&feature.dispute_ref_hash)),
+                    ("fiat_currency", json!(&feature.fiat_currency)),
+                    ("fiat_amount_minor", json!(feature.fiat_amount_minor)),
+                    ("epoch", json!(feature.epoch)),
+                    ("at", json!(feature.at)),
+                    ("credited_at", json!(&feature_key)),
+                    ("credited_by_role", json!("admin")),
+                ],
+            )
+            .await?;
+            Ok(result)
         })
     }
 }

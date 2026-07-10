@@ -14,7 +14,8 @@ use axum::{
 use mayhem_paygate::{
     paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture,
     ContractPostResult, ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair,
-    PaygateConfig, PaygateState, RailConfig, StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
+    PaygateConfig, PaygateState, PeerRpcContractPoster, RailConfig, StripeSettings,
+    DEFAULT_STRIPE_API_BASE_URL,
 };
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
@@ -231,6 +232,135 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
     (format!("http://{addr}"), capture)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContractFeatureMode {
+    Applied,
+    Rejected,
+    MissingState,
+    MismatchedState,
+}
+
+#[derive(Clone)]
+struct ContractRpcCapture {
+    mode: ContractFeatureMode,
+    feature_requests: Arc<Mutex<Vec<Value>>>,
+    states: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+async fn mock_contract_feature(
+    State(capture): State<ContractRpcCapture>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    capture.feature_requests.lock().await.push(body.clone());
+    let key = body["key"].as_str().expect("feature key").to_owned();
+    let hash = "9".repeat(64);
+    if capture.mode == ContractFeatureMode::Rejected {
+        return Json(json!({
+            "ok": false,
+            "accepted": true,
+            "status": "rejected",
+            "feature": "mayhem",
+            "key": key,
+            "hash": hash,
+            "message": "Admin required.",
+            "result": {
+                "type": "feature_result",
+                "feature_key": key,
+                "hash": hash,
+                "status": "rejected",
+                "ok": false,
+                "result": null,
+                "error": {"name": "Error", "message": "Admin required."}
+            }
+        }));
+    }
+
+    let value = body["value"].clone();
+    let op = value["op"].as_str().expect("feature op");
+    if capture.mode != ContractFeatureMode::MissingState {
+        let mut state = json!({
+            "rail": "fiat",
+            "processor_rail": value["rail"],
+            "who": value["who"],
+            "au": value["au"],
+            "ext_ref_hash": value["ext_ref_hash"],
+            "fiat_currency": value["fiat_currency"],
+            "fiat_amount_minor": value["fiat_amount_minor"],
+            "epoch": value["epoch"],
+            "at": value["at"],
+            "credited_at": key,
+            "credited_by": "a".repeat(64),
+            "credited_by_role": "admin"
+        });
+        if op == "fiat_chargeback" {
+            state["dispute_ref_hash"] = value["dispute_ref_hash"].clone();
+        }
+        if capture.mode == ContractFeatureMode::MismatchedState {
+            state["au"] = json!("1");
+        }
+        capture.states.lock().await.insert(key.clone(), state);
+    }
+
+    let contract_op = match op {
+        "fiat_deposit" => "fiatDeposit",
+        "fiat_chargeback" => "fiatChargeback",
+        _ => "unknown",
+    };
+    Json(json!({
+        "ok": true,
+        "accepted": true,
+        "status": "applied",
+        "feature": "mayhem",
+        "key": key,
+        "hash": hash,
+        "message": "Feature applied.",
+        "result": {
+            "type": "feature_result",
+            "feature_key": key,
+            "hash": hash,
+            "status": "applied",
+            "ok": true,
+            "result": {"ok": true, "op": contract_op},
+            "error": null
+        }
+    }))
+}
+
+async fn mock_contract_state(
+    State(capture): State<ContractRpcCapture>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let key = query.get("key").cloned().unwrap_or_default();
+    let value = capture.states.lock().await.get(&key).cloned();
+    Json(json!({
+        "key": key,
+        "confirmed": false,
+        "value": value
+    }))
+}
+
+async fn start_mock_contract(mode: ContractFeatureMode) -> (String, ContractRpcCapture) {
+    let capture = ContractRpcCapture {
+        mode,
+        feature_requests: Arc::new(Mutex::new(Vec::new())),
+        states: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let app = Router::new()
+        .route("/contract/feature", post(mock_contract_feature))
+        .route("/state", get(mock_contract_state))
+        .with_state(capture.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock contract");
+    let addr = listener.local_addr().expect("mock contract local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock contract server");
+    });
+    (format!("http://{addr}"), capture)
+}
+
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
     let backfill_cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
     PaygateConfig {
@@ -275,6 +405,152 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_secs()
+}
+
+fn succeeded_payment_payload(event_id: &str, payment_intent: &str) -> String {
+    json!({
+        "id": event_id,
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": payment_intent,
+                "object": "payment_intent",
+                "latest_charge": format!("ch_{payment_intent}"),
+                "amount_received": 250,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_who": "b".repeat(64),
+                    "mayhem_au": "2500000000000000000",
+                    "mayhem_denom": "au_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "250"
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+async fn post_signed_webhook(app: Router, payload: &str) -> axum::response::Response {
+    let signature =
+        stripe_signature_header("whsec_test", payload.as_bytes(), now_seconds()).expect("sig");
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/stripe/webhook")
+            .header("stripe-signature", signature)
+            .body(Body::from(payload.to_owned()))
+            .expect("request builds"),
+    )
+    .await
+    .expect("router response")
+}
+
+#[tokio::test]
+async fn stripe_event_is_not_persisted_until_admin_feature_and_state_are_applied() {
+    for mode in [
+        ContractFeatureMode::Rejected,
+        ContractFeatureMode::MissingState,
+        ContractFeatureMode::MismatchedState,
+    ] {
+        let (contract_base, capture) = start_mock_contract(mode).await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let event_store_path = temp.path().join("stripe-events.jsonl");
+        let mut config = test_config("http://127.0.0.1:9".to_owned(), event_store_path.clone());
+        config.contract_rpc_url = contract_base;
+        config.contract_dry_run = false;
+        let state = PaygateState::try_new(
+            config,
+            OracleKeypair::from_seed_hex(&"61".repeat(32)).expect("oracle"),
+        )
+        .expect("state");
+        let payload = succeeded_payment_payload(
+            &format!("evt_contract_{mode:?}"),
+            &format!("pi_contract_{mode:?}"),
+        );
+
+        let response = post_signed_webhook(paygate_router(state), &payload).await;
+
+        assert_ne!(response.status(), StatusCode::OK, "mode {mode:?}");
+        assert!(
+            std::fs::read_to_string(&event_store_path)
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "mode {mode:?} must not persist the Stripe event"
+        );
+        let requests = capture.feature_requests.lock().await;
+        assert_eq!(requests.len(), 1, "mode {mode:?}");
+        assert_eq!(requests[0]["feature"], "mayhem");
+        assert_eq!(requests[0]["value"]["op"], "fiat_deposit");
+    }
+}
+
+#[tokio::test]
+async fn stripe_event_uses_admin_feature_and_persists_after_exact_state_proof() {
+    let (contract_base, capture) = start_mock_contract(ContractFeatureMode::Applied).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let event_store_path = temp.path().join("stripe-events.jsonl");
+    let mut config = test_config("http://127.0.0.1:9".to_owned(), event_store_path.clone());
+    config.contract_rpc_url = contract_base;
+    config.contract_dry_run = false;
+    let state = PaygateState::try_new(
+        config,
+        OracleKeypair::from_seed_hex(&"62".repeat(32)).expect("oracle"),
+    )
+    .expect("state");
+    let payload = succeeded_payment_payload("evt_contract_applied", "pi_contract_applied");
+
+    let response = post_signed_webhook(paygate_router(state), &payload).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let event_log = std::fs::read_to_string(&event_store_path).expect("event log");
+    assert_eq!(event_log.lines().count(), 1);
+    assert!(event_log.contains("evt_contract_applied"));
+    let requests = capture.feature_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["feature"], "mayhem");
+    assert_eq!(requests[0]["value"]["op"], "fiat_deposit");
+    assert!(requests[0]["key"]
+        .as_str()
+        .expect("feature key")
+        .starts_with("dep/fiat/"));
+}
+
+#[tokio::test]
+async fn stripe_chargeback_uses_admin_feature_and_exact_chargeback_state() {
+    let (contract_base, capture) = start_mock_contract(ContractFeatureMode::Applied).await;
+    let poster = PeerRpcContractPoster::new(contract_base, false, reqwest::Client::new());
+    let oracle = OracleKeypair::from_seed_hex(&"63".repeat(32)).expect("oracle");
+    let feature = FiatChargebackFeature {
+        op: "fiat_chargeback",
+        rail: "stripe",
+        who: "b".repeat(64),
+        au: 2_500_000_000_000_000_000u128,
+        ext_ref_hash: "c".repeat(64),
+        dispute_ref_hash: "d".repeat(64),
+        fiat_currency: "usd".to_owned(),
+        fiat_amount_minor: 250,
+        epoch: 2,
+        at: 3_600,
+    };
+
+    let result = poster
+        .post_fiat_chargeback(&oracle, feature)
+        .await
+        .expect("chargeback feature");
+
+    assert_eq!(result.result["ok"], true);
+    assert_eq!(result.result["op"], "fiatChargeback");
+    let requests = capture.feature_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["value"]["op"], "fiat_chargeback");
+    assert_eq!(
+        requests[0]["key"],
+        format!("dep/fiat/{}/chargeback/{}", "c".repeat(64), "d".repeat(64))
+    );
 }
 
 #[tokio::test]
