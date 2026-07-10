@@ -265,7 +265,7 @@ async fn mock_contract_feature(
             "message": "Admin required.",
             "result": {
                 "type": "feature_result",
-                "feature_key": key,
+                "feature_key": format!("mayhem_{key}"),
                 "hash": hash,
                 "status": "rejected",
                 "ok": false,
@@ -316,7 +316,7 @@ async fn mock_contract_feature(
         "message": "Feature applied.",
         "result": {
             "type": "feature_result",
-            "feature_key": key,
+            "feature_key": format!("mayhem_{key}"),
             "hash": hash,
             "status": "applied",
             "ok": true,

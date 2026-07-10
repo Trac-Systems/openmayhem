@@ -973,9 +973,11 @@ impl PeerRpcContractPoster {
         let feature_result = submitted.get("result").ok_or_else(|| {
             PaygateError::Contract("applied feature response missing result".to_owned())
         })?;
+        let result_feature_key = format!("mayhem_{feature_key}");
         if feature_result.get("ok").and_then(Value::as_bool) != Some(true)
             || feature_result.get("status").and_then(Value::as_str) != Some("applied")
-            || feature_result.get("feature_key").and_then(Value::as_str) != Some(feature_key)
+            || feature_result.get("feature_key").and_then(Value::as_str)
+                != Some(result_feature_key.as_str())
         {
             return Err(PaygateError::Contract(format!(
                 "admin feature result was not applied: {feature_result}"
