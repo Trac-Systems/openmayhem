@@ -315,6 +315,8 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
     provider_bridge
         .session_close(&user_key, &session_id)
         .await?;
+    assert_eq!(user_bridge.session_stats().await?["sessionCount"], 0);
+    assert_eq!(provider_bridge.session_stats().await?["sessionCount"], 0);
 
     provider.shutdown().await;
     user.shutdown().await;

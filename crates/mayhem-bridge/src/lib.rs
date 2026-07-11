@@ -10,12 +10,16 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 pub const DEFAULT_SC_BRIDGE_URL: &str = "ws://127.0.0.1:49222";
 pub const DEFAULT_RPC_URL: &str = "http://127.0.0.1:49223/v1";
+pub const DEFAULT_SC_BRIDGE_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+pub const DEFAULT_SC_BRIDGE_MAX_QUEUED_EVENTS: usize = 4096;
+pub const DEFAULT_SC_BRIDGE_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -37,6 +41,8 @@ pub enum BridgeError {
     Timeout,
     #[error("SC-Bridge protocol error: {0}")]
     Protocol(String),
+    #[error("SC-Bridge resource limit: {0}")]
+    ResourceLimit(String),
     #[error("RPC returned {status}: {body}")]
     RpcStatus { status: StatusCode, body: String },
 }
@@ -47,6 +53,9 @@ pub type Result<T> = std::result::Result<T, BridgeError>;
 pub struct ScBridgeConfig {
     pub url: Url,
     pub token: String,
+    pub max_message_bytes: usize,
+    pub max_queued_events: usize,
+    pub max_queued_bytes: usize,
 }
 
 impl ScBridgeConfig {
@@ -54,8 +63,45 @@ impl ScBridgeConfig {
         Ok(Self {
             url: Url::parse(url.as_ref())?,
             token: token.into(),
+            max_message_bytes: configured_limit(
+                "MAYHEM_SC_BRIDGE_MAX_MESSAGE_BYTES",
+                DEFAULT_SC_BRIDGE_MAX_MESSAGE_BYTES,
+            )?,
+            max_queued_events: configured_limit(
+                "MAYHEM_SC_BRIDGE_MAX_QUEUED_EVENTS",
+                DEFAULT_SC_BRIDGE_MAX_QUEUED_EVENTS,
+            )?,
+            max_queued_bytes: configured_limit(
+                "MAYHEM_SC_BRIDGE_MAX_QUEUED_BYTES",
+                DEFAULT_SC_BRIDGE_MAX_QUEUED_BYTES,
+            )?,
         })
     }
+
+    #[must_use]
+    pub fn with_queue_limits(mut self, max_events: usize, max_bytes: usize) -> Self {
+        self.max_queued_events = max_events.max(1);
+        self.max_queued_bytes = max_bytes.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_message_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_message_bytes = max_bytes.max(1);
+        self
+    }
+}
+
+fn configured_limit(name: &'static str, default: usize) -> Result<usize> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| BridgeError::Protocol(format!("{name} must be a positive integer")))
 }
 
 pub struct ScBridgeClient {
@@ -63,17 +109,28 @@ pub struct ScBridgeClient {
     read: WsRead,
     next_id: u64,
     queued_events: VecDeque<Value>,
+    queued_event_bytes: usize,
+    max_queued_events: usize,
+    max_queued_bytes: usize,
 }
 
 impl ScBridgeClient {
     pub async fn connect(config: ScBridgeConfig) -> Result<Self> {
-        let (stream, _) = connect_async(config.url.as_str()).await?;
+        let websocket_config = WebSocketConfig::default()
+            .max_message_size(Some(config.max_message_bytes))
+            .max_frame_size(Some(config.max_message_bytes))
+            .max_write_buffer_size(config.max_message_bytes.saturating_mul(2).max(256 * 1024));
+        let (stream, _) =
+            connect_async_with_config(config.url.as_str(), Some(websocket_config), false).await?;
         let (write, read) = stream.split();
         let mut client = Self {
             write,
             read,
             next_id: 1,
             queued_events: VecDeque::new(),
+            queued_event_bytes: 0,
+            max_queued_events: config.max_queued_events,
+            max_queued_bytes: config.max_queued_bytes,
         };
         client
             .request(json!({ "type": "auth", "token": config.token }), "auth_ok")
@@ -286,35 +343,36 @@ impl ScBridgeClient {
         wait: Option<Duration>,
     ) -> Result<Value> {
         let session_id = session_id.as_ref();
+        if let Some(event) = self.pop_queued_session_event(session_id) {
+            return Ok(event);
+        }
         let deadline = wait.map(|wait| Instant::now() + wait);
-        let mut deferred = Vec::new();
-        let result = async {
-            loop {
-                let event = match deadline {
-                    Some(deadline) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            return Err(BridgeError::Timeout);
-                        }
-                        self.next_session_frame(remaining).await?
+        loop {
+            let message = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(BridgeError::Timeout);
                     }
-                    None => self.next_session_frame_unbounded().await?,
-                };
-                if event.get("session_id").and_then(Value::as_str) == Some(session_id) {
-                    return Ok(event);
+                    timeout(remaining, self.read_json())
+                        .await
+                        .map_err(|_| BridgeError::Timeout)??
                 }
-                deferred.push(event);
+                None => self.read_json().await?,
+            };
+            if message.get("type").and_then(Value::as_str) == Some("session_frame")
+                && message.get("session_id").and_then(Value::as_str) == Some(session_id)
+            {
+                return Ok(message);
+            }
+            if is_async_event(&message) {
+                self.queue_event_back(message)?;
             }
         }
-        .await;
-        for event in deferred.into_iter().rev() {
-            self.requeue_event_front(event);
-        }
-        result
     }
 
-    pub fn requeue_event_front(&mut self, event: Value) {
-        self.queued_events.push_front(event);
+    pub fn requeue_event_front(&mut self, event: Value) -> Result<()> {
+        self.queue_event_front(event)
     }
 
     async fn next_event_of_type(&mut self, expected_type: &str, wait: Duration) -> Result<Value> {
@@ -330,7 +388,7 @@ impl ScBridgeClient {
                 return Ok(message);
             }
             if is_async_event(&message) {
-                self.queued_events.push_back(message);
+                self.queue_event_back(message)?;
             }
         }
     }
@@ -340,7 +398,54 @@ impl ScBridgeClient {
             .queued_events
             .iter()
             .position(|event| event.get("type").and_then(Value::as_str) == Some(expected_type))?;
-        self.queued_events.remove(idx)
+        let event = self.queued_events.remove(idx)?;
+        self.queued_event_bytes = self
+            .queued_event_bytes
+            .saturating_sub(json_value_bytes(&event));
+        Some(event)
+    }
+
+    fn pop_queued_session_event(&mut self, session_id: &str) -> Option<Value> {
+        let idx = self.queued_events.iter().position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("session_frame")
+                && event.get("session_id").and_then(Value::as_str) == Some(session_id)
+        })?;
+        let event = self.queued_events.remove(idx)?;
+        self.queued_event_bytes = self
+            .queued_event_bytes
+            .saturating_sub(json_value_bytes(&event));
+        Some(event)
+    }
+
+    fn queue_event_back(&mut self, event: Value) -> Result<()> {
+        self.ensure_queue_capacity(&event)?;
+        self.queued_event_bytes = self
+            .queued_event_bytes
+            .saturating_add(json_value_bytes(&event));
+        self.queued_events.push_back(event);
+        Ok(())
+    }
+
+    fn queue_event_front(&mut self, event: Value) -> Result<()> {
+        self.ensure_queue_capacity(&event)?;
+        self.queued_event_bytes = self
+            .queued_event_bytes
+            .saturating_add(json_value_bytes(&event));
+        self.queued_events.push_front(event);
+        Ok(())
+    }
+
+    fn ensure_queue_capacity(&self, event: &Value) -> Result<()> {
+        let event_bytes = json_value_bytes(event);
+        if self.queued_events.len() >= self.max_queued_events
+            || self.queued_event_bytes.saturating_add(event_bytes) > self.max_queued_bytes
+        {
+            return Err(BridgeError::ResourceLimit(format!(
+                "async event queue exceeds {} events or {} bytes",
+                self.max_queued_events, self.max_queued_bytes
+            )));
+        }
+        Ok(())
     }
 
     async fn request(&mut self, mut request: Value, expected_type: &str) -> Result<Value> {
@@ -355,7 +460,7 @@ impl ScBridgeClient {
             let message = self.read_json().await?;
             let message_id = message.get("id").and_then(Value::as_u64);
             if is_async_event(&message) {
-                self.queued_events.push_back(message);
+                self.queue_event_back(message)?;
                 continue;
             }
             if message_id != Some(id) {
@@ -397,6 +502,12 @@ fn is_async_event(message: &Value) -> bool {
         message.get("type").and_then(Value::as_str),
         Some("sidechannel_message" | "session_frame")
     )
+}
+
+fn json_value_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 #[derive(Clone)]
@@ -535,6 +646,14 @@ mod tests {
         assert_eq!(config.url.host_str(), Some("127.0.0.1"));
         assert_eq!(config.url.port(), Some(49222));
         assert_eq!(config.token, "token");
+        assert_eq!(
+            config.max_message_bytes,
+            DEFAULT_SC_BRIDGE_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(
+            config.max_queued_events,
+            DEFAULT_SC_BRIDGE_MAX_QUEUED_EVENTS
+        );
     }
 
     #[tokio::test]
@@ -592,6 +711,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deferred["session_id"], other);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_session_wait_fails_closed_when_unrelated_event_queue_is_full() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wanted = "aa".repeat(32);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = socket.next().await.unwrap().unwrap();
+            let auth: Value = match auth {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected auth text, got {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": auth["id"], "type": "auth_ok"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            for index in 0..3 {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "type": "session_frame",
+                            "session_id": format!("{index:064x}"),
+                            "frame": {"t": "s.open"},
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let config = ScBridgeConfig::new(format!("ws://{address}"), "token")
+            .unwrap()
+            .with_queue_limits(2, 4096);
+        let mut client = ScBridgeClient::connect(config).await.unwrap();
+        let err = client
+            .next_session_frame_for(&wanted, Some(Duration::from_secs(1)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::ResourceLimit(_)));
         server.await.unwrap();
     }
 }

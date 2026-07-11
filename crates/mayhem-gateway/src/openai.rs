@@ -48,7 +48,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{Multipart, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -66,20 +66,23 @@ use base64::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
+#[cfg(test)]
+use mayhem_proto::chunk_json_payload;
 use mayhem_proto::{
-    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule,
-    default_model_class, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    AttestationReport, CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk,
+    ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
+    payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, AttestationReport,
+    CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk, PayloadChunkCollector,
     PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
     SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, SESSION_RECEIPT_SCHEMA_VERSION,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
 
@@ -128,6 +131,13 @@ pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
 pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
+const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
+const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS: usize = 32;
+const DEFAULT_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_SESSION_MAX_ARTIFACTS: usize = 128;
+const MAX_SESSION_ARTIFACT_ID_BYTES: usize = 128;
+const MAX_SESSION_ARTIFACT_CONTENT_TYPE_BYTES: usize = 256;
 const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
@@ -2079,6 +2089,11 @@ impl GatewayCanaryProbePolicy {
 }
 
 pub fn openai_router(state: GatewayState) -> Router {
+    let request_body_limit = gateway_request_body_limit(&state);
+    let max_inflight_requests = configured_positive_usize(
+        "MAYHEM_GATEWAY_MAX_INFLIGHT_REQUESTS",
+        DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS,
+    );
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
@@ -2100,7 +2115,33 @@ pub fn openai_router(state: GatewayState) -> Router {
             "/mayhem/dashboard/assets/exo-latin.woff2",
             get(mayhem_dashboard_exo_font),
         )
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(ConcurrencyLimitLayer::new(max_inflight_requests))
         .with_state(Arc::new(state))
+}
+
+fn gateway_request_body_limit(state: &GatewayState) -> usize {
+    if let Some(configured) = configured_optional_positive_usize("MAYHEM_GATEWAY_MAX_BODY_BYTES") {
+        return configured;
+    }
+    let max_ctx = state
+        .models
+        .iter()
+        .flat_map(|model| {
+            std::iter::once(model_served_ctx(model)).chain(
+                model
+                    .mayhem
+                    .route_candidates
+                    .iter()
+                    .map(|candidate| route_caps_ctx(model, candidate)),
+            )
+        })
+        .max()
+        .unwrap_or(0);
+    usize::try_from(max_ctx)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .max(DEFAULT_GATEWAY_REQUEST_BODY_BYTES)
 }
 
 pub async fn serve(bind: SocketAddr, state: GatewayState) -> std::io::Result<()> {
@@ -6927,18 +6968,13 @@ impl ScBridgeGatewaySessionBackend {
                 invocation.session_id
             )));
         }
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "hedge_probe_pre_spend",
-                }),
-            )
-            .await;
+        let _ = close_direct_session_channel(
+            &mut bridge,
+            direct_peer,
+            &invocation.session_id,
+            "hedge_probe_pre_spend",
+        )
+        .await;
         Ok(GatewayHedgeProbeResult {
             provider: provider.to_owned(),
             ttft_ms: duration_millis_u64(started.elapsed()).max(1),
@@ -7025,6 +7061,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
@@ -7062,12 +7099,14 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
+            direct_session_request_byte_limit(invocation),
         )
         .await?;
 
         let collected = match collect_direct_session_output(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             &request_id,
             invocation,
             request,
@@ -7099,18 +7138,13 @@ impl ScBridgeGatewaySessionBackend {
                         "sending partial s.receipt_ack",
                     )
                     .await;
-                    let _ = bridge
-                        .session_send(
-                            direct_peer,
-                            &invocation.session_id,
-                            json!({
-                                "t": "s.close",
-                                "v": 1,
-                                "session_id": invocation.session_id,
-                                "reason": "redispatch",
-                            }),
-                        )
-                        .await;
+                    let _ = close_direct_session_channel(
+                        &mut bridge,
+                        direct_peer,
+                        &invocation.session_id,
+                        "redispatch",
+                    )
+                    .await;
                 }
                 return Err(err.into_retryable());
             }
@@ -7138,18 +7172,9 @@ impl ScBridgeGatewaySessionBackend {
             "sending s.receipt_ack",
         )
         .await?;
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "done",
-                }),
-            )
-            .await;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
 
         Ok(GatewaySessionResult {
             output: collected.output,
@@ -7243,6 +7268,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
@@ -7280,12 +7306,14 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
+            direct_session_request_byte_limit(invocation),
         )
         .await?;
 
         let collected = collect_direct_session_embedding_output(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             &request_id,
             invocation.failover,
             &inputs,
@@ -7315,18 +7343,9 @@ impl ScBridgeGatewaySessionBackend {
             "sending embedding s.receipt_ack",
         )
         .await?;
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "done",
-                }),
-            )
-            .await;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
 
         Ok(GatewayEmbeddingResult {
             output: collected.output,
@@ -7417,6 +7436,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
@@ -7454,12 +7474,14 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
+            direct_session_request_byte_limit(invocation),
         )
         .await?;
 
         let collected = collect_direct_session_image_generation_output(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             &request_id,
             invocation.failover,
             request,
@@ -7489,18 +7511,9 @@ impl ScBridgeGatewaySessionBackend {
             "sending image s.receipt_ack",
         )
         .await?;
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "done",
-                }),
-            )
-            .await;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
 
         Ok(GatewayImageGenerationResult {
             output: collected.output,
@@ -7591,6 +7604,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
@@ -7618,12 +7632,14 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
+            direct_session_request_byte_limit(invocation),
         )
         .await?;
 
         let collected = collect_direct_session_audio_speech_output(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             &request_id,
             invocation.failover,
             request,
@@ -7653,18 +7669,9 @@ impl ScBridgeGatewaySessionBackend {
             "sending audio speech s.receipt_ack",
         )
         .await?;
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "done",
-                }),
-            )
-            .await;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
 
         Ok(GatewayAudioSpeechResult {
             output: collected.output,
@@ -7755,6 +7762,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
@@ -7782,12 +7790,14 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
+            direct_session_request_byte_limit(invocation),
         )
         .await?;
 
         let collected = collect_direct_session_audio_transcription_output(
             &mut bridge,
             &invocation.session_id,
+            direct_peer,
             &request_id,
             invocation.failover,
             request,
@@ -7817,18 +7827,9 @@ impl ScBridgeGatewaySessionBackend {
             "sending audio transcription s.receipt_ack",
         )
         .await?;
-        let _ = bridge
-            .session_send(
-                direct_peer,
-                &invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": invocation.session_id,
-                    "reason": "done",
-                }),
-            )
-            .await;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
 
         Ok(GatewayAudioTranscriptionResult {
             output: collected.output,
@@ -8015,15 +8016,24 @@ fn decode_hex_array<const N: usize>(
 async fn next_session_frame(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     wait: Duration,
     expected_types: &[&str],
 ) -> Result<Value, GatewaySessionError> {
-    next_session_frame_with_optional_wait(bridge, session_id, Some(wait), expected_types).await
+    next_session_frame_with_optional_wait(
+        bridge,
+        session_id,
+        expected_remote,
+        Some(wait),
+        expected_types,
+    )
+    .await
 }
 
 async fn next_session_frame_with_optional_wait(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     wait: Option<Duration>,
     expected_types: &[&str],
 ) -> Result<Value, GatewaySessionError> {
@@ -8047,7 +8057,31 @@ async fn next_session_frame_with_optional_wait(
         };
         match event {
             Ok(event) => {
+                if event.get("remote").and_then(Value::as_str) != Some(expected_remote) {
+                    return Err(GatewaySessionError::new(format!(
+                        "session {session_id} received a frame from an unexpected transport peer"
+                    )));
+                }
+                if event.get("session_id").and_then(Value::as_str) != Some(session_id) {
+                    return Err(GatewaySessionError::new(format!(
+                        "session frame envelope did not match {session_id}"
+                    )));
+                }
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+                if !frame.is_object() {
+                    return Err(GatewaySessionError::new(format!(
+                        "session {session_id} received a non-object frame"
+                    )));
+                }
+                if frame
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|frame_session_id| frame_session_id != session_id)
+                {
+                    return Err(GatewaySessionError::new(format!(
+                        "session frame body did not match {session_id}"
+                    )));
+                }
                 let frame_type = frame.get("t").and_then(Value::as_str).unwrap_or("");
                 if expected_types.contains(&frame_type) {
                     return Ok(frame);
@@ -8197,21 +8231,128 @@ async fn send_direct_session_request_frames(
     session_id: &str,
     request_id: &str,
     body: &Value,
+    max_request_bytes: usize,
 ) -> Result<(), GatewaySessionError> {
     let max_frame_bytes = direct_session_max_frame_bytes();
-    for frame in direct_session_request_frames(request_id, body, max_frame_bytes)? {
+    let direct = json!({
+        "t": "s.req",
+        "rid": request_id,
+        "body": body,
+    });
+    if session_frame_json_len(&direct)? <= max_frame_bytes {
         bridge
-            .session_send(direct_peer, session_id, frame)
+            .session_send(direct_peer, session_id, direct)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
                     "sending s.req for session {session_id} to transport peer {direct_peer} failed: {err}"
                 ))
             })?;
+        return Ok(());
     }
+
+    let bytes = stable_json_bytes(body).map_err(|err| {
+        GatewaySessionError::new(format!("serializing s.req payload failed: {err}"))
+    })?;
+    if bytes.len() > max_request_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "request body {} bytes exceeds the {max_request_bytes}-byte selected-session budget",
+            bytes.len()
+        )));
+    }
+    let chunk_size = direct_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size).map_err(|err| {
+        GatewaySessionError::new(format!("planning s.req payload chunks failed: {err}"))
+    })?;
+    for index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, index)
+            .map_err(|err| {
+                GatewaySessionError::new(format!("building s.req payload chunk failed: {err}"))
+            })?
+            .ok_or_else(|| GatewaySessionError::new("planned s.req payload chunk was missing"))?;
+        let frame = json!({
+            "t": "s.req_chunk",
+            "v": 1,
+            "rid": request_id,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = session_frame_json_len(&frame)?;
+        if len > max_frame_bytes {
+            return Err(GatewaySessionError::new(format!(
+                "chunked s.req frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+            )));
+        }
+        bridge
+            .session_send(direct_peer, session_id, frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.req chunk for session {session_id} to transport peer {direct_peer} failed: {err}"
+                ))
+            })?;
+    }
+    bridge
+        .session_send(
+            direct_peer,
+            session_id,
+            json!({
+                "t": "s.req",
+                "rid": request_id,
+                "body_ref": manifest,
+            }),
+        )
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "sending final s.req manifest for session {session_id} to transport peer {direct_peer} failed: {err}"
+            ))
+        })?;
     Ok(())
 }
 
+fn direct_session_request_byte_limit(invocation: &GatewaySessionInvocation) -> usize {
+    let derived = usize::try_from(invocation.served_ctx)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+    configured_optional_positive_usize("MAYHEM_GATEWAY_SESSION_MAX_REQUEST_BYTES")
+        .unwrap_or(derived)
+}
+
+async fn close_direct_session_channel(
+    bridge: &mut ScBridgeClient,
+    direct_peer: &str,
+    session_id: &str,
+    reason: &str,
+) -> Result<(), GatewaySessionError> {
+    let send_result = bridge
+        .session_send(
+            direct_peer,
+            session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": session_id,
+                "reason": reason,
+            }),
+        )
+        .await;
+    let close_result = bridge.session_close(direct_peer, session_id).await;
+    if let Err(err) = send_result {
+        return Err(GatewaySessionError::retryable(format!(
+            "sending s.close for session {session_id} failed: {err}"
+        )));
+    }
+    close_result.map_err(|err| {
+        GatewaySessionError::retryable(format!(
+            "reclaiming direct session {session_id} failed: {err}"
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn direct_session_request_frames(
     request_id: &str,
     body: &Value,
@@ -8267,14 +8408,35 @@ fn direct_session_max_frame_bytes() -> usize {
 }
 
 fn direct_session_payload_chunk_bytes(max_frame_bytes: usize) -> usize {
-    let safe_raw = max_frame_bytes.saturating_sub(4096) / 3;
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(safe_raw.max(1024))
+    let safe_raw = max_frame_bytes.saturating_sub(4096) / 2;
+    (64 * 1024).min(safe_raw.max(1024))
 }
 
 fn session_frame_json_len(frame: &Value) -> Result<usize, GatewaySessionError> {
-    serde_json::to_vec(frame)
-        .map(|bytes| bytes.len())
-        .map_err(|err| GatewaySessionError::new(format!("serializing session frame failed: {err}")))
+    let mut counter = GatewayJsonLengthWriter::default();
+    serde_json::to_writer(&mut counter, frame).map_err(|err| {
+        GatewaySessionError::new(format!("serializing session frame failed: {err}"))
+    })?;
+    Ok(counter.len)
+}
+
+#[derive(Default)]
+struct GatewayJsonLengthWriter {
+    len: usize,
+}
+
+impl io::Write for GatewayJsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn set_optional_json(body: &mut Value, key: &str, value: Option<Value>) {
@@ -8480,9 +8642,147 @@ fn quality_from_session_delta(frame: &Value) -> Option<GatewaySessionQuality> {
     Some(GatewaySessionQuality { ttft_ms, tok_s })
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SessionDeltaPayloadChunks {
-    chunks: BTreeMap<String, Vec<PayloadChunk>>,
+    chunks: BTreeMap<String, PayloadChunkCollector>,
+    total_bytes: usize,
+    total_chunks: usize,
+    max_payload_bytes: usize,
+    max_payload_chunks: usize,
+}
+
+impl Default for SessionDeltaPayloadChunks {
+    fn default() -> Self {
+        Self {
+            chunks: BTreeMap::new(),
+            total_bytes: 0,
+            total_chunks: 0,
+            max_payload_bytes: configured_positive_usize(
+                "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
+                DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+            ),
+            max_payload_chunks: configured_positive_usize(
+                "MAYHEM_SESSION_MAX_PAYLOAD_CHUNKS",
+                DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+            ),
+        }
+    }
+}
+
+fn configured_positive_usize(name: &str, default: usize) -> usize {
+    configured_optional_positive_usize(name).unwrap_or(default)
+}
+
+fn configured_optional_positive_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn direct_session_chat_output_byte_limit(
+    request: &ChatCompletionRequest,
+    invocation: &GatewaySessionInvocation,
+) -> usize {
+    let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+    let available_tokens = u64::from(invocation.served_ctx)
+        .saturating_sub(prompt_tokens)
+        .max(1);
+    let output_tokens = request
+        .max_tokens
+        .map(u64::from)
+        .unwrap_or(available_tokens)
+        .min(available_tokens)
+        .max(1);
+    let derived = usize::try_from(output_tokens)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET);
+    configured_optional_positive_usize("MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES").unwrap_or(derived)
+}
+
+fn append_session_text(
+    content: &mut String,
+    delta: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), GatewaySessionError> {
+    let next_len = content
+        .len()
+        .checked_add(delta.len())
+        .ok_or_else(|| GatewaySessionError::new(format!("{label} byte length overflow")))?;
+    if next_len > max_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "{label} exceeded the {max_bytes}-byte session output budget"
+        )));
+    }
+    content.push_str(delta);
+    Ok(())
+}
+
+fn session_delta_text(frame: &Value) -> Result<Option<&str>, GatewaySessionError> {
+    match frame.get("d") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(delta)) => Ok(Some(delta.as_str())),
+        Some(_) => Err(GatewaySessionError::new(
+            "provider s.delta d field must be text or null",
+        )),
+    }
+}
+
+fn ensure_session_token_ids_within_limit(
+    token_ids: &[i32],
+    request: &ChatCompletionRequest,
+    invocation: &GatewaySessionInvocation,
+) -> Result<(), GatewaySessionError> {
+    let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+    let available_tokens = u64::from(invocation.served_ctx).saturating_sub(prompt_tokens);
+    let max_tokens = request
+        .max_tokens
+        .map(u64::from)
+        .unwrap_or(available_tokens)
+        .min(available_tokens);
+    if u64::try_from(token_ids.len()).unwrap_or(u64::MAX) > max_tokens {
+        return Err(GatewaySessionError::new(format!(
+            "provider emitted more token ids than the {max_tokens}-token session output budget"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct SessionDeltaSequence {
+    next_index: u64,
+    final_seen: bool,
+}
+
+impl SessionDeltaSequence {
+    fn observe(&mut self, frame: &Value) -> Result<(), GatewaySessionError> {
+        if self.final_seen {
+            return Err(GatewaySessionError::new(
+                "provider sent a delta after the final delta",
+            ));
+        }
+        let index = frame
+            .get("i")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| GatewaySessionError::new("provider delta missing i"))?;
+        if index != self.next_index {
+            return Err(GatewaySessionError::new(format!(
+                "provider delta index out of order: expected {}, got {index}",
+                self.next_index
+            )));
+        }
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or_else(|| GatewaySessionError::new("provider delta index overflow"))?;
+        if frame.get("t").and_then(Value::as_str) == Some("s.delta")
+            && frame.get("fin").and_then(Value::as_str).is_some()
+        {
+            self.final_seen = true;
+        }
+        Ok(())
+    }
 }
 
 fn session_delta_payload_key(request_id: &str, field: &str, payload_id: &str) -> String {
@@ -8502,6 +8802,11 @@ fn collect_session_delta_chunk(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing rid"))?;
+    if request_id.len() > 128 {
+        return Err(GatewaySessionError::new(
+            "s.delta_chunk rid exceeds 128 bytes",
+        ));
+    }
     let field = frame
         .get("field")
         .and_then(Value::as_str)
@@ -8512,6 +8817,11 @@ fn collect_session_delta_chunk(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing payload_id"))?;
+    if !is_hex_len(payload_id, 64) {
+        return Err(GatewaySessionError::new(
+            "s.delta_chunk payload_id must be a 32-byte hex digest",
+        ));
+    }
     let chunk: PayloadChunk = serde_json::from_value(
         frame
             .get("chunk")
@@ -8519,11 +8829,51 @@ fn collect_session_delta_chunk(
             .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing chunk"))?,
     )
     .map_err(|err| GatewaySessionError::new(format!("invalid s.delta_chunk chunk: {err}")))?;
-    pending
+    let chunk_len = usize::try_from(chunk.len)
+        .map_err(|_| GatewaySessionError::new("s.delta_chunk len exceeds platform range"))?;
+    let next_total_bytes = pending
+        .total_bytes
+        .checked_add(chunk_len)
+        .ok_or_else(|| GatewaySessionError::new("s.delta_chunk aggregate byte overflow"))?;
+    if next_total_bytes > pending.max_payload_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "s.delta_chunk payloads exceed the {}-byte session budget",
+            pending.max_payload_bytes
+        )));
+    }
+    let next_total_chunks = pending
+        .total_chunks
+        .checked_add(1)
+        .ok_or_else(|| GatewaySessionError::new("s.delta_chunk aggregate count overflow"))?;
+    if next_total_chunks > pending.max_payload_chunks {
+        return Err(GatewaySessionError::new(format!(
+            "s.delta_chunk payloads exceed the {}-chunk session budget",
+            pending.max_payload_chunks
+        )));
+    }
+    let key = session_delta_payload_key(request_id, field, payload_id);
+    let field_prefix = format!("{request_id}:{field}:");
+    if !pending.chunks.contains_key(&key)
+        && pending
+            .chunks
+            .keys()
+            .any(|existing| existing.starts_with(&field_prefix))
+    {
+        return Err(GatewaySessionError::new(format!(
+            "s.delta_chunk changed payload_id for {field}"
+        )));
+    }
+    let max_payload_bytes = pending.max_payload_bytes;
+    let max_payload_chunks = pending.max_payload_chunks;
+    let collector = pending
         .chunks
-        .entry(session_delta_payload_key(request_id, field, payload_id))
-        .or_default()
-        .push(chunk);
+        .entry(key)
+        .or_insert_with(|| PayloadChunkCollector::new(max_payload_bytes, max_payload_chunks));
+    collector.push(chunk).map_err(|err| {
+        GatewaySessionError::new(format!("collecting s.delta_chunk failed: {err}"))
+    })?;
+    pending.total_bytes = next_total_bytes;
+    pending.total_chunks = next_total_chunks;
     Ok(())
 }
 
@@ -8544,22 +8894,23 @@ fn resolve_session_delta_ref_field(
     let manifest: PayloadChunkManifest = serde_json::from_value(manifest_value.clone())
         .map_err(|err| GatewaySessionError::new(format!("invalid s.delta {ref_key}: {err}")))?;
     let key = session_delta_payload_key(request_id, field, &manifest.blake3);
-    let chunks = pending.chunks.remove(&key).ok_or_else(|| {
+    let collector = pending.chunks.remove(&key).ok_or_else(|| {
         GatewaySessionError::new(format!(
             "s.delta {ref_key} {} has no received chunks",
             manifest.blake3
         ))
     })?;
-    reassemble_json_payload(&manifest, &chunks)
-        .map(Some)
-        .map_err(|err| {
-            GatewaySessionError::new(format!("reassembling s.delta {ref_key} failed: {err}"))
-        })
+    pending.total_bytes = pending.total_bytes.saturating_sub(collector.len());
+    pending.total_chunks = pending.total_chunks.saturating_sub(collector.chunk_count());
+    collector.finish_json(&manifest).map(Some).map_err(|err| {
+        GatewaySessionError::new(format!("reassembling s.delta {ref_key} failed: {err}"))
+    })
 }
 
 async fn collect_direct_session_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     request_id: &str,
     invocation: &GatewaySessionInvocation,
     request: &ChatCompletionRequest,
@@ -8576,9 +8927,11 @@ async fn collect_direct_session_output(
     let mut latest_checkpoint_receipt = None;
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
-    let mut artifact_builders = BTreeMap::new();
+    let mut artifact_builders = SessionArtifactCollection::default();
     let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
     let mut provider_quality = None;
+    let max_text_bytes = direct_session_chat_output_byte_limit(request, invocation);
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -8595,6 +8948,7 @@ async fn collect_direct_session_output(
         let frame = match next_session_frame_with_optional_wait(
             bridge,
             session_id,
+            expected_remote,
             remaining_millis.map(Duration::from_millis),
             &[
                 "s.delta",
@@ -8645,26 +8999,29 @@ async fn collect_direct_session_output(
             Some("s.delta_chunk")
                 if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
             {
+                delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
                 collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
             }
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
                 watchdog.record_delta(now);
-                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
-                    content.push_str(delta);
+                if let Some(delta) = session_delta_text(&frame)? {
+                    append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
                 }
-                if let Some(ids) = token_ids_from_session_delta(&frame) {
+                if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
                 } else if let Some(ids) =
                     token_ids_ref_from_session_delta(&frame, &mut delta_payload_chunks)?
                 {
                     token_ids = ids;
-                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
+                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame)? {
                     token_ids.extend(ids);
-                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
+                } else if let Some(token_id) = token_id_from_session_delta(&frame)? {
                     token_ids.push(token_id);
                 }
+                ensure_session_token_ids_within_limit(&token_ids, request, invocation)?;
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if maybe_ack_direct_session_checkpoint_receipt(
                         bridge,
@@ -8877,6 +9234,7 @@ fn observed_chat_usage(request: &ChatCompletionRequest, content: &str, token_ids
 async fn collect_direct_session_embedding_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     request_id: &str,
     failover: GatewayFailoverInvocation,
     inputs: &[String],
@@ -8886,6 +9244,7 @@ async fn collect_direct_session_embedding_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
     let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
@@ -8903,6 +9262,7 @@ async fn collect_direct_session_embedding_output(
         let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
+            expected_remote,
             remaining_millis.map(Duration::from_millis),
             &[
                 "s.delta",
@@ -8918,10 +9278,12 @@ async fn collect_direct_session_embedding_output(
             Some("s.delta_chunk")
                 if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
             {
+                delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
                 collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
             }
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
                 watchdog.record_delta(now);
                 if embeddings.is_none() {
@@ -9001,6 +9363,7 @@ async fn collect_direct_session_embedding_output(
 async fn collect_direct_session_image_generation_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     request_id: &str,
     failover: GatewayFailoverInvocation,
     request: &ImageGenerationRequest,
@@ -9009,7 +9372,8 @@ async fn collect_direct_session_image_generation_output(
     let mut finish_seen = false;
     let mut usage = None;
     let mut provider_receipt = None;
-    let mut artifact_builders = BTreeMap::new();
+    let mut artifact_builders = SessionArtifactCollection::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
     let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
@@ -9027,6 +9391,7 @@ async fn collect_direct_session_image_generation_output(
         let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
+            expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
@@ -9034,6 +9399,7 @@ async fn collect_direct_session_image_generation_output(
         .map_err(GatewaySessionError::into_retryable)?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if frame.get("fin").and_then(Value::as_str).is_some() {
@@ -9112,6 +9478,7 @@ async fn collect_direct_session_image_generation_output(
 async fn collect_direct_session_audio_speech_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     request_id: &str,
     failover: GatewayFailoverInvocation,
     request: &AudioSpeechRequest,
@@ -9120,7 +9487,8 @@ async fn collect_direct_session_audio_speech_output(
     let mut finish_seen = false;
     let mut usage = None;
     let mut provider_receipt = None;
-    let mut artifact_builders = BTreeMap::new();
+    let mut artifact_builders = SessionArtifactCollection::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
     let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
@@ -9138,6 +9506,7 @@ async fn collect_direct_session_audio_speech_output(
         let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
+            expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
@@ -9145,6 +9514,7 @@ async fn collect_direct_session_audio_speech_output(
         .map_err(GatewaySessionError::into_retryable)?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if frame.get("fin").and_then(Value::as_str).is_some() {
@@ -9222,6 +9592,7 @@ async fn collect_direct_session_audio_speech_output(
 async fn collect_direct_session_audio_transcription_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
+    expected_remote: &str,
     request_id: &str,
     failover: GatewayFailoverInvocation,
     request: &AudioTranscriptionRequest,
@@ -9232,6 +9603,11 @@ async fn collect_direct_session_audio_transcription_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut provider_quality = None;
+    let mut delta_sequence = SessionDeltaSequence::default();
+    let max_text_bytes = configured_positive_usize(
+        "MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES",
+        DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    );
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -9248,6 +9624,7 @@ async fn collect_direct_session_audio_transcription_output(
         let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
+            expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
@@ -9255,9 +9632,15 @@ async fn collect_direct_session_audio_transcription_output(
         .map_err(GatewaySessionError::into_retryable)?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
-                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
-                    content.push_str(delta);
+                if let Some(delta) = session_delta_text(&frame)? {
+                    append_session_text(
+                        &mut content,
+                        delta,
+                        max_text_bytes,
+                        "audio transcription output",
+                    )?;
                 }
                 if frame.get("fin").and_then(Value::as_str).is_some() {
                     finish_seen = true;
@@ -9618,13 +10001,25 @@ fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
     }
 }
 
-fn token_ids_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
-    let ids = frame.get("token_ids")?.as_array()?;
-    Some(
-        ids.iter()
-            .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
-            .collect(),
-    )
+fn token_ids_from_session_delta(frame: &Value) -> Result<Option<Vec<i32>>, GatewaySessionError> {
+    let Some(value) = frame.get("token_ids") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let ids = value
+        .as_array()
+        .ok_or_else(|| GatewaySessionError::new("provider token_ids must be an array"))?;
+    ids.iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| GatewaySessionError::new("provider token_ids contains invalid id"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn token_ids_ref_from_session_delta(
@@ -9639,21 +10034,43 @@ fn token_ids_ref_from_session_delta(
         .map_err(|err| GatewaySessionError::new(format!("invalid token_ids_ref delta: {err}")))
 }
 
-fn token_ids_delta_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
-    let ids = frame.get("token_ids_delta")?.as_array()?;
-    Some(
-        ids.iter()
-            .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
-            .collect(),
-    )
+fn token_ids_delta_from_session_delta(
+    frame: &Value,
+) -> Result<Option<Vec<i32>>, GatewaySessionError> {
+    let Some(value) = frame.get("token_ids_delta") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let ids = value
+        .as_array()
+        .ok_or_else(|| GatewaySessionError::new("provider token_ids_delta must be an array"))?;
+    ids.iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| {
+                    GatewaySessionError::new("provider token_ids_delta contains invalid id")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
-fn token_id_from_session_delta(frame: &Value) -> Option<i32> {
-    frame
+fn token_id_from_session_delta(frame: &Value) -> Result<Option<i32>, GatewaySessionError> {
+    let Some(value) = frame
         .get("token_id")
         .or_else(|| frame.get("chunk").and_then(|chunk| chunk.get("token_id")))
-        .and_then(Value::as_i64)
+    else {
+        return Ok(None);
+    };
+    value
+        .as_i64()
         .and_then(|id| i32::try_from(id).ok())
+        .map(Some)
+        .ok_or_else(|| GatewaySessionError::new("provider token_id is invalid"))
 }
 
 #[derive(Debug)]
@@ -9666,9 +10083,34 @@ struct SessionArtifactBuilder {
     final_seen: bool,
 }
 
+#[derive(Debug)]
+struct SessionArtifactCollection {
+    builders: BTreeMap<String, SessionArtifactBuilder>,
+    total_bytes: usize,
+    max_total_bytes: usize,
+    max_artifacts: usize,
+}
+
+impl Default for SessionArtifactCollection {
+    fn default() -> Self {
+        Self {
+            builders: BTreeMap::new(),
+            total_bytes: 0,
+            max_total_bytes: configured_positive_usize(
+                "MAYHEM_SESSION_MAX_ARTIFACT_BYTES",
+                DEFAULT_SESSION_MAX_ARTIFACT_BYTES,
+            ),
+            max_artifacts: configured_positive_usize(
+                "MAYHEM_SESSION_MAX_ARTIFACTS",
+                DEFAULT_SESSION_MAX_ARTIFACTS,
+            ),
+        }
+    }
+}
+
 fn collect_artifact_from_session_delta(
     frame: &Value,
-    builders: &mut BTreeMap<String, SessionArtifactBuilder>,
+    collection: &mut SessionArtifactCollection,
 ) -> Result<(), GatewaySessionError> {
     let Some(artifact) = frame.get("artifact") else {
         return Ok(());
@@ -9683,12 +10125,22 @@ fn collect_artifact_from_session_delta(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| fail("artifact delta missing id".to_owned()))?
         .to_owned();
+    if id.len() > MAX_SESSION_ARTIFACT_ID_BYTES {
+        return Err(fail(format!(
+            "artifact id exceeds {MAX_SESSION_ARTIFACT_ID_BYTES} bytes"
+        )));
+    }
     let content_type = artifact
         .get("content_type")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| fail(format!("artifact {id} missing content_type")))?
         .to_owned();
+    if content_type.len() > MAX_SESSION_ARTIFACT_CONTENT_TYPE_BYTES {
+        return Err(fail(format!(
+            "artifact {id} content_type exceeds {MAX_SESSION_ARTIFACT_CONTENT_TYPE_BYTES} bytes"
+        )));
+    }
     let encoding = artifact
         .get("encoding")
         .and_then(Value::as_str)
@@ -9702,6 +10154,20 @@ fn collect_artifact_from_session_delta(
         .get("data")
         .and_then(Value::as_str)
         .ok_or_else(|| fail(format!("artifact {id} missing data")))?;
+    if data.len() % 2 != 0 {
+        return Err(fail(format!("artifact {id} data has odd-length hex")));
+    }
+    let decoded_len = data.len() / 2;
+    let next_total_bytes = collection
+        .total_bytes
+        .checked_add(decoded_len)
+        .ok_or_else(|| fail("artifact aggregate byte length overflow".to_owned()))?;
+    if next_total_bytes > collection.max_total_bytes {
+        return Err(fail(format!(
+            "artifact output exceeds the {}-byte session budget",
+            collection.max_total_bytes
+        )));
+    }
     let bytes = hex::decode(data)
         .map_err(|err| fail(format!("artifact {id} data is not valid hex: {err}")))?;
     let offset = artifact
@@ -9725,6 +10191,12 @@ fn collect_artifact_from_session_delta(
         .get("total_len")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok());
+    if total_len.is_some_and(|total_len| total_len > collection.max_total_bytes) {
+        return Err(fail(format!(
+            "artifact {id} declared total_len above the {}-byte session budget",
+            collection.max_total_bytes
+        )));
+    }
     let blake3 = artifact
         .get("blake3")
         .and_then(Value::as_str)
@@ -9732,7 +10204,16 @@ fn collect_artifact_from_session_delta(
         .ok_or_else(|| fail(format!("artifact {id} missing 32-byte blake3 digest")))?
         .to_ascii_lowercase();
 
-    let builder = builders
+    if !collection.builders.contains_key(&id)
+        && collection.builders.len() >= collection.max_artifacts
+    {
+        return Err(fail(format!(
+            "artifact count exceeds the {}-artifact session budget",
+            collection.max_artifacts
+        )));
+    }
+    let builder = collection
+        .builders
         .entry(id.clone())
         .or_insert_with(|| SessionArtifactBuilder {
             id: id.clone(),
@@ -9742,6 +10223,11 @@ fn collect_artifact_from_session_delta(
             blake3: blake3.clone(),
             final_seen: false,
         });
+    if builder.final_seen {
+        return Err(fail(format!(
+            "artifact {id} received data after its final chunk"
+        )));
+    }
     if builder.content_type != content_type {
         return Err(fail(format!(
             "artifact {id} changed content_type from {} to {}",
@@ -9764,8 +10250,11 @@ fn collect_artifact_from_session_delta(
             builder.bytes.len()
         )));
     }
+    let artifact_end = offset
+        .checked_add(bytes.len())
+        .ok_or_else(|| fail(format!("artifact {id} offset overflow")))?;
     if let Some(total_len) = builder.total_len {
-        if offset.saturating_add(bytes.len()) > total_len {
+        if artifact_end > total_len {
             return Err(fail(format!("artifact {id} exceeds declared total_len")));
         }
     }
@@ -9777,14 +10266,15 @@ fn collect_artifact_from_session_delta(
     {
         builder.final_seen = true;
     }
+    collection.total_bytes = next_total_bytes;
     Ok(())
 }
 
 fn finish_session_artifacts(
-    builders: BTreeMap<String, SessionArtifactBuilder>,
+    collection: SessionArtifactCollection,
 ) -> Result<Vec<GatewayArtifactOutput>, GatewaySessionError> {
     let mut artifacts = Vec::new();
-    for (_id, builder) in builders {
+    for (_id, builder) in collection.builders {
         if !builder.final_seen {
             return Err(GatewaySessionError::new(format!(
                 "artifact {} ended without final chunk",
@@ -11212,6 +11702,7 @@ async fn open_live_direct_chat_session(
     let accept = next_session_frame(
         &mut bridge,
         &invocation.session_id,
+        direct_peer,
         invocation.failover.open_timeout(),
         &["s.accept", "s.reject"],
     )
@@ -11243,6 +11734,7 @@ async fn open_live_direct_chat_session(
         &invocation.session_id,
         &request_id,
         &request_body,
+        direct_session_request_byte_limit(invocation),
     )
     .await?;
     Ok((
@@ -11304,19 +11796,13 @@ async fn run_live_direct_chat_sse(
                         session.route.as_ref(),
                         observation_sample_from_error(session.attempt_started.elapsed()),
                     );
-                    let _ = session
-                        .bridge
-                        .session_send(
-                            &session.transport_peer,
-                            &session.invocation.session_id,
-                            json!({
-                                "t": "s.close",
-                                "v": 1,
-                                "session_id": session.invocation.session_id,
-                                "reason": "stream_error",
-                            }),
-                        )
-                        .await;
+                    let _ = close_direct_session_channel(
+                        &mut session.bridge,
+                        &session.transport_peer,
+                        &session.invocation.session_id,
+                        "stream_error",
+                    )
+                    .await;
                     let _ = send_sse_error(&tx, &err.message).await;
                     let _ = send_sse_done(&tx).await;
                 }
@@ -11351,34 +11837,22 @@ async fn finish_live_direct_chat_after_client_disconnect(
                 &partial,
             )
             .map_err(|err| GatewaySessionError::new(err.message))?;
-        let _ = session
-            .bridge
-            .session_send(
-                &session.transport_peer,
-                &session.invocation.session_id,
-                json!({
-                    "t": "s.close",
-                    "v": 1,
-                    "session_id": session.invocation.session_id,
-                    "reason": "client_disconnect",
-                }),
-            )
-            .await;
-        return Ok(());
-    }
-    let _ = session
-        .bridge
-        .session_send(
+        let _ = close_direct_session_channel(
+            &mut session.bridge,
             &session.transport_peer,
             &session.invocation.session_id,
-            json!({
-                "t": "s.close",
-                "v": 1,
-                "session_id": session.invocation.session_id,
-                "reason": "client_disconnect",
-            }),
+            "client_disconnect",
         )
         .await;
+        return Ok(());
+    }
+    let _ = close_direct_session_channel(
+        &mut session.bridge,
+        &session.transport_peer,
+        &session.invocation.session_id,
+        "client_disconnect",
+    )
+    .await;
     if let Some(interrupted) = err.interrupted.take() {
         if let Some(partial) =
             wait_for_client_disconnect_provider_receipt(session, *interrupted).await?
@@ -11426,6 +11900,7 @@ async fn wait_for_client_disconnect_provider_receipt(
         let frame = match next_session_frame(
             &mut session.bridge,
             &session.invocation.session_id,
+            &session.transport_peer,
             remaining,
             &["s.receipt", "s.close", "s.error"],
         )
@@ -11488,19 +11963,13 @@ async fn recover_live_direct_chat_after_partial(
         session.route.as_ref(),
         observation_sample_from_error(session.attempt_started.elapsed()),
     );
-    let _ = session
-        .bridge
-        .session_send(
-            &session.transport_peer,
-            &session.invocation.session_id,
-            json!({
-                "t": "s.close",
-                "v": 1,
-                "session_id": session.invocation.session_id,
-                "reason": "redispatch",
-            }),
-        )
-        .await;
+    let _ = close_direct_session_channel(
+        &mut session.bridge,
+        &session.transport_peer,
+        &session.invocation.session_id,
+        "redispatch",
+    )
+    .await;
 
     let partials = vec![partial];
     let retry_request = redispatch_request_with_partials(&session.request, &partials);
@@ -11599,8 +12068,11 @@ async fn run_live_direct_chat_sse_inner(
     let mut latest_checkpoint_ack_frame: Option<Value> = None;
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
-    let mut artifact_builders = BTreeMap::new();
+    let mut artifact_builders = SessionArtifactCollection::default();
     let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
+    let max_text_bytes =
+        direct_session_chat_output_byte_limit(&session.request, &session.invocation);
     let started_at_millis = now_millis_u64();
     let failover = session.invocation.failover;
     let mut watchdog = DirectSessionWatchdog::new(
@@ -11639,6 +12111,7 @@ async fn run_live_direct_chat_sse_inner(
             result = next_session_frame_with_optional_wait(
                 &mut session.bridge,
                 &session.invocation.session_id,
+                &session.transport_peer,
                 wait_millis.map(Duration::from_millis),
                 &[
                     "s.delta",
@@ -11704,6 +12177,7 @@ async fn run_live_direct_chat_sse_inner(
                 if frame.get("rid").and_then(Value::as_str)
                     == Some(session.request_id.as_str()) =>
             {
+                delta_sequence.observe(&frame)?;
                 latest_checkpoint_ack_frame = None;
                 watchdog.record_delta(now_millis_u64());
                 collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
@@ -11712,24 +12186,30 @@ async fn run_live_direct_chat_sse_inner(
                 if frame.get("rid").and_then(Value::as_str)
                     == Some(session.request_id.as_str()) =>
             {
+                delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
                 latest_checkpoint_ack_frame = None;
                 watchdog.record_delta(now);
-                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
-                    content.push_str(delta);
+                if let Some(delta) = session_delta_text(&frame)? {
+                    append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
                 }
-                if let Some(ids) = token_ids_from_session_delta(&frame) {
+                if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
                 } else if let Some(ids) =
                     token_ids_ref_from_session_delta(&frame, &mut delta_payload_chunks)?
                 {
                     token_ids = ids;
-                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
+                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame)? {
                     token_ids.extend(ids);
-                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
+                } else if let Some(token_id) = token_id_from_session_delta(&frame)? {
                     token_ids.push(token_id);
                 }
-                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
+                ensure_session_token_ids_within_limit(
+                    &token_ids,
+                    &session.request,
+                    &session.invocation,
+                )?;
+                if let Some(delta) = session_delta_text(&frame)? {
                     if !delta.is_empty()
                         && !send_sse_value(
                             tx,
@@ -12006,19 +12486,13 @@ async fn run_live_direct_chat_sse_inner(
         "sending s.receipt_ack",
     )
     .await?;
-    let _ = session
-        .bridge
-        .session_send(
-            &session.transport_peer,
-            &session.invocation.session_id,
-            json!({
-                "t": "s.close",
-                "v": 1,
-                "session_id": session.invocation.session_id,
-                "reason": "done",
-            }),
-        )
-        .await;
+    let _ = close_direct_session_channel(
+        &mut session.bridge,
+        &session.transport_peer,
+        &session.invocation.session_id,
+        "done",
+    )
+    .await;
 
     let result = GatewaySessionResult {
         output: output.clone(),
@@ -20429,12 +20903,18 @@ mod tests {
     #[test]
     fn session_delta_token_ids_support_full_and_delta_lists() {
         let full = json!({ "token_ids": [1, 2, 3] });
-        assert_eq!(token_ids_from_session_delta(&full), Some(vec![1, 2, 3]));
-        assert_eq!(token_ids_delta_from_session_delta(&full), None);
+        assert_eq!(
+            token_ids_from_session_delta(&full).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(token_ids_delta_from_session_delta(&full).unwrap(), None);
 
         let delta = json!({ "token_ids_delta": [4, 5] });
-        assert_eq!(token_ids_from_session_delta(&delta), None);
-        assert_eq!(token_ids_delta_from_session_delta(&delta), Some(vec![4, 5]));
+        assert_eq!(token_ids_from_session_delta(&delta).unwrap(), None);
+        assert_eq!(
+            token_ids_delta_from_session_delta(&delta).unwrap(),
+            Some(vec![4, 5])
+        );
     }
 
     fn test_routed_model(provider_count: u8) -> GatewayModel {
@@ -22129,6 +22609,64 @@ mod tests {
         assert!(pending.chunks.is_empty());
     }
 
+    #[test]
+    fn session_delta_sequence_rejects_replay_reordering_and_post_final_data() {
+        let mut ordered = SessionDeltaSequence::default();
+        ordered
+            .observe(&json!({ "t": "s.delta", "i": 0, "d": "one", "fin": null }))
+            .unwrap();
+        ordered
+            .observe(&json!({ "t": "s.delta_chunk", "i": 1 }))
+            .unwrap();
+        ordered
+            .observe(&json!({ "t": "s.delta", "i": 2, "d": "two", "fin": "stop" }))
+            .unwrap();
+        assert!(ordered
+            .observe(&json!({ "t": "s.delta", "i": 3, "d": "late", "fin": null }))
+            .unwrap_err()
+            .message
+            .contains("after the final"));
+
+        let mut replay = SessionDeltaSequence::default();
+        replay
+            .observe(&json!({ "t": "s.delta", "i": 0, "d": "one", "fin": null }))
+            .unwrap();
+        assert!(replay
+            .observe(&json!({ "t": "s.delta", "i": 0, "d": "replay", "fin": null }))
+            .unwrap_err()
+            .message
+            .contains("out of order"));
+
+        let mut reordered = SessionDeltaSequence::default();
+        assert!(reordered
+            .observe(&json!({ "t": "s.delta", "i": 1, "d": "skip", "fin": null }))
+            .unwrap_err()
+            .message
+            .contains("expected 0"));
+    }
+
+    #[test]
+    fn chat_output_budget_scales_with_selected_session_context() {
+        let mut invocation = test_invocation();
+        invocation.served_ctx = 262_144;
+        let mut request = test_chat_request("mayhem/chat");
+        request.max_tokens = Some(100_000);
+
+        assert_eq!(
+            direct_session_chat_output_byte_limit(&request, &invocation),
+            100_000 * DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET
+        );
+        let mut output = String::new();
+        append_session_text(
+            &mut output,
+            &"x".repeat(2 * 1024 * 1024),
+            3 * 1024 * 1024,
+            "chat",
+        )
+        .unwrap();
+        assert_eq!(output.len(), 2 * 1024 * 1024);
+    }
+
     fn test_chat_output() -> ChatOutput {
         ChatOutput {
             content: Some("receipt ok".to_owned()),
@@ -22147,7 +22685,7 @@ mod tests {
     fn session_artifact_delta_collects_chunks_and_verifies_digest() {
         let bytes = b"\x89PNG mayhem image".to_vec();
         let digest = blake3_hex(&bytes);
-        let mut builders = BTreeMap::new();
+        let mut builders = SessionArtifactCollection::default();
 
         collect_artifact_from_session_delta(
             &json!({
@@ -22199,7 +22737,7 @@ mod tests {
     #[test]
     fn session_artifact_delta_rejects_corrupt_digest() {
         let bytes = b"not the claimed image".to_vec();
-        let mut builders = BTreeMap::new();
+        let mut builders = SessionArtifactCollection::default();
         collect_artifact_from_session_delta(
             &json!({
                 "t": "s.delta",
@@ -22222,6 +22760,62 @@ mod tests {
 
         let err = finish_session_artifacts(builders).expect_err("digest mismatch must reject");
         assert!(err.message.contains("blake3 mismatch"));
+    }
+
+    #[test]
+    fn session_artifact_delta_enforces_aggregate_budget_and_finality() {
+        let bytes = b"12345";
+        let digest = blake3_hex(bytes);
+        let mut too_large = SessionArtifactCollection {
+            builders: BTreeMap::new(),
+            total_bytes: 0,
+            max_total_bytes: 4,
+            max_artifacts: 1,
+        };
+        let err = collect_artifact_from_session_delta(
+            &json!({
+                "artifact": {
+                    "id": "a",
+                    "content_type": "application/octet-stream",
+                    "encoding": "hex",
+                    "offset": 0,
+                    "len": bytes.len(),
+                    "total_len": bytes.len(),
+                    "blake3": digest,
+                    "data": hex::encode(bytes),
+                    "final": true,
+                }
+            }),
+            &mut too_large,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("session budget"));
+
+        let one = b"1";
+        let mut finalized = SessionArtifactCollection {
+            builders: BTreeMap::new(),
+            total_bytes: 0,
+            max_total_bytes: 16,
+            max_artifacts: 1,
+        };
+        let frame = json!({
+            "artifact": {
+                "id": "a",
+                "content_type": "application/octet-stream",
+                "encoding": "hex",
+                "offset": 0,
+                "len": 1,
+                "total_len": 1,
+                "blake3": blake3_hex(one),
+                "data": hex::encode(one),
+                "final": true,
+            }
+        });
+        collect_artifact_from_session_delta(&frame, &mut finalized).unwrap();
+        assert!(collect_artifact_from_session_delta(&frame, &mut finalized)
+            .unwrap_err()
+            .message
+            .contains("after its final"));
     }
 
     #[test]

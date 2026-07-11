@@ -1,7 +1,11 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
 import Protomux from 'protomux';
-import { boundedJsonEncoding } from '../bounded-json.js';
+import {
+  boundedJsonEncoding,
+  decodedJsonByteLength,
+  decodedJsonWasRejected,
+} from '../bounded-json.js';
 
 const SESSION_PROTOCOL = 'mx/s';
 const SESSION_CHANNEL_PREFIX = 'mx/s/';
@@ -331,7 +335,14 @@ class DirectSession extends Feature {
 
   _handleFrame(session, frame) {
     if (session.closed || session.channel?.closed || session.channel?.destroyed) return;
-    if (!this._validateFrame(frame, false)) return;
+    if (!this._validateFrame(frame, false)) {
+      this._closeRecord(
+        session,
+        new Error(`Session ${session.sessionId} sent an invalid frame.`),
+        true
+      );
+      return;
+    }
     const frameBytes = this._frameBytes(frame);
     if (!this._checkRate(session.receiveLimiter, frameBytes)) {
       if (this.debug) console.log(`[direct-session:${session.sessionId}] drop (rate limit)`);
@@ -383,17 +394,22 @@ class DirectSession extends Feature {
     if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
       return fail('Session frame must be a JSON object.');
     }
+    if (decodedJsonWasRejected(frame)) {
+      return fail('Session frame failed bounded JSON decoding.');
+    }
     if (typeof frame.t !== 'string' || frame.t.length === 0) {
       return fail('Session frame missing t.');
     }
     if (b4a.byteLength(frame.t, 'utf8') > MAX_FRAME_TYPE_BYTES) {
       return fail(`Session frame t exceeds ${MAX_FRAME_TYPE_BYTES} bytes.`);
     }
-    let size = 0;
-    try {
-      size = b4a.byteLength(JSON.stringify(frame), 'utf8');
-    } catch (_e) {
-      return fail('Session frame is not serializable.');
+    let size = decodedJsonByteLength(frame);
+    if (size === null) {
+      try {
+        size = b4a.byteLength(JSON.stringify(frame), 'utf8');
+      } catch (_e) {
+        return fail('Session frame is not serializable.');
+      }
     }
     if (size > this.maxFrameBytes) {
       return fail(`Session frame is too large (${size} > ${this.maxFrameBytes}).`);
@@ -402,7 +418,7 @@ class DirectSession extends Feature {
   }
 
   _frameBytes(frame) {
-    return b4a.byteLength(JSON.stringify(frame), 'utf8');
+    return decodedJsonByteLength(frame) ?? b4a.byteLength(JSON.stringify(frame), 'utf8');
   }
 
   _newLimiter() {

@@ -7,6 +7,12 @@ import {
   messageByteLength,
   writeBoundedClientPayload,
 } from '../features/sc-bridge/bounded-client.js';
+import {
+  canOwnSession,
+  closeOwnedSessions,
+  disownSession,
+  ownSession,
+} from '../features/sc-bridge/session-ownership.js';
 
 test('failed async client request is contained and the bridge serves the next request', async () => {
   const events = [];
@@ -97,4 +103,29 @@ test('SC-Bridge disconnects one stalled consumer when its bounded queue fills', 
 test('SC-Bridge rejects oversized local websocket messages and caps subscriptions', () => {
   assert.equal(addBoundedSubscriptions(new Set(), ['one', 'two', 'three'], 2), false);
   assert.equal(messageByteLength('x'.repeat(65)) > 64, true);
+});
+
+test('SC-Bridge bounds and reclaims every direct session owned by a disconnected client', () => {
+  const sessions = new Map();
+  const remote = 'ab'.repeat(32);
+  const maxSessions = 128;
+  for (let index = 0; index < maxSessions; index += 1) {
+    const sessionId = index.toString(16).padStart(64, '0');
+    assert.equal(canOwnSession(sessions, remote, sessionId, maxSessions), true);
+    ownSession(sessions, remote, sessionId);
+  }
+  assert.equal(sessions.size, maxSessions);
+  assert.equal(canOwnSession(sessions, remote, 'ff'.repeat(32), maxSessions), false);
+
+  const first = '0'.repeat(64);
+  assert.equal(canOwnSession(sessions, remote, first, maxSessions), true);
+  disownSession(sessions, remote, first);
+  assert.equal(canOwnSession(sessions, remote, 'ff'.repeat(32), maxSessions), true);
+
+  const closed = [];
+  closeOwnedSessions(sessions, (closedRemote, sessionId) => {
+    closed.push(`${closedRemote}:${sessionId}`);
+  });
+  assert.equal(closed.length, maxSessions - 1);
+  assert.equal(sessions.size, 0);
 });

@@ -2,7 +2,11 @@ import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
 import crypto from 'crypto';
 import PeerWallet from 'trac-wallet';
-import { boundedJsonEncoding } from '../bounded-json.js';
+import {
+  boundedJsonEncoding,
+  decodedJsonByteLength,
+  decodedJsonWasRejected,
+} from '../bounded-json.js';
 
 const DEFAULT_MUX_RETRY_MAX = 5;
 const DEFAULT_MUX_RETRY_DELAY_MS = 50;
@@ -894,13 +898,20 @@ class Sidechannel extends Feature {
       onmessage: (payload) => {
         try {
           if (this._isBlocked(connection)) return;
-          let payloadJson = null;
-          try {
-            payloadJson = JSON.stringify(payload);
-          } catch (_e) {
+          let payloadBytes = decodedJsonByteLength(payload);
+          if (decodedJsonWasRejected(payload)) {
+            this._checkRate(connection, payloadBytes ?? this._maxMessageBytes(entry.name));
             return;
           }
-          const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
+          if (payloadBytes === null) {
+            let payloadJson = null;
+            try {
+              payloadJson = JSON.stringify(payload);
+            } catch (_e) {
+              return;
+            }
+            payloadBytes = b4a.byteLength(payloadJson, 'utf8');
+          }
           const maxMessageBytes = this._maxMessageBytes(entry.name);
           if (payloadBytes > maxMessageBytes) {
             this._checkRate(connection, payloadBytes);

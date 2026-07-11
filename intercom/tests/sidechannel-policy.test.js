@@ -3,6 +3,10 @@ import test from 'node:test';
 import b4a from 'b4a';
 import Sidechannel from '../features/sidechannel/index.js';
 import {
+  decodedJsonByteLength,
+  decodedJsonWasRejected,
+} from '../features/bounded-json.js';
+import {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
 } from '../features/mayhem/index.js';
@@ -151,7 +155,9 @@ test('sidechannel decoder drops oversized JSON before parsing it', () => {
 
   assert.ok(encoding);
   const state = { buffer: b4a.concat([b4a.from([65]), b4a.alloc(65)]), start: 0, end: 66 };
-  assert.equal(encoding.decode(state), null);
+  const decoded = encoding.decode(state);
+  assert.equal(decodedJsonWasRejected(decoded), true);
+  assert.equal(decodedJsonByteLength(decoded), 65);
   assert.equal(state.start, 66);
 });
 

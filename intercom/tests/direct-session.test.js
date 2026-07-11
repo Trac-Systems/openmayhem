@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
+import c from '../node_modules/compact-encoding/index.js';
 import DirectSession from '../features/direct-session/index.js';
-import { boundedJsonEncoding } from '../features/bounded-json.js';
+import {
+  boundedJsonEncoding,
+  decodedJsonByteLength,
+  decodedJsonWasRejected,
+  jsonShapeWithinBounds,
+} from '../features/bounded-json.js';
 import { isLocalPeer, loopbackSessionInfo } from '../features/sc-bridge/loopback.js';
 
 const sessionId = 'ab'.repeat(32);
@@ -148,8 +154,23 @@ test('DirectSession sender throttles a valid multi-frame payload instead of reje
 test('bounded JSON drops a complete oversized payload before UTF-8 decode', () => {
   const encoding = boundedJsonEncoding(64, 'test frame');
   const state = { buffer: b4a.concat([b4a.from([65]), b4a.alloc(65)]), start: 0, end: 66 };
-  assert.equal(encoding.decode(state), null);
+  const decoded = encoding.decode(state);
+  assert.equal(decodedJsonWasRejected(decoded), true);
+  assert.equal(decodedJsonByteLength(decoded), 65);
   assert.equal(state.start, 66);
+});
+
+test('bounded JSON rejects excessive nesting without a recursive second size pass', () => {
+  let nested = { t: 's.delta' };
+  for (let depth = 0; depth < 300; depth += 1) nested = { child: nested };
+  assert.equal(jsonShapeWithinBounds(nested), false);
+
+  const text = JSON.stringify(nested);
+  const buffer = c.encode(c.utf8, text);
+  const state = { buffer, start: 0, end: buffer.length };
+  const decoded = boundedJsonEncoding(buffer.length, 'nested frame').decode(state);
+  assert.equal(decodedJsonWasRejected(decoded), true);
+  assert.equal(decodedJsonByteLength(decoded), b4a.byteLength(text, 'utf8'));
 });
 
 test('DirectSession bounds inbound sessions per connection and globally', () => {
@@ -169,17 +190,56 @@ test('DirectSession bounds inbound sessions per connection and globally', () => 
   assert.equal(directSession._hasSessionCapacity(connection, 'ef'.repeat(32)), false);
 });
 
-test('DirectSession drops a malformed frame and still accepts the next valid frame', () => {
+test('DirectSession reclaims repeated session churn on one persistent connection', () => {
+  const directSession = new DirectSession({}, {
+    maxSessions: 16,
+    maxSessionsPerConnection: 4,
+  });
+  const connection = { remotePublicKey: b4a.from(remote, 'hex') };
+  let channelCloses = 0;
+  for (let index = 0; index < 1000; index += 1) {
+    const churnSessionId = index.toString(16).padStart(64, '0');
+    const record = {
+      sessionId: churnSessionId,
+      remote,
+      connection,
+      channel: { close: () => { channelCloses += 1; } },
+      drainWaiters: new Set(),
+      closed: false,
+    };
+    directSession.sessions.set(`${remote}:${churnSessionId}`, record);
+    directSession._closeRecord(record, new Error('churn close'), true);
+  }
+
+  assert.equal(channelCloses, 1000);
+  assert.equal(directSession.sessions.size, 0);
+});
+
+test('DirectSession closes only the malformed-frame session and keeps other sessions healthy', () => {
   const frames = [];
   const directSession = new DirectSession({}, { onFrame: (event) => frames.push(event) });
-  const session = {
+  let closed = 0;
+  const malformed = {
     sessionId,
     remote,
     receiveLimiter: directSession._newLimiter(),
+    drainWaiters: new Set(),
+    channel: { close: () => { closed += 1; } },
+    closed: false,
+  };
+  const healthy = {
+    sessionId: 'ef'.repeat(32),
+    remote,
+    receiveLimiter: directSession._newLimiter(),
+    drainWaiters: new Set(),
+    channel: { closed: false, destroyed: false },
+    closed: false,
   };
 
-  assert.doesNotThrow(() => directSession._handleFrame(session, { missing: 'type' }));
-  assert.doesNotThrow(() => directSession._handleFrame(session, { t: 's.delta', d: 'healthy' }));
+  assert.doesNotThrow(() => directSession._handleFrame(malformed, { missing: 'type' }));
+  assert.equal(malformed.closed, true);
+  assert.equal(closed, 1);
+  assert.doesNotThrow(() => directSession._handleFrame(healthy, { t: 's.delta', d: 'healthy' }));
   assert.equal(frames.length, 1);
   assert.equal(frames[0].frame.d, 'healthy');
 });

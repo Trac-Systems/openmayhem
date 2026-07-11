@@ -14,6 +14,12 @@ import {
   loopbackSessionInfo,
   normalizePeerKey,
 } from './loopback.js';
+import {
+  canOwnSession,
+  closeOwnedSessions,
+  disownSession,
+  ownSession,
+} from './session-ownership.js';
 
 const DEFAULT_MAX_CLIENTS = 64;
 const DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -152,6 +158,12 @@ class ScBridge extends Feature {
     if (!client || client.closed) return;
     client.closed = true;
     if (client.authTimer) clearTimeout(client.authTimer);
+    if (this.directSession && client.directSessions) {
+      closeOwnedSessions(
+        client.directSessions,
+        (remote, sessionId) => this.directSession.close(remote, sessionId)
+      );
+    }
     client.outboundQueue.length = 0;
     client.outboundBytes = 0;
     this.clients.delete(client);
@@ -163,6 +175,23 @@ class ScBridge extends Feature {
         client.socket.destroy?.(new Error(reason));
       } catch (_e) {}
     }
+  }
+
+  _canTrackClientSession(client, remote, sessionId) {
+    return canOwnSession(
+      client.directSessions,
+      remote,
+      sessionId,
+      this.maxSubscriptionsPerClient
+    );
+  }
+
+  _trackClientSession(client, remote, sessionId) {
+    ownSession(client.directSessions, remote, sessionId);
+  }
+
+  _untrackClientSession(client, remote, sessionId) {
+    disownSession(client.directSessions, remote, sessionId);
   }
 
   _shouldEmit(client, channel, messageText) {
@@ -404,12 +433,12 @@ class ScBridge extends Feature {
             ? [message.session_id]
             : [];
         if (!client.sessionIds) client.sessionIds = new Set();
-        if (sessionIds.some((sessionId) => String(sessionId) === '*')) {
-          client.sessionAll = true;
-        }
         if (!this._addSubscriptions(client.sessionIds, sessionIds)) {
           sendError('Session subscription limit reached.');
           return;
+        }
+        if (sessionIds.some((sessionId) => String(sessionId) === '*')) {
+          client.sessionAll = true;
         }
         if (message.sidechannel === false) {
           client.sidechannelMuted = true;
@@ -484,6 +513,10 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
+        if (!this._canTrackClientSession(client, remote, sessionId)) {
+          sendError('Direct session ownership limit reached.');
+          return;
+        }
         if (this.debug) {
           console.log(`[sc-bridge] client ${client.id} session_open ${sessionId} -> ${remote}`);
         }
@@ -500,7 +533,14 @@ class ScBridge extends Feature {
         }
         this.directSession
           .open(remote, sessionId)
-          .then((session) => reply({ type: 'session_opened', ...session }))
+          .then((session) => {
+            if (client.closed) {
+              this.directSession.close(remote, sessionId);
+              return;
+            }
+            this._trackClientSession(client, remote, sessionId);
+            reply({ type: 'session_opened', ...session });
+          })
           .catch((err) => {
             sendError(err?.message ? `Session open failed: ${err.message}` : 'Session open failed.');
           });
@@ -513,6 +553,10 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
+        if (!this._canTrackClientSession(client, remote, sessionId)) {
+          sendError('Direct session ownership limit reached.');
+          return;
+        }
         if (this.debug) {
           console.log(
             `[sc-bridge] client ${client.id} session_send ` +
@@ -530,7 +574,14 @@ class ScBridge extends Feature {
         }
         this.directSession
           .send(remote, sessionId, message.frame)
-          .then((session) => reply({ type: 'session_sent', ...session }))
+          .then((session) => {
+            if (client.closed) {
+              this.directSession.close(remote, sessionId);
+              return;
+            }
+            this._trackClientSession(client, remote, sessionId);
+            reply({ type: 'session_sent', ...session });
+          })
           .catch((err) => {
             sendError(err?.message ? `Session send failed: ${err.message}` : 'Session send failed.');
           });
@@ -550,6 +601,7 @@ class ScBridge extends Feature {
             return;
           }
           const result = this.directSession.close(message.remote, message.session_id);
+          this._untrackClientSession(client, message.remote, message.session_id);
           reply({ type: 'session_closed', ...result });
         } catch (err) {
           sendError(err?.message ? `Session close failed: ${err.message}` : 'Session close failed.');
@@ -926,6 +978,7 @@ class ScBridge extends Feature {
         channels: null,
         sessionIds: null,
         sessionAll: false,
+        directSessions: new Map(),
         outboundQueue: [],
         outboundBytes: 0,
         writing: false,

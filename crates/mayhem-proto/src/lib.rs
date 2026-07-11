@@ -767,6 +767,19 @@ pub struct PayloadChunk {
     pub final_chunk: bool,
 }
 
+pub const DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS: usize = 65_536;
+
+#[derive(Clone, Debug)]
+pub struct PayloadChunkCollector {
+    max_total_len: usize,
+    max_chunks: usize,
+    bytes: Vec<u8>,
+    chunk_hashes: Vec<String>,
+    chunk_lengths: Vec<u64>,
+    final_seen: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PayloadChunkError {
     EmptyChunkSize,
@@ -814,6 +827,17 @@ pub enum PayloadChunkError {
     ChunkCountMismatch {
         expected: u64,
         got: u64,
+    },
+    PayloadTooLarge {
+        max: u64,
+        got: u64,
+    },
+    TooManyChunks {
+        max: u64,
+        got: u64,
+    },
+    ChunkAfterFinal {
+        index: u64,
     },
     Json(String),
 }
@@ -881,12 +905,219 @@ impl fmt::Display for PayloadChunkError {
                     "payload chunk count mismatch: expected {expected}, got {got}"
                 )
             }
+            Self::PayloadTooLarge { max, got } => {
+                write!(f, "payload length {got} exceeds the {max}-byte limit")
+            }
+            Self::TooManyChunks { max, got } => {
+                write!(f, "payload chunk count {got} exceeds the {max}-chunk limit")
+            }
+            Self::ChunkAfterFinal { index } => {
+                write!(f, "payload chunk {index} arrived after the final chunk")
+            }
             Self::Json(message) => write!(f, "payload JSON error: {message}"),
         }
     }
 }
 
 impl std::error::Error for PayloadChunkError {}
+
+impl PayloadChunkCollector {
+    #[must_use]
+    pub fn new(max_total_len: usize, max_chunks: usize) -> Self {
+        Self {
+            max_total_len,
+            max_chunks,
+            bytes: Vec::new(),
+            chunk_hashes: Vec::new(),
+            chunk_lengths: Vec::new(),
+            final_seen: false,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_hashes.len()
+    }
+
+    pub fn push(&mut self, chunk: PayloadChunk) -> Result<(), PayloadChunkError> {
+        validate_payload_chunk(&chunk)?;
+        if self.final_seen {
+            return Err(PayloadChunkError::ChunkAfterFinal { index: chunk.i });
+        }
+        let next_count = self
+            .chunk_hashes
+            .len()
+            .checked_add(1)
+            .ok_or(PayloadChunkError::LengthOverflow)?;
+        if next_count > self.max_chunks {
+            return Err(PayloadChunkError::TooManyChunks {
+                max: u64::try_from(self.max_chunks)
+                    .map_err(|_| PayloadChunkError::LengthOverflow)?,
+                got: u64::try_from(next_count).map_err(|_| PayloadChunkError::LengthOverflow)?,
+            });
+        }
+        let expected_index = u64::try_from(self.chunk_hashes.len())
+            .map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if chunk.i != expected_index {
+            return Err(PayloadChunkError::ReorderedChunk {
+                expected: expected_index,
+                got: chunk.i,
+            });
+        }
+        let expected_offset =
+            u64::try_from(self.bytes.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if chunk.offset != expected_offset {
+            return Err(PayloadChunkError::OffsetMismatch {
+                index: chunk.i,
+                expected: expected_offset,
+                got: chunk.offset,
+            });
+        }
+        let declared_len =
+            usize::try_from(chunk.len).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        let expected_hex_len = declared_len
+            .checked_mul(2)
+            .ok_or(PayloadChunkError::LengthOverflow)?;
+        if chunk.data.len() != expected_hex_len {
+            return Err(PayloadChunkError::LenMismatch {
+                index: chunk.i,
+                expected: chunk.len,
+                got: u64::try_from(chunk.data.len() / 2)
+                    .map_err(|_| PayloadChunkError::LengthOverflow)?,
+            });
+        }
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(declared_len)
+            .ok_or(PayloadChunkError::LengthOverflow)?;
+        if next_len > self.max_total_len {
+            return Err(PayloadChunkError::PayloadTooLarge {
+                max: u64::try_from(self.max_total_len)
+                    .map_err(|_| PayloadChunkError::LengthOverflow)?,
+                got: u64::try_from(next_len).map_err(|_| PayloadChunkError::LengthOverflow)?,
+            });
+        }
+        let decoded = hex_decode(&chunk.data, "payload chunk data")?;
+        if decoded.len() != declared_len {
+            return Err(PayloadChunkError::LenMismatch {
+                index: chunk.i,
+                expected: chunk.len,
+                got: u64::try_from(decoded.len()).map_err(|_| PayloadChunkError::LengthOverflow)?,
+            });
+        }
+        let actual_hash = blake3_hex(&decoded);
+        if actual_hash != chunk.blake3 {
+            return Err(PayloadChunkError::ChunkHashMismatch {
+                index: chunk.i,
+                expected: chunk.blake3,
+                got: actual_hash,
+            });
+        }
+        self.bytes.extend_from_slice(&decoded);
+        self.chunk_hashes.push(actual_hash);
+        self.chunk_lengths.push(chunk.len);
+        self.final_seen = chunk.final_chunk;
+        Ok(())
+    }
+
+    pub fn finish_bytes(
+        self,
+        manifest: &PayloadChunkManifest,
+    ) -> Result<Vec<u8>, PayloadChunkError> {
+        validate_payload_manifest(manifest)?;
+        let total_len =
+            usize::try_from(manifest.total_len).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if total_len > self.max_total_len {
+            return Err(PayloadChunkError::PayloadTooLarge {
+                max: u64::try_from(self.max_total_len)
+                    .map_err(|_| PayloadChunkError::LengthOverflow)?,
+                got: manifest.total_len,
+            });
+        }
+        let chunk_count =
+            usize::try_from(manifest.chunk_count).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if chunk_count > self.max_chunks {
+            return Err(PayloadChunkError::TooManyChunks {
+                max: u64::try_from(self.max_chunks)
+                    .map_err(|_| PayloadChunkError::LengthOverflow)?,
+                got: manifest.chunk_count,
+            });
+        }
+        let got_count = u64::try_from(self.chunk_hashes.len())
+            .map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if got_count != manifest.chunk_count {
+            return Err(PayloadChunkError::ChunkCountMismatch {
+                expected: manifest.chunk_count,
+                got: got_count,
+            });
+        }
+        if manifest.chunk_count > 0 && !self.final_seen {
+            return Err(PayloadChunkError::FinalFlagMismatch {
+                index: manifest.chunk_count.saturating_sub(1),
+            });
+        }
+        for (index, (actual, expected)) in self
+            .chunk_hashes
+            .iter()
+            .zip(manifest.chunks.iter())
+            .enumerate()
+        {
+            if actual != expected {
+                return Err(PayloadChunkError::ChunkHashMismatch {
+                    index: u64::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?,
+                    expected: expected.clone(),
+                    got: actual.clone(),
+                });
+            }
+        }
+        for (index, length) in self.chunk_lengths.iter().enumerate() {
+            let last = index + 1 == self.chunk_lengths.len();
+            if (!last && *length != manifest.chunk_size) || (last && *length > manifest.chunk_size)
+            {
+                return Err(PayloadChunkError::LenMismatch {
+                    index: u64::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?,
+                    expected: manifest.chunk_size,
+                    got: *length,
+                });
+            }
+        }
+        let got_len =
+            u64::try_from(self.bytes.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if got_len != manifest.total_len {
+            return Err(PayloadChunkError::TotalLenMismatch {
+                expected: manifest.total_len,
+                got: got_len,
+            });
+        }
+        let actual_root = blake3_hex(&self.bytes);
+        if actual_root != manifest.blake3 {
+            return Err(PayloadChunkError::RootHashMismatch {
+                expected: manifest.blake3.clone(),
+                got: actual_root,
+            });
+        }
+        Ok(self.bytes)
+    }
+
+    pub fn finish_json(
+        self,
+        manifest: &PayloadChunkManifest,
+    ) -> Result<serde_json::Value, PayloadChunkError> {
+        let bytes = self.finish_bytes(manifest)?;
+        serde_json::from_slice(&bytes).map_err(|err| PayloadChunkError::Json(err.to_string()))
+    }
+}
 
 pub fn chunk_json_payload(
     value: &serde_json::Value,
@@ -908,6 +1139,23 @@ pub fn chunk_payload_bytes(
     bytes: &[u8],
     chunk_size: usize,
 ) -> Result<(PayloadChunkManifest, Vec<PayloadChunk>), PayloadChunkError> {
+    let manifest = payload_chunk_manifest(bytes, chunk_size)?;
+    let mut chunks = Vec::with_capacity(
+        usize::try_from(manifest.chunk_count).map_err(|_| PayloadChunkError::LengthOverflow)?,
+    );
+    for index in 0..manifest.chunk_count {
+        chunks.push(
+            payload_chunk_at(bytes, chunk_size, index)?
+                .ok_or(PayloadChunkError::MissingChunk { index })?,
+        );
+    }
+    Ok((manifest, chunks))
+}
+
+pub fn payload_chunk_manifest(
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<PayloadChunkManifest, PayloadChunkError> {
     if chunk_size == 0 {
         return Err(PayloadChunkError::EmptyChunkSize);
     }
@@ -915,52 +1163,45 @@ pub fn chunk_payload_bytes(
     let chunk_size_u64 =
         u64::try_from(chunk_size).map_err(|_| PayloadChunkError::LengthOverflow)?;
     let root = blake3_hex(bytes);
-    let mut chunks = Vec::new();
-    if bytes.is_empty() {
-        return Ok((
-            PayloadChunkManifest {
-                schema_version: SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION,
-                encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
-                total_len,
-                chunk_size: chunk_size_u64,
-                chunk_count: 0,
-                blake3: root,
-                chunks: Vec::new(),
-            },
-            chunks,
-        ));
-    }
-    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-        let index_u64 = u64::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?;
-        let offset = index
-            .checked_mul(chunk_size)
-            .ok_or(PayloadChunkError::LengthOverflow)?;
-        let offset_u64 = u64::try_from(offset).map_err(|_| PayloadChunkError::LengthOverflow)?;
-        let len_u64 = u64::try_from(chunk.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
-        let hash = blake3_hex(chunk);
-        chunks.push(PayloadChunk {
-            i: index_u64,
-            offset: offset_u64,
-            len: len_u64,
-            blake3: hash,
-            encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
-            data: hex_encode(chunk),
-            final_chunk: false,
-        });
-    }
-    if let Some(last) = chunks.last_mut() {
-        last.final_chunk = true;
-    }
-    let manifest = PayloadChunkManifest {
+    let chunk_hashes = bytes.chunks(chunk_size).map(blake3_hex).collect::<Vec<_>>();
+    Ok(PayloadChunkManifest {
         schema_version: SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION,
         encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
         total_len,
         chunk_size: chunk_size_u64,
-        chunk_count: u64::try_from(chunks.len()).map_err(|_| PayloadChunkError::LengthOverflow)?,
+        chunk_count: u64::try_from(chunk_hashes.len())
+            .map_err(|_| PayloadChunkError::LengthOverflow)?,
         blake3: root,
-        chunks: chunks.iter().map(|chunk| chunk.blake3.clone()).collect(),
-    };
-    Ok((manifest, chunks))
+        chunks: chunk_hashes,
+    })
+}
+
+pub fn payload_chunk_at(
+    bytes: &[u8],
+    chunk_size: usize,
+    index: u64,
+) -> Result<Option<PayloadChunk>, PayloadChunkError> {
+    if chunk_size == 0 {
+        return Err(PayloadChunkError::EmptyChunkSize);
+    }
+    let index_usize = usize::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    let offset = index_usize
+        .checked_mul(chunk_size)
+        .ok_or(PayloadChunkError::LengthOverflow)?;
+    if offset >= bytes.len() {
+        return Ok(None);
+    }
+    let end = offset.saturating_add(chunk_size).min(bytes.len());
+    let chunk = &bytes[offset..end];
+    Ok(Some(PayloadChunk {
+        i: index,
+        offset: u64::try_from(offset).map_err(|_| PayloadChunkError::LengthOverflow)?,
+        len: u64::try_from(chunk.len()).map_err(|_| PayloadChunkError::LengthOverflow)?,
+        blake3: blake3_hex(chunk),
+        encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
+        data: hex_encode(chunk),
+        final_chunk: end == bytes.len(),
+    }))
 }
 
 pub fn reassemble_payload_chunks(
@@ -1702,6 +1943,54 @@ mod tests {
         assert!(matches!(
             reassemble_payload_chunks(&manifest, &corrupt).unwrap_err(),
             PayloadChunkError::ChunkHashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn incremental_payload_collector_bounds_and_reassembles_large_json() {
+        let value = json!({
+            "messages": [{"role": "user", "content": "x".repeat(3 * 1024 * 1024)}]
+        });
+        let (manifest, chunks) = chunk_json_payload(&value, 16 * 1024).unwrap();
+        let mut collector = PayloadChunkCollector::new(4 * 1024 * 1024, 4096);
+        for chunk in chunks {
+            collector.push(chunk).unwrap();
+        }
+        assert_eq!(collector.chunk_count(), manifest.chunk_count as usize);
+        assert_eq!(collector.finish_json(&manifest).unwrap(), value);
+
+        let (_manifest, chunks) = chunk_payload_bytes(b"0123456789", 5).unwrap();
+        let mut too_small = PayloadChunkCollector::new(9, 8);
+        too_small.push(chunks[0].clone()).unwrap();
+        assert!(matches!(
+            too_small.push(chunks[1].clone()).unwrap_err(),
+            PayloadChunkError::PayloadTooLarge { .. }
+        ));
+
+        let mut too_few = PayloadChunkCollector::new(64, 1);
+        too_few.push(chunks[0].clone()).unwrap();
+        assert!(matches!(
+            too_few.push(chunks[1].clone()).unwrap_err(),
+            PayloadChunkError::TooManyChunks { .. }
+        ));
+    }
+
+    #[test]
+    fn incremental_payload_collector_rejects_replay_and_post_final_data() {
+        let (_manifest, chunks) = chunk_payload_bytes(b"0123456789", 5).unwrap();
+        let mut replay = PayloadChunkCollector::new(64, 8);
+        replay.push(chunks[0].clone()).unwrap();
+        assert!(matches!(
+            replay.push(chunks[0].clone()).unwrap_err(),
+            PayloadChunkError::ReorderedChunk { .. }
+        ));
+
+        let mut after_final = PayloadChunkCollector::new(64, 8);
+        after_final.push(chunks[0].clone()).unwrap();
+        after_final.push(chunks[1].clone()).unwrap();
+        assert!(matches!(
+            after_final.push(chunks[1].clone()).unwrap_err(),
+            PayloadChunkError::ChunkAfterFinal { .. }
         ));
     }
 }

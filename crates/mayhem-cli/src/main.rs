@@ -72,12 +72,14 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
-    ctx_bracket_table_at, default_ctx_bracket_schedule, reassemble_json_payload,
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
-    MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    ctx_bracket_table_at, default_ctx_bracket_schedule, payload_chunk_at, payload_chunk_manifest,
+    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
+    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
     USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
@@ -198,6 +200,7 @@ const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const OPENCODE_GATEWAY_TOKEN_NAME: &str = "opencode-local";
 const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
+const PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA: usize = 8_192;
 const DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS: u64 = 15_000;
 const DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS: u64 = 10_000;
 const DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS: u64 = 2_000;
@@ -207,6 +210,11 @@ const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
+const DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN: usize = 256;
+const DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_MILLIS: u64 = 3_600_000;
+const DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_BYTES_PER_SECOND: usize = 16 * 1024;
+const DEFAULT_PROVIDER_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_PROVIDER_SESSION_MAX_ARTIFACTS: usize = 128;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const GIB_BYTES: u64 = 1024 * 1024 * 1024;
@@ -31794,9 +31802,26 @@ struct ActiveProviderSession {
     checkpoint_every: CheckpointPolicy,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct PendingProviderPayload {
-    chunks: Vec<PayloadChunk>,
+    request_id: String,
+    payload_id: String,
+    collector: PayloadChunkCollector,
+    started_at: Instant,
+}
+
+impl Default for PendingProviderPayload {
+    fn default() -> Self {
+        Self {
+            request_id: String::new(),
+            payload_id: String::new(),
+            collector: PayloadChunkCollector::new(
+                DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+                DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+            ),
+            started_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39925,6 +39950,7 @@ async fn serve_provider_sessions(
     let component_poll_interval =
         provider_heartbeat_reconnect_initial.min(bridge_liveness_interval);
     let request_stall_timeout = provider_session_request_timeout()?;
+    let (max_request_bytes, max_payload_chunks) = provider_session_request_limits(&terms)?;
     let mut bridge = reconnect_provider_session_bridge(
         &sc_bridge_url,
         &sc_bridge_token,
@@ -40287,6 +40313,11 @@ async fn serve_provider_sessions(
                         })
                         .unwrap_or("")
                         .to_owned();
+                    let event_remote = event
+                        .get("remote")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
                     let session_reject = runtime_floor_reject
                         .clone()
                         .or_else(|| engine_watchdog_reject.clone())
@@ -40304,6 +40335,8 @@ async fn serve_provider_sessions(
                         &mut engine_recovery,
                         session_reject,
                         request_stall_timeout,
+                        max_request_bytes,
+                        max_payload_chunks,
                         event,
                     )
                     .await
@@ -40311,6 +40344,11 @@ async fn serve_provider_sessions(
                         provider_session_debug(format!(
                             "session {event_session_id} failed without stopping provider serving: {err:#}"
                         ));
+                        if is_hex_len(&event_remote, 64) && is_hex_len(&event_session_id, 64) {
+                            let _ = bridge
+                                .session_close(&event_remote, &event_session_id)
+                                .await;
+                        }
                         discard_provider_session_state(
                             &mut sessions,
                             &mut pending_requests,
@@ -40583,13 +40621,21 @@ fn provider_session_collect_request_chunk(
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     session_id: &str,
     frame: &Value,
+    max_request_bytes: usize,
+    max_payload_chunks: usize,
 ) -> Result<()> {
+    let upload_timeout = provider_session_request_upload_timeout(max_request_bytes)?;
     let request_id = provider_session_request_id(frame);
+    ensure!(request_id.len() <= 128, "s.req_chunk rid exceeds 128 bytes");
     let payload_id = frame
         .get("payload_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .context("s.req_chunk missing payload_id")?;
+    ensure!(
+        is_hex_len(payload_id, 64),
+        "s.req_chunk payload_id must be a 32-byte hex digest"
+    );
     let chunk: PayloadChunk = serde_json::from_value(
         frame
             .get("chunk")
@@ -40597,24 +40643,77 @@ fn provider_session_collect_request_chunk(
             .context("s.req_chunk missing chunk")?,
     )
     .context("decoding s.req_chunk chunk")?;
-    pending_payloads
-        .entry(provider_session_payload_key(
-            session_id,
-            &request_id,
-            payload_id,
-        ))
-        .or_default()
-        .chunks
-        .push(chunk);
+    let key = provider_session_payload_key(session_id, &request_id, payload_id);
+    let prefix = format!("{session_id}:");
+    ensure!(
+        pending_payloads.contains_key(&key)
+            || !pending_payloads
+                .keys()
+                .any(|existing| existing.starts_with(&prefix)),
+        "session already has a different pending request payload"
+    );
+    let pending = pending_payloads
+        .entry(key)
+        .or_insert_with(|| PendingProviderPayload {
+            request_id: request_id.clone(),
+            payload_id: payload_id.to_owned(),
+            collector: PayloadChunkCollector::new(max_request_bytes, max_payload_chunks),
+            started_at: Instant::now(),
+        });
+    ensure!(
+        pending.request_id == request_id,
+        "request payload changed rid"
+    );
+    ensure!(
+        pending.payload_id == payload_id,
+        "request payload changed payload_id"
+    );
+    ensure!(
+        pending.started_at.elapsed() <= upload_timeout,
+        "request payload exceeded its upload lifetime"
+    );
+    pending
+        .collector
+        .push(chunk)
+        .map_err(|err| anyhow::anyhow!("collecting s.req_chunk failed: {err}"))?;
     Ok(())
+}
+
+fn provider_session_request_upload_timeout(max_request_bytes: usize) -> Result<Duration> {
+    if let Some(configured) = std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_UPLOAD_MAX_MS").ok() {
+        let millis = configured.trim().parse::<u64>().with_context(|| {
+            "MAYHEM_PROVIDER_SESSION_REQUEST_UPLOAD_MAX_MS must be a positive integer in milliseconds"
+        })?;
+        ensure!(
+            millis > 0,
+            "MAYHEM_PROVIDER_SESSION_REQUEST_UPLOAD_MAX_MS must be positive"
+        );
+        return Ok(Duration::from_millis(millis));
+    }
+    let seconds = max_request_bytes
+        .saturating_add(DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_BYTES_PER_SECOND - 1)
+        / DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_BYTES_PER_SECOND;
+    let millis = u64::try_from(seconds)
+        .unwrap_or(u64::MAX / 1000)
+        .saturating_mul(1000)
+        .max(DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_MILLIS);
+    Ok(Duration::from_millis(millis))
 }
 
 fn provider_session_request_body_from_frame(
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     session_id: &str,
     frame: &Value,
+    max_request_bytes: usize,
 ) -> Result<Value> {
     if let Some(body) = frame.get("body") {
+        let body_len = serde_json::to_vec(body)
+            .context("serializing inline s.req body")?
+            .len();
+        ensure!(
+            body_len <= max_request_bytes,
+            "inline s.req body {body_len} bytes exceeds {max_request_bytes}-byte limit"
+        );
         return Ok(body.clone());
     }
     let manifest: PayloadChunkManifest = serde_json::from_value(
@@ -40629,7 +40728,9 @@ fn provider_session_request_body_from_frame(
     let pending = pending_payloads
         .remove(&key)
         .with_context(|| format!("s.req body_ref {} has no received chunks", manifest.blake3))?;
-    reassemble_json_payload(&manifest, &pending.chunks)
+    pending
+        .collector
+        .finish_json(&manifest)
         .map_err(|err| anyhow::anyhow!("reassembling s.req body_ref failed: {err}"))
 }
 
@@ -40650,6 +40751,33 @@ fn provider_session_request_timeout_from(configured: Option<&str>) -> Result<Dur
         "MAYHEM_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MS must be positive"
     );
     Ok(Duration::from_millis(millis))
+}
+
+fn provider_session_request_limits(terms: &ProviderSessionTerms) -> Result<(usize, usize)> {
+    let ctx = usize::try_from(terms.ctx).context("provider context exceeds platform range")?;
+    let derived_max = ctx
+        .checked_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
+        .context("provider request byte limit overflowed platform range")?
+        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+    let max_bytes = match std::env::var("MAYHEM_PROVIDER_SESSION_MAX_REQUEST_BYTES").ok() {
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .context("MAYHEM_PROVIDER_SESSION_MAX_REQUEST_BYTES must be a positive integer")?,
+        None => derived_max,
+    };
+    let max_chunks = match std::env::var("MAYHEM_SESSION_MAX_PAYLOAD_CHUNKS").ok() {
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .context("MAYHEM_SESSION_MAX_PAYLOAD_CHUNKS must be a positive integer")?,
+        None => DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    };
+    Ok((max_bytes, max_chunks))
 }
 
 fn record_provider_session_request_progress(
@@ -40674,27 +40802,59 @@ async fn handle_provider_session_frame(
     engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
     request_stall_timeout: Duration,
+    max_request_bytes: usize,
+    max_payload_chunks: usize,
     event: Value,
 ) -> Result<()> {
-    let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+    let frame = event
+        .get("frame")
+        .cloned()
+        .filter(Value::is_object)
+        .context("provider session event frame must be an object")?;
     let session_id = event
         .get("session_id")
         .and_then(Value::as_str)
-        .or_else(|| frame.get("session_id").and_then(Value::as_str))
-        .unwrap_or("")
+        .filter(|session_id| is_hex_len(session_id, 64))
+        .context("provider session event has invalid session_id")?
         .to_owned();
     let remote = event
         .get("remote")
         .and_then(Value::as_str)
-        .filter(|remote| !remote.is_empty())
-        .context("provider session frame missing remote peer")?
+        .filter(|remote| is_hex_len(remote, 64))
+        .context("provider session frame has invalid remote peer")?
         .to_owned();
-    match frame.get("t").and_then(Value::as_str) {
-        Some("s.open") => {
+    ensure!(
+        frame
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_none_or(|frame_session_id| frame_session_id == session_id),
+        "provider session frame session_id mismatch"
+    );
+    let frame_type = frame
+        .get("t")
+        .and_then(Value::as_str)
+        .filter(|frame_type| !frame_type.is_empty() && frame_type.len() <= 64)
+        .context("provider session frame has invalid type")?;
+    match frame_type {
+        "s.open" => {
+            if let Some(existing) = sessions.get(&session_id) {
+                if existing.remote != remote {
+                    provider_session_debug(format!(
+                        "refusing colliding s.open for active session {session_id} from {remote}"
+                    ));
+                    let _ = bridge.session_close(&remote, &session_id).await;
+                } else {
+                    provider_session_debug(format!(
+                        "ignoring replayed s.open for active session {session_id} from {remote}"
+                    ));
+                }
+                return Ok(());
+            }
             if !provider_session_open_targets_enclave(&frame, terms) {
                 provider_session_debug(format!(
-                    "ignoring s.open for session {session_id} from {remote}: frame targets a different enclave"
+                    "refusing s.open for session {session_id} from {remote}: frame targets a different enclave"
                 ));
+                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             }
             provider_session_debug(format!(
@@ -40705,6 +40865,7 @@ async fn handle_provider_session_frame(
                 provider_session_debug(format!(
                     "could not open provider side of session {session_id}; leaving the provider online for a clean client retry: {err:#}"
                 ));
+                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             }
             provider_session_debug(format!("provider side session {session_id} opened"));
@@ -40875,21 +41036,44 @@ async fn handle_provider_session_frame(
                         )
                         .await
                         .context("sending s.reject")?;
+                    bridge
+                        .session_close(&remote, &session_id)
+                        .await
+                        .context("reclaiming rejected provider session")?;
                     provider_session_debug(format!("sent s.reject for session {session_id}"));
                 }
             }
         }
-        Some("s.req_chunk") => {
+        "s.req_chunk" => {
             provider_session_debug(format!("handling s.req_chunk for session {session_id}"));
-            if !sessions.contains_key(&session_id) {
+            let Some(active) = sessions.get(&session_id) else {
                 provider_session_debug(format!(
-                    "ignoring s.req_chunk for unknown session {session_id} from {remote}"
+                    "refusing s.req_chunk for unknown session {session_id} from {remote}"
                 ));
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Ok(());
+            };
+            if active.remote != remote {
+                provider_session_debug(format!(
+                    "refusing cross-peer s.req_chunk for session {session_id} from {remote}"
+                ));
+                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             }
-            if let Err(err) =
-                provider_session_collect_request_chunk(pending_payloads, &session_id, &frame)
-            {
+            if !pending_requests.contains_key(&session_id) {
+                provider_session_debug(format!(
+                    "refusing s.req_chunk after request dispatch for session {session_id}"
+                ));
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Ok(());
+            }
+            if let Err(err) = provider_session_collect_request_chunk(
+                pending_payloads,
+                &session_id,
+                &frame,
+                max_request_bytes,
+                max_payload_chunks,
+            ) {
                 let request_id = provider_session_request_id(&frame);
                 provider_session_debug(format!(
                     "request chunk failed for session {session_id}: {err:#}"
@@ -40923,15 +41107,29 @@ async fn handle_provider_session_frame(
                 );
             }
         }
-        Some("s.req") => {
+        "s.req" => {
             provider_session_debug(format!("handling s.req for session {session_id}"));
-            pending_requests.remove(&session_id);
             let Some(active) = sessions.get(&session_id).cloned() else {
                 provider_session_debug(format!(
-                    "ignoring s.req for unknown session {session_id} from {remote}"
+                    "refusing s.req for unknown session {session_id} from {remote}"
                 ));
+                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             };
+            if active.remote != remote {
+                provider_session_debug(format!(
+                    "refusing cross-peer s.req for session {session_id} from {remote}"
+                ));
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Ok(());
+            }
+            if pending_requests.remove(&session_id).is_none() {
+                provider_session_debug(format!(
+                    "refusing duplicate s.req for session {session_id} from {remote}"
+                ));
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Ok(());
+            }
             let request_id = frame
                 .get("rid")
                 .and_then(Value::as_str)
@@ -40941,6 +41139,7 @@ async fn handle_provider_session_frame(
                 pending_payloads,
                 &session_id,
                 &frame,
+                max_request_bytes,
             ) {
                 Ok(body) => body,
                 Err(err) => {
@@ -40988,7 +41187,9 @@ async fn handle_provider_session_frame(
                 )
             });
             let response = contain_provider_request(|| {
-                responder.respond_streaming(terms, &body, live_stream.as_mut())
+                let output = responder.respond_streaming(terms, &body, live_stream.as_mut())?;
+                validate_provider_session_output(terms, &body, &output)?;
+                Ok(output)
             });
             let output = match response {
                 Ok(output) => {
@@ -41184,13 +41385,39 @@ async fn handle_provider_session_frame(
             remove_provider_session_pending_payloads(pending_payloads, &session_id);
             heartbeat_load.set_active_sessions(sessions.len());
         }
-        Some("s.close") => {
-            sessions.remove(&session_id);
-            pending_requests.remove(&session_id);
-            remove_provider_session_pending_payloads(pending_payloads, &session_id);
+        "s.close" => {
+            let owns_session = sessions
+                .get(&session_id)
+                .is_some_and(|active| active.remote == remote);
+            if owns_session {
+                discard_provider_session_state(
+                    sessions,
+                    pending_requests,
+                    pending_payloads,
+                    &session_id,
+                );
+            }
+            let _ = bridge.session_close(&remote, &session_id).await;
             heartbeat_load.set_active_sessions(sessions.len());
         }
-        _ => {}
+        _ => {
+            provider_session_debug(format!(
+                "refusing unsupported provider session frame {frame_type} for {session_id} from {remote}"
+            ));
+            let owns_session = sessions
+                .get(&session_id)
+                .is_some_and(|active| active.remote == remote);
+            if owns_session {
+                discard_provider_session_state(
+                    sessions,
+                    pending_requests,
+                    pending_payloads,
+                    &session_id,
+                );
+                heartbeat_load.set_active_sessions(sessions.len());
+            }
+            let _ = bridge.session_close(&remote, &session_id).await;
+        }
     }
     Ok(())
 }
@@ -41415,7 +41642,21 @@ impl<'a> ProviderSessionLiveStream<'a> {
         };
         if event.get("session_id").and_then(Value::as_str) != Some(self.active.session_id.as_str())
         {
-            self.bridge.requeue_event_front(event);
+            self.bridge
+                .requeue_event_front(event)
+                .context("requeueing unrelated provider session event")?;
+            return Ok(());
+        }
+        if event.get("remote").and_then(Value::as_str) != Some(self.active.remote.as_str()) {
+            if let Some(remote) = event.get("remote").and_then(Value::as_str) {
+                let _ = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        self.bridge
+                            .session_close(remote, &self.active.session_id)
+                            .await
+                    })
+                });
+            }
             return Ok(());
         }
         let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -41425,7 +41666,9 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.send_client_disconnect_receipt()?;
             bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
         }
-        self.bridge.requeue_event_front(event);
+        self.bridge
+            .requeue_event_front(event)
+            .context("requeueing provider session event after disconnect poll")?;
         Ok(())
     }
 
@@ -41506,30 +41749,49 @@ async fn send_provider_session_output(
         .unwrap_or(0);
     let mut token_ids_sent_in_deltas = live_stream_state.is_some();
     if output.tool.is_none() && live_stream_state.is_none() {
-        let mut delivered_content = String::new();
-        let parts = provider_stream_parts(&output.content);
-        for (part_index, part) in parts.iter().enumerate() {
+        let max_frame_bytes = provider_session_max_frame_bytes();
+        let parts = provider_stream_parts(
+            &output.content,
+            provider_session_text_delta_bytes(max_frame_bytes),
+        );
+        let token_part_count = output
+            .token_ids
+            .len()
+            .div_ceil(PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA);
+        let part_count = parts.len().max(token_part_count);
+        let mut delivered_token_ids = 0_usize;
+        let mut delivered_rough_tokens = IncrementalRoughTokenCounter::default();
+        for part_index in 0..part_count {
+            let part = parts.get(part_index).copied().unwrap_or("");
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
                 active.session_id
             ));
             let token_ids_delta =
-                provider_token_ids_delta_for_part(&output.token_ids, part_index, parts.len());
+                provider_token_ids_delta_for_part(&output.token_ids, part_index, part_count);
             if !token_ids_delta.is_empty() {
                 token_ids_sent_in_deltas = true;
             }
+            let frame =
+                provider_session_content_delta_frame(request_id, index, part, token_ids_delta);
+            let frame_len = provider_session_frame_json_len(&frame)?;
+            ensure!(
+                frame_len <= max_frame_bytes,
+                "content s.delta frame {frame_len} bytes exceeds session max {max_frame_bytes} bytes"
+            );
             bridge
-                .session_send(
-                    &active.remote,
-                    &active.session_id,
-                    provider_session_content_delta_frame(request_id, index, part, token_ids_delta),
-                )
+                .session_send(&active.remote, &active.session_id, frame)
                 .await
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
-            delivered_content.push_str(part);
-            let delivered_tokens = rough_text_tokens(&delivered_content);
+            delivered_token_ids = delivered_token_ids.saturating_add(token_ids_delta.len());
+            delivered_rough_tokens.observe(part);
+            let delivered_tokens = if output.token_ids.is_empty() {
+                delivered_rough_tokens.count
+            } else {
+                u64::try_from(delivered_token_ids).unwrap_or(u64::MAX)
+            };
             if provider_session_checkpoint_due(
                 delivered_tokens,
                 output.usage.output_tokens(),
@@ -41569,18 +41831,15 @@ async fn send_provider_session_output(
         }
     }
 
-    for frame in provider_session_artifact_delta_frames(request_id, index, &output.artifacts) {
-        provider_session_debug(format!(
-            "sending artifact s.delta #{} for session {} request {request_id}",
-            frame.get("i").and_then(Value::as_u64).unwrap_or(index),
-            active.session_id,
-        ));
-        bridge
-            .session_send(&active.remote, &active.session_id, frame)
-            .await
-            .context("sending artifact s.delta")?;
-        index = index.saturating_add(1);
-    }
+    index = send_provider_session_artifacts(
+        bridge,
+        active,
+        request_id,
+        index,
+        &output.artifacts,
+        provider_session_max_frame_bytes(),
+    )
+    .await?;
 
     if let Some(state) = &live_stream_state {
         send_provider_client_disconnect_receipt_if_requested(
@@ -41595,25 +41854,17 @@ async fn send_provider_session_output(
         .await?;
     }
 
-    for frame in provider_session_final_delta_frames(
+    send_provider_session_final_output_frames(
+        bridge,
+        active,
         request_id,
         index,
         output,
         token_ids_sent_in_deltas,
         &provider_quality,
         provider_session_max_frame_bytes(),
-    )? {
-        provider_session_debug(format!(
-            "sending final response frame {} #{} for session {} request {request_id}",
-            frame.get("t").and_then(Value::as_str).unwrap_or("frame"),
-            frame.get("i").and_then(Value::as_u64).unwrap_or(index),
-            active.session_id
-        ));
-        bridge
-            .session_send(&active.remote, &active.session_id, frame)
-            .await
-            .context("sending final response frame")?;
-    }
+    )
+    .await?;
 
     if let Some(state) = &live_stream_state {
         send_provider_client_disconnect_receipt_if_requested(
@@ -41690,7 +41941,15 @@ async fn provider_session_client_disconnect_requested(
         Err(err) => return Err(err).context("polling provider session close before final receipt"),
     };
     if event.get("session_id").and_then(Value::as_str) != Some(active.session_id.as_str()) {
-        bridge.requeue_event_front(event);
+        bridge
+            .requeue_event_front(event)
+            .context("requeueing unrelated provider session event")?;
+        return Ok(false);
+    }
+    if event.get("remote").and_then(Value::as_str) != Some(active.remote.as_str()) {
+        if let Some(remote) = event.get("remote").and_then(Value::as_str) {
+            let _ = bridge.session_close(remote, &active.session_id).await;
+        }
         return Ok(false);
     }
     let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -41699,7 +41958,9 @@ async fn provider_session_client_disconnect_requested(
     {
         return Ok(true);
     }
-    bridge.requeue_event_front(event);
+    bridge
+        .requeue_event_front(event)
+        .context("requeueing provider session event after disconnect poll")?;
     Ok(false)
 }
 
@@ -41724,16 +41985,188 @@ fn provider_session_max_frame_bytes() -> usize {
 }
 
 fn provider_session_payload_chunk_bytes(max_frame_bytes: usize) -> usize {
-    let safe_raw = max_frame_bytes.saturating_sub(4096) / 3;
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(safe_raw.max(1024))
+    let safe_raw = max_frame_bytes.saturating_sub(4096) / 2;
+    (64 * 1024).min(safe_raw.max(1024))
+}
+
+fn provider_session_text_delta_bytes(max_frame_bytes: usize) -> usize {
+    let worst_case_json_text = max_frame_bytes.saturating_sub(4096) / 6;
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(worst_case_json_text.max(1024))
 }
 
 fn provider_session_frame_json_len(frame: &Value) -> Result<usize> {
-    serde_json::to_vec(frame)
-        .map(|bytes| bytes.len())
-        .context("serializing provider session frame")
+    provider_session_serialized_len(frame)
 }
 
+fn provider_session_serialized_len<T: Serialize>(value: &T) -> Result<usize> {
+    let mut counter = JsonLengthWriter::default();
+    serde_json::to_writer(&mut counter, value).context("serializing provider session JSON")?;
+    Ok(counter.len)
+}
+
+#[derive(Default)]
+struct JsonLengthWriter {
+    len: usize,
+}
+
+impl Write for JsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn send_provider_session_final_output_frames(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    start_index: u64,
+    output: &ProviderSessionOutput,
+    token_ids_sent_in_deltas: bool,
+    provider_quality: &Value,
+    max_frame_bytes: usize,
+) -> Result<()> {
+    let mut next_index = start_index;
+    let mut final_frame = json!({
+        "t": "s.delta",
+        "rid": request_id,
+        "i": next_index,
+        "d": "",
+        "tool": null,
+        "embeddings": null,
+        "fin": output.finish_reason,
+        "usage": output.usage,
+        "quality": provider_quality,
+        "token_ids": null,
+        "artifacts": provider_session_artifact_summaries(&output.artifacts),
+    });
+    if let Some(tool) = &output.tool {
+        attach_or_stream_provider_delta_field(
+            bridge,
+            active,
+            request_id,
+            &mut final_frame,
+            "tool",
+            serde_json::to_value(tool).context("serializing provider tool output")?,
+            &mut next_index,
+            max_frame_bytes,
+        )
+        .await?;
+    }
+    if let Some(embeddings) = &output.embeddings {
+        attach_or_stream_provider_delta_field(
+            bridge,
+            active,
+            request_id,
+            &mut final_frame,
+            "embeddings",
+            serde_json::to_value(embeddings).context("serializing provider embeddings")?,
+            &mut next_index,
+            max_frame_bytes,
+        )
+        .await?;
+    }
+    if !token_ids_sent_in_deltas {
+        attach_or_stream_provider_delta_field(
+            bridge,
+            active,
+            request_id,
+            &mut final_frame,
+            "token_ids",
+            serde_json::to_value(&output.token_ids).context("serializing provider token ids")?,
+            &mut next_index,
+            max_frame_bytes,
+        )
+        .await?;
+    }
+    final_frame["i"] = json!(next_index);
+    let final_len = provider_session_frame_json_len(&final_frame)?;
+    ensure!(
+        final_len <= max_frame_bytes,
+        "final provider s.delta frame {final_len} bytes exceeds session max {max_frame_bytes} bytes after streaming large fields"
+    );
+    provider_session_debug(format!(
+        "sending final s.delta #{next_index} for session {} request {request_id}",
+        active.session_id
+    ));
+    bridge
+        .session_send(&active.remote, &active.session_id, final_frame)
+        .await
+        .context("sending final response frame")?;
+    Ok(())
+}
+
+async fn attach_or_stream_provider_delta_field(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    final_frame: &mut Value,
+    field: &'static str,
+    value: Value,
+    next_index: &mut u64,
+    max_frame_bytes: usize,
+) -> Result<()> {
+    final_frame[field] = value;
+    if provider_session_frame_json_len(final_frame)? <= max_frame_bytes {
+        return Ok(());
+    }
+    let value = final_frame
+        .as_object_mut()
+        .context("final provider s.delta frame must be an object")?
+        .insert(field.to_owned(), Value::Null)
+        .context("provider session field disappeared while chunking")?;
+    let bytes = stable_json_bytes(&value)
+        .with_context(|| format!("serializing provider session {field} field"))?;
+    let chunk_size = provider_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size)
+        .map_err(|err| anyhow::anyhow!("planning provider session {field} chunks failed: {err}"))?;
+    for chunk_index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, chunk_index)
+            .map_err(|err| {
+                anyhow::anyhow!("building provider session {field} chunk failed: {err}")
+            })?
+            .context("planned provider session payload chunk was missing")?;
+        let frame = json!({
+            "t": "s.delta_chunk",
+            "v": 1,
+            "rid": request_id,
+            "i": *next_index,
+            "field": field,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = provider_session_frame_json_len(&frame)?;
+        ensure!(
+            len <= max_frame_bytes,
+            "chunked provider s.delta {field} frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+        );
+        bridge
+            .session_send(&active.remote, &active.session_id, frame)
+            .await
+            .with_context(|| format!("sending provider session {field} chunk"))?;
+        *next_index = next_index
+            .checked_add(1)
+            .context("provider delta index overflow")?;
+    }
+    let object = final_frame
+        .as_object_mut()
+        .context("final provider s.delta frame must be an object")?;
+    object.insert(format!("{field}_ref"), json!(manifest));
+    ensure!(
+        provider_session_frame_json_len(final_frame)? <= max_frame_bytes,
+        "provider session {field} manifest does not fit the session frame limit"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 fn provider_session_final_delta_frames(
     request_id: &str,
     start_index: u64,
@@ -41805,6 +42238,7 @@ fn provider_session_final_delta_frames(
     Ok(frames)
 }
 
+#[cfg(test)]
 fn provider_session_add_delta_ref_frames(
     frames: &mut Vec<Value>,
     final_frame: &mut Value,
@@ -41926,6 +42360,99 @@ async fn send_provider_session_receipt_frame(
     Ok(())
 }
 
+async fn send_provider_session_artifacts(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    start_index: u64,
+    artifacts: &[ProviderSessionArtifact],
+    max_frame_bytes: usize,
+) -> Result<u64> {
+    let mut index = start_index;
+    for artifact in artifacts {
+        let digest = blake3_bytes_hex(&artifact.bytes);
+        if artifact.bytes.is_empty() {
+            let frame = provider_session_artifact_delta_frame(
+                request_id,
+                index,
+                artifact,
+                &digest,
+                0,
+                &[],
+                true,
+            );
+            send_provider_session_artifact_frame(
+                bridge,
+                active,
+                request_id,
+                frame,
+                max_frame_bytes,
+            )
+            .await?;
+            index = index
+                .checked_add(1)
+                .context("artifact delta index overflow")?;
+            continue;
+        }
+        for (chunk_index, chunk) in artifact
+            .bytes
+            .chunks(PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE)
+            .enumerate()
+        {
+            let offset = chunk_index
+                .checked_mul(PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE)
+                .context("artifact chunk offset overflow")?;
+            let final_chunk = offset.saturating_add(chunk.len()) >= artifact.bytes.len();
+            let frame = provider_session_artifact_delta_frame(
+                request_id,
+                index,
+                artifact,
+                &digest,
+                offset,
+                chunk,
+                final_chunk,
+            );
+            send_provider_session_artifact_frame(
+                bridge,
+                active,
+                request_id,
+                frame,
+                max_frame_bytes,
+            )
+            .await?;
+            index = index
+                .checked_add(1)
+                .context("artifact delta index overflow")?;
+        }
+    }
+    Ok(index)
+}
+
+async fn send_provider_session_artifact_frame(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    frame: Value,
+    max_frame_bytes: usize,
+) -> Result<()> {
+    let index = frame.get("i").and_then(Value::as_u64).unwrap_or(0);
+    let frame_len = provider_session_frame_json_len(&frame)?;
+    ensure!(
+        frame_len <= max_frame_bytes,
+        "artifact s.delta frame {frame_len} bytes exceeds session max {max_frame_bytes} bytes"
+    );
+    provider_session_debug(format!(
+        "sending artifact s.delta #{index} for session {} request {request_id}",
+        active.session_id,
+    ));
+    bridge
+        .session_send(&active.remote, &active.session_id, frame)
+        .await
+        .context("sending artifact s.delta")?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn provider_session_artifact_delta_frames(
     request_id: &str,
     start_index: u64,
@@ -42090,6 +42617,12 @@ async fn wait_for_provider_receipt_ack(
             .await
         {
             Ok(event) => {
+                if event.get("remote").and_then(Value::as_str) != Some(active.remote.as_str()) {
+                    if let Some(remote) = event.get("remote").and_then(Value::as_str) {
+                        let _ = bridge.session_close(remote, &active.session_id).await;
+                    }
+                    continue;
+                }
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
                 match frame.get("t").and_then(Value::as_str) {
                     Some("s.receipt_ack") => {
@@ -42176,7 +42709,7 @@ async fn send_provider_session_close(
     session_id: &str,
     reason: &str,
 ) -> Result<()> {
-    bridge
+    let send_result = bridge
         .session_send(
             remote,
             session_id,
@@ -42187,8 +42720,10 @@ async fn send_provider_session_close(
                 "reason": reason,
             }),
         )
-        .await
-        .with_context(|| format!("sending s.close for {session_id}"))?;
+        .await;
+    let close_result = bridge.session_close(remote, session_id).await;
+    send_result.with_context(|| format!("sending s.close for {session_id}"))?;
+    close_result.with_context(|| format!("reclaiming direct session {session_id}"))?;
     Ok(())
 }
 
@@ -43601,6 +44136,90 @@ struct ProviderSessionOutput {
     usage: ReceiptUsage,
 }
 
+fn validate_provider_session_output(
+    terms: &ProviderSessionTerms,
+    body: &Value,
+    output: &ProviderSessionOutput,
+) -> Result<()> {
+    let payload_limit = provider_session_configured_limit(
+        "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
+        DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    );
+    if body.get("kind").and_then(Value::as_str).is_none() {
+        let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
+        let max_output_tokens = body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(available_tokens)
+            .min(available_tokens);
+        ensure!(
+            output.completion_tokens <= max_output_tokens,
+            "provider output exceeded the selected session token budget"
+        );
+        ensure!(
+            u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
+            "provider token ids exceeded the selected session token budget"
+        );
+        let max_text_bytes = usize::try_from(max_output_tokens)
+            .unwrap_or(usize::MAX / DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
+            .saturating_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN);
+        ensure!(
+            output.content.len() <= max_text_bytes,
+            "provider text output exceeded the selected session byte budget"
+        );
+    } else {
+        ensure!(
+            output.content.len() <= payload_limit,
+            "provider modality text output exceeds the session payload budget"
+        );
+    }
+    if let Some(tool) = output.tool.as_ref() {
+        ensure!(
+            provider_session_serialized_len(tool)? <= payload_limit,
+            "provider tool output exceeds the session payload budget"
+        );
+    }
+    if let Some(embeddings) = output.embeddings.as_ref() {
+        ensure!(
+            provider_session_serialized_len(embeddings)? <= payload_limit,
+            "provider embeddings exceed the session payload budget"
+        );
+    }
+    let max_artifacts = provider_session_configured_limit(
+        "MAYHEM_SESSION_MAX_ARTIFACTS",
+        DEFAULT_PROVIDER_SESSION_MAX_ARTIFACTS,
+    );
+    ensure!(
+        output.artifacts.len() <= max_artifacts,
+        "provider artifact count exceeds the session budget"
+    );
+    let max_artifact_bytes = provider_session_configured_limit(
+        "MAYHEM_SESSION_MAX_ARTIFACT_BYTES",
+        DEFAULT_PROVIDER_SESSION_MAX_ARTIFACT_BYTES,
+    );
+    let artifact_bytes = output
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |total, artifact| {
+            total
+                .checked_add(artifact.bytes.len())
+                .context("provider artifact byte count overflow")
+        })?;
+    ensure!(
+        artifact_bytes <= max_artifact_bytes,
+        "provider artifacts exceed the session byte budget"
+    );
+    Ok(())
+}
+
+fn provider_session_configured_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 fn provider_engine_session_response(
     backend: &mut dyn EngineBackend,
     adapter: &catalog::CatalogAdapter,
@@ -44614,14 +45233,46 @@ fn provider_content_part_to_text(part: &Value) -> String {
     }
 }
 
-fn provider_stream_parts(content: &str) -> Vec<String> {
-    let mut parts = content
-        .split_inclusive(' ')
-        .map(str::to_owned)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.is_empty() && !content.is_empty() {
-        parts.push(content.to_owned());
+#[derive(Default)]
+struct IncrementalRoughTokenCounter {
+    count: u64,
+    in_token: bool,
+}
+
+impl IncrementalRoughTokenCounter {
+    fn observe(&mut self, text: &str) {
+        for character in text.chars() {
+            if character.is_whitespace() {
+                self.in_token = false;
+            } else if !self.in_token {
+                self.count = self.count.saturating_add(1);
+                self.in_token = true;
+            }
+        }
+    }
+}
+
+fn provider_stream_parts(content: &str, max_part_bytes: usize) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let max_part_bytes = max_part_bytes.max(4);
+    let mut parts = Vec::with_capacity(content.len().div_ceil(max_part_bytes));
+    let mut start = 0;
+    while start < content.len() {
+        let mut end = start.saturating_add(max_part_bytes).min(content.len());
+        while end > start && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = content[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(content.len());
+        }
+        parts.push(&content[start..end]);
+        start = end;
     }
     parts
 }
@@ -54209,6 +54860,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     "payload_id": manifest.blake3,
                     "chunk": chunk,
                 }),
+                1024 * 1024,
+                1024,
             )
             .unwrap();
         }
@@ -54221,6 +54874,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "rid": request_id,
                 "body_ref": manifest,
             }),
+            1024 * 1024,
         )
         .unwrap();
 
@@ -54236,6 +54890,38 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let session_id = "sess-corrupt";
         let request_id = "req-corrupt";
         let mut pending_payloads = HashMap::new();
+        let err = chunks
+            .into_iter()
+            .find_map(|chunk| {
+                provider_session_collect_request_chunk(
+                    &mut pending_payloads,
+                    session_id,
+                    &json!({
+                        "t": "s.req_chunk",
+                        "rid": request_id,
+                        "payload_id": manifest.blake3,
+                        "chunk": chunk,
+                    }),
+                    1024 * 1024,
+                    1024,
+                )
+                .err()
+            })
+            .expect("corrupt chunk must fail during collection");
+
+        assert!(err.to_string().contains("collecting s.req_chunk failed"));
+    }
+
+    #[test]
+    fn provider_session_reassembles_multi_megabyte_request_without_frame_cutoff() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "x".repeat(2 * 1024 * 1024) }],
+            "stream": true,
+        });
+        let (manifest, chunks) = mayhem_proto::chunk_json_payload(&body, 16 * 1024).unwrap();
+        let session_id = "sess-large";
+        let request_id = "req-large";
+        let mut pending_payloads = HashMap::new();
         for chunk in chunks {
             provider_session_collect_request_chunk(
                 &mut pending_payloads,
@@ -54246,11 +54932,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     "payload_id": manifest.blake3,
                     "chunk": chunk,
                 }),
+                4 * 1024 * 1024,
+                4096,
             )
             .unwrap();
         }
-
-        let err = provider_session_request_body_from_frame(
+        let restored = provider_session_request_body_from_frame(
             &mut pending_payloads,
             session_id,
             &json!({
@@ -54258,21 +54945,95 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "rid": request_id,
                 "body_ref": manifest,
             }),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn provider_session_rejects_payload_switch_replay_and_byte_overflow() {
+        let body = json!({ "messages": [{ "role": "user", "content": "x".repeat(1024) }] });
+        let (manifest, chunks) = mayhem_proto::chunk_json_payload(&body, 128).unwrap();
+        let mut pending = HashMap::new();
+        provider_session_collect_request_chunk(
+            &mut pending,
+            "sess",
+            &json!({
+                "t": "s.req_chunk",
+                "rid": "rid",
+                "payload_id": manifest.blake3,
+                "chunk": chunks[0],
+            }),
+            4096,
+            64,
+        )
+        .unwrap();
+
+        let replay = provider_session_collect_request_chunk(
+            &mut pending,
+            "sess",
+            &json!({
+                "t": "s.req_chunk",
+                "rid": "rid",
+                "payload_id": manifest.blake3,
+                "chunk": chunks[0],
+            }),
+            4096,
+            64,
         )
         .unwrap_err();
+        assert!(replay.to_string().contains("reordered"));
 
-        assert!(err
+        let switched = provider_session_collect_request_chunk(
+            &mut pending,
+            "sess",
+            &json!({
+                "t": "s.req_chunk",
+                "rid": "rid",
+                "payload_id": "11".repeat(32),
+                "chunk": chunks[1],
+            }),
+            4096,
+            64,
+        )
+        .unwrap_err();
+        assert!(switched
             .to_string()
-            .contains("reassembling s.req body_ref failed"));
+            .contains("different pending request payload"));
+
+        let mut too_small = HashMap::new();
+        let overflow = chunks.into_iter().find_map(|chunk| {
+            provider_session_collect_request_chunk(
+                &mut too_small,
+                "small",
+                &json!({
+                    "t": "s.req_chunk",
+                    "rid": "rid",
+                    "payload_id": manifest.blake3,
+                    "chunk": chunk,
+                }),
+                100,
+                64,
+            )
+            .err()
+        });
+        assert!(overflow
+            .expect("payload must exceed byte limit")
+            .to_string()
+            .contains("exceeds"));
     }
 
     #[test]
     fn provider_session_content_deltas_distribute_token_ids_incrementally() {
-        let parts = provider_stream_parts("one two three four five");
+        let content = "one two three four five \u{03c0}\u{03c0}";
+        let parts = provider_stream_parts(content, 4);
         let token_ids = vec![10, 11, 12, 13, 14, 15, 16];
         let mut observed = Vec::new();
+        let mut token_counter = IncrementalRoughTokenCounter::default();
 
         for (index, part) in parts.iter().enumerate() {
+            token_counter.observe(part);
             let delta = provider_token_ids_delta_for_part(&token_ids, index, parts.len());
             let frame = provider_session_content_delta_frame("rid", index as u64, part, delta);
             observed.extend(
@@ -54285,6 +55046,69 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }
 
         assert_eq!(observed, token_ids);
+        assert_eq!(parts.concat(), content);
+        assert_eq!(token_counter.count, rough_text_tokens(content));
+    }
+
+    #[test]
+    fn provider_session_token_only_continuations_stay_inside_frame_limit() {
+        let max_frame_bytes = DEFAULT_SESSION_MAX_FRAME_BYTES;
+        let token_ids = vec![i32::MIN; 20_000];
+        let text_parts =
+            provider_stream_parts("", provider_session_text_delta_bytes(max_frame_bytes));
+        let part_count = text_parts.len().max(
+            token_ids
+                .len()
+                .div_ceil(PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA),
+        );
+        let mut observed = Vec::new();
+        for index in 0..part_count {
+            let token_delta = provider_token_ids_delta_for_part(&token_ids, index, part_count);
+            let frame = provider_session_content_delta_frame("rid", index as u64, "", token_delta);
+            assert!(provider_session_frame_json_len(&frame).unwrap() <= max_frame_bytes);
+            observed.extend_from_slice(token_delta);
+        }
+        assert_eq!(observed, token_ids);
+    }
+
+    #[test]
+    fn provider_session_output_budget_allows_large_valid_text_and_rejects_overrun() {
+        let terms = test_provider_session_terms();
+        let body = json!({ "messages": [], "max_tokens": 8192 });
+        let mut output = ProviderSessionOutput {
+            content: "x".repeat(8192 * DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN),
+            tool: None,
+            embeddings: None,
+            artifacts: Vec::new(),
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 8192,
+            token_ids: vec![1; 8192],
+            usage: ReceiptUsage::text(0, 8192),
+        };
+        validate_provider_session_output(&terms, &body, &output).unwrap();
+
+        output.content.push('x');
+        assert!(validate_provider_session_output(&terms, &body, &output)
+            .unwrap_err()
+            .to_string()
+            .contains("byte budget"));
+
+        output.content.clear();
+        output.completion_tokens = 0;
+        output.token_ids.clear();
+        output.usage = ReceiptUsage::text(0, 0);
+        output.artifacts = (0..=DEFAULT_PROVIDER_SESSION_MAX_ARTIFACTS)
+            .map(|index| ProviderSessionArtifact {
+                id: format!("artifact-{index}"),
+                content_type: "application/octet-stream".to_owned(),
+                bytes: Vec::new(),
+            })
+            .collect();
+        assert!(validate_provider_session_output(&terms, &body, &output)
+            .unwrap_err()
+            .to_string()
+            .contains("artifact count"));
     }
 
     #[test]
