@@ -2055,13 +2055,16 @@ mod stable_diffusion_cpp_backend {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod stable_diffusion_tests {
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn stable_diffusion_cpp_backend_emits_generated_image_artifact() {
         let root =
@@ -2163,6 +2166,7 @@ printf '\211PNG\r\n\032\n' > "$out"
         assert!(artifacts[0].bytes.len() > 1024);
     }
 
+    #[cfg(unix)]
     fn stable_empty_safetensors() -> Vec<u8> {
         let header = b"{}";
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();

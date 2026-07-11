@@ -38,10 +38,11 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
     let spec = python_runtime_spec(backend)
         .with_context(|| format!("backend {backend} does not use a managed Python runtime"))?;
     verify_requirements(&spec)?;
+    let cache_root = home.join("cache").join(spec.backend);
 
     if let Some(explicit) = env::var_os(spec.override_env) {
         let python = PathBuf::from(explicit);
-        validate_python(&python, &spec).with_context(|| {
+        validate_python(&python, &spec, &cache_root).with_context(|| {
             format!(
                 "{} points to an unusable {} runtime; fix or unset the explicit override",
                 spec.override_env, spec.backend
@@ -59,7 +60,7 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         .with_context(|| format!("creating managed Python directory {}", venvs.display()))?;
     let venv = venvs.join(spec.backend);
     let python = venv_python(&venv);
-    if validate_python(&python, &spec).is_ok() {
+    if validate_python(&python, &spec, &cache_root).is_ok() {
         return Ok(PythonRuntime {
             python,
             source: "managed existing venv".to_owned(),
@@ -78,7 +79,7 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
     })?;
 
     let result = (|| {
-        if validate_python(&python, &spec).is_ok() {
+        if validate_python(&python, &spec, &cache_root).is_ok() {
             return Ok(PythonRuntime {
                 python,
                 source: "managed existing venv".to_owned(),
@@ -167,7 +168,7 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
                 install.status
             );
         }
-        validate_python(&managed_python, &spec).with_context(|| {
+        validate_python(&managed_python, &spec, &cache_root).with_context(|| {
             format!(
                 "managed {} install completed but its import/version check failed",
                 spec.backend
@@ -204,7 +205,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             import_name: "tensorrt_llm",
             version: "1.3.0rc20",
             requirements: TRT_LLM_REQUIREMENTS,
-            requirements_sha256: "349e16bfabb93bf450befe2a2d214e074560af3ede4baba1ccfebe0298476332",
+            requirements_sha256: "af04f36cac8fa64b2694ab8d7709e837a69f49c7f5f3fe856594a628c8d5a8ff",
             extra_index_urls: &[
                 "https://pypi.nvidia.com",
                 "https://download.pytorch.org/whl/cu130",
@@ -285,17 +286,20 @@ fn exact_requirement_pairs(text: &str) -> Result<Vec<(String, String)>> {
     Ok(pairs)
 }
 
-fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
+fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -> Result<()> {
     let text = std::str::from_utf8(spec.requirements)
         .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
     let expected_versions = serde_json::to_string(&exact_requirement_pairs(text)?)?;
+    const VERSION_MARKER: &str = "__MAYHEM_RUNTIME_VERSION__=";
     let script = format!(
-        "import importlib.metadata as m; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); import {}; print(m.version({:?}))",
-        spec.import_name, spec.distribution
+        "import importlib.metadata as m; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); import {}; print({:?} + m.version({:?}))",
+        spec.import_name, VERSION_MARKER, spec.distribution
     );
-    let output = Command::new(python)
+    let mut command = Command::new(python);
+    configure_validation_cache(&mut command, cache_root)?;
+    let output = command
         .arg("-c")
-        .arg(script)
+        .arg(&script)
         .output()
         .with_context(|| format!("starting {}", python.display()))?;
     if !output.status.success() {
@@ -312,7 +316,18 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
             }
         );
     }
-    let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(VERSION_MARKER))
+        .with_context(|| {
+            format!(
+                "{} validated {} but did not emit its version marker",
+                python.display(),
+                spec.distribution
+            )
+        })?;
     if actual != spec.version {
         bail!(
             "{} has {} {}, expected {}",
@@ -321,6 +336,22 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec) -> Result<()> {
             actual,
             spec.version
         );
+    }
+    Ok(())
+}
+
+fn configure_validation_cache(command: &mut Command, cache_root: &Path) -> Result<()> {
+    for (name, default_path) in [
+        ("XDG_CACHE_HOME", cache_root.join("xdg")),
+        ("HF_HOME", cache_root.join("huggingface")),
+        ("HF_HUB_CACHE", cache_root.join("huggingface/hub")),
+        ("TRANSFORMERS_CACHE", cache_root.join("transformers")),
+        ("TORCH_HOME", cache_root.join("torch")),
+    ] {
+        let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+        fs::create_dir_all(&path)
+            .with_context(|| format!("creating managed Python cache {}", path.display()))?;
+        command.env(name, path);
     }
     Ok(())
 }

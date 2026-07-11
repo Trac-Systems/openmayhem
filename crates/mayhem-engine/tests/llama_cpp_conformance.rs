@@ -12,6 +12,8 @@ use mayhem_engine::{
 use serde_json::json;
 
 const RUN_ENV: &str = "MAYHEM_RUN_LLAMACPP_TESTS";
+const MODEL_ENV: &str = "MAYHEM_LLAMACPP_MODEL";
+const GPU_LAYERS_ENV: &str = "MAYHEM_LLAMACPP_GPU_LAYERS";
 const HF_TOKEN_FILE_ENV: &str = "HF_TOKEN_FILE";
 const DEFAULT_HF_TOKEN_FILE: &str = ".mayhem-local/secrets/hf.txt";
 const REPO: &str = "lmstudio-community/Qwen3.5-4B-GGUF";
@@ -42,6 +44,12 @@ fn gguf_dev_model_smoke_generates_and_constrains_tool_call() -> TestResult {
     config.batch_size = 256;
     config.ubatch_size = 256;
     config.threads = Some(4);
+    config.gpu_layers = optional_positive_u32(GPU_LAYERS_ENV)?;
+    eprintln!(
+        "llama.cpp conformance model={} gpu_layers={:?}",
+        model_path.display(),
+        config.gpu_layers
+    );
     let info = backend.load(config)?;
     assert_eq!(info.artifact.path, model_path);
     assert!(info.n_vocab > 0);
@@ -183,6 +191,10 @@ fn gguf_vision_model_smoke_describes_real_image() -> TestResult {
 }
 
 fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = env::var_os(MODEL_ENV).map(PathBuf::from) {
+        verify_artifact(&ModelArtifact::gguf(&path))?;
+        return Ok(path);
+    }
     let path = cache_path(REPO, REVISION, FILE_NAME)?;
     let artifact = ModelArtifact::gguf(&path);
     if path.exists() {
@@ -195,6 +207,24 @@ fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>
     download_hf_file(REPO, REVISION, FILE_NAME, &path)?;
     verify_artifact(&artifact)?;
     Ok(path)
+}
+
+fn optional_positive_u32(
+    name: &str,
+) -> std::result::Result<Option<u32>, Box<dyn std::error::Error>> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|err| format!("{name} must be a positive integer: {err}"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be a positive integer").into());
+    }
+    Ok(Some(parsed))
 }
 
 fn ensure_embedding_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {

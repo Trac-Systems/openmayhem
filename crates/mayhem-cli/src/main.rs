@@ -32361,14 +32361,45 @@ fn stable_diffusion_accelerator(hardware: &HardwareReport) -> Result<Option<Stri
     {
         return Ok(Some(explicit));
     }
-    let selected = hardware.gpus.iter().find_map(|gpu| match gpu.vendor {
-        GpuVendor::Nvidia => Some("cuda"),
-        GpuVendor::Apple => Some("metal"),
-        GpuVendor::Amd if gpu.backend == GpuBackend::Rocm => Some("rocm"),
-        GpuVendor::Amd | GpuVendor::Intel | GpuVendor::Vulkan => Some("vulkan"),
-        GpuVendor::Unknown => None,
-    });
-    Ok(selected.map(str::to_owned))
+    Ok(stable_diffusion_accelerator_from_hardware(hardware).map(str::to_owned))
+}
+
+fn stable_diffusion_accelerator_from_hardware(hardware: &HardwareReport) -> Option<&'static str> {
+    let selected = [
+        (
+            "cuda",
+            hardware
+                .gpus
+                .iter()
+                .any(|gpu| gpu.vendor == GpuVendor::Nvidia),
+        ),
+        (
+            "metal",
+            hardware
+                .gpus
+                .iter()
+                .any(|gpu| gpu.vendor == GpuVendor::Apple),
+        ),
+        (
+            "rocm",
+            hardware
+                .gpus
+                .iter()
+                .any(|gpu| gpu.vendor == GpuVendor::Amd && gpu.backend == GpuBackend::Rocm),
+        ),
+        (
+            "vulkan",
+            hardware.gpus.iter().any(|gpu| {
+                matches!(
+                    gpu.vendor,
+                    GpuVendor::Amd | GpuVendor::Intel | GpuVendor::Vulkan
+                )
+            }),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(backend, available)| available.then_some(backend));
+    selected
 }
 
 fn provider_llama_accelerator_preflight(
@@ -58629,6 +58660,32 @@ State initialization...
             "trt-llm"
         );
         assert!(resolve_doctor_provider_backend("trt_llm", &linux).is_err());
+    }
+
+    #[test]
+    fn stable_diffusion_accelerator_prefers_cuda_on_mixed_gpu_hosts() {
+        let mut mixed = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut integrated = mixed.gpus[0].clone();
+        integrated.vendor = GpuVendor::Amd;
+        integrated.backend = GpuBackend::Vulkan;
+        mixed.gpus.insert(0, integrated.clone());
+        assert_eq!(
+            stable_diffusion_accelerator_from_hardware(&mixed),
+            Some("cuda")
+        );
+
+        mixed.gpus.retain(|gpu| gpu.vendor != GpuVendor::Nvidia);
+        assert_eq!(
+            stable_diffusion_accelerator_from_hardware(&mixed),
+            Some("vulkan")
+        );
+
+        integrated.backend = GpuBackend::Rocm;
+        mixed.gpus = vec![integrated];
+        assert_eq!(
+            stable_diffusion_accelerator_from_hardware(&mixed),
+            Some("rocm")
+        );
     }
 
     #[test]
