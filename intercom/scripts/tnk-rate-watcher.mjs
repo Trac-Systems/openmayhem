@@ -97,13 +97,13 @@ export function rateStateMatches(rate, value) {
 
 export async function waitForRateState(rate, {
   rpcUrl,
-  timeoutMs = 30_000,
+  timeoutMs = 0,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
   let last = null;
-  while (Date.now() <= deadline) {
+  while (deadline === null || Date.now() <= deadline) {
     last = await readContractStateValue(rpcUrl, 'rate/latest', { fetchImpl });
     if (rateStateMatches(rate, last)) {
       return { verified: true, state: last };
@@ -255,6 +255,18 @@ function parsePositiveInt(value, label, fallback = null) {
   return parsed;
 }
 
+function parseNonNegativeInt(value, label, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    if (fallback !== null) return fallback;
+    throw new Error(`Missing ${label}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+  return parsed;
+}
+
 async function main() {
   const args = parseArgs();
   const intervalMs = parsePositiveInt(args['interval-ms'] ?? DEFAULT_INTERVAL_MS, '--interval-ms', DEFAULT_INTERVAL_MS);
@@ -274,7 +286,7 @@ async function main() {
       ? process.env[String(args['admin-wallet-password-env'])]
       : undefined,
     verify: !boolArg(args['no-verify'], false),
-    verifyTimeoutMs: parsePositiveInt(args['verify-timeout-ms'] ?? 30_000, '--verify-timeout-ms', 30_000),
+    verifyTimeoutMs: parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0),
     verifyPollMs: parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500),
   };
 

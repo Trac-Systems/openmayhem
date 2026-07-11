@@ -347,6 +347,10 @@ impl ProviderTable {
         }
     }
 
+    pub fn set_heartbeat_ttl_millis(&mut self, heartbeat_ttl_millis: u64) {
+        self.heartbeat_ttl_millis = heartbeat_ttl_millis;
+    }
+
     pub fn replace_contract_snapshot(
         &mut self,
         records: impl IntoIterator<Item = ContractProviderSnapshot>,
@@ -613,7 +617,7 @@ pub fn evaluate_eligibility(
     let heartbeat_age = entry
         .heartbeat_age_millis
         .ok_or(IneligibilityReason::HeartbeatMissing)?;
-    if heartbeat_age >= request.heartbeat_ttl_millis {
+    if heartbeat_age > request.heartbeat_ttl_millis {
         return Err(IneligibilityReason::HeartbeatStale);
     }
     if request.requires_transport_peer && heartbeat.transport_peer.is_none() {
@@ -1631,7 +1635,7 @@ mod tests {
         );
 
         let mut bad = good.clone();
-        bad.heartbeat_age_millis = Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS);
+        bad.heartbeat_age_millis = Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS + 1);
         assert_eq!(
             evaluate_eligibility(&bad, &request),
             Err(IneligibilityReason::HeartbeatStale)

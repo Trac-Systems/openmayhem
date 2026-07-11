@@ -16,7 +16,9 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.maxFrameBytes, 256 * 1024);
   assert.equal(stats.rateBytesPerSecond, 1_000_000);
   assert.equal(stats.rateBurstBytes, 1_000_000);
-  assert.equal(stats.sendDrainTimeoutMs, 30_000);
+  assert.equal(stats.sendDrainTimeoutMs, 0);
+  assert.equal(stats.connectMaxWaitMs, 120_000);
+  assert.equal(stats.connectPollMs, 100);
   assert.equal(stats.sessionCount, 0);
 });
 
@@ -26,6 +28,8 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
     rateBytesPerSecond: 2_000_000,
     rateBurstBytes: 3_000_000,
     sendDrainTimeoutMs: 12_000,
+    connectMaxWaitMs: 600_000,
+    connectPollMs: 250,
   });
 
   assert.equal(configured.maxFrameBytes, 4096);
@@ -33,6 +37,8 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
   assert.equal(configured.stats().rateBytesPerSecond, 2_000_000);
   assert.equal(configured.stats().rateBurstBytes, 3_000_000);
   assert.equal(configured.stats().sendDrainTimeoutMs, 12_000);
+  assert.equal(configured.stats().connectMaxWaitMs, 600_000);
+  assert.equal(configured.stats().connectPollMs, 250);
 
   const fallback = new DirectSession({}, {
     maxFrameBytes: -1,
@@ -44,7 +50,27 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
   assert.equal(fallback.maxFrameBytes, 256 * 1024);
   assert.equal(fallback.stats().rateBytesPerSecond, 1_000_000);
   assert.equal(fallback.stats().rateBurstBytes, 1_000_000);
-  assert.equal(fallback.stats().sendDrainTimeoutMs, 30_000);
+  assert.equal(fallback.stats().sendDrainTimeoutMs, 0);
+});
+
+test('DirectSession default drain wait ends on transport progress without a wall-clock cutoff', async () => {
+  const directSession = new DirectSession({}, {});
+  const session = {
+    sessionId,
+    channel: { drained: false },
+    drainWaiters: new Set(),
+  };
+  let settled = false;
+  const waiting = directSession._waitForDrain(session).then(() => {
+    settled = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(settled, false);
+  assert.equal(session.drainWaiters.size, 1);
+  directSession._resolveDrainWaiters(session);
+  await waiting;
+  assert.equal(settled, true);
 });
 
 test('DirectSession rejects oversized frames before transport send', () => {

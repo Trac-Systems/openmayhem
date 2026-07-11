@@ -143,6 +143,7 @@ function extractEnvironment(files) {
         /process\.env\[['"]([A-Z0-9_]+)['"]\]/g,
         /\benv\.([A-Z0-9_]+)/g,
         /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g,
+        /['"]((?:MAYHEM_|TRAC_|PEER_|MSB_|SC_BRIDGE|SIDECHANNEL|SESSION_|STRIPE_|TAP_|ETH_|HF_|CARGO_|PROCESSOR_)[A-Z0-9_]*)['"]/g,
       ]) {
         for (const match of ref.text.matchAll(regex)) {
           addOccurrence(vars, match[1], `${ref.file}:${ref.line}`, ref.text.trim());

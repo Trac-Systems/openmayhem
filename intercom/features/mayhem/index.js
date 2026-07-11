@@ -9,8 +9,10 @@ const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
 const RELAY_VERSION = 1;
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
-const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_TIMEOUT_MS = 0;
 const DEFAULT_RETRY_MS = 1_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_RESULT_POLL_MS = 50;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
 
@@ -87,8 +89,25 @@ class MayhemFeature extends Feature {
     this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes) && config.maxMessageBytes > 0
       ? config.maxMessageBytes
       : MAYHEM_RELAY_MAX_MESSAGE_BYTES;
-    this.timeoutMs = Number.isSafeInteger(config.timeoutMs) ? config.timeoutMs : DEFAULT_TIMEOUT_MS;
-    this.retryMs = Number.isSafeInteger(config.retryMs) ? config.retryMs : DEFAULT_RETRY_MS;
+    this.timeoutMs = Number.isSafeInteger(config.timeoutMs) && config.timeoutMs >= 0
+      ? config.timeoutMs
+      : DEFAULT_TIMEOUT_MS;
+    this.retryMs = Number.isSafeInteger(config.retryMs) && config.retryMs > 0
+      ? config.retryMs
+      : DEFAULT_RETRY_MS;
+    this.connectTimeoutMs = Number.isSafeInteger(config.connectTimeoutMs) &&
+      config.connectTimeoutMs > 0
+      ? config.connectTimeoutMs
+      : this.timeoutMs > 0
+        ? Math.min(this.timeoutMs, DEFAULT_CONNECT_TIMEOUT_MS)
+        : DEFAULT_CONNECT_TIMEOUT_MS;
+    this.resultTimeoutMs = Number.isSafeInteger(config.resultTimeoutMs) &&
+      config.resultTimeoutMs >= 0
+      ? config.resultTimeoutMs
+      : DEFAULT_TIMEOUT_MS;
+    this.resultPollMs = Number.isSafeInteger(config.resultPollMs) && config.resultPollMs > 0
+      ? config.resultPollMs
+      : DEFAULT_RESULT_POLL_MS;
     this.cacheTtlMs = Number.isSafeInteger(config.cacheTtlMs)
       ? config.cacheTtlMs
       : DEFAULT_CACHE_TTL_MS;
@@ -98,6 +117,7 @@ class MayhemFeature extends Feature {
     this.processed = new Map();
     this.servicePending = new Map();
     this.serviceProcessed = new Map();
+    this.stopped = false;
   }
 
   async record(key, value) {
@@ -239,20 +259,26 @@ class MayhemFeature extends Feature {
     };
 
     const retry = setInterval(() => void attempt(), this.retryMs);
-    const timeout = setTimeout(() => {
-      const current = pending.get(requestId);
-      if (!current) return;
-      pending.delete(requestId);
-      const messageText = !connected ? unavailableMessage : !sent ? unsentMessage : timeoutMessage;
-      current.resolve(relayError(messageText, requestId));
-    }, this.timeoutMs);
+    const timeout = this.timeoutMs > 0
+      ? setTimeout(() => {
+          const current = pending.get(requestId);
+          if (!current) return;
+          pending.delete(requestId);
+          const messageText = !connected
+            ? unavailableMessage
+            : !sent
+              ? unsentMessage
+              : timeoutMessage;
+          current.resolve(relayError(messageText, requestId));
+        }, this.timeoutMs)
+      : null;
     void attempt();
 
     try {
       return await promise;
     } finally {
       clearInterval(retry);
-      clearTimeout(timeout);
+      if (timeout !== null) clearTimeout(timeout);
     }
   }
 
@@ -280,8 +306,7 @@ class MayhemFeature extends Feature {
     const target = normalizeKey(admin);
     if (!/^[0-9a-f]{64}$/.test(target) ||
         typeof sidechannel?.connectDirectPeer !== 'function') return false;
-    const waitMs = Math.max(1, Math.min(this.timeoutMs, 15_000));
-    return await sidechannel.connectDirectPeer(target, this.channel, waitMs);
+    return await sidechannel.connectDirectPeer(target, this.channel, this.connectTimeoutMs);
   }
 
   _verifyEnvelope(payload, expectedKey) {
@@ -296,6 +321,7 @@ class MayhemFeature extends Feature {
   _pruneMap(map) {
     const cutoff = Date.now() - this.cacheTtlMs;
     for (const [key, entry] of map) {
+      if (entry.pending === true) continue;
       if (entry.at >= cutoff && map.size <= this.cacheMax) break;
       map.delete(key);
     }
@@ -322,10 +348,12 @@ class MayhemFeature extends Feature {
       const promise = this._applyRelayed(message.key, stableValue(message.value), expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
       );
-      cached = { at: Date.now(), promise };
+      cached = { at: Date.now(), pending: true, promise };
       this.processed.set(expectedId, cached);
     }
     const response = await cached.promise;
+    cached.pending = false;
+    cached.at = Date.now();
     if (response?.ok !== true) this.processed.delete(expectedId);
     this.peer.sidechannel.broadcast(this.channel, {
       control: RELAY_CONTROL_RESULT,
@@ -375,10 +403,12 @@ class MayhemFeature extends Feature {
       const promise = Promise.resolve()
         .then(() => this.serviceHandler(message.service, stableValue(message.value)))
         .catch((error) => relayError(error?.message || 'Mayhem admin service request failed.', expectedId));
-      cached = { at: Date.now(), promise };
+      cached = { at: Date.now(), pending: true, promise };
       this.serviceProcessed.set(expectedId, cached);
     }
     const response = await cached.promise;
+    cached.pending = false;
+    cached.at = Date.now();
     if (response?.ok !== true) this.serviceProcessed.delete(expectedId);
     this.peer.sidechannel.broadcast(this.channel, {
       control: SERVICE_CONTROL_RESULT,
@@ -432,7 +462,7 @@ class MayhemFeature extends Feature {
     });
     await this.peer.base.append(null);
     const featureResult =
-      (await this._waitForResult(resultKey, 10_000, previousResult)) ?? previousResult;
+      (await this._waitForResult(resultKey, this.resultTimeoutMs, previousResult)) ?? previousResult;
     if (!featureResult) {
       return {
         ok: false,
@@ -463,22 +493,25 @@ class MayhemFeature extends Feature {
     };
   }
 
-  async _waitForResult(key, timeoutMs = 10_000, previousResult = null) {
-    const deadline = Date.now() + timeoutMs;
+  async _waitForResult(key, timeoutMs = 0, previousResult = null) {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
     const previousJson = previousResult === null ? null : stableJson(previousResult);
-    while (Date.now() <= deadline) {
+    while (!this.stopped && (deadline === null || Date.now() <= deadline)) {
       const result = await this.peer.base.view.get(key);
       if (result !== null && (previousJson === null || stableJson(result.value) !== previousJson)) {
         return result.value;
       }
-      await this.sleep(50);
+      await this.sleep(this.resultPollMs);
     }
     return null;
   }
 
-  async start() {}
+  async start() {
+    this.stopped = false;
+  }
 
   async stop() {
+    this.stopped = true;
     for (const [requestId, pending] of this.pending) {
       pending.resolve(relayError('Mayhem feature relay stopped.', requestId));
     }

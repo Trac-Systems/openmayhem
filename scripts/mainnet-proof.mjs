@@ -31,6 +31,15 @@ function positiveInteger(value, label, fallback) {
   return parsed;
 }
 
+function nonNegativeInteger(value, label, fallback) {
+  const candidate = value === undefined || value === null || value === '' ? fallback : value;
+  const parsed = Number(candidate);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function rpcBase(value) {
   const raw = String(value ?? '').trim();
   if (!raw) throw new Error('peer RPC is required');
@@ -46,6 +55,25 @@ function sanitizeError(error) {
 async function responseJson(response, label) {
   if (!response?.ok) throw new Error(`${label} returned HTTP ${response?.status ?? 'unknown'}`);
   return await response.json();
+}
+
+async function fetchWithTimeout(fetchImpl, input, init, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`request attempt timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      fetchImpl(input, { ...init, signal: controller.signal }),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function validateMainnetState(chainId, status) {
@@ -88,24 +116,31 @@ export async function proveMainnet({
   peerRpc = 'http://127.0.0.1:49223/v1',
   timeoutSeconds = 180,
   pollMs = 2_000,
+  attemptTimeoutMs = 30_000,
   fetchImpl = globalThis.fetch,
 } = {}) {
   if (!String(ethRpc ?? '').trim()) throw new Error('Ethereum RPC is required');
   if (typeof fetchImpl !== 'function') throw new Error('fetch is unavailable');
-  const timeout = positiveInteger(timeoutSeconds, 'timeoutSeconds', 180) * 1_000;
+  const timeout = nonNegativeInteger(timeoutSeconds, 'timeoutSeconds', 180) * 1_000;
   const poll = positiveInteger(pollMs, 'pollMs', 2_000);
-  const deadline = Date.now() + timeout;
+  const attemptTimeout = positiveInteger(attemptTimeoutMs, 'attemptTimeoutMs', 30_000);
+  const deadline = timeout > 0 ? Date.now() + timeout : null;
   let last = 'no attempt';
 
   do {
     try {
       const [chainResponse, statusResponse] = await Promise.all([
-        fetchImpl(ethRpc, {
+        fetchWithTimeout(fetchImpl, ethRpc, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
-        }),
-        fetchImpl(new URL('status', rpcBase(peerRpc))),
+        }, attemptTimeout),
+        fetchWithTimeout(
+          fetchImpl,
+          new URL('status', rpcBase(peerRpc)),
+          undefined,
+          attemptTimeout,
+        ),
       ]);
       const [chainBody, status] = await Promise.all([
         responseJson(chainResponse, 'Ethereum RPC'),
@@ -120,9 +155,9 @@ export async function proveMainnet({
     } catch (error) {
       last = sanitizeError(error);
     }
-    if (Date.now() >= deadline) break;
-    await sleep(Math.min(poll, Math.max(1, deadline - Date.now())));
-  } while (Date.now() <= deadline);
+    if (deadline !== null && Date.now() >= deadline) break;
+    await sleep(deadline === null ? poll : Math.min(poll, Math.max(1, deadline - Date.now())));
+  } while (deadline === null || Date.now() <= deadline);
 
   throw new Error(`mainnet proof failed: ${last}`);
 }
@@ -134,6 +169,8 @@ async function main() {
     peerRpc: args['peer-rpc'] || process.env.MAYHEM_PEER_RPC,
     timeoutSeconds: args['timeout-seconds'] || process.env.MAYHEM_MAINNET_PROOF_TIMEOUT_SECONDS,
     pollMs: args['poll-ms'],
+    attemptTimeoutMs:
+      args['attempt-timeout-ms'] || process.env.MAYHEM_MAINNET_PROOF_ATTEMPT_TIMEOUT_MS,
   });
   if (args.json) console.log(JSON.stringify(report, null, 2));
   else {

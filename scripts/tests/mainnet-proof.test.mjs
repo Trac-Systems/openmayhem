@@ -43,3 +43,28 @@ test('mainnet proof returns only verified public network evidence', async () => 
   assert.deepEqual(report.ethereum, { chain_id: 1 });
   assert.equal(JSON.stringify(report).includes('rpc.invalid'), false);
 });
+
+test('mainnet proof timeout zero keeps polling until healthy convergence', async () => {
+  let statusCalls = 0;
+  const fetchImpl = async (_url, options) => {
+    if (options?.method === 'POST') {
+      return { ok: true, json: async () => ({ jsonrpc: '2.0', result: '0x1' }) };
+    }
+    statusCalls += 1;
+    return {
+      ok: true,
+      json: async () => status(statusCalls === 1 ? { connectedValidators: 0 } : {}),
+    };
+  };
+
+  const report = await proveMainnet({
+    ethRpc: 'https://rpc.invalid/key',
+    peerRpc: 'http://127.0.0.1:49223/v1',
+    timeoutSeconds: 0,
+    pollMs: 1,
+    attemptTimeoutMs: 100,
+    fetchImpl,
+  });
+  assert.equal(report.ok, true);
+  assert.equal(statusCalls, 2);
+});

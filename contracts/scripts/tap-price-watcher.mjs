@@ -423,13 +423,13 @@ export function tapRateStateMatches(rate, value) {
 
 export async function waitForTapRateState(rate, {
   rpcUrl,
-  timeoutMs = 30_000,
+  timeoutMs = 0,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
   let last = null;
-  while (Date.now() <= deadline) {
+  while (deadline === null || Date.now() <= deadline) {
     last = await readContractStateValue(rpcUrl, 'tap/rate/latest', { fetchImpl });
     if (tapRateStateMatches(rate, last)) {
       return { verified: true, state: last };
@@ -598,7 +598,7 @@ async function main() {
       ? process.env[String(args['admin-wallet-password-env'])]
       : undefined,
     verify: !boolArg(args['no-verify'], false),
-    verifyTimeoutMs: parsePositiveInt(args['verify-timeout-ms'] ?? 30_000, '--verify-timeout-ms', 30_000),
+    verifyTimeoutMs: parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0),
     verifyPollMs: parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500),
     requireLiveMainnetPrice: !boolArg(args['allow-price-fallback'], false),
   };

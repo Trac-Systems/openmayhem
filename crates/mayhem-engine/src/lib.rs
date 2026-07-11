@@ -3320,7 +3320,7 @@ mod vllm_backend {
     const BUILD_JOBS_ENV: &str = "MAYHEM_VLLM_BUILD_JOBS";
     const DEFAULT_BUILD_JOBS: usize = 2;
     const MEMORY_UTILIZATION_BACKOFF_STEP_PCT: u32 = 5;
-    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+    const DEFAULT_REQUEST_TIMEOUT: Option<Duration> = None;
 
     pub struct VllmBackend {
         python: PathBuf,
@@ -3555,7 +3555,7 @@ mod vllm_backend {
         stdin: ChildStdin,
         stdout_rx: Receiver<WorkerRead>,
         reader: Option<JoinHandle<()>>,
-        request_timeout: Duration,
+        request_timeout: Option<Duration>,
         terminated: bool,
     }
 
@@ -3565,12 +3565,12 @@ mod vllm_backend {
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes, cache_root)
+            Self::spawn_with_timeout(python, request_timeout()?, memory_limit_bytes, cache_root)
         }
 
         fn spawn_with_timeout(
             python: &Path,
-            request_timeout: Duration,
+            request_timeout: Option<Duration>,
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
@@ -3627,20 +3627,25 @@ mod vllm_backend {
         }
 
         fn read_message(&mut self) -> Result<WorkerMessage> {
-            let read = match self.stdout_rx.recv_timeout(self.request_timeout) {
-                Ok(read) => read,
-                Err(RecvTimeoutError::Timeout) => {
-                    self.terminate();
-                    return Err(EngineError::Vllm(format!(
-                        "vLLM backend worker timed out after {}s waiting for a response",
-                        self.request_timeout.as_secs()
-                    )));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(EngineError::Vllm(
-                        "vLLM backend worker stdout reader stopped".to_owned(),
-                    ));
-                }
+            let read = match self.request_timeout {
+                Some(request_timeout) => match self.stdout_rx.recv_timeout(request_timeout) {
+                    Ok(read) => read,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.terminate();
+                        return Err(EngineError::Vllm(format!(
+                            "vLLM backend worker stalled for {}s without a response",
+                            request_timeout.as_secs()
+                        )));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(EngineError::Vllm(
+                            "vLLM backend worker stdout reader stopped".to_owned(),
+                        ));
+                    }
+                },
+                None => self.stdout_rx.recv().map_err(|_| {
+                    EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
+                })?,
             };
             Self::decode_read(read)
         }
@@ -3704,13 +3709,26 @@ mod vllm_backend {
         }
     }
 
-    fn request_timeout() -> Duration {
-        env::var(REQUEST_TIMEOUT_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    fn request_timeout() -> Result<Option<Duration>> {
+        match env::var(REQUEST_TIMEOUT_ENV) {
+            Ok(value) => request_timeout_from(Some(&value)),
+            Err(env::VarError::NotPresent) => Ok(DEFAULT_REQUEST_TIMEOUT),
+            Err(err) => Err(EngineError::InvalidConfig(format!(
+                "reading {REQUEST_TIMEOUT_ENV} failed: {err}"
+            ))),
+        }
+    }
+
+    fn request_timeout_from(value: Option<&str>) -> Result<Option<Duration>> {
+        let Some(value) = value else {
+            return Ok(DEFAULT_REQUEST_TIMEOUT);
+        };
+        let seconds = value.trim().parse::<u64>().map_err(|_| {
+            EngineError::InvalidConfig(format!(
+                "{REQUEST_TIMEOUT_ENV} must be a non-negative integer in seconds"
+            ))
+        })?;
+        Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
     }
 
     fn configure_vllm_worker_environment(
@@ -4020,7 +4038,7 @@ mod vllm_backend {
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
             let mut worker =
-                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None, None)
+                VllmWorker::spawn_with_timeout(&path, Some(Duration::from_secs(1)), None, None)
                     .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
@@ -4028,7 +4046,10 @@ mod vllm_backend {
             let start = Instant::now();
             let err = worker.read_message().expect_err("silent worker times out");
             assert!(start.elapsed() < Duration::from_secs(5));
-            assert!(format!("{err}").contains("timed out after 1s"), "{err}");
+            assert!(
+                format!("{err}").contains("stalled for 1s without a response"),
+                "{err}"
+            );
 
             let _ = fs::remove_file(path);
         }
@@ -4049,7 +4070,7 @@ mod vllm_backend {
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
             let mut worker =
-                VllmWorker::spawn_with_timeout(&path, Duration::from_millis(50), None, None)
+                VllmWorker::spawn_with_timeout(&path, Some(Duration::from_millis(50)), None, None)
                     .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
@@ -4063,6 +4084,44 @@ mod vllm_backend {
             assert_eq!(message.ok, Some(true));
 
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn vllm_worker_has_no_implicit_response_deadline() {
+            let path =
+                env::temp_dir().join(format!("mayhem-delayed-vllm-worker-{}", std::process::id()));
+            fs::write(
+                &path,
+                "#!/bin/sh\nread request\nsleep 1\nprintf '%s\\n' '{\"id\":1,\"type\":\"response\",\"ok\":true,\"result\":{}}'\n",
+            )
+            .expect("write fake worker");
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&path, perms).expect("chmod fake worker");
+
+            let mut worker =
+                VllmWorker::spawn_with_timeout(&path, None, None, None).expect("spawn");
+            worker
+                .send(1, "generate", Value::Null)
+                .expect("send generation request");
+            let message = worker
+                .read_message()
+                .expect("default response wait has no time ceiling");
+            assert_eq!(message.id, 1);
+            assert_eq!(message.ok, Some(true));
+
+            let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn vllm_worker_timeout_override_is_validated() {
+            assert_eq!(request_timeout_from(None).unwrap(), None);
+            assert_eq!(request_timeout_from(Some("0")).unwrap(), None);
+            assert_eq!(
+                request_timeout_from(Some("600")).unwrap(),
+                Some(Duration::from_secs(600))
+            );
+            assert!(request_timeout_from(Some("later")).is_err());
         }
 
         #[test]
@@ -4289,7 +4348,7 @@ mod trt_llm_backend {
     const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS";
     const CACHE_DIR_ENV: &str = "MAYHEM_TRTLLM_CACHE_DIR";
     const CUDA_HOME_ENV: &str = "MAYHEM_TRTLLM_CUDA_HOME";
-    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+    const DEFAULT_REQUEST_TIMEOUT: Option<Duration> = None;
 
     pub struct TrtLlmBackend {
         python: PathBuf,
@@ -4495,7 +4554,7 @@ mod trt_llm_backend {
         stdin: ChildStdin,
         stdout_rx: Receiver<WorkerRead>,
         reader: Option<JoinHandle<()>>,
-        request_timeout: Duration,
+        request_timeout: Option<Duration>,
         terminated: bool,
     }
 
@@ -4505,12 +4564,12 @@ mod trt_llm_backend {
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes, cache_root)
+            Self::spawn_with_timeout(python, request_timeout()?, memory_limit_bytes, cache_root)
         }
 
         fn spawn_with_timeout(
             python: &Path,
-            request_timeout: Duration,
+            request_timeout: Option<Duration>,
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
@@ -4567,20 +4626,27 @@ mod trt_llm_backend {
         }
 
         fn read_message(&mut self) -> Result<WorkerMessage> {
-            let read = match self.stdout_rx.recv_timeout(self.request_timeout) {
-                Ok(read) => read,
-                Err(RecvTimeoutError::Timeout) => {
-                    self.terminate();
-                    return Err(EngineError::TrtLlm(format!(
-                        "TensorRT-LLM backend worker timed out after {}s waiting for a response",
-                        self.request_timeout.as_secs()
-                    )));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(EngineError::TrtLlm(
+            let read = match self.request_timeout {
+                Some(request_timeout) => match self.stdout_rx.recv_timeout(request_timeout) {
+                    Ok(read) => read,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.terminate();
+                        return Err(EngineError::TrtLlm(format!(
+                            "TensorRT-LLM backend worker stalled for {}s without a response",
+                            request_timeout.as_secs()
+                        )));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(EngineError::TrtLlm(
+                            "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
+                        ));
+                    }
+                },
+                None => self.stdout_rx.recv().map_err(|_| {
+                    EngineError::TrtLlm(
                         "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
-                    ));
-                }
+                    )
+                })?,
             };
             Self::decode_read(read)
         }
@@ -4787,13 +4853,26 @@ mod trt_llm_backend {
         })
     }
 
-    fn request_timeout() -> Duration {
-        env::var(REQUEST_TIMEOUT_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    fn request_timeout() -> Result<Option<Duration>> {
+        match env::var(REQUEST_TIMEOUT_ENV) {
+            Ok(value) => request_timeout_from(Some(&value)),
+            Err(env::VarError::NotPresent) => Ok(DEFAULT_REQUEST_TIMEOUT),
+            Err(err) => Err(EngineError::InvalidConfig(format!(
+                "reading {REQUEST_TIMEOUT_ENV} failed: {err}"
+            ))),
+        }
+    }
+
+    fn request_timeout_from(value: Option<&str>) -> Result<Option<Duration>> {
+        let Some(value) = value else {
+            return Ok(DEFAULT_REQUEST_TIMEOUT);
+        };
+        let seconds = value.trim().parse::<u64>().map_err(|_| {
+            EngineError::InvalidConfig(format!(
+                "{REQUEST_TIMEOUT_ENV} must be a non-negative integer in seconds"
+            ))
+        })?;
+        Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
     }
 
     fn terminate_worker_process(child: &mut Child) {
@@ -4910,7 +4989,7 @@ mod trt_llm_backend {
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
             let mut worker =
-                TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None, None)
+                TrtLlmWorker::spawn_with_timeout(&path, Some(Duration::from_secs(1)), None, None)
                     .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
@@ -4918,9 +4997,23 @@ mod trt_llm_backend {
             let start = Instant::now();
             let err = worker.read_message().expect_err("silent worker times out");
             assert!(start.elapsed() < Duration::from_secs(5));
-            assert!(format!("{err}").contains("timed out after 1s"), "{err}");
+            assert!(
+                format!("{err}").contains("stalled for 1s without a response"),
+                "{err}"
+            );
 
             let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn trt_worker_timeout_override_is_validated() {
+            assert_eq!(request_timeout_from(None).unwrap(), None);
+            assert_eq!(request_timeout_from(Some("0")).unwrap(), None);
+            assert_eq!(
+                request_timeout_from(Some("600")).unwrap(),
+                Some(Duration::from_secs(600))
+            );
+            assert!(request_timeout_from(Some("later")).is_err());
         }
 
         #[test]

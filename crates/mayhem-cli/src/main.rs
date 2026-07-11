@@ -197,11 +197,15 @@ const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const OPENCODE_GATEWAY_TOKEN_NAME: &str = "opencode-local";
 const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
-const PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
-const PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS: u64 = 15_000;
+const DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS: u64 = 10_000;
+const DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS: u64 = 2_000;
+const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MILLIS: u64 = 250;
+const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_MAX_MILLIS: u64 = 5_000;
 const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const GIB_BYTES: u64 = 1024 * 1024 * 1024;
@@ -214,8 +218,8 @@ const F13_DISK_RESERVE_DEFAULT_BYTES: u64 = 10 * GIB_BYTES;
 const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
 #[cfg(any(target_os = "macos", test))]
 const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
-const PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES: u32 = 3;
-const PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS: u64 = 30;
+const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MILLIS: u64 = 0;
+const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_MILLIS: u64 = 30_000;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT: u32 = 90;
 const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
@@ -1236,8 +1240,8 @@ struct UpArgs {
     #[arg(long)]
     sc_bridge_token: Option<String>,
 
-    /// Seconds to wait for peer, bridge, and gateway health gates.
-    #[arg(long, default_value_t = 120)]
+    /// Seconds to wait for peer, bridge, and gateway health gates. Zero waits until ready.
+    #[arg(long, default_value_t = 0)]
     timeout_seconds: u64,
 
     /// Print a machine-readable readiness report.
@@ -1294,6 +1298,14 @@ struct UseArgs {
     /// Seconds to wait for the first provider token after s.accept.
     #[arg(long, hide = true)]
     session_ttft_timeout_seconds: Option<u64>,
+
+    /// Provider heartbeat freshness window shared by validation and routing.
+    #[arg(long)]
+    provider_heartbeat_ttl_ms: Option<u64>,
+
+    /// Maximum accepted provider heartbeat clock skew.
+    #[arg(long)]
+    provider_heartbeat_clock_skew_ms: Option<u64>,
 
     /// Minimum sustained provider throughput before the gateway reroutes.
     #[arg(long)]
@@ -20484,9 +20496,6 @@ async fn canonical_mainnet_readiness(
 }
 
 async fn up(args: UpArgs) -> Result<()> {
-    if args.timeout_seconds == 0 {
-        bail!("--timeout-seconds must be positive");
-    }
     if args.fraud_challenger && args.fraud_challenger_poll_interval_seconds == 0 {
         bail!("--fraud-challenger-poll-interval-seconds must be positive when --fraud-challenger is set");
     }
@@ -20494,7 +20503,7 @@ async fn up(args: UpArgs) -> Result<()> {
     write_up_supervisor_config(&plan)?;
     start_mayhemd_for_up(&plan)?;
 
-    let deadline = Instant::now() + plan.timeout;
+    let deadline = (!plan.timeout.is_zero()).then(|| Instant::now() + plan.timeout);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -22143,13 +22152,17 @@ async fn mayhemd_status_report(home: &Path, client: &reqwest::Client) -> Value {
     })
 }
 
-async fn wait_until_ready<F, Fut>(label: &str, deadline: Instant, mut check: F) -> Result<Value>
+async fn wait_until_ready<F, Fut>(
+    label: &str,
+    deadline: Option<Instant>,
+    mut check: F,
+) -> Result<Value>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
     let mut last_error = None;
-    while Instant::now() < deadline {
+    while deadline.map_or(true, |deadline| Instant::now() < deadline) {
         match check().await {
             Ok(value) => return Ok(value),
             Err(err) => last_error = Some(err.to_string()),
@@ -22610,6 +22623,8 @@ struct GatewayProviderHeartbeatWatcherConfig {
     sc_bridge_url: String,
     sc_bridge_token: String,
     channels: Vec<String>,
+    max_age_millis: u64,
+    max_clock_skew_millis: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -22706,7 +22721,8 @@ async fn run_gateway_provider_heartbeat_watcher(
             .with_context(|| format!("joining provider heartbeat sidechannel {channel}"))?;
     }
 
-    let mut receiver = HeartbeatReceiver::new();
+    let mut receiver =
+        HeartbeatReceiver::with_limits(config.max_age_millis, config.max_clock_skew_millis);
     loop {
         match bridge
             .next_sidechannel_message(Duration::from_secs(86_400))
@@ -22733,10 +22749,55 @@ async fn run_gateway_provider_heartbeat_watcher(
     }
 }
 
+fn configured_positive_millis(
+    cli_value: Option<u64>,
+    env_name: &str,
+    default_value: u64,
+    label: &str,
+) -> Result<u64> {
+    let value = match cli_value {
+        Some(value) => value,
+        None => match std::env::var(env_name) {
+            Ok(value) => value.trim().parse::<u64>().with_context(|| {
+                format!("{env_name} must be a positive integer in milliseconds")
+            })?,
+            Err(std::env::VarError::NotPresent) => default_value,
+            Err(err) => return Err(err).with_context(|| format!("reading {env_name}")),
+        },
+    };
+    if value == 0 {
+        bail!("{label} must be positive");
+    }
+    Ok(value)
+}
+
+fn configured_nonnegative_millis(env_name: &str, default_value: u64) -> Result<u64> {
+    match std::env::var(env_name) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{env_name} must be a non-negative integer in milliseconds")),
+        Err(std::env::VarError::NotPresent) => Ok(default_value),
+        Err(err) => Err(err).with_context(|| format!("reading {env_name}")),
+    }
+}
+
 async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let provider_heartbeat_ttl_millis = configured_positive_millis(
+        args.provider_heartbeat_ttl_ms,
+        "MAYHEM_PROVIDER_HEARTBEAT_TTL_MS",
+        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        "provider heartbeat TTL",
+    )?;
+    let provider_heartbeat_clock_skew_millis = configured_positive_millis(
+        args.provider_heartbeat_clock_skew_ms,
+        "MAYHEM_PROVIDER_HEARTBEAT_CLOCK_SKEW_MS",
+        mayhem_gateway::DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        "provider heartbeat clock skew",
+    )?;
     let uses_dev_local_catalog = args.dev_catalog_path.is_some()
         || args.dev_signature_path.is_some()
         || args.dev_keys_dir.is_some()
@@ -23088,6 +23149,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             sc_bridge_url: sc_bridge_url.clone(),
             sc_bridge_token: sc_bridge_token.clone(),
             channels: heartbeat_channels,
+            max_age_millis: provider_heartbeat_ttl_millis,
+            max_clock_skew_millis: provider_heartbeat_clock_skew_millis,
         });
         if args.session_open_timeout_seconds == Some(0) {
             bail!("--session-open-timeout-seconds must be positive");
@@ -23169,7 +23232,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(verifier) => state.with_hardware_quote_verifier_command(verifier),
         None => state,
     };
-    let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
+    let state = state
+        .with_provider_heartbeat_ttl_millis(provider_heartbeat_ttl_millis)
+        .with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
         .with_default_max_price_au(default_max_price_au)
@@ -23203,6 +23268,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "source": source,
         "backend": backend,
         "epoch_seconds": state.epoch_seconds(),
+        "provider_heartbeat_ttl_ms": provider_heartbeat_ttl_millis,
+        "provider_heartbeat_clock_skew_ms": provider_heartbeat_clock_skew_millis,
         "rail": args.rail.as_str(),
         "wallet": wallet_public_key.as_ref().map(|public_key| json!({
             "public_key": public_key,
@@ -31196,15 +31263,23 @@ enum ProviderEngineWatchdogAction {
 #[derive(Clone, Debug)]
 struct ProviderEngineWatchdog {
     limit_bytes: u64,
-    sustained_samples: u32,
+    pressure_started_at: Option<Instant>,
+    restart_after: Option<Duration>,
+    restart_cooldown: Duration,
     cooldown_until: Option<Instant>,
 }
 
 impl ProviderEngineWatchdog {
-    fn new(selected: &ProviderCandidate) -> Self {
+    fn new(
+        selected: &ProviderCandidate,
+        restart_after: Option<Duration>,
+        restart_cooldown: Duration,
+    ) -> Self {
         Self {
             limit_bytes: selected.feasibility.memory_budget.budget_bytes,
-            sustained_samples: 0,
+            pressure_started_at: None,
+            restart_after,
+            restart_cooldown,
             cooldown_until: None,
         }
     }
@@ -31217,26 +31292,28 @@ impl ProviderEngineWatchdog {
         now: Instant,
     ) -> ProviderEngineWatchdogAction {
         let Some(reject) = provider_engine_watchdog_rejection(memory_floor, &rss) else {
-            self.sustained_samples = 0;
+            self.pressure_started_at = None;
             return ProviderEngineWatchdogAction::Healthy;
         };
-        self.sustained_samples = self.sustained_samples.saturating_add(1);
-        if self.sustained_samples < PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES {
+        let pressure_started_at = *self.pressure_started_at.get_or_insert(now);
+        let Some(restart_after) = self.restart_after else {
+            return ProviderEngineWatchdogAction::RefuseNew(reject);
+        };
+        if active_sessions > 0 {
             return ProviderEngineWatchdogAction::RefuseNew(reject);
         }
-        if active_sessions > 0 {
+        if now.saturating_duration_since(pressure_started_at) < restart_after {
             return ProviderEngineWatchdogAction::RefuseNew(reject);
         }
         if self.cooldown_until.is_some_and(|until| now < until) {
             return ProviderEngineWatchdogAction::RefuseNew(reject);
         }
-        self.cooldown_until =
-            Some(now + Duration::from_secs(PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS));
+        self.cooldown_until = Some(now + self.restart_cooldown);
         ProviderEngineWatchdogAction::RestartNow(reject)
     }
 
     fn reset_after_restart(&mut self) {
-        self.sustained_samples = 0;
+        self.pressure_started_at = None;
     }
 }
 
@@ -31372,7 +31449,7 @@ fn provider_engine_watchdog_rejection(
         return Some(ProviderRuntimeFloorRejection {
             code: memory_floor.code,
             reason: format!(
-                "{}; provider engine watchdog will keep refusing new sessions and reload the engine after active sessions drain",
+                "{}; provider engine watchdog will keep refusing new sessions until pressure clears",
                 memory_floor.reason
             ),
         });
@@ -31384,7 +31461,7 @@ fn provider_engine_watchdog_rejection(
         return Some(ProviderRuntimeFloorRejection {
             code: "CAPACITY",
             reason: format!(
-                "provider engine watchdog is active: engine/process RSS {} across pid(s) {} exceeds budget {}; refusing new sessions and reloading the engine after active sessions drain",
+                "provider engine watchdog is active: engine/process RSS {} across pid(s) {} exceeds budget {}; refusing new sessions until pressure clears",
                 human_bytes(total_rss_bytes),
                 rss.pids
                     .iter()
@@ -31577,6 +31654,11 @@ struct ProviderSessionHeartbeatTask {
     min_ask_au: MoneyAu,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
+    bridge_operation_timeout: Duration,
+    heartbeat_interval: Duration,
+    heartbeat_reconnect_initial: Duration,
+    heartbeat_reconnect_max: Duration,
+    heartbeat_ttl: Duration,
 }
 
 struct ProviderSessionContext<'a> {
@@ -39484,7 +39566,7 @@ fn provider_heartbeat_tok_s(
 }
 
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
-    let mut retry_delay = Duration::from_millis(250);
+    let mut retry_delay = ctx.heartbeat_reconnect_initial;
     while !ctx.load.is_stopped() {
         match run_provider_session_heartbeat_connection(&ctx).await {
             Ok(()) => return Ok(()),
@@ -39496,7 +39578,7 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
                     return Ok(());
                 }
                 sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                retry_delay = (retry_delay * 2).min(ctx.heartbeat_reconnect_max);
             }
         }
     }
@@ -39507,7 +39589,7 @@ async fn run_provider_session_heartbeat_connection(
     ctx: &ProviderSessionHeartbeatTask,
 ) -> Result<()> {
     let mut bridge = timeout(
-        PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+        ctx.bridge_operation_timeout,
         ScBridgeClient::connect(ScBridgeConfig::new(
             &ctx.sc_bridge_url,
             ctx.sc_bridge_token.clone(),
@@ -39516,7 +39598,7 @@ async fn run_provider_session_heartbeat_connection(
     .await
     .context("timed out connecting to SC-Bridge for live provider session heartbeats")??;
     let transport_peer = timeout(
-        PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+        ctx.bridge_operation_timeout,
         sc_bridge_transport_peer(&mut bridge),
     )
     .await
@@ -39526,7 +39608,7 @@ async fn run_provider_session_heartbeat_connection(
     let mut heartbeat_cache_updated_at = None::<Instant>;
     while !ctx.load.is_stopped() {
         let sent = timeout(
-            PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT,
+            ctx.bridge_operation_timeout,
             send_provider_heartbeat_round(
                 &mut bridge,
                 &ctx.keypair_path,
@@ -39548,10 +39630,7 @@ async fn run_provider_session_heartbeat_connection(
         .await
         .with_context(|| format!("timed out sending live provider heartbeat seq {seq}"))??;
         let refresh_cache = heartbeat_cache_updated_at
-            .map(|updated_at| {
-                updated_at.elapsed()
-                    >= Duration::from_millis(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS / 2)
-            })
+            .map(|updated_at| updated_at.elapsed() >= ctx.heartbeat_ttl / 2)
             .unwrap_or(true);
         if refresh_cache {
             if let Err(err) = write_provider_heartbeat_cache(
@@ -39569,7 +39648,7 @@ async fn run_provider_session_heartbeat_connection(
         }
         join_rooms = false;
         seq = seq.saturating_add(1);
-        sleep(Duration::from_secs(2)).await;
+        sleep(ctx.heartbeat_interval).await;
     }
     Ok(())
 }
@@ -39603,11 +39682,54 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_token.as_deref(),
     )?;
     let admin_transport_peer = provider_admin_transport_peer(runtime.rpc).await?;
+    let bridge_operation_timeout = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MS",
+        DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS,
+        "provider SC-Bridge operation timeout",
+    )?);
+    let bridge_liveness_interval = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MS",
+        DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS,
+        "provider SC-Bridge liveness interval",
+    )?);
+    let provider_heartbeat_interval = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_HEARTBEAT_INTERVAL_MS",
+        DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS,
+        "provider heartbeat interval",
+    )?);
+    let provider_heartbeat_reconnect_initial = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MS",
+        DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MILLIS,
+        "provider heartbeat initial reconnect delay",
+    )?);
+    let provider_heartbeat_reconnect_max = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_HEARTBEAT_RECONNECT_MAX_MS",
+        DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_MAX_MILLIS,
+        "provider heartbeat maximum reconnect delay",
+    )?);
+    ensure!(
+        provider_heartbeat_reconnect_initial <= provider_heartbeat_reconnect_max,
+        "provider heartbeat initial reconnect delay must not exceed its maximum reconnect delay"
+    );
+    let provider_heartbeat_ttl = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_HEARTBEAT_TTL_MS",
+        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        "provider heartbeat TTL",
+    )?);
+    let request_stall_timeout = provider_session_request_timeout()?;
     let mut bridge = reconnect_provider_session_bridge(
         &sc_bridge_url,
         &sc_bridge_token,
         &admin_transport_peer,
         None,
+        provider_heartbeat_reconnect_initial,
+        provider_heartbeat_reconnect_max,
     )
     .await?;
     let mut bridge_liveness_checked_at = Instant::now();
@@ -39632,7 +39754,22 @@ async fn serve_provider_sessions(
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::default();
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
-    let mut engine_watchdog = ProviderEngineWatchdog::new(ctx.selected);
+    let engine_watchdog_restart_after_millis = configured_nonnegative_millis(
+        "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MS",
+        DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MILLIS,
+    )?;
+    let engine_watchdog_restart_cooldown = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_MS",
+        DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_MILLIS,
+        "provider engine watchdog restart cooldown",
+    )?);
+    let mut engine_watchdog = ProviderEngineWatchdog::new(
+        ctx.selected,
+        (engine_watchdog_restart_after_millis > 0)
+            .then(|| Duration::from_millis(engine_watchdog_restart_after_millis)),
+        engine_watchdog_restart_cooldown,
+    );
     let heartbeat_task = heartbeat_enabled.then(|| {
         tokio::spawn(run_provider_session_heartbeats(
             ProviderSessionHeartbeatTask {
@@ -39650,6 +39787,11 @@ async fn serve_provider_sessions(
                 min_ask_au: ctx.args.min_ask_au,
                 max_sessions: protection_config.max_sessions,
                 load: heartbeat_load.clone(),
+                bridge_operation_timeout,
+                heartbeat_interval: provider_heartbeat_interval,
+                heartbeat_reconnect_initial: provider_heartbeat_reconnect_initial,
+                heartbeat_reconnect_max: provider_heartbeat_reconnect_max,
+                heartbeat_ttl: provider_heartbeat_ttl,
             },
         ))
     });
@@ -39669,12 +39811,12 @@ async fn serve_provider_sessions(
     );
     let serve_result: Result<()> = async {
         loop {
-            if bridge_liveness_checked_at.elapsed() >= PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL {
-                match timeout(PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT, bridge.ping()).await {
+            if bridge_liveness_checked_at.elapsed() >= bridge_liveness_interval {
+                match timeout(bridge_operation_timeout, bridge.ping()).await {
                     Ok(Ok(_)) => {
                         bridge_liveness_checked_at = Instant::now();
                     }
-                    liveness => {
+                    Ok(Err(BridgeError::Closed)) | Ok(Err(BridgeError::WebSocket(_))) => {
                         let dropped = clear_provider_sessions_after_bridge_drop(
                             &mut sessions,
                             &mut pending_requests,
@@ -39682,17 +39824,31 @@ async fn serve_provider_sessions(
                             &heartbeat_load,
                         );
                         provider_session_debug(format!(
-                            "SC-Bridge provider session liveness failed ({liveness:?}); dropped {dropped} active session(s), reconnecting"
+                            "SC-Bridge provider session liveness confirmed a closed transport; dropped {dropped} active session(s), reconnecting"
                         ));
                         bridge = reconnect_provider_session_bridge(
                             &sc_bridge_url,
                             &sc_bridge_token,
                             &admin_transport_peer,
                             deadline,
+                            provider_heartbeat_reconnect_initial,
+                            provider_heartbeat_reconnect_max,
                         )
                         .await?;
                         bridge_liveness_checked_at = Instant::now();
                         continue;
+                    }
+                    Ok(Err(err)) => {
+                        provider_session_debug(format!(
+                            "SC-Bridge provider session ping failed transiently without dropping active sessions: {err}"
+                        ));
+                        bridge_liveness_checked_at = Instant::now();
+                    }
+                    Err(_) => {
+                        provider_session_debug(
+                            "SC-Bridge provider session ping timed out; preserving active sessions while the frame stream remains open",
+                        );
+                        bridge_liveness_checked_at = Instant::now();
                     }
                 }
             }
@@ -39870,6 +40026,7 @@ async fn serve_provider_sessions(
                         runtime_floor_reject
                             .clone()
                             .or_else(|| engine_watchdog_reject.clone()),
+                        request_stall_timeout,
                         event,
                     )
                     .await
@@ -39915,6 +40072,8 @@ async fn serve_provider_sessions(
                             &sc_bridge_token,
                             &admin_transport_peer,
                             deadline,
+                            provider_heartbeat_reconnect_initial,
+                            provider_heartbeat_reconnect_max,
                         )
                         .await?;
                     bridge_liveness_checked_at = Instant::now();
@@ -39986,8 +40145,10 @@ async fn reconnect_provider_session_bridge(
     sc_bridge_token: &str,
     admin_transport_peer: &str,
     deadline: Option<Instant>,
+    initial_delay: Duration,
+    max_delay: Duration,
 ) -> Result<ScBridgeClient> {
-    let mut delay = Duration::from_millis(250);
+    let mut delay = initial_delay;
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             bail!("provider session serving deadline reached while reconnecting to SC-Bridge");
@@ -40010,7 +40171,7 @@ async fn reconnect_provider_session_bridge(
                 if !sleep.is_zero() {
                     tokio::time::sleep(sleep).await;
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
+                delay = (delay * 2).min(max_delay);
             }
         }
     }
@@ -40175,26 +40336,32 @@ fn provider_session_request_body_from_frame(
         .map_err(|err| anyhow::anyhow!("reassembling s.req body_ref failed: {err}"))
 }
 
-fn provider_session_request_timeout() -> Duration {
-    let configured = std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS").ok();
+fn provider_session_request_timeout() -> Result<Duration> {
+    let configured = std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MS").ok();
     provider_session_request_timeout_from(configured.as_deref())
 }
 
-fn provider_session_request_timeout_from(configured: Option<&str>) -> Duration {
-    let millis = configured
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS);
-    Duration::from_millis(millis)
+fn provider_session_request_timeout_from(configured: Option<&str>) -> Result<Duration> {
+    let millis = match configured {
+        Some(value) => value.trim().parse::<u64>().with_context(|| {
+            "MAYHEM_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MS must be a positive integer in milliseconds"
+        })?,
+        None => DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS,
+    };
+    ensure!(
+        millis > 0,
+        "MAYHEM_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MS must be positive"
+    );
+    Ok(Duration::from_millis(millis))
 }
 
-fn record_provider_session_accept_sent(
+fn record_provider_session_request_progress(
     pending_requests: &mut HashMap<String, Instant>,
     session_id: &str,
-    sent_at: Instant,
+    progressed_at: Instant,
     request_timeout: Duration,
 ) {
-    pending_requests.insert(session_id.to_owned(), sent_at + request_timeout);
+    pending_requests.insert(session_id.to_owned(), progressed_at + request_timeout);
 }
 
 async fn handle_provider_session_frame(
@@ -40208,6 +40375,7 @@ async fn handle_provider_session_frame(
     runtime: &ProviderSessionRuntime<'_>,
     responder: &mut dyn ProviderSessionResponder,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
+    request_stall_timeout: Duration,
     event: Value,
 ) -> Result<()> {
     let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -40380,11 +40548,11 @@ async fn handle_provider_session_frame(
                         .session_send(&remote, &session_id, accept_frame)
                         .await
                         .context("sending s.accept")?;
-                    record_provider_session_accept_sent(
+                    record_provider_session_request_progress(
                         pending_requests,
                         &session_id,
                         Instant::now(),
-                        provider_session_request_timeout(),
+                        request_stall_timeout,
                     );
                     provider_session_debug(format!("sent s.accept for session {session_id}"));
                 }
@@ -40448,6 +40616,13 @@ async fn handle_provider_session_frame(
                 pending_requests.remove(&session_id);
                 remove_provider_session_pending_payloads(pending_payloads, &session_id);
                 heartbeat_load.set_active_sessions(sessions.len());
+            } else {
+                record_provider_session_request_progress(
+                    pending_requests,
+                    &session_id,
+                    Instant::now(),
+                    request_stall_timeout,
+                );
             }
         }
         Some("s.req") => {
@@ -54016,10 +54191,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_watchdog_restarts_only_after_sustained_pressure_and_drain() {
+    fn provider_engine_watchdog_default_never_reloads_on_pressure() {
         let mut watchdog = ProviderEngineWatchdog {
             limit_bytes: 8 * GIB_BYTES,
-            sustained_samples: 0,
+            pressure_started_at: None,
+            restart_after: None,
+            restart_cooldown: Duration::from_secs(30),
             cooldown_until: None,
         };
         let rss = ProviderEngineRssObservation {
@@ -54034,11 +54211,37 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ProviderEngineWatchdogAction::RefuseNew(_)
         ));
         assert!(matches!(
-            watchdog.check(None, rss.clone(), 1, now + Duration::from_secs(1)),
+            watchdog.check(None, rss, 0, now + Duration::from_secs(3_600)),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+    }
+
+    #[test]
+    fn provider_engine_watchdog_explicit_restart_waits_for_elapsed_pressure_and_drain() {
+        let mut watchdog = ProviderEngineWatchdog {
+            limit_bytes: 8 * GIB_BYTES,
+            pressure_started_at: None,
+            restart_after: Some(Duration::from_secs(3)),
+            restart_cooldown: Duration::from_secs(30),
+            cooldown_until: None,
+        };
+        let rss = ProviderEngineRssObservation {
+            pids: vec![std::process::id()],
+            total_rss_bytes: Some(9 * GIB_BYTES),
+            limit_bytes: 8 * GIB_BYTES,
+        };
+        let now = Instant::now();
+
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 0, now),
             ProviderEngineWatchdogAction::RefuseNew(_)
         ));
         assert!(matches!(
-            watchdog.check(None, rss.clone(), 1, now + Duration::from_secs(2)),
+            watchdog.check(None, rss.clone(), 0, now + Duration::from_secs(2)),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 1, now + Duration::from_secs(3)),
             ProviderEngineWatchdogAction::RefuseNew(_)
         ));
         assert!(matches!(
@@ -54102,20 +54305,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_request_wait_starts_after_accept_and_uses_the_open_budget() {
+    fn provider_request_wait_is_an_inactivity_budget_refreshed_by_chunk_progress() {
         assert_eq!(
-            provider_session_request_timeout_from(None),
-            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+            provider_session_request_timeout_from(None).unwrap(),
+            Duration::from_millis(DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS)
         );
         assert_eq!(
-            provider_session_request_timeout_from(Some("600000")),
+            provider_session_request_timeout_from(Some("600000")).unwrap(),
             Duration::from_secs(600)
         );
+        assert!(provider_session_request_timeout_from(Some("later")).is_err());
+        assert!(provider_session_request_timeout_from(Some("0")).is_err());
 
         let accept_sent_at = Instant::now();
         let timeout = Duration::from_secs(90);
         let mut pending = HashMap::new();
-        record_provider_session_accept_sent(
+        record_provider_session_request_progress(
             &mut pending,
             "accepted-session",
             accept_sent_at,
@@ -54124,6 +54329,32 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             pending.get("accepted-session"),
             Some(&(accept_sent_at + timeout))
+        );
+
+        let chunk_received_at = accept_sent_at + Duration::from_secs(30);
+        record_provider_session_request_progress(
+            &mut pending,
+            "accepted-session",
+            chunk_received_at,
+            timeout,
+        );
+        assert_eq!(
+            pending.get("accepted-session"),
+            Some(&(chunk_received_at + timeout))
+        );
+    }
+
+    #[test]
+    fn positive_runtime_millis_rejects_zero_cli_values() {
+        assert_eq!(
+            configured_positive_millis(Some(60_000), "UNUSED", 30_000, "heartbeat TTL").unwrap(),
+            60_000
+        );
+        assert!(
+            configured_positive_millis(Some(0), "UNUSED", 30_000, "heartbeat TTL")
+                .unwrap_err()
+                .to_string()
+                .contains("must be positive")
         );
     }
 

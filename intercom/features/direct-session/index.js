@@ -8,7 +8,9 @@ const SESSION_CHANNEL_PREFIX = 'mx/s/';
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const DEFAULT_RATE_BYTES_PER_SECOND = 1_000_000;
 const DEFAULT_RATE_BURST_BYTES = 1_000_000;
-const DEFAULT_SEND_DRAIN_TIMEOUT_MS = 30_000;
+const DEFAULT_SEND_DRAIN_TIMEOUT_MS = 0;
+const DEFAULT_CONNECT_MAX_WAIT_MS = 120_000;
+const DEFAULT_CONNECT_POLL_MS = 100;
 
 const normalizeKeyHex = (value) => {
   if (!value) return null;
@@ -50,8 +52,14 @@ class DirectSession extends Feature {
     this.sendDrainTimeoutMs = safeIntegerOr(
       config.sendDrainTimeoutMs,
       DEFAULT_SEND_DRAIN_TIMEOUT_MS,
+      { min: 0 }
+    );
+    this.connectMaxWaitMs = safeIntegerOr(
+      config.connectMaxWaitMs,
+      DEFAULT_CONNECT_MAX_WAIT_MS,
       { min: 1 }
     );
+    this.connectPollMs = safeIntegerOr(config.connectPollMs, DEFAULT_CONNECT_POLL_MS, { min: 1 });
     this.sessions = new Map();
     this.pairedConnections = new WeakSet();
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
@@ -79,6 +87,8 @@ class DirectSession extends Feature {
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
       sendDrainTimeoutMs: this.sendDrainTimeoutMs,
+      connectMaxWaitMs: this.connectMaxWaitMs,
+      connectPollMs: this.connectPollMs,
       sessionCount: this.sessions.size,
       sessions: Array.from(this.sessions.values()).map((session) => ({
         session_id: session.sessionId,
@@ -128,7 +138,7 @@ class DirectSession extends Feature {
       this._prepareConnection(existing);
       return this._peerInfo(normalizedRemote, true);
     }
-    const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, 120_000));
+    const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, this.connectMaxWaitMs));
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       const connection = this._findConnection(normalizedRemote);
@@ -136,7 +146,7 @@ class DirectSession extends Feature {
         this._prepareConnection(connection);
         return this._peerInfo(normalizedRemote, true);
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, this.connectPollMs));
     }
     throw new Error(`Timed out connecting to peer ${normalizedRemote}.`);
   }
@@ -357,18 +367,21 @@ class DirectSession extends Feature {
       const waiter = {
         resolve,
         reject,
-        timer: setTimeout(() => {
+        timer: null,
+      };
+      if (this.sendDrainTimeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
           session.drainWaiters.delete(waiter);
           reject(new Error(`Session ${session.sessionId} send drain timed out.`));
-        }, this.sendDrainTimeoutMs),
-      };
+        }, this.sendDrainTimeoutMs);
+      }
       session.drainWaiters.add(waiter);
     });
   }
 
   _resolveDrainWaiters(session) {
     for (const waiter of session.drainWaiters) {
-      clearTimeout(waiter.timer);
+      if (waiter.timer !== null) clearTimeout(waiter.timer);
       waiter.resolve();
     }
     session.drainWaiters.clear();
@@ -376,7 +389,7 @@ class DirectSession extends Feature {
 
   _rejectDrainWaiters(session, err) {
     for (const waiter of session.drainWaiters) {
-      clearTimeout(waiter.timer);
+      if (waiter.timer !== null) clearTimeout(waiter.timer);
       waiter.reject(err);
     }
     session.drainWaiters.clear();

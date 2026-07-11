@@ -41,7 +41,7 @@ pub const DEFAULT_MAX_REPORT_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS: u64 = 5 * 60;
 pub const DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS: u64 = 120;
 pub const HEARTBEAT_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = 30_000;
+pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
 const APPLE_APP_ATTEST_ISSUER: &str = "https://appattest.apple.com";
@@ -262,6 +262,8 @@ pub struct HeartbeatReplayCache {
 pub struct HeartbeatReceiver {
     replay_cache: HeartbeatReplayCache,
     drops: Vec<HeartbeatDrop>,
+    max_age_millis: u64,
+    max_clock_skew_millis: u64,
 }
 
 #[derive(Debug)]
@@ -352,9 +354,18 @@ impl Default for HeartbeatReceiver {
 
 impl HeartbeatReceiver {
     pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+            DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        )
+    }
+
+    pub fn with_limits(max_age_millis: u64, max_clock_skew_millis: u64) -> Self {
         Self {
             replay_cache: HeartbeatReplayCache::default(),
             drops: Vec::new(),
+            max_age_millis,
+            max_clock_skew_millis,
         }
     }
 
@@ -363,8 +374,8 @@ impl HeartbeatReceiver {
             raw,
             now_millis,
             replay_cache: &mut self.replay_cache,
-            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
-            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+            max_age_millis: self.max_age_millis,
+            max_clock_skew_millis: self.max_clock_skew_millis,
         }) {
             Ok(heartbeat) => Some(heartbeat),
             Err(err) => {
@@ -2720,6 +2731,34 @@ mod tests {
         assert!(receiver.receive(&bad, now).is_none());
         assert_eq!(receiver.drops().len(), 2);
         assert!(receiver.drops()[1].reason.contains("signature"));
+    }
+
+    #[test]
+    fn heartbeat_receiver_uses_the_shared_routing_freshness_window() {
+        let signing_key = SigningKey::from_bytes(&[18_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut receiver = HeartbeatReceiver::with_limits(
+            DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+            DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        );
+
+        let fresh = signed_heartbeat(&signing_key, &provider, now - 45_000, "dd");
+        assert!(receiver.receive(&fresh, now).is_some());
+
+        let stale = signed_heartbeat(
+            &signing_key,
+            &provider,
+            now - DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS - 1,
+            "ee",
+        );
+        assert!(receiver.receive(&stale, now).is_none());
+        assert!(receiver
+            .drops()
+            .last()
+            .expect("stale drop")
+            .reason
+            .contains("heartbeat is stale"));
     }
 
     fn signed_heartbeat(

@@ -307,14 +307,14 @@ export function tapDepositStateMatches(deposit, {
 export async function waitForTapDepositState(deposit, {
   rpcUrl,
   epoch,
-  timeoutMs = 30_000,
+  timeoutMs = 0,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
   const seenKey = `dep/tap/${tapDepositKey(deposit)}`;
   let state = null;
-  while (Date.now() <= deadline) {
+  while (deadline === null || Date.now() <= deadline) {
     const [seen, depositRoot] = await Promise.all([
       readContractStateValue(rpcUrl, seenKey, { fetchImpl }),
       readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
@@ -460,7 +460,7 @@ async function main() {
   const sim = boolArg(args.sim, false);
   const json = boolArg(args.json, false);
   const verify = !boolArg(args['no-verify'], false);
-  const verifyTimeoutMs = parseNonNegativeInt(args['verify-timeout-ms'] ?? 30_000, '--verify-timeout-ms', 30_000);
+  const verifyTimeoutMs = parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0);
   const verifyPollMs = parseNonNegativeInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500);
 
   const provider = new ethers.JsonRpcProvider(rpc);

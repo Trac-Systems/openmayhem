@@ -340,13 +340,13 @@ export function depositStateMatches(match, {
 export async function waitForDepositState(match, {
   rpcUrl,
   epoch,
-  timeoutMs = 30_000,
+  timeoutMs = 0,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
   let state = null;
-  while (Date.now() <= deadline) {
+  while (deadline === null || Date.now() <= deadline) {
     const [pending, balance, depositRoot] = await Promise.all([
       readContractStateValue(rpcUrl, `dep/pending/${match.memo_hash}`, { fetchImpl }),
       readContractStateValue(rpcUrl, `bal/${match.user}/tnk`, { fetchImpl }),
@@ -417,6 +417,18 @@ function parsePositiveInt(value, label, fallback = null) {
   return parsed;
 }
 
+function parseNonNegativeInt(value, label, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    if (fallback !== null) return fallback;
+    throw new Error(`Missing ${label}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+  return parsed;
+}
+
 async function main() {
   const args = parseArgs();
   const stateDir = path.resolve(args['state-dir'] || defaultStateDir());
@@ -445,7 +457,7 @@ async function main() {
   const submit = boolArg(args.submit, false);
   const sim = boolArg(args.sim, false);
   const verify = !boolArg(args['no-verify'], false);
-  const verifyTimeoutMs = parsePositiveInt(args['verify-timeout-ms'] ?? 30_000, '--verify-timeout-ms', 30_000);
+  const verifyTimeoutMs = parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0);
   const verifyPollMs = parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500);
 
   const config = createLocalConfig({

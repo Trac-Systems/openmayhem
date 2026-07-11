@@ -38,7 +38,8 @@ use crate::{
         ProviderObservationSample, ProviderTable, ProviderTableEntry, ProviderUnderdeliveryEvent,
         RequestRequirements, SelectionWeights, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
         DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S,
-        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_SATURATION_CUTOFF,
+        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        DEFAULT_SATURATION_CUTOFF,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
@@ -162,6 +163,7 @@ pub struct GatewayState {
     access_control: Arc<GatewayAccessControl>,
     hidden_update_models: Arc<Vec<GatewayUpdateModelNotice>>,
     epoch_seconds: u64,
+    provider_heartbeat_ttl_millis: u64,
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
     default_max_price_au: Option<MoneyAu>,
@@ -1664,6 +1666,7 @@ impl GatewayState {
             access_control: Arc::new(GatewayAccessControl::disabled()),
             hidden_update_models: Arc::new(Vec::new()),
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
+            provider_heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
             default_max_price_au: None,
@@ -1780,6 +1783,15 @@ impl GatewayState {
                 table.upsert_heartbeat(heartbeat, now);
             }
         }
+        self
+    }
+
+    pub fn with_provider_heartbeat_ttl_millis(mut self, ttl_millis: u64) -> Self {
+        self.provider_heartbeat_ttl_millis = ttl_millis;
+        self.provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .set_heartbeat_ttl_millis(ttl_millis);
         self
     }
 
@@ -5689,7 +5701,6 @@ type SseEventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Sen
 const LIVE_SSE_MIN_EVENT_BUFFER: usize = 1;
 const LIVE_SSE_MAX_EVENT_BUFFER: usize = 8;
 const LIVE_SSE_DEFAULT_MAX_TOKENS: usize = 1024;
-const LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS: u64 = 3_000;
 const LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS: u64 = 8;
 const DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS: u64 = 5_000;
 
@@ -12223,20 +12234,34 @@ async fn send_sse_event(
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     event: Result<Event, Infallible>,
 ) -> bool {
-    tokio::select! {
-        result = tx.send(event) => result.is_ok(),
-        _ = tx.closed() => false,
-        _ = tokio::time::sleep(live_sse_client_backpressure_timeout()) => false,
+    send_sse_event_with_timeout(tx, event, live_sse_client_backpressure_timeout()).await
+}
+
+async fn send_sse_event_with_timeout(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    event: Result<Event, Infallible>,
+    timeout: Option<Duration>,
+) -> bool {
+    if let Some(timeout) = timeout {
+        tokio::select! {
+            result = tx.send(event) => result.is_ok(),
+            _ = tx.closed() => false,
+            _ = tokio::time::sleep(timeout) => false,
+        }
+    } else {
+        tokio::select! {
+            result = tx.send(event) => result.is_ok(),
+            _ = tx.closed() => false,
+        }
     }
 }
 
-fn live_sse_client_backpressure_timeout() -> Duration {
+fn live_sse_client_backpressure_timeout() -> Option<Duration> {
     std::env::var("MAYHEM_LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS))
 }
 
 fn sse_event_from_value(value: Value) -> Event {
@@ -13205,6 +13230,7 @@ fn request_requirements_for_chat(
         min_throughput,
         now_millis,
         max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
 }
@@ -13267,6 +13293,7 @@ fn request_requirements_for_embedding(
         min_throughput,
         now_millis,
         max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
 }
@@ -13293,6 +13320,7 @@ fn request_requirements_for_image_generation(
         min_throughput,
         now_millis,
         max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
 }
@@ -13319,6 +13347,7 @@ fn request_requirements_for_audio_speech(
         min_throughput,
         now_millis,
         max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
 }
@@ -13344,6 +13373,7 @@ fn request_requirements_for_audio_transcription(
         min_throughput,
         now_millis,
         max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
 }
@@ -20353,6 +20383,22 @@ mod tests {
             live_sse_event_buffer_capacity(&request),
             LIVE_SSE_MAX_EVENT_BUFFER
         );
+    }
+
+    #[tokio::test]
+    async fn live_sse_default_backpressure_waits_for_client_progress() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(send_sse_event_with_timeout(&tx, Ok(Event::default().data("first")), None,).await);
+
+        let waiting = tokio::spawn(async move {
+            send_sse_event_with_timeout(&tx, Ok(Event::default().data("second")), None).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+
+        assert!(rx.recv().await.is_some());
+        assert!(waiting.await.expect("backpressure send task"));
+        assert!(rx.recv().await.is_some());
     }
 
     #[test]

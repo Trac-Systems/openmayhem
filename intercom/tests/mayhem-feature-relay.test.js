@@ -289,6 +289,32 @@ test('participant does not broadcast when the canonical admin channel is unavail
   assert.equal(broadcasts, 0);
 });
 
+test('participant relay has no implicit wall-clock deadline and stops cleanly', async () => {
+  const participant = peerFor(providerKey);
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => false,
+    broadcast: () => false,
+  };
+  const feature = new MayhemFeature(participant.peer, { retryMs: 5 });
+  feature.key = 'mayhem';
+  const relaying = feature.relay(
+    `consent/${providerKey}/1/rules-hash`,
+    consentValue()
+  );
+
+  const state = await Promise.race([
+    relaying.then(() => 'settled'),
+    new Promise((resolve) => setTimeout(() => resolve('pending'), 30)),
+  ]);
+  assert.equal(state, 'pending');
+
+  await feature.stop();
+  const result = await relaying;
+  assert.equal(result.ok, false);
+  assert.match(result.message, /relay stopped/);
+});
+
 test('participant reconnects the direct admin channel while a relay is pending', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });

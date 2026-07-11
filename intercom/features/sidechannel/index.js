@@ -4,6 +4,19 @@ import c from '../../node_modules/compact-encoding/index.js';
 import crypto from 'crypto';
 import PeerWallet from 'trac-wallet';
 
+const DEFAULT_MUX_RETRY_MAX = 5;
+const DEFAULT_MUX_RETRY_DELAY_MS = 50;
+const DEFAULT_OPEN_RETRY_MAX = 5;
+const DEFAULT_OPEN_RETRY_BASE_MS = 100;
+const DEFAULT_OPEN_RETRY_RESET_MS = 2_000;
+const DEFAULT_FLUSH_TIMEOUT_MS = 10_000;
+const DEFAULT_DIRECT_CONNECT_MAX_WAIT_MS = 120_000;
+const DEFAULT_DIRECT_CONNECT_POLL_MS = 100;
+
+const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
+  Number.isSafeInteger(value) && value >= min ? value : fallback
+);
+
 // Join topics must be deterministic and collision-resistant.
 // The previous implementation (alloc(32).fill(name)) could collide for different names.
 const toTopic = (name) =>
@@ -68,6 +81,38 @@ class Sidechannel extends Feature {
     this._dhtBootPromise = null;
     this.onMessage = typeof config.onMessage === 'function' ? config.onMessage : null;
     this.debug = config.debug === true;
+    this.muxRetryMax = safeIntegerOr(config.muxRetryMax, DEFAULT_MUX_RETRY_MAX);
+    this.muxRetryDelayMs = safeIntegerOr(
+      config.muxRetryDelayMs,
+      DEFAULT_MUX_RETRY_DELAY_MS,
+      { min: 1 }
+    );
+    this.openRetryMax = safeIntegerOr(config.openRetryMax, DEFAULT_OPEN_RETRY_MAX);
+    this.openRetryBaseMs = safeIntegerOr(
+      config.openRetryBaseMs,
+      DEFAULT_OPEN_RETRY_BASE_MS,
+      { min: 1 }
+    );
+    this.openRetryResetMs = safeIntegerOr(
+      config.openRetryResetMs,
+      DEFAULT_OPEN_RETRY_RESET_MS,
+      { min: 1 }
+    );
+    this.flushTimeoutMs = safeIntegerOr(
+      config.flushTimeoutMs,
+      DEFAULT_FLUSH_TIMEOUT_MS,
+      { min: 1 }
+    );
+    this.directConnectMaxWaitMs = safeIntegerOr(
+      config.directConnectMaxWaitMs,
+      DEFAULT_DIRECT_CONNECT_MAX_WAIT_MS,
+      { min: 1 }
+    );
+    this.directConnectPollMs = safeIntegerOr(
+      config.directConnectPollMs,
+      DEFAULT_DIRECT_CONNECT_POLL_MS,
+      { min: 1 }
+    );
     this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes)
       ? config.maxMessageBytes
       : 1_000_000;
@@ -746,8 +791,11 @@ class Sidechannel extends Feature {
     if (!mux || typeof mux.createChannel !== 'function') {
       const tries = (connection.__sidechannelMuxTries || 0) + 1;
       connection.__sidechannelMuxTries = tries;
-      if (tries <= 5) {
-        setTimeout(() => this._openChannelForConnection(connection, entry), 50);
+      if (tries <= this.muxRetryMax) {
+        setTimeout(
+          () => this._openChannelForConnection(connection, entry),
+          this.muxRetryDelayMs
+        );
       } else if (this.debug) {
         console.log(`[sidechannel:${entry.name}] mux not ready for connection.`);
       }
@@ -963,17 +1011,22 @@ class Sidechannel extends Feature {
         const now = this._now();
         const state = perConn._openRetries?.get(entry.name) || { count: 0, lastAt: 0 };
         // If the last attempt was a while ago, start a fresh retry burst.
-        const baseCount = now - (state.lastAt || 0) > 2000 ? 0 : Number(state.count) || 0;
+        const baseCount = now - (state.lastAt || 0) > this.openRetryResetMs
+          ? 0
+          : Number(state.count) || 0;
         const retryCount = baseCount + 1;
         if (perConn._openRetries) {
           perConn._openRetries.set(entry.name, { count: retryCount, lastAt: now });
         }
-        if (retryCount <= 5) {
+        if (retryCount <= this.openRetryMax) {
           try {
             record?.channel?.close?.();
           } catch (_e) {}
           perConn.delete(entry.name);
-          setTimeout(() => this._openChannelForConnection(connection, entry), 100 * retryCount);
+          setTimeout(
+            () => this._openChannelForConnection(connection, entry),
+            this.openRetryBaseMs * retryCount
+          );
           return;
         }
         if (this.debug) {
@@ -993,11 +1046,13 @@ class Sidechannel extends Feature {
     if (this.started && this.peer?.swarm) {
       this.peer.swarm.join(entry.topic, { server: true, client: true });
       {
-        const flushTimeoutMs = 10_000;
         const flushP = Promise.resolve()
           .then(() => this.peer.swarm.flush())
           .catch(() => {});
-        await Promise.race([flushP, new Promise((resolve) => setTimeout(resolve, flushTimeoutMs))]);
+        await Promise.race([
+          flushP,
+          new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
+        ]);
       }
 
       for (const connection of this.connections.keys()) {
@@ -1030,7 +1085,10 @@ class Sidechannel extends Feature {
       return false;
     }
 
-    const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 15_000, 120_000));
+    const maxWaitMs = Math.max(
+      1,
+      Math.min(Number(waitMs) || 15_000, this.directConnectMaxWaitMs)
+    );
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       for (const connection of this.peer.swarm.connections || []) {
@@ -1039,7 +1097,7 @@ class Sidechannel extends Feature {
         }
       }
       if (this._directPeerChannelReady(target, entry.name)) return true;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, this.directConnectPollMs));
     }
     return false;
   }
@@ -1087,11 +1145,13 @@ class Sidechannel extends Feature {
       } catch (_e) {}
       try {
         if (typeof this.peer.swarm.flush === 'function') {
-          const flushTimeoutMs = 10_000;
           const flushP = Promise.resolve()
             .then(() => this.peer.swarm.flush())
             .catch(() => {});
-          await Promise.race([flushP, new Promise((resolve) => setTimeout(resolve, flushTimeoutMs))]);
+          await Promise.race([
+            flushP,
+            new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
+          ]);
         }
       } catch (_e) {}
     }
@@ -1221,11 +1281,13 @@ class Sidechannel extends Feature {
     }
     // Flush can hang in degraded networks. Bound the wait so the app can keep running.
     {
-      const flushTimeoutMs = 10_000;
       const flushP = Promise.resolve()
         .then(() => this.peer.swarm.flush())
         .catch(() => {});
-      await Promise.race([flushP, new Promise((resolve) => setTimeout(resolve, flushTimeoutMs))]);
+      await Promise.race([
+        flushP,
+        new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
+      ]);
     }
     this.started = true;
 

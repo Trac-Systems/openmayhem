@@ -13,7 +13,7 @@ UMask=0077
 ExecStartPre=+/usr/bin/systemctl stop mayhem-paygate.service mayhem-tap-rate.service mayhem-tnk-rate.service mayhem-tap-deposit.service mayhem-tnk-deposit.service mayhem-tap-settlement.service mayhem-stack.service
 ExecStart=/opt/mayhem/source/scripts/ops/backup-mainnet.sh
 ExecStopPost=+/usr/bin/systemctl start mayhem-stack.service mayhem-paygate.service mayhem-tap-rate.service mayhem-tnk-rate.service mayhem-tap-deposit.service mayhem-tnk-deposit.service mayhem-tap-settlement.service
-TimeoutStartSec=900
+TimeoutStartSec=infinity
 NoNewPrivileges=true
 PrivateTmp=true
 

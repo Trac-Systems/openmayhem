@@ -37,7 +37,11 @@ const stripeWorkerEndpoint = (raw = 'http://127.0.0.1:11436') => {
   return parsed;
 };
 
-const postInternalStripeCheckout = (endpoint, value) => new Promise((resolve, reject) => {
+const postInternalStripeCheckout = (
+  endpoint,
+  value,
+  timeoutMs = 120_000
+) => new Promise((resolve, reject) => {
   const body = JSON.stringify(value);
   const request = http.request(endpoint, {
     method: 'POST',
@@ -72,7 +76,9 @@ const postInternalStripeCheckout = (endpoint, value) => new Promise((resolve, re
       resolve(parsed);
     });
   });
-  request.setTimeout(30_000, () => request.destroy(new Error('Stripe worker request timed out.')));
+  request.setTimeout(timeoutMs, () => {
+    request.destroy(new Error(`Stripe worker request timed out after ${timeoutMs}ms.`));
+  });
   request.on('error', reject);
   request.end(body);
 });
@@ -137,7 +143,7 @@ const stripeCheckoutService = (peer) => async (service, value) => {
     ...value,
     currency,
     locale,
-  });
+  }, stripeWorkerRequestTimeoutMs);
 };
 
 if (flags['msb-transfer-helper']) {
@@ -352,6 +358,56 @@ const sidechannelWelcomeRequired = parseBool(
     '',
   false
 );
+const sidechannelMuxRetryMax = parseInteger(
+  flagValue('sidechannel-mux-retry-max', env.SIDECHANNEL_MUX_RETRY_MAX || ''),
+  5
+);
+const sidechannelMuxRetryDelayMs = parseInteger(
+  flagValue('sidechannel-mux-retry-delay-ms', env.SIDECHANNEL_MUX_RETRY_DELAY_MS || ''),
+  50
+);
+const sidechannelOpenRetryMax = parseInteger(
+  flagValue('sidechannel-open-retry-max', env.SIDECHANNEL_OPEN_RETRY_MAX || ''),
+  5
+);
+const sidechannelOpenRetryBaseMs = parseInteger(
+  flagValue('sidechannel-open-retry-base-ms', env.SIDECHANNEL_OPEN_RETRY_BASE_MS || ''),
+  100
+);
+const sidechannelOpenRetryResetMs = parseInteger(
+  flagValue('sidechannel-open-retry-reset-ms', env.SIDECHANNEL_OPEN_RETRY_RESET_MS || ''),
+  2_000
+);
+const sidechannelFlushTimeoutMs = parseInteger(
+  flagValue('sidechannel-flush-timeout-ms', env.SIDECHANNEL_FLUSH_TIMEOUT_MS || ''),
+  10_000
+);
+const sidechannelDirectConnectMaxWaitMs = parseInteger(
+  flagValue(
+    'sidechannel-direct-connect-max-wait-ms',
+    env.SIDECHANNEL_DIRECT_CONNECT_MAX_WAIT_MS || ''
+  ),
+  120_000
+);
+const sidechannelDirectConnectPollMs = parseInteger(
+  flagValue(
+    'sidechannel-direct-connect-poll-ms',
+    env.SIDECHANNEL_DIRECT_CONNECT_POLL_MS || ''
+  ),
+  100
+);
+if (
+  sidechannelMuxRetryMax < 0 ||
+  sidechannelMuxRetryDelayMs <= 0 ||
+  sidechannelOpenRetryMax < 0 ||
+  sidechannelOpenRetryBaseMs <= 0 ||
+  sidechannelOpenRetryResetMs <= 0 ||
+  sidechannelFlushTimeoutMs <= 0 ||
+  sidechannelDirectConnectMaxWaitMs <= 0 ||
+  sidechannelDirectConnectPollMs <= 0
+) {
+  throw new Error('Sidechannel retry and flush timing values are invalid.');
+}
 const mayhemRelayPowDifficulty = parseInteger(
   flagValue('mayhem-relay-pow-difficulty', env.MAYHEM_RELAY_POW_DIFFICULTY || ''),
   18
@@ -360,6 +416,36 @@ const mayhemRelayMaxMessageBytes = parseInteger(
   flagValue('mayhem-relay-max-bytes', env.MAYHEM_RELAY_MAX_BYTES || ''),
   MAYHEM_RELAY_MAX_MESSAGE_BYTES
 );
+const mayhemRelayTimeoutMs = parseInteger(
+  flagValue('mayhem-relay-timeout-ms', env.MAYHEM_RELAY_TIMEOUT_MS || ''),
+  0
+);
+const mayhemRelayRetryMs = parseInteger(
+  flagValue('mayhem-relay-retry-ms', env.MAYHEM_RELAY_RETRY_MS || ''),
+  1_000
+);
+const mayhemRelayConnectTimeoutMs = parseInteger(
+  flagValue('mayhem-relay-connect-timeout-ms', env.MAYHEM_RELAY_CONNECT_TIMEOUT_MS || ''),
+  15_000
+);
+const mayhemRelayResultTimeoutMs = parseInteger(
+  flagValue('mayhem-relay-result-timeout-ms', env.MAYHEM_RELAY_RESULT_TIMEOUT_MS || ''),
+  0
+);
+const mayhemRelayResultPollMs = parseInteger(
+  flagValue('mayhem-relay-result-poll-ms', env.MAYHEM_RELAY_RESULT_POLL_MS || ''),
+  50
+);
+const stripeWorkerRequestTimeoutMs = parseInteger(
+  flagValue(
+    'stripe-worker-request-timeout-ms',
+    env.MAYHEM_STRIPE_WORKER_REQUEST_TIMEOUT_MS || ''
+  ),
+  120_000
+);
+if (stripeWorkerRequestTimeoutMs <= 0) {
+  throw new Error('Stripe worker request timeout must be positive.');
+}
 const directSessionDebug = parseBool(
   (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',
   false
@@ -379,6 +465,25 @@ const directSessionRateBytesPerSecond = Number.parseInt(
 const directSessionRateBurstBytes = Number.parseInt(
   (flags['session-rate-burst-bytes'] && String(flags['session-rate-burst-bytes'])) ||
     env.SESSION_RATE_BURST_BYTES ||
+    '',
+  10
+);
+const directSessionSendDrainTimeoutMs = Number.parseInt(
+  (flags['session-send-drain-timeout-ms'] &&
+    String(flags['session-send-drain-timeout-ms'])) ||
+    env.SESSION_SEND_DRAIN_TIMEOUT_MS ||
+    '',
+  10
+);
+const directSessionConnectMaxWaitMs = Number.parseInt(
+  (flags['session-connect-max-wait-ms'] && String(flags['session-connect-max-wait-ms'])) ||
+    env.SESSION_CONNECT_MAX_WAIT_MS ||
+    '',
+  10
+);
+const directSessionConnectPollMs = Number.parseInt(
+  (flags['session-connect-poll-ms'] && String(flags['session-connect-poll-ms'])) ||
+    env.SESSION_CONNECT_POLL_MS ||
     '',
   10
 );
@@ -572,6 +677,11 @@ let mayhemFeature = null;
   mayhemFeature = new MayhemFeature(peer, {
     channel: MAYHEM_RELAY_CHANNEL,
     maxMessageBytes: mayhemRelayMaxMessageBytes,
+    timeoutMs: mayhemRelayTimeoutMs,
+    retryMs: mayhemRelayRetryMs,
+    connectTimeoutMs: mayhemRelayConnectTimeoutMs,
+    resultTimeoutMs: mayhemRelayResultTimeoutMs,
+    resultPollMs: mayhemRelayResultPollMs,
     serviceHandler: stripeCheckoutService(peer),
   });
   await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
@@ -685,6 +795,15 @@ const directSession = new DirectSession(peer, {
   rateBurstBytes: Number.isSafeInteger(directSessionRateBurstBytes)
     ? directSessionRateBurstBytes
     : undefined,
+  sendDrainTimeoutMs: Number.isSafeInteger(directSessionSendDrainTimeoutMs)
+    ? directSessionSendDrainTimeoutMs
+    : undefined,
+  connectMaxWaitMs: Number.isSafeInteger(directSessionConnectMaxWaitMs)
+    ? directSessionConnectMaxWaitMs
+    : undefined,
+  connectPollMs: Number.isSafeInteger(directSessionConnectPollMs)
+    ? directSessionConnectPollMs
+    : undefined,
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
     : null,
@@ -698,6 +817,14 @@ const sidechannel = new Sidechannel(peer, {
   maxMessageBytesByChannel: {
     [MAYHEM_RELAY_CHANNEL]: mayhemRelayMaxMessageBytes,
   },
+  muxRetryMax: sidechannelMuxRetryMax,
+  muxRetryDelayMs: sidechannelMuxRetryDelayMs,
+  openRetryMax: sidechannelOpenRetryMax,
+  openRetryBaseMs: sidechannelOpenRetryBaseMs,
+  openRetryResetMs: sidechannelOpenRetryResetMs,
+  flushTimeoutMs: sidechannelFlushTimeoutMs,
+  directConnectMaxWaitMs: sidechannelDirectConnectMaxWaitMs,
+  directConnectPollMs: sidechannelDirectConnectPollMs,
   powEnabled: true,
   powDifficulty: mayhemRelayPowDifficulty,
   powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
