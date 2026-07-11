@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     fmt, fs,
     future::Future,
@@ -134,6 +134,8 @@ const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
 const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
 const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS: usize = 32;
+const DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS: usize = 1_024;
+const DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES: usize = 4_096;
 const DEFAULT_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_SESSION_MAX_ARTIFACTS: usize = 128;
 const MAX_SESSION_ARTIFACT_ID_BYTES: usize = 128;
@@ -173,7 +175,8 @@ pub struct GatewayState {
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
-    paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
+    paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
+    retention_limits: GatewayRetentionLimits,
     receipt_config: ReceiptConfig,
     ledger_balance_au: Arc<Mutex<MoneyAu>>,
     payment_directory: Arc<Mutex<Option<Value>>>,
@@ -204,6 +207,35 @@ pub struct GatewayState {
 struct ChatAffinityKey {
     model_id: String,
     conversation_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GatewayRetentionLimits {
+    paused_sessions: usize,
+    chat_affinities: usize,
+}
+
+impl Default for GatewayRetentionLimits {
+    fn default() -> Self {
+        Self {
+            paused_sessions: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_PAUSED_SESSIONS",
+                DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS,
+            ),
+            chat_affinities: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_CHAT_AFFINITIES",
+                DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES,
+            ),
+        }
+    }
+}
+
+fn push_bounded<T>(items: &mut VecDeque<T>, item: T, max_items: usize) {
+    let max_items = max_items.max(1);
+    while items.len() >= max_items {
+        items.pop_front();
+    }
+    items.push_back(item);
 }
 
 #[derive(Clone)]
@@ -1668,7 +1700,8 @@ impl GatewayState {
             receipts: Arc::new(Mutex::new(Vec::new())),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
-            paused_sessions: Arc::new(Mutex::new(Vec::new())),
+            paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            retention_limits: GatewayRetentionLimits::default(),
             receipt_config,
             ledger_balance_au: Arc::new(Mutex::new(ledger_balance_au)),
             payment_directory: Arc::new(Mutex::new(None)),
@@ -1958,7 +1991,9 @@ impl GatewayState {
     pub fn paused_sessions(&self) -> Vec<PausedSession> {
         self.paused_sessions
             .lock_recover("paused session store")
-            .clone()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn receipt_count(&self) -> usize {
@@ -2014,9 +2049,11 @@ impl GatewayState {
     }
 
     fn pause_session(&self, paused: PausedSession) {
-        self.paused_sessions
-            .lock_recover("paused session store")
-            .push(paused);
+        push_bounded(
+            &mut self.paused_sessions.lock_recover("paused session store"),
+            paused,
+            self.retention_limits.paused_sessions,
+        );
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
@@ -13615,9 +13652,13 @@ impl GatewayState {
         let Some(key) = chat_affinity_key(model, request) else {
             return;
         };
-        self.chat_affinity
-            .lock_recover("chat affinity map")
-            .insert(key, route_key(route));
+        let mut affinities = self.chat_affinity.lock_recover("chat affinity map");
+        if !affinities.contains_key(&key)
+            && affinities.len() >= self.retention_limits.chat_affinities
+        {
+            affinities.pop_first();
+        }
+        affinities.insert(key, route_key(route));
     }
 }
 
@@ -13673,7 +13714,7 @@ fn chat_affinity_key(
         {
             return Some(ChatAffinityKey {
                 model_id: model.id.clone(),
-                conversation_id: format!("metadata:{field}:{id}"),
+                conversation_id: format!("metadata:{field}:{}", blake3_hex(id.as_bytes())),
             });
         }
     }
@@ -13685,7 +13726,7 @@ fn chat_affinity_key(
         .filter(|value| !value.is_empty())
         .map(|user| ChatAffinityKey {
             model_id: model.id.clone(),
-            conversation_id: format!("user:{user}"),
+            conversation_id: format!("user:{}", blake3_hex(user.as_bytes())),
         })
 }
 
@@ -20067,6 +20108,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_gateway_stores_drop_oldest_entries() {
+        let mut values = VecDeque::new();
+        for value in 0..10_000 {
+            push_bounded(&mut values, value, 3);
+        }
+        assert_eq!(
+            values.into_iter().collect::<Vec<_>>(),
+            vec![9_997, 9_998, 9_999]
+        );
+    }
+
     #[tokio::test]
     async fn route_wait_rechecks_until_route_becomes_eligible_or_expires() {
         let model = test_routed_model(1);
@@ -22479,6 +22532,35 @@ mod tests {
         let selected =
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, seed);
         assert_eq!(selected[0].provider, served_provider);
+    }
+
+    #[test]
+    fn conversation_affinity_is_fixed_size_and_bounded() {
+        let model = test_routed_model(1);
+        let route = model.mayhem.route_candidates.first().expect("route");
+        let mut state = test_gateway_state_from_models(vec![model.clone()]);
+        state.retention_limits.chat_affinities = 2;
+
+        let mut huge_request = test_chat_request(&model.id);
+        huge_request
+            .metadata
+            .insert("conversation_id".to_owned(), json!("x".repeat(1_000_000)));
+        let key = chat_affinity_key(&model, &huge_request).expect("affinity key");
+        assert!(key.conversation_id.len() < 100);
+        state.record_chat_affinity(&model, &huge_request, route);
+
+        for index in 0..100 {
+            let mut request = test_chat_request(&model.id);
+            request
+                .metadata
+                .insert("conversation_id".to_owned(), json!(format!("loop-{index}")));
+            state.record_chat_affinity(&model, &request, route);
+        }
+
+        assert_eq!(
+            state.chat_affinity.lock_recover("chat affinity map").len(),
+            2
+        );
     }
 
     #[test]

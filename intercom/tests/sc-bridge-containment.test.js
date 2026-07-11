@@ -12,6 +12,7 @@ import {
   closeOwnedSessions,
   disownSession,
   ownSession,
+  sessionSubscriptionMatches,
 } from '../features/sc-bridge/session-ownership.js';
 
 test('failed async client request is contained and the bridge serves the next request', async () => {
@@ -128,4 +129,12 @@ test('SC-Bridge bounds and reclaims every direct session owned by a disconnected
   });
   assert.equal(closed.length, maxSessions - 1);
   assert.equal(sessions.size, 0);
+});
+
+test('SC-Bridge does not leak session frames to an unsubscribed local client', () => {
+  const sessionId = 'ab'.repeat(32);
+  assert.equal(sessionSubscriptionMatches(false, null, sessionId), false);
+  assert.equal(sessionSubscriptionMatches(false, new Set(), sessionId), false);
+  assert.equal(sessionSubscriptionMatches(false, new Set([sessionId]), sessionId), true);
+  assert.equal(sessionSubscriptionMatches(true, null, sessionId), true);
 });

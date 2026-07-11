@@ -19,6 +19,8 @@ import {
   closeOwnedSessions,
   disownSession,
   ownSession,
+  sessionOwnershipKey,
+  sessionSubscriptionMatches,
 } from './session-ownership.js';
 
 const DEFAULT_MAX_CLIENTS = 64;
@@ -256,12 +258,7 @@ class ScBridge extends Feature {
     }
     for (const client of this.clients) {
       if (!client.ready) continue;
-      if (
-        !client.sessionAll &&
-        client.sessionIds &&
-        client.sessionIds.size > 0 &&
-        !client.sessionIds.has(payload.session_id)
-      ) {
+      if (!sessionSubscriptionMatches(client.sessionAll, client.sessionIds, payload.session_id)) {
         if (this.debug) {
           console.log(
             `[sc-bridge] skip client ${client.id} for session ${payload.session_id || ''}`
@@ -513,10 +510,6 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
-        if (!this._canTrackClientSession(client, remote, sessionId)) {
-          sendError('Direct session ownership limit reached.');
-          return;
-        }
         if (this.debug) {
           console.log(`[sc-bridge] client ${client.id} session_open ${sessionId} -> ${remote}`);
         }
@@ -531,6 +524,13 @@ class ScBridge extends Feature {
           }
           return;
         }
+        if (!this._canTrackClientSession(client, remote, sessionId)) {
+          sendError('Direct session ownership limit reached.');
+          return;
+        }
+        const ownershipKey = sessionOwnershipKey(remote, sessionId);
+        const alreadyOwned = client.directSessions.has(ownershipKey);
+        this._trackClientSession(client, remote, sessionId);
         this.directSession
           .open(remote, sessionId)
           .then((session) => {
@@ -538,10 +538,15 @@ class ScBridge extends Feature {
               this.directSession.close(remote, sessionId);
               return;
             }
-            this._trackClientSession(client, remote, sessionId);
             reply({ type: 'session_opened', ...session });
           })
           .catch((err) => {
+            if (
+              !alreadyOwned &&
+              !this.directSession.sessions?.has(ownershipKey)
+            ) {
+              this._untrackClientSession(client, remote, sessionId);
+            }
             sendError(err?.message ? `Session open failed: ${err.message}` : 'Session open failed.');
           });
         return;
@@ -553,10 +558,6 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
-        if (!this._canTrackClientSession(client, remote, sessionId)) {
-          sendError('Direct session ownership limit reached.');
-          return;
-        }
         if (this.debug) {
           console.log(
             `[sc-bridge] client ${client.id} session_send ` +
@@ -572,6 +573,13 @@ class ScBridge extends Feature {
           }
           return;
         }
+        if (!this._canTrackClientSession(client, remote, sessionId)) {
+          sendError('Direct session ownership limit reached.');
+          return;
+        }
+        const ownershipKey = sessionOwnershipKey(remote, sessionId);
+        const alreadyOwned = client.directSessions.has(ownershipKey);
+        this._trackClientSession(client, remote, sessionId);
         this.directSession
           .send(remote, sessionId, message.frame)
           .then((session) => {
@@ -579,10 +587,15 @@ class ScBridge extends Feature {
               this.directSession.close(remote, sessionId);
               return;
             }
-            this._trackClientSession(client, remote, sessionId);
             reply({ type: 'session_sent', ...session });
           })
           .catch((err) => {
+            if (
+              !alreadyOwned &&
+              !this.directSession.sessions?.has(ownershipKey)
+            ) {
+              this._untrackClientSession(client, remote, sessionId);
+            }
             sendError(err?.message ? `Session send failed: ${err.message}` : 'Session send failed.');
           });
         return;

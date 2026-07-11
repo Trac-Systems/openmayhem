@@ -190,7 +190,13 @@ class DirectSession extends Feature {
         `[direct-session:${session.session_id}] send ${frame?.t || 'frame'} to ${session.remote}`
       );
     }
-    const ok = record.message.send(frame);
+    let ok = false;
+    try {
+      ok = record.message.send(frame);
+    } catch (error) {
+      this._closeRecord(record, error, true);
+      throw error;
+    }
     if (!ok && this.debug) {
       console.log(`[direct-session:${session.session_id}] send accepted with backpressure`);
     }

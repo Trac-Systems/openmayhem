@@ -31216,6 +31216,9 @@ impl ProviderProtectionState {
     }
 
     fn record_accept(&mut self) {
+        if self.config.accept_rate_per_minute == 0 {
+            return;
+        }
         let now = Instant::now();
         self.prune_accept_window(now);
         self.accepted_at.push_back(now);
@@ -55271,6 +55274,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 ..
             }
         ));
+        for _ in 0..10_000 {
+            capacity.record_accept();
+        }
+        assert!(capacity.accepted_at.is_empty());
 
         let mut rate = ProviderProtectionState::new(ProviderProtectionConfig {
             max_sessions: 4,
@@ -55281,6 +55288,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         assert_eq!(rate.acceptance_decision(0), ProviderSessionDecision::Accept);
         rate.record_accept();
+        assert_eq!(rate.accepted_at.len(), 1);
         assert!(matches!(
             rate.acceptance_decision(0),
             ProviderSessionDecision::Reject { code: "RATE", .. }

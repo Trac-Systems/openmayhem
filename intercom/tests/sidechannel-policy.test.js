@@ -180,3 +180,32 @@ test('sidechannel bounds channel names/count and reclaims limiter state under co
   assert.equal(sidechannel.rateLimits.size, 0);
   assert.equal(sidechannel.connections.size, 0);
 });
+
+test('sidechannel does not send from a stale fully-opened callback after channel removal', async () => {
+  const room = 'room-race';
+  let resolveOpened = null;
+  let sends = 0;
+  const transportChannel = {
+    opened: false,
+    close() {},
+    fullyOpened: () => new Promise((resolve) => { resolveOpened = resolve; }),
+  };
+  const record = {
+    channel: transportChannel,
+    message: { send: () => { sends += 1; } },
+  };
+  const connection = { remotePublicKey: b4a.from('ee'.repeat(32), 'hex') };
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel, room],
+    entryChannel,
+  });
+  sidechannel.connections.set(connection, new Map([[room, record]]));
+
+  assert.equal(sidechannel.broadcast(room, { text: 'must not escape after leave' }), true);
+  await sidechannel.removeChannel(room);
+  resolveOpened(true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(sends, 0);
+  assert.equal(sidechannel.channels.has(room), false);
+});

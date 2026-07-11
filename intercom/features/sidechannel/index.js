@@ -1080,6 +1080,13 @@ class Sidechannel extends Feature {
     channel
       .fullyOpened()
       .then((opened) => {
+        if (
+          this.closedConnections.has(connection) ||
+          perConn.get(entry.name) !== record ||
+          this.channels.get(entry.name) !== entry
+        ) {
+          return;
+        }
         if (this.debug) {
           console.log(
             `[sidechannel:${entry.name}] channel open=${opened} for ${this._getRemoteKey(connection)}`
@@ -1148,6 +1155,8 @@ class Sidechannel extends Feature {
           new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
         ]);
       }
+
+      if (this.channels.get(entry.name) !== entry) return false;
 
       for (const connection of this.connections.keys()) {
         this._openChannelForConnection(connection, entry);
@@ -1327,7 +1336,14 @@ class Sidechannel extends Feature {
           record.channel
             ?.fullyOpened()
             .then((opened) => {
-              if (opened) record.message.send(payload);
+              if (
+                opened &&
+                !this.closedConnections.has(connection) &&
+                this.connections.get(connection)?.get(channel) === record &&
+                this.channels.get(channel) === entry
+              ) {
+                record.message.send(payload);
+              }
             })
             .catch((error) => {
               this._reportEventError(`deferred send ${channel}`, error, connection);

@@ -151,6 +151,103 @@ test('DirectSession sender throttles a valid multi-frame payload instead of reje
   await assert.doesNotReject(directSession._acquireSendRate(session, 100));
 });
 
+test('DirectSession send failure closes and reclaims only the failed session', async () => {
+  const directSession = new DirectSession({}, {});
+  let closed = 0;
+  const failed = {
+    sessionId,
+    remote,
+    channel: {
+      opened: true,
+      close: () => { closed += 1; },
+    },
+    message: {
+      send: () => { throw new Error('injected transport send failure'); },
+    },
+    sendLimiter: directSession._newLimiter(),
+    drainWaiters: new Set(),
+    closed: false,
+  };
+  const healthyId = 'ef'.repeat(32);
+  const healthy = {
+    sessionId: healthyId,
+    remote,
+    channel: { opened: true },
+    message: { send: () => true },
+    sendLimiter: directSession._newLimiter(),
+    drainWaiters: new Set(),
+    closed: false,
+  };
+  directSession.sessions.set(`${remote}:${sessionId}`, failed);
+  directSession.sessions.set(`${remote}:${healthyId}`, healthy);
+
+  await assert.rejects(
+    directSession.send(remote, sessionId, { t: 's.delta', d: 'fail' }),
+    /injected transport send failure/
+  );
+
+  assert.equal(failed.closed, true);
+  assert.equal(closed, 1);
+  assert.equal(directSession.sessions.has(`${remote}:${sessionId}`), false);
+  assert.equal(directSession.sessions.get(`${remote}:${healthyId}`), healthy);
+});
+
+test('DirectSession close racing a backpressured send rejects and reclaims promptly', async () => {
+  const directSession = new DirectSession({}, {});
+  const record = {
+    sessionId,
+    remote,
+    channel: { opened: true, drained: false, close: () => {} },
+    message: { send: () => false },
+    sendLimiter: directSession._newLimiter(),
+    drainWaiters: new Set(),
+    closed: false,
+  };
+  directSession.sessions.set(`${remote}:${sessionId}`, record);
+
+  const sending = directSession.send(remote, sessionId, { t: 's.delta', d: 'wait' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  directSession.close(remote, sessionId);
+
+  await assert.rejects(sending, /closed locally/);
+  assert.equal(record.drainWaiters.size, 0);
+  assert.equal(directSession.sessions.size, 0);
+});
+
+test('DirectSession contains concurrent send-close churn across many hostile sessions', async () => {
+  const directSession = new DirectSession({}, {
+    maxSessions: 512,
+    maxSessionsPerConnection: 512,
+  });
+  const sends = [];
+  const records = [];
+  for (let index = 0; index < 256; index += 1) {
+    const churnId = index.toString(16).padStart(64, '0');
+    const record = {
+      sessionId: churnId,
+      remote,
+      channel: { opened: true, drained: false, close: () => {} },
+      message: { send: () => false },
+      sendLimiter: directSession._newLimiter(),
+      drainWaiters: new Set(),
+      closed: false,
+    };
+    directSession.sessions.set(`${remote}:${churnId}`, record);
+    records.push(record);
+    sends.push(directSession.send(remote, churnId, { t: 's.delta', d: `frame-${index}` }));
+  }
+  const outcomes = Promise.allSettled(sends);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (const record of [...records].reverse()) {
+    directSession.close(remote, record.sessionId);
+  }
+
+  const settled = await outcomes;
+  assert.equal(settled.every((result) => result.status === 'rejected'), true);
+  assert.equal(records.every((record) => record.drainWaiters.size === 0), true);
+  assert.equal(directSession.sessions.size, 0);
+});
+
 test('bounded JSON drops a complete oversized payload before UTF-8 decode', () => {
   const encoding = boundedJsonEncoding(64, 'test frame');
   const state = { buffer: b4a.concat([b4a.from([65]), b4a.alloc(65)]), start: 0, end: 66 };

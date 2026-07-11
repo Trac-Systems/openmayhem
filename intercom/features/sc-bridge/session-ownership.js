@@ -26,3 +26,7 @@ export const closeOwnedSessions = (sessions, close) => {
   }
   sessions.clear();
 };
+
+export const sessionSubscriptionMatches = (sessionAll, sessionIds, sessionId) => (
+  sessionAll === true || (sessionIds instanceof Set && sessionIds.has(sessionId))
+);
