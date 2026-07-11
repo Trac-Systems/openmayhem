@@ -3,6 +3,17 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+mod endpoint_contract;
+
+pub use endpoint_contract::{
+    endpoint_attribute_value_matches, endpoint_contract_fingerprint,
+    endpoint_family_contract_template, generate_endpoint_calibration_cases,
+    materialize_endpoint_calibration_request, validate_endpoint_attribute_value,
+    validate_endpoint_request, validate_endpoint_response, EndpointCalibrationCase,
+    EndpointCalibrationMutation, EndpointCalibrationValue, EndpointContractViolation,
+};
 
 pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 7;
@@ -244,6 +255,26 @@ pub const USAGE_IMAGE: &str = "image";
 pub const USAGE_STEP: &str = "step";
 pub const USAGE_INPUT_CHARACTER: &str = "input_character";
 pub const USAGE_AUDIO_SECOND: &str = "audio_second";
+pub const USAGE_VIDEO_SECOND: &str = "video_second";
+pub const USAGE_FRAME: &str = "frame";
+pub const DEFAULT_VIDEO_GENERATION_FPS: u64 = 24;
+pub const ENDPOINT_OPENAI_CHAT_COMPLETIONS: &str = "openai_chat_completions";
+pub const ENDPOINT_OPENAI_COMPLETIONS: &str = "openai_completions";
+pub const ENDPOINT_OPENAI_RESPONSES: &str = "openai_responses";
+pub const ENDPOINT_HF_MULTIMODAL_CHAT: &str = "hf_multimodal_chat";
+pub const ENDPOINT_OPENAI_EMBEDDINGS: &str = "openai_embeddings";
+pub const ENDPOINT_HF_FEATURE_EXTRACTION: &str = "hf_feature_extraction";
+pub const ENDPOINT_OPENAI_IMAGE_GENERATIONS: &str = "openai_image_generations";
+pub const ENDPOINT_HF_TEXT_TO_IMAGE: &str = "hf_text_to_image";
+pub const ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS: &str = "openai_audio_transcriptions";
+pub const ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION: &str = "hf_automatic_speech_recognition";
+pub const ENDPOINT_OPENAI_AUDIO_SPEECH: &str = "openai_audio_speech";
+pub const ENDPOINT_HF_TEXT_TO_SPEECH: &str = "hf_text_to_speech";
+pub const ENDPOINT_OPENAI_VIDEOS: &str = "openai_videos";
+pub const ENDPOINT_HF_TEXT_TO_VIDEO: &str = "hf_text_to_video";
+pub const ENDPOINT_MAYHEM_AUDIO_GENERATIONS: &str = "mayhem_audio_generations";
+pub const ENDPOINT_MAYHEM_MUSIC_GENERATIONS: &str = "mayhem_music_generations";
+pub const ENDPOINT_HF_TEXT_TO_AUDIO: &str = "hf_text_to_audio";
 pub const DEFAULT_SESSION_MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES: usize = 16 * 1024;
 pub const SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION: u32 = 1;
@@ -252,6 +283,71 @@ pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
 pub const TIER4_PROVIDER_KYB_TIER: u8 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointValueType {
+    String,
+    Boolean,
+    Integer,
+    Number,
+    Object,
+    Array,
+    Null,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EndpointAttributeSpec {
+    pub value_types: Vec<EndpointValueType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_values: Vec<Value>,
+}
+
+impl EndpointAttributeSpec {
+    #[must_use]
+    pub fn new(value_type: EndpointValueType) -> Self {
+        Self {
+            value_types: vec![value_type],
+            default: None,
+            enum_values: Vec::new(),
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            min_items: None,
+            max_items: None,
+            calibration_values: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EndpointFamilyContract {
+    pub family: String,
+    pub request_attributes: Vec<String>,
+    pub required_request_attributes: Vec<String>,
+    pub response_attributes: Vec<String>,
+    pub required_response_attributes: Vec<String>,
+    pub request_attribute_specs: BTreeMap<String, EndpointAttributeSpec>,
+    pub response_attribute_specs: BTreeMap<String, EndpointAttributeSpec>,
+    pub interaction_groups: Vec<Vec<String>>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttestationSigner {
@@ -405,6 +501,8 @@ pub struct SpendVoucherBody {
     #[serde(with = "decimal_u128")]
     pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_modalities: Vec<String>,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
     #[serde(default)]
@@ -1591,6 +1689,7 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: 8192,
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -1601,6 +1700,12 @@ mod tests {
         };
         let mut changed = voucher.clone();
         changed.price_ver = 2;
+        assert_ne!(
+            spend_voucher_signing_bytes(&voucher).unwrap(),
+            spend_voucher_signing_bytes(&changed).unwrap()
+        );
+        let mut changed = voucher.clone();
+        changed.required_modalities = vec!["image".to_owned(), "text".to_owned()];
         assert_ne!(
             spend_voucher_signing_bytes(&voucher).unwrap(),
             spend_voucher_signing_bytes(&changed).unwrap()
@@ -1695,6 +1800,7 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: 8192,
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -1760,6 +1866,7 @@ mod tests {
             locked_per_req_au: 1,
             locked_min_session_au: 2_000_000_000_000_000_000_000_000,
             served_ctx: 131_072,
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: Some("le128k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 2_000_000_000_000_000_000_000_001,
@@ -1775,7 +1882,8 @@ mod tests {
             "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
             "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
             "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
-            "\"served_ctx\":131072,\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"served_ctx\":131072,\"required_modalities\":[\"text\"],",
+            "\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
             "\"max_spend_au\":\"2000000000000000000000001\",",
             "\"checkpoint_every\":{\"tokens\":4096,\"ms\":30000}}}"
         );

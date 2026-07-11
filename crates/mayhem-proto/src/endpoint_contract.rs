@@ -1,0 +1,2076 @@
+use std::collections::BTreeMap;
+
+use serde_json::{json, Value};
+
+use crate::{
+    EndpointAttributeSpec, EndpointFamilyContract, EndpointValueType,
+    ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, ENDPOINT_HF_FEATURE_EXTRACTION,
+    ENDPOINT_HF_MULTIMODAL_CHAT, ENDPOINT_HF_TEXT_TO_AUDIO, ENDPOINT_HF_TEXT_TO_IMAGE,
+    ENDPOINT_HF_TEXT_TO_SPEECH, ENDPOINT_HF_TEXT_TO_VIDEO, ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+    ENDPOINT_MAYHEM_MUSIC_GENERATIONS, ENDPOINT_OPENAI_AUDIO_SPEECH,
+    ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS, ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+    ENDPOINT_OPENAI_COMPLETIONS, ENDPOINT_OPENAI_EMBEDDINGS, ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+    ENDPOINT_OPENAI_RESPONSES, ENDPOINT_OPENAI_VIDEOS,
+};
+
+pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyContract> {
+    let (request, required, response): (&[&str], &[&str], &[&str]) = match family {
+        ENDPOINT_OPENAI_CHAT_COMPLETIONS => (
+            &[
+                "model",
+                "messages",
+                "metadata",
+                "stream",
+                "stream_options.include_usage",
+                "max_tokens",
+                "max_completion_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "seed",
+                "frequency_penalty",
+                "presence_penalty",
+                "repeat_penalty",
+                "stop",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "response_format",
+                "user",
+            ],
+            &["model", "messages"],
+            &[
+                "id", "object", "created", "model", "choices", "usage", "mayhem",
+            ],
+        ),
+        ENDPOINT_OPENAI_COMPLETIONS => (
+            &[
+                "model",
+                "prompt",
+                "stream",
+                "max_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "seed",
+                "frequency_penalty",
+                "presence_penalty",
+                "stop",
+                "user",
+            ],
+            &["model", "prompt"],
+            &[
+                "id", "object", "created", "model", "choices", "usage", "mayhem",
+            ],
+        ),
+        ENDPOINT_OPENAI_RESPONSES => (
+            &[
+                "model",
+                "input",
+                "stream",
+                "max_output_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "text",
+                "reasoning",
+                "metadata",
+                "user",
+            ],
+            &["model", "input"],
+            &[
+                "id",
+                "object",
+                "created_at",
+                "status",
+                "model",
+                "output",
+                "usage",
+                "mayhem",
+            ],
+        ),
+        ENDPOINT_HF_MULTIMODAL_CHAT => (
+            &[
+                "model",
+                "messages",
+                "messages.role",
+                "messages.name",
+                "messages.tool_calls",
+                "messages.tool_call_id",
+                "messages.content.type",
+                "messages.content.text",
+                "messages.content.image_url.url",
+                "messages.content.input_audio.data",
+                "messages.content.input_audio.format",
+                "messages.content.video.data",
+                "messages.content.video.content_type",
+                "messages.content.video.num_frames",
+                "messages.content.video.fps",
+                "stream",
+                "max_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "seed",
+                "tools",
+                "tool_choice",
+                "response_format",
+            ],
+            &["model", "messages"],
+            &[
+                "id", "object", "created", "model", "choices", "usage", "mayhem",
+            ],
+        ),
+        ENDPOINT_OPENAI_EMBEDDINGS => (
+            &["model", "input", "encoding_format", "dimensions", "user"],
+            &["model", "input"],
+            &["object", "data", "model", "usage", "mayhem"],
+        ),
+        ENDPOINT_HF_FEATURE_EXTRACTION => (
+            &[
+                "inputs",
+                "normalize",
+                "prompt_name",
+                "truncate",
+                "truncation_direction",
+                "dimensions",
+            ],
+            &["inputs"],
+            &["embeddings", "usage", "mayhem"],
+        ),
+        ENDPOINT_OPENAI_IMAGE_GENERATIONS => (
+            &[
+                "model",
+                "prompt",
+                "background",
+                "moderation",
+                "n",
+                "output_compression",
+                "output_format",
+                "partial_images",
+                "quality",
+                "response_format",
+                "size",
+                "stream",
+                "style",
+                "user",
+                "negative_prompt",
+                "steps",
+                "cfg_scale",
+                "seed",
+                "scheduler",
+            ],
+            &["model", "prompt"],
+            &[
+                "id",
+                "object",
+                "created",
+                "model",
+                "background",
+                "data",
+                "output_format",
+                "quality",
+                "size",
+                "usage",
+                "mayhem",
+            ],
+        ),
+        ENDPOINT_HF_TEXT_TO_IMAGE => (
+            &[
+                "inputs",
+                "parameters.guidance_scale",
+                "parameters.negative_prompt",
+                "parameters.num_inference_steps",
+                "parameters.width",
+                "parameters.height",
+                "parameters.scheduler",
+                "parameters.seed",
+            ],
+            &["inputs"],
+            &["image", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => (
+            &[
+                "file",
+                "model",
+                "language",
+                "prompt",
+                "response_format",
+                "temperature",
+                "timestamp_granularities",
+                "stream",
+            ],
+            &["file", "model"],
+            &["text", "usage", "mayhem"],
+        ),
+        ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => (
+            &[
+                "inputs",
+                "parameters.return_timestamps",
+                "parameters.generation_parameters.temperature",
+                "parameters.generation_parameters.top_k",
+                "parameters.generation_parameters.top_p",
+                "parameters.generation_parameters.typical_p",
+                "parameters.generation_parameters.max_length",
+                "parameters.generation_parameters.max_new_tokens",
+                "parameters.generation_parameters.min_length",
+                "parameters.generation_parameters.min_new_tokens",
+                "parameters.generation_parameters.do_sample",
+                "parameters.generation_parameters.num_beams",
+            ],
+            &["inputs"],
+            &["text", "chunks", "usage", "mayhem"],
+        ),
+        ENDPOINT_OPENAI_AUDIO_SPEECH => (
+            &[
+                "model",
+                "input",
+                "voice",
+                "response_format",
+                "speed",
+                "instructions",
+                "stream_format",
+            ],
+            &["model", "input", "voice"],
+            &["audio", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_HF_TEXT_TO_SPEECH => (
+            &[
+                "inputs",
+                "parameters.generation_parameters.temperature",
+                "parameters.generation_parameters.top_k",
+                "parameters.generation_parameters.top_p",
+                "parameters.generation_parameters.typical_p",
+                "parameters.generation_parameters.max_length",
+                "parameters.generation_parameters.max_new_tokens",
+                "parameters.generation_parameters.min_length",
+                "parameters.generation_parameters.min_new_tokens",
+                "parameters.generation_parameters.do_sample",
+                "parameters.generation_parameters.num_beams",
+                "parameters.voice",
+                "parameters.speed",
+                "parameters.language",
+                "parameters.speaker_id",
+            ],
+            &["inputs"],
+            &["audio", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_OPENAI_VIDEOS => (
+            &["model", "prompt", "input_reference", "seconds", "size"],
+            &["model", "prompt"],
+            &[
+                "id",
+                "object",
+                "model",
+                "status",
+                "progress",
+                "created_at",
+                "completed_at",
+                "expires_at",
+                "error",
+                "prompt",
+                "size",
+                "seconds",
+                "usage",
+                "mayhem",
+            ],
+        ),
+        ENDPOINT_HF_TEXT_TO_VIDEO => (
+            &[
+                "inputs",
+                "parameters.num_frames",
+                "parameters.guidance_scale",
+                "parameters.negative_prompt",
+                "parameters.num_inference_steps",
+                "parameters.seed",
+                "parameters.width",
+                "parameters.height",
+                "parameters.fps",
+            ],
+            &["inputs"],
+            &["video", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
+            &[
+                "model",
+                "prompt",
+                "input_audio",
+                "duration_seconds",
+                "response_format",
+                "temperature",
+                "top_k",
+                "top_p",
+                "typical_p",
+                "guidance_scale",
+                "negative_prompt",
+                "seed",
+                "do_sample",
+                "max_new_tokens",
+            ],
+            &["model", "prompt"],
+            &["id", "object", "audio", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
+            &[
+                "model",
+                "prompt",
+                "melody",
+                "duration_seconds",
+                "response_format",
+                "temperature",
+                "top_k",
+                "top_p",
+                "typical_p",
+                "guidance_scale",
+                "seed",
+                "do_sample",
+                "max_new_tokens",
+            ],
+            &["model", "prompt"],
+            &["id", "object", "music", "content_type", "usage", "mayhem"],
+        ),
+        ENDPOINT_HF_TEXT_TO_AUDIO => (
+            &[
+                "inputs",
+                "parameters.audio",
+                "parameters.duration_seconds",
+                "parameters.generation_parameters.temperature",
+                "parameters.generation_parameters.top_k",
+                "parameters.generation_parameters.top_p",
+                "parameters.generation_parameters.typical_p",
+                "parameters.generation_parameters.max_length",
+                "parameters.generation_parameters.max_new_tokens",
+                "parameters.generation_parameters.min_length",
+                "parameters.generation_parameters.min_new_tokens",
+                "parameters.generation_parameters.do_sample",
+                "parameters.generation_parameters.early_stopping",
+                "parameters.generation_parameters.num_beams",
+                "parameters.generation_parameters.num_beam_groups",
+                "parameters.generation_parameters.penalty_alpha",
+                "parameters.generation_parameters.use_cache",
+                "parameters.guidance_scale",
+                "parameters.seed",
+            ],
+            &["inputs"],
+            &["audio", "sampling_rate", "content_type", "usage", "mayhem"],
+        ),
+        _ => return None,
+    };
+
+    let request_attributes = strings(request);
+    let required_request_attributes = strings(required);
+    let response_attributes = strings(response);
+    let required_response_attributes = response
+        .iter()
+        .filter(|path| !endpoint_response_attribute_optional(family, path))
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    let request_attribute_specs = request
+        .iter()
+        .map(|path| {
+            request_attribute_spec(family, path)
+                .map(|spec| ((*path).to_owned(), spec))
+                .ok_or(())
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .ok()?;
+    let response_attribute_specs = response
+        .iter()
+        .map(|path| {
+            response_attribute_spec(path)
+                .map(|spec| ((*path).to_owned(), spec))
+                .ok_or(())
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .ok()?;
+
+    let interaction_groups = endpoint_interaction_groups(family)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .filter(|path| request_attributes.contains(path))
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| group.len() > 1)
+        .collect();
+    Some(EndpointFamilyContract {
+        family: family.to_owned(),
+        request_attributes,
+        required_request_attributes,
+        response_attributes,
+        required_response_attributes,
+        request_attribute_specs,
+        response_attribute_specs,
+        interaction_groups,
+    })
+}
+
+fn endpoint_response_attribute_optional(family: &str, path: &str) -> bool {
+    matches!(
+        (family, path),
+        (
+            ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            "background" | "output_format" | "quality" | "size"
+        ) | (
+            ENDPOINT_OPENAI_VIDEOS,
+            "completed_at" | "expires_at" | "error"
+        ) | (ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, "chunks")
+    )
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
+    let groups: &[&[&str]] = match family {
+        ENDPOINT_OPENAI_CHAT_COMPLETIONS | ENDPOINT_HF_MULTIMODAL_CHAT => &[
+            &["tools", "tool_choice", "parallel_tool_calls"],
+            &["response_format", "stream"],
+            &["temperature", "top_p", "top_k", "min_p", "seed"],
+        ],
+        ENDPOINT_OPENAI_COMPLETIONS | ENDPOINT_OPENAI_RESPONSES => &[
+            &["temperature", "top_p", "top_k", "min_p", "seed"],
+            &["tools", "tool_choice", "parallel_tool_calls"],
+        ],
+        ENDPOINT_OPENAI_IMAGE_GENERATIONS => &[
+            &["background", "output_format", "response_format"],
+            &["quality", "size", "steps", "cfg_scale"],
+            &["negative_prompt", "scheduler", "seed"],
+        ],
+        ENDPOINT_HF_TEXT_TO_IMAGE => &[
+            &[
+                "parameters.width",
+                "parameters.height",
+                "parameters.num_inference_steps",
+                "parameters.guidance_scale",
+            ],
+            &[
+                "parameters.negative_prompt",
+                "parameters.scheduler",
+                "parameters.seed",
+            ],
+        ],
+        ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => &[&[
+            "response_format",
+            "timestamp_granularities",
+            "stream",
+            "temperature",
+        ]],
+        ENDPOINT_OPENAI_AUDIO_SPEECH => &[&[
+            "voice",
+            "response_format",
+            "speed",
+            "instructions",
+            "stream_format",
+        ]],
+        ENDPOINT_OPENAI_VIDEOS => &[&["input_reference", "seconds", "size"]],
+        ENDPOINT_HF_TEXT_TO_VIDEO => &[
+            &["parameters.num_frames", "parameters.num_inference_steps"],
+            &[
+                "parameters.guidance_scale",
+                "parameters.negative_prompt",
+                "parameters.seed",
+            ],
+        ],
+        ENDPOINT_MAYHEM_AUDIO_GENERATIONS | ENDPOINT_MAYHEM_MUSIC_GENERATIONS => &[&[
+            "temperature",
+            "top_k",
+            "top_p",
+            "typical_p",
+            "do_sample",
+            "max_new_tokens",
+        ]],
+        ENDPOINT_HF_TEXT_TO_AUDIO
+        | ENDPOINT_HF_TEXT_TO_SPEECH
+        | ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => &[&[
+            "parameters.generation_parameters.temperature",
+            "parameters.generation_parameters.top_k",
+            "parameters.generation_parameters.top_p",
+            "parameters.generation_parameters.typical_p",
+            "parameters.generation_parameters.do_sample",
+            "parameters.generation_parameters.max_new_tokens",
+        ]],
+        _ => &[],
+    };
+    groups
+        .iter()
+        .map(|group| group.iter().map(|path| (*path).to_owned()).collect())
+        .collect()
+}
+
+fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeSpec> {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    let spec = match path {
+        "model" => string_spec(1, 512, json!("$MODEL")),
+        "messages" => array_spec(
+            1,
+            4096,
+            json!([{"role":"user","content":"Mayhem calibration"}]),
+        ),
+        "metadata" => object_spec_with_default(json!({})),
+        "text" | "reasoning" | "response_format"
+            if matches!(
+                family,
+                ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | ENDPOINT_OPENAI_RESPONSES
+                    | ENDPOINT_HF_MULTIMODAL_CHAT
+            ) =>
+        {
+            object_spec(json!({}))
+        }
+        "stream_options.include_usage" => boolean_spec(None),
+        "tools" => array_spec(
+            1,
+            128,
+            json!([{"type":"function","function":{"name":"calibration_tool","parameters":{"type":"object"}}}]),
+        ),
+        "tool_choice" => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Object],
+            &[
+                json!("auto"),
+                json!("none"),
+                json!({"type":"function","function":{"name":"calibration_tool"}}),
+            ],
+        ),
+        "parallel_tool_calls" => boolean_spec(Some(true)),
+        "stream" => boolean_spec(Some(false)),
+        "prompt" => string_spec(1, 32_000, json!("Mayhem calibration")),
+        "input" if family == ENDPOINT_OPENAI_EMBEDDINGS => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Array],
+            &[
+                json!("Mayhem calibration"),
+                json!(["Mayhem calibration A", "Mayhem calibration B"]),
+            ],
+        ),
+        "input" if family == ENDPOINT_OPENAI_RESPONSES => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Array],
+            &[
+                json!("Mayhem calibration"),
+                json!([{"role":"user","content":"Mayhem calibration"}]),
+            ],
+        ),
+        "input" => string_spec(1, 32_000, json!("Mayhem calibration")),
+        "inputs" if family == ENDPOINT_HF_FEATURE_EXTRACTION => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Array],
+            &[
+                json!("Mayhem calibration"),
+                json!(["Mayhem calibration A", "Mayhem calibration B"]),
+            ],
+        ),
+        "inputs" if family == ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+            string_spec(1, 256 * 1024 * 1024, json!("$AUDIO_BASE64"))
+        }
+        "inputs" => string_spec(1, 32_000, json!("Mayhem calibration")),
+        "file" => object_spec(json!({
+            "filename": "calibration.wav",
+            "content_type": "audio/wav",
+            "bytes": 44,
+            "blake3": "$AUDIO_BLAKE3"
+        })),
+        "user" => string_spec(1, 512, json!("mayhem-calibration-user")),
+        "language" | "parameters.language" => string_spec(1, 128, json!("en")),
+        "prompt_name" => string_spec(1, 256, json!("query")),
+        "instructions" => string_spec(1, 4096, json!("Speak clearly")),
+        "negative_prompt" | "parameters.negative_prompt" => {
+            if family == ENDPOINT_HF_TEXT_TO_VIDEO {
+                array_spec(1, 32, json!(["blur"]))
+            } else {
+                string_spec(0, 32_000, json!("blur"))
+            }
+        }
+        "input_audio" | "melody" | "parameters.audio" => object_spec(json!({
+            "data": "$AUDIO_BASE64",
+            "format": "wav"
+        })),
+        "input_reference" => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Object],
+            &[json!("$IMAGE_FILE"), json!({"image_url":"$IMAGE_DATA_URL"})],
+        ),
+        "voice" => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Object],
+            &[json!("$VOICE"), json!({"id":"$VOICE"})],
+        ),
+        "parameters.voice" | "parameters.speaker_id" | "scheduler" | "parameters.scheduler" => {
+            string_spec(1, 256, json!("$MODEL_VALUE"))
+        }
+        "messages.content.type" => enum_spec(
+            None,
+            &[
+                json!("text"),
+                json!("image_url"),
+                json!("input_audio"),
+                json!("video"),
+            ],
+        ),
+        "messages.role" => enum_spec(
+            None,
+            &[
+                json!("system"),
+                json!("developer"),
+                json!("user"),
+                json!("assistant"),
+                json!("tool"),
+            ],
+        ),
+        "messages.name" | "messages.tool_call_id" => string_spec(1, 256, json!("calibration")),
+        "messages.tool_calls" => array_spec(
+            1,
+            128,
+            json!([{"id":"call-calibration","type":"function","function":{"name":"calibration_tool","arguments":"{}"}}]),
+        ),
+        "messages.content.text" => string_spec(1, 32_000, json!("Mayhem calibration")),
+        "messages.content.image_url.url" => {
+            string_spec(1, 64 * 1024 * 1024, json!("$IMAGE_DATA_URL"))
+        }
+        "messages.content.input_audio.data" => {
+            string_spec(1, 256 * 1024 * 1024, json!("$AUDIO_BASE64"))
+        }
+        "messages.content.input_audio.format" => enum_spec(
+            None,
+            &[json!("wav"), json!("mp3"), json!("flac"), json!("ogg")],
+        ),
+        "messages.content.video.data" => string_spec(1, 512 * 1024 * 1024, json!("$VIDEO_BASE64")),
+        "messages.content.video.content_type" => string_spec(1, 128, json!("video/mp4")),
+        "messages.content.video.num_frames" | "parameters.num_frames" => {
+            integer_spec(1.0, 4096.0, 16)
+        }
+        "messages.content.video.fps" | "parameters.fps" => number_spec(0.01, 240.0, 8.0),
+        "encoding_format" => enum_spec(Some(json!("float")), &[json!("float"), json!("base64")]),
+        "truncation_direction" => enum_spec(Some(json!("right")), &[json!("left"), json!("right")]),
+        "background" => enum_spec(
+            Some(json!("auto")),
+            &[json!("transparent"), json!("opaque"), json!("auto")],
+        ),
+        "moderation" => enum_spec(Some(json!("auto")), &[json!("low"), json!("auto")]),
+        "output_format" => enum_spec(None, &[json!("png"), json!("jpeg"), json!("webp")]),
+        "quality" => enum_spec(
+            Some(json!("auto")),
+            &[
+                json!("standard"),
+                json!("hd"),
+                json!("low"),
+                json!("medium"),
+                json!("high"),
+                json!("auto"),
+            ],
+        ),
+        "style" => enum_spec(None, &[json!("vivid"), json!("natural")]),
+        "response_format" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            enum_spec(Some(json!("b64_json")), &[json!("url"), json!("b64_json")])
+        }
+        "response_format" if family == ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => enum_spec(
+            Some(json!("json")),
+            &[
+                json!("json"),
+                json!("text"),
+                json!("srt"),
+                json!("verbose_json"),
+                json!("vtt"),
+            ],
+        ),
+        "response_format"
+            if matches!(
+                family,
+                ENDPOINT_OPENAI_AUDIO_SPEECH
+                    | ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+                    | ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            ) =>
+        {
+            enum_spec(
+                Some(json!("wav")),
+                &[
+                    json!("mp3"),
+                    json!("opus"),
+                    json!("aac"),
+                    json!("flac"),
+                    json!("wav"),
+                    json!("pcm"),
+                ],
+            )
+        }
+        "stream_format" => enum_spec(Some(json!("audio")), &[json!("audio"), json!("sse")]),
+        "timestamp_granularities" => array_enum_spec(
+            Some(json!(["segment"])),
+            &[json!("word"), json!("segment")],
+            1,
+            2,
+        ),
+        "size" if family == ENDPOINT_OPENAI_VIDEOS => enum_spec(
+            Some(json!("720x1280")),
+            &[
+                json!("720x1280"),
+                json!("1280x720"),
+                json!("1024x1792"),
+                json!("1792x1024"),
+            ],
+        ),
+        "seconds" => enum_spec(Some(json!("4")), &[json!("4"), json!("8"), json!("12")]),
+        "size" => string_spec(3, 64, json!("512x512")),
+        "stop" => union_spec(
+            &[
+                EndpointValueType::String,
+                EndpointValueType::Array,
+                EndpointValueType::Null,
+            ],
+            &[
+                json!("CALIBRATION_STOP"),
+                json!(["CALIBRATION_STOP", "CALIBRATION_END"]),
+                Value::Null,
+            ],
+        ),
+        "early_stopping" | "parameters.generation_parameters.early_stopping" => union_spec(
+            &[EndpointValueType::Boolean, EndpointValueType::String],
+            &[json!(false), json!(true), json!("never")],
+        ),
+        _ if boolean_leaf(leaf) => boolean_spec(None),
+        _ if integer_leaf(leaf) => integer_spec(0.0, integer_maximum(leaf), integer_baseline(leaf)),
+        _ if number_leaf(leaf) => number_spec(
+            number_minimum(leaf),
+            number_maximum(leaf),
+            number_baseline(leaf),
+        ),
+        _ => return None,
+    };
+    Some(spec)
+}
+
+fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    let spec = match leaf {
+        "id" | "object" | "model" | "status" | "content_type" | "text" | "audio" | "music"
+        | "image" | "video" | "size" | "seconds" | "quality" | "output_format" | "prompt"
+        | "background" => string_spec(0, 512 * 1024 * 1024, json!("$RESPONSE_VALUE")),
+        "sampling_rate" => integer_spec(1.0, 1_000_000.0, 16_000),
+        "created" | "created_at" | "completed_at" | "expires_at" | "progress" => {
+            integer_spec(0.0, u64::MAX as f64, 1)
+        }
+        "choices" | "data" | "output" | "embeddings" | "chunks" => {
+            array_spec(0, 1_000_000, json!([]))
+        }
+        "usage" | "mayhem" => object_spec(json!({})),
+        "error" => union_spec(
+            &[EndpointValueType::Object, EndpointValueType::Null],
+            &[json!({}), Value::Null],
+        ),
+        _ => return None,
+    };
+    Some(spec)
+}
+
+fn boolean_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "normalize" | "truncate" | "return_timestamps" | "do_sample" | "use_cache"
+    )
+}
+
+fn integer_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "max_tokens"
+            | "max_completion_tokens"
+            | "max_output_tokens"
+            | "top_k"
+            | "seed"
+            | "dimensions"
+            | "n"
+            | "output_compression"
+            | "partial_images"
+            | "steps"
+            | "num_inference_steps"
+            | "max_length"
+            | "max_new_tokens"
+            | "min_length"
+            | "min_new_tokens"
+            | "num_beams"
+            | "num_beam_groups"
+            | "width"
+            | "height"
+    )
+}
+
+fn number_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "temperature"
+            | "top_p"
+            | "min_p"
+            | "typical_p"
+            | "frequency_penalty"
+            | "presence_penalty"
+            | "repeat_penalty"
+            | "cfg_scale"
+            | "guidance_scale"
+            | "speed"
+            | "duration_seconds"
+            | "penalty_alpha"
+    )
+}
+
+fn integer_maximum(leaf: &str) -> f64 {
+    match leaf {
+        "n" => 10.0,
+        "partial_images" => 3.0,
+        "output_compression" => 100.0,
+        "steps" | "num_inference_steps" => 1_000.0,
+        "width" | "height" => 16_384.0,
+        "dimensions" => 1_000_000.0,
+        "seed" => u32::MAX as f64,
+        "top_k" => 1_000_000.0,
+        "num_beams" | "num_beam_groups" => 1_024.0,
+        _ => 262_144.0,
+    }
+}
+
+fn integer_baseline(leaf: &str) -> i64 {
+    match leaf {
+        "n" => 1,
+        "partial_images" => 1,
+        "output_compression" => 50,
+        "steps" | "num_inference_steps" => 4,
+        "width" | "height" => 512,
+        "dimensions" => 32,
+        "top_k" => 20,
+        "seed" => 7,
+        "num_beams" | "num_beam_groups" => 1,
+        _ => 8,
+    }
+}
+
+fn number_minimum(leaf: &str) -> f64 {
+    match leaf {
+        "frequency_penalty" | "presence_penalty" => -2.0,
+        "repeat_penalty" | "speed" => 0.01,
+        _ => 0.0,
+    }
+}
+
+fn number_maximum(leaf: &str) -> f64 {
+    match leaf {
+        "temperature" => 2.0,
+        "top_p" | "min_p" | "typical_p" => 1.0,
+        "frequency_penalty" | "presence_penalty" => 2.0,
+        "repeat_penalty" => 10.0,
+        "cfg_scale" | "guidance_scale" => 100.0,
+        "speed" => 4.0,
+        "duration_seconds" => 86_400.0,
+        "penalty_alpha" => 1.0,
+        _ => 1_000_000.0,
+    }
+}
+
+fn number_baseline(leaf: &str) -> f64 {
+    match leaf {
+        "temperature" => 0.6,
+        "top_p" => 0.95,
+        "min_p" => 0.05,
+        "typical_p" => 0.95,
+        "repeat_penalty" | "speed" => 1.0,
+        "cfg_scale" | "guidance_scale" => 1.0,
+        "duration_seconds" => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn string_spec(min_length: u64, max_length: u64, calibration: Value) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
+    spec.min_length = Some(min_length);
+    spec.max_length = Some(max_length);
+    spec.calibration_values.push(calibration);
+    spec
+}
+
+fn boolean_spec(default: Option<bool>) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Boolean);
+    spec.default = default.map(Value::Bool);
+    spec.calibration_values = vec![Value::Bool(false), Value::Bool(true)];
+    spec
+}
+
+fn integer_spec(minimum: f64, maximum: f64, calibration: i64) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Integer);
+    spec.minimum = Some(minimum);
+    spec.maximum = Some(maximum);
+    spec.calibration_values = vec![json!(calibration)];
+    spec
+}
+
+fn number_spec(minimum: f64, maximum: f64, calibration: f64) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Number);
+    spec.minimum = Some(minimum);
+    spec.maximum = Some(maximum);
+    spec.calibration_values = vec![json!(calibration)];
+    spec
+}
+
+fn object_spec(calibration: Value) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Object);
+    spec.calibration_values.push(calibration);
+    spec
+}
+
+fn object_spec_with_default(default: Value) -> EndpointAttributeSpec {
+    let mut spec = object_spec(default.clone());
+    spec.default = Some(default);
+    spec
+}
+
+fn array_spec(min_items: u64, max_items: u64, calibration: Value) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Array);
+    spec.min_items = Some(min_items);
+    spec.max_items = Some(max_items);
+    spec.calibration_values.push(calibration);
+    spec
+}
+
+fn union_spec(
+    value_types: &[EndpointValueType],
+    calibration_values: &[Value],
+) -> EndpointAttributeSpec {
+    EndpointAttributeSpec {
+        value_types: value_types.to_vec(),
+        default: None,
+        enum_values: Vec::new(),
+        minimum: None,
+        maximum: None,
+        min_length: None,
+        max_length: None,
+        min_items: None,
+        max_items: None,
+        calibration_values: calibration_values.to_vec(),
+    }
+}
+
+fn enum_spec(default: Option<Value>, values: &[Value]) -> EndpointAttributeSpec {
+    let value_types = values
+        .iter()
+        .map(value_type)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    let mut value_types = value_types
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut spec =
+        EndpointAttributeSpec::new(value_types.pop_first().unwrap_or(EndpointValueType::String));
+    spec.value_types.extend(value_types);
+    spec.default = default;
+    spec.enum_values = values.to_vec();
+    spec.calibration_values = values.to_vec();
+    spec
+}
+
+fn array_enum_spec(
+    default: Option<Value>,
+    values: &[Value],
+    min_items: u64,
+    max_items: u64,
+) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::Array);
+    spec.default = default;
+    spec.enum_values = values.to_vec();
+    spec.min_items = Some(min_items);
+    spec.max_items = Some(max_items);
+    spec.calibration_values = values.iter().map(|value| json!([value])).collect();
+    spec
+}
+
+fn value_type(value: &Value) -> Option<EndpointValueType> {
+    match value {
+        Value::Null => Some(EndpointValueType::Null),
+        Value::Bool(_) => Some(EndpointValueType::Boolean),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            Some(EndpointValueType::Integer)
+        }
+        Value::Number(_) => Some(EndpointValueType::Number),
+        Value::String(_) => Some(EndpointValueType::String),
+        Value::Array(_) => Some(EndpointValueType::Array),
+        Value::Object(_) => Some(EndpointValueType::Object),
+    }
+}
+
+#[must_use]
+pub fn endpoint_attribute_value_matches(spec: &EndpointAttributeSpec, value: &Value) -> bool {
+    validate_endpoint_attribute_value(spec, value).is_ok()
+}
+
+pub fn validate_endpoint_attribute_value(
+    spec: &EndpointAttributeSpec,
+    value: &Value,
+) -> Result<(), String> {
+    let actual = value_type(value).ok_or_else(|| "unsupported JSON value type".to_owned())?;
+    let type_allowed = spec.value_types.contains(&actual)
+        || (actual == EndpointValueType::Integer
+            && spec.value_types.contains(&EndpointValueType::Number));
+    if !type_allowed {
+        return Err(format!(
+            "expected one of {:?}, got {:?}",
+            spec.value_types, actual
+        ));
+    }
+    if !spec.enum_values.is_empty() {
+        let enum_match = if actual == EndpointValueType::Array {
+            value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|item| spec.enum_values.iter().any(|allowed| allowed == item))
+            })
+        } else {
+            spec.enum_values.iter().any(|allowed| allowed == value)
+        };
+        if !enum_match {
+            return Err(format!("value {value} is not in the declared enum"));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if !number.is_finite() {
+            return Err("number must be finite".to_owned());
+        }
+        if spec.minimum.is_some_and(|minimum| number < minimum) {
+            return Err(format!("number {number} is below the minimum"));
+        }
+        if spec.maximum.is_some_and(|maximum| number > maximum) {
+            return Err(format!("number {number} exceeds the maximum"));
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+        if spec.min_length.is_some_and(|minimum| length < minimum) {
+            return Err(format!("string length {length} is below the minimum"));
+        }
+        if spec.max_length.is_some_and(|maximum| length > maximum) {
+            return Err(format!("string length {length} exceeds the maximum"));
+        }
+    }
+    if let Some(items) = value.as_array() {
+        let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
+        if spec.min_items.is_some_and(|minimum| length < minimum) {
+            return Err(format!("array length {length} is below the minimum"));
+        }
+        if spec.max_items.is_some_and(|maximum| length > maximum) {
+            return Err(format!("array length {length} exceeds the maximum"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EndpointCalibrationValue {
+    Literal { value: Value },
+    Omitted,
+    StringLength { length: u64 },
+    ArrayLength { length: u64, item: Value },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointCalibrationMutation {
+    pub path: String,
+    pub value: EndpointCalibrationValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointCalibrationCase {
+    pub case_id: String,
+    pub endpoint_family: String,
+    pub case_kind: String,
+    pub attributes: Vec<String>,
+    pub expect_accept: bool,
+    pub base_request: Value,
+    pub mutations: Vec<EndpointCalibrationMutation>,
+    pub expected_response_attributes: Vec<String>,
+    pub contract_fingerprint: String,
+}
+
+pub fn generate_endpoint_calibration_cases(
+    contract: &EndpointFamilyContract,
+) -> Result<Vec<EndpointCalibrationCase>, String> {
+    let mut base_request = json!({});
+    for path in &contract.required_request_attributes {
+        let spec = contract
+            .request_attribute_specs
+            .get(path)
+            .ok_or_else(|| format!("required attribute {path} has no signed spec"))?;
+        let value = endpoint_calibration_baseline(spec)
+            .ok_or_else(|| format!("required attribute {path} has no calibration baseline"))?;
+        set_endpoint_path(&mut base_request, path, value)?;
+    }
+    validate_endpoint_request(contract, &base_request).map_err(|violations| {
+        format!(
+            "generated baseline request is invalid: {}",
+            violations
+                .iter()
+                .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
+
+    let contract_fingerprint = endpoint_contract_fingerprint(contract);
+    let mut cases = Vec::new();
+    for path in &contract.request_attributes {
+        let spec = contract
+            .request_attribute_specs
+            .get(path)
+            .ok_or_else(|| format!("request attribute {path} has no signed spec"))?;
+        let required = contract.required_request_attributes.contains(path);
+        if required {
+            push_calibration_case(
+                &mut cases,
+                contract,
+                &contract_fingerprint,
+                &base_request,
+                "required_present",
+                vec![literal_mutation(
+                    path,
+                    endpoint_calibration_baseline(spec).ok_or_else(|| {
+                        format!("required attribute {path} has no calibration baseline")
+                    })?,
+                )],
+                true,
+                Vec::new(),
+            );
+            push_calibration_case(
+                &mut cases,
+                contract,
+                &contract_fingerprint,
+                &base_request,
+                "required_missing",
+                vec![EndpointCalibrationMutation {
+                    path: path.clone(),
+                    value: EndpointCalibrationValue::Omitted,
+                }],
+                false,
+                Vec::new(),
+            );
+        } else {
+            push_calibration_case(
+                &mut cases,
+                contract,
+                &contract_fingerprint,
+                &base_request,
+                if spec.default.is_some() {
+                    "omitted_default"
+                } else {
+                    "omitted_optional"
+                },
+                vec![EndpointCalibrationMutation {
+                    path: path.clone(),
+                    value: EndpointCalibrationValue::Omitted,
+                }],
+                true,
+                Vec::new(),
+            );
+        }
+
+        let mut accepted_values = spec.calibration_values.clone();
+        if let Some(default) = &spec.default {
+            accepted_values.push(default.clone());
+        }
+        accepted_values.extend(spec.enum_values.iter().cloned());
+        deduplicate_values(&mut accepted_values);
+        for (index, value) in accepted_values.into_iter().enumerate() {
+            push_calibration_case(
+                &mut cases,
+                contract,
+                &contract_fingerprint,
+                &base_request,
+                &format!("accepted_value_{index}"),
+                vec![literal_mutation(path, value)],
+                true,
+                Vec::new(),
+            );
+        }
+
+        add_boundary_calibration_cases(
+            &mut cases,
+            contract,
+            &contract_fingerprint,
+            &base_request,
+            path,
+            spec,
+        );
+        push_calibration_case(
+            &mut cases,
+            contract,
+            &contract_fingerprint,
+            &base_request,
+            "wrong_type",
+            vec![literal_mutation(path, wrong_type_value(spec))],
+            false,
+            Vec::new(),
+        );
+        if !spec.enum_values.is_empty() {
+            let invalid_enum = if spec.value_types.contains(&EndpointValueType::Array) {
+                json!(["__mayhem_invalid_enum__"])
+            } else {
+                json!("__mayhem_invalid_enum__")
+            };
+            push_calibration_case(
+                &mut cases,
+                contract,
+                &contract_fingerprint,
+                &base_request,
+                "invalid_enum",
+                vec![literal_mutation(path, invalid_enum)],
+                false,
+                Vec::new(),
+            );
+        }
+    }
+
+    for path in &contract.response_attributes {
+        push_calibration_case(
+            &mut cases,
+            contract,
+            &contract_fingerprint,
+            &base_request,
+            "response_attribute",
+            Vec::new(),
+            true,
+            vec![path.clone()],
+        );
+    }
+
+    for group in &contract.interaction_groups {
+        for left in 0..group.len() {
+            for right in (left + 1)..group.len() {
+                let left_path = &group[left];
+                let right_path = &group[right];
+                let left_value = endpoint_calibration_interaction_value(
+                    contract
+                        .request_attribute_specs
+                        .get(left_path)
+                        .ok_or_else(|| format!("interaction attribute {left_path} has no spec"))?,
+                )
+                .ok_or_else(|| format!("interaction attribute {left_path} has no test value"))?;
+                let right_value = endpoint_calibration_interaction_value(
+                    contract
+                        .request_attribute_specs
+                        .get(right_path)
+                        .ok_or_else(|| format!("interaction attribute {right_path} has no spec"))?,
+                )
+                .ok_or_else(|| format!("interaction attribute {right_path} has no test value"))?;
+                push_calibration_case(
+                    &mut cases,
+                    contract,
+                    &contract_fingerprint,
+                    &base_request,
+                    "pairwise_interaction",
+                    vec![
+                        literal_mutation(left_path, left_value),
+                        literal_mutation(right_path, right_value),
+                    ],
+                    true,
+                    Vec::new(),
+                );
+            }
+        }
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    if cases.iter().any(|case| !ids.insert(case.case_id.clone())) {
+        return Err("generated calibration matrix contains duplicate case IDs".to_owned());
+    }
+    Ok(cases)
+}
+
+pub fn materialize_endpoint_calibration_request(
+    case: &EndpointCalibrationCase,
+    substitutions: &BTreeMap<String, Value>,
+) -> Result<Value, String> {
+    let mut request = substitute_calibration_markers(case.base_request.clone(), substitutions);
+    for mutation in &case.mutations {
+        match &mutation.value {
+            EndpointCalibrationValue::Literal { value } => set_endpoint_path(
+                &mut request,
+                &mutation.path,
+                substitute_calibration_markers(value.clone(), substitutions),
+            )?,
+            EndpointCalibrationValue::Omitted => {
+                remove_endpoint_path(&mut request, &mutation.path)?;
+            }
+            EndpointCalibrationValue::StringLength { length } => {
+                let length = usize::try_from(*length).map_err(|_| {
+                    format!("string fixture for {} exceeds this platform", mutation.path)
+                })?;
+                set_endpoint_path(&mut request, &mutation.path, json!("x".repeat(length)))?;
+            }
+            EndpointCalibrationValue::ArrayLength { length, item } => {
+                let length = usize::try_from(*length).map_err(|_| {
+                    format!("array fixture for {} exceeds this platform", mutation.path)
+                })?;
+                let item = substitute_calibration_markers(item.clone(), substitutions);
+                set_endpoint_path(
+                    &mut request,
+                    &mutation.path,
+                    Value::Array(vec![item; length]),
+                )?;
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn endpoint_calibration_baseline(spec: &EndpointAttributeSpec) -> Option<Value> {
+    spec.default
+        .clone()
+        .or_else(|| spec.calibration_values.first().cloned())
+        .or_else(|| spec.enum_values.first().cloned())
+}
+
+fn endpoint_calibration_interaction_value(spec: &EndpointAttributeSpec) -> Option<Value> {
+    spec.calibration_values
+        .last()
+        .cloned()
+        .or_else(|| spec.enum_values.last().cloned())
+        .or_else(|| spec.default.clone())
+}
+
+fn literal_mutation(path: &str, value: Value) -> EndpointCalibrationMutation {
+    EndpointCalibrationMutation {
+        path: path.to_owned(),
+        value: EndpointCalibrationValue::Literal { value },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_calibration_case(
+    cases: &mut Vec<EndpointCalibrationCase>,
+    contract: &EndpointFamilyContract,
+    contract_fingerprint: &str,
+    base_request: &Value,
+    case_kind: &str,
+    mutations: Vec<EndpointCalibrationMutation>,
+    expect_accept: bool,
+    expected_response_attributes: Vec<String>,
+) {
+    let mut attributes = mutations
+        .iter()
+        .map(|mutation| mutation.path.clone())
+        .chain(expected_response_attributes.iter().cloned())
+        .collect::<Vec<_>>();
+    attributes.sort();
+    attributes.dedup();
+    let identity = json!({
+        "family": contract.family,
+        "kind": case_kind,
+        "attributes": attributes,
+        "mutations": mutations,
+        "responses": expected_response_attributes,
+        "accept": expect_accept,
+        "contract": contract_fingerprint,
+    });
+    let digest = blake3::hash(
+        &serde_json::to_vec(&identity).expect("calibration case identity is serializable"),
+    )
+    .to_hex()
+    .to_string();
+    cases.push(EndpointCalibrationCase {
+        case_id: format!("{}-{case_kind}-{}", contract.family, &digest[..16]),
+        endpoint_family: contract.family.clone(),
+        case_kind: case_kind.to_owned(),
+        attributes,
+        expect_accept,
+        base_request: base_request.clone(),
+        mutations,
+        expected_response_attributes,
+        contract_fingerprint: contract_fingerprint.to_owned(),
+    });
+}
+
+fn add_boundary_calibration_cases(
+    cases: &mut Vec<EndpointCalibrationCase>,
+    contract: &EndpointFamilyContract,
+    contract_fingerprint: &str,
+    base_request: &Value,
+    path: &str,
+    spec: &EndpointAttributeSpec,
+) {
+    for (kind, value, accept) in numeric_boundary_values(spec) {
+        push_calibration_case(
+            cases,
+            contract,
+            contract_fingerprint,
+            base_request,
+            kind,
+            vec![literal_mutation(path, value)],
+            accept,
+            Vec::new(),
+        );
+    }
+    for (kind, length, accept) in length_boundary_values(spec.min_length, spec.max_length) {
+        push_calibration_case(
+            cases,
+            contract,
+            contract_fingerprint,
+            base_request,
+            kind,
+            vec![EndpointCalibrationMutation {
+                path: path.to_owned(),
+                value: EndpointCalibrationValue::StringLength { length },
+            }],
+            accept,
+            Vec::new(),
+        );
+    }
+    let array_item = spec
+        .calibration_values
+        .iter()
+        .chain(spec.default.iter())
+        .find_map(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .or_else(|| spec.enum_values.first().cloned())
+        .unwrap_or_else(|| json!("item"));
+    for (kind, length, accept) in length_boundary_values(spec.min_items, spec.max_items) {
+        push_calibration_case(
+            cases,
+            contract,
+            contract_fingerprint,
+            base_request,
+            kind,
+            vec![EndpointCalibrationMutation {
+                path: path.to_owned(),
+                value: EndpointCalibrationValue::ArrayLength {
+                    length,
+                    item: array_item.clone(),
+                },
+            }],
+            accept,
+            Vec::new(),
+        );
+    }
+}
+
+fn numeric_boundary_values(spec: &EndpointAttributeSpec) -> Vec<(&'static str, Value, bool)> {
+    let integer = spec.value_types.contains(&EndpointValueType::Integer)
+        && !spec.value_types.contains(&EndpointValueType::Number);
+    let mut values = Vec::new();
+    if let Some(minimum) = spec.minimum {
+        values.push(("minimum_valid", number_value(minimum, integer), true));
+        values.push((
+            "below_minimum",
+            number_value(
+                if integer {
+                    minimum - 1.0
+                } else {
+                    minimum - 0.001
+                },
+                integer,
+            ),
+            false,
+        ));
+    }
+    if let Some(maximum) = spec.maximum {
+        values.push(("maximum_valid", number_value(maximum, integer), true));
+        values.push((
+            "above_maximum",
+            number_value(
+                if integer {
+                    maximum + 1.0
+                } else {
+                    maximum + 0.001
+                },
+                integer,
+            ),
+            false,
+        ));
+    }
+    values
+}
+
+fn number_value(value: f64, integer: bool) -> Value {
+    if integer && value >= 0.0 && value <= u64::MAX as f64 {
+        json!(value as u64)
+    } else if integer && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        json!(value as i64)
+    } else {
+        json!(value)
+    }
+}
+
+fn length_boundary_values(
+    minimum: Option<u64>,
+    maximum: Option<u64>,
+) -> Vec<(&'static str, u64, bool)> {
+    let mut values = Vec::new();
+    if let Some(minimum) = minimum {
+        values.push(("minimum_length_valid", minimum, true));
+        if minimum > 0 {
+            values.push(("below_minimum_length", minimum - 1, false));
+        }
+    }
+    if let Some(maximum) = maximum {
+        values.push(("maximum_length_valid", maximum, true));
+        if let Some(above) = maximum.checked_add(1) {
+            values.push(("above_maximum_length", above, false));
+        }
+    }
+    values
+}
+
+fn wrong_type_value(spec: &EndpointAttributeSpec) -> Value {
+    for candidate in [
+        Value::Bool(true),
+        json!(1),
+        json!(0.5),
+        json!("wrong-type"),
+        json!([]),
+        json!({}),
+        Value::Null,
+    ] {
+        if !endpoint_attribute_value_matches(spec, &candidate) {
+            return candidate;
+        }
+    }
+    Value::Null
+}
+
+fn deduplicate_values(values: &mut Vec<Value>) {
+    let mut seen = std::collections::BTreeSet::new();
+    values.retain(|value| {
+        seen.insert(serde_json::to_string(value).expect("JSON value is serializable"))
+    });
+}
+
+fn set_endpoint_path(target: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    if let Some(rest) = path.strip_prefix("messages.content.") {
+        let object = ensure_first_message_content_part(target)?;
+        return set_object_path(
+            object,
+            rest.split('.').collect::<Vec<_>>().as_slice(),
+            value,
+        );
+    }
+    if let Some(rest) = path.strip_prefix("messages.") {
+        let message = ensure_first_array_object(target, "messages")?;
+        return set_object_path(
+            message,
+            rest.split('.').collect::<Vec<_>>().as_slice(),
+            value,
+        );
+    }
+    let segments = path.split('.').collect::<Vec<_>>();
+    let object = target
+        .as_object_mut()
+        .ok_or_else(|| "calibration request root must be an object".to_owned())?;
+    set_object_path(object, &segments, value)
+}
+
+fn set_object_path(
+    object: &mut serde_json::Map<String, Value>,
+    segments: &[&str],
+    value: Value,
+) -> Result<(), String> {
+    let Some((head, tail)) = segments.split_first() else {
+        return Err("endpoint attribute path is empty".to_owned());
+    };
+    if tail.is_empty() {
+        object.insert((*head).to_owned(), value);
+        return Ok(());
+    }
+    let child = object
+        .entry((*head).to_owned())
+        .or_insert_with(|| json!({}));
+    if !child.is_object() {
+        *child = json!({});
+    }
+    set_object_path(
+        child
+            .as_object_mut()
+            .expect("child was replaced with an object"),
+        tail,
+        value,
+    )
+}
+
+fn ensure_first_array_object<'a>(
+    target: &'a mut Value,
+    key: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>, String> {
+    let root = target
+        .as_object_mut()
+        .ok_or_else(|| "calibration request root must be an object".to_owned())?;
+    let array = root.entry(key.to_owned()).or_insert_with(|| json!([{}]));
+    if !array.is_array() {
+        *array = json!([{}]);
+    }
+    let items = array
+        .as_array_mut()
+        .expect("value was replaced with an array");
+    if items.is_empty() {
+        items.push(json!({}));
+    }
+    if !items[0].is_object() {
+        items[0] = json!({});
+    }
+    Ok(items[0]
+        .as_object_mut()
+        .expect("first array item was replaced with an object"))
+}
+
+fn ensure_first_message_content_part(
+    target: &mut Value,
+) -> Result<&mut serde_json::Map<String, Value>, String> {
+    let message = ensure_first_array_object(target, "messages")?;
+    let content = message
+        .entry("content".to_owned())
+        .or_insert_with(|| json!([{}]));
+    if !content.is_array() {
+        *content = json!([{}]);
+    }
+    let parts = content
+        .as_array_mut()
+        .expect("content was replaced with an array");
+    if parts.is_empty() {
+        parts.push(json!({}));
+    }
+    if !parts[0].is_object() {
+        parts[0] = json!({});
+    }
+    Ok(parts[0]
+        .as_object_mut()
+        .expect("content part was replaced with an object"))
+}
+
+fn remove_endpoint_path(target: &mut Value, path: &str) -> Result<(), String> {
+    if !path.contains('.') {
+        target
+            .as_object_mut()
+            .ok_or_else(|| "calibration request root must be an object".to_owned())?
+            .remove(path);
+        return Ok(());
+    }
+    let segments = path.split('.').collect::<Vec<_>>();
+    remove_nested_endpoint_path(target, &segments);
+    Ok(())
+}
+
+fn remove_nested_endpoint_path(value: &mut Value, segments: &[&str]) {
+    if segments.is_empty() {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                remove_nested_endpoint_path(item, segments);
+            }
+        }
+        Value::Object(object) => {
+            if segments.len() == 1 {
+                object.remove(segments[0]);
+            } else if let Some(child) = object.get_mut(segments[0]) {
+                remove_nested_endpoint_path(child, &segments[1..]);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_calibration_markers(value: Value, substitutions: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(marker) => substitutions
+            .get(&marker)
+            .cloned()
+            .unwrap_or(Value::String(marker)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| substitute_calibration_markers(item, substitutions))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, substitute_calibration_markers(value, substitutions)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointContractViolation {
+    pub path: String,
+    pub reason: String,
+}
+
+#[must_use]
+pub fn endpoint_contract_fingerprint(contract: &EndpointFamilyContract) -> String {
+    let encoded = serde_json::to_vec(contract).expect("endpoint contracts are JSON serializable");
+    blake3::hash(&encoded).to_hex().to_string()
+}
+
+pub fn validate_endpoint_request(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+) -> Result<(), Vec<EndpointContractViolation>> {
+    validate_endpoint_value(
+        &contract.request_attributes,
+        &contract.required_request_attributes,
+        &contract.request_attribute_specs,
+        request,
+        "request",
+    )
+}
+
+pub fn validate_endpoint_response(
+    contract: &EndpointFamilyContract,
+    response: &Value,
+) -> Result<(), Vec<EndpointContractViolation>> {
+    validate_endpoint_value(
+        &contract.response_attributes,
+        &contract.required_response_attributes,
+        &contract.response_attribute_specs,
+        response,
+        "response",
+    )
+}
+
+fn validate_endpoint_value(
+    attributes: &[String],
+    required: &[String],
+    specs: &BTreeMap<String, EndpointAttributeSpec>,
+    value: &Value,
+    direction: &str,
+) -> Result<(), Vec<EndpointContractViolation>> {
+    let Some(object) = value.as_object() else {
+        return Err(vec![EndpointContractViolation {
+            path: direction.to_owned(),
+            reason: format!("endpoint {direction} must be a JSON object"),
+        }]);
+    };
+    let roots = attributes
+        .iter()
+        .filter_map(|path| path.split('.').next())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for key in object.keys() {
+        if !roots.contains(key.as_str()) {
+            violations.push(EndpointContractViolation {
+                path: key.clone(),
+                reason: format!("unsupported {direction} attribute"),
+            });
+        }
+    }
+    for path in required {
+        if endpoint_values_at_path(value, path).is_empty() {
+            violations.push(EndpointContractViolation {
+                path: path.clone(),
+                reason: format!("required {direction} attribute is missing"),
+            });
+        }
+    }
+    for (path, spec) in specs {
+        for candidate in endpoint_values_at_path(value, path) {
+            if let Err(reason) = validate_endpoint_attribute_value(spec, candidate) {
+                violations.push(EndpointContractViolation {
+                    path: path.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    for root in &roots {
+        let Some(root_value) = object.get(*root) else {
+            continue;
+        };
+        let has_declared_children = attributes
+            .iter()
+            .any(|path| path.starts_with(&format!("{root}.")));
+        if has_declared_children {
+            validate_nested_endpoint_attributes(
+                root,
+                root_value,
+                attributes,
+                &mut violations,
+                direction,
+            );
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+fn endpoint_values_at_path<'a>(value: &'a Value, path: &str) -> Vec<&'a Value> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    let mut values = Vec::new();
+    collect_endpoint_values(value, &segments, &mut values);
+    values
+}
+
+fn collect_endpoint_values<'a>(value: &'a Value, segments: &[&str], output: &mut Vec<&'a Value>) {
+    if segments.is_empty() {
+        output.push(value);
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_endpoint_values(item, segments, output);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(next) = object.get(segments[0]) {
+                collect_endpoint_values(next, &segments[1..], output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_nested_endpoint_attributes(
+    path: &str,
+    value: &Value,
+    attributes: &[String],
+    violations: &mut Vec<EndpointContractViolation>,
+    direction: &str,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                validate_nested_endpoint_attributes(path, item, attributes, violations, direction);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                let exact = attributes.iter().any(|declared| declared == &child_path);
+                let descendant = attributes
+                    .iter()
+                    .any(|declared| declared.starts_with(&format!("{child_path}.")));
+                if !exact && !descendant {
+                    violations.push(EndpointContractViolation {
+                        path: child_path,
+                        reason: format!("unsupported nested {direction} attribute"),
+                    });
+                    continue;
+                }
+                if descendant {
+                    validate_nested_endpoint_attributes(
+                        &child_path,
+                        child,
+                        attributes,
+                        violations,
+                        direction,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_endpoint_template_has_complete_typed_specs() {
+        for family in [
+            ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            ENDPOINT_OPENAI_COMPLETIONS,
+            ENDPOINT_OPENAI_RESPONSES,
+            ENDPOINT_HF_MULTIMODAL_CHAT,
+            ENDPOINT_OPENAI_EMBEDDINGS,
+            ENDPOINT_HF_FEATURE_EXTRACTION,
+            ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            ENDPOINT_HF_TEXT_TO_IMAGE,
+            ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+            ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+            ENDPOINT_OPENAI_AUDIO_SPEECH,
+            ENDPOINT_HF_TEXT_TO_SPEECH,
+            ENDPOINT_OPENAI_VIDEOS,
+            ENDPOINT_HF_TEXT_TO_VIDEO,
+            ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            ENDPOINT_HF_TEXT_TO_AUDIO,
+        ] {
+            let contract = endpoint_family_contract_template(family)
+                .unwrap_or_else(|| panic!("missing endpoint template for {family}"));
+            assert_eq!(
+                contract.request_attributes.len(),
+                contract.request_attribute_specs.len(),
+                "request schema mismatch for {family}"
+            );
+            assert_eq!(
+                contract.response_attributes.len(),
+                contract.response_attribute_specs.len(),
+                "response schema mismatch for {family}"
+            );
+            for required in &contract.required_request_attributes {
+                assert!(contract.request_attribute_specs.contains_key(required));
+            }
+            for spec in contract.request_attribute_specs.values() {
+                assert!(!spec.value_types.is_empty());
+                for value in &spec.calibration_values {
+                    validate_endpoint_attribute_value(spec, value).unwrap();
+                }
+                if let Some(default) = &spec.default {
+                    validate_endpoint_attribute_value(spec, default).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attribute_validator_enforces_enum_bounds_and_types() {
+        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_VIDEOS).unwrap();
+        let seconds = &contract.request_attribute_specs["seconds"];
+        assert!(validate_endpoint_attribute_value(seconds, &json!("8")).is_ok());
+        assert!(validate_endpoint_attribute_value(seconds, &json!(8)).is_err());
+        assert!(validate_endpoint_attribute_value(seconds, &json!("5")).is_err());
+
+        let prompt = &contract.request_attribute_specs["prompt"];
+        assert!(validate_endpoint_attribute_value(prompt, &json!("")).is_err());
+        assert!(validate_endpoint_attribute_value(prompt, &json!("valid")).is_ok());
+
+        let error = &contract.response_attribute_specs["error"];
+        assert!(validate_endpoint_attribute_value(error, &Value::Null).is_ok());
+        assert!(validate_endpoint_attribute_value(error, &json!({"code": "failed"})).is_ok());
+        assert!(validate_endpoint_attribute_value(error, &json!("failed")).is_err());
+    }
+
+    #[test]
+    fn selected_model_contract_rejects_unknown_and_unsupported_attributes() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat contract");
+        contract
+            .request_attributes
+            .retain(|attribute| attribute != "top_k");
+        contract.request_attribute_specs.remove("top_k");
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({"model":"test", "messages":[{"role":"user","content":"hello"}]})
+        )
+        .is_ok());
+        let unsupported = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model":"test",
+                "messages":[{"role":"user","content":"hello"}],
+                "top_k":20
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(unsupported[0].path, "top_k");
+        let unknown = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model":"test",
+                "messages":[{"role":"user","content":"hello"}],
+                "provider_native":true
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(unknown[0].path, "provider_native");
+    }
+
+    #[test]
+    fn nested_hf_parameters_are_closed_and_typed() {
+        let contract = endpoint_family_contract_template(ENDPOINT_HF_TEXT_TO_IMAGE)
+            .expect("HF image contract");
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "inputs":"draw a square",
+                "parameters":{"width":512,"height":512,"guidance_scale":1.0}
+            })
+        )
+        .is_ok());
+        let unknown = validate_endpoint_request(
+            &contract,
+            &json!({"inputs":"draw a square", "parameters":{"magic":true}}),
+        )
+        .unwrap_err();
+        assert_eq!(unknown[0].path, "parameters.magic");
+        let wrong_type = validate_endpoint_request(
+            &contract,
+            &json!({"inputs":"draw a square", "parameters":{"width":"512"}}),
+        )
+        .unwrap_err();
+        assert_eq!(wrong_type[0].path, "parameters.width");
+    }
+
+    #[test]
+    fn generated_matrix_covers_every_declared_attribute_and_interaction() {
+        for family in [
+            ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            ENDPOINT_OPENAI_COMPLETIONS,
+            ENDPOINT_OPENAI_RESPONSES,
+            ENDPOINT_HF_MULTIMODAL_CHAT,
+            ENDPOINT_OPENAI_EMBEDDINGS,
+            ENDPOINT_HF_FEATURE_EXTRACTION,
+            ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            ENDPOINT_HF_TEXT_TO_IMAGE,
+            ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+            ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+            ENDPOINT_OPENAI_AUDIO_SPEECH,
+            ENDPOINT_HF_TEXT_TO_SPEECH,
+            ENDPOINT_OPENAI_VIDEOS,
+            ENDPOINT_HF_TEXT_TO_VIDEO,
+            ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            ENDPOINT_HF_TEXT_TO_AUDIO,
+        ] {
+            let contract = endpoint_family_contract_template(family).unwrap();
+            let cases = generate_endpoint_calibration_cases(&contract)
+                .unwrap_or_else(|err| panic!("matrix generation failed for {family}: {err}"));
+            assert!(!cases.is_empty());
+            for attribute in &contract.request_attributes {
+                assert!(
+                    cases.iter().any(|case| {
+                        case.attributes.contains(attribute) && case.case_kind == "wrong_type"
+                    }),
+                    "{family}/{attribute} has no wrong-type row"
+                );
+                assert!(
+                    cases.iter().any(|case| {
+                        case.attributes.contains(attribute)
+                            && matches!(
+                                case.case_kind.as_str(),
+                                "required_present" | "omitted_default" | "omitted_optional"
+                            )
+                    }),
+                    "{family}/{attribute} has no presence/default row"
+                );
+            }
+            for attribute in &contract.response_attributes {
+                assert!(
+                    cases
+                        .iter()
+                        .any(|case| { case.expected_response_attributes.contains(attribute) }),
+                    "{family}/{attribute} has no response row"
+                );
+            }
+            for group in &contract.interaction_groups {
+                for left in 0..group.len() {
+                    for right in (left + 1)..group.len() {
+                        assert!(
+                            cases.iter().any(|case| {
+                                case.case_kind == "pairwise_interaction"
+                                    && case.attributes.contains(&group[left])
+                                    && case.attributes.contains(&group[right])
+                            }),
+                            "{family} missing pairwise row for {} + {}",
+                            group[left],
+                            group[right]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

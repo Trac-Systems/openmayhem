@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use crate::HeartbeatModalityCapacity;
 use crate::{
     audit::{
         aggregate_canary_fingerprints, audio_fingerprint, embedding_vector_fingerprint,
@@ -22,24 +24,21 @@ use crate::{
         CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT, CANARY_VERIFICATION_CONTEXT_NEEDLE,
         CANARY_VERIFICATION_EMBEDDING_COSINE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
         CANARY_VERIFICATION_TOKEN_FINGERPRINT, CANARY_VERIFICATION_TRANSCRIPT_MATCH,
-        DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
+        DEFAULT_CANARY_MATCH_MIN_BPS,
     },
     failover::{
         effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
         RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
         DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
-    pricing::{
-        normalize_rate_map, priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
-        RateMapEntry,
-    },
+    pricing::{normalize_rate_map, priced_usage_au, text_generation_rate_map, RateMapEntry},
     provider_table::{
-        ContractProviderSnapshot, LcgBalancerRng, ProviderCapacityMismatchEvent,
-        ProviderObservationSample, ProviderTable, ProviderTableEntry, ProviderUnderdeliveryEvent,
-        RequestRequirements, SelectionWeights, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
-        DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S,
-        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
-        DEFAULT_SATURATION_CUTOFF,
+        ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
+        ProviderCapacityMismatchEvent, ProviderObservationSample, ProviderTable,
+        ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements, SelectionWeights,
+        DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+        DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
+        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, DEFAULT_SATURATION_CUTOFF,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
@@ -48,7 +47,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -65,6 +64,7 @@ use base64::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
+use image::ImageReader;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 #[cfg(test)]
 use mayhem_proto::chunk_json_payload;
@@ -72,14 +72,16 @@ use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
     payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
     session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, AttestationReport,
-    CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk, PayloadChunkCollector,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, SESSION_RECEIPT_SCHEMA_VERSION,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
@@ -136,8 +138,21 @@ const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
 const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
 const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS: usize = 32;
+const DEFAULT_GATEWAY_MAX_CHAT_MEDIA_ITEMS: u32 = 16;
+const DEFAULT_GATEWAY_MAX_CHAT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_GATEWAY_MAX_CHAT_IMAGE_PIXELS: u64 = 40_000_000;
+const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_SECONDS: u64 = 3_600;
+const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_FRAMES: u64 = 64;
+const GATEWAY_MEDIA_SCHEMA_MAX_ITEMS: u32 = 1_024;
+const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS: u64 = 1_000_000_000_000;
 const DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS: usize = 1_024;
 const DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES: usize = 4_096;
+const DEFAULT_GATEWAY_MAX_STORED_VIDEO_JOBS: usize = 64;
+const DEFAULT_GATEWAY_MAX_STORED_VIDEO_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_GATEWAY_VIDEO_TTL_SECONDS: u64 = 3_600;
 const DEFAULT_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_SESSION_MAX_ARTIFACTS: usize = 128;
 const MAX_SESSION_ARTIFACT_ID_BYTES: usize = 128;
@@ -178,6 +193,7 @@ pub struct GatewayState {
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
+    video_jobs: Arc<Mutex<GatewayVideoJobStore>>,
     retention_limits: GatewayRetentionLimits,
     receipt_config: ReceiptConfig,
     ledger_balance_au: Arc<Mutex<MoneyAu>>,
@@ -191,6 +207,7 @@ pub struct GatewayState {
     provider_earnings: Arc<Vec<Value>>,
     provider_load_progress_dir: Arc<Option<PathBuf>>,
     provider_table: Arc<Mutex<ProviderTable>>,
+    modality_admission: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     preferred_providers: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
@@ -204,6 +221,103 @@ pub struct GatewayState {
     default_max_wait_ms: u64,
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
+    media_limits: Arc<GatewayMediaLimits>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayMediaLimits {
+    max_items_per_request: u32,
+    max_image_bytes: u64,
+    max_image_pixels: u64,
+    max_audio_bytes: u64,
+    max_audio_seconds: u64,
+    max_video_bytes: u64,
+    max_video_frames: u64,
+}
+
+impl Default for GatewayMediaLimits {
+    fn default() -> Self {
+        Self {
+            max_items_per_request: DEFAULT_GATEWAY_MAX_CHAT_MEDIA_ITEMS,
+            max_image_bytes: DEFAULT_GATEWAY_MAX_CHAT_IMAGE_BYTES,
+            max_image_pixels: DEFAULT_GATEWAY_MAX_CHAT_IMAGE_PIXELS,
+            max_audio_bytes: DEFAULT_GATEWAY_MAX_CHAT_AUDIO_BYTES,
+            max_audio_seconds: DEFAULT_GATEWAY_MAX_CHAT_AUDIO_SECONDS,
+            max_video_bytes: DEFAULT_GATEWAY_MAX_CHAT_VIDEO_BYTES,
+            max_video_frames: DEFAULT_GATEWAY_MAX_CHAT_VIDEO_FRAMES,
+        }
+    }
+}
+
+impl GatewayMediaLimits {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            max_items_per_request: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_MEDIA_ITEMS_PER_REQUEST",
+                u64::from(DEFAULT_GATEWAY_MAX_CHAT_MEDIA_ITEMS),
+                u64::from(GATEWAY_MEDIA_SCHEMA_MAX_ITEMS),
+            )?
+            .try_into()
+            .map_err(|_| "gateway media item limit exceeds u32".to_owned())?,
+            max_image_bytes: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_IMAGE_BYTES",
+                DEFAULT_GATEWAY_MAX_CHAT_IMAGE_BYTES,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            )?,
+            max_image_pixels: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_IMAGE_PIXELS",
+                DEFAULT_GATEWAY_MAX_CHAT_IMAGE_PIXELS,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+            )?,
+            max_audio_bytes: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_AUDIO_BYTES",
+                DEFAULT_GATEWAY_MAX_CHAT_AUDIO_BYTES,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            )?,
+            max_audio_seconds: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_AUDIO_SECONDS",
+                DEFAULT_GATEWAY_MAX_CHAT_AUDIO_SECONDS,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+            )?,
+            max_video_bytes: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_VIDEO_BYTES",
+                DEFAULT_GATEWAY_MAX_CHAT_VIDEO_BYTES,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            )?,
+            max_video_frames: configured_bounded_media_u64(
+                "MAYHEM_GATEWAY_MAX_VIDEO_FRAMES",
+                DEFAULT_GATEWAY_MAX_CHAT_VIDEO_FRAMES,
+                GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+            )?,
+        })
+    }
+
+    fn schema_ceiling() -> Self {
+        Self {
+            max_items_per_request: GATEWAY_MEDIA_SCHEMA_MAX_ITEMS,
+            max_image_bytes: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            max_image_pixels: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+            max_audio_bytes: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            max_audio_seconds: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+            max_video_bytes: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES,
+            max_video_frames: GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS,
+        }
+    }
+}
+
+fn configured_bounded_media_u64(name: &str, default: u64, max: u64) -> Result<u64, String> {
+    let value = match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a positive integer"))?,
+        Err(std::env::VarError::NotPresent) => default,
+        Err(err) => return Err(format!("reading {name}: {err}")),
+    };
+    if value == 0 || value > max {
+        return Err(format!("{name} must be between 1 and {max}"));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -212,14 +326,44 @@ struct ChatAffinityKey {
     conversation_id: String,
 }
 
+struct GatewayModalityAdmissionGuard {
+    active: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
+    reservations: Vec<(ProviderKey, String, u32)>,
+}
+
+impl Drop for GatewayModalityAdmissionGuard {
+    fn drop(&mut self) {
+        let mut active = self.active.lock_recover("modality admission map");
+        for (provider, modality, count) in self.reservations.iter().rev() {
+            let key = (provider.clone(), modality.clone());
+            let remove = if let Some(current) = active.get_mut(&key) {
+                *current = current.saturating_sub(*count);
+                *current == 0
+            } else {
+                false
+            };
+            if remove {
+                active.remove(&key);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GatewayRetentionLimits {
     paused_sessions: usize,
     chat_affinities: usize,
+    video_jobs: usize,
+    video_bytes: usize,
+    video_ttl_seconds: u64,
 }
 
 impl Default for GatewayRetentionLimits {
     fn default() -> Self {
+        let session_artifact_bytes = configured_positive_usize(
+            "MAYHEM_SESSION_MAX_ARTIFACT_BYTES",
+            DEFAULT_SESSION_MAX_ARTIFACT_BYTES,
+        );
         Self {
             paused_sessions: configured_positive_usize(
                 "MAYHEM_GATEWAY_MAX_STORED_PAUSED_SESSIONS",
@@ -229,7 +373,91 @@ impl Default for GatewayRetentionLimits {
                 "MAYHEM_GATEWAY_MAX_CHAT_AFFINITIES",
                 DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES,
             ),
+            video_jobs: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_VIDEO_JOBS",
+                DEFAULT_GATEWAY_MAX_STORED_VIDEO_JOBS,
+            ),
+            video_bytes: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_VIDEO_BYTES",
+                DEFAULT_GATEWAY_MAX_STORED_VIDEO_BYTES,
+            )
+            .max(session_artifact_bytes),
+            video_ttl_seconds: u64::try_from(configured_positive_usize(
+                "MAYHEM_GATEWAY_VIDEO_TTL_SECONDS",
+                usize::try_from(DEFAULT_GATEWAY_VIDEO_TTL_SECONDS).unwrap_or(3_600),
+            ))
+            .unwrap_or(DEFAULT_GATEWAY_VIDEO_TTL_SECONDS),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StoredVideoJob {
+    id: String,
+    model: String,
+    metadata: Value,
+    artifact: GatewayArtifactOutput,
+    access_token: Option<GatewayTokenAttribution>,
+    expires_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct GatewayVideoJobStore {
+    jobs: VecDeque<StoredVideoJob>,
+    total_bytes: usize,
+}
+
+impl GatewayVideoJobStore {
+    fn purge_expired(&mut self, now: u64) {
+        self.jobs.retain(|job| job.expires_at > now);
+        self.total_bytes = self
+            .jobs
+            .iter()
+            .map(|job| job.artifact.bytes.len())
+            .fold(0_usize, usize::saturating_add);
+    }
+
+    fn insert(
+        &mut self,
+        job: StoredVideoJob,
+        max_jobs: usize,
+        max_bytes: usize,
+        now: u64,
+    ) -> Result<(), String> {
+        self.purge_expired(now);
+        let bytes = job.artifact.bytes.len();
+        if bytes > max_bytes {
+            return Err(format!(
+                "video artifact is {bytes} bytes, above the {max_bytes}-byte lifecycle store limit"
+            ));
+        }
+        if let Some(index) = self.jobs.iter().position(|existing| existing.id == job.id) {
+            if let Some(existing) = self.jobs.remove(index) {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(existing.artifact.bytes.len());
+            }
+        }
+        let max_jobs = max_jobs.max(1);
+        while self.jobs.len() >= max_jobs || self.total_bytes.saturating_add(bytes) > max_bytes {
+            let Some(evicted) = self.jobs.pop_front() else {
+                break;
+            };
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(evicted.artifact.bytes.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.jobs.push_back(job);
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &str, now: u64) -> Option<StoredVideoJob> {
+        self.purge_expired(now);
+        let index = self.jobs.iter().position(|job| job.id == id)?;
+        let job = self.jobs.remove(index)?;
+        self.total_bytes = self.total_bytes.saturating_sub(job.artifact.bytes.len());
+        Some(job)
     }
 }
 
@@ -288,6 +516,8 @@ pub struct GatewayModel {
 pub struct MayhemModelInfo {
     #[serde(default = "default_model_class")]
     pub model_class: String,
+    #[serde(default)]
+    pub family: String,
     pub providers_online: u32,
     pub rooms: u32,
     pub price_ref_au: PriceRefAu,
@@ -299,8 +529,9 @@ pub struct MayhemModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_app_version: Option<String>,
     pub caps: ModelCaps,
-    #[serde(default)]
     pub adapter: ShapeAdapterInfo,
+    #[serde(default, skip_serializing_if = "SamplingProfile::is_empty")]
+    pub sampling: SamplingProfile,
     #[serde(default, skip_serializing_if = "GatewayFailoverPolicyConfig::is_empty")]
     pub failover: GatewayFailoverPolicyConfig,
     pub source: String,
@@ -308,6 +539,40 @@ pub struct MayhemModelInfo {
     pub kyb_identities: Vec<ProviderKybInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_candidates: Vec<GatewayRouteCandidate>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SamplingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+}
+
+impl SamplingProfile {
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
+            && self.repeat_penalty.is_none()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_sampling_values(
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+            self.repeat_penalty,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -343,6 +608,8 @@ pub struct GatewayRouteCandidate {
     pub provider: String,
     #[serde(default)]
     pub accepted_rails: Vec<String>,
+    #[serde(default)]
+    pub served_modalities: Vec<String>,
     pub enclave_id: String,
     pub room_id: String,
     pub price_ver: u64,
@@ -455,25 +722,26 @@ pub struct ModelCaps {
     pub output_modalities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ShapeAdapterInfo {
-    pub request_shape_family: String,
+    pub endpoint_families: Vec<EndpointFamilyContract>,
     pub chat_template_id: String,
     pub tool_call_strategy: String,
     pub reasoning_passthrough: String,
     pub modality_set: Vec<String>,
-    pub response_normalization: String,
 }
 
 impl Default for ShapeAdapterInfo {
     fn default() -> Self {
         Self {
-            request_shape_family: "openai_chat".to_owned(),
+            endpoint_families: vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            )
+            .expect("the built-in chat endpoint contract exists")],
             chat_template_id: "generic_chatml".to_owned(),
             tool_call_strategy: "mayhem_json".to_owned(),
             reasoning_passthrough: "strip".to_owned(),
             modality_set: vec!["text".to_owned()],
-            response_normalization: "openai_chat".to_owned(),
         }
     }
 }
@@ -1067,6 +1335,11 @@ pub struct GatewayCanaryPrompt {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Value>>,
     pub max_tokens: u32,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f64>,
+    pub repeat_penalty: Option<f64>,
     pub prompt: Option<String>,
     pub input: Option<String>,
     pub audio_b64: Option<String>,
@@ -1127,6 +1400,7 @@ struct HardwareQuoteTrust {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     #[serde(default)]
@@ -1144,17 +1418,35 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     pub response_format: Option<Value>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
     pub stop: Option<Value>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(skip)]
+    pub endpoint_family: Option<String>,
+    #[serde(skip)]
+    pub endpoint_request: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1162,19 +1454,21 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamOptions {
-    #[serde(default)]
-    pub include_usage: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
     pub model: String,
     #[serde(default)]
@@ -1188,12 +1482,56 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
     pub stop: Option<Value>,
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesRequest {
+    pub model: String,
+    pub input: Value,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub text: Option<Value>,
+    #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: Value,
@@ -1203,9 +1541,14 @@ pub struct EmbeddingRequest {
     pub dimensions: Option<usize>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(skip)]
+    pub endpoint_family: Option<String>,
+    #[serde(skip)]
+    pub endpoint_request: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
@@ -1216,16 +1559,29 @@ pub struct ImageGenerationRequest {
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
+    pub quality: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    #[serde(default)]
     pub steps: Option<u64>,
     #[serde(default)]
     pub cfg_scale: Option<f32>,
     #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
+    pub scheduler: Option<String>,
+    #[serde(default)]
     pub user: Option<String>,
+    #[serde(skip)]
+    pub endpoint_family: Option<String>,
+    #[serde(skip)]
+    pub endpoint_request: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioSpeechRequest {
     pub model: String,
     pub input: String,
@@ -1235,6 +1591,52 @@ pub struct AudioSpeechRequest {
     pub response_format: Option<String>,
     #[serde(default)]
     pub speed: Option<f64>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub stream_format: Option<String>,
+    #[serde(skip)]
+    pub endpoint_family: Option<String>,
+    #[serde(skip)]
+    pub endpoint_request: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    pub endpoint_family: String,
+    pub contract_request: Value,
+    pub output_modality: String,
+    pub transport_kind: String,
+    pub duration_seconds: u64,
+    pub frame_count: u64,
+    pub step_count: u64,
+    pub response_format: String,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedArtifactGeneration {
+    output: ArtifactGenerationOutput,
+    backend: String,
+    direct_session: bool,
+    billable: bool,
+    quality: Option<GatewaySessionQuality>,
+    receipt: Option<Value>,
+    session_id: String,
+    access_token: Option<GatewayTokenAttribution>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct VideoListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+    order: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct VideoContentQuery {
+    variant: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1246,6 +1648,138 @@ pub struct AudioTranscriptionRequest {
     pub response_format: Option<String>,
     pub language: Option<String>,
     pub prompt: Option<String>,
+    pub temperature: Option<f64>,
+    pub timestamp_granularities: Vec<String>,
+    pub stream: bool,
+    pub endpoint_family: String,
+    pub contract_request: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointRequestNormalization {
+    pub endpoint_family: String,
+    pub contract_fingerprint: String,
+    pub normalized_request_fingerprint: String,
+    pub normalized_request: Value,
+}
+
+pub fn normalize_endpoint_request_for_provider(
+    contract: &EndpointFamilyContract,
+    raw_request: &Value,
+) -> Result<EndpointRequestNormalization, String> {
+    mayhem_proto::validate_endpoint_request(contract, raw_request).map_err(|violations| {
+        violations
+            .iter()
+            .map(|violation| format!("{}: {}", violation.path, violation.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let mut normalized_request = match contract.family.as_str() {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
+            let request = serde_json::from_value::<ChatCompletionRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid chat request: {err}"))?;
+            direct_session_contract_request(&direct_session_request_body(&request))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => {
+            let request = serde_json::from_value::<CompletionRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid completion request: {err}"))?;
+            json_object_without_nulls(
+                serde_json::to_value(request)
+                    .map_err(|err| format!("normalizing completion request: {err}"))?,
+            )
+        }
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => {
+            let request = serde_json::from_value::<ResponsesRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid Responses request: {err}"))?;
+            json_object_without_nulls(
+                serde_json::to_value(request)
+                    .map_err(|err| format!("normalizing Responses request: {err}"))?,
+            )
+        }
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
+            let request = serde_json::from_value::<EmbeddingRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid embedding request: {err}"))?;
+            direct_session_contract_request(&direct_session_embedding_request_body(&request))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            let request = serde_json::from_value::<ImageGenerationRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid image request: {err}"))?;
+            direct_session_contract_request(&direct_session_image_generation_request_body(&request))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            let request = serde_json::from_value::<AudioSpeechRequest>(raw_request.clone())
+                .map_err(|err| format!("invalid speech request: {err}"))?;
+            direct_session_contract_request(&direct_session_audio_speech_request_body(&request))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => raw_request.clone(),
+        mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+        | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+        | mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => raw_request.clone(),
+        other => {
+            return Err(format!(
+                "endpoint family {other} has no gateway normalization path"
+            ))
+        }
+    };
+    restore_explicit_null_attributes(raw_request, &mut normalized_request);
+    let raw_object = raw_request
+        .as_object()
+        .ok_or_else(|| "endpoint request must be an object".to_owned())?;
+    let normalized_object = normalized_request
+        .as_object()
+        .ok_or_else(|| "normalized endpoint request must be an object".to_owned())?;
+    for (key, value) in raw_object {
+        if normalized_object.get(key) != Some(value) {
+            return Err(format!(
+                "gateway normalization changed or dropped supplied attribute {key}"
+            ));
+        }
+    }
+    mayhem_proto::validate_endpoint_request(contract, &normalized_request).map_err(
+        |violations| {
+            format!(
+                "normalized request violates contract: {}",
+                violations
+                    .iter()
+                    .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        },
+    )?;
+    Ok(EndpointRequestNormalization {
+        endpoint_family: contract.family.clone(),
+        contract_fingerprint: mayhem_proto::endpoint_contract_fingerprint(contract),
+        normalized_request_fingerprint: stable_value_hash(&normalized_request),
+        normalized_request,
+    })
+}
+
+fn restore_explicit_null_attributes(raw_request: &Value, normalized_request: &mut Value) {
+    let (Some(raw), Some(normalized)) =
+        (raw_request.as_object(), normalized_request.as_object_mut())
+    else {
+        return;
+    };
+    for (key, value) in raw {
+        if value.is_null() && !normalized.contains_key(key) {
+            normalized.insert(key.clone(), Value::Null);
+        }
+    }
+}
+
+fn json_object_without_nulls(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    value
 }
 
 #[derive(Debug)]
@@ -1272,6 +1806,14 @@ pub type GatewayAudioSpeechFuture<'a> = Pin<
 pub type GatewayAudioTranscriptionFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<GatewayAudioTranscriptionResult, GatewaySessionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type GatewayArtifactGenerationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<GatewayArtifactGenerationResult, GatewaySessionError>>
             + Send
             + 'a,
     >,
@@ -1361,6 +1903,21 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
             )))
         })
     }
+
+    fn run_artifact_generation<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ArtifactGenerationRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayArtifactGenerationFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support {} generation",
+                self.name(),
+                request.output_modality
+            )))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1403,6 +1960,15 @@ pub struct GatewayAudioSpeechResult {
 #[derive(Clone, Debug)]
 pub struct GatewayAudioTranscriptionResult {
     pub output: AudioTranscriptionOutput,
+    pub backend: String,
+    pub direct_session: bool,
+    pub provider_receipt: Option<ProviderSignedReceipt>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayArtifactGenerationResult {
+    pub output: ArtifactGenerationOutput,
     pub backend: String,
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
@@ -1580,6 +2146,12 @@ pub struct AudioTranscriptionOutput {
     pub usage: ReceiptUsage,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArtifactGenerationOutput {
+    pub artifacts: Vec<GatewayArtifactOutput>,
+    pub usage: ReceiptUsage,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayArtifactOutput {
     pub id: String,
@@ -1617,7 +2189,7 @@ impl GatewayState {
             .flatten()
             .filter_map(|model| model_from_catalog_value(model, created))
             .collect::<Vec<_>>();
-        let canaries = canary_registry_from_catalog_root(&root);
+        let canaries = canary_registry_from_catalog_root(&root, &embedded_canary_sets());
         if models.is_empty() {
             Ok(Self::fixture())
         } else {
@@ -1629,7 +2201,30 @@ impl GatewayState {
         catalog: &str,
     ) -> Result<GatewayCanaryRegistry, serde_json::Error> {
         let root: Value = serde_json::from_str(catalog)?;
-        Ok(canary_registry_from_catalog_root(&root))
+        Ok(canary_registry_from_catalog_root(
+            &root,
+            &embedded_canary_sets(),
+        ))
+    }
+
+    pub fn canary_registry_from_catalog_and_canary_json(
+        catalog: &str,
+        canary_json_by_set: &BTreeMap<String, String>,
+    ) -> Result<GatewayCanaryRegistry, String> {
+        let root: Value = serde_json::from_str(catalog).map_err(|err| err.to_string())?;
+        let mut canary_sets = embedded_canary_sets();
+        for (set_id, raw) in canary_json_by_set {
+            let doc: CanarySetDocument =
+                serde_json::from_str(raw).map_err(|err| format!("parsing {set_id}: {err}"))?;
+            if doc.set_id != *set_id {
+                return Err(format!(
+                    "canary set map key {set_id} does not match document {}",
+                    doc.set_id
+                ));
+            }
+            canary_sets.insert(set_id.clone(), gateway_canary_prompts(doc));
+        }
+        Ok(canary_registry_from_catalog_root(&root, &canary_sets))
     }
 
     pub fn fixture() -> Self {
@@ -1641,6 +2236,7 @@ impl GatewayState {
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
+                family: "mayhem-dev".to_owned(),
                 providers_online: 1,
                 rooms: 1,
                 price_ref_au: PriceRefAu {
@@ -1674,6 +2270,7 @@ impl GatewayState {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
@@ -1698,12 +2295,17 @@ impl GatewayState {
         let receipt_config = ReceiptConfig::default();
         let ledger_balance_au = receipt_config.balance_au;
         let provider_table = provider_table_from_models(&models, receipt_config.rules_ver);
+        let media_limits = GatewayMediaLimits::from_env().unwrap_or_else(|err| {
+            eprintln!("Invalid gateway media limit during state construction: {err}");
+            GatewayMediaLimits::default()
+        });
         Self {
             models: Arc::new(models),
             receipts: Arc::new(Mutex::new(Vec::new())),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            video_jobs: Arc::new(Mutex::new(GatewayVideoJobStore::default())),
             retention_limits: GatewayRetentionLimits::default(),
             receipt_config,
             ledger_balance_au: Arc::new(Mutex::new(ledger_balance_au)),
@@ -1717,6 +2319,7 @@ impl GatewayState {
             provider_earnings: Arc::new(Vec::new()),
             provider_load_progress_dir: Arc::new(None),
             provider_table: Arc::new(Mutex::new(provider_table)),
+            modality_admission: Arc::new(Mutex::new(BTreeMap::new())),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             preferred_providers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1730,6 +2333,7 @@ impl GatewayState {
             default_max_wait_ms: DEFAULT_ROUTE_MAX_WAIT_MS,
             default_min_ctx: None,
             dev_session_shim: false,
+            media_limits: Arc::new(media_limits),
         }
     }
 
@@ -2150,10 +2754,26 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/completions", post(create_completion))
+        .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
         .route("/v1/images/generations", post(create_image_generation))
+        .route(
+            "/v1/videos",
+            get(list_video_generations).post(create_video_generation),
+        )
+        .route(
+            "/v1/videos/{video_id}",
+            get(retrieve_video_generation).delete(delete_video_generation),
+        )
+        .route(
+            "/v1/videos/{video_id}/content",
+            get(retrieve_video_generation_content),
+        )
         .route("/v1/audio/speech", post(create_audio_speech))
         .route("/v1/audio/transcriptions", post(create_audio_transcription))
+        .route("/v1/audio/generations", post(create_audio_generation))
+        .route("/v1/music/generations", post(create_music_generation))
+        .route("/hf-inference/models/{*model}", post(create_hf_inference))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
@@ -2190,18 +2810,33 @@ fn gateway_request_body_limit(state: &GatewayState) -> usize {
         })
         .max()
         .unwrap_or(0);
-    usize::try_from(max_ctx)
+    let context_limit = usize::try_from(max_ctx)
         .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
         .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .max(DEFAULT_GATEWAY_REQUEST_BODY_BYTES)
+        .max(DEFAULT_GATEWAY_REQUEST_BODY_BYTES);
+    let decoded_media_bytes = state
+        .media_limits
+        .max_image_bytes
+        .saturating_add(state.media_limits.max_audio_bytes)
+        .saturating_add(state.media_limits.max_video_bytes);
+    let encoded_media_limit = usize::try_from(decoded_media_bytes)
+        .unwrap_or(usize::MAX / 4)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(1024 * 1024);
+    context_limit.max(encoded_media_limit)
 }
 
-pub async fn serve(bind: SocketAddr, state: GatewayState) -> std::io::Result<()> {
+pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result<()> {
     validate_gateway_bind_access(
         bind,
         state.access_control.requires_auth(),
         state.access_control.has_active_tokens(now_secs()),
     )?;
+    state.media_limits = Arc::new(
+        GatewayMediaLimits::from_env()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+    );
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, openai_router(state)).await
 }
@@ -2269,15 +2904,90 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 
+fn parse_catalog_endpoint_request<T: DeserializeOwned>(
+    state: &GatewayState,
+    raw_request: &Value,
+    endpoint_family: &str,
+) -> Result<T, ApiError> {
+    let model_id = endpoint_request_model(raw_request)?;
+    validate_catalog_endpoint_request(state, model_id, endpoint_family, raw_request)?;
+    serde_json::from_value(raw_request.clone()).map_err(|err| {
+        ApiError::bad_request(format!("invalid endpoint request: {err}"), Some("request"))
+    })
+}
+
+fn validate_catalog_endpoint_request(
+    state: &GatewayState,
+    model_id: &str,
+    endpoint_family: &str,
+    raw_request: &Value,
+) -> Result<(), ApiError> {
+    let model = require_model(state, model_id)?;
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                format!(
+                    "model {} does not expose endpoint family {endpoint_family}",
+                    model.id
+                ),
+                Some("model"),
+            )
+        })?;
+    if let Err(violations) = mayhem_proto::validate_endpoint_request(contract, raw_request) {
+        let summary = violations
+            .iter()
+            .take(4)
+            .map(|violation| format!("{}: {}", violation.path, violation.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad_request(
+            format!("request violates the signed model endpoint contract: {summary}"),
+            Some("request"),
+        ));
+    }
+    Ok(())
+}
+
+fn endpoint_request_model(raw_request: &Value) -> Result<&str, ApiError> {
+    raw_request
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("request missing model", Some("model")))
+}
+
 async fn create_chat_completion(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(raw_request): Json<Value>,
 ) -> Response {
-    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
+    let endpoint_family = match chat_endpoint_family(&state, model_id, &raw_request) {
+        Ok(family) => family,
+        Err(err) => return err.into_response(),
+    };
+    let mut request = match parse_catalog_endpoint_request::<ChatCompletionRequest>(
+        &state,
+        &raw_request,
+        &endpoint_family,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    request.endpoint_family = Some(endpoint_family);
+    request.endpoint_request = Some(raw_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -2291,15 +3001,113 @@ async fn create_chat_completion(
     }
 }
 
+fn chat_endpoint_family(
+    state: &GatewayState,
+    model_id: &str,
+    raw_request: &Value,
+) -> Result<String, ApiError> {
+    let model = require_model(state, model_id)?;
+    let has_family = |family: &str| {
+        model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == family)
+    };
+    let has_video = raw_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("video"));
+    if has_video {
+        if has_family(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT) {
+            return Ok(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT.to_owned());
+        }
+        return Err(ApiError::bad_request(
+            format!(
+                "model {} does not expose the signed video-chat endpoint family",
+                model.id
+            ),
+            Some("messages"),
+        ));
+    }
+    if has_family(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS) {
+        return Ok(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS.to_owned());
+    }
+    if has_family(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT) {
+        return Ok(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT.to_owned());
+    }
+    Err(ApiError::bad_request(
+        format!("model {} does not expose a chat endpoint family", model.id),
+        Some("model"),
+    ))
+}
+
 async fn create_completion(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    Json(raw_request): Json<Value>,
 ) -> Response {
-    if let Err(err) = state.authorize_gateway_request(&headers, Some(&request.model)) {
-        return err.into_response();
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let request = match parse_catalog_endpoint_request::<CompletionRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    options.access_token = access_token;
+    match build_completion(state.clone(), request, raw_request, options).await {
+        Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+        Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+        Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
+        Err(err) => err.into_response(),
     }
-    match build_completion(&state, request) {
+}
+
+async fn create_response(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let request = match parse_catalog_endpoint_request::<ResponsesRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    options.access_token = access_token;
+    match build_response(state.clone(), request, raw_request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
@@ -2310,12 +3118,26 @@ async fn create_completion(
 async fn create_embedding(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<EmbeddingRequest>,
+    Json(raw_request): Json<Value>,
 ) -> Response {
-    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
+    let mut request = match parse_catalog_endpoint_request::<EmbeddingRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS.to_owned());
+    request.endpoint_request = Some(raw_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -2330,12 +3152,26 @@ async fn create_embedding(
 async fn create_image_generation(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<ImageGenerationRequest>,
+    Json(raw_request): Json<Value>,
 ) -> Response {
-    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
+    let mut request = match parse_catalog_endpoint_request::<ImageGenerationRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS.to_owned());
+    request.endpoint_request = Some(raw_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -2347,15 +3183,337 @@ async fn create_image_generation(
     }
 }
 
-async fn create_audio_speech(
+async fn create_video_generation(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<AudioSpeechRequest>,
+    Json(raw_request): Json<Value>,
 ) -> Response {
-    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+    match execute_artifact_generation_endpoint(
+        &state,
+        &headers,
+        raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+    )
+    .await
+    {
+        Ok((request, run)) => match state.store_completed_video(&request, &run) {
+            Ok(metadata) => Json(metadata).into_response(),
+            Err(err) => err.into_response(),
+        },
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_audio_generation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    match execute_artifact_generation_endpoint(
+        &state,
+        &headers,
+        raw_request,
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+    )
+    .await
+    {
+        Ok((request, run)) => {
+            Json(artifact_generation_response_value(&request, &run)).into_response()
+        }
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_music_generation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    match execute_artifact_generation_endpoint(
+        &state,
+        &headers,
+        raw_request,
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+    )
+    .await
+    {
+        Ok((request, run)) => {
+            Json(artifact_generation_response_value(&request, &run)).into_response()
+        }
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn execute_artifact_generation_endpoint(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    raw_request: Value,
+    endpoint_family: &str,
+) -> Result<(ArtifactGenerationRequest, CompletedArtifactGeneration), ApiError> {
+    let model_id = endpoint_request_model(&raw_request)?.to_owned();
+    let access_token = state.authorize_gateway_request(headers, Some(&model_id))?;
+    validate_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
+    let request = artifact_generation_request(&model_id, endpoint_family, raw_request)?;
+    let mut options = state.request_options_from_headers(headers)?;
+    options.access_token = access_token;
+    let run = build_artifact_generation(state, request.clone(), options).await?;
+    Ok((request, run))
+}
+
+impl GatewayState {
+    fn store_completed_video(
+        &self,
+        request: &ArtifactGenerationRequest,
+        run: &CompletedArtifactGeneration,
+    ) -> Result<Value, ApiError> {
+        let artifact = run.output.artifacts.first().cloned().ok_or_else(|| {
+            ApiError::bad_gateway("video generation response is empty", Some("model"))
+        })?;
+        if !artifact.content_type.starts_with("video/") {
+            return Err(ApiError::bad_gateway(
+                format!(
+                    "video provider returned non-video content type {}",
+                    artifact.content_type
+                ),
+                Some("model"),
+            ));
+        }
+        let now = now_secs();
+        let id = video_job_id(&run.session_id);
+        let metadata = video_generation_metadata(
+            request,
+            run,
+            &id,
+            now,
+            self.retention_limits.video_ttl_seconds,
+        );
+        self.video_jobs
+            .lock_recover("video lifecycle store")
+            .insert(
+                StoredVideoJob {
+                    id,
+                    model: request.model.clone(),
+                    metadata: metadata.clone(),
+                    artifact,
+                    access_token: run.access_token.clone(),
+                    expires_at: now.saturating_add(self.retention_limits.video_ttl_seconds),
+                },
+                self.retention_limits.video_jobs,
+                self.retention_limits.video_bytes,
+                now,
+            )
+            .map_err(ApiError::internal_message)?;
+        Ok(metadata)
+    }
+
+    fn video_job(&self, id: &str) -> Option<StoredVideoJob> {
+        let now = now_secs();
+        let mut store = self.video_jobs.lock_recover("video lifecycle store");
+        store.purge_expired(now);
+        store.jobs.iter().find(|job| job.id == id).cloned()
+    }
+}
+
+fn requester_owns_video(
+    job: &StoredVideoJob,
+    access_token: &Option<GatewayTokenAttribution>,
+) -> Result<(), ApiError> {
+    if &job.access_token == access_token {
+        Ok(())
+    } else {
+        Err(ApiError::not_found(
+            "video job was not found",
+            Some("video_id"),
+        ))
+    }
+}
+
+async fn list_video_generations(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<VideoListQuery>,
+) -> Response {
+    let access_token = match state.authorize_gateway_request(&headers, None) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return ApiError::bad_request("limit must be between 1 and 100", Some("limit"))
+            .into_response();
+    }
+    let descending = match query.order.as_deref().unwrap_or("desc") {
+        "desc" => true,
+        "asc" => false,
+        _ => {
+            return ApiError::bad_request("order must be asc or desc", Some("order"))
+                .into_response()
+        }
+    };
+    let mut jobs = {
+        let now = now_secs();
+        let mut store = state.video_jobs.lock_recover("video lifecycle store");
+        store.purge_expired(now);
+        store
+            .jobs
+            .iter()
+            .filter(|job| job.access_token == access_token)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if descending {
+        jobs.reverse();
+    }
+    let start = if let Some(after) = query.after.as_deref() {
+        match jobs.iter().position(|job| job.id == after) {
+            Some(index) => index.saturating_add(1),
+            None => {
+                return ApiError::bad_request("after cursor was not found", Some("after"))
+                    .into_response()
+            }
+        }
+    } else {
+        0
+    };
+    let has_more = jobs.len().saturating_sub(start) > limit;
+    let data = jobs
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|job| job.metadata)
+        .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(|job| job.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_id = data
+        .last()
+        .and_then(|job| job.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": has_more,
+    }))
+    .into_response()
+}
+
+async fn retrieve_video_generation(
+    State(state): State<SharedState>,
+    Path(video_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(job) = state.video_job(&video_id) else {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    match requester_owns_video(&job, &access_token) {
+        Ok(()) => Json(job.metadata).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn delete_video_generation(
+    State(state): State<SharedState>,
+    Path(video_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(job) = state.video_job(&video_id) else {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = requester_owns_video(&job, &access_token) {
+        return err.into_response();
+    }
+    let Some(removed) = state
+        .video_jobs
+        .lock_recover("video lifecycle store")
+        .remove(&video_id, now_secs())
+    else {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    };
+    let mut metadata = removed.metadata;
+    metadata["deleted"] = json!(true);
+    Json(metadata).into_response()
+}
+
+async fn retrieve_video_generation_content(
+    State(state): State<SharedState>,
+    Path(video_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<VideoContentQuery>,
+) -> Response {
+    if !matches!(query.variant.as_deref(), None | Some("video")) {
+        return ApiError::bad_request(
+            "only variant=video is available for open-model video artifacts",
+            Some("variant"),
+        )
+        .into_response();
+    }
+    let Some(job) = state.video_job(&video_id) else {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = requester_owns_video(&job, &access_token) {
+        return err.into_response();
+    }
+    let mut response = Body::from(job.artifact.bytes).into_response();
+    let content_type = match HeaderValue::from_str(&job.artifact.content_type) {
+        Ok(content_type) => content_type,
+        Err(err) => {
+            return ApiError::internal_message(format!(
+                "stored video content type is invalid: {err}"
+            ))
+            .into_response()
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    if let Ok(blake3) = HeaderValue::from_str(&job.artifact.blake3) {
+        response
+            .headers_mut()
+            .insert("x-mayhem-artifact-blake3", blake3);
+    }
+    response
+}
+
+async fn create_audio_speech(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let mut request = match parse_catalog_endpoint_request::<AudioSpeechRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH.to_owned());
+    request.endpoint_request = Some(raw_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -2386,6 +3544,14 @@ async fn create_audio_transcription(
                 Ok(access_token) => access_token,
                 Err(err) => return err.into_response(),
             };
+            if let Err(err) = validate_catalog_endpoint_request(
+                &state,
+                &request.model,
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+                &request.contract_request,
+            ) {
+                return err.into_response();
+            }
             options.access_token = access_token;
             match build_audio_transcription(&state, request, options).await {
                 Ok(value) => Json(value).into_response(),
@@ -2396,6 +3562,639 @@ async fn create_audio_transcription(
     }
 }
 
+async fn create_hf_inference(
+    State(state): State<SharedState>,
+    Path(model_path): Path<String>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    let (model_id, endpoint_family) = match hf_inference_target(&state, &model_path) {
+        Ok(target) => target,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(&model_id)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) =
+        validate_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
+    {
+        return err.into_response();
+    }
+    let mut options = match state.request_options_from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    options.access_token = access_token;
+
+    match endpoint_family.as_str() {
+        mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
+            let request = match hf_embedding_request(&model_id, raw_request) {
+                Ok(request) => request,
+                Err(err) => return err.into_response(),
+            };
+            match build_embedding(&state, request, options).await {
+                Ok(value) => match hf_embedding_response(value) {
+                    Ok(value) => Json(value).into_response(),
+                    Err(err) => err.into_response(),
+                },
+                Err(err) => err.into_response(),
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
+            let request = match hf_image_generation_request(&model_id, raw_request) {
+                Ok(request) => request,
+                Err(err) => return err.into_response(),
+            };
+            match build_image_generation(&state, request, options).await {
+                Ok(value) => match hf_image_response(value) {
+                    Ok(response) => response,
+                    Err(err) => err.into_response(),
+                },
+                Err(err) => err.into_response(),
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+            let request = match hf_audio_speech_request(&model_id, raw_request) {
+                Ok(request) => request,
+                Err(err) => return err.into_response(),
+            };
+            match build_audio_speech(&state, request, options).await {
+                Ok(response) => response,
+                Err(err) => err.into_response(),
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+            let request = match hf_audio_transcription_request(&model_id, raw_request) {
+                Ok(request) => request,
+                Err(err) => return err.into_response(),
+            };
+            match build_audio_transcription(&state, request, options).await {
+                Ok(value) => Json(value).into_response(),
+                Err(err) => err.into_response(),
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
+            let request =
+                match artifact_generation_request(&model_id, &endpoint_family, raw_request) {
+                    Ok(request) => request,
+                    Err(err) => return err.into_response(),
+                };
+            match build_artifact_generation(&state, request.clone(), options).await {
+                Ok(run) => match artifact_generation_raw_response(&request, &run) {
+                    Ok(response) => response,
+                    Err(err) => err.into_response(),
+                },
+                Err(err) => err.into_response(),
+            }
+        }
+        _ => ApiError::bad_request(
+            format!("endpoint family {endpoint_family} is not an HF task route"),
+            Some("model"),
+        )
+        .into_response(),
+    }
+}
+
+fn hf_inference_target(
+    state: &GatewayState,
+    model_path: &str,
+) -> Result<(String, String), ApiError> {
+    let path = model_path.trim_start_matches('/');
+    let (model_id, forced_family) = path
+        .strip_suffix("/pipeline/feature-extraction")
+        .map(|model| (model, Some(mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION)))
+        .unwrap_or((path, None));
+    if model_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "HF route missing model",
+            Some("model"),
+        ));
+    }
+    let model = require_model(state, model_id)?;
+    if let Some(family) = forced_family {
+        if model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == family)
+        {
+            return Ok((model.id, family.to_owned()));
+        }
+        return Err(ApiError::bad_request(
+            format!(
+                "model {} does not expose endpoint family {family}",
+                model.id
+            ),
+            Some("model"),
+        ));
+    }
+
+    let candidates = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .filter(|contract| {
+            matches!(
+                contract.family.as_str(),
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+                    | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+                    | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+                    | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+                    | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+            )
+        })
+        .map(|contract| contract.family.clone())
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [family] => Ok((model.id, family.clone())),
+        [] => Err(ApiError::bad_request(
+            format!("model {} has no HF task endpoint", model.id),
+            Some("model"),
+        )),
+        _ => Err(ApiError::bad_request(
+            format!(
+                "model {} has ambiguous HF task endpoints: {}",
+                model.id,
+                candidates.join(", ")
+            ),
+            Some("model"),
+        )),
+    }
+}
+
+fn hf_embedding_request(model_id: &str, raw_request: Value) -> Result<EmbeddingRequest, ApiError> {
+    let input = raw_request
+        .get("inputs")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?;
+    let dimensions = raw_request
+        .get("dimensions")
+        .and_then(Value::as_u64)
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("dimensions is too large", Some("dimensions")))?;
+    Ok(EmbeddingRequest {
+        model: model_id.to_owned(),
+        input,
+        encoding_format: Some("float".to_owned()),
+        dimensions,
+        user: None,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION.to_owned()),
+        endpoint_request: Some(raw_request),
+    })
+}
+
+fn hf_embedding_response(value: Value) -> Result<Value, ApiError> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad_gateway("embedding response missing data", Some("model")))?;
+    Ok(Value::Array(
+        data.iter()
+            .map(|item| {
+                item.get("embedding").cloned().ok_or_else(|| {
+                    ApiError::bad_gateway("embedding response item missing vector", Some("model"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn hf_image_generation_request(
+    model_id: &str,
+    raw_request: Value,
+) -> Result<ImageGenerationRequest, ApiError> {
+    let prompt = raw_request
+        .get("inputs")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?
+        .to_owned();
+    let parameters = raw_request.get("parameters").unwrap_or(&Value::Null);
+    let width = parameters.get("width").and_then(Value::as_u64);
+    let height = parameters.get("height").and_then(Value::as_u64);
+    if width.is_some() != height.is_some() {
+        return Err(ApiError::bad_request(
+            "parameters.width and parameters.height must be supplied together",
+            Some("parameters"),
+        ));
+    }
+    let size = width
+        .zip(height)
+        .map(|(width, height)| format!("{width}x{height}"));
+    Ok(ImageGenerationRequest {
+        model: model_id.to_owned(),
+        prompt,
+        n: Some(1),
+        size,
+        response_format: Some("b64_json".to_owned()),
+        quality: None,
+        style: None,
+        negative_prompt: parameters
+            .get("negative_prompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        steps: parameters
+            .get("num_inference_steps")
+            .and_then(Value::as_u64),
+        cfg_scale: parameters
+            .get("guidance_scale")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+        seed: parameters.get("seed").and_then(Value::as_i64),
+        scheduler: parameters
+            .get("scheduler")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        user: None,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE.to_owned()),
+        endpoint_request: Some(raw_request),
+    })
+}
+
+fn hf_image_response(value: Value) -> Result<Response, ApiError> {
+    let encoded = value
+        .pointer("/data/0/b64_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_gateway("image response missing bytes", Some("model")))?;
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|err| {
+        ApiError::bad_gateway(
+            format!("image response has invalid base64: {err}"),
+            Some("model"),
+        )
+    })?;
+    let content_type = value
+        .pointer("/mayhem/artifacts/0/content_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let mut response = Body::from(bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type).map_err(|err| {
+            ApiError::bad_gateway(format!("invalid image content type: {err}"), Some("model"))
+        })?,
+    );
+    Ok(response)
+}
+
+fn hf_audio_speech_request(
+    model_id: &str,
+    raw_request: Value,
+) -> Result<AudioSpeechRequest, ApiError> {
+    let input = raw_request
+        .get("inputs")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?
+        .to_owned();
+    let parameters = raw_request.get("parameters").unwrap_or(&Value::Null);
+    let voice = parameters
+        .get("voice")
+        .or_else(|| parameters.get("speaker_id"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_i64().map(|value| value.to_string()))
+        });
+    Ok(AudioSpeechRequest {
+        model: model_id.to_owned(),
+        input,
+        voice,
+        response_format: Some("wav".to_owned()),
+        speed: parameters.get("speed").and_then(Value::as_f64),
+        instructions: None,
+        stream_format: None,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH.to_owned()),
+        endpoint_request: Some(raw_request),
+    })
+}
+
+fn hf_audio_transcription_request(
+    model_id: &str,
+    raw_request: Value,
+) -> Result<AudioTranscriptionRequest, ApiError> {
+    let encoded = raw_request
+        .get("inputs")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?;
+    let audio = BASE64_STANDARD.decode(encoded).map_err(|err| {
+        ApiError::bad_request(
+            format!("inputs is not valid base64 audio: {err}"),
+            Some("inputs"),
+        )
+    })?;
+    let temperature = raw_request
+        .pointer("/parameters/generation_parameters/temperature")
+        .and_then(Value::as_f64);
+    Ok(AudioTranscriptionRequest {
+        model: model_id.to_owned(),
+        audio,
+        content_type: Some("audio/wav".to_owned()),
+        filename: Some("audio.wav".to_owned()),
+        response_format: Some("json".to_owned()),
+        language: None,
+        prompt: None,
+        temperature,
+        timestamp_granularities: Vec::new(),
+        stream: false,
+        endpoint_family: mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION.to_owned(),
+        contract_request: raw_request,
+    })
+}
+
+fn artifact_generation_request(
+    model_id: &str,
+    endpoint_family: &str,
+    raw_request: Value,
+) -> Result<ArtifactGenerationRequest, ApiError> {
+    let parameters = raw_request.get("parameters").and_then(Value::as_object);
+    let prompt_key = if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    ) {
+        "inputs"
+    } else {
+        "prompt"
+    };
+    let prompt = raw_request
+        .get(prompt_key)
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("request missing prompt", Some(prompt_key)))?
+        .to_owned();
+    let duration_seconds = raw_request
+        .get("duration_seconds")
+        .and_then(generation_duration_seconds_ceil)
+        .or_else(|| {
+            parameters
+                .and_then(|parameters| parameters.get("duration_seconds"))
+                .and_then(generation_duration_seconds_ceil)
+        })
+        .or_else(|| {
+            raw_request
+                .get("seconds")
+                .and_then(generation_duration_seconds_ceil)
+        });
+    let requested_frames = parameters
+        .and_then(|parameters| parameters.get("num_frames"))
+        .and_then(Value::as_u64);
+    let (output_modality, transport_kind, duration_seconds, frame_count, response_format) =
+        match endpoint_family {
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
+                let duration = duration_seconds.unwrap_or(4).max(1);
+                (
+                    "video",
+                    "video_generation",
+                    duration,
+                    duration.saturating_mul(DEFAULT_VIDEO_GENERATION_FPS),
+                    "mp4",
+                )
+            }
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+                let frames = requested_frames.unwrap_or(16).max(1);
+                let duration = duration_seconds.unwrap_or_else(|| {
+                    let fps = parameters
+                        .and_then(|parameters| parameters.get("fps"))
+                        .and_then(Value::as_f64)
+                        .filter(|fps| fps.is_finite() && *fps > 0.0)
+                        .unwrap_or(8.0);
+                    ((frames as f64) / fps).ceil().max(1.0) as u64
+                });
+                ("video", "video_generation", duration, frames, "mp4")
+            }
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
+                "audio",
+                "music_generation",
+                duration_seconds.unwrap_or(1).max(1),
+                0,
+                raw_request
+                    .get("response_format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("wav"),
+            ),
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
+                "audio",
+                "audio_generation",
+                duration_seconds.unwrap_or(1).max(1),
+                0,
+                raw_request
+                    .get("response_format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("wav"),
+            ),
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => (
+                "audio",
+                "audio_generation",
+                duration_seconds.unwrap_or(1).max(1),
+                0,
+                "wav",
+            ),
+            _ => {
+                return Err(ApiError::bad_request(
+                    format!("endpoint family {endpoint_family} is not an artifact generation API"),
+                    Some("model"),
+                ))
+            }
+        };
+    let step_count = parameters
+        .and_then(|parameters| parameters.get("num_inference_steps"))
+        .and_then(Value::as_u64)
+        .or_else(|| raw_request.get("max_new_tokens").and_then(Value::as_u64))
+        .unwrap_or(1)
+        .max(1);
+    let response_format = response_format.to_owned();
+    Ok(ArtifactGenerationRequest {
+        model: model_id.to_owned(),
+        prompt,
+        endpoint_family: endpoint_family.to_owned(),
+        contract_request: raw_request,
+        output_modality: output_modality.to_owned(),
+        transport_kind: transport_kind.to_owned(),
+        duration_seconds,
+        frame_count,
+        step_count,
+        response_format,
+    })
+}
+
+fn generation_duration_seconds_ceil(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|value| *value > 0)
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
+                .map(|value| value.ceil() as u64)
+        })
+}
+
+fn artifact_generation_response_value(
+    request: &ArtifactGenerationRequest,
+    run: &CompletedArtifactGeneration,
+) -> Value {
+    let output = &run.output;
+    let artifact = output.artifacts.first();
+    let id = artifact
+        .map(|artifact| {
+            format!(
+                "{}-{}",
+                request.output_modality,
+                artifact.blake3.get(..16).unwrap_or(&artifact.blake3)
+            )
+        })
+        .unwrap_or_else(|| make_id("artifact"));
+    let encoded = artifact
+        .map(|artifact| BASE64_STANDARD.encode(&artifact.bytes))
+        .unwrap_or_default();
+    let content_type = artifact
+        .map(|artifact| artifact.content_type.as_str())
+        .unwrap_or("application/octet-stream");
+    let mayhem = json!({
+        "backend": run.backend,
+        "direct_session": run.direct_session,
+        "billable": run.billable,
+        "session_id": run.session_id,
+        "artifact_blake3": artifact.map(|artifact| artifact.blake3.as_str()),
+        "quality": run.quality.map(|quality| json!({
+            "ttft_ms": quality.ttft_ms,
+            "tok_s": quality.tok_s,
+        })),
+        "receipt": run.receipt,
+    });
+    match request.endpoint_family.as_str() {
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS => video_generation_metadata(
+            request,
+            run,
+            &video_job_id(&run.session_id),
+            now_secs(),
+            DEFAULT_GATEWAY_VIDEO_TTL_SECONDS,
+        ),
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => json!({
+            "id": id,
+            "object": "music.generation",
+            "music": encoded,
+            "content_type": content_type,
+            "usage": output.usage,
+            "mayhem": mayhem,
+        }),
+        _ => json!({
+            "id": id,
+            "object": "audio.generation",
+            "audio": encoded,
+            "content_type": content_type,
+            "usage": output.usage,
+            "mayhem": mayhem,
+        }),
+    }
+}
+
+fn video_job_id(session_id: &str) -> String {
+    let digest = blake3_hex(format!("mayhem-video-job:{session_id}").as_bytes());
+    format!("video_{}", &digest[..24])
+}
+
+fn video_generation_metadata(
+    request: &ArtifactGenerationRequest,
+    run: &CompletedArtifactGeneration,
+    id: &str,
+    created_at: u64,
+    ttl_seconds: u64,
+) -> Value {
+    let artifact = run.output.artifacts.first();
+    json!({
+        "id": id,
+        "object": "video",
+        "model": request.model,
+        "status": "completed",
+        "progress": 100,
+        "created_at": created_at,
+        "completed_at": created_at,
+        "expires_at": created_at.saturating_add(ttl_seconds),
+        "error": Value::Null,
+        "prompt": request.prompt,
+        "size": request.contract_request.get("size").cloned().unwrap_or_else(|| json!("720x1280")),
+        "seconds": request.duration_seconds.to_string(),
+        "usage": run.output.usage,
+        "mayhem": {
+            "backend": run.backend,
+            "direct_session": run.direct_session,
+            "billable": run.billable,
+            "session_id": run.session_id,
+            "artifact_blake3": artifact.map(|artifact| artifact.blake3.as_str()),
+            "quality": run.quality.map(|quality| json!({
+                "ttft_ms": quality.ttft_ms,
+                "tok_s": quality.tok_s,
+            })),
+            "receipt": run.receipt,
+        },
+    })
+}
+
+fn artifact_generation_raw_response(
+    request: &ArtifactGenerationRequest,
+    run: &CompletedArtifactGeneration,
+) -> Result<Response, ApiError> {
+    let artifact = run.output.artifacts.first().ok_or_else(|| {
+        ApiError::bad_gateway("artifact generation response is empty", Some("model"))
+    })?;
+    let mut response = Body::from(artifact.bytes.clone()).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.content_type).map_err(|err| {
+            ApiError::bad_gateway(
+                format!("invalid artifact content type: {err}"),
+                Some("model"),
+            )
+        })?,
+    );
+    response.headers_mut().insert(
+        "x-mayhem-backend",
+        HeaderValue::from_str(&run.backend)
+            .map_err(|err| ApiError::bad_gateway(format!("invalid backend header: {err}"), None))?,
+    );
+    response.headers_mut().insert(
+        "x-mayhem-direct-session",
+        HeaderValue::from_static(if run.direct_session { "true" } else { "false" }),
+    );
+    response.headers_mut().insert(
+        "x-mayhem-usage",
+        HeaderValue::from_str(
+            &serde_json::to_string(&run.output.usage).map_err(ApiError::internal)?,
+        )
+        .map_err(|err| ApiError::bad_gateway(format!("invalid usage header: {err}"), None))?,
+    );
+    if let Some(receipt) = &run.receipt {
+        response.headers_mut().insert(
+            "x-mayhem-receipt",
+            HeaderValue::from_str(&receipt.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid receipt header: {err}"), None)
+            })?,
+        );
+    }
+    if request.endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+        let sample_rate = wav_sample_rate(&artifact.bytes).ok_or_else(|| {
+            ApiError::bad_gateway(
+                "HF text-to-audio response is not a valid WAV",
+                Some("model"),
+            )
+        })?;
+        response.headers_mut().insert(
+            "x-mayhem-sampling-rate",
+            HeaderValue::from_str(&sample_rate.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid sampling-rate header: {err}"), None)
+            })?,
+        );
+    }
+    Ok(response)
+}
+
 #[derive(Debug, Deserialize)]
 struct DashboardQuery {
     token: Option<String>,
@@ -2404,6 +4203,7 @@ struct DashboardQuery {
     tf: Option<String>,
     bucket: Option<String>,
     quant: Option<String>,
+    unit: Option<String>,
     pin: Option<String>,
 }
 
@@ -2485,6 +4285,7 @@ struct DashboardChartOptions {
     selected_timeframe: DashboardPriceTimeframe,
     selected_bucket: Option<String>,
     selected_quant: Option<String>,
+    selected_unit: Option<String>,
     pinned_models: Vec<String>,
     provider_filter: Option<String>,
 }
@@ -2741,6 +4542,12 @@ fn dashboard_chart_options(
                 .as_deref()
                 .map(normalize_quant_bucket)
                 .and_then(Result::ok),
+            selected_unit: query
+                .unit
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
             pinned_models: pins.models,
             provider_filter: query
                 .provider
@@ -3524,6 +5331,11 @@ fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
     if model.mayhem.caps.audio {
         abilities.insert("audio".to_owned());
     }
+    for contract in &model.mayhem.adapter.endpoint_families {
+        if !contract.family.trim().is_empty() {
+            abilities.insert(format!("api:{}", contract.family.trim()));
+        }
+    }
     abilities.insert(format!("ctx {}", model.mayhem.caps.ctx));
     abilities.into_iter().collect()
 }
@@ -3550,6 +5362,11 @@ fn dashboard_route_abilities(
     }
     if caps.vision {
         abilities.insert("vision".to_owned());
+    }
+    for modality in &caps.served_modalities {
+        if !modality.trim().is_empty() {
+            abilities.insert(modality.trim().to_owned());
+        }
     }
     abilities.insert(format!("ctx {}", caps.ctx));
     abilities.into_iter().collect()
@@ -3603,8 +5420,16 @@ fn dashboard_route_engine(model: &GatewayModel, candidate: &GatewayRouteCandidat
         .or_else(|| candidate.caps.get("backend"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(model.mayhem.adapter.request_shape_family.as_str())
+        .unwrap_or_else(|| primary_endpoint_family(&model.mayhem.adapter))
         .to_owned()
+}
+
+fn primary_endpoint_family(adapter: &ShapeAdapterInfo) -> &str {
+    adapter
+        .endpoint_families
+        .first()
+        .map(|contract| contract.family.as_str())
+        .unwrap_or("invalid-missing-endpoint-family")
 }
 
 fn dashboard_route_rails(candidate: &GatewayRouteCandidate) -> String {
@@ -3789,7 +5614,7 @@ fn dashboard_provider_candidates(
                 model_id: model.id.clone(),
                 enclave_id: candidate.enclave_id.clone(),
                 room_id: candidate.room_id.clone(),
-                backend: model.mayhem.adapter.request_shape_family.clone(),
+                backend: primary_endpoint_family(&model.mayhem.adapter).to_owned(),
                 att_tier: candidate.att_tier,
                 kyb: candidate.kyb.clone(),
             });
@@ -4480,6 +6305,8 @@ struct DashboardPricePoint {
 struct DashboardPriceSeries {
     tier: String,
     quant: String,
+    unit: String,
+    granularity: u64,
     ctx_bracket: String,
     price_ver: u64,
     points: Vec<DashboardPricePoint>,
@@ -4561,6 +6388,10 @@ fn dashboard_price_chart_card(
         .selected_quant
         .as_deref()
         .unwrap_or(DEFAULT_QUANT_BUCKET);
+    let fallback_unit = options
+        .selected_unit
+        .as_deref()
+        .unwrap_or(USAGE_INPUT_TOKEN);
     let fallback_bucket = options.selected_bucket.as_deref().unwrap_or("base");
     let empty_pin_href = dashboard_chart_href(
         options,
@@ -4568,6 +6399,7 @@ fn dashboard_price_chart_card(
         options.selected_timeframe,
         Some(fallback_bucket),
         Some(fallback_quant),
+        Some(fallback_unit),
         Some(&next_pins),
     );
     if series.is_empty() {
@@ -4606,8 +6438,25 @@ fn dashboard_price_chart_card(
         .into_iter()
         .filter(|entry| entry.quant == selected_quant)
         .collect::<Vec<_>>();
+    let units =
+        dashboard_unique_series_values(quant_series.iter().map(|entry| entry.unit.as_str()));
+    let selected_unit = options
+        .selected_unit
+        .as_ref()
+        .filter(|unit| units.iter().any(|entry| entry == *unit))
+        .cloned()
+        .unwrap_or_else(|| {
+            units
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "request".to_owned())
+        });
+    let unit_series = quant_series
+        .into_iter()
+        .filter(|entry| entry.unit == selected_unit)
+        .collect::<Vec<_>>();
     let buckets =
-        dashboard_unique_series_values(quant_series.iter().map(|entry| entry.ctx_bracket.as_str()));
+        dashboard_unique_series_values(unit_series.iter().map(|entry| entry.ctx_bracket.as_str()));
     let selected_bucket = options
         .selected_bucket
         .as_ref()
@@ -4619,12 +6468,12 @@ fn dashboard_price_chart_card(
                 .cloned()
                 .unwrap_or_else(|| "base".to_owned())
         });
-    let selected = quant_series
+    let selected = unit_series
         .iter()
         .find(|entry| entry.ctx_bracket == selected_bucket)
         .copied()
-        .unwrap_or(quant_series[0]);
-    let overlays = quant_series
+        .unwrap_or(unit_series[0]);
+    let overlays = unit_series
         .iter()
         .filter(|entry| entry.ctx_bracket != selected.ctx_bracket)
         .copied()
@@ -4635,6 +6484,7 @@ fn dashboard_price_chart_card(
         options.selected_timeframe,
         Some(&selected_bucket),
         Some(&selected_quant),
+        Some(&selected_unit),
         Some(&next_pins),
     );
     let controls = dashboard_price_chart_controls(
@@ -4643,6 +6493,8 @@ fn dashboard_price_chart_card(
         &selected_tier,
         &quants,
         &selected_quant,
+        &units,
+        &selected_unit,
         &buckets,
         &selected_bucket,
     );
@@ -4652,18 +6504,29 @@ fn dashboard_price_chart_card(
         .map(|point| point.epoch.to_string())
         .unwrap_or_else(|| "?".to_owned());
     let latest_price = latest
-        .map(|point| format!("{} / 1k", format_au_usd(point.price_au)))
+        .map(|point| {
+            format!(
+                "{} / {} {}",
+                format_au_usd(point.price_au),
+                selected.granularity,
+                selected.unit
+            )
+        })
         .unwrap_or_else(|| "pending".to_owned());
     let volume = latest
         .map(|point| format!("{} volume", format_au_usd(point.volume_au)))
         .unwrap_or_else(|| "$0.00 volume".to_owned());
     format!(
-        r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
+        r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {} · {} per {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{} / {}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
         html_escape(&model.id),
         html_escape(&selected_tier),
         html_escape(&selected_quant),
         html_escape(&selected.ctx_bracket),
+        selected.granularity,
+        html_escape(&selected.unit),
         html_escape(&pin_href),
+        html_escape(&selected.unit),
+        selected.granularity,
         html_escape(options.selected_timeframe.label()),
         html_escape(&selected.ctx_bracket),
         html_escape(&format!("price v{}", selected.price_ver)),
@@ -4690,6 +6553,8 @@ fn dashboard_price_chart_controls(
     selected_tier: &str,
     quants: &[String],
     selected_quant: &str,
+    units: &[String],
+    selected_unit: &str,
     buckets: &[String],
     selected_bucket: &str,
 ) -> String {
@@ -4702,6 +6567,7 @@ fn dashboard_price_chart_controls(
                 options.selected_timeframe,
                 Some(selected_bucket),
                 Some(selected_quant),
+                Some(selected_unit),
                 None,
             );
             dashboard_segment_link(tier, &href, tier == selected_tier)
@@ -4721,6 +6587,7 @@ fn dashboard_price_chart_controls(
             timeframe,
             Some(selected_bucket),
             Some(selected_quant),
+            Some(selected_unit),
             None,
         );
         dashboard_segment_link(
@@ -4739,9 +6606,25 @@ fn dashboard_price_chart_controls(
                 options.selected_timeframe,
                 Some(selected_bucket),
                 Some(quant),
+                Some(selected_unit),
                 None,
             );
             dashboard_segment_link(quant, &href, quant == selected_quant)
+        })
+        .collect::<String>();
+    let unit_links = units
+        .iter()
+        .map(|unit| {
+            let href = dashboard_chart_href(
+                options,
+                Some(selected_tier),
+                options.selected_timeframe,
+                Some(selected_bucket),
+                Some(selected_quant),
+                Some(unit),
+                None,
+            );
+            dashboard_segment_link(unit, &href, unit == selected_unit)
         })
         .collect::<String>();
     let bucket_links = buckets
@@ -4753,13 +6636,14 @@ fn dashboard_price_chart_controls(
                 options.selected_timeframe,
                 Some(bucket),
                 Some(selected_quant),
+                Some(selected_unit),
                 None,
             );
             dashboard_segment_link(bucket, &href, bucket == selected_bucket)
         })
         .collect::<String>();
     format!(
-        r#"<div class="price-chart-toolbar"><div class="price-chart-control"><span class="label">Tier</span><div class="segmented">{tier_links}</div></div><div class="price-chart-control"><span class="label">Timeframe</span><div class="segmented">{time_links}</div></div><div class="price-chart-control"><span class="label">Quant</span><div class="segmented">{quant_links}</div></div><div class="price-chart-control"><span class="label">Ctx bucket</span><div class="segmented">{bucket_links}</div></div></div>"#
+        r#"<div class="price-chart-toolbar"><div class="price-chart-control"><span class="label">Tier</span><div class="segmented">{tier_links}</div></div><div class="price-chart-control"><span class="label">Timeframe</span><div class="segmented">{time_links}</div></div><div class="price-chart-control"><span class="label">Quant</span><div class="segmented">{quant_links}</div></div><div class="price-chart-control"><span class="label">Unit</span><div class="segmented">{unit_links}</div></div><div class="price-chart-control"><span class="label">Ctx bucket</span><div class="segmented">{bucket_links}</div></div></div>"#
     )
 }
 
@@ -4778,6 +6662,7 @@ fn dashboard_chart_href(
     timeframe: DashboardPriceTimeframe,
     bucket: Option<&str>,
     quant: Option<&str>,
+    unit: Option<&str>,
     pin_override: Option<&[String]>,
 ) -> String {
     let mut query = Vec::new();
@@ -4793,6 +6678,9 @@ fn dashboard_chart_href(
     }
     if let Some(quant) = quant.filter(|value| !value.is_empty()) {
         query.push(format!("quant={}", dashboard_url_encode(quant)));
+    }
+    if let Some(unit) = unit.filter(|value| !value.is_empty()) {
+        query.push(format!("unit={}", dashboard_url_encode(unit)));
     }
     let pins = pin_override.unwrap_or(&options.pinned_models);
     if pin_override.is_some() {
@@ -4823,7 +6711,8 @@ fn dashboard_model_price_series(
     model: &GatewayModel,
     provider_scope: Option<&BTreeSet<String>>,
 ) -> Vec<DashboardPriceSeries> {
-    let mut by_key: BTreeMap<(String, String, String), DashboardPriceSeries> = BTreeMap::new();
+    let mut by_key: BTreeMap<(String, String, String, String), DashboardPriceSeries> =
+        BTreeMap::new();
     for candidate in &model.mayhem.route_candidates {
         if let Some(scope) = provider_scope {
             if !dashboard_provider_in_scope(scope, &candidate.provider) {
@@ -4834,20 +6723,22 @@ fn dashboard_model_price_series(
         let tier = format!("T{}", candidate.att_tier.max(1));
         let quant = normalize_quant_bucket(&candidate.quant)
             .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
-        let series = dashboard_price_series_from_price(price, &tier, &quant);
-        let key = (
-            series.tier.clone(),
-            series.quant.clone(),
-            series.ctx_bracket.clone(),
-        );
-        by_key
-            .entry(key)
-            .and_modify(|existing| {
-                if series.points.len() > existing.points.len() {
-                    *existing = series.clone();
-                }
-            })
-            .or_insert(series);
+        for series in dashboard_price_series_from_price(price, &tier, &quant) {
+            let key = (
+                series.tier.clone(),
+                series.quant.clone(),
+                series.unit.clone(),
+                series.ctx_bracket.clone(),
+            );
+            by_key
+                .entry(key)
+                .and_modify(|existing| {
+                    if series.points.len() > existing.points.len() {
+                        *existing = series.clone();
+                    }
+                })
+                .or_insert(series);
+        }
     }
     if by_key.is_empty() && provider_scope.is_none() {
         let tier = model
@@ -4864,15 +6755,17 @@ fn dashboard_model_price_series(
             .next()
             .cloned()
             .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned());
-        let series = dashboard_price_series_from_price(&model.mayhem.price_ref_au, &tier, &quant);
-        by_key.insert(
-            (
-                series.tier.clone(),
-                series.quant.clone(),
-                series.ctx_bracket.clone(),
-            ),
-            series,
-        );
+        for series in dashboard_price_series_from_price(&model.mayhem.price_ref_au, &tier, &quant) {
+            by_key.insert(
+                (
+                    series.tier.clone(),
+                    series.quant.clone(),
+                    series.unit.clone(),
+                    series.ctx_bracket.clone(),
+                ),
+                series,
+            );
+        }
     }
     by_key.into_values().collect()
 }
@@ -4881,8 +6774,32 @@ fn dashboard_price_series_from_price(
     price: &PriceRefAu,
     tier: &str,
     quant: &str,
+) -> Vec<DashboardPriceSeries> {
+    let fallback;
+    let rate_map = if price.rate_map.is_empty() {
+        fallback = vec![RateMapEntry {
+            unit: "request".to_owned(),
+            per_unit_au: price.per_req_au.max(price.min_session_au).max(1),
+            granularity: 1,
+        }];
+        fallback.as_slice()
+    } else {
+        price.rate_map.as_slice()
+    };
+    rate_map
+        .iter()
+        .filter(|rate| !rate.unit.trim().is_empty() && rate.granularity > 0)
+        .map(|rate| dashboard_price_series_for_unit(price, tier, quant, rate))
+        .collect()
+}
+
+fn dashboard_price_series_for_unit(
+    price: &PriceRefAu,
+    tier: &str,
+    quant: &str,
+    rate: &RateMapEntry,
 ) -> DashboardPriceSeries {
-    let mut points = dashboard_price_points_from_price(price);
+    let mut points = dashboard_price_points_from_price(price, rate);
     points.sort_by_key(|point| point.epoch);
     let ctx_bracket = points
         .last()
@@ -4897,14 +6814,19 @@ fn dashboard_price_series_from_price(
     DashboardPriceSeries {
         tier: tier.to_owned(),
         quant: quant.to_owned(),
+        unit: rate.unit.clone(),
+        granularity: rate.granularity,
         ctx_bracket,
         price_ver: price.ver,
         points,
     }
 }
 
-fn dashboard_price_points_from_price(price: &PriceRefAu) -> Vec<DashboardPricePoint> {
-    let fallback_price = dashboard_price_basis_au(price);
+fn dashboard_price_points_from_price(
+    price: &PriceRefAu,
+    rate: &RateMapEntry,
+) -> Vec<DashboardPricePoint> {
+    let fallback_price = rate.per_unit_au.max(1);
     let history = if price.history.is_empty() {
         price.derivation.iter().collect::<Vec<_>>()
     } else {
@@ -4913,18 +6835,31 @@ fn dashboard_price_points_from_price(price: &PriceRefAu) -> Vec<DashboardPricePo
     let mut points = history
         .into_iter()
         .enumerate()
-        .map(|(index, derivation)| {
+        .filter_map(|(index, derivation)| {
+            let (historical_price, historical_granularity) =
+                dashboard_derivation_unit_rate(derivation, &rate.unit)?;
             let volume_au = dashboard_derivation_volume_au(derivation);
             let pinned = dashboard_derivation_pinned(derivation, volume_au);
-            DashboardPricePoint {
+            Some(DashboardPricePoint {
                 epoch: derivation_u64(derivation, &["epoch"]).unwrap_or(index as u64),
-                price_au: dashboard_derivation_price_basis_au(derivation).unwrap_or(fallback_price),
+                price_au: dashboard_normalize_unit_rate(
+                    historical_price,
+                    historical_granularity,
+                    rate.granularity,
+                )
+                .max(1),
                 volume_au,
                 pinned,
                 ctx_bracket: dashboard_ctx_bracket_from_derivation(derivation)
                     .unwrap_or_else(|| "base".to_owned()),
-                title: dashboard_price_derivation_summary(derivation),
-            }
+                title: format!(
+                    "{} · {} / {} {}",
+                    dashboard_price_derivation_summary(derivation),
+                    format_au_usd(historical_price),
+                    historical_granularity,
+                    rate.unit
+                ),
+            })
         })
         .collect::<Vec<_>>();
     if points.is_empty() {
@@ -4934,57 +6869,71 @@ fn dashboard_price_points_from_price(price: &PriceRefAu) -> Vec<DashboardPricePo
             volume_au: 0,
             pinned: true,
             ctx_bracket: "base".to_owned(),
-            title: format!("price v{} · derivation pending", price.ver),
+            title: format!(
+                "price v{} · {} / {} {} · derivation pending",
+                price.ver,
+                format_au_usd(fallback_price),
+                rate.granularity,
+                rate.unit
+            ),
         });
     }
     points
 }
 
-fn dashboard_price_basis_au(price: &PriceRefAu) -> MoneyAu {
-    rate_map_cost_basis_per_1k(&price.rate_map)
-        .max(price.per_req_au)
-        .max(price.min_session_au)
-        .max(1)
-}
-
-fn dashboard_derivation_price_basis_au(derivation: &Value) -> Option<MoneyAu> {
+fn dashboard_derivation_unit_rate(derivation: &Value, unit: &str) -> Option<(MoneyAu, u64)> {
     for path in [
         &["result_price", "rate_map"][..],
         &["rate_map"][..],
         &["seed_price", "rate_map"][..],
     ] {
-        if let Some(rate_map) =
-            derivation_value(derivation, path).and_then(dashboard_rate_map_from_value)
+        if let Some(rate) = derivation_value(derivation, path)
+            .and_then(dashboard_rate_map_from_value)
+            .and_then(|rates| rates.into_iter().find(|rate| rate.unit == unit))
         {
-            let basis = rate_map_cost_basis_per_1k(&rate_map);
-            if basis > 0 {
-                return Some(basis);
-            }
+            return Some((rate.per_unit_au, rate.granularity));
         }
     }
-    if let Some(input) =
-        derivation_value(derivation, &["result_price", "in_per_1k"]).and_then(value_as_money_au)
-    {
+    if matches!(
+        unit,
+        USAGE_INPUT_TOKEN | USAGE_CACHED_INPUT_TOKEN | USAGE_OUTPUT_TOKEN
+    ) {
+        let input = derivation_value(derivation, &["result_price", "in_per_1k"])
+            .and_then(value_as_money_au)?;
         let output = derivation_value(derivation, &["result_price", "out_per_1k"])
             .and_then(value_as_money_au)
             .unwrap_or(0);
-        return Some(rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1));
+        let rate = text_generation_rate_map(input, output)
+            .into_iter()
+            .find(|rate| rate.unit == unit)?;
+        return Some((rate.per_unit_au, rate.granularity));
     }
-    for path in [
-        &["result_price", "price_basis_au"][..],
-        &["price_basis_au"][..],
-        &["result_price", "per_req_au"][..],
-        &["result_price", "min_session_au"][..],
-        &["price_au"][..],
-    ] {
-        if let Some(value) = derivation_value(derivation, path)
-            .and_then(value_as_money_au)
-            .filter(|value| *value > 0)
-        {
-            return Some(value);
+    if unit == "request" {
+        for path in [
+            &["result_price", "per_req_au"][..],
+            &["result_price", "min_session_au"][..],
+            &["per_req_au"][..],
+            &["min_session_au"][..],
+        ] {
+            if let Some(value) = derivation_value(derivation, path).and_then(value_as_money_au) {
+                return Some((value, 1));
+            }
         }
     }
     None
+}
+
+fn dashboard_normalize_unit_rate(
+    price_au: MoneyAu,
+    from_granularity: u64,
+    to_granularity: u64,
+) -> MoneyAu {
+    if price_au == 0 || from_granularity == 0 || to_granularity == 0 {
+        return price_au;
+    }
+    price_au
+        .saturating_mul(u128::from(to_granularity))
+        .div_ceil(u128::from(from_granularity))
 }
 
 fn dashboard_rate_map_from_value(value: &Value) -> Option<Vec<RateMapEntry>> {
@@ -5218,9 +7167,10 @@ fn dashboard_price_chart_svg(
     }
 
     format!(
-        r#"<svg class="price-chart-svg" viewBox="0 0 760 310" role="img" aria-label="{} {} price chart">{body}</svg>"#,
+        r#"<svg class="price-chart-svg" viewBox="0 0 760 310" role="img" aria-label="{} {} {} price chart">{body}</svg>"#,
         html_escape(&selected.tier),
         html_escape(&selected.ctx_bracket),
+        html_escape(&selected.unit),
     )
 }
 
@@ -5861,6 +7811,13 @@ struct DirectAudioTranscriptionSessionCollected {
     quality: Option<GatewaySessionQuality>,
 }
 
+#[derive(Clone, Debug)]
+struct DirectArtifactGenerationSessionCollected {
+    output: ArtifactGenerationOutput,
+    provider_receipt: ProviderSignedReceipt,
+    quality: Option<GatewaySessionQuality>,
+}
+
 struct GatewaySessionRun {
     result: GatewaySessionResult,
     invocation: GatewaySessionInvocation,
@@ -5896,6 +7853,13 @@ struct GatewayAudioTranscriptionRun {
     metering_output: AudioTranscriptionOutput,
 }
 
+struct GatewayArtifactGenerationRun {
+    result: GatewayArtifactGenerationResult,
+    invocation: GatewaySessionInvocation,
+    metering_request: ArtifactGenerationRequest,
+    metering_output: ArtifactGenerationOutput,
+}
+
 #[derive(Clone, Debug, Default)]
 struct GatewayHedgeProbeOutcome {
     actual_probe_count: usize,
@@ -5925,6 +7889,16 @@ struct CanaryPromptDocument {
     tools: Option<Vec<Value>>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    top_p: Option<f64>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    min_p: Option<f64>,
+    #[serde(default)]
+    repeat_penalty: Option<f64>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -5960,8 +7934,10 @@ struct ExpectedProviderReceipt<'a> {
     prompt_hash: String,
 }
 
-fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
-    let canary_sets = embedded_canary_sets();
+fn canary_registry_from_catalog_root(
+    root: &Value,
+    canary_sets: &BTreeMap<String, Vec<GatewayCanaryPrompt>>,
+) -> GatewayCanaryRegistry {
     let mut models = BTreeMap::new();
     let Some(model_values) = root.get("models").and_then(Value::as_array) else {
         return GatewayCanaryRegistry { models };
@@ -6263,32 +8239,37 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
     ]
     .into_iter()
     .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
-    .map(|doc| {
-        let prompts = doc
-            .prompts
-            .into_iter()
-            .map(|prompt| GatewayCanaryPrompt {
-                id: prompt.id,
-                messages: prompt.messages,
-                tools: prompt.tools,
-                max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
-                prompt: prompt.prompt,
-                input: prompt.input,
-                audio_b64: prompt.audio_b64,
-                content_type: prompt.content_type,
-                filename: prompt.filename,
-                language: prompt.language,
-                voice: prompt.voice,
-                response_format: prompt.response_format,
-                size: prompt.size,
-                steps: prompt.steps,
-                cfg_scale: prompt.cfg_scale,
-                seed: prompt.seed,
-            })
-            .collect::<Vec<_>>();
-        (doc.set_id, prompts)
-    })
+    .map(|doc| (doc.set_id.clone(), gateway_canary_prompts(doc)))
     .collect()
+}
+
+fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
+    doc.prompts
+        .into_iter()
+        .map(|prompt| GatewayCanaryPrompt {
+            id: prompt.id,
+            messages: prompt.messages,
+            tools: prompt.tools,
+            max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
+            temperature: prompt.temperature,
+            top_p: prompt.top_p,
+            top_k: prompt.top_k,
+            min_p: prompt.min_p,
+            repeat_penalty: prompt.repeat_penalty,
+            prompt: prompt.prompt,
+            input: prompt.input,
+            audio_b64: prompt.audio_b64,
+            content_type: prompt.content_type,
+            filename: prompt.filename,
+            language: prompt.language,
+            voice: prompt.voice,
+            response_format: prompt.response_format,
+            size: prompt.size,
+            steps: prompt.steps,
+            cfg_scale: prompt.cfg_scale,
+            seed: prompt.seed,
+        })
+        .collect()
 }
 
 fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> ProviderTable {
@@ -6405,12 +8386,14 @@ fn route_identity_anchor(candidate: &GatewayRouteCandidate) -> Option<String> {
         })
 }
 
-fn heartbeat_caps_from_model(caps: &ModelCaps) -> HeartbeatCaps {
+fn heartbeat_caps_from_model(caps: &ModelCaps, modalities: &[String]) -> HeartbeatCaps {
     HeartbeatCaps {
         tools: caps.tools,
         json: caps.json,
         ctx: caps.ctx,
         vision: caps.vision,
+        served_modalities: modalities.to_vec(),
+        modality_capacity: BTreeMap::new(),
     }
 }
 
@@ -6418,7 +8401,8 @@ fn heartbeat_caps_for_route(
     model: &GatewayModel,
     candidate: &GatewayRouteCandidate,
 ) -> HeartbeatCaps {
-    let fallback = heartbeat_caps_from_model(&model.mayhem.caps);
+    let fallback =
+        heartbeat_caps_from_model(&model.mayhem.caps, &model.mayhem.adapter.modality_set);
     HeartbeatCaps {
         tools: candidate
             .caps
@@ -6447,6 +8431,13 @@ fn heartbeat_caps_for_route(
             .get("vision")
             .and_then(Value::as_bool)
             .unwrap_or(fallback.vision),
+        served_modalities: candidate.served_modalities.clone(),
+        modality_capacity: candidate
+            .caps
+            .get("modality_capacity")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -7049,6 +9040,18 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
                 .await
         })
     }
+
+    fn run_artifact_generation<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ArtifactGenerationRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayArtifactGenerationFuture<'a> {
+        Box::pin(async move {
+            self.run_artifact_generation_over_bridge(model, request, invocation)
+                .await
+        })
+    }
 }
 
 impl ScBridgeGatewaySessionBackend {
@@ -7217,14 +9220,20 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
-        let request_body = direct_session_request_body(request);
+        let transport_body = direct_session_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            direct_chat_endpoint_family(request),
+            transport_body.clone(),
+            direct_chat_contract_request(request, &transport_body),
+        )?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
-            direct_session_request_byte_limit(invocation),
+            direct_session_request_byte_limit(invocation, &request_body)?,
         )
         .await?;
 
@@ -7424,14 +9433,20 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
-        let request_body = direct_session_embedding_request_body(request);
+        let transport_body = direct_session_embedding_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            embedding_endpoint_family(request),
+            transport_body.clone(),
+            embedding_contract_request(request, &transport_body),
+        )?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
-            direct_session_request_byte_limit(invocation),
+            direct_session_request_byte_limit(invocation, &request_body)?,
         )
         .await?;
 
@@ -7581,7 +9596,13 @@ impl ScBridgeGatewaySessionBackend {
             now / 1000,
         )?;
 
-        let request_body = direct_session_image_generation_request_body(request);
+        let transport_body = direct_session_image_generation_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            image_generation_endpoint_family(request),
+            transport_body.clone(),
+            image_generation_contract_request(request, &transport_body),
+        )?;
         let request_id = blake3_hex(
             format!(
                 "rid:{}:{}",
@@ -7599,7 +9620,7 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
-            direct_session_request_byte_limit(invocation),
+            direct_session_request_byte_limit(invocation, &request_body)?,
         )
         .await?;
 
@@ -7749,7 +9770,13 @@ impl ScBridgeGatewaySessionBackend {
             now / 1000,
         )?;
 
-        let request_body = direct_session_audio_speech_request_body(request);
+        let transport_body = direct_session_audio_speech_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            audio_speech_endpoint_family(request),
+            transport_body.clone(),
+            audio_speech_contract_request(request, &transport_body),
+        )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
         send_direct_session_request_frames(
             &mut bridge,
@@ -7757,7 +9784,7 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
-            direct_session_request_byte_limit(invocation),
+            direct_session_request_byte_limit(invocation, &request_body)?,
         )
         .await?;
 
@@ -7907,7 +9934,13 @@ impl ScBridgeGatewaySessionBackend {
             now / 1000,
         )?;
 
-        let request_body = direct_session_audio_transcription_request_body(request);
+        let transport_body = direct_session_audio_transcription_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            &request.endpoint_family,
+            transport_body,
+            request.contract_request.clone(),
+        )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
         send_direct_session_request_frames(
             &mut bridge,
@@ -7915,7 +9948,7 @@ impl ScBridgeGatewaySessionBackend {
             &invocation.session_id,
             &request_id,
             &request_body,
-            direct_session_request_byte_limit(invocation),
+            direct_session_request_byte_limit(invocation, &request_body)?,
         )
         .await?;
 
@@ -7957,6 +9990,169 @@ impl ScBridgeGatewaySessionBackend {
                 .await;
 
         Ok(GatewayAudioTranscriptionResult {
+            output: collected.output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+            provider_receipt: Some(collected.provider_receipt),
+            quality: collected.quality,
+        })
+    }
+
+    async fn run_artifact_generation_over_bridge(
+        &self,
+        model: &GatewayModel,
+        request: &ArtifactGenerationRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayArtifactGenerationResult, GatewaySessionError> {
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting provider {} transport peer {} for {} generation session {} failed: {err}",
+                    provider, direct_peer, request.output_modality, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(direct_peer, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening direct {} generation session {} to provider {} transport peer {} failed: {err}",
+                    request.output_modality, invocation.session_id, provider, direct_peer
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "{} generation session {} was not opened as a direct non-relayed channel",
+                request.output_modality, invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        bridge
+            .session_send(direct_peer, &invocation.session_id, open_frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for {} generation session {} failed: {err}",
+                    request.output_modality, invocation.session_id
+                ))
+            })?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            direct_peer,
+            invocation.failover.open_timeout(),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
+        }
+        let accept_info = validate_direct_session_accept(
+            &accept,
+            invocation,
+            &open_head,
+            &att_nonce,
+            now / 1000,
+        )?;
+
+        let request_body = seal_direct_session_request_body(
+            model,
+            &request.endpoint_family,
+            json!({"kind": request.transport_kind}),
+            request.contract_request.clone(),
+        )?;
+        let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        send_direct_session_request_frames(
+            &mut bridge,
+            direct_peer,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+            direct_session_request_byte_limit(invocation, &request_body)?,
+        )
+        .await?;
+
+        let collected = collect_direct_session_artifact_generation_output(
+            &mut bridge,
+            &invocation.session_id,
+            direct_peer,
+            &request_id,
+            invocation.failover,
+            request,
+            &accept_info.enclave_pubkey,
+        )
+        .await?;
+        let receipt_ack = direct_session_artifact_generation_receipt_ack(
+            request,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            direct_peer,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending artifact generation s.receipt_ack",
+        )
+        .await?;
+        let _ =
+            close_direct_session_channel(&mut bridge, direct_peer, &invocation.session_id, "done")
+                .await;
+
+        Ok(GatewayArtifactGenerationResult {
             output: collected.output,
             backend: self.name().to_owned(),
             direct_session: true,
@@ -8233,9 +10429,17 @@ async fn next_session_frame_with_optional_wait(
 
 fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
     let mut body = json!({
+        "kind": "chat",
+        "model": &request.model,
         "messages": &request.messages,
-        "stream": true,
+        "stream": request.stream,
+        "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
     });
+    set_optional_json(
+        &mut body,
+        "stream_options",
+        request.stream_options.as_ref().map(|value| json!(value)),
+    );
     set_optional_json(
         &mut body,
         "tools",
@@ -8248,6 +10452,11 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
     );
     set_optional_json(
         &mut body,
+        "parallel_tool_calls",
+        request.parallel_tool_calls.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
         "response_format",
         request.response_format.as_ref().cloned(),
     );
@@ -8257,6 +10466,23 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
         request.temperature.map(|value| json!(value)),
     );
     set_optional_json(&mut body, "top_p", request.top_p.map(|value| json!(value)));
+    set_optional_json(&mut body, "top_k", request.top_k.map(|value| json!(value)));
+    set_optional_json(&mut body, "min_p", request.min_p.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "repeat_penalty",
+        request.repeat_penalty.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "frequency_penalty",
+        request.frequency_penalty.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "presence_penalty",
+        request.presence_penalty.map(|value| json!(value)),
+    );
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
     set_optional_json(&mut body, "stop", request.stop.as_ref().cloned());
     set_optional_json(
@@ -8266,48 +10492,190 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
     );
     set_optional_json(
         &mut body,
+        "max_completion_tokens",
+        request.max_completion_tokens.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
         "user",
         request.user.as_ref().map(|value| json!(value)),
     );
-    if !request.metadata.is_empty() {
-        body["metadata"] = json!(&request.metadata);
-    }
+    body["metadata"] = json!(&request.metadata);
     body
+}
+
+fn direct_chat_endpoint_family(request: &ChatCompletionRequest) -> &str {
+    request
+        .endpoint_family
+        .as_deref()
+        .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+}
+
+fn direct_chat_contract_request(request: &ChatCompletionRequest, transport_body: &Value) -> Value {
+    request
+        .endpoint_request
+        .clone()
+        .unwrap_or_else(|| direct_session_contract_request(transport_body))
+}
+
+fn direct_session_contract_request(transport_body: &Value) -> Value {
+    let mut request = transport_body.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.remove("kind");
+        object.remove("endpoint_family");
+        object.remove("mayhem_contract");
+        object.remove("contract_request");
+    }
+    request
+}
+
+fn seal_direct_session_request_body(
+    model: &GatewayModel,
+    endpoint_family: &str,
+    transport_body: Value,
+    contract_request: Value,
+) -> Result<Value, GatewaySessionError> {
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .ok_or_else(|| {
+            GatewaySessionError::new(format!(
+                "model {} does not expose endpoint family {endpoint_family}",
+                model.id
+            ))
+        })?;
+    if let Err(violations) = mayhem_proto::validate_endpoint_request(contract, &contract_request) {
+        let summary = violations
+            .iter()
+            .take(4)
+            .map(|violation| format!("{}: {}", violation.path, violation.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(GatewaySessionError::new(format!(
+            "normalized provider request violates endpoint contract: {summary}"
+        )));
+    }
+    let mut sealed = json!({});
+    for key in ["kind", "audio", "audio_seconds"] {
+        if let Some(value) = transport_body.get(key) {
+            sealed[key] = value.clone();
+        }
+    }
+    let transport_request_fingerprint = stable_value_hash(&sealed);
+    sealed["contract_request"] = contract_request.clone();
+    sealed["mayhem_contract"] = json!({
+        "schema_version": 1,
+        "endpoint_family": endpoint_family,
+        "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "normalized_request_fingerprint": stable_value_hash(&contract_request),
+        "transport_request_fingerprint": transport_request_fingerprint,
+    });
+    Ok(sealed)
 }
 
 fn direct_session_embedding_request_body(request: &EmbeddingRequest) -> Value {
     let mut body = json!({
         "kind": "embedding",
+        "model": &request.model,
         "input": &request.input,
         "encoding_format": request.encoding_format.as_deref().unwrap_or("float"),
+        "endpoint_family": embedding_endpoint_family(request),
     });
     set_optional_json(
         &mut body,
         "dimensions",
         request.dimensions.map(|value| json!(value)),
     );
+    set_optional_json(
+        &mut body,
+        "user",
+        request.user.as_ref().map(|value| json!(value)),
+    );
     body
+}
+
+fn embedding_endpoint_family(request: &EmbeddingRequest) -> &str {
+    request
+        .endpoint_family
+        .as_deref()
+        .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS)
+}
+
+fn embedding_contract_request(request: &EmbeddingRequest, transport_body: &Value) -> Value {
+    request
+        .endpoint_request
+        .clone()
+        .unwrap_or_else(|| direct_session_contract_request(transport_body))
 }
 
 fn direct_session_image_generation_request_body(request: &ImageGenerationRequest) -> Value {
     let mut body = json!({
         "kind": "image_generation",
+        "model": &request.model,
         "prompt": &request.prompt,
         "n": image_generation_count(request),
         "size": request.size.as_deref().unwrap_or("512x512"),
         "steps": image_generation_steps(request),
         "cfg_scale": image_generation_cfg_scale(request),
         "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "endpoint_family": image_generation_endpoint_family(request),
     });
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "quality",
+        request.quality.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "style",
+        request.style.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "negative_prompt",
+        request.negative_prompt.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "scheduler",
+        request.scheduler.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "user",
+        request.user.as_ref().map(|value| json!(value)),
+    );
     body
+}
+
+fn image_generation_endpoint_family(request: &ImageGenerationRequest) -> &str {
+    request
+        .endpoint_family
+        .as_deref()
+        .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+}
+
+fn image_generation_contract_request(
+    request: &ImageGenerationRequest,
+    transport_body: &Value,
+) -> Value {
+    request
+        .endpoint_request
+        .clone()
+        .unwrap_or_else(|| direct_session_contract_request(transport_body))
 }
 
 fn direct_session_audio_speech_request_body(request: &AudioSpeechRequest) -> Value {
     let mut body = json!({
         "kind": "audio_speech",
+        "model": &request.model,
         "input": &request.input,
         "response_format": audio_speech_response_format(request),
+        "endpoint_family": audio_speech_endpoint_family(request),
     });
     set_optional_json(
         &mut body,
@@ -8315,12 +10683,37 @@ fn direct_session_audio_speech_request_body(request: &AudioSpeechRequest) -> Val
         request.voice.as_ref().map(|value| json!(value)),
     );
     set_optional_json(&mut body, "speed", request.speed.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "instructions",
+        request.instructions.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "stream_format",
+        request.stream_format.as_ref().map(|value| json!(value)),
+    );
     body
+}
+
+fn audio_speech_endpoint_family(request: &AudioSpeechRequest) -> &str {
+    request
+        .endpoint_family
+        .as_deref()
+        .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH)
+}
+
+fn audio_speech_contract_request(request: &AudioSpeechRequest, transport_body: &Value) -> Value {
+    request
+        .endpoint_request
+        .clone()
+        .unwrap_or_else(|| direct_session_contract_request(transport_body))
 }
 
 fn direct_session_audio_transcription_request_body(request: &AudioTranscriptionRequest) -> Value {
     let mut body = json!({
         "kind": "audio_transcription",
+        "model": &request.model,
         "audio": {
             "encoding": "hex",
             "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
@@ -8329,6 +10722,7 @@ fn direct_session_audio_transcription_request_body(request: &AudioTranscriptionR
         },
         "audio_seconds": audio_transcription_seconds(request),
         "response_format": request.response_format.as_deref().unwrap_or("json"),
+        "endpoint_family": &request.endpoint_family,
     });
     set_optional_json(
         &mut body,
@@ -8340,6 +10734,15 @@ fn direct_session_audio_transcription_request_body(request: &AudioTranscriptionR
         "prompt",
         request.prompt.as_ref().map(|value| json!(value)),
     );
+    set_optional_json(
+        &mut body,
+        "temperature",
+        request.temperature.map(|value| json!(value)),
+    );
+    if !request.timestamp_granularities.is_empty() {
+        body["timestamp_granularities"] = json!(&request.timestamp_granularities);
+    }
+    body["stream"] = json!(request.stream);
     body
 }
 
@@ -8436,13 +10839,29 @@ async fn send_direct_session_request_frames(
     Ok(())
 }
 
-fn direct_session_request_byte_limit(invocation: &GatewaySessionInvocation) -> usize {
-    let derived = usize::try_from(invocation.served_ctx)
+fn direct_session_request_byte_limit(
+    invocation: &GatewaySessionInvocation,
+    request_body: &Value,
+) -> Result<usize, GatewaySessionError> {
+    let request_body_bytes = session_frame_json_len(request_body)?;
+    Ok(direct_session_request_byte_limit_for_len(
+        invocation.served_ctx,
+        request_body_bytes,
+        configured_optional_positive_usize("MAYHEM_GATEWAY_SESSION_MAX_REQUEST_BYTES"),
+    ))
+}
+
+fn direct_session_request_byte_limit_for_len(
+    served_ctx: u32,
+    request_body_bytes: usize,
+    configured: Option<usize>,
+) -> usize {
+    let derived = usize::try_from(served_ctx)
         .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
         .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
-    configured_optional_positive_usize("MAYHEM_GATEWAY_SESSION_MAX_REQUEST_BYTES")
-        .unwrap_or(derived)
+        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES)
+        .max(request_body_bytes);
+    configured.unwrap_or(derived)
 }
 
 async fn close_direct_session_channel(
@@ -9714,6 +12133,130 @@ async fn collect_direct_session_audio_speech_output(
     })
 }
 
+async fn collect_direct_session_artifact_generation_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    expected_remote: &str,
+    request_id: &str,
+    failover: GatewayFailoverInvocation,
+    request: &ArtifactGenerationRequest,
+    enclave_pubkey: &str,
+) -> Result<DirectArtifactGenerationSessionCollected, GatewaySessionError> {
+    let mut finish_seen = false;
+    let mut usage = None;
+    let mut provider_receipt = None;
+    let mut artifact_builders = SessionArtifactCollection::default();
+    let mut delta_sequence = SessionDeltaSequence::default();
+    let mut provider_quality = None;
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        None,
+    );
+
+    while !finish_seen || provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = next_session_frame_with_optional_wait(
+            bridge,
+            session_id,
+            expected_remote,
+            remaining_millis.map(Duration::from_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                delta_sequence.observe(&frame)?;
+                watchdog.record_delta(now_millis_u64());
+                collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
+                if frame.get("fin").and_then(Value::as_str).is_some() {
+                    finish_seen = true;
+                    usage = receipt_usage_from_session_delta(&frame);
+                    provider_quality =
+                        provider_quality.or_else(|| quality_from_session_delta(&frame));
+                }
+            }
+            Some("s.receipt") => {
+                provider_receipt = Some(provider_signed_receipt_from_frame(
+                    &frame,
+                    session_id,
+                    enclave_pubkey,
+                )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on {} generation session {session_id}: {message}",
+                    request.output_modality
+                )));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed {} generation session {session_id} before completion: {reason}",
+                    request.output_modality
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let completed_at_millis = now_millis_u64();
+    let artifacts = finish_session_artifacts(artifact_builders)?;
+    let content_prefix = format!("{}/", request.output_modality);
+    if artifacts.is_empty()
+        || artifacts
+            .iter()
+            .any(|artifact| !artifact.content_type.starts_with(&content_prefix))
+    {
+        return Err(GatewaySessionError::new(format!(
+            "provider {} generation session {session_id} returned no valid {} artifact",
+            request.output_modality, request.output_modality
+        )));
+    }
+    let usage = usage.unwrap_or_else(|| artifact_generation_usage_for_request(request));
+    let throughput_units = if request.output_modality == "video" {
+        usage.get(USAGE_FRAME)
+    } else {
+        usage.get(USAGE_AUDIO_SECOND)
+    };
+    let quality = provider_quality.or_else(|| {
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: units_per_second(throughput_units, started_at_millis, completed_at_millis),
+            })
+    });
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider {} generation session {session_id} ended without a final receipt",
+            request.output_modality
+        ))
+    })?;
+    Ok(DirectArtifactGenerationSessionCollected {
+        output: ArtifactGenerationOutput { artifacts, usage },
+        provider_receipt,
+        quality,
+    })
+}
+
 async fn collect_direct_session_audio_transcription_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
@@ -10480,7 +13023,8 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let usage = expected_text_usage_for_provider(
+    let usage = expected_chat_usage_for_provider(
+        request,
         Some(&provider_receipt.body.usage),
         output.usage.prompt_tokens,
         output.usage.completion_tokens,
@@ -10598,6 +13142,29 @@ fn direct_session_audio_transcription_receipt_ack(
     })
 }
 
+fn direct_session_artifact_generation_receipt_ack(
+    request: &ArtifactGenerationRequest,
+    output: &ArtifactGenerationOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected =
+        expected_artifact_generation_provider_receipt(model, request, output, provider, invocation);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider artifact generation receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
 fn direct_session_partial_receipt_ack(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
@@ -10611,7 +13178,8 @@ fn direct_session_partial_receipt_ack(
         ));
     }
     let body = &partial.provider_receipt.body;
-    let usage = expected_text_usage_for_provider(
+    let usage = expected_chat_usage_for_provider(
+        request,
         Some(&partial.provider_receipt.body.usage),
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
@@ -10715,6 +13283,24 @@ fn expected_audio_transcription_provider_receipt<'a>(
     }
 }
 
+fn expected_artifact_generation_provider_receipt<'a>(
+    _model: &GatewayModel,
+    request: &ArtifactGenerationRequest,
+    output: &ArtifactGenerationOutput,
+    provider: &'a str,
+    invocation: &GatewaySessionInvocation,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = output.usage.clone();
+    ExpectedProviderReceipt {
+        provider,
+        seq: 1,
+        final_receipt: true,
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
+        prompt_hash: artifact_generation_prompt_hash(request),
+        usage,
+    }
+}
+
 fn expected_text_usage_for_provider(
     provider_usage: Option<&ReceiptUsage>,
     observed_prompt_tokens: u64,
@@ -10752,6 +13338,40 @@ fn expected_text_usage_for_provider(
         ));
     }
     Ok(provider_usage.clone())
+}
+
+fn expected_chat_usage_for_provider(
+    request: &ChatCompletionRequest,
+    provider_usage: Option<&ReceiptUsage>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
+    locked_rate_map: &[RateMapEntry],
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let text = expected_text_usage_for_provider(
+        provider_usage,
+        observed_prompt_tokens,
+        observed_completion_tokens,
+        locked_rate_map,
+    )?;
+    chat_media_stats(&request.messages, &GatewayMediaLimits::schema_ceiling())
+        .map_err(|err| GatewaySessionError::new(err.message))?;
+    if let Some(provider_usage) = provider_usage {
+        if provider_usage.get(USAGE_IMAGE) != 0 {
+            return Err(GatewaySessionError::new(
+                "provider receipt must not double-bill LLM image input outside input tokens",
+            ));
+        }
+        if provider_usage.get(USAGE_AUDIO_SECOND) != 0 {
+            return Err(GatewaySessionError::new(
+                "provider receipt must not double-bill LLM audio input outside input tokens",
+            ));
+        }
+    }
+    Ok(ReceiptUsage::from_units([
+        (USAGE_INPUT_TOKEN, text.input_tokens()),
+        (USAGE_CACHED_INPUT_TOKEN, text.cached_input_tokens()),
+        (USAGE_OUTPUT_TOKEN, text.output_tokens()),
+    ]))
 }
 
 fn validate_provider_receipt(
@@ -10935,14 +13555,31 @@ async fn run_embedding_with_route_retry(
     inputs: &[String],
     options: GatewayRequestOptions,
 ) -> Result<GatewayEmbeddingRun, ApiError> {
+    let requirements = request_requirements_for_embedding(
+        state,
+        model,
+        inputs,
+        now_millis_u64(),
+        options.max_price_au,
+        state.throughput_floor_for_model(
+            model,
+            &options,
+            DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+        ),
+    );
     let eligible_routes =
         ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options);
     let RouteWaitOutcome {
         routes: eligible_routes,
         waited,
-    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
-        ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options)
-    })
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &requirements.required_modalities,
+        eligible_routes,
+        || ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options),
+    )
     .await;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
@@ -10953,7 +13590,12 @@ async fn run_embedding_with_route_retry(
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(state, model, &options));
+        return Err(no_eligible_route_error(
+            state,
+            model,
+            &options,
+            &requirements.required_modalities,
+        ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -10965,9 +13607,15 @@ async fn run_embedding_with_route_retry(
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
-
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation =
             state.prepare_embedding_invocation_for_route(model, inputs, route, &options)?;
         let attempt_started = Instant::now();
@@ -11016,14 +13664,31 @@ async fn run_image_generation_with_route_retry(
     request: &ImageGenerationRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayImageGenerationRun, ApiError> {
+    let requirements = request_requirements_for_image_generation(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        state.throughput_floor_for_model(model, &options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
+    );
     let eligible_routes =
         ordered_route_candidates_for_image_generation_with_options(state, model, request, &options);
     let RouteWaitOutcome {
         routes: eligible_routes,
         waited,
-    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
-        ordered_route_candidates_for_image_generation_with_options(state, model, request, &options)
-    })
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &requirements.required_modalities,
+        eligible_routes,
+        || {
+            ordered_route_candidates_for_image_generation_with_options(
+                state, model, request, &options,
+            )
+        },
+    )
     .await;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
@@ -11034,7 +13699,12 @@ async fn run_image_generation_with_route_retry(
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(state, model, &options));
+        return Err(no_eligible_route_error(
+            state,
+            model,
+            &options,
+            &requirements.required_modalities,
+        ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -11046,9 +13716,15 @@ async fn run_image_generation_with_route_retry(
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
-
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation =
             state.prepare_image_generation_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
@@ -11101,14 +13777,27 @@ async fn run_audio_speech_with_route_retry(
     request: &AudioSpeechRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioSpeechRun, ApiError> {
+    let requirements = request_requirements_for_audio_speech(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        state.throughput_floor_for_model(model, &options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
+    );
     let eligible_routes =
         ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options);
     let RouteWaitOutcome {
         routes: eligible_routes,
         waited,
-    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
-        ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options)
-    })
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &requirements.required_modalities,
+        eligible_routes,
+        || ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options),
+    )
     .await;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
@@ -11119,7 +13808,12 @@ async fn run_audio_speech_with_route_retry(
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(state, model, &options));
+        return Err(no_eligible_route_error(
+            state,
+            model,
+            &options,
+            &requirements.required_modalities,
+        ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -11133,6 +13827,13 @@ async fn run_audio_speech_with_route_retry(
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation =
             state.prepare_audio_speech_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
@@ -11184,17 +13885,32 @@ async fn run_audio_transcription_with_route_retry(
     request: &AudioTranscriptionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioTranscriptionRun, ApiError> {
+    let requirements = request_requirements_for_audio_transcription(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        state.throughput_floor_for_model(model, &options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
+    );
     let eligible_routes = ordered_route_candidates_for_audio_transcription_with_options(
         state, model, request, &options,
     );
     let RouteWaitOutcome {
         routes: eligible_routes,
         waited,
-    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
-        ordered_route_candidates_for_audio_transcription_with_options(
-            state, model, request, &options,
-        )
-    })
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &requirements.required_modalities,
+        eligible_routes,
+        || {
+            ordered_route_candidates_for_audio_transcription_with_options(
+                state, model, request, &options,
+            )
+        },
+    )
     .await;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
@@ -11205,7 +13921,12 @@ async fn run_audio_transcription_with_route_retry(
         if waited {
             return Err(route_wait_expired_error(&options));
         }
-        return Err(no_eligible_route_error(state, model, &options));
+        return Err(no_eligible_route_error(
+            state,
+            model,
+            &options,
+            &requirements.required_modalities,
+        ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -11219,6 +13940,13 @@ async fn run_audio_transcription_with_route_retry(
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation = state
             .prepare_audio_transcription_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
@@ -11243,6 +13971,126 @@ async fn run_audio_transcription_with_route_retry(
                     invocation,
                     metering_request,
                     metering_output,
+                });
+            }
+            Err(err) if err.retryable => {
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
+}
+
+async fn run_artifact_generation_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ArtifactGenerationRequest,
+    options: GatewayRequestOptions,
+) -> Result<GatewayArtifactGenerationRun, ApiError> {
+    let requirements = request_requirements_for_artifact_generation(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        state.throughput_floor_for_model(
+            model,
+            &options,
+            if request.output_modality == "video" {
+                DEFAULT_IMAGE_FLOOR_IMAGES_PER_S
+            } else {
+                DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR
+            },
+        ),
+    );
+    let eligible_routes = ordered_route_candidates_for_artifact_generation_with_options(
+        state, model, request, &options,
+    );
+    let RouteWaitOutcome {
+        routes: eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &requirements.required_modalities,
+        eligible_routes,
+        || {
+            ordered_route_candidates_for_artifact_generation_with_options(
+                state, model, request, &options,
+            )
+        },
+    )
+    .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
+        return Err(no_eligible_route_error(
+            state,
+            model,
+            &options,
+            &requirements.required_modalities,
+        ));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+
+    let attempt_count =
+        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut last_retryable_error = None;
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index).copied();
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
+        let invocation = state
+            .prepare_artifact_generation_invocation_for_route(model, request, route, &options)?;
+        let attempt_started = Instant::now();
+        match state
+            .session_backend
+            .run_artifact_generation(model, request, &invocation)
+            .await
+        {
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_artifact_generation_success(
+                        request,
+                        &result,
+                        attempt_started.elapsed(),
+                    ),
+                );
+                return Ok(GatewayArtifactGenerationRun {
+                    metering_request: request.clone(),
+                    metering_output: result.output.clone(),
+                    result,
+                    invocation,
                 });
             }
             Err(err) if err.retryable => {
@@ -11343,6 +14191,7 @@ fn no_eligible_route_error(
     state: &GatewayState,
     model: &GatewayModel,
     options: &GatewayRequestOptions,
+    required_modalities: &[String],
 ) -> ApiError {
     if let Some(error) = preferred_provider_refusal_error(state, model, options) {
         return error;
@@ -11398,8 +14247,31 @@ fn no_eligible_route_error(
             Some("X-Mayhem-Quant"),
         );
     }
+    let modality_candidates = quant_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            required_modalities
+                .iter()
+                .all(|modality| candidate.served_modalities.contains(modality))
+        })
+        .collect::<Vec<_>>();
+    let non_text_modalities = required_modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+        .cloned()
+        .collect::<Vec<_>>();
+    if !non_text_modalities.is_empty() && modality_candidates.is_empty() {
+        return ApiError::service_unavailable(
+            format!(
+                "no provider currently serves the required modalities: {}",
+                non_text_modalities.join(", ")
+            ),
+            Some("model"),
+        );
+    }
     let now_millis = now_millis_u64();
-    if quant_candidates
+    if modality_candidates
         .iter()
         .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
     {
@@ -11410,6 +14282,15 @@ fn no_eligible_route_error(
     }
     if options.max_price_au.is_some() {
         return no_price_band_route_error();
+    }
+    if !non_text_modalities.is_empty() {
+        return ApiError::service_unavailable(
+            format!(
+                "provider capacity for the required modalities is currently unavailable: {}",
+                non_text_modalities.join(", ")
+            ),
+            Some("model"),
+        );
     }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
 }
@@ -11460,8 +14341,14 @@ fn no_eligible_chat_route_error(
     request: &ChatCompletionRequest,
     options: &GatewayRequestOptions,
 ) -> ApiError {
-    chat_context_capacity_error(state, model, request, options)
-        .unwrap_or_else(|| no_eligible_route_error(state, model, options))
+    chat_context_capacity_error(state, model, request, options).unwrap_or_else(|| {
+        no_eligible_route_error(
+            state,
+            model,
+            options,
+            &chat_required_modalities(&request.messages),
+        )
+    })
 }
 
 struct RouteWaitOutcome<'a> {
@@ -11473,6 +14360,7 @@ async fn wait_for_eligible_routes<'a, F>(
     state: &GatewayState,
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
+    required_modalities: &[String],
     routes: Vec<&'a GatewayRouteCandidate>,
     refresh: F,
 ) -> RouteWaitOutcome<'a>
@@ -11483,6 +14371,7 @@ where
         state,
         model,
         options,
+        required_modalities,
         routes,
         refresh,
         Duration::from_millis(ROUTE_WAIT_POLL_MS),
@@ -11494,6 +14383,7 @@ async fn wait_for_eligible_routes_with_poll<'a, F>(
     state: &GatewayState,
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
+    required_modalities: &[String],
     mut routes: Vec<&'a GatewayRouteCandidate>,
     mut refresh: F,
     poll_interval: Duration,
@@ -11504,7 +14394,7 @@ where
     if model.mayhem.route_candidates.is_empty()
         || !routes.is_empty()
         || options.max_wait_ms == 0
-        || !route_static_filters_have_candidates(state, model, options)
+        || !route_static_filters_have_candidates(state, model, options, required_modalities)
     {
         return RouteWaitOutcome {
             routes,
@@ -11531,6 +14421,7 @@ fn route_static_filters_have_candidates(
     state: &GatewayState,
     model: &GatewayModel,
     options: &GatewayRequestOptions,
+    required_modalities: &[String],
 ) -> bool {
     let preferred = state.preferred_provider_order(model, options);
     model
@@ -11555,6 +14446,11 @@ fn route_static_filters_have_candidates(
                 .min_att_tier
                 .map(|min_tier| candidate.att_tier >= min_tier)
                 .unwrap_or(true)
+        })
+        .filter(|candidate| {
+            required_modalities
+                .iter()
+                .all(|modality| candidate.served_modalities.contains(modality))
         })
         .any(|candidate| {
             options
@@ -11592,19 +14488,92 @@ fn ensure_max_price_allows(
     Ok(())
 }
 
+fn validate_sampling_values(
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<i32>,
+    min_p: Option<f64>,
+    repeat_penalty: Option<f64>,
+) -> Result<(), String> {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+        return Err("temperature must be finite and between 0 and 2".to_owned());
+    }
+    if top_p.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0) {
+        return Err("top_p must be finite and in (0, 1]".to_owned());
+    }
+    if top_k.is_some_and(|value| !(0..=1_000_000).contains(&value)) {
+        return Err("top_k must be between 0 and 1000000".to_owned());
+    }
+    if min_p.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err("min_p must be finite and between 0 and 1".to_owned());
+    }
+    if repeat_penalty.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0) {
+        return Err("repeat_penalty must be finite and in (0, 10]".to_owned());
+    }
+    Ok(())
+}
+
+fn apply_model_sampling_defaults(
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    validate_sampling_values(
+        request.temperature,
+        request.top_p,
+        request.top_k,
+        request.min_p,
+        None,
+    )
+    .map_err(|message| ApiError::bad_request(message, Some("sampling")))?;
+    model.mayhem.sampling.validate().map_err(|message| {
+        ApiError::bad_gateway(
+            format!("invalid catalog sampling profile: {message}"),
+            Some("model"),
+        )
+    })?;
+
+    let defaults = &model.mayhem.sampling;
+    match (request.repeat_penalty, defaults.repeat_penalty) {
+        (Some(requested), Some(expected))
+            if (requested - expected).abs()
+                <= f64::EPSILON * requested.abs().max(expected.abs()).max(1.0) => {}
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "repeat_penalty is server-controlled and must match the signed model profile",
+                Some("repeat_penalty"),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(
+                "repeat_penalty is server-controlled and is not enabled for this model",
+                Some("repeat_penalty"),
+            ));
+        }
+        (None, _) => {}
+    }
+    request.temperature = request.temperature.or(defaults.temperature);
+    request.top_p = request.top_p.or(defaults.top_p);
+    request.top_k = request.top_k.or(defaults.top_k);
+    request.min_p = request.min_p.or(defaults.min_p);
+    request.repeat_penalty = defaults.repeat_penalty;
+    Ok(())
+}
+
 async fn build_chat_completion(
     state: SharedState,
     request: ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
     let model = require_model(&state, &request.model)?;
+    let mut request = request;
+    apply_model_sampling_defaults(&model, &mut request)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
             "messages must contain at least one item",
             Some("messages"),
         ));
     }
-    validate_chat_modalities(&model, &request)?;
+    validate_chat_modalities(&model, &request, &state.media_limits)?;
     if request
         .tools
         .as_ref()
@@ -11686,7 +14655,7 @@ async fn build_chat_completion(
             request
                 .stream_options
                 .as_ref()
-                .is_some_and(|options| options.include_usage),
+                .is_some_and(|options| options.include_usage.unwrap_or(false)),
         )))
     } else {
         Ok(ChatResponse::Json(chat_response_value(
@@ -11717,6 +14686,7 @@ struct LiveDirectChatSession {
     created: u64,
     include_usage: bool,
     backend: String,
+    _modality_admission: Option<GatewayModalityAdmissionGuard>,
 }
 
 async fn build_live_chat_completion(
@@ -11745,14 +14715,28 @@ async fn prepare_live_direct_chat_session(
     created: u64,
     config: ScBridgeGatewaySessionConfig,
 ) -> Result<LiveDirectChatSession, ApiError> {
+    let requirements = request_requirements_for_chat(
+        &state,
+        &model,
+        &request,
+        now_millis_u64(),
+        options.max_price_au,
+        options.min_ctx,
+        state.generation_floor_tok_s_for_model(&model, &options),
+    );
     let eligible_route_refs =
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
     let RouteWaitOutcome {
         routes: mut eligible_route_refs,
         waited,
-    } = wait_for_eligible_routes(&state, &model, &options, eligible_route_refs, || {
-        ordered_route_candidates_for_request_with_options(&state, &model, &request, &options)
-    })
+    } = wait_for_eligible_routes(
+        &state,
+        &model,
+        &options,
+        &requirements.required_modalities,
+        eligible_route_refs,
+        || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
+    )
     .await;
     if eligible_route_refs.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
@@ -11795,16 +14779,23 @@ async fn prepare_live_direct_chat_session(
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index);
+        let modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation =
             state.prepare_chat_invocation_for_route(&model, &request, route, &options)?;
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
-        match open_live_direct_chat_session(&config, &request, &invocation).await {
+        match open_live_direct_chat_session(&config, &model, &request, &invocation).await {
             Ok((bridge, provider, transport_peer, request_id, enclave_pubkey)) => {
                 let include_usage = request
                     .stream_options
                     .as_ref()
-                    .is_some_and(|options| options.include_usage);
+                    .is_some_and(|options| options.include_usage.unwrap_or(false));
                 return Ok(LiveDirectChatSession {
                     state,
                     model,
@@ -11822,6 +14813,7 @@ async fn prepare_live_direct_chat_session(
                     created,
                     include_usage,
                     backend: "sc-bridge-direct-session".to_owned(),
+                    _modality_admission: modality_admission,
                 });
             }
             Err(err) if err.retryable => {
@@ -11846,6 +14838,7 @@ async fn prepare_live_direct_chat_session(
 
 async fn open_live_direct_chat_session(
     config: &ScBridgeGatewaySessionConfig,
+    model: &GatewayModel,
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
 ) -> Result<(ScBridgeClient, String, String, String, String), GatewaySessionError> {
@@ -11945,14 +14938,20 @@ async fn open_live_direct_chat_session(
     .chars()
     .take(32)
     .collect::<String>();
-    let request_body = direct_session_request_body(request);
+    let transport_body = direct_session_request_body(request);
+    let request_body = seal_direct_session_request_body(
+        model,
+        direct_chat_endpoint_family(request),
+        transport_body.clone(),
+        direct_chat_contract_request(request, &transport_body),
+    )?;
     send_direct_session_request_frames(
         &mut bridge,
         direct_peer,
         &invocation.session_id,
         &request_id,
         &request_body,
-        direct_session_request_byte_limit(invocation),
+        direct_session_request_byte_limit(invocation, &request_body)?,
     )
     .await?;
     Ok((
@@ -12999,14 +15998,28 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
+    let initial_requirements = request_requirements_for_chat(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        options.min_ctx,
+        state.generation_floor_tok_s_for_model(model, &options),
+    );
     let eligible_routes =
         ordered_route_candidates_for_request_with_options(state, model, request, &options);
     let RouteWaitOutcome {
         routes: mut eligible_routes,
         waited,
-    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
-        ordered_route_candidates_for_request_with_options(state, model, request, &options)
-    })
+    } = wait_for_eligible_routes(
+        state,
+        model,
+        &options,
+        &initial_requirements.required_modalities,
+        eligible_routes,
+        || ordered_route_candidates_for_request_with_options(state, model, request, &options),
+    )
     .await;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
@@ -13075,6 +16088,22 @@ async fn run_chat_with_route_retry(
             attempted_route_keys.insert(route_key(route));
         }
         attempts_made = attempts_made.saturating_add(1);
+        let requirements = request_requirements_for_chat(
+            state,
+            model,
+            &attempt_request,
+            now_millis_u64(),
+            attempt_options.max_price_au,
+            attempt_options.min_ctx,
+            state.generation_floor_tok_s_for_model(model, &attempt_options),
+        );
+        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error = Some(err);
+                continue;
+            }
+        };
         let invocation = state.prepare_chat_invocation_for_route(
             model,
             &attempt_request,
@@ -13283,6 +16312,41 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
     order_strict_preferred_routes(state, model, options, routes)
 }
 
+fn ordered_route_candidates_for_artifact_generation_with_options<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ArtifactGenerationRequest,
+    options: &GatewayRequestOptions,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = artifact_generation_route_selection_seed(model, request, now_millis_u64());
+    let now_millis = now_millis_u64();
+    let routes = ordered_route_candidates_for_requirements_with_seed(
+        state,
+        model,
+        options.min_att_tier,
+        options.quant.as_deref(),
+        seed,
+        request_requirements_for_artifact_generation(
+            state,
+            model,
+            request,
+            now_millis,
+            options.max_price_au,
+            state.throughput_floor_for_model(
+                model,
+                options,
+                if request.output_modality == "video" {
+                    DEFAULT_IMAGE_FLOOR_IMAGES_PER_S
+                } else {
+                    DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR
+                },
+            ),
+        ),
+        now_millis,
+    );
+    order_strict_preferred_routes(state, model, options, routes)
+}
+
 async fn run_hedge_probes_if_requested(
     state: &GatewayState,
     model: &GatewayModel,
@@ -13296,6 +16360,24 @@ async fn run_hedge_probes_if_requested(
     {
         return Ok(GatewayHedgeProbeOutcome::default());
     }
+    let requirements = request_requirements_for_chat(
+        state,
+        model,
+        request,
+        now_millis_u64(),
+        options.max_price_au,
+        options.min_ctx,
+        state.generation_floor_tok_s_for_model(model, options),
+    );
+    let Ok(_first_admission) = state.try_acquire_modality_admission(Some(routes[0]), &requirements)
+    else {
+        return Ok(GatewayHedgeProbeOutcome::default());
+    };
+    let Ok(_second_admission) =
+        state.try_acquire_modality_admission(Some(routes[1]), &requirements)
+    else {
+        return Ok(GatewayHedgeProbeOutcome::default());
+    };
     let first_invocation =
         state.prepare_chat_invocation_for_route(model, request, Some(routes[0]), options)?;
     let second_invocation =
@@ -13707,6 +16789,85 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
 }
 
 impl GatewayState {
+    fn try_acquire_modality_admission(
+        &self,
+        route: Option<&GatewayRouteCandidate>,
+        requirements: &RequestRequirements,
+    ) -> Result<Option<GatewayModalityAdmissionGuard>, String> {
+        if requirements.modality_load.is_empty() {
+            return Ok(None);
+        }
+        let Some(route) = route else {
+            return if self.dev_session_shim {
+                Ok(None)
+            } else {
+                Err("non-text request has no provider route".to_owned())
+            };
+        };
+        let provider = route_key(route);
+        let entry = self
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == provider)
+            .ok_or_else(|| "provider disappeared before modality admission".to_owned())?;
+        crate::provider_table::evaluate_eligibility(&entry, requirements).map_err(|reason| {
+            format!("provider became ineligible before modality admission: {reason:?}")
+        })?;
+        let heartbeat = entry
+            .heartbeat
+            .ok_or_else(|| "provider heartbeat disappeared before modality admission".to_owned())?;
+        let mut reservations = Vec::new();
+        let mut active = self
+            .modality_admission
+            .lock_recover("modality admission map");
+        for (modality, load) in &requirements.modality_load {
+            let capacity = heartbeat
+                .caps
+                .modality_capacity
+                .get(modality)
+                .ok_or_else(|| format!("provider no longer advertises {modality} capacity"))?;
+            if load.item_count == 0
+                || load.item_count > capacity.max_items_per_request
+                || load.max_item_bytes == 0
+                || load.max_item_bytes > capacity.max_item_bytes
+                || load.max_item_units == 0
+                || load.max_item_units > capacity.max_item_units
+            {
+                return Err(format!(
+                    "request exceeds provider {modality} item size or per-request capacity"
+                ));
+            }
+            let locally_active = active
+                .get(&(provider.clone(), modality.clone()))
+                .copied()
+                .unwrap_or_default();
+            if capacity
+                .active_items
+                .saturating_add(locally_active)
+                .saturating_add(load.item_count)
+                > capacity.max_inflight_items
+            {
+                return Err(format!(
+                    "provider {modality} capacity is full; try another provider or wait"
+                ));
+            }
+            reservations.push((provider.clone(), modality.clone(), load.item_count));
+        }
+        for (provider, modality, count) in &reservations {
+            let active_count = active
+                .entry((provider.clone(), modality.clone()))
+                .or_default();
+            *active_count = active_count.saturating_add(*count);
+        }
+        drop(active);
+        Ok(Some(GatewayModalityAdmissionGuard {
+            active: Arc::clone(&self.modality_admission),
+            reservations,
+        }))
+    }
+
     fn refresh_provider_table_routes(&self, model: &GatewayModel) {
         let now = now_millis_u64();
         let mut table = self.provider_table.lock_recover("provider table");
@@ -13928,6 +17089,9 @@ fn request_requirements_for_chat(
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
     let output_tokens = chat_output_headroom_tokens(request);
+    let chat_modalities = chat_input_modalities(&request.messages);
+    let usage = chat_receipt_usage(request, input_tokens, output_tokens, &state.media_limits);
+    let modality_load = chat_modality_load(&request.messages, &state.media_limits);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
@@ -13936,17 +17100,105 @@ fn request_requirements_for_chat(
             .as_ref()
             .is_some_and(|tools| !tools.is_empty()),
         requires_json: request.response_format.is_some(),
-        requires_vision: chat_input_modalities(&request.messages).image,
+        requires_vision: chat_modalities.image || chat_modalities.video,
+        required_modalities: chat_required_modalities(&request.messages),
+        modality_load,
         min_ctx: effective_context_floor(explicit_min_ctx, input_tokens, output_tokens),
         input_tokens,
         output_tokens,
-        usage: ReceiptUsage::text(input_tokens, output_tokens),
+        usage,
         min_throughput,
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
+}
+
+fn chat_receipt_usage(
+    request: &ChatCompletionRequest,
+    input_tokens: u64,
+    output_tokens: u64,
+    limits: &GatewayMediaLimits,
+) -> ReceiptUsage {
+    let _ = chat_media_stats(&request.messages, limits);
+    ReceiptUsage::from_units([
+        (USAGE_INPUT_TOKEN, input_tokens),
+        (USAGE_OUTPUT_TOKEN, output_tokens),
+    ])
+}
+
+fn chat_modality_load(
+    messages: &[ChatMessage],
+    limits: &GatewayMediaLimits,
+) -> BTreeMap<String, ModalityRequestLoad> {
+    let modalities = chat_input_modalities(messages);
+    let Ok(media) = chat_media_stats(messages, limits) else {
+        let mut rejected = BTreeMap::new();
+        if modalities.image {
+            rejected.insert(
+                "image".to_owned(),
+                ModalityRequestLoad {
+                    item_count: u32::MAX,
+                    max_item_bytes: u64::MAX,
+                    max_item_units: u64::MAX,
+                },
+            );
+        }
+        if modalities.audio {
+            rejected.insert(
+                "audio".to_owned(),
+                ModalityRequestLoad {
+                    item_count: u32::MAX,
+                    max_item_bytes: u64::MAX,
+                    max_item_units: u64::MAX,
+                },
+            );
+        }
+        if modalities.video {
+            rejected.insert(
+                "video".to_owned(),
+                ModalityRequestLoad {
+                    item_count: u32::MAX,
+                    max_item_bytes: u64::MAX,
+                    max_item_units: u64::MAX,
+                },
+            );
+        }
+        return rejected;
+    };
+    let mut load = BTreeMap::new();
+    if media.image_count > 0 {
+        load.insert(
+            "image".to_owned(),
+            ModalityRequestLoad {
+                item_count: media.image_count,
+                max_item_bytes: media.image_max_bytes,
+                max_item_units: media.image_max_pixels,
+            },
+        );
+    }
+    if media.audio_count > 0 {
+        load.insert(
+            "audio".to_owned(),
+            ModalityRequestLoad {
+                item_count: media.audio_count,
+                max_item_bytes: media.audio_max_bytes,
+                max_item_units: media.audio_max_seconds,
+            },
+        );
+    }
+    if media.video_count > 0 {
+        load.insert(
+            "video".to_owned(),
+            ModalityRequestLoad {
+                item_count: media.video_count,
+                max_item_bytes: media.video_max_bytes,
+                max_item_units: media.video_max_frames,
+            },
+        );
+    }
+    load
 }
 
 fn chat_output_headroom_tokens(request: &ChatCompletionRequest) -> u64 {
@@ -13994,12 +17246,33 @@ fn request_requirements_for_embedding(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = embedding_input_token_count(inputs);
+    let max_item_bytes = inputs
+        .iter()
+        .map(|input| u64::try_from(input.len()).unwrap_or(u64::MAX))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_item_units = inputs
+        .iter()
+        .map(|input| rough_tokens(input))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
+        required_modalities: vec!["embedding".to_owned()],
+        modality_load: BTreeMap::from([(
+            "embedding".to_owned(),
+            ModalityRequestLoad {
+                item_count: u32::try_from(inputs.len()).unwrap_or(u32::MAX).max(1),
+                max_item_bytes,
+                max_item_units,
+            },
+        )]),
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
@@ -14021,12 +17294,23 @@ fn request_requirements_for_image_generation(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
+    let (width, height) = parse_image_generation_size(request).unwrap_or((1, 1));
+    let image_count = image_generation_count(request);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
+        required_modalities: vec!["image".to_owned()],
+        modality_load: BTreeMap::from([(
+            "image".to_owned(),
+            ModalityRequestLoad {
+                item_count: image_count,
+                max_item_bytes: 1,
+                max_item_units: u64::from(width).saturating_mul(u64::from(height)),
+            },
+        )]),
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
@@ -14048,12 +17332,22 @@ fn request_requirements_for_audio_speech(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.input);
+    let estimated_seconds = estimate_audio_speech_seconds(request).max(1);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
+        required_modalities: vec!["audio".to_owned()],
+        modality_load: BTreeMap::from([(
+            "audio".to_owned(),
+            ModalityRequestLoad {
+                item_count: 1,
+                max_item_bytes: 1,
+                max_item_units: estimated_seconds,
+            },
+        )]),
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
@@ -14074,16 +17368,69 @@ fn request_requirements_for_audio_transcription(
     max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
+    let seconds = audio_transcription_seconds(request).max(1);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
+        required_modalities: vec!["audio".to_owned(), "text".to_owned()],
+        modality_load: BTreeMap::from([(
+            "audio".to_owned(),
+            ModalityRequestLoad {
+                item_count: 1,
+                max_item_bytes: u64::try_from(request.audio.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+                max_item_units: seconds,
+            },
+        )]),
         min_ctx: 1,
         input_tokens: audio_transcription_seconds(request),
         output_tokens: 0,
         usage: audio_transcription_usage_for_request(request),
+        min_throughput,
+        now_millis,
+        max_price_au,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
+        ..RequestRequirements::default()
+    }
+}
+
+fn request_requirements_for_artifact_generation(
+    state: &GatewayState,
+    _model: &GatewayModel,
+    request: &ArtifactGenerationRequest,
+    now_millis: u64,
+    max_price_au: Option<MoneyAu>,
+    min_throughput: Option<f64>,
+) -> RequestRequirements {
+    let input_tokens = rough_tokens(&request.prompt);
+    let max_item_units = if request.output_modality == "video" {
+        request.frame_count.max(1)
+    } else {
+        request.duration_seconds.max(1)
+    };
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
+        requires_tools: false,
+        requires_json: false,
+        requires_vision: false,
+        required_modalities: vec![request.output_modality.clone()],
+        modality_load: BTreeMap::from([(
+            request.output_modality.clone(),
+            ModalityRequestLoad {
+                item_count: 1,
+                max_item_bytes: 1,
+                max_item_units,
+            },
+        )]),
+        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        input_tokens,
+        output_tokens: 0,
+        usage: artifact_generation_usage_for_request(request),
         min_throughput,
         now_millis,
         max_price_au,
@@ -14157,6 +17504,22 @@ fn audio_transcription_route_selection_seed(
     let mut hasher = blake3::Hasher::new();
     hasher.update(model.id.as_bytes());
     hasher.update(audio_transcription_prompt_hash(request).as_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn artifact_generation_route_selection_seed(
+    model: &GatewayModel,
+    request: &ArtifactGenerationRequest,
+    now_millis: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(request.endpoint_family.as_bytes());
+    hasher.update(request.prompt.as_bytes());
     hasher.update(&now_millis.to_le_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
@@ -14452,6 +17815,33 @@ fn observation_sample_from_audio_transcription_success(
     }
 }
 
+fn observation_sample_from_artifact_generation_success(
+    request: &ArtifactGenerationRequest,
+    result: &GatewayArtifactGenerationResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+    let unit = if request.output_modality == "video" {
+        USAGE_FRAME
+    } else {
+        USAGE_AUDIO_SECOND
+    };
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.get(unit) as f64 / elapsed_seconds)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }),
+        error: false,
+    }
+}
+
 fn throughput_floor_retry_message(
     result: &GatewaySessionResult,
     failover: &GatewayFailoverInvocation,
@@ -14578,52 +17968,272 @@ fn eligible_route_candidates<'a>(
         .collect()
 }
 
-fn build_completion(
-    state: &GatewayState,
+async fn build_completion(
+    state: SharedState,
     request: CompletionRequest,
+    raw_request: Value,
+    options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
-    if !state.dev_session_shim {
-        return Err(ApiError::service_unavailable(
-            "no provider available: text completions cannot use the local dev shim in production mode",
+    let wants_stream = request.stream;
+    let mut chat = completion_chat_request(request, raw_request)?;
+    chat.stream = false;
+    let response = build_chat_completion(state, chat, options).await?;
+    let ChatResponse::Json(response) = response else {
+        return Err(ApiError::bad_gateway(
+            "completion adapter expected a non-streaming provider result",
             Some("model"),
         ));
-    }
-    let model = require_model(state, &request.model)?;
-    let id = make_id("cmpl");
-    let created = now_secs();
-    let prompt = prompt_to_text(&request.prompt);
-    let max_tokens = request.max_tokens.unwrap_or(64).max(1);
-    let text = format!("Mayhem completion: {}", prompt.trim())
-        .chars()
-        .take(max_tokens as usize * 8)
-        .collect::<String>();
-    let usage = usage_for(&prompt, &text);
-    let chunk = json!({
-        "id": id,
-        "object": "text_completion",
-        "created": created,
-        "model": model.id,
-        "choices": [{
-            "text": text,
-            "index": 0,
-            "logprobs": null,
-            "finish_reason": "stop"
-        }],
-        "usage": usage,
-        "mayhem": {
-            "backend": "local-openai-shape",
-            "billable": false,
-            "dev_session": true,
-            "receipt": null,
-        },
-    });
-    if request.stream {
-        Ok(ChatResponse::Sse(vec![chunk]))
+    };
+    let completion = completion_response_from_chat(response)?;
+    if wants_stream {
+        Ok(ChatResponse::Sse(vec![completion]))
     } else {
-        Ok(ChatResponse::Json(chunk))
+        Ok(ChatResponse::Json(completion))
     }
 }
 
+fn completion_chat_request(
+    request: CompletionRequest,
+    raw_request: Value,
+) -> Result<ChatCompletionRequest, ApiError> {
+    let prompt = prompt_to_text(&request.prompt);
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request(
+            "prompt must not be empty",
+            Some("prompt"),
+        ));
+    }
+    Ok(ChatCompletionRequest {
+        model: request.model,
+        messages: vec![ChatMessage {
+            role: "user".to_owned(),
+            content: json!(prompt),
+            name: None,
+            extra: BTreeMap::new(),
+        }],
+        user: request.user,
+        metadata: BTreeMap::new(),
+        stream: false,
+        stream_options: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        repeat_penalty: None,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        seed: request.seed,
+        stop: request.stop,
+        max_tokens: request.max_tokens,
+        max_completion_tokens: None,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS.to_owned()),
+        endpoint_request: Some(raw_request),
+    })
+}
+
+fn completion_response_from_chat(mut response: Value) -> Result<Value, ApiError> {
+    let choices = response
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
+    for choice in choices {
+        let text = choice
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let tool_calls = choice
+            .get("message")
+            .and_then(|message| message.get("tool_calls"))
+            .cloned();
+        let object = choice
+            .as_object_mut()
+            .ok_or_else(|| ApiError::bad_gateway("chat choice was not an object", Some("model")))?;
+        object.remove("message");
+        object.insert(
+            "text".to_owned(),
+            if let Some(tool_calls) = tool_calls {
+                json!({"tool_calls": tool_calls}).to_string().into()
+            } else {
+                text
+            },
+        );
+        object.entry("logprobs").or_insert(Value::Null);
+    }
+    response["object"] = json!("text_completion");
+    Ok(response)
+}
+
+async fn build_response(
+    state: SharedState,
+    request: ResponsesRequest,
+    raw_request: Value,
+    options: GatewayRequestOptions,
+) -> Result<ChatResponse, ApiError> {
+    let wants_stream = request.stream;
+    let mut chat = responses_chat_request(request, raw_request)?;
+    chat.stream = false;
+    let response = build_chat_completion(state, chat, options).await?;
+    let ChatResponse::Json(response) = response else {
+        return Err(ApiError::bad_gateway(
+            "responses adapter expected a non-streaming provider result",
+            Some("model"),
+        ));
+    };
+    let response = responses_value_from_chat(response)?;
+    if wants_stream {
+        Ok(ChatResponse::Sse(vec![json!({
+            "type": "response.completed",
+            "response": response,
+        })]))
+    } else {
+        Ok(ChatResponse::Json(response))
+    }
+}
+
+fn responses_chat_request(
+    request: ResponsesRequest,
+    raw_request: Value,
+) -> Result<ChatCompletionRequest, ApiError> {
+    let messages = responses_input_messages(&request.input)?;
+    let response_format = request
+        .text
+        .as_ref()
+        .and_then(|text| text.get("format"))
+        .cloned();
+    Ok(ChatCompletionRequest {
+        model: request.model,
+        messages,
+        user: request.user,
+        metadata: request.metadata,
+        stream: false,
+        stream_options: None,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls,
+        response_format,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        repeat_penalty: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        stop: None,
+        max_tokens: request.max_output_tokens,
+        max_completion_tokens: None,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_RESPONSES.to_owned()),
+        endpoint_request: Some(raw_request),
+    })
+}
+
+fn responses_input_messages(input: &Value) -> Result<Vec<ChatMessage>, ApiError> {
+    match input {
+        Value::String(text) if !text.trim().is_empty() => Ok(vec![ChatMessage {
+            role: "user".to_owned(),
+            content: json!(text),
+            name: None,
+            extra: BTreeMap::new(),
+        }]),
+        Value::Array(items) if !items.is_empty() => items
+            .iter()
+            .map(|item| {
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .filter(|role| !role.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "Responses input message is missing role",
+                            Some("input"),
+                        )
+                    })?;
+                let content = item.get("content").cloned().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "Responses input message is missing content",
+                        Some("input"),
+                    )
+                })?;
+                Ok(ChatMessage {
+                    role: role.to_owned(),
+                    content,
+                    name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+                    extra: item
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, _)| !matches!(key.as_str(), "role" | "content" | "name"))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                })
+            })
+            .collect(),
+        _ => Err(ApiError::bad_request(
+            "input must be a non-empty string or array of message objects",
+            Some("input"),
+        )),
+    }
+}
+
+fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
+    let id = response
+        .get("id")
+        .cloned()
+        .unwrap_or_else(|| json!(make_id("resp")));
+    let model = response.get("model").cloned().unwrap_or(Value::Null);
+    let created_at = response
+        .get("created")
+        .cloned()
+        .unwrap_or_else(|| json!(now_secs()));
+    let choice = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
+    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+    let text = message.get("content").cloned().unwrap_or(Value::Null);
+    let mut output_content = vec![json!({
+        "type": "output_text",
+        "text": text,
+        "annotations": [],
+    })];
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        output_content.extend(tool_calls.iter().map(|call| {
+            json!({
+                "type": "function_call",
+                "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                "name": call.get("function").and_then(|function| function.get("name")).cloned().unwrap_or(Value::Null),
+                "arguments": call.get("function").and_then(|function| function.get("arguments")).cloned().unwrap_or(Value::Null),
+            })
+        }));
+    }
+    let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
+    Ok(json!({
+        "id": id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "id": make_id("msg"),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": output_content,
+        }],
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| json!(0)),
+            "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| json!(0)),
+            "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
+        },
+        "mayhem": response.get("mayhem").cloned().unwrap_or_else(|| json!({})),
+    }))
+}
 async fn build_embedding(
     state: &GatewayState,
     request: EmbeddingRequest,
@@ -14785,6 +18395,110 @@ async fn build_image_generation(
     }))
 }
 
+async fn build_artifact_generation(
+    state: &GatewayState,
+    request: ArtifactGenerationRequest,
+    options: GatewayRequestOptions,
+) -> Result<CompletedArtifactGeneration, ApiError> {
+    let model = require_model(state, &request.model)?;
+    let class_allowed = match request.endpoint_family.as_str() {
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            model.mayhem.model_class == "video-generation"
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => {
+            model.mayhem.model_class == "music-generation"
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => matches!(
+            model.mayhem.model_class.as_str(),
+            "audio-generation" | "music-generation"
+        ),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => matches!(
+            model.mayhem.model_class.as_str(),
+            "audio-generation" | "music-generation"
+        ),
+        _ => false,
+    };
+    if !class_allowed {
+        return Err(ApiError::bad_request(
+            format!(
+                "model {} does not support endpoint family {}",
+                model.id, request.endpoint_family
+            ),
+            Some("model"),
+        ));
+    }
+    let GatewayArtifactGenerationRun {
+        result:
+            GatewayArtifactGenerationResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                quality,
+            },
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_artifact_generation_with_route_retry(state, &model, &request, options).await?;
+    if output.artifacts.len() != 1 {
+        return Err(ApiError::bad_gateway(
+            format!(
+                "provider returned {} {} artifact(s), expected 1",
+                output.artifacts.len(),
+                request.output_modality
+            ),
+            Some("model"),
+        ));
+    }
+    let content_type = output.artifacts[0].content_type.as_str();
+    let expected_prefix = if request.output_modality == "video" {
+        "video/"
+    } else {
+        "audio/"
+    };
+    if !content_type.starts_with(expected_prefix) {
+        return Err(ApiError::bad_gateway(
+            format!("provider returned content type {content_type}, expected {expected_prefix}*"),
+            Some("model"),
+        ));
+    }
+    if request.endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+        && (content_type != "audio/wav" || wav_sample_rate(&output.artifacts[0].bytes).is_none())
+    {
+        return Err(ApiError::bad_gateway(
+            "HF text-to-audio provider must return a valid WAV artifact with a sample rate",
+            Some("model"),
+        ));
+    }
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_artifact_generation_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        Some(receipt_summary(&receipt))
+    };
+    if !state.dev_session_shim {
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
+    }
+    Ok(CompletedArtifactGeneration {
+        output,
+        backend,
+        direct_session,
+        billable: !state.dev_session_shim,
+        quality,
+        receipt,
+        session_id: invocation.session_id,
+        access_token: invocation.access_token,
+    })
+}
+
 async fn build_audio_speech(
     state: &GatewayState,
     request: AudioSpeechRequest,
@@ -14884,6 +18598,10 @@ async fn parse_audio_transcription_multipart(
     let mut response_format = None;
     let mut language = None;
     let mut prompt = None;
+    let mut temperature = None;
+    let mut timestamp_granularities = Vec::new();
+    let mut stream = false;
+    let mut stream_present = false;
 
     while let Some(field) = multipart.next_field().await.map_err(|err| {
         ApiError::bad_request(format!("invalid multipart form: {err}"), Some("file"))
@@ -14926,21 +18644,106 @@ async fn parse_audio_transcription_multipart(
                     ApiError::bad_request(format!("invalid prompt field: {err}"), Some("prompt"))
                 })?);
             }
-            _ => {}
+            "temperature" => {
+                let value = field.text().await.map_err(|err| {
+                    ApiError::bad_request(
+                        format!("invalid temperature field: {err}"),
+                        Some("temperature"),
+                    )
+                })?;
+                temperature = Some(value.parse::<f64>().map_err(|_| {
+                    ApiError::bad_request(
+                        "temperature must be a finite number",
+                        Some("temperature"),
+                    )
+                })?);
+            }
+            "timestamp_granularities" | "timestamp_granularities[]" => {
+                timestamp_granularities.push(field.text().await.map_err(|err| {
+                    ApiError::bad_request(
+                        format!("invalid timestamp granularity: {err}"),
+                        Some("timestamp_granularities"),
+                    )
+                })?);
+            }
+            "stream" => {
+                stream_present = true;
+                let value = field.text().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid stream field: {err}"), Some("stream"))
+                })?;
+                stream = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(ApiError::bad_request(
+                            "stream must be true or false",
+                            Some("stream"),
+                        ))
+                    }
+                };
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    format!("unsupported audio transcription field {name}"),
+                    Some("file"),
+                ))
+            }
         }
     }
 
+    let model = model
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?;
+    let audio =
+        audio.ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?;
+    let mut contract_request = json!({
+        "model": &model,
+        "file": {
+            "filename": filename.as_deref().unwrap_or("audio.bin"),
+            "content_type": content_type.as_deref().unwrap_or("application/octet-stream"),
+            "bytes": audio.len(),
+            "blake3": blake3_hex(&audio),
+        },
+    });
+    set_optional_json(
+        &mut contract_request,
+        "response_format",
+        response_format.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut contract_request,
+        "language",
+        language.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut contract_request,
+        "prompt",
+        prompt.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut contract_request,
+        "temperature",
+        temperature.map(|value| json!(value)),
+    );
+    if !timestamp_granularities.is_empty() {
+        contract_request["timestamp_granularities"] = json!(&timestamp_granularities);
+    }
+    if stream_present {
+        contract_request["stream"] = json!(stream);
+    }
     Ok(AudioTranscriptionRequest {
-        model: model
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?,
-        audio: audio
-            .ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?,
+        model,
+        audio,
         content_type,
         filename,
         response_format,
         language,
         prompt,
+        temperature,
+        timestamp_granularities,
+        stream,
+        endpoint_family: mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS.to_owned(),
+        contract_request,
     })
 }
 
@@ -15062,11 +18865,27 @@ fn model_supports_stt(model: &GatewayModel) -> bool {
 struct ChatInputModalities {
     image: bool,
     audio: bool,
+    video: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChatMediaStats {
+    image_count: u32,
+    image_max_bytes: u64,
+    image_max_pixels: u64,
+    audio_count: u32,
+    audio_max_bytes: u64,
+    audio_max_seconds: u64,
+    audio_seconds: u64,
+    video_count: u32,
+    video_max_bytes: u64,
+    video_max_frames: u64,
 }
 
 fn validate_chat_modalities(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
+    limits: &GatewayMediaLimits,
 ) -> Result<(), ApiError> {
     let modalities = chat_input_modalities(&request.messages);
     if modalities.image && !model.mayhem.caps.vision {
@@ -15081,7 +18900,289 @@ fn validate_chat_modalities(
             Some("messages"),
         ));
     }
+    if modalities.video && !model.mayhem.caps.video {
+        return Err(ApiError::bad_request(
+            "model does not support video chat content",
+            Some("messages"),
+        ));
+    }
+    chat_media_stats(&request.messages, limits)?;
     Ok(())
+}
+
+fn chat_media_stats(
+    messages: &[ChatMessage],
+    limits: &GatewayMediaLimits,
+) -> Result<ChatMediaStats, ApiError> {
+    let mut stats = ChatMediaStats::default();
+    let mut media_parts = 0_u64;
+    for message in messages {
+        let Value::Array(parts) = &message.content else {
+            continue;
+        };
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("image_url") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .or_else(|| part.get("url"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ApiError::bad_request(
+                                "image_url content is missing image_url.url",
+                                Some("messages"),
+                            )
+                        })?;
+                    let (bytes, pixels) = validate_chat_image_data_url(url, limits)?;
+                    stats.image_count = stats.image_count.saturating_add(1);
+                    stats.image_max_bytes = stats.image_max_bytes.max(bytes);
+                    stats.image_max_pixels = stats.image_max_pixels.max(pixels);
+                }
+                Some("input_audio") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let audio = part.get("input_audio").ok_or_else(|| {
+                        ApiError::bad_request(
+                            "input_audio content is missing input_audio",
+                            Some("messages"),
+                        )
+                    })?;
+                    let (bytes, seconds) = validate_chat_audio_input(audio, limits)?;
+                    stats.audio_count = stats.audio_count.saturating_add(1);
+                    stats.audio_max_bytes = stats.audio_max_bytes.max(bytes);
+                    stats.audio_max_seconds = stats.audio_max_seconds.max(seconds);
+                    stats.audio_seconds = stats.audio_seconds.saturating_add(seconds);
+                }
+                Some("video") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let video = part.get("video").ok_or_else(|| {
+                        ApiError::bad_request("video content is missing video", Some("messages"))
+                    })?;
+                    let (bytes, frames) = validate_chat_video_input(video, limits)?;
+                    stats.video_count = stats.video_count.saturating_add(1);
+                    stats.video_max_bytes = stats.video_max_bytes.max(bytes);
+                    stats.video_max_frames = stats.video_max_frames.max(frames);
+                }
+                _ => {}
+            }
+        }
+    }
+    if media_parts > u64::from(limits.max_items_per_request) {
+        return Err(ApiError::bad_request(
+            format!(
+                "chat request exceeds the {}-item gateway media limit",
+                limits.max_items_per_request
+            ),
+            Some("messages"),
+        ));
+    }
+    Ok(stats)
+}
+
+fn validate_chat_image_data_url(
+    url: &str,
+    limits: &GatewayMediaLimits,
+) -> Result<(u64, u64), ApiError> {
+    let rest = url.strip_prefix("data:").ok_or_else(|| {
+        ApiError::bad_request(
+            "remote image URLs are not fetched; use a base64 image data URL",
+            Some("messages"),
+        )
+    })?;
+    let (metadata, encoded) = rest
+        .split_once(',')
+        .ok_or_else(|| ApiError::bad_request("image data URL is malformed", Some("messages")))?;
+    let mut metadata_parts = metadata.split(';');
+    let content_type = metadata_parts.next().unwrap_or_default();
+    if !matches!(content_type, "image/png" | "image/jpeg")
+        || !metadata_parts.any(|entry| entry == "base64")
+    {
+        return Err(ApiError::bad_request(
+            "image data URL must be base64 PNG or JPEG",
+            Some("messages"),
+        ));
+    }
+    let encoded_limit = usize::try_from(limits.max_image_bytes)
+        .unwrap_or(usize::MAX / 4)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(4);
+    if encoded.len() > encoded_limit {
+        return Err(ApiError::bad_request(
+            format!(
+                "image input exceeds the {}-byte gateway limit",
+                limits.max_image_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| {
+        ApiError::bad_request("image data URL contains invalid base64", Some("messages"))
+    })?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limits.max_image_bytes {
+        return Err(ApiError::bad_request(
+            format!(
+                "image input must be 1..={} decoded bytes",
+                limits.max_image_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let (width, height) = ImageReader::new(io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|_| ApiError::bad_request("image input format is invalid", Some("messages")))?
+        .into_dimensions()
+        .map_err(|_| ApiError::bad_request("image input cannot be decoded", Some("messages")))?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > limits.max_image_pixels {
+        return Err(ApiError::bad_request(
+            format!(
+                "image input exceeds the {}-pixel gateway limit",
+                limits.max_image_pixels
+            ),
+            Some("messages"),
+        ));
+    }
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), pixels))
+}
+
+fn validate_chat_audio_input(
+    audio: &Value,
+    limits: &GatewayMediaLimits,
+) -> Result<(u64, u64), ApiError> {
+    let format = audio
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("wav")
+        .to_ascii_lowercase();
+    if format != "wav" {
+        return Err(ApiError::bad_request(
+            "input_audio currently requires format=wav for bounded decoding and exact metering",
+            Some("messages"),
+        ));
+    }
+    let encoded = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("input_audio.data is required", Some("messages")))?;
+    let encoded_limit = usize::try_from(limits.max_audio_bytes)
+        .unwrap_or(usize::MAX / 4)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(4);
+    if encoded.len() > encoded_limit {
+        return Err(ApiError::bad_request(
+            format!(
+                "audio input exceeds the {}-byte gateway limit",
+                limits.max_audio_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| {
+        ApiError::bad_request("input_audio.data contains invalid base64", Some("messages"))
+    })?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limits.max_audio_bytes {
+        return Err(ApiError::bad_request(
+            format!(
+                "audio input must be 1..={} decoded bytes",
+                limits.max_audio_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let seconds = wav_duration_seconds_ceil(&bytes).ok_or_else(|| {
+        ApiError::bad_request("input_audio is not a valid bounded WAV", Some("messages"))
+    })?;
+    if seconds == 0 || seconds > limits.max_audio_seconds {
+        return Err(ApiError::bad_request(
+            format!(
+                "audio input must be 1..={} seconds",
+                limits.max_audio_seconds
+            ),
+            Some("messages"),
+        ));
+    }
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), seconds))
+}
+
+fn validate_chat_video_input(
+    video: &Value,
+    limits: &GatewayMediaLimits,
+) -> Result<(u64, u64), ApiError> {
+    let content_type = video
+        .get("content_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("video.content_type is required", Some("messages")))?;
+    if !matches!(content_type, "video/mp4" | "video/webm" | "video/quicktime") {
+        return Err(ApiError::bad_request(
+            "video.content_type must be video/mp4, video/webm, or video/quicktime",
+            Some("messages"),
+        ));
+    }
+    let encoded = video
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("video.data is required", Some("messages")))?;
+    let encoded_limit = usize::try_from(limits.max_video_bytes)
+        .unwrap_or(usize::MAX / 4)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(4);
+    if encoded.len() > encoded_limit {
+        return Err(ApiError::bad_request(
+            format!(
+                "video input exceeds the {}-byte gateway limit",
+                limits.max_video_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| {
+        ApiError::bad_request("video.data contains invalid base64", Some("messages"))
+    })?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limits.max_video_bytes {
+        return Err(ApiError::bad_request(
+            format!(
+                "video input must be 1..={} decoded bytes",
+                limits.max_video_bytes
+            ),
+            Some("messages"),
+        ));
+    }
+    let frames = video
+        .get("num_frames")
+        .and_then(Value::as_u64)
+        .filter(|frames| *frames > 0)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "video.num_frames must be a positive integer",
+                Some("messages"),
+            )
+        })?;
+    if frames > limits.max_video_frames {
+        return Err(ApiError::bad_request(
+            format!(
+                "video input exceeds the {}-frame gateway limit",
+                limits.max_video_frames
+            ),
+            Some("messages"),
+        ));
+    }
+    if let Some(fps) = video.get("fps") {
+        fps.as_f64()
+            .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "video.fps must be a finite number between 0 and 240",
+                    Some("messages"),
+                )
+            })?;
+    }
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
 }
 
 fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
@@ -15094,9 +19195,25 @@ fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
             match part.get("type").and_then(Value::as_str) {
                 Some("image_url") => modalities.image = true,
                 Some("input_audio") => modalities.audio = true,
+                Some("video") => modalities.video = true,
                 _ => {}
             }
         }
+    }
+    modalities
+}
+
+fn chat_required_modalities(messages: &[ChatMessage]) -> Vec<String> {
+    let input = chat_input_modalities(messages);
+    let mut modalities = vec!["text".to_owned()];
+    if input.image {
+        modalities.push("image".to_owned());
+    }
+    if input.audio {
+        modalities.push("audio".to_owned());
+    }
+    if input.video {
+        modalities.push("video".to_owned());
     }
     modalities
 }
@@ -15444,14 +19561,7 @@ impl GatewayState {
         served_invocation: &GatewaySessionInvocation,
         config: &GatewayCanaryModelConfig,
     ) -> Result<StoredProbeEvent, ApiError> {
-        let expected_fingerprint = canary_expected_fingerprint(config, served_invocation)
-            .ok_or_else(|| {
-                ApiError::bad_gateway(
-                    "no catalog canary fingerprint for served artifact",
-                    Some("model"),
-                )
-            })?;
-        let expected_token_prefixes = canary_expected_token_prefixes(config, served_invocation)
+        let all_expected_token_prefixes = canary_expected_token_prefixes(config, served_invocation)
             .ok_or_else(|| {
                 ApiError::bad_gateway(
                     "no catalog canary token prefixes for served artifact",
@@ -15459,13 +19569,69 @@ impl GatewayState {
                 )
             })?;
         let route = canary_served_route(model, served_invocation);
-        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
-        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
-        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let served_modalities = route
+            .as_ref()
+            .map(|route| route.served_modalities.clone())
+            .unwrap_or_else(|| model.mayhem.adapter.modality_set.clone());
+        let served_modalities = served_modalities.into_iter().collect::<BTreeSet<_>>();
+        let prompts = config
+            .prompts
+            .iter()
+            .filter(|prompt| {
+                canary_chat_prompt_modalities(prompt)
+                    .iter()
+                    .all(|modality| served_modalities.contains(modality))
+            })
+            .collect::<Vec<_>>();
+        let covered_modalities = prompts
+            .iter()
+            .flat_map(|prompt| canary_chat_prompt_modalities(prompt))
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = served_modalities
+            .iter()
+            .find(|modality| !covered_modalities.contains(*modality))
+        {
+            return Err(ApiError::bad_gateway(
+                format!("served modality {missing} has no matching catalog canary prompt"),
+                Some("model"),
+            ));
+        }
+        let expected_token_prefixes = prompts
+            .iter()
+            .filter_map(|prompt| {
+                all_expected_token_prefixes
+                    .get(&prompt.id)
+                    .cloned()
+                    .map(|tokens| (prompt.id.clone(), tokens))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if expected_token_prefixes.len() != prompts.len() {
+            return Err(ApiError::bad_gateway(
+                "catalog canary token prefixes do not cover every served-modality prompt",
+                Some("model"),
+            ));
+        }
+        let expected_prompt_fingerprints = expected_token_prefixes
+            .iter()
+            .map(|(prompt_id, tokens)| {
+                (
+                    prompt_id.clone(),
+                    token_fingerprint(tokens.iter().copied()).digest,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected_fingerprint = aggregate_canary_fingerprints(
+            expected_prompt_fingerprints
+                .iter()
+                .map(|(prompt_id, fingerprint)| (prompt_id.as_str(), fingerprint.as_str())),
+        );
+        let mut prompt_reports = Vec::with_capacity(prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(prompts.len());
+        let mut stored_receipts = Vec::with_capacity(prompts.len());
         let mut observed_tokens = BTreeMap::new();
 
-        for prompt in &config.prompts {
-            let request = canary_chat_request(&model.id, config, prompt, self.canary_policy.seed);
+        for prompt in &prompts {
+            let request = canary_chat_request(model, prompt, self.canary_policy.seed)?;
             let invocation = self.prepare_chat_invocation_for_route(
                 model,
                 &request,
@@ -15503,20 +19669,19 @@ impl GatewayState {
         let spec = CanaryProbeSpec {
             model: model.id.clone(),
             canary_set: config.canary_set.clone(),
-            prompt_id: format!("aggregate:{}", config.prompts.len()),
-            prompt: config
-                .prompts
+            prompt_id: format!("aggregate:{}", prompts.len()),
+            prompt: prompts
                 .iter()
                 .map(|prompt| prompt.id.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
             seed: self.canary_policy.seed,
-            max_tokens: config
-                .prompts
+            max_tokens: prompts
                 .iter()
                 .map(|prompt| prompt.max_tokens)
                 .max()
                 .unwrap_or(1),
+            sampling: Default::default(),
         };
         let evaluation = evaluate_catalog_canary_token_prefix_probe(
             &spec,
@@ -15700,6 +19865,7 @@ impl GatewayState {
                 .join(","),
             seed: self.canary_policy.seed,
             max_tokens: 1,
+            sampling: Default::default(),
         };
         let evaluation = evaluate_catalog_canary_perceptual_hash_probe(
             &spec,
@@ -15874,6 +20040,7 @@ impl GatewayState {
                 .join(","),
             seed: self.canary_policy.seed,
             max_tokens: 1,
+            sampling: Default::default(),
         };
         let min_match_bps = config
             .verification_tolerance_bps
@@ -15981,6 +20148,7 @@ impl GatewayState {
                 .join(","),
             seed: self.canary_policy.seed,
             max_tokens: 1,
+            sampling: Default::default(),
         };
         let evaluation = evaluate_catalog_canary_transcript_match_probe(
             &spec,
@@ -16097,6 +20265,7 @@ impl GatewayState {
                 .join(","),
             seed: self.canary_policy.seed,
             max_tokens: 1,
+            sampling: Default::default(),
         };
         let evaluation = evaluate_catalog_canary_audio_fingerprint_probe(
             &spec,
@@ -16274,6 +20443,7 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
+            required_modalities: chat_required_modalities(&request.messages),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -16375,6 +20545,7 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
+            required_modalities: vec!["embedding".to_owned()],
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -16476,6 +20647,7 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
+            required_modalities: vec!["image".to_owned()],
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -16577,6 +20749,7 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
+            required_modalities: vec!["audio".to_owned()],
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -16678,6 +20851,112 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
+            required_modalities: vec!["audio".to_owned(), "text".to_owned()],
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
+            max_spend_au,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
+            session_id,
+            rail: self.receipt_config.rail.clone(),
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
+            enclave_id,
+            price_ver,
+            opened_at,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+            attestation,
+            hedge: GatewayHedgeInvocation::default(),
+            failover,
+            access_token: options.access_token.clone(),
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
+        })
+    }
+
+    fn prepare_artifact_generation_invocation_for_route(
+        &self,
+        model: &GatewayModel,
+        request: &ArtifactGenerationRequest,
+        route: Option<&GatewayRouteCandidate>,
+        options: &GatewayRequestOptions,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_hash = artifact_generation_prompt_hash(request);
+        let work_units = if request.output_modality == "video" {
+            request.frame_count
+        } else {
+            request.duration_seconds
+        }
+        .saturating_mul(1_000)
+        .max(1);
+        let failover = self.failover_thresholds_for_model(model, options, work_units);
+        let session_id = session_id_for(&model.id, &prompt_hash);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price = route_price_ref_au(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
+        });
+        let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.ledger_balance_au() {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let opened_at = now_secs();
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
+            served_ctx,
+            required_modalities: vec![request.output_modality.clone()],
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -16780,7 +21059,8 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let receipt = if let Some(provider_receipt) = provider_receipt {
             let seq = provider_receipt.body.seq;
-            let usage = expected_text_usage_for_provider(
+            let usage = expected_chat_usage_for_provider(
+                request,
                 Some(&provider_receipt.body.usage),
                 output.usage.prompt_tokens,
                 output.usage.completion_tokens,
@@ -16808,8 +21088,12 @@ impl GatewayState {
                 },
             )?
         } else {
-            let usage =
-                ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+            let usage = chat_receipt_usage(
+                request,
+                output.usage.prompt_tokens,
+                output.usage.completion_tokens,
+                &self.media_limits,
+            );
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
             if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
                 return Err(ApiError::payment_required(
@@ -17046,6 +21330,100 @@ impl GatewayState {
             session_id: receipt.body.session_id.clone(),
             seq: receipt.body.seq,
             user_sig,
+        };
+        let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+            access_token: invocation.access_token.clone(),
+        };
+        self.record_receipt(stored.clone())?;
+        Ok(stored)
+    }
+
+    fn meter_artifact_generation_session(
+        &self,
+        model: &GatewayModel,
+        request: &ArtifactGenerationRequest,
+        output: &ArtifactGenerationOutput,
+        invocation: &GatewaySessionInvocation,
+        provider_receipt: Option<&ProviderSignedReceipt>,
+    ) -> Result<StoredReceipt, ApiError> {
+        let usage = output.usage.clone();
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let prompt_hash = artifact_generation_prompt_hash(request);
+        let receipt = if let Some(provider_receipt) = provider_receipt {
+            self.cosign_provider_receipt(
+                model,
+                invocation,
+                provider_receipt,
+                ExpectedProviderReceipt {
+                    provider: &provider,
+                    seq: 1,
+                    final_receipt: true,
+                    usage: usage.clone(),
+                    au_owed_cum,
+                    prompt_hash: prompt_hash.clone(),
+                },
+            )?
+        } else {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider,
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
+                rules_ver: invocation.rules_ver,
+                usage,
+                au_owed_cum,
+                prompt_hash,
+                ts: now_millis_u64(),
+            };
+            let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+            let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+            SessionReceipt {
+                body,
+                enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                enclave_pubkey: verifying_key_hex(&self.receipt_config.enclave_seed),
+                user_sig,
+            }
+        };
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig: receipt.user_sig.clone(),
         };
         let stored = StoredReceipt {
             rail: invocation.rail.clone(),
@@ -17554,43 +21932,68 @@ fn context_needle_chat_request(model_id: &str, spec: &ContextNeedleSpec) -> Chat
         metadata: BTreeMap::new(),
         stream: true,
         stream_options: Some(StreamOptions {
-            include_usage: true,
+            include_usage: Some(true),
         }),
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         response_format: None,
-        temperature: Some(DEFAULT_CANARY_TEMPERATURE),
+        temperature: Some(0.0),
         top_p: None,
+        top_k: None,
+        min_p: None,
+        repeat_penalty: None,
+        frequency_penalty: None,
+        presence_penalty: None,
         seed: Some(0),
         stop: None,
         max_tokens: Some(CONTEXT_NEEDLE_MAX_TOKENS),
+        max_completion_tokens: None,
+        endpoint_family: None,
+        endpoint_request: None,
     }
 }
 
+fn canary_chat_prompt_modalities(prompt: &GatewayCanaryPrompt) -> BTreeSet<String> {
+    chat_required_modalities(&prompt.messages)
+        .into_iter()
+        .collect()
+}
+
 fn canary_chat_request(
-    model_id: &str,
-    _config: &GatewayCanaryModelConfig,
+    model: &GatewayModel,
     prompt: &GatewayCanaryPrompt,
     seed: i64,
-) -> ChatCompletionRequest {
-    ChatCompletionRequest {
-        model: model_id.to_owned(),
+) -> Result<ChatCompletionRequest, ApiError> {
+    let mut request = ChatCompletionRequest {
+        model: model.id.clone(),
         messages: prompt.messages.clone(),
         user: None,
         metadata: BTreeMap::new(),
         stream: true,
         stream_options: Some(StreamOptions {
-            include_usage: true,
+            include_usage: Some(true),
         }),
         tools: prompt.tools.clone(),
         tool_choice: None,
+        parallel_tool_calls: None,
         response_format: None,
-        temperature: Some(DEFAULT_CANARY_TEMPERATURE),
-        top_p: None,
-        seed: Some(seed),
+        temperature: prompt.temperature,
+        top_p: prompt.top_p,
+        top_k: prompt.top_k,
+        min_p: prompt.min_p,
+        repeat_penalty: prompt.repeat_penalty,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: Some(prompt.seed.unwrap_or(seed)),
         stop: None,
         max_tokens: Some(prompt.max_tokens.max(1)),
-    }
+        max_completion_tokens: None,
+        endpoint_family: None,
+        endpoint_request: None,
+    };
+    apply_model_sampling_defaults(model, &mut request)?;
+    Ok(request)
 }
 
 fn canary_image_prompt_text(prompt: &GatewayCanaryPrompt) -> String {
@@ -17625,10 +22028,16 @@ fn canary_image_generation_request(
         n: Some(1),
         size: prompt.size.clone(),
         response_format: Some("b64_json".to_owned()),
+        quality: None,
+        style: None,
+        negative_prompt: None,
         steps: prompt.steps,
         cfg_scale: prompt.cfg_scale,
         seed: Some(prompt.seed.unwrap_or(seed)),
+        scheduler: None,
         user: None,
+        endpoint_family: None,
+        endpoint_request: None,
     }
 }
 
@@ -17661,6 +22070,8 @@ fn canary_embedding_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> Emb
         encoding_format: Some("float".to_owned()),
         dimensions: None,
         user: None,
+        endpoint_family: None,
+        endpoint_request: None,
     }
 }
 
@@ -17676,6 +22087,10 @@ fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> 
                 .unwrap_or_else(|| "wav".to_owned()),
         ),
         speed: None,
+        instructions: None,
+        stream_format: None,
+        endpoint_family: None,
+        endpoint_request: None,
     }
 }
 
@@ -17698,6 +22113,39 @@ fn canary_audio_transcription_request(
             Some("model"),
         ));
     }
+    let filename = prompt
+        .filename
+        .clone()
+        .unwrap_or_else(|| format!("{}.wav", prompt.id));
+    let response_format = prompt
+        .response_format
+        .clone()
+        .unwrap_or_else(|| "json".to_owned());
+    let mut contract_request = json!({
+        "model": model_id,
+        "file": {
+            "filename": &filename,
+            "content_type": prompt.content_type.as_deref().unwrap_or("audio/wav"),
+            "bytes": audio.len(),
+            "blake3": blake3_hex(&audio),
+        },
+        "response_format": &response_format,
+    });
+    set_optional_json(
+        &mut contract_request,
+        "language",
+        prompt.language.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut contract_request,
+        "prompt",
+        prompt.prompt.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut contract_request,
+        "temperature",
+        prompt.temperature.map(|value| json!(value)),
+    );
     Ok(AudioTranscriptionRequest {
         model: model_id.to_owned(),
         audio,
@@ -17707,20 +22155,15 @@ fn canary_audio_transcription_request(
                 .clone()
                 .unwrap_or_else(|| "audio/wav".to_owned()),
         ),
-        filename: Some(
-            prompt
-                .filename
-                .clone()
-                .unwrap_or_else(|| format!("{}.wav", prompt.id)),
-        ),
-        response_format: Some(
-            prompt
-                .response_format
-                .clone()
-                .unwrap_or_else(|| "json".to_owned()),
-        ),
+        filename: Some(filename),
+        response_format: Some(response_format),
         language: prompt.language.clone(),
         prompt: prompt.prompt.clone(),
+        temperature: prompt.temperature,
+        timestamp_granularities: Vec::new(),
+        stream: false,
+        endpoint_family: mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS.to_owned(),
+        contract_request,
     })
 }
 
@@ -18290,6 +22733,11 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_MODEL_CLASS)
                 .to_owned(),
+            family: model
+                .get("family")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             providers_online: 0,
             rooms: 0,
             price_ref_au: PriceRefAu {
@@ -18350,13 +22798,28 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .map(str::to_owned),
                 output_modalities: caps_output_modalities(caps),
             },
-            adapter: shape_adapter_from_catalog_value(model),
+            adapter: shape_adapter_from_catalog_value(model)?,
+            sampling: sampling_profile_from_catalog_value(model),
             failover: failover_policy_from_catalog_value(model),
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
             route_candidates: Vec::new(),
         },
     })
+}
+
+fn sampling_profile_from_catalog_value(model: &Value) -> SamplingProfile {
+    let sampling = model.get("sampling").unwrap_or(&Value::Null);
+    SamplingProfile {
+        temperature: sampling.get("temperature").and_then(Value::as_f64),
+        top_p: sampling.get("top_p").and_then(Value::as_f64),
+        top_k: sampling
+            .get("top_k")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        min_p: sampling.get("min_p").and_then(Value::as_f64),
+        repeat_penalty: sampling.get("repeat_penalty").and_then(Value::as_f64),
+    }
 }
 
 fn failover_policy_from_catalog_value(model: &Value) -> GatewayFailoverPolicyConfig {
@@ -18460,48 +22923,29 @@ fn caps_output_modalities(caps: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn shape_adapter_from_catalog_value(model: &Value) -> ShapeAdapterInfo {
-    let adapter = model.get("adapter").unwrap_or(&Value::Null);
-    let defaults = ShapeAdapterInfo::default();
-    ShapeAdapterInfo {
-        request_shape_family: adapter
-            .get("request_shape_family")
-            .and_then(Value::as_str)
-            .unwrap_or(defaults.request_shape_family.as_str())
-            .to_owned(),
-        chat_template_id: adapter
-            .get("chat_template_id")
-            .and_then(Value::as_str)
-            .unwrap_or(defaults.chat_template_id.as_str())
-            .to_owned(),
-        tool_call_strategy: adapter
-            .get("tool_call_strategy")
-            .and_then(Value::as_str)
-            .unwrap_or(defaults.tool_call_strategy.as_str())
-            .to_owned(),
-        reasoning_passthrough: adapter
-            .get("reasoning_passthrough")
-            .and_then(Value::as_str)
-            .unwrap_or(defaults.reasoning_passthrough.as_str())
-            .to_owned(),
-        modality_set: adapter
-            .get("modality_set")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|entries| !entries.is_empty())
-            .unwrap_or(defaults.modality_set),
-        response_normalization: adapter
-            .get("response_normalization")
-            .and_then(Value::as_str)
-            .unwrap_or(defaults.response_normalization.as_str())
-            .to_owned(),
+fn shape_adapter_from_catalog_value(model: &Value) -> Option<ShapeAdapterInfo> {
+    let adapter = model.get("adapter")?;
+    let endpoint_families = serde_json::from_value::<Vec<EndpointFamilyContract>>(
+        adapter.get("endpoint_families")?.clone(),
+    )
+    .ok()
+    .filter(|contracts| !contracts.is_empty())?;
+    let modality_set = adapter
+        .get("modality_set")?
+        .as_array()?
+        .iter()
+        .map(|entry| entry.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    if modality_set.is_empty() {
+        return None;
     }
+    Some(ShapeAdapterInfo {
+        endpoint_families,
+        chat_template_id: adapter.get("chat_template_id")?.as_str()?.to_owned(),
+        tool_call_strategy: adapter.get("tool_call_strategy")?.as_str()?.to_owned(),
+        reasoning_passthrough: adapter.get("reasoning_passthrough")?.as_str()?.to_owned(),
+        modality_set,
+    })
 }
 
 fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
@@ -18700,6 +23144,38 @@ fn stable_value_hash(value: &Value) -> String {
     blake3::hash(stable_json_value(value).to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn wav_sample_rate(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.checked_add(chunk_len)?;
+        if chunk_end > bytes.len() {
+            return None;
+        }
+        if chunk_id == b"fmt " && chunk_len >= 16 {
+            let sample_rate = u32::from_le_bytes([
+                bytes[chunk_start + 4],
+                bytes[chunk_start + 5],
+                bytes[chunk_start + 6],
+                bytes[chunk_start + 7],
+            ]);
+            return (sample_rate > 0).then_some(sample_rate);
+        }
+        offset = chunk_end.checked_add(chunk_len % 2)?;
+    }
+    None
 }
 
 fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
@@ -18947,6 +23423,10 @@ fn audio_transcription_prompt_hash(request: &AudioTranscriptionRequest) -> Strin
     stable_value_hash(&direct_session_audio_transcription_request_body(request))
 }
 
+fn artifact_generation_prompt_hash(request: &ArtifactGenerationRequest) -> String {
+    stable_value_hash(&request.contract_request)
+}
+
 fn validate_image_generation_request(
     model: &GatewayModel,
     request: &ImageGenerationRequest,
@@ -19158,6 +23638,23 @@ fn audio_transcription_failover_work_units(request: &AudioTranscriptionRequest) 
     audio_transcription_seconds(request).saturating_mul(1_000)
 }
 
+fn artifact_generation_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
+    if request.output_modality == "video" {
+        ReceiptUsage::from_units([
+            (USAGE_VIDEO_SECOND, request.duration_seconds),
+            (USAGE_FRAME, request.frame_count),
+        ])
+    } else {
+        ReceiptUsage::from_units([
+            (
+                USAGE_INPUT_CHARACTER,
+                u64::try_from(request.prompt.chars().count()).unwrap_or(u64::MAX),
+            ),
+            (USAGE_AUDIO_SECOND, request.duration_seconds),
+        ])
+    }
+}
+
 fn embedding_input_token_count(inputs: &[String]) -> u64 {
     inputs
         .iter()
@@ -19317,6 +23814,13 @@ fn estimate_audio_transcription_max_spend_au(
     calculate_au_owed(price, &audio_transcription_usage_for_request(request)).max(1_000)
 }
 
+fn estimate_artifact_generation_max_spend_au(
+    price: &PriceRefAu,
+    request: &ArtifactGenerationRequest,
+) -> MoneyAu {
+    calculate_au_owed(price, &artifact_generation_usage_for_request(request)).max(1_000)
+}
+
 fn rough_tokens(text: &str) -> u64 {
     if text.trim().is_empty() {
         0
@@ -19362,6 +23866,14 @@ impl ApiError {
     fn bad_request(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn not_found(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
             param,
         }
@@ -19683,7 +24195,13 @@ mod tests {
             steps: Some(1),
             cfg_scale: None,
             seed: None,
+            quality: None,
+            style: None,
+            negative_prompt: None,
+            scheduler: None,
             user: None,
+            endpoint_family: None,
+            endpoint_request: None,
         };
         let mut large_image = small_image.clone();
         large_image.n = Some(4);
@@ -19735,6 +24253,10 @@ mod tests {
             voice: None,
             response_format: Some("wav".to_owned()),
             speed: None,
+            instructions: None,
+            stream_format: None,
+            endpoint_family: None,
+            endpoint_request: None,
         };
         let mut large_audio = small_audio.clone();
         large_audio.input = "long ".repeat(1_000);
@@ -19944,9 +24466,20 @@ mod tests {
 
     #[test]
     fn catalog_model_parses_per_model_failover_policy() {
+        let chat_contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .unwrap();
         let model = model_from_catalog_value(
             &json!({
                 "model_id": "admin/quality-test",
+                "adapter": {
+                    "endpoint_families": [chat_contract],
+                    "chat_template_id": "generic_chatml",
+                    "tool_call_strategy": "none",
+                    "reasoning_passthrough": "preserve",
+                    "modality_set": ["text"]
+                },
                 "failover": {
                     "open_timeout_ms": 2_000,
                     "ttft_timeout_ms": 5_000,
@@ -20314,12 +24847,14 @@ mod tests {
             max_wait_ms: 40,
             ..GatewayRequestOptions::default()
         };
+        let required_modalities = vec!["text".to_owned()];
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_refresh = calls.clone();
         let outcome = wait_for_eligible_routes_with_poll(
             &state,
             &model,
             &options,
+            &required_modalities,
             Vec::new(),
             || {
                 if calls_for_refresh.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
@@ -20342,6 +24877,7 @@ mod tests {
             &state,
             &model,
             &instant,
+            &required_modalities,
             Vec::new(),
             || vec![&model.mayhem.route_candidates[0]],
             Duration::from_millis(1),
@@ -20349,6 +24885,31 @@ mod tests {
         .await;
         assert!(!outcome.waited);
         assert!(outcome.routes.is_empty());
+
+        let media_modalities = vec!["text".to_owned(), "image".to_owned()];
+        let incompatible_refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_count = incompatible_refreshes.clone();
+        let outcome = wait_for_eligible_routes_with_poll(
+            &state,
+            &model,
+            &options,
+            &media_modalities,
+            Vec::new(),
+            || {
+                refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(!outcome.waited);
+        assert_eq!(
+            incompatible_refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let error = no_eligible_route_error(&state, &model, &options, &media_modalities);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("image"));
 
         let error = route_wait_expired_error(&options);
         assert!(error.message.contains("no eligible provider"));
@@ -20867,6 +25428,7 @@ mod tests {
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 4096,
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: Some(ctx_bracket_for_tokens(4096).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 1000,
@@ -20917,6 +25479,7 @@ mod tests {
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
+                family: "test".to_owned(),
                 providers_online: 1,
                 rooms: 1,
                 price_ref_au: PriceRefAu {
@@ -20950,12 +25513,206 @@ mod tests {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn model_sampling_fills_missing_values_without_overriding_client_values() {
+        let mut model = test_model();
+        model.mayhem.sampling = SamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.02),
+            repeat_penalty: Some(1.05),
+        };
+        let mut request = test_chat_request(&model.id);
+        request.temperature = Some(0.3);
+        request.top_k = Some(42);
+
+        apply_model_sampling_defaults(&model, &mut request).unwrap();
+
+        assert_eq!(request.temperature, Some(0.3));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.top_k, Some(42));
+        assert_eq!(request.min_p, Some(0.02));
+        assert_eq!(request.repeat_penalty, Some(1.05));
+    }
+
+    #[test]
+    fn model_sampling_rejects_conflicting_server_controlled_repeat_penalty() {
+        let mut model = test_model();
+        model.mayhem.sampling.repeat_penalty = Some(1.05);
+        let mut request = test_chat_request(&model.id);
+        request.repeat_penalty = Some(1.2);
+
+        let error = apply_model_sampling_defaults(&model, &mut request).unwrap_err();
+
+        assert_eq!(error.param.as_deref(), Some("repeat_penalty"));
+        assert!(error.message.contains("server-controlled"));
+    }
+
+    #[test]
+    fn automatic_canary_request_uses_profile_and_seeded_client_overrides() {
+        let mut model = test_model();
+        model.mayhem.sampling = SamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.02),
+            repeat_penalty: Some(1.05),
+        };
+        let prompt = GatewayCanaryPrompt {
+            id: "sampling-high".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: json!("sample"),
+                name: None,
+                extra: BTreeMap::new(),
+            }],
+            tools: None,
+            max_tokens: 8,
+            temperature: Some(1.0),
+            top_p: None,
+            top_k: Some(40),
+            min_p: Some(0.1),
+            repeat_penalty: None,
+            prompt: None,
+            input: None,
+            audio_b64: None,
+            content_type: None,
+            filename: None,
+            language: None,
+            voice: None,
+            response_format: None,
+            size: None,
+            steps: None,
+            cfg_scale: None,
+            seed: Some(77),
+        };
+
+        let request = canary_chat_request(&model, &prompt, 9).unwrap();
+
+        assert_eq!(request.temperature, Some(1.0));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.top_k, Some(40));
+        assert_eq!(request.min_p, Some(0.1));
+        assert_eq!(request.repeat_penalty, Some(1.05));
+        assert_eq!(request.seed, Some(77));
+    }
+
+    #[test]
+    fn hf_inference_target_uses_admin_signed_model_task() {
+        let mut model = test_model();
+        model.id = "test/image-model".to_owned();
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+            )
+            .unwrap()];
+        let state = GatewayState::from_models(vec![model]);
+
+        assert_eq!(
+            hf_inference_target(&state, "test/image-model").unwrap(),
+            (
+                "test/image-model".to_owned(),
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE.to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn hf_feature_extraction_suffix_selects_only_declared_contract() {
+        let mut model = test_model();
+        model.id = "test/embedding-model".to_owned();
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION,
+            )
+            .unwrap()];
+        let state = GatewayState::from_models(vec![model]);
+
+        assert_eq!(
+            hf_inference_target(&state, "test/embedding-model/pipeline/feature-extraction")
+                .unwrap(),
+            (
+                "test/embedding-model".to_owned(),
+                mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION.to_owned()
+            )
+        );
+        assert!(hf_inference_target(&state, "test/embedding-model").is_err());
+    }
+
+    #[test]
+    fn hf_inference_target_rejects_ambiguous_generic_tasks() {
+        let mut model = test_model();
+        model.id = "test/ambiguous-model".to_owned();
+        model.mayhem.adapter.endpoint_families = [
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ]
+        .into_iter()
+        .map(|family| mayhem_proto::endpoint_family_contract_template(family).unwrap())
+        .collect();
+        let state = GatewayState::from_models(vec![model]);
+
+        let error = hf_inference_target(&state, "test/ambiguous-model").unwrap_err();
+        assert!(error.message.contains("ambiguous HF task endpoints"));
+    }
+
+    #[test]
+    fn hf_image_request_keeps_signed_payload_and_maps_every_engine_field() {
+        let raw = json!({
+            "inputs": "a red cube",
+            "parameters": {
+                "width": 768,
+                "height": 512,
+                "num_inference_steps": 17,
+                "guidance_scale": 6.5,
+                "negative_prompt": "blue",
+                "scheduler": "euler",
+                "seed": 23
+            }
+        });
+
+        let request = hf_image_generation_request("test/image", raw.clone()).unwrap();
+        assert_eq!(request.prompt, "a red cube");
+        assert_eq!(request.size.as_deref(), Some("768x512"));
+        assert_eq!(request.steps, Some(17));
+        assert_eq!(request.cfg_scale, Some(6.5));
+        assert_eq!(request.negative_prompt.as_deref(), Some("blue"));
+        assert_eq!(request.scheduler.as_deref(), Some("euler"));
+        assert_eq!(request.seed, Some(23));
+        assert_eq!(request.endpoint_request, Some(raw));
+        assert_eq!(
+            request.endpoint_family.as_deref(),
+            Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE)
+        );
+    }
+
+    #[test]
+    fn hf_embedding_request_keeps_hf_options_in_signed_payload() {
+        let raw = json!({
+            "inputs": ["alpha", "beta"],
+            "normalize": true,
+            "prompt_name": "query",
+            "truncate": true,
+            "truncation_direction": "left"
+        });
+
+        let request = hf_embedding_request("test/embed", raw.clone()).unwrap();
+        assert_eq!(request.input, json!(["alpha", "beta"]));
+        assert_eq!(request.endpoint_request, Some(raw));
+        assert_eq!(
+            request.endpoint_family.as_deref(),
+            Some(mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION)
+        );
     }
 
     #[test]
@@ -21008,6 +25765,7 @@ mod tests {
             selected_timeframe: DashboardPriceTimeframe::H1,
             selected_bucket: None,
             selected_quant: None,
+            selected_unit: None,
             pinned_models: Vec::new(),
             provider_filter: None,
         };
@@ -21055,7 +25813,33 @@ mod tests {
             }]
         });
 
-        let registry = canary_registry_from_catalog_root(&root);
+        let canary_sets = BTreeMap::from([(
+            "canary-dev-v1".to_owned(),
+            vec![GatewayCanaryPrompt {
+                id: "fixed-image".to_owned(),
+                messages: Vec::new(),
+                tools: None,
+                max_tokens: 1,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                repeat_penalty: None,
+                prompt: Some("fixed image canary".to_owned()),
+                input: None,
+                audio_b64: None,
+                content_type: None,
+                filename: None,
+                language: None,
+                voice: None,
+                response_format: None,
+                size: Some("64x64".to_owned()),
+                steps: Some(1),
+                cfg_scale: Some(1.0),
+                seed: Some(7),
+            }],
+        )]);
+        let registry = canary_registry_from_catalog_root(&root, &canary_sets);
         let config = registry
             .models
             .get("admin/image-fixture")
@@ -21087,13 +25871,52 @@ mod tests {
             stream_options: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             response_format: None,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: None,
             stop: None,
             max_tokens: None,
+            max_completion_tokens: None,
+            endpoint_family: None,
+            endpoint_request: None,
         }
+    }
+
+    fn test_png_data_url() -> String {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(bytes.into_inner())
+        )
+    }
+
+    fn test_wav_b64() -> String {
+        let data = vec![128_u8; 8_000];
+        let mut wav = Vec::with_capacity(44 + data.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36_u32 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        BASE64_STANDARD.encode(wav)
     }
 
     #[test]
@@ -21180,6 +26003,7 @@ mod tests {
         GatewayRouteCandidate {
             provider: format!("{:02x}", idx.wrapping_add(1)).repeat(32),
             accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+            served_modalities: vec!["text".to_owned()],
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
@@ -21491,6 +26315,54 @@ mod tests {
         providers: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Debug)]
+    struct ArtifactGenerationSuccessBackend;
+
+    impl GatewaySessionBackend for ArtifactGenerationSuccessBackend {
+        fn name(&self) -> &str {
+            "test-artifact-generation"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async { Err(GatewaySessionError::new("chat not used")) })
+        }
+
+        fn run_artifact_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ArtifactGenerationRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayArtifactGenerationFuture<'a> {
+            Box::pin(async move {
+                let content_type = if request.output_modality == "video" {
+                    "video/mp4"
+                } else {
+                    "audio/wav"
+                };
+                Ok(GatewayArtifactGenerationResult {
+                    output: ArtifactGenerationOutput {
+                        artifacts: vec![GatewayArtifactOutput {
+                            id: "artifact-1".to_owned(),
+                            content_type: content_type.to_owned(),
+                            bytes: b"fixture".to_vec(),
+                            blake3: blake3_hex(b"fixture"),
+                        }],
+                        usage: artifact_generation_usage_for_request(request),
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: false,
+                    provider_receipt: None,
+                    quality: None,
+                })
+            })
+        }
+    }
+
     fn test_gateway_state_from_models(models: Vec<GatewayModel>) -> GatewayState {
         let now = now_millis_u64();
         let heartbeats = models
@@ -21498,6 +26370,32 @@ mod tests {
             .flat_map(|model| {
                 model.mayhem.route_candidates.iter().map(|route| {
                     let mut heartbeat = heartbeat_for_route(model, route, now);
+                    heartbeat.caps.modality_capacity = route
+                        .served_modalities
+                        .iter()
+                        .filter(|modality| modality.as_str() != "text")
+                        .map(|modality| {
+                            (
+                                modality.clone(),
+                                HeartbeatModalityCapacity {
+                                    unit: match modality.as_str() {
+                                        "image" => "pixel",
+                                        "audio" => "second",
+                                        "video" => "frame",
+                                        "embedding" => "input_token",
+                                        _ => "unit",
+                                    }
+                                    .to_owned(),
+                                    max_inflight_items: 16,
+                                    active_items: 0,
+                                    max_items_per_request: 4,
+                                    max_item_bytes: 256 * 1024 * 1024,
+                                    max_item_units: 100_000_000,
+                                    working_set_bytes_per_item: 1024,
+                                },
+                            )
+                        })
+                        .collect();
                     heartbeat.sig = "aa".repeat(64);
                     heartbeat
                 })
@@ -22072,7 +26970,16 @@ mod tests {
 
     #[test]
     fn route_selection_applies_modality_throughput_floors() {
-        let model = test_routed_model(2);
+        let mut model = test_routed_model(2);
+        model.mayhem.model_class = "embedding".to_owned();
+        model.mayhem.adapter.modality_set = vec![
+            "embedding".to_owned(),
+            "image".to_owned(),
+            "audio".to_owned(),
+        ];
+        for route in &mut model.mayhem.route_candidates {
+            route.served_modalities = model.mayhem.adapter.modality_set.clone();
+        }
         let state = test_gateway_state_from_models(vec![model.clone()]);
         let inputs = vec!["alpha beta".to_owned(), "gamma".to_owned()];
 
@@ -22108,7 +27015,13 @@ mod tests {
             steps: Some(4),
             cfg_scale: None,
             seed: None,
+            quality: None,
+            style: None,
+            negative_prompt: None,
+            scheduler: None,
             user: None,
+            endpoint_family: None,
+            endpoint_request: None,
         };
         assert_eq!(
             ordered_route_candidates_for_image_generation_with_options(
@@ -22134,6 +27047,10 @@ mod tests {
             voice: None,
             response_format: Some("wav".to_owned()),
             speed: None,
+            instructions: None,
+            stream_format: None,
+            endpoint_family: None,
+            endpoint_request: None,
         };
         assert_eq!(
             ordered_route_candidates_for_audio_speech_with_options(
@@ -22675,6 +27592,259 @@ mod tests {
         assert_eq!(run.invocation.hedge.actual_probe_count, 0);
     }
 
+    #[test]
+    fn preferred_provider_and_failover_never_select_text_only_route_for_image_chat() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.vision = true;
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        model.mayhem.route_candidates[0].served_modalities = vec!["text".to_owned()];
+        model.mayhem.route_candidates[1].served_modalities =
+            vec!["text".to_owned(), "image".to_owned()];
+        let text_only = model.mayhem.route_candidates[0].provider.clone();
+        let vision = model.mayhem.route_candidates[1].provider.clone();
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        state
+            .replace_preferred_providers(BTreeMap::from([(
+                model.id.clone(),
+                vec![text_only.clone(), vision.clone()],
+            )]))
+            .unwrap();
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            { "type": "text", "text": "describe" },
+            { "type": "image_url", "image_url": { "url": test_png_data_url() } }
+        ]);
+
+        let routes = ordered_route_candidates_for_request_with_options(
+            &state,
+            &model,
+            &request,
+            &GatewayRequestOptions::default(),
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec![vision.as_str()]
+        );
+        assert!(!routes.iter().any(|route| route.provider == text_only));
+    }
+
+    #[test]
+    fn modality_admission_rechecks_live_capability_and_releases_capacity() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.vision = true;
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        model.mayhem.route_candidates[0].served_modalities =
+            vec!["text".to_owned(), "image".to_owned()];
+        let route = &model.mayhem.route_candidates[0];
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, route, now);
+        heartbeat.caps.modality_capacity.insert(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 1,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 1024 * 1024,
+                max_item_units: 1024 * 1024,
+                working_set_bytes_per_item: 1024,
+            },
+        );
+        heartbeat.sig = "aa".repeat(64);
+        state.ingest_provider_heartbeat(heartbeat.clone(), now);
+
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            { "type": "text", "text": "describe" },
+            { "type": "image_url", "image_url": { "url": test_png_data_url() } }
+        ]);
+        let requirements =
+            request_requirements_for_chat(&state, &model, &request, now, None, None, None);
+
+        let admission = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("first image admission")
+            .expect("image admission guard");
+        assert!(state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .err()
+            .expect("second image request must be refused")
+            .contains("capacity is full"));
+        drop(admission);
+        assert!(state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .is_ok());
+
+        heartbeat.caps.served_modalities = vec!["text".to_owned()];
+        state.ingest_provider_heartbeat(heartbeat, now.saturating_add(1));
+        let err = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .err()
+            .expect("dropped image capability must be refused");
+        assert!(err.contains("Capabilities"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn video_generation_executes_through_the_common_artifact_path() {
+        let mut model = test_model();
+        model.id = "mayhem/video-test".to_owned();
+        model.mayhem.model_class = "video-generation".to_owned();
+        model.mayhem.caps.video = true;
+        model.mayhem.caps.output_modality = Some("video".to_owned());
+        model.mayhem.caps.output_modalities = vec!["video".to_owned()];
+        model.mayhem.adapter.modality_set = vec!["video".to_owned()];
+        model.mayhem.adapter.endpoint_families = vec![
+            mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+                .unwrap(),
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            )
+            .unwrap(),
+        ];
+        model.mayhem.price_ref_au.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_FRAME.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+        ];
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_dev_session_shim()
+            .with_session_backend(Arc::new(ArtifactGenerationSuccessBackend));
+        let raw = json!({
+            "model": model.id.clone(),
+            "prompt": "a quiet launch",
+            "seconds": "4",
+            "size": "1280x720"
+        });
+        validate_catalog_endpoint_request(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &raw,
+        )
+        .unwrap();
+        let request =
+            artifact_generation_request(&model.id, mayhem_proto::ENDPOINT_OPENAI_VIDEOS, raw)
+                .unwrap();
+        assert_eq!(request.duration_seconds, 4);
+        assert_eq!(request.frame_count, 4 * DEFAULT_VIDEO_GENERATION_FPS);
+
+        let run =
+            build_artifact_generation(&state, request.clone(), GatewayRequestOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(run.output.usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(run.output.usage.get(USAGE_FRAME), 96);
+        assert_eq!(run.backend, "test-artifact-generation");
+        assert!(!run.direct_session);
+        assert!(!run.billable);
+        let response = artifact_generation_response_value(&request, &run);
+        assert_eq!(response["object"], json!("video"));
+        assert_eq!(response["status"], json!("completed"));
+    }
+
+    #[test]
+    fn video_lifecycle_store_evicts_by_count_bytes_and_expiry() {
+        let job = |id: &str, bytes: usize, expires_at: u64| StoredVideoJob {
+            id: id.to_owned(),
+            model: "mayhem/video-test".to_owned(),
+            metadata: json!({"id": id, "object": "video"}),
+            artifact: GatewayArtifactOutput {
+                id: format!("artifact-{id}"),
+                content_type: "video/mp4".to_owned(),
+                bytes: vec![7; bytes],
+                blake3: blake3_hex(id.as_bytes()),
+            },
+            access_token: None,
+            expires_at,
+        };
+        let mut store = GatewayVideoJobStore::default();
+        store.insert(job("a", 4, 100), 2, 8, 1).unwrap();
+        store.insert(job("b", 4, 100), 2, 8, 1).unwrap();
+        store.insert(job("c", 4, 100), 2, 8, 1).unwrap();
+        assert_eq!(
+            store
+                .jobs
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        assert_eq!(store.total_bytes, 8);
+
+        store.insert(job("d", 6, 100), 2, 8, 1).unwrap();
+        assert_eq!(store.jobs.len(), 1);
+        assert_eq!(store.jobs[0].id, "d");
+        assert_eq!(store.total_bytes, 6);
+
+        store.insert(job("expired", 1, 2), 2, 8, 1).unwrap();
+        store.purge_expired(2);
+        assert_eq!(store.jobs.len(), 1);
+        assert_eq!(store.jobs[0].id, "d");
+        assert_eq!(store.total_bytes, 6);
+        assert!(store.insert(job("too-large", 9, 100), 2, 8, 2).is_err());
+    }
+
+    #[test]
+    fn audio_and_music_generation_keep_distinct_contracts_and_usage() {
+        for (family, expected_kind, expected_object) in [
+            (
+                mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+                "audio_generation",
+                "audio.generation",
+            ),
+            (
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+                "music_generation",
+                "music.generation",
+            ),
+        ] {
+            let raw = json!({
+                "model": "mayhem/audio-test",
+                "prompt": "piano",
+                "duration_seconds": 2.25,
+                "response_format": "wav",
+                "seed": 7
+            });
+            let request = artifact_generation_request("mayhem/audio-test", family, raw).unwrap();
+            assert_eq!(request.transport_kind, expected_kind);
+            assert_eq!(request.duration_seconds, 3);
+            let output = ArtifactGenerationOutput {
+                artifacts: vec![GatewayArtifactOutput {
+                    id: "audio-1".to_owned(),
+                    content_type: "audio/wav".to_owned(),
+                    bytes: b"wav".to_vec(),
+                    blake3: blake3_hex(b"wav"),
+                }],
+                usage: artifact_generation_usage_for_request(&request),
+            };
+            assert_eq!(output.usage.get(USAGE_INPUT_CHARACTER), 5);
+            assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 3);
+            let run = CompletedArtifactGeneration {
+                output,
+                backend: "test".to_owned(),
+                direct_session: false,
+                billable: false,
+                quality: None,
+                receipt: None,
+                session_id: "test-session".to_owned(),
+                access_token: None,
+            };
+            let response = artifact_generation_response_value(&request, &run);
+            assert_eq!(response["object"], json!(expected_object));
+        }
+    }
+
     #[tokio::test]
     async fn route_retry_abandons_below_floor_provider_and_reroutes() {
         let model = test_routed_model(2);
@@ -22943,6 +28113,168 @@ mod tests {
     }
 
     #[test]
+    fn chat_media_is_admitted_without_double_billing_llm_input() {
+        let mut model = test_model();
+        model.mayhem.caps.vision = true;
+        model.mayhem.caps.audio = true;
+        model.mayhem.adapter.modality_set =
+            vec!["text".to_owned(), "image".to_owned(), "audio".to_owned()];
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            { "type": "text", "text": "describe the media" },
+            { "type": "image_url", "image_url": { "url": test_png_data_url() } },
+            { "type": "input_audio", "input_audio": { "data": test_wav_b64(), "format": "wav" } }
+        ]);
+
+        validate_chat_modalities(&model, &request, &GatewayMediaLimits::default()).unwrap();
+        let requirements = request_requirements_for_chat(
+            &GatewayState::from_models(vec![model.clone()]),
+            &model,
+            &request,
+            1,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            requirements.required_modalities,
+            vec!["text".to_owned(), "image".to_owned(), "audio".to_owned()]
+        );
+        assert_eq!(requirements.usage.get(USAGE_IMAGE), 0);
+        assert_eq!(requirements.usage.get(USAGE_AUDIO_SECOND), 0);
+
+        let provider_usage = ReceiptUsage::from_units([
+            (USAGE_INPUT_TOKEN, requirements.input_tokens),
+            (USAGE_OUTPUT_TOKEN, 2),
+        ]);
+        let expected = expected_chat_usage_for_provider(
+            &request,
+            Some(&provider_usage),
+            requirements.input_tokens,
+            2,
+            &[
+                RateMapEntry {
+                    unit: USAGE_INPUT_TOKEN.to_owned(),
+                    per_unit_au: 1,
+                    granularity: 1,
+                },
+                RateMapEntry {
+                    unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                    per_unit_au: 1,
+                    granularity: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(expected, provider_usage);
+
+        let double_billed_usage = ReceiptUsage::from_units([
+            (USAGE_INPUT_TOKEN, requirements.input_tokens),
+            (USAGE_OUTPUT_TOKEN, 2),
+            (USAGE_IMAGE, 1),
+            (USAGE_AUDIO_SECOND, 1),
+        ]);
+        assert!(expected_chat_usage_for_provider(
+            &request,
+            Some(&double_billed_usage),
+            requirements.input_tokens,
+            2,
+            &[],
+        )
+        .unwrap_err()
+        .message
+        .contains("double-bill"));
+    }
+
+    #[test]
+    fn chat_media_rejects_remote_images_and_unmeterable_audio() {
+        let mut model = test_model();
+        model.mayhem.caps.vision = true;
+        model.mayhem.caps.audio = true;
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([{
+            "type": "image_url",
+            "image_url": { "url": "https://example.test/untrusted.png" }
+        }]);
+        assert!(
+            validate_chat_modalities(&model, &request, &GatewayMediaLimits::default())
+                .unwrap_err()
+                .message
+                .contains("not fetched")
+        );
+
+        request.messages[0].content = json!([{
+            "type": "input_audio",
+            "input_audio": { "data": "AAAA", "format": "mp3" }
+        }]);
+        assert!(
+            validate_chat_modalities(&model, &request, &GatewayMediaLimits::default())
+                .unwrap_err()
+                .message
+                .contains("format=wav")
+        );
+    }
+
+    #[test]
+    fn video_chat_uses_hf_contract_and_routes_by_bounded_frame_load() {
+        let mut model = test_model();
+        model.mayhem.caps.video = true;
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "video".to_owned()];
+        model.mayhem.adapter.endpoint_families.push(
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
+            )
+            .unwrap(),
+        );
+        let raw = json!({
+            "model": model.id,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text", "text":"describe this clip"},
+                    {"type":"video", "video": {
+                        "data": BASE64_STANDARD.encode(b"bounded-video"),
+                        "content_type":"video/mp4",
+                        "num_frames":8,
+                        "fps":2.0
+                    }}
+                ]
+            }]
+        });
+        let state = GatewayState::from_models(vec![model.clone()]);
+        assert_eq!(
+            chat_endpoint_family(&state, &model.id, &raw).unwrap(),
+            mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        );
+        let request: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        validate_chat_modalities(&model, &request, &GatewayMediaLimits::default()).unwrap();
+        let requirements =
+            request_requirements_for_chat(&state, &model, &request, 1, None, None, None);
+        assert_eq!(
+            requirements.required_modalities,
+            vec!["text".to_owned(), "video".to_owned()]
+        );
+        assert_eq!(requirements.modality_load["video"].item_count, 1);
+        assert_eq!(requirements.modality_load["video"].max_item_units, 8);
+    }
+
+    #[test]
+    fn gateway_body_limit_covers_base64_expansion_of_configured_media() {
+        let state = GatewayState::from_models(vec![test_model()]);
+        let decoded = state
+            .media_limits
+            .max_image_bytes
+            .saturating_add(state.media_limits.max_audio_bytes)
+            .saturating_add(state.media_limits.max_video_bytes);
+        let encoded = usize::try_from(decoded)
+            .unwrap()
+            .saturating_mul(4)
+            .div_ceil(3);
+
+        assert!(gateway_request_body_limit(&state) >= encoded);
+    }
+
+    #[test]
     fn direct_session_request_body_preserves_conversation_hints() {
         let mut request = test_chat_request("mayhem/chat");
         request.user = Some("terminal-user-1".to_owned());
@@ -22982,6 +28314,20 @@ mod tests {
             .collect::<Vec<_>>();
         let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn direct_session_request_budget_expands_to_the_admitted_body() {
+        let body_bytes = DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES + 32 * 1024 * 1024;
+
+        assert_eq!(
+            direct_session_request_byte_limit_for_len(4096, body_bytes, None),
+            body_bytes
+        );
+        assert_eq!(
+            direct_session_request_byte_limit_for_len(4096, body_bytes, Some(80 * 1024 * 1024)),
+            80 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -23278,6 +28624,71 @@ mod tests {
         let label = dashboard_price(&price);
         assert!(label.contains("$0.00000000001 / 1000 input_token"));
         assert!(!label.contains("au/"));
+    }
+
+    #[test]
+    fn dashboard_keeps_multi_unit_prices_separate_and_exposes_endpoint_families() {
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 4,
+            rate_map: vec![
+                RateMapEntry {
+                    unit: USAGE_IMAGE.to_owned(),
+                    per_unit_au: 500,
+                    granularity: 1,
+                },
+                RateMapEntry {
+                    unit: USAGE_STEP.to_owned(),
+                    per_unit_au: 2,
+                    granularity: 1,
+                },
+            ],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: vec![json!({
+                "epoch": 3,
+                "ctx_bracket": "base",
+                "result_price": {
+                    "rate_map": [
+                        {"unit": USAGE_IMAGE, "per_unit_au": "450", "granularity": 1},
+                        {"unit": USAGE_STEP, "per_unit_au": "3", "granularity": 1}
+                    ]
+                },
+                "usage": {"settled_au": "10"}
+            })],
+        };
+        let series = dashboard_price_series_from_price(&price, "T1", "int4");
+        assert_eq!(series.len(), 2);
+        let image = series
+            .iter()
+            .find(|series| series.unit == USAGE_IMAGE)
+            .unwrap();
+        let step = series
+            .iter()
+            .find(|series| series.unit == USAGE_STEP)
+            .unwrap();
+        assert_eq!(image.points[0].price_au, 450);
+        assert_eq!(step.points[0].price_au, 3);
+        assert_ne!(image.points[0].price_au, step.points[0].price_au);
+
+        let mut model = test_model();
+        model.mayhem.adapter.endpoint_families = vec![
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            )
+            .unwrap(),
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+            )
+            .unwrap(),
+        ];
+        let abilities = dashboard_model_abilities(&model);
+        assert!(abilities.contains(&format!(
+            "api:{}",
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+        )));
+        assert!(abilities.contains(&format!("api:{}", mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE)));
     }
 
     fn test_provider_receipt(

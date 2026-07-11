@@ -5,6 +5,7 @@
     {
       "id": "tts-hello-world-fixed",
       "input": "Hello world.",
+      "voice": "en_US-lessac-low",
       "response_format": "wav",
       "max_tokens": 1
     }

@@ -7,8 +7,9 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_proto::{
-    default_model_class, MoneyAu, DEFAULT_MODEL_CLASS, USAGE_AUDIO_SECOND, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
+    default_model_class, EndpointFamilyContract, MoneyAu, DEFAULT_MODEL_CLASS,
+    ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,10 +104,63 @@ pub(crate) struct CatalogModel {
     pub(crate) artifacts: BTreeMap<String, CatalogArtifact>,
     pub(crate) caps: CatalogCaps,
     pub(crate) requirements: CatalogRequirements,
-    #[serde(default)]
     pub(crate) adapter: CatalogAdapter,
+    pub(crate) modality_assessment: CatalogModalityAssessment,
+    #[serde(default)]
+    pub(crate) sampling: CatalogSamplingProfile,
     pub(crate) canary: CanaryRef,
     pub(crate) price_ref_au: PriceRef,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct CatalogSamplingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_penalty: Option<f64>,
+}
+
+impl CatalogSamplingProfile {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
+            && self.repeat_penalty.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogModalityAssessment {
+    pub(crate) detected: Vec<String>,
+    pub(crate) evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) calibrated_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) resource_profiles:
+        BTreeMap<String, BTreeMap<String, CatalogModalityResourceProfile>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogModalityResourceProfile {
+    pub(crate) unit: String,
+    pub(crate) measurement_source: String,
+    pub(crate) max_item_bytes: u64,
+    pub(crate) max_item_units: u64,
+    pub(crate) measured_item_bytes: u64,
+    pub(crate) measured_item_units: u64,
+    pub(crate) measured_working_set_bytes: u64,
+    pub(crate) calibration_baseline_memory_bytes: u64,
+    pub(crate) calibration_peak_memory_bytes: u64,
+    pub(crate) calibration_f13_budget_bytes: u64,
+    pub(crate) default_max_inflight_items: u32,
+    pub(crate) default_max_items_per_request: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,39 +262,38 @@ pub(crate) struct CatalogRequirements {
     pub(crate) backends: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub(crate) struct CatalogAdapter {
-    #[serde(default = "default_request_shape_family")]
-    pub(crate) request_shape_family: String,
+    pub(crate) endpoint_families: Vec<EndpointFamilyContract>,
     #[serde(default = "default_chat_template_id")]
     pub(crate) chat_template_id: String,
     #[serde(default = "default_tool_call_strategy")]
     pub(crate) tool_call_strategy: String,
     #[serde(default = "default_reasoning_passthrough")]
     pub(crate) reasoning_passthrough: String,
-    #[serde(default = "default_modality_set")]
     pub(crate) modality_set: Vec<String>,
-    #[serde(default = "default_response_normalization")]
-    pub(crate) response_normalization: String,
 }
 
 impl Default for CatalogAdapter {
     fn default() -> Self {
         Self {
-            request_shape_family: default_request_shape_family(),
+            endpoint_families: vec![default_chat_endpoint_contract()],
             chat_template_id: default_chat_template_id(),
             tool_call_strategy: default_tool_call_strategy(),
             reasoning_passthrough: default_reasoning_passthrough(),
             modality_set: default_modality_set(),
-            response_normalization: default_response_normalization(),
         }
     }
 }
 
-fn default_request_shape_family() -> String {
-    "openai_chat".to_owned()
+fn default_chat_endpoint_contract() -> EndpointFamilyContract {
+    endpoint_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+        .expect("the built-in chat endpoint contract exists")
 }
 
+pub(crate) fn endpoint_contract_template(family: &str) -> Option<EndpointFamilyContract> {
+    mayhem_proto::endpoint_family_contract_template(family)
+}
 fn default_chat_template_id() -> String {
     "generic_chatml".to_owned()
 }
@@ -255,10 +308,6 @@ fn default_reasoning_passthrough() -> String {
 
 fn default_modality_set() -> Vec<String> {
     vec!["text".to_owned()]
-}
-
-fn default_response_normalization() -> String {
-    "openai_chat".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,7 +375,34 @@ struct CatalogKey {
 struct CanarySet {
     set_id: String,
     #[serde(default)]
-    prompts: Vec<Value>,
+    prompts: Vec<CanarySetPrompt>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanarySetPrompt {
+    id: String,
+    #[serde(default)]
+    messages: Vec<Value>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    audio_b64: Option<String>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    top_p: Option<f64>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    min_p: Option<f64>,
+    #[serde(default)]
+    repeat_penalty: Option<f64>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
 }
 
 fn default_canary_verification_method() -> String {
@@ -389,6 +465,9 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
 
     for set_id in &canary_sets {
         validate_canary_set(&options.canaries_dir, set_id, &mut errors);
+    }
+    for model in &catalog.models {
+        validate_model_canary_modality_coverage(&options.canaries_dir, model, &mut errors);
     }
 
     let download_checks = if options.check_dev_downloads && errors.is_empty() {
@@ -616,7 +695,9 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_model_caps_modalities(model, errors);
+    validate_model_modality_assessment(model, errors);
     validate_model_adapter(model, errors);
+    validate_model_sampling(model, errors);
     let _ = (model.caps.tools, model.caps.json);
     if model.requirements.min_ram_gb == 0 {
         errors.push(format!(
@@ -680,9 +761,117 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_price_ref(model, errors);
 }
 
+fn validate_model_sampling(model: &CatalogModel, errors: &mut Vec<String>) {
+    let sampling = &model.sampling;
+    if sampling
+        .temperature
+        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+    {
+        errors.push(format!(
+            "{} sampling.temperature must be finite and between 0 and 2",
+            model.model_id
+        ));
+    }
+    if sampling
+        .top_p
+        .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
+    {
+        errors.push(format!(
+            "{} sampling.top_p must be finite and in (0, 1]",
+            model.model_id
+        ));
+    }
+    if sampling
+        .top_k
+        .is_some_and(|value| !(0..=1_000_000).contains(&value))
+    {
+        errors.push(format!(
+            "{} sampling.top_k must be between 0 and 1000000",
+            model.model_id
+        ));
+    }
+    if sampling
+        .min_p
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        errors.push(format!(
+            "{} sampling.min_p must be finite and between 0 and 1",
+            model.model_id
+        ));
+    }
+    if sampling
+        .repeat_penalty
+        .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0)
+    {
+        errors.push(format!(
+            "{} sampling.repeat_penalty must be finite and in (0, 10]",
+            model.model_id
+        ));
+    }
+}
+
+fn validate_model_modality_assessment(model: &CatalogModel, errors: &mut Vec<String>) {
+    let assessment = &model.modality_assessment;
+    if assessment.detected.is_empty() || assessment.detected.len() > 8 {
+        errors.push(format!(
+            "{} modality_assessment.detected must have 1..=8 entries",
+            model.model_id
+        ));
+    }
+    if assessment.evidence.is_empty()
+        || assessment
+            .evidence
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+    {
+        errors.push(format!(
+            "{} modality_assessment.evidence must contain non-empty detection evidence",
+            model.model_id
+        ));
+    }
+
+    let mut detected = BTreeSet::new();
+    for modality in &assessment.detected {
+        if !valid_adapter_modality(modality) {
+            errors.push(format!(
+                "{} modality_assessment.detected entry is unsupported: {}",
+                model.model_id, modality
+            ));
+        }
+        if !detected.insert(modality.as_str()) {
+            errors.push(format!(
+                "{} modality_assessment.detected duplicates {}",
+                model.model_id, modality
+            ));
+        }
+    }
+
+    let enabled = model
+        .adapter
+        .modality_set
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for modality in &enabled {
+        if !detected.contains(modality) {
+            errors.push(format!(
+                "{} adapter.modality_set enables {} without modality assessment evidence",
+                model.model_id, modality
+            ));
+        }
+    }
+    for modality in detected.difference(&enabled) {
+        errors.push(format!(
+            "{} detected modality {} must be enabled; modality exclusion is forbidden",
+            model.model_id, modality
+        ));
+    }
+}
+
 fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
     if !model.price_ref_au.rate_map.is_empty() {
         validate_price_rate_map(model, errors);
+        validate_required_modality_price_units(model, errors);
         return;
     }
     if model.price_ref_au.in_per_1k == 0 {
@@ -696,6 +885,57 @@ fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
             "{} price_ref_au.out_per_1k must be positive for non-embedding models",
             model.model_id
         ));
+    }
+}
+
+fn validate_required_modality_price_units(model: &CatalogModel, errors: &mut Vec<String>) {
+    let mut required = BTreeSet::new();
+    match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => {
+            required.insert("input_token");
+            required.insert("output_token");
+        }
+        "embedding" => {
+            required.insert("input_token");
+        }
+        "image-generation" => {
+            required.insert("image");
+            required.insert("step");
+        }
+        "video-generation" => {
+            required.insert("video_second");
+            required.insert("frame");
+        }
+        "tts" | "audio-generation" | "music-generation" => {
+            required.insert("input_character");
+            required.insert("audio_second");
+        }
+        "stt" => {
+            required.insert("audio_second");
+        }
+        _ => {}
+    }
+    let units = model
+        .price_ref_au
+        .rate_map
+        .iter()
+        .map(|entry| entry.unit.as_str())
+        .collect::<BTreeSet<_>>();
+    for unit in required.difference(&units) {
+        errors.push(format!(
+            "{} price_ref_au.rate_map is missing required modality unit {}",
+            model.model_id, unit
+        ));
+    }
+    if model.model_class == DEFAULT_MODEL_CLASS {
+        for forbidden in ["image", "step", "audio_second", "video_second", "frame"] {
+            if units.contains(forbidden) {
+                errors.push(format!(
+                    "{} multimodal LLM media input is billed through input_token; rate_map must not include separate {} charges",
+                    model.model_id, forbidden
+                ));
+            }
+        }
     }
 }
 
@@ -731,6 +971,7 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
 
     let required_units: &[&str] = match model.model_class.as_str() {
         MODEL_CLASS_IMAGE_GENERATION => &[USAGE_IMAGE, USAGE_STEP],
+        MODEL_CLASS_VIDEO_GENERATION => &[USAGE_VIDEO_SECOND, USAGE_FRAME],
         MODEL_CLASS_EMBEDDING => &[USAGE_INPUT_TOKEN],
         MODEL_CLASS_STT => &[USAGE_AUDIO_SECOND],
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
@@ -792,6 +1033,159 @@ fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) 
         }
         _ => {}
     }
+    validate_modality_calibration_fingerprints(model, errors);
+    validate_modality_resource_profiles(model, errors);
+}
+
+fn validate_modality_resource_profiles(model: &CatalogModel, errors: &mut Vec<String>) {
+    for (artifact, modalities) in &model.modality_assessment.resource_profiles {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} modality resource profiles reference unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        for (modality, profile) in modalities {
+            if modality == "text" || !model.adapter.modality_set.contains(modality) {
+                errors.push(format!(
+                    "{} modality resource profile for {} references unsupported modality {}",
+                    model.model_id, artifact, modality
+                ));
+            }
+            let expected_unit = match modality.as_str() {
+                "image" => "pixel",
+                "audio" => "second",
+                "video" => "frame",
+                "embedding" => "input_token",
+                _ => "",
+            };
+            if profile.unit != expected_unit {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} unit must be {}, got {}",
+                    model.model_id, artifact, modality, expected_unit, profile.unit
+                ));
+            }
+            if profile.measurement_source.trim().is_empty() {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} requires a memory measurement source",
+                    model.model_id, artifact, modality
+                ));
+            }
+            if profile.max_item_bytes == 0
+                || profile.max_item_units == 0
+                || profile.measured_item_bytes == 0
+                || profile.measured_item_units == 0
+                || profile.measured_working_set_bytes == 0
+                || profile.calibration_baseline_memory_bytes == 0
+                || profile.calibration_peak_memory_bytes == 0
+                || profile.calibration_f13_budget_bytes == 0
+            {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} must contain positive measured limits",
+                    model.model_id, artifact, modality
+                ));
+            }
+            if profile.measured_item_bytes != profile.max_item_bytes
+                || profile.measured_item_units != profile.max_item_units
+            {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} must be measured at its published maximum item shape",
+                    model.model_id, artifact, modality
+                ));
+            }
+            if profile.calibration_peak_memory_bytes < profile.calibration_baseline_memory_bytes
+                || profile.calibration_peak_memory_bytes > profile.calibration_f13_budget_bytes
+                || profile
+                    .calibration_baseline_memory_bytes
+                    .saturating_add(profile.measured_working_set_bytes)
+                    > profile.calibration_f13_budget_bytes
+            {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} peak and decoded working set must fit between baseline and its F13 budget",
+                    model.model_id, artifact, modality
+                ));
+            }
+            if profile.default_max_inflight_items != 1 || profile.default_max_items_per_request != 1
+            {
+                errors.push(format!(
+                    "{} modality resource profile for {}/{} must default to one in-flight item and one item per request",
+                    model.model_id, artifact, modality
+                ));
+            }
+        }
+    }
+    if model.tier != "launch" {
+        return;
+    }
+    for artifact in model.artifacts.keys() {
+        for modality in model
+            .adapter
+            .modality_set
+            .iter()
+            .filter(|modality| modality.as_str() != "text")
+        {
+            if !model
+                .modality_assessment
+                .resource_profiles
+                .get(artifact)
+                .is_some_and(|profiles| profiles.contains_key(modality))
+            {
+                errors.push(format!(
+                    "{} modality resource profiles for {} missing served modality {}",
+                    model.model_id, artifact, modality
+                ));
+            }
+        }
+    }
+}
+
+fn validate_modality_calibration_fingerprints(model: &CatalogModel, errors: &mut Vec<String>) {
+    for (artifact, modalities) in &model.modality_assessment.calibrated_fingerprints {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} modality calibration references unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        for (modality, fingerprint) in modalities {
+            if !model.adapter.modality_set.contains(modality) {
+                errors.push(format!(
+                    "{} modality calibration for {} references disabled modality {}",
+                    model.model_id, artifact, modality
+                ));
+            }
+            if !is_hex_len(fingerprint, 64) {
+                errors.push(format!(
+                    "{} modality calibration fingerprint for {}/{} must be 32-byte hex",
+                    model.model_id, artifact, modality
+                ));
+            }
+        }
+    }
+    if model.tier != "launch" {
+        return;
+    }
+    for artifact in model.artifacts.keys() {
+        let Some(calibrated) = model
+            .modality_assessment
+            .calibrated_fingerprints
+            .get(artifact)
+        else {
+            errors.push(format!(
+                "{} modality calibration fingerprints missing artifact {}",
+                model.model_id, artifact
+            ));
+            continue;
+        };
+        for modality in &model.adapter.modality_set {
+            if !calibrated.contains_key(modality) {
+                errors.push(format!(
+                    "{} modality calibration fingerprints for {} missing served modality {}",
+                    model.model_id, artifact, modality
+                ));
+            }
+        }
+    }
 }
 
 fn valid_canary_verification_method(method: &str) -> bool {
@@ -826,6 +1220,7 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
 
 fn required_launch_output_canary_method(model_class: &str) -> Option<&'static str> {
     match model_class {
+        DEFAULT_MODEL_CLASS => Some(VERIFICATION_TOKEN_FINGERPRINT),
         MODEL_CLASS_EMBEDDING => Some(VERIFICATION_EMBEDDING_COSINE),
         MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION => {
             Some(VERIFICATION_SEED_PERCEPTUAL_HASH)
@@ -1248,103 +1643,7 @@ fn validate_model_caps_modalities(model: &CatalogModel, errors: &mut Vec<String>
 
 fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     let adapter = &model.adapter;
-    if !matches!(
-        adapter.request_shape_family.as_str(),
-        "openai_chat"
-            | "openai_embeddings"
-            | "openai_images"
-            | "openai_audio_speech"
-            | "openai_audio_transcriptions"
-            | "openai_audio_generations"
-    ) {
-        errors.push(format!(
-            "{} adapter.request_shape_family is unsupported: {}",
-            model.model_id, adapter.request_shape_family
-        ));
-    }
-    if model.model_class == MODEL_CLASS_EMBEDDING
-        && adapter.request_shape_family != "openai_embeddings"
-    {
-        errors.push(format!(
-            "{} embedding model must use adapter.request_shape_family openai_embeddings",
-            model.model_id
-        ));
-    }
-    if adapter.request_shape_family == "openai_embeddings"
-        && model.model_class != MODEL_CLASS_EMBEDDING
-    {
-        errors.push(format!(
-            "{} adapter.request_shape_family openai_embeddings is only allowed for model_class embedding",
-            model.model_id
-        ));
-    }
-    if model.model_class == MODEL_CLASS_IMAGE_GENERATION
-        && adapter.request_shape_family != "openai_images"
-    {
-        errors.push(format!(
-            "{} image-generation model must use adapter.request_shape_family openai_images",
-            model.model_id
-        ));
-    }
-    if adapter.request_shape_family == "openai_images"
-        && model.model_class != MODEL_CLASS_IMAGE_GENERATION
-    {
-        errors.push(format!(
-            "{} adapter.request_shape_family openai_images is only allowed for model_class image-generation",
-            model.model_id
-        ));
-    }
-    if model.model_class == MODEL_CLASS_TTS && adapter.request_shape_family != "openai_audio_speech"
-    {
-        errors.push(format!(
-            "{} tts model must use adapter.request_shape_family openai_audio_speech",
-            model.model_id
-        ));
-    }
-    if adapter.request_shape_family == "openai_audio_speech" && model.model_class != MODEL_CLASS_TTS
-    {
-        errors.push(format!(
-            "{} adapter.request_shape_family openai_audio_speech is only allowed for model_class tts",
-            model.model_id
-        ));
-    }
-    if model.model_class == MODEL_CLASS_STT
-        && adapter.request_shape_family != "openai_audio_transcriptions"
-    {
-        errors.push(format!(
-            "{} stt model must use adapter.request_shape_family openai_audio_transcriptions",
-            model.model_id
-        ));
-    }
-    if adapter.request_shape_family == "openai_audio_transcriptions"
-        && model.model_class != MODEL_CLASS_STT
-    {
-        errors.push(format!(
-            "{} adapter.request_shape_family openai_audio_transcriptions is only allowed for model_class stt",
-            model.model_id
-        ));
-    }
-    if matches!(
-        model.model_class.as_str(),
-        MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
-    ) && adapter.request_shape_family != "openai_audio_generations"
-    {
-        errors.push(format!(
-            "{} {} model must use adapter.request_shape_family openai_audio_generations",
-            model.model_id, model.model_class
-        ));
-    }
-    if adapter.request_shape_family == "openai_audio_generations"
-        && !matches!(
-            model.model_class.as_str(),
-            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
-        )
-    {
-        errors.push(format!(
-            "{} adapter.request_shape_family openai_audio_generations is only allowed for model_class audio-generation or music-generation",
-            model.model_id
-        ));
-    }
+    validate_endpoint_families(model, errors);
     if !matches!(
         adapter.chat_template_id.as_str(),
         "generic_chatml" | "llama3-instruct" | "qwen2.5-instruct" | "smolvlm2-instruct"
@@ -1375,13 +1674,6 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
-    let mut caps_modalities = BTreeSet::new();
-    if let Some(modality) = model.caps.output_modality.as_deref() {
-        caps_modalities.insert(modality);
-    }
-    for modality in &model.caps.output_modalities {
-        caps_modalities.insert(modality.as_str());
-    }
     let mut seen = BTreeSet::new();
     for modality in &adapter.modality_set {
         if !valid_adapter_modality(modality) {
@@ -1402,104 +1694,504 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             ));
         }
     }
-    if !matches!(
-        adapter.response_normalization.as_str(),
-        "openai_chat"
-            | "openai_embeddings"
-            | "openai_images"
-            | "openai_audio_speech"
-            | "openai_audio_transcriptions"
-            | "openai_audio_generations"
-    ) {
+}
+
+fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
+    let contracts = &model.adapter.endpoint_families;
+    if contracts.is_empty() || contracts.len() > 12 {
         errors.push(format!(
-            "{} adapter.response_normalization is unsupported: {}",
-            model.model_id, adapter.response_normalization
-        ));
-    }
-    if model.model_class == MODEL_CLASS_EMBEDDING
-        && adapter.response_normalization != "openai_embeddings"
-    {
-        errors.push(format!(
-            "{} embedding model must use adapter.response_normalization openai_embeddings",
+            "{} adapter.endpoint_families must contain 1..=12 task contracts",
             model.model_id
         ));
     }
-    if adapter.response_normalization == "openai_embeddings"
-        && model.model_class != MODEL_CLASS_EMBEDDING
-    {
+    let mut families = BTreeSet::new();
+    for contract in contracts {
+        if !valid_endpoint_family(&contract.family) {
+            errors.push(format!(
+                "{} adapter.endpoint_families contains unsupported family {}",
+                model.model_id, contract.family
+            ));
+        } else if !endpoint_family_allowed_for_model(model, &contract.family) {
+            errors.push(format!(
+                "{} endpoint family {} is not compatible with model_class {} and modalities {:?}",
+                model.model_id, contract.family, model.model_class, model.adapter.modality_set
+            ));
+        } else if let Some(template) = endpoint_contract_template(&contract.family) {
+            for attribute in &contract.request_attributes {
+                if !template.request_attributes.contains(attribute) {
+                    errors.push(format!(
+                        "{} endpoint family {} declares unknown request attribute {}",
+                        model.model_id, contract.family, attribute
+                    ));
+                }
+            }
+            for required in &template.required_request_attributes {
+                if !contract.required_request_attributes.contains(required) {
+                    errors.push(format!(
+                        "{} endpoint family {} omits standard required request attribute {}",
+                        model.model_id, contract.family, required
+                    ));
+                }
+            }
+            for attribute in &contract.response_attributes {
+                if !template.response_attributes.contains(attribute) {
+                    errors.push(format!(
+                        "{} endpoint family {} declares unknown response attribute {}",
+                        model.model_id, contract.family, attribute
+                    ));
+                }
+            }
+            for required in &template.required_response_attributes {
+                if !contract.required_response_attributes.contains(required) {
+                    errors.push(format!(
+                        "{} endpoint family {} omits standard required response attribute {}",
+                        model.model_id, contract.family, required
+                    ));
+                }
+            }
+        }
+        if !families.insert(contract.family.as_str()) {
+            errors.push(format!(
+                "{} adapter.endpoint_families duplicates {}",
+                model.model_id, contract.family
+            ));
+        }
+        validate_endpoint_attribute_names(
+            &model.model_id,
+            &contract.family,
+            "request_attributes",
+            &contract.request_attributes,
+            errors,
+        );
+        validate_endpoint_attribute_names(
+            &model.model_id,
+            &contract.family,
+            "required_response_attributes",
+            &contract.required_response_attributes,
+            errors,
+        );
+        validate_endpoint_attribute_names(
+            &model.model_id,
+            &contract.family,
+            "required_request_attributes",
+            &contract.required_request_attributes,
+            errors,
+        );
+        validate_endpoint_attribute_names(
+            &model.model_id,
+            &contract.family,
+            "response_attributes",
+            &contract.response_attributes,
+            errors,
+        );
+        validate_endpoint_attribute_specs(model, contract, errors);
+        for required in &contract.required_request_attributes {
+            if !contract.request_attributes.contains(required) {
+                errors.push(format!(
+                    "{} endpoint family {} requires undeclared request attribute {}",
+                    model.model_id, contract.family, required
+                ));
+            }
+        }
+        for required in &contract.required_response_attributes {
+            if !contract.response_attributes.contains(required) {
+                errors.push(format!(
+                    "{} endpoint family {} requires undeclared response attribute {}",
+                    model.model_id, contract.family, required
+                ));
+            }
+        }
+    }
+    for required in required_endpoint_families(model) {
+        if !families.contains(required) {
+            errors.push(format!(
+                "{} adapter.endpoint_families missing required compatible family {}",
+                model.model_id, required
+            ));
+        }
+    }
+}
+
+fn validate_endpoint_attribute_specs(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    errors: &mut Vec<String>,
+) {
+    let Some(template) = endpoint_contract_template(&contract.family) else {
+        return;
+    };
+    let request_names = contract
+        .request_attributes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let request_spec_names = contract
+        .request_attribute_specs
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if request_names != request_spec_names {
         errors.push(format!(
-            "{} adapter.response_normalization openai_embeddings is only allowed for model_class embedding",
-            model.model_id
+            "{} endpoint family {} request_attribute_specs must exactly cover request_attributes",
+            model.model_id, contract.family
         ));
     }
-    if model.model_class == MODEL_CLASS_IMAGE_GENERATION
-        && adapter.response_normalization != "openai_images"
-    {
+    let response_names = contract
+        .response_attributes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let response_spec_names = contract
+        .response_attribute_specs
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if response_names != response_spec_names {
         errors.push(format!(
-            "{} image-generation model must use adapter.response_normalization openai_images",
-            model.model_id
+            "{} endpoint family {} response_attribute_specs must exactly cover response_attributes",
+            model.model_id, contract.family
         ));
     }
-    if adapter.response_normalization == "openai_images"
-        && model.model_class != MODEL_CLASS_IMAGE_GENERATION
+    for (path, spec) in &contract.request_attribute_specs {
+        let Some(standard) = template.request_attribute_specs.get(path) else {
+            continue;
+        };
+        validate_endpoint_attribute_spec(
+            &model.model_id,
+            &contract.family,
+            "request",
+            path,
+            spec,
+            standard,
+            errors,
+        );
+    }
+    for (path, spec) in &contract.response_attribute_specs {
+        let Some(standard) = template.response_attribute_specs.get(path) else {
+            continue;
+        };
+        validate_endpoint_attribute_spec(
+            &model.model_id,
+            &contract.family,
+            "response",
+            path,
+            spec,
+            standard,
+            errors,
+        );
+    }
+    let mut seen_groups = BTreeSet::new();
+    for group in &contract.interaction_groups {
+        if group.len() < 2 || group.len() > 12 {
+            errors.push(format!(
+                "{} endpoint family {} interaction group must contain 2..=12 attributes",
+                model.model_id, contract.family
+            ));
+            continue;
+        }
+        let mut unique = group.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != group.len() {
+            errors.push(format!(
+                "{} endpoint family {} interaction group duplicates an attribute",
+                model.model_id, contract.family
+            ));
+        }
+        for path in group {
+            if !request_names.contains(path.as_str()) {
+                errors.push(format!(
+                    "{} endpoint family {} interaction group references undeclared request attribute {}",
+                    model.model_id, contract.family, path
+                ));
+            }
+        }
+        if !seen_groups.insert(unique) {
+            errors.push(format!(
+                "{} endpoint family {} duplicates an interaction group",
+                model.model_id, contract.family
+            ));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_endpoint_attribute_spec(
+    model_id: &str,
+    family: &str,
+    direction: &str,
+    path: &str,
+    spec: &mayhem_proto::EndpointAttributeSpec,
+    standard: &mayhem_proto::EndpointAttributeSpec,
+    errors: &mut Vec<String>,
+) {
+    let label = format!("{model_id} endpoint family {family} {direction} attribute {path}");
+    if spec.value_types.is_empty() {
+        errors.push(format!("{label} must declare at least one value type"));
+    }
+    let unique_types = spec.value_types.iter().collect::<BTreeSet<_>>();
+    if unique_types.len() != spec.value_types.len() {
+        errors.push(format!("{label} duplicates a value type"));
+    }
+    for value_type in &spec.value_types {
+        if !standard.value_types.contains(value_type) {
+            errors.push(format!(
+                "{label} widens the task standard with unsupported type {value_type:?}"
+            ));
+        }
+    }
+    if spec.minimum.is_some_and(|value| !value.is_finite())
+        || spec.maximum.is_some_and(|value| !value.is_finite())
+        || matches!((spec.minimum, spec.maximum), (Some(minimum), Some(maximum)) if minimum > maximum)
     {
+        errors.push(format!("{label} has invalid numeric bounds"));
+    }
+    if matches!((spec.min_length, spec.max_length), (Some(minimum), Some(maximum)) if minimum > maximum)
+    {
+        errors.push(format!("{label} has invalid string-length bounds"));
+    }
+    if matches!((spec.min_items, spec.max_items), (Some(minimum), Some(maximum)) if minimum > maximum)
+    {
+        errors.push(format!("{label} has invalid array-length bounds"));
+    }
+    if standard.minimum.is_some() && spec.minimum.is_none() {
+        errors.push(format!("{label} omits the task-standard minimum"));
+    } else if let (Some(standard_minimum), Some(minimum)) = (standard.minimum, spec.minimum) {
+        if minimum < standard_minimum {
+            errors.push(format!("{label} widens the task-standard minimum"));
+        }
+    }
+    if standard.maximum.is_some() && spec.maximum.is_none() {
+        errors.push(format!("{label} omits the task-standard maximum"));
+    } else if let (Some(standard_maximum), Some(maximum)) = (standard.maximum, spec.maximum) {
+        if maximum > standard_maximum {
+            errors.push(format!("{label} widens the task-standard maximum"));
+        }
+    }
+    if standard.min_length.is_some() && spec.min_length.is_none() {
+        errors.push(format!("{label} omits the task-standard minimum length"));
+    } else if let (Some(standard_minimum), Some(minimum)) = (standard.min_length, spec.min_length) {
+        if minimum < standard_minimum {
+            errors.push(format!("{label} widens the task-standard minimum length"));
+        }
+    }
+    if standard.max_length.is_some() && spec.max_length.is_none() {
+        errors.push(format!("{label} omits the task-standard maximum length"));
+    } else if let (Some(standard_maximum), Some(maximum)) = (standard.max_length, spec.max_length) {
+        if maximum > standard_maximum {
+            errors.push(format!("{label} widens the task-standard maximum length"));
+        }
+    }
+    if standard.min_items.is_some() && spec.min_items.is_none() {
         errors.push(format!(
-            "{} adapter.response_normalization openai_images is only allowed for model_class image-generation",
-            model.model_id
+            "{label} omits the task-standard minimum item count"
+        ));
+    } else if let (Some(standard_minimum), Some(minimum)) = (standard.min_items, spec.min_items) {
+        if minimum < standard_minimum {
+            errors.push(format!(
+                "{label} widens the task-standard minimum item count"
+            ));
+        }
+    }
+    if standard.max_items.is_some() && spec.max_items.is_none() {
+        errors.push(format!(
+            "{label} omits the task-standard maximum item count"
+        ));
+    } else if let (Some(standard_maximum), Some(maximum)) = (standard.max_items, spec.max_items) {
+        if maximum > standard_maximum {
+            errors.push(format!(
+                "{label} widens the task-standard maximum item count"
+            ));
+        }
+    }
+    if !standard.enum_values.is_empty() {
+        if spec.enum_values.is_empty()
+            || spec
+                .enum_values
+                .iter()
+                .any(|value| !standard.enum_values.contains(value))
+        {
+            errors.push(format!("{label} widens or omits the task-standard enum"));
+        }
+    }
+    let mut values = spec.calibration_values.iter().collect::<Vec<_>>();
+    if let Some(default) = &spec.default {
+        values.push(default);
+    }
+    if values.is_empty() {
+        errors.push(format!(
+            "{label} has no default or calibration value from which to generate conformance cases"
         ));
     }
-    if model.model_class == MODEL_CLASS_TTS
-        && adapter.response_normalization != "openai_audio_speech"
-    {
+    for value in values {
+        if let Err(reason) = mayhem_proto::validate_endpoint_attribute_value(spec, value) {
+            errors.push(format!("{label} has invalid declared test value: {reason}"));
+        }
+    }
+}
+
+fn validate_endpoint_attribute_names(
+    model_id: &str,
+    family: &str,
+    field: &str,
+    attributes: &[String],
+    errors: &mut Vec<String>,
+) {
+    if attributes.is_empty() || attributes.len() > 64 {
         errors.push(format!(
-            "{} tts model must use adapter.response_normalization openai_audio_speech",
-            model.model_id
+            "{model_id} endpoint family {family} {field} must contain 1..=64 entries"
         ));
     }
-    if adapter.response_normalization == "openai_audio_speech"
-        && model.model_class != MODEL_CLASS_TTS
-    {
-        errors.push(format!(
-            "{} adapter.response_normalization openai_audio_speech is only allowed for model_class tts",
-            model.model_id
-        ));
+    let mut seen = BTreeSet::new();
+    for attribute in attributes {
+        if !valid_endpoint_attribute_name(attribute) {
+            errors.push(format!(
+                "{model_id} endpoint family {family} has invalid {field} entry {attribute}"
+            ));
+        }
+        if !seen.insert(attribute) {
+            errors.push(format!(
+                "{model_id} endpoint family {family} duplicates {field} entry {attribute}"
+            ));
+        }
     }
-    if model.model_class == MODEL_CLASS_STT
-        && adapter.response_normalization != "openai_audio_transcriptions"
+}
+
+fn valid_endpoint_attribute_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'[' | b']' | b'-')
+        })
+}
+
+fn valid_endpoint_family(family: &str) -> bool {
+    matches!(
+        family,
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            | mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS
+            | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
+            | mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+            | mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    )
+}
+
+fn required_endpoint_families(model: &CatalogModel) -> BTreeSet<&'static str> {
+    required_endpoint_family_names(&model.model_class, &model.adapter.modality_set)
+}
+
+fn required_endpoint_family_names(
+    model_class: &str,
+    modalities: &[String],
+) -> BTreeSet<&'static str> {
+    let mut required = match model_class {
+        DEFAULT_MODEL_CLASS => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        ]),
+        MODEL_CLASS_EMBEDDING => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+            mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION,
+        ]),
+        MODEL_CLASS_IMAGE_GENERATION => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+        ]),
+        MODEL_CLASS_VIDEO_GENERATION => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ]),
+        MODEL_CLASS_TTS => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+        ]),
+        MODEL_CLASS_STT => BTreeSet::from([
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+            mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+        ]),
+        MODEL_CLASS_AUDIO_GENERATION => BTreeSet::from([
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+        ]),
+        MODEL_CLASS_MUSIC_GENERATION => BTreeSet::from([
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+        ]),
+        _ => BTreeSet::new(),
+    };
+    if model_class == DEFAULT_MODEL_CLASS
+        && modalities
+            .iter()
+            .any(|modality| matches!(modality.as_str(), "image" | "audio" | "video"))
     {
-        errors.push(format!(
-            "{} stt model must use adapter.response_normalization openai_audio_transcriptions",
-            model.model_id
-        ));
+        required.insert(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT);
     }
-    if adapter.response_normalization == "openai_audio_transcriptions"
-        && model.model_class != MODEL_CLASS_STT
-    {
-        errors.push(format!(
-            "{} adapter.response_normalization openai_audio_transcriptions is only allowed for model_class stt",
-            model.model_id
-        ));
-    }
-    if matches!(
-        model.model_class.as_str(),
-        MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
-    ) && adapter.response_normalization != "openai_audio_generations"
-    {
-        errors.push(format!(
-            "{} {} model must use adapter.response_normalization openai_audio_generations",
-            model.model_id, model.model_class
-        ));
-    }
-    if adapter.response_normalization == "openai_audio_generations"
-        && !matches!(
-            model.model_class.as_str(),
-            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
-        )
-    {
-        errors.push(format!(
-            "{} adapter.response_normalization openai_audio_generations is only allowed for model_class audio-generation or music-generation",
-            model.model_id
-        ));
+    required
+}
+
+fn endpoint_family_allowed_for_model(model: &CatalogModel, family: &str) -> bool {
+    match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => {
+            matches!(
+                family,
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            ) || (family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+                && model
+                    .adapter
+                    .modality_set
+                    .iter()
+                    .any(|modality| matches!(modality.as_str(), "image" | "audio" | "video")))
+        }
+        MODEL_CLASS_EMBEDDING => matches!(
+            family,
+            mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
+        ),
+        MODEL_CLASS_IMAGE_GENERATION => matches!(
+            family,
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+        ),
+        MODEL_CLASS_VIDEO_GENERATION => matches!(
+            family,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+        ),
+        MODEL_CLASS_TTS => matches!(
+            family,
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+        ),
+        MODEL_CLASS_STT => matches!(
+            family,
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+                | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+        ),
+        MODEL_CLASS_AUDIO_GENERATION => matches!(
+            family,
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+        ),
+        MODEL_CLASS_MUSIC_GENERATION => matches!(
+            family,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+                | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+        ),
+        _ => false,
     }
 }
 
@@ -1508,23 +2200,11 @@ fn valid_adapter_modality(modality: &str) -> bool {
 }
 
 fn adapter_modality_allowed(model: &CatalogModel, modality: &str) -> bool {
-    let caps_modalities = model_output_modalities(model);
-    match modality {
-        "image" => model.caps.vision || caps_modalities.contains("image"),
-        "audio" => model.caps.audio || caps_modalities.contains("audio"),
-        other => caps_modalities.is_empty() || caps_modalities.contains(other),
-    }
-}
-
-fn model_output_modalities(model: &CatalogModel) -> BTreeSet<&str> {
-    let mut caps_modalities = BTreeSet::new();
-    if let Some(modality) = model.caps.output_modality.as_deref() {
-        caps_modalities.insert(modality);
-    }
-    for modality in &model.caps.output_modalities {
-        caps_modalities.insert(modality.as_str());
-    }
-    caps_modalities
+    model
+        .modality_assessment
+        .detected
+        .iter()
+        .any(|detected| detected == modality)
 }
 
 fn validate_artifact(
@@ -1810,9 +2490,162 @@ fn validate_canary_set(canaries_dir: &Path, set_id: &str, errors: &mut Vec<Strin
             if canary.prompts.is_empty() {
                 errors.push(format!("canary set {set_id} has no prompts"));
             }
+            let mut prompt_ids = BTreeSet::new();
+            for prompt in &canary.prompts {
+                if prompt.id.trim().is_empty() {
+                    errors.push(format!("canary set {set_id} has an empty prompt id"));
+                } else if !prompt_ids.insert(prompt.id.as_str()) {
+                    errors.push(format!(
+                        "canary set {set_id} duplicates prompt id {}",
+                        prompt.id
+                    ));
+                }
+                if prompt.max_tokens == Some(0) {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} must use positive max_tokens",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .temperature
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid temperature",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .top_p
+                    .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid top_p",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .top_k
+                    .is_some_and(|value| !(0..=1_000_000).contains(&value))
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid top_k",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .min_p
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid min_p",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .repeat_penalty
+                    .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0)
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid repeat_penalty",
+                        prompt.id
+                    ));
+                }
+                if prompt.temperature.is_some_and(|value| value > 0.0) && prompt.seed.is_none() {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} must pin seed when temperature is non-zero",
+                        prompt.id
+                    ));
+                }
+                if prompt.seed.is_some_and(|seed| seed > u64::from(u32::MAX)) {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} seed exceeds u32",
+                        prompt.id
+                    ));
+                }
+            }
         }
         Err(err) => errors.push(err.to_string()),
     }
+}
+
+fn validate_model_canary_modality_coverage(
+    canaries_dir: &Path,
+    model: &CatalogModel,
+    errors: &mut Vec<String>,
+) {
+    let path = canaries_dir.join(format!("{}.json", model.canary.set_id));
+    let canary = match fs::read_to_string(&path)
+        .with_context(|| format!("reading canary set {}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str::<CanarySet>(&text)
+                .with_context(|| format!("parsing canary set {}", path.display()))
+        }) {
+        Ok(canary) => canary,
+        Err(_) => return,
+    };
+    let mut covered = BTreeSet::new();
+    for prompt in &canary.prompts {
+        covered.extend(canary_prompt_modalities(model, prompt));
+    }
+    for modality in &model.adapter.modality_set {
+        if !covered.contains(modality.as_str()) {
+            errors.push(format!(
+                "{} served modality {} has no functional prompt in canary set {} using {}",
+                model.model_id, modality, model.canary.set_id, model.canary.verification_method
+            ));
+        }
+    }
+}
+
+fn canary_prompt_modalities<'a>(
+    model: &'a CatalogModel,
+    prompt: &'a CanarySetPrompt,
+) -> BTreeSet<&'a str> {
+    let mut modalities = BTreeSet::new();
+    match model.canary.verification_method.as_str() {
+        VERIFICATION_TOKEN_FINGERPRINT => {
+            if !prompt.messages.is_empty() {
+                modalities.insert("text");
+            }
+            for message in &prompt.messages {
+                for part in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("image_url") => {
+                            modalities.insert("image");
+                        }
+                        Some("input_audio") => {
+                            modalities.insert("audio");
+                        }
+                        Some("video_url") | Some("input_video") => {
+                            modalities.insert("video");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        VERIFICATION_SEED_PERCEPTUAL_HASH if prompt.prompt.is_some() => {
+            modalities.insert("image");
+        }
+        VERIFICATION_EMBEDDING_COSINE if prompt.input.is_some() || prompt.prompt.is_some() => {
+            modalities.insert("embedding");
+        }
+        VERIFICATION_TRANSCRIPT_MATCH if prompt.audio_b64.is_some() => {
+            modalities.insert("audio");
+            modalities.insert("text");
+        }
+        VERIFICATION_AUDIO_FINGERPRINT if prompt.input.is_some() || prompt.prompt.is_some() => {
+            modalities.insert("audio");
+        }
+        _ => {}
+    }
+    modalities
 }
 
 fn run_download_checks(
@@ -2277,6 +3110,13 @@ mod tests {
                 backends: vec!["llama.cpp".to_owned()],
             },
             adapter: CatalogAdapter::default(),
+            modality_assessment: CatalogModalityAssessment {
+                detected: vec!["text".to_owned()],
+                evidence: vec!["test fixture".to_owned()],
+                calibrated_fingerprints: BTreeMap::new(),
+                resource_profiles: BTreeMap::new(),
+            },
+            sampling: CatalogSamplingProfile::default(),
             canary: CanaryRef {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
@@ -2537,12 +3377,62 @@ mod tests {
         let mut vision_input = model.clone();
         vision_input.caps.vision = true;
         vision_input.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        vision_input
+            .adapter
+            .endpoint_families
+            .push(endpoint_contract_template(mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT).unwrap());
+        vision_input
+            .modality_assessment
+            .detected
+            .push("image".to_owned());
+        vision_input
+            .modality_assessment
+            .calibrated_fingerprints
+            .get_mut("fixture")
+            .unwrap()
+            .insert("image".to_owned(), "e".repeat(64));
+        vision_input
+            .modality_assessment
+            .resource_profiles
+            .entry("fixture".to_owned())
+            .or_default()
+            .insert(
+                "image".to_owned(),
+                verification_test_resource_profile("image"),
+            );
+        vision_input.price_ref_au.rate_map = vec![
+            CatalogRateMapEntry {
+                unit: "input_token".to_owned(),
+                per_unit_au: 1,
+                granularity: 1000,
+            },
+            CatalogRateMapEntry {
+                unit: "output_token".to_owned(),
+                per_unit_au: 1,
+                granularity: 1000,
+            },
+        ];
         let mut errors = Vec::new();
         validate_model(&vision_input, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
 
+        let mut double_billed_vision = vision_input.clone();
+        double_billed_vision
+            .price_ref_au
+            .rate_map
+            .push(CatalogRateMapEntry {
+                unit: "image".to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            });
+        let mut errors = Vec::new();
+        validate_model(&double_billed_vision, &mut errors);
+        assert!(errors.iter().any(
+            |error| error.contains("multimodal LLM media input is billed through input_token")
+        ));
+
         let mut invalid = model.clone();
-        invalid.adapter.request_shape_family = "provider_native".to_owned();
+        invalid.adapter.endpoint_families[0].family = "provider_native".to_owned();
         invalid.adapter.chat_template_id = String::new();
         invalid.adapter.tool_call_strategy = "provider_custom".to_owned();
         invalid.adapter.reasoning_passthrough = "leak".to_owned();
@@ -2552,12 +3442,11 @@ mod tests {
             "image".to_owned(),
             "smell".to_owned(),
         ];
-        invalid.adapter.response_normalization = "raw".to_owned();
         let mut errors = Vec::new();
         validate_model(&invalid, &mut errors);
         assert!(errors
             .iter()
-            .any(|error| error.contains("request_shape_family")));
+            .any(|error| error.contains("endpoint_families")));
         assert!(errors
             .iter()
             .any(|error| error.contains("chat_template_id")));
@@ -2576,9 +3465,6 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("adapter.modality_set entry is unsupported: smell")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("response_normalization")));
     }
 
     #[test]
@@ -2603,8 +3489,6 @@ mod tests {
                 audio_fingerprints: BTreeMap::new(),
             },
         );
-        model.adapter.request_shape_family = "openai_embeddings".to_owned();
-        model.adapter.response_normalization = "openai_embeddings".to_owned();
         model.price_ref_au.out_per_1k = 0;
 
         let mut errors = Vec::new();
@@ -2612,14 +3496,14 @@ mod tests {
         assert!(errors.is_empty(), "{errors:#?}");
 
         let mut wrong_shape = model.clone();
-        wrong_shape.adapter.request_shape_family = "openai_chat".to_owned();
-        wrong_shape.adapter.response_normalization = "openai_chat".to_owned();
+        wrong_shape.adapter.endpoint_families = vec![default_chat_endpoint_contract()];
         let mut errors = Vec::new();
         validate_model(&wrong_shape, &mut errors);
-        assert!(errors.iter().any(|error| error
-            .contains("embedding model must use adapter.request_shape_family openai_embeddings")));
         assert!(errors.iter().any(|error| error.contains(
-            "embedding model must use adapter.response_normalization openai_embeddings"
+            "adapter.endpoint_families missing required compatible family openai_embeddings"
+        )));
+        assert!(errors.iter().any(|error| error.contains(
+            "endpoint family openai_chat_completions is not compatible with model_class embedding"
         )));
 
         let mut text_with_zero_output = verification_test_model(
@@ -2668,8 +3552,6 @@ mod tests {
                 audio_fingerprints: BTreeMap::new(),
             },
         );
-        model.adapter.request_shape_family = "openai_images".to_owned();
-        model.adapter.response_normalization = "openai_images".to_owned();
         model.adapter.tool_call_strategy = "none".to_owned();
         model.adapter.modality_set = vec!["image".to_owned()];
         model.price_ref_au.in_per_1k = 0;
@@ -2703,15 +3585,14 @@ mod tests {
             .any(|error| { error.contains("price_ref_au.rate_map missing required unit step") }));
 
         let mut wrong_shape = model.clone();
-        wrong_shape.adapter.request_shape_family = "openai_chat".to_owned();
-        wrong_shape.adapter.response_normalization = "openai_chat".to_owned();
+        wrong_shape.adapter.endpoint_families = vec![default_chat_endpoint_contract()];
         let mut errors = Vec::new();
         validate_model(&wrong_shape, &mut errors);
         assert!(errors.iter().any(|error| error.contains(
-            "image-generation model must use adapter.request_shape_family openai_images"
+            "adapter.endpoint_families missing required compatible family openai_image_generations"
         )));
         assert!(errors.iter().any(|error| error.contains(
-            "image-generation model must use adapter.response_normalization openai_images"
+            "endpoint family openai_chat_completions is not compatible with model_class image-generation"
         )));
 
         let mut text_with_image_shape = verification_test_model(
@@ -2731,16 +3612,103 @@ mod tests {
                 audio_fingerprints: BTreeMap::new(),
             },
         );
-        text_with_image_shape.adapter.request_shape_family = "openai_images".to_owned();
-        text_with_image_shape.adapter.response_normalization = "openai_images".to_owned();
+        text_with_image_shape.adapter.endpoint_families =
+            vec![
+                endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+                    .unwrap(),
+            ];
         let mut errors = Vec::new();
         validate_model(&text_with_image_shape, &mut errors);
         assert!(errors.iter().any(|error| error.contains(
-            "adapter.request_shape_family openai_images is only allowed for model_class image-generation"
+            "endpoint family openai_image_generations is not compatible with model_class text-generation"
         )));
-        assert!(errors.iter().any(|error| error.contains(
-            "adapter.response_normalization openai_images is only allowed for model_class image-generation"
-        )));
+    }
+
+    #[test]
+    fn video_generation_requires_video_units_in_every_price_validator() {
+        let mut model = verification_test_model(
+            "admin/video@small",
+            MODEL_CLASS_VIDEO_GENERATION,
+            "diffusers",
+            CanaryRef {
+                set_id: "canary-video-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+                verification_tolerance_bps: Some(128),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-video".to_owned(), "a".repeat(16))]),
+                )]),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        model.price_ref_au.in_per_1k = 0;
+        model.price_ref_au.out_per_1k = 0;
+        model.price_ref_au.rate_map = vec![
+            CatalogRateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 500,
+                granularity: 1,
+            },
+            CatalogRateMapEntry {
+                unit: USAGE_FRAME.to_owned(),
+                per_unit_au: 2,
+                granularity: 1,
+            },
+        ];
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        model.price_ref_au.rate_map = vec![
+            CatalogRateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 500,
+                granularity: 1,
+            },
+            CatalogRateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 2,
+                granularity: 1,
+            },
+        ];
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing required unit video_second")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing required unit frame")));
+    }
+
+    fn verification_test_resource_profile(modality: &str) -> CatalogModalityResourceProfile {
+        CatalogModalityResourceProfile {
+            unit: match modality {
+                "image" => "pixel",
+                "audio" => "second",
+                "video" => "frame",
+                "embedding" => "input_token",
+                _ => "",
+            }
+            .to_owned(),
+            measurement_source: "test-fixture".to_owned(),
+            max_item_bytes: 1,
+            max_item_units: 1,
+            measured_item_bytes: 1,
+            measured_item_units: 1,
+            measured_working_set_bytes: 10,
+            calibration_baseline_memory_bytes: 100,
+            calibration_peak_memory_bytes: 110,
+            calibration_f13_budget_bytes: 200,
+            default_max_inflight_items: 1,
+            default_max_items_per_request: 1,
+        }
     }
 
     fn verification_test_model(
@@ -2758,17 +3726,11 @@ mod tests {
             }
             _ => "text",
         };
-        let request_shape_family = match model_class {
-            MODEL_CLASS_EMBEDDING => "openai_embeddings",
-            MODEL_CLASS_IMAGE_GENERATION => "openai_images",
-            MODEL_CLASS_TTS => "openai_audio_speech",
-            MODEL_CLASS_STT => "openai_audio_transcriptions",
-            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
-                "openai_audio_generations"
-            }
-            _ => "openai_chat",
-        };
-        let response_normalization = request_shape_family;
+        let modality_set = vec![output_modality.to_owned()];
+        let endpoint_families = required_endpoint_family_names(model_class, &modality_set)
+            .into_iter()
+            .map(|family| endpoint_contract_template(family).unwrap())
+            .collect();
         CatalogModel {
             model_id: model_id.to_owned(),
             model_class: model_class.to_owned(),
@@ -2836,9 +3798,8 @@ mod tests {
                 backends: vec![engine.to_owned()],
             },
             adapter: CatalogAdapter {
-                modality_set: vec![output_modality.to_owned()],
-                request_shape_family: request_shape_family.to_owned(),
-                response_normalization: response_normalization.to_owned(),
+                endpoint_families,
+                modality_set,
                 tool_call_strategy: if model_class == DEFAULT_MODEL_CLASS {
                     "mayhem_json".to_owned()
                 } else {
@@ -2846,6 +3807,26 @@ mod tests {
                 },
                 ..CatalogAdapter::default()
             },
+            modality_assessment: CatalogModalityAssessment {
+                detected: vec![output_modality.to_owned()],
+                evidence: vec!["test fixture".to_owned()],
+                calibrated_fingerprints: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([(output_modality.to_owned(), "f".repeat(64))]),
+                )]),
+                resource_profiles: if output_modality == "text" {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(
+                        "fixture".to_owned(),
+                        BTreeMap::from([(
+                            output_modality.to_owned(),
+                            verification_test_resource_profile(output_modality),
+                        )]),
+                    )])
+                },
+            },
+            sampling: CatalogSamplingProfile::default(),
             canary,
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),

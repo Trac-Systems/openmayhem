@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use crate::ReputationEventKind;
 
 pub const DEFAULT_CANARY_MATCH_MIN_BPS: u32 = 9_000;
-pub const DEFAULT_CANARY_TEMPERATURE: f64 = 0.0;
 pub const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 pub const CANARY_VERIFICATION_CONTEXT_NEEDLE: &str = "context_needle";
 pub const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
@@ -15,7 +14,7 @@ pub const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 pub const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 pub const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanaryProbeSpec {
     pub model: String,
     pub canary_set: String,
@@ -23,6 +22,22 @@ pub struct CanaryProbeSpec {
     pub prompt: String,
     pub seed: i64,
     pub max_tokens: u32,
+    #[serde(default)]
+    pub sampling: CanarySamplingProfile,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CanarySamplingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,7 +61,7 @@ pub struct CanaryProbeEvaluation {
 
 impl CanaryProbeSpec {
     pub fn openai_chat_body(&self) -> Value {
-        json!({
+        let mut body = json!({
             "model": self.model,
             "messages": [
                 {
@@ -54,12 +69,26 @@ impl CanaryProbeSpec {
                     "content": self.prompt,
                 }
             ],
-            "temperature": DEFAULT_CANARY_TEMPERATURE,
             "seed": self.seed,
             "max_tokens": self.max_tokens,
             "stream": true,
             "stream_options": { "include_usage": true },
-        })
+        });
+        for (name, value) in [
+            ("temperature", self.sampling.temperature.map(Value::from)),
+            ("top_p", self.sampling.top_p.map(Value::from)),
+            ("top_k", self.sampling.top_k.map(Value::from)),
+            ("min_p", self.sampling.min_p.map(Value::from)),
+            (
+                "repeat_penalty",
+                self.sampling.repeat_penalty.map(Value::from),
+            ),
+        ] {
+            if let Some(value) = value {
+                body[name] = value;
+            }
+        }
+        body
     }
 }
 
@@ -720,6 +749,10 @@ mod tests {
             prompt: "Return the fixed continuation.".to_owned(),
             seed: 7,
             max_tokens: 8,
+            sampling: CanarySamplingProfile {
+                temperature: Some(0.0),
+                ..CanarySamplingProfile::default()
+            },
         }
     }
 

@@ -79,6 +79,7 @@ const enclaveRegistration = {
     embeddings: false,
     tools: false,
     ctx: 32768,
+    modality_set: ['text'],
   },
 };
 
@@ -90,6 +91,7 @@ const enclaveUpdate = {
     embeddings: false,
     tools: true,
     ctx: 32768,
+    modality_set: ['text'],
   },
 };
 
@@ -136,6 +138,10 @@ const priceSchedule = {
 const providerJoin = {
   op: 'join_enclave',
   enclave_id: enclaveId,
+  served_ctx: 32768,
+  served_modalities: ['text'],
+  ctx_bracket: 'le32k',
+  ctx_bracket_table_ver: 1,
 };
 
 const buildRegistryLog = (admin, provider, feePayer) => [
@@ -293,6 +299,10 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     enclave_id: enclaveId,
     model_id: enclaveRegistration.model_id,
     status: 'tombstoned',
+    served_ctx: 32768,
+    served_modalities: ['text'],
+    ctx_bracket: 'le32k',
+    ctx_bracket_table_ver: 1,
     joined_at: makeTxKey(8),
     updated_at: makeTxKey(10),
     left_at: null,
@@ -350,6 +360,7 @@ test('MayhemContract requires model_class and allows admin model classes', async
     caps: {
       embeddings: true,
       ctx: 8192,
+      modality_set: ['embedding'],
     },
   };
   const registered = await execute(
@@ -392,6 +403,7 @@ test('MayhemContract requires model_class and allows admin model classes', async
       audio: true,
       output_modality: 'audio',
       output_modalities: ['audio'],
+      modality_set: ['audio'],
     },
   };
   const musicRegistered = await execute(
@@ -466,6 +478,11 @@ test('MayhemContract rejects unsupported model classes and mismatched model refe
       ...enclaveRegistration,
       enclave_id: 'c'.repeat(64),
       model_class: 'embedding',
+      caps: {
+        embeddings: true,
+        ctx: 8192,
+        modality_set: ['embedding'],
+      },
     },
     admin.publicKey,
     3
@@ -508,6 +525,7 @@ test('MayhemContract stores admin-bound enclave artifact sidecars only when cano
       caps: {
         ...enclaveRegistration.caps,
         vision: true,
+        modality_set: ['text', 'image'],
       },
     },
     admin.publicKey,
@@ -821,6 +839,7 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     provider: provider.publicKey,
     enclave_id: enclaveId,
     served_ctx: 32768,
+    served_modalities: ['text'],
     ctx_bracket: 'le32k',
     ctx_bracket_table_ver: 1,
     nonce: 'b'.repeat(64),
@@ -1127,6 +1146,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         chat: true,
         tools: false,
         ctx: 0,
+        modality_set: ['text'],
       },
     },
     admin.publicKey,
@@ -1139,6 +1159,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     json: true,
     ctx_max: 8192,
     vision: false,
+    modality_set: ['text'],
   };
   const accepted = await execute(
     contract,
@@ -1220,6 +1241,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     image: true,
     output_modality: 'image',
     output_modalities: ['image'],
+    modality_set: ['image'],
     max_image_width: 1024,
     max_image_height: 1024,
     max_image_steps: 50,
@@ -1253,6 +1275,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         ...catalogStyleCaps,
         image: true,
         output_modality: 'image',
+        modality_set: ['text', 'image'],
       },
     },
     admin.publicKey,
@@ -2147,6 +2170,10 @@ test('MayhemContract rejects provider-authored serving terms on joins', async ()
     {
       op: 'join_enclave',
       enclave_id: enclaveId,
+      served_ctx: 32768,
+      served_modalities: ['text'],
+      ctx_bracket: 'le32k',
+      ctx_bracket_table_ver: 1,
       model_id: 'provider/custom@4bit',
       price_ver: 999,
       rate_map: textRateMap(1, 1),
@@ -2390,6 +2417,10 @@ test('MayhemContract rejects unsafe canonical registry identifiers', async () =>
     {
       op: 'join_enclave',
       enclave_id: 'bad/enclave',
+      served_ctx: 32768,
+      served_modalities: ['text'],
+      ctx_bracket: 'le32k',
+      ctx_bracket_table_ver: 1,
     },
     provider.publicKey,
     5

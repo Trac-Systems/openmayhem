@@ -21,6 +21,15 @@ const providerRegistration = {
   op: 'register_provider',
 };
 
+const providerJoinFor = (targetEnclaveId) => ({
+  op: 'join_enclave',
+  enclave_id: targetEnclaveId,
+  served_ctx: 32768,
+  served_modalities: ['text'],
+  ctx_bracket: 'le32k',
+  ctx_bracket_table_ver: 1,
+});
+
 const enclaveRegistration = {
   op: 'register_enclave',
   enclave_id: enclaveId,
@@ -42,6 +51,7 @@ const enclaveRegistration = {
     chat: true,
     tools: false,
     ctx: 32768,
+    modality_set: ['text'],
   },
 };
 
@@ -164,10 +174,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     contract,
     peerAStorage,
     'joinEnclave',
-    {
-      op: 'join_enclave',
-      enclave_id: enclaveId,
-    },
+    providerJoinFor(enclaveId),
     provider.publicKey,
     8
   );
@@ -597,10 +604,7 @@ test('MayhemContract room serving rejects explicit non-admin authority markers',
     contract,
     storage,
     'joinEnclave',
-    {
-      op: 'join_enclave',
-      enclave_id: enclaveId,
-    },
+    providerJoinFor(enclaveId),
     provider.publicKey,
     8
   );
@@ -698,10 +702,7 @@ test('MayhemContract rejects model-only rooms because canonical rooms are enclav
     contract,
     storage,
     'joinEnclave',
-    {
-      op: 'join_enclave',
-      enclave_id: enclaveId,
-    },
+    providerJoinFor(enclaveId),
     provider.publicKey,
     7
   );
@@ -769,10 +770,7 @@ test('MayhemContract rejects non-canonical and wrong-enclave room offers', async
     contract,
     storage,
     'joinEnclave',
-    {
-      op: 'join_enclave',
-      enclave_id: otherEnclaveId,
-    },
+    providerJoinFor(otherEnclaveId),
     provider.publicKey,
     7
   );

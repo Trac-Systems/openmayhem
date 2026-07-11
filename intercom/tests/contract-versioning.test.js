@@ -173,6 +173,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     locked_per_req_au: '1',
     locked_min_session_au: '2000000000000000000000000',
     served_ctx: 131072,
+    required_modalities: ['text'],
     ctx_bracket: 'le128k',
     ctx_bracket_table_ver: 1,
     max_spend_au: '2000000000000000000000001',
@@ -185,7 +186,8 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
     '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
     '],"locked_per_req_au":"1","locked_min_session_au":"2000000000000000000000000",',
-    '"served_ctx":131072,"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
+    '"served_ctx":131072,"required_modalities":["text"],',
+    '"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
     '"max_spend_au":"2000000000000000000000001",',
     '"checkpoint_every":{"tokens":4096,"ms":30000}}}',
   ].join('');
@@ -275,7 +277,7 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
       enclave_id: body.enclave_id,
       model_id: body.model_id,
       model_class: 'text-generation',
-      caps: { chat: true, ctx: 8192 },
+      caps: { chat: true, ctx: 8192, modality_set: ['text'] },
     },
   });
 

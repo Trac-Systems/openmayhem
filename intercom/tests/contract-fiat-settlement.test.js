@@ -10,6 +10,7 @@ import {
   fiatSettlementFeatureKey,
   makeIdentity,
   makeVerifier,
+  seedSpendHoldsForApply,
   signConsent,
 } from './helpers/contract.js';
 
@@ -134,6 +135,7 @@ async function setupFiatSettlementContract({
       gross_au: provider.gross_au,
     })),
   };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
   assert.equal(applied.ok, true, applied.message);
   const applyState = (await storage.get('epoch/apply/state')).value;

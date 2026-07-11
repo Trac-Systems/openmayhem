@@ -26,6 +26,15 @@ const providerRegistration = {
   op: 'register_provider',
 };
 
+const providerJoin = {
+  op: 'join_enclave',
+  enclave_id: enclaveId,
+  served_ctx: 32768,
+  served_modalities: ['text'],
+  ctx_bracket: priceCtxBracket,
+  ctx_bracket_table_ver: priceCtxBracketTableVer,
+};
+
 const auString = (value) => String(value);
 
 const seededBalance = (user, au, rail = 'fiat') => ({
@@ -61,6 +70,7 @@ const enclaveRegistration = {
     chat: true,
     tools: false,
     ctx: 32768,
+    modality_set: ['text'],
   },
 };
 
@@ -175,7 +185,7 @@ async function registerAndJoinExtraProvider(contract, storage, admin, provider, 
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     txStart + 2
   );
@@ -317,6 +327,48 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
   assert.equal(afterSecond.price.ver, 2);
 });
 
+test('MayhemContract bills multimodal LLM input through token rates only', async () => {
+  const { contract, storage, admin } = await setupRegisteredEnclave();
+  const enclaveKey = `enclave/${enclaveId}`;
+  const enclave = (await storage.get(enclaveKey)).value;
+  await storage.put(enclaveKey, {
+    ...enclave,
+    caps: {
+      ...enclave.caps,
+      vision: true,
+      audio: true,
+      video: true,
+      modality_set: ['text', 'image', 'audio', 'video'],
+    },
+  });
+
+  const tokenOnly = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice(),
+    admin.publicKey,
+    5
+  );
+  assert.equal(tokenOnly.ok, true, tokenOnly.message);
+
+  const doubleBill = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({
+      effective_at: 43_200,
+      rate_map: [
+        ...textRateMap(18, 55),
+        { unit: 'image', per_unit_au: '1', granularity: 1 },
+      ],
+    }),
+    admin.publicKey,
+    6
+  );
+  assert.match(doubleBill.message, /unit image is not allowed for model_class text-generation/i);
+});
+
 test('MayhemContract epochApply keeps cold-start markets pinned to the admin seed', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
@@ -327,7 +379,7 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -392,7 +444,7 @@ test('MayhemContract epochApply counts settled-work supply, not idle joined wall
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -435,7 +487,7 @@ test('MayhemContract epochApply floats market price from settled usage with clam
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -562,7 +614,7 @@ test('MayhemContract keeps context brackets as independent price markets', async
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     7
   );
@@ -646,7 +698,7 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     7
   );
@@ -700,7 +752,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -798,7 +850,7 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -877,7 +929,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
     contract,
     storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: enclaveId },
+    providerJoin,
     provider.publicKey,
     6
   );
@@ -1074,6 +1126,12 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
     enclave_id: 'e'.repeat(64),
     model_id: 'admin/image-small@fp16',
     model_class: 'image-generation',
+    caps: {
+      image: true,
+      output_modality: 'image',
+      output_modalities: ['image'],
+      modality_set: ['image'],
+    },
   };
 
   let result = await execute(
@@ -1094,7 +1152,10 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
       op: 'set_model_ref',
       model_id: imageEnclave.model_id,
       model_class: 'image-generation',
-      rate_map: [{ unit: 'image', per_unit_au: '500', granularity: 1 }],
+      rate_map: [
+        { unit: 'image', per_unit_au: '500', granularity: 1 },
+        { unit: 'step', per_unit_au: '2', granularity: 1 },
+      ],
     },
     admin.publicKey,
     2
@@ -1125,7 +1186,10 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
     {
       op: 'set_price',
       enclave_id: imageEnclave.enclave_id,
-      rate_map: [{ unit: 'image', per_unit_au: '600', granularity: 1 }],
+      rate_map: [
+        { unit: 'image', per_unit_au: '600', granularity: 1 },
+        { unit: 'step', per_unit_au: '2', granularity: 1 },
+      ],
       per_req_au: '0',
       min_session_au: '0',
       effective_at: 0,
@@ -1136,6 +1200,7 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
   assert.equal(result.ok, true, result.message);
   assert.deepEqual((await storage.get(`price/${imageEnclave.enclave_id}`)).value.current.rate_map, [
     { unit: 'image', per_unit_au: '600', granularity: 1 },
+    { unit: 'step', per_unit_au: '2', granularity: 1 },
   ]);
 });
 

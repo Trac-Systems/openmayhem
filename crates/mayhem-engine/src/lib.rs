@@ -364,6 +364,8 @@ impl Tokenization {
 pub struct GenerateRequest {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default = "default_max_new_tokens")]
     pub max_new_tokens: u32,
@@ -374,17 +376,19 @@ pub struct GenerateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub width: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub height: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub steps: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cfg_scale: Option<f32>,
     #[serde(default)]
     pub ignore_eos: bool,
 }
@@ -394,6 +398,86 @@ pub struct EmbeddingRequest {
     pub inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+    #[serde(default = "default_image_count")]
+    pub image_count: u32,
+    #[serde(default = "default_image_width")]
+    pub width: u32,
+    #[serde(default = "default_image_height")]
+    pub height: u32,
+    #[serde(default = "default_image_steps")]
+    pub steps: u32,
+    #[serde(default = "default_image_guidance_scale")]
+    pub guidance_scale: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<String>,
+}
+
+impl ImageGenerationRequest {
+    #[must_use]
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            negative_prompt: None,
+            image_count: default_image_count(),
+            width: default_image_width(),
+            height: default_image_height(),
+            steps: default_image_steps(),
+            guidance_scale: default_image_guidance_scale(),
+            seed: None,
+            sampling_method: None,
+            scheduler: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.prompt.trim().is_empty() {
+            return Err(EngineError::InvalidConfig(
+                "image prompt must not be empty".to_owned(),
+            ));
+        }
+        if !(1..=4).contains(&self.image_count) {
+            return Err(EngineError::InvalidConfig(
+                "image_count must be between 1 and 4".to_owned(),
+            ));
+        }
+        if !(64..=2_048).contains(&self.width) || !(64..=2_048).contains(&self.height) {
+            return Err(EngineError::InvalidConfig(
+                "image dimensions must each be between 64 and 2048".to_owned(),
+            ));
+        }
+        if !(1..=150).contains(&self.steps) {
+            return Err(EngineError::InvalidConfig(
+                "image steps must be between 1 and 150".to_owned(),
+            ));
+        }
+        if !self.guidance_scale.is_finite() || !(0.0..=50.0).contains(&self.guidance_scale) {
+            return Err(EngineError::InvalidConfig(
+                "image guidance_scale must be finite and between 0 and 50".to_owned(),
+            ));
+        }
+        for (name, value) in [
+            ("sampling_method", self.sampling_method.as_deref()),
+            ("scheduler", self.scheduler.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty() || value.len() > 128) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "image {name} must be a non-empty string of at most 128 bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl EmbeddingRequest {
@@ -418,7 +502,7 @@ impl EmbeddingRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaInput {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,23 +511,29 @@ pub struct MediaInput {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f32>,
 }
 
 impl GenerateRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            messages: Vec::new(),
             media: Vec::new(),
             max_new_tokens: default_max_new_tokens(),
             grammar: None,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: Vec::new(),
             seed: None,
-            artifact_count: None,
-            width: None,
-            height: None,
-            steps: None,
-            cfg_scale: None,
             ignore_eos: false,
         }
     }
@@ -464,6 +554,77 @@ impl GenerateRequest {
     pub fn with_ignore_eos(mut self, ignore_eos: bool) -> Self {
         self.ignore_eos = ignore_eos;
         self
+    }
+
+    pub fn validate_sampling(&self) -> Result<()> {
+        if self
+            .temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+        {
+            return Err(EngineError::InvalidConfig(
+                "temperature must be finite and between 0 and 2".to_owned(),
+            ));
+        }
+        if self
+            .top_p
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
+        {
+            return Err(EngineError::InvalidConfig(
+                "top_p must be finite and in (0, 1]".to_owned(),
+            ));
+        }
+        if self
+            .top_k
+            .is_some_and(|value| !(0..=1_000_000).contains(&value))
+        {
+            return Err(EngineError::InvalidConfig(
+                "top_k must be between 0 and 1000000".to_owned(),
+            ));
+        }
+        if self
+            .min_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(EngineError::InvalidConfig(
+                "min_p must be finite and between 0 and 1".to_owned(),
+            ));
+        }
+        if self
+            .repeat_penalty
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0)
+        {
+            return Err(EngineError::InvalidConfig(
+                "repeat_penalty must be finite and in (0, 10]".to_owned(),
+            ));
+        }
+        if self
+            .frequency_penalty
+            .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            return Err(EngineError::InvalidConfig(
+                "frequency_penalty must be finite and between -2 and 2".to_owned(),
+            ));
+        }
+        if self
+            .presence_penalty
+            .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            return Err(EngineError::InvalidConfig(
+                "presence_penalty must be finite and between -2 and 2".to_owned(),
+            ));
+        }
+        if self.stop.len() > 4
+            || self
+                .stop
+                .iter()
+                .any(|value| value.is_empty() || value.chars().count() > 1_024)
+        {
+            return Err(EngineError::InvalidConfig(
+                "stop must contain at most 4 non-empty strings of at most 1024 characters"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -524,6 +685,12 @@ pub struct EmbeddingOutput {
     pub usage: UsageCounters,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenerationOutput {
+    pub image_count: u32,
+    pub steps: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioTranscriptionRequest {
     pub audio: Vec<u8>,
@@ -555,6 +722,60 @@ pub struct SpeechRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpeechOutput {
     pub audio_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaGenerationRequest {
+    pub endpoint_family: String,
+    pub prompt: String,
+    pub request: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+impl MediaGenerationRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.endpoint_family.trim().is_empty() {
+            return Err(EngineError::InvalidConfig(
+                "media generation endpoint_family must not be empty".to_owned(),
+            ));
+        }
+        if self.prompt.trim().is_empty() {
+            return Err(EngineError::InvalidConfig(
+                "media generation prompt must not be empty".to_owned(),
+            ));
+        }
+        if !self.request.is_object() {
+            return Err(EngineError::InvalidConfig(
+                "media generation request must be an object".to_owned(),
+            ));
+        }
+        for (field, value) in [
+            ("duration_seconds", self.duration_seconds),
+            ("frame_count", self.frame_count),
+            ("step_count", self.step_count),
+        ] {
+            if value == Some(0) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "media generation {field} must be positive when supplied"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaGenerationOutput {
+    pub duration_seconds: u64,
+    pub frame_count: u64,
+    pub step_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -664,6 +885,16 @@ pub trait EngineBackend {
             self.backend_id()
         )))
     }
+    fn generate_image(
+        &mut self,
+        _request: ImageGenerationRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<ImageGenerationOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support image generation",
+            self.backend_id()
+        )))
+    }
     fn transcribe(
         &mut self,
         _request: AudioTranscriptionRequest,
@@ -680,6 +911,36 @@ pub trait EngineBackend {
     ) -> Result<SpeechOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support speech synthesis",
+            self.backend_id()
+        )))
+    }
+    fn generate_video(
+        &mut self,
+        _request: MediaGenerationRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<MediaGenerationOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support video generation",
+            self.backend_id()
+        )))
+    }
+    fn generate_audio(
+        &mut self,
+        _request: MediaGenerationRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<MediaGenerationOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support general audio generation",
+            self.backend_id()
+        )))
+    }
+    fn generate_music(
+        &mut self,
+        _request: MediaGenerationRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<MediaGenerationOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support music generation",
             self.backend_id()
         )))
     }
@@ -1331,6 +1592,26 @@ fn default_max_new_tokens() -> u32 {
     64
 }
 
+fn default_image_count() -> u32 {
+    1
+}
+
+fn default_image_width() -> u32 {
+    512
+}
+
+fn default_image_height() -> u32 {
+    512
+}
+
+fn default_image_steps() -> u32 {
+    1
+}
+
+fn default_image_guidance_scale() -> f32 {
+    1.0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1860,14 +2141,11 @@ mod stable_diffusion_cpp_backend {
 
     use super::{
         stable_diffusion_payload_path, validate_load_config, verify_artifact, ArtifactChunk,
-        ArtifactFormat, ArtifactSink, EngineBackend, EngineError, FinishReason, GenerateOutput,
-        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
-        UsageCounters, DEFAULT_SEED,
+        ArtifactFormat, ArtifactSink, EngineBackend, EngineError, GenerateOutput, GenerateRequest,
+        ImageGenerationOutput, ImageGenerationRequest, LoadConfig, LoadedModelInfo, Result,
+        TokenSink, Tokenization, DEFAULT_SEED,
     };
 
-    const DEFAULT_IMAGE_WIDTH: u32 = 512;
-    const DEFAULT_IMAGE_HEIGHT: u32 = 512;
-    const DEFAULT_IMAGE_STEPS: u32 = 1;
     const MAX_IMAGE_COUNT: u32 = 4;
 
     #[derive(Debug)]
@@ -1945,24 +2223,18 @@ mod stable_diffusion_cpp_backend {
             ))
         }
 
-        fn generate_with_artifacts(
+        fn generate_image(
             &mut self,
-            request: GenerateRequest,
-            _token_sink: &mut dyn TokenSink,
+            request: ImageGenerationRequest,
             artifact_sink: &mut dyn ArtifactSink,
-        ) -> Result<GenerateOutput> {
+        ) -> Result<ImageGenerationOutput> {
+            request.validate()?;
             let config = self.config()?.clone();
-            let image_count = request
-                .artifact_count
-                .unwrap_or(1)
-                .clamp(1, MAX_IMAGE_COUNT);
-            let width = request.width.unwrap_or(DEFAULT_IMAGE_WIDTH).clamp(64, 2048);
-            let height = request
-                .height
-                .unwrap_or(DEFAULT_IMAGE_HEIGHT)
-                .clamp(64, 2048);
-            let steps = request.steps.unwrap_or(DEFAULT_IMAGE_STEPS).clamp(1, 150);
-            let cfg_scale = request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0);
+            let image_count = request.image_count.clamp(1, MAX_IMAGE_COUNT);
+            let width = request.width.clamp(64, 2048);
+            let height = request.height.clamp(64, 2048);
+            let steps = request.steps.clamp(1, 150);
+            let cfg_scale = request.guidance_scale.clamp(0.0, 50.0);
             let seed_base = request.seed.unwrap_or(DEFAULT_SEED);
             let model_path = stable_diffusion_payload_path(&config.artifact.path)?;
             let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
@@ -1996,6 +2268,15 @@ mod stable_diffusion_cpp_backend {
                     .arg(height.to_string())
                     .arg("--rng")
                     .arg("cpu");
+                if let Some(negative_prompt) = request.negative_prompt.as_deref() {
+                    command.arg("--negative-prompt").arg(negative_prompt);
+                }
+                if let Some(sampling_method) = request.sampling_method.as_deref() {
+                    command.arg("--sampling-method").arg(sampling_method);
+                }
+                if let Some(scheduler) = request.scheduler.as_deref() {
+                    command.arg("--scheduler").arg(scheduler);
+                }
                 if let Some(backend) = &backend {
                     command.arg("--backend").arg(backend);
                 }
@@ -2038,11 +2319,7 @@ mod stable_diffusion_cpp_backend {
                 let _ = fs::remove_file(&output_path);
             }
 
-            Ok(GenerateOutput {
-                text: String::new(),
-                usage: UsageCounters::default(),
-                finish_reason: FinishReason::Stop,
-            })
+            Ok(ImageGenerationOutput { image_count, steps })
         }
     }
 
@@ -2082,6 +2359,9 @@ mod stable_diffusion_tests {
             r#"#!/bin/sh
 out=""
 cfg=""
+negative=""
+sampler=""
+scheduler=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then
     shift
@@ -2091,9 +2371,24 @@ while [ "$#" -gt 0 ]; do
     shift
     cfg="$1"
   fi
+  if [ "$1" = "--negative-prompt" ]; then
+    shift
+    negative="$1"
+  fi
+  if [ "$1" = "--sampling-method" ]; then
+    shift
+    sampler="$1"
+  fi
+  if [ "$1" = "--scheduler" ]; then
+    shift
+    scheduler="$1"
+  fi
   shift
 done
 [ "$cfg" = "1.25" ] || exit 23
+[ "$negative" = "blur" ] || exit 24
+[ "$sampler" = "euler" ] || exit 25
+[ "$scheduler" = "discrete" ] || exit 26
 printf '\211PNG\r\n\032\n' > "$out"
 "#,
         )
@@ -2106,17 +2401,19 @@ printf '\211PNG\r\n\032\n' > "$out"
         backend
             .load(LoadConfig::stable_diffusion_checkpoint(&model))
             .unwrap();
-        let mut request = GenerateRequest::new("a red square");
-        request.artifact_count = Some(1);
-        request.width = Some(64);
-        request.height = Some(64);
-        request.steps = Some(2);
-        request.cfg_scale = Some(1.25);
+        let mut request = ImageGenerationRequest::new("a red square");
+        request.negative_prompt = Some("blur".to_owned());
+        request.image_count = 1;
+        request.width = 64;
+        request.height = 64;
+        request.steps = 2;
+        request.guidance_scale = 1.25;
         request.seed = Some(7);
+        request.sampling_method = Some("euler".to_owned());
+        request.scheduler = Some("discrete".to_owned());
         let mut artifacts = Vec::new();
-        let mut token_sink = NoopTokenSink;
         backend
-            .generate_with_artifacts(request, &mut token_sink, &mut |chunk| {
+            .generate_image(request, &mut |chunk| {
                 artifacts.push(chunk);
                 Ok(())
             })
@@ -2146,18 +2443,17 @@ printf '\211PNG\r\n\032\n' > "$out"
         backend
             .load(LoadConfig::stable_diffusion_checkpoint(model))
             .unwrap();
-        let mut request = GenerateRequest::new("a blue glass sphere on a white table");
-        request.artifact_count = Some(1);
-        request.width = Some(512);
-        request.height = Some(512);
-        request.steps = Some(1);
-        request.cfg_scale = Some(1.0);
+        let mut request = ImageGenerationRequest::new("a blue glass sphere on a white table");
+        request.image_count = 1;
+        request.width = 512;
+        request.height = 512;
+        request.steps = 1;
+        request.guidance_scale = 1.0;
         request.seed = Some(11);
 
         let mut artifacts = Vec::new();
-        let mut token_sink = NoopTokenSink;
         backend
-            .generate_with_artifacts(request, &mut token_sink, &mut |chunk| {
+            .generate_image(request, &mut |chunk| {
                 artifacts.push(chunk);
                 Ok(())
             })
@@ -2418,6 +2714,7 @@ mod llama_cpp_backend {
         Result, TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
         MTMD_MEDIA_MARKER,
     };
+    use std::collections::VecDeque;
     use std::ffi::CString;
     use std::num::NonZeroU32;
 
@@ -2538,6 +2835,7 @@ mod llama_cpp_backend {
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
+            request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -2591,7 +2889,7 @@ mod llama_cpp_backend {
 
             let mut sampler = make_sampler(model, &request)?;
             let mut decoder = UTF_8.new_decoder();
-            let mut output = String::new();
+            let mut stop_stream = StopSequenceStream::new(&request.stop);
             let mut completion_tokens = 0_u32;
             let mut finish_reason = FinishReason::Length;
             let mut next_pos = i32::try_from(prompt_tokens.len()).map_err(|err| {
@@ -2601,18 +2899,25 @@ mod llama_cpp_backend {
             while completion_tokens < request.max_new_tokens {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
                 if model.is_eog_token(token) && !request.ignore_eos {
+                    stop_stream.finish(sink)?;
                     finish_reason = FinishReason::Stop;
                     break;
                 }
 
                 let text = model.token_to_piece(token, &mut decoder, true, None)?;
-                output.push_str(&text);
-                sink.on_token(TokenChunk {
-                    index: completion_tokens,
-                    token_id: token.0,
-                    text,
-                })?;
+                let stopped = stop_stream.push(
+                    TokenChunk {
+                        index: completion_tokens,
+                        token_id: token.0,
+                        text,
+                    },
+                    sink,
+                )?;
                 completion_tokens = completion_tokens.saturating_add(1);
+                if stopped {
+                    finish_reason = FinishReason::Stop;
+                    break;
+                }
 
                 if completion_tokens >= request.max_new_tokens {
                     break;
@@ -2626,9 +2931,10 @@ mod llama_cpp_backend {
                 next_pos = next_pos.saturating_add(1);
                 ctx.decode(&mut batch)?;
             }
+            stop_stream.finish(sink)?;
 
             Ok(GenerateOutput {
-                text: output,
+                text: stop_stream.output,
                 usage: UsageCounters::new(prompt_tokens.len() as u32, completion_tokens),
                 finish_reason,
             })
@@ -2792,7 +3098,7 @@ mod llama_cpp_backend {
 
             let mut sampler = make_sampler(model, &request)?;
             let mut decoder = UTF_8.new_decoder();
-            let mut output = String::new();
+            let mut stop_stream = StopSequenceStream::new(&request.stop);
             let mut completion_tokens = 0_u32;
             let mut finish_reason = FinishReason::Length;
             let mut batch = LlamaBatch::new(1, 1);
@@ -2800,18 +3106,25 @@ mod llama_cpp_backend {
             while completion_tokens < request.max_new_tokens {
                 let token = sampler.sample(&ctx, -1);
                 if model.is_eog_token(token) && !request.ignore_eos {
+                    stop_stream.finish(sink)?;
                     finish_reason = FinishReason::Stop;
                     break;
                 }
 
                 let text = model.token_to_piece(token, &mut decoder, true, None)?;
-                output.push_str(&text);
-                sink.on_token(TokenChunk {
-                    index: completion_tokens,
-                    token_id: token.0,
-                    text,
-                })?;
+                let stopped = stop_stream.push(
+                    TokenChunk {
+                        index: completion_tokens,
+                        token_id: token.0,
+                        text,
+                    },
+                    sink,
+                )?;
                 completion_tokens = completion_tokens.saturating_add(1);
+                if stopped {
+                    finish_reason = FinishReason::Stop;
+                    break;
+                }
 
                 if completion_tokens >= request.max_new_tokens {
                     break;
@@ -2825,9 +3138,10 @@ mod llama_cpp_backend {
                 next_pos = next_pos.saturating_add(1);
                 ctx.decode(&mut batch)?;
             }
+            stop_stream.finish(sink)?;
 
             Ok(GenerateOutput {
-                text: output,
+                text: stop_stream.output,
                 usage: UsageCounters::new(prompt_tokens as u32, completion_tokens),
                 finish_reason,
             })
@@ -2911,14 +3225,39 @@ mod llama_cpp_backend {
             samplers.push(make_grammar_sampler(model, grammar)?);
         }
 
-        if let Some(temperature) = request.temperature {
-            if temperature > 0.0 {
-                samplers.push(LlamaSampler::temp(temperature));
+        let repeat_penalty = request.repeat_penalty.unwrap_or(1.0);
+        let frequency_penalty = request.frequency_penalty.unwrap_or(0.0);
+        let presence_penalty = request.presence_penalty.unwrap_or(0.0);
+        if (repeat_penalty - 1.0).abs() > f32::EPSILON
+            || frequency_penalty.abs() > f32::EPSILON
+            || presence_penalty.abs() > f32::EPSILON
+        {
+            samplers.push(LlamaSampler::penalties(
+                -1,
+                repeat_penalty,
+                frequency_penalty,
+                presence_penalty,
+            ));
+        }
+        if let Some(top_k) = request.top_k {
+            if top_k > 0 {
+                samplers.push(LlamaSampler::top_k(top_k));
             }
         }
+
         if let Some(top_p) = request.top_p {
             if top_p > 0.0 && top_p < 1.0 {
                 samplers.push(LlamaSampler::top_p(top_p, 1));
+            }
+        }
+        if let Some(min_p) = request.min_p {
+            if min_p > 0.0 {
+                samplers.push(LlamaSampler::min_p(min_p, 1));
+            }
+        }
+        if let Some(temperature) = request.temperature {
+            if temperature > 0.0 {
+                samplers.push(LlamaSampler::temp(temperature));
             }
         }
 
@@ -2929,6 +3268,113 @@ mod llama_cpp_backend {
         }
 
         Ok(LlamaSampler::chain_simple(samplers))
+    }
+
+    struct StopSequenceStream {
+        stops: Vec<String>,
+        pending: VecDeque<TokenChunk>,
+        pending_text: String,
+        output: String,
+        stopped: bool,
+    }
+
+    impl StopSequenceStream {
+        fn new(stops: &[String]) -> Self {
+            Self {
+                stops: stops.to_vec(),
+                pending: VecDeque::new(),
+                pending_text: String::new(),
+                output: String::new(),
+                stopped: false,
+            }
+        }
+
+        fn push(&mut self, chunk: TokenChunk, sink: &mut dyn TokenSink) -> Result<bool> {
+            self.pending_text.push_str(&chunk.text);
+            self.pending.push_back(chunk);
+            if let Some(stop_at) = self
+                .stops
+                .iter()
+                .filter_map(|stop| self.pending_text.find(stop))
+                .min()
+            {
+                self.flush_through(stop_at, sink)?;
+                self.stopped = true;
+                return Ok(true);
+            }
+            let held_suffix = longest_stop_prefix_suffix(&self.pending_text, &self.stops);
+            let safe_bytes = self.pending_text.len().saturating_sub(held_suffix);
+            self.flush_complete_chunks(safe_bytes, sink)?;
+            Ok(false)
+        }
+
+        fn finish(&mut self, sink: &mut dyn TokenSink) -> Result<()> {
+            if self.stopped {
+                return Ok(());
+            }
+            while let Some(chunk) = self.pending.pop_front() {
+                self.output.push_str(&chunk.text);
+                sink.on_token(chunk)?;
+            }
+            self.pending_text.clear();
+            Ok(())
+        }
+
+        fn flush_complete_chunks(
+            &mut self,
+            mut safe_bytes: usize,
+            sink: &mut dyn TokenSink,
+        ) -> Result<()> {
+            while self
+                .pending
+                .front()
+                .is_some_and(|chunk| chunk.text.len() <= safe_bytes)
+            {
+                let chunk = self.pending.pop_front().expect("front chunk exists");
+                safe_bytes = safe_bytes.saturating_sub(chunk.text.len());
+                self.pending_text.drain(..chunk.text.len());
+                self.output.push_str(&chunk.text);
+                sink.on_token(chunk)?;
+            }
+            Ok(())
+        }
+
+        fn flush_through(
+            &mut self,
+            mut allowed_bytes: usize,
+            sink: &mut dyn TokenSink,
+        ) -> Result<()> {
+            while let Some(mut chunk) = self.pending.pop_front() {
+                let take = allowed_bytes.min(chunk.text.len());
+                let take = floor_char_boundary(&chunk.text, take);
+                chunk.text.truncate(take);
+                allowed_bytes = allowed_bytes.saturating_sub(take);
+                self.output.push_str(&chunk.text);
+                sink.on_token(chunk)?;
+            }
+            self.pending_text.clear();
+            Ok(())
+        }
+    }
+
+    fn longest_stop_prefix_suffix(text: &str, stops: &[String]) -> usize {
+        text.char_indices()
+            .map(|(offset, _)| &text[offset..])
+            .chain(std::iter::once(""))
+            .filter(|suffix| {
+                !suffix.is_empty() && stops.iter().any(|stop| stop.starts_with(suffix))
+            })
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+        index = index.min(text.len());
+        while index > 0 && !text.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
     }
 
     fn make_grammar_sampler(model: &LlamaModel, spec: &GrammarSpec) -> Result<LlamaSampler> {
@@ -3126,6 +3572,7 @@ mod mlx_backend {
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
+            request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -3532,6 +3979,7 @@ mod vllm_backend {
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
+            request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -4146,6 +4594,17 @@ mod vllm_backend {
         }
 
         #[test]
+        fn vllm_worker_multimodal_path_is_local_only_and_processor_backed() {
+            assert!(WORKER.contains("AutoProcessor.from_pretrained"));
+            assert!(WORKER.contains("processor.apply_chat_template"));
+            assert!(WORKER.contains("multi_modal_data"));
+            assert!(WORKER.contains("limit_mm_per_prompt"));
+            assert!(WORKER.contains("remote media URLs are forbidden"));
+            assert!(WORKER.contains("base64.b64decode"));
+            assert!(WORKER.contains("num_frames must be between 1 and 1024"));
+        }
+
+        #[test]
         fn vllm_stream_sink_failure_drains_response_and_keeps_request_ids_aligned() {
             let root =
                 env::temp_dir().join(format!("mayhem-vllm-stream-drain-{}", std::process::id()));
@@ -4540,6 +4999,7 @@ mod trt_llm_backend {
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
+            request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),

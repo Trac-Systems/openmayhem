@@ -1,7 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod endpoint_calibration;
 mod python_runtime;
+
+use endpoint_calibration::{
+    run_endpoint_calibration_matrix, validate_endpoint_calibration_report,
+    EndpointCalibrationExecution, EndpointCalibrationReport,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
@@ -26,6 +32,7 @@ use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
+use image::ImageReader;
 use indicatif::{ProgressBar, ProgressStyle};
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
@@ -45,7 +52,8 @@ use mayhem_enclave::{
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, NoopTokenSink,
+    GenerateRequest, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
+    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
@@ -57,14 +65,16 @@ use mayhem_gateway::{
         GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
         GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore,
         GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo,
-        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS,
-        MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
+        SamplingProfile, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
+        ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL,
+        MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
-    HardwareQuoteVerifierCommand, HeartbeatReceiver, ProbationCaps, ProbationPolicy,
-    ProviderProbation, RateMapEntry, ReputationEvent, ReputationEventKind,
-    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
-    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
+    ModalityRequestLoad, ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry,
+    ReputationEvent, ReputationEventKind, DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
+    DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION,
+    INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
@@ -80,8 +90,9 @@ use mayhem_proto::{
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
     DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -121,6 +132,10 @@ const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
 const DEFAULT_RATE_STALENESS_SECONDS: u64 = 45 * 60;
 const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS: u64 = 86_400;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
+const MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS: u32 = 1_024;
+const MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
+const MAX_PROVIDER_MODALITY_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PROVIDER_MODALITY_ITEM_UNITS: u64 = 1_000_000_000_000;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MainnetManifest {
@@ -211,6 +226,7 @@ const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
 const DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN: usize = 256;
+const DEFAULT_PROVIDER_SESSION_REQUEST_JSON_OVERHEAD_BYTES: usize = 1024 * 1024;
 const DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_MILLIS: u64 = 3_600_000;
 const DEFAULT_PROVIDER_SESSION_REQUEST_UPLOAD_MIN_BYTES_PER_SECOND: usize = 16 * 1024;
 const DEFAULT_PROVIDER_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
@@ -1216,6 +1232,10 @@ struct UpArgs {
     #[arg(long)]
     provider_gpu_layers: Option<u32>,
 
+    /// Disable a non-core catalog modality for supervised providers. Repeat or comma-separate.
+    #[arg(long = "provider-disable-modality", value_delimiter = ',')]
+    provider_disable_modalities: Vec<String>,
+
     /// Hardware quote kind emitted by the supervised provider, for example tpm2_quote_ek or nvidia_nvtrust_offline_jwt.
     #[arg(long)]
     provider_hardware_quote_kind: Option<String>,
@@ -1579,6 +1599,10 @@ struct ModelsArgs {
     /// Show only live models with at least one admin-KYB'd provider; requires --gateway.
     #[arg(long)]
     require_kyb: bool,
+
+    /// Show models supporting this modality; live mode requires at least one serving provider.
+    #[arg(long)]
+    modality: Option<String>,
 
     /// Print a machine-readable model list.
     #[arg(long)]
@@ -2950,6 +2974,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long, value_name = "PATH")]
     artifact_path: PathBuf,
 
+    /// Local admin-bound mmproj file for a vision artifact.
+    #[arg(long, value_name = "PATH")]
+    vision_projector_path: Option<PathBuf>,
+
     /// Restrict calibration to one prompt id. Defaults to all prompts in the canary set.
     #[arg(long)]
     prompt_id: Option<String>,
@@ -2965,6 +2993,10 @@ struct CatalogCalibrateCanaryArgs {
     /// Optional GPU layer count for llama.cpp calibration.
     #[arg(long)]
     gpu_layers: Option<u32>,
+
+    /// F13 memory reserve used by calibration fit proof, e.g. 4GB or 15%.
+    #[arg(long, value_name = "GB|%")]
+    memory_reserve: Option<String>,
 
     /// Seed for deterministic calibration requests.
     #[arg(long, default_value_t = 0)]
@@ -3095,6 +3127,10 @@ struct CatalogCanaryPlanArgs {
     /// Optional GPU layer count for llama.cpp calibration commands.
     #[arg(long)]
     gpu_layers: Option<u32>,
+
+    /// F13 memory reserve used by printed calibration commands.
+    #[arg(long, value_name = "GB|%")]
+    memory_reserve: Option<String>,
 
     /// TensorRT-LLM tensor-parallel degree for calibration commands.
     #[arg(long)]
@@ -4892,6 +4928,22 @@ struct ProviderLimitsSetArgs {
     #[arg(long, value_name = "GB")]
     disk_reserve: Option<String>,
 
+    /// Per-modality in-flight item limit, e.g. image=2. Repeat for multiple modalities.
+    #[arg(long = "modality-concurrency", value_name = "MODALITY=N")]
+    modality_concurrency: Vec<String>,
+
+    /// Per-request item limit for a modality, e.g. image=1. Repeat for multiple modalities.
+    #[arg(long = "modality-max-items", value_name = "MODALITY=N")]
+    modality_max_items: Vec<String>,
+
+    /// Maximum bytes per item, e.g. image=20MB. Repeat for multiple modalities.
+    #[arg(long = "modality-max-bytes", value_name = "MODALITY=BYTES")]
+    modality_max_bytes: Vec<String>,
+
+    /// Maximum natural units per item, e.g. image=40000000 or audio=3600.
+    #[arg(long = "modality-max-units", value_name = "MODALITY=N")]
+    modality_max_units: Vec<String>,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
@@ -4963,6 +5015,10 @@ struct ProviderJoinArgs {
     /// Canonical room ids to join, comma-separated, or auto for all open admin rooms for the model.
     #[arg(long, default_value = "auto")]
     rooms: String,
+
+    /// Disable a non-core catalog modality. Repeat or comma-separate.
+    #[arg(long = "disable-modality", value_delimiter = ',')]
+    disable_modalities: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -5063,6 +5119,10 @@ struct ProviderServePlanArgs {
     #[arg(long)]
     ctx: Option<u64>,
 
+    /// Disable a non-core catalog modality. Repeat or comma-separate.
+    #[arg(long = "disable-modality", value_delimiter = ',')]
+    disable_modalities: Vec<String>,
+
     /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
@@ -5092,6 +5152,10 @@ struct ProviderServeAddArgs {
     /// Maximum context tokens this provider commits to serve for the selected enclave.
     #[arg(long)]
     ctx: Option<u64>,
+
+    /// Disable a non-core catalog modality for this worker. Repeat or comma-separate.
+    #[arg(long = "disable-modality", value_delimiter = ',')]
+    disable_modalities: Vec<String>,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -5236,6 +5300,10 @@ struct ProviderStartArgs {
     #[arg(long)]
     ctx: Option<u64>,
 
+    /// Disable a non-core catalog modality. Repeat or comma-separate.
+    #[arg(long = "disable-modality", value_delimiter = ',')]
+    disable_modalities: Vec<String>,
+
     /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
@@ -5290,6 +5358,9 @@ struct ProviderStartArgs {
 
     #[arg(skip)]
     load_progress: Option<ProviderLoadProgressContext>,
+
+    #[arg(skip)]
+    modality_limits: BTreeMap<String, ConfigProviderModalityLimits>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -5512,6 +5583,15 @@ struct ConfigProviderLimits {
     memory_reserve: Option<String>,
     vllm_memory_utilization_pct: Option<u32>,
     disk_reserve: Option<String>,
+    modalities: Option<BTreeMap<String, ConfigProviderModalityLimits>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ConfigProviderModalityLimits {
+    max_inflight_items: Option<u32>,
+    max_items_per_request: Option<u32>,
+    max_item_bytes: Option<u64>,
+    max_item_units: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6377,6 +6457,8 @@ struct CatalogListModel {
     caps: CatalogListCaps,
     requirements: CatalogListRequirements,
     adapter: catalog::CatalogAdapter,
+    modality_assessment: catalog::CatalogModalityAssessment,
+    sampling: catalog::CatalogSamplingProfile,
     canary_set: String,
     canary_match_min: f64,
     canary_verification_method: String,
@@ -6461,6 +6543,8 @@ struct CatalogListLocalRunMemory {
     kv_human: String,
     overhead_bytes: u64,
     overhead_human: String,
+    media_bytes: u64,
+    media_human: String,
     budget_bytes: u64,
     budget_human: String,
     reserve_bytes: u64,
@@ -6527,7 +6611,7 @@ fn catalog_list(args: CatalogListArgs) -> Result<()> {
         catalog_path: catalog_path.clone(),
         signature_path: signature_path.clone(),
         keys_dir,
-        canaries_dir,
+        canaries_dir: canaries_dir.clone(),
         check_dev_downloads: false,
         check_launch_sources: false,
         hf_token_file: None,
@@ -6595,6 +6679,29 @@ fn catalog_list_report(
     }
 }
 
+fn filter_catalog_list_report_by_modality(
+    mut report: CatalogListReport,
+    modality: Option<&str>,
+) -> CatalogListReport {
+    let Some(modality) = modality else {
+        return report;
+    };
+    report.models.retain(|model| {
+        model
+            .adapter
+            .modality_set
+            .iter()
+            .any(|entry| entry == modality)
+    });
+    report.model_count = report.models.len();
+    report.artifact_count = report
+        .models
+        .iter()
+        .map(|model| model.artifacts.len())
+        .sum();
+    report
+}
+
 fn catalog_list_tier_matches(model_tier: &str, filter: CatalogListTier) -> bool {
     match filter {
         CatalogListTier::Launch => model_tier == "launch",
@@ -6658,10 +6765,7 @@ fn catalog_list_model(
         license: model.provenance.license.clone(),
         price_ref_au: CatalogListPrice {
             denom: model.price_ref_au.denom.clone(),
-            rate_map: text_generation_rate_map(
-                model.price_ref_au.in_per_1k,
-                model.price_ref_au.out_per_1k,
-            ),
+            rate_map: catalog_model_price_rate_map(model),
         },
         caps: CatalogListCaps {
             tools: model.caps.tools,
@@ -6680,6 +6784,8 @@ fn catalog_list_model(
             backends: model.requirements.backends.clone(),
         },
         adapter: model.adapter.clone(),
+        modality_assessment: model.modality_assessment.clone(),
+        sampling: model.sampling.clone(),
         canary_set: model.canary.set_id.clone(),
         canary_match_min: model.canary.match_min,
         canary_verification_method: model.canary.verification_method.clone(),
@@ -6688,6 +6794,25 @@ fn catalog_list_model(
         local_runs: local_run
             .map(|context| catalog_model_local_runs(model, context))
             .unwrap_or_default(),
+    }
+}
+
+fn catalog_model_price_rate_map(model: &catalog::CatalogModel) -> Vec<RateMapEntry> {
+    if model.price_ref_au.rate_map.is_empty() {
+        text_generation_rate_map(model.price_ref_au.in_per_1k, model.price_ref_au.out_per_1k)
+    } else {
+        normalize_rate_map(
+            model
+                .price_ref_au
+                .rate_map
+                .iter()
+                .map(|entry| RateMapEntry {
+                    unit: entry.unit.clone(),
+                    per_unit_au: entry.per_unit_au,
+                    granularity: entry.granularity,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -6776,10 +6901,25 @@ fn catalog_enclave_local_run(
         );
     }
 
+    let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
+        Ok(modalities) => modalities,
+        Err(err) => {
+            return catalog_local_run_cannot_run(
+                enclave,
+                artifact_name,
+                artifact,
+                download,
+                "cannot_run",
+                format!("resolving served modalities: {err:#}"),
+            );
+        }
+    };
     match provider_context_feasibility(
         enclave,
         model,
+        artifact_name,
         artifact,
+        &served_modalities,
         verdict,
         context.hardware,
         args,
@@ -6880,6 +7020,8 @@ fn catalog_local_run_cannot_run(
             kv_human: human_bytes(0),
             overhead_bytes: 0,
             overhead_human: human_bytes(0),
+            media_bytes: 0,
+            media_human: human_bytes(0),
             budget_bytes: 0,
             budget_human: human_bytes(0),
             reserve_bytes: 0,
@@ -6902,6 +7044,8 @@ fn catalog_local_run_memory(feasibility: &ProviderCtxFeasibility) -> CatalogList
         kv_human: human_bytes(feasibility.estimated_kv_bytes),
         overhead_bytes: feasibility.estimated_overhead_bytes,
         overhead_human: human_bytes(feasibility.estimated_overhead_bytes),
+        media_bytes: feasibility.estimated_media_bytes,
+        media_human: human_bytes(feasibility.estimated_media_bytes),
         budget_bytes: feasibility.memory_budget.budget_bytes,
         budget_human: human_bytes(feasibility.memory_budget.budget_bytes),
         reserve_bytes: feasibility.memory_budget.reserve_bytes,
@@ -6957,6 +7101,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         heartbeat_count: 1,
         min_ask_au: 0,
         ctx: None,
+        disable_modalities: Vec::new(),
         memory_reserve: None,
         vllm_memory_utilization: None,
         disk_reserve: None,
@@ -6971,6 +7116,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         print_json: true,
         dev_skip_catalog_verify: true,
         load_progress: None,
+        modality_limits: BTreeMap::new(),
     }
 }
 
@@ -7366,13 +7512,18 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.requirements.backends.join(",")
         );
         println!(
-            "  adapter: request_shape={} template={} tool_call={} reasoning={} modalities={} normalization={}",
-            model.adapter.request_shape_family,
+            "  adapter: endpoint_families={} template={} tool_call={} reasoning={} modalities={}",
+            model
+                .adapter
+                .endpoint_families
+                .iter()
+                .map(|contract| contract.family.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
             model.adapter.chat_template_id,
             model.adapter.tool_call_strategy,
             model.adapter.reasoning_passthrough,
-            model.adapter.modality_set.join(","),
-            model.adapter.response_normalization
+            model.adapter.modality_set.join(",")
         );
         println!(
             "  canary: {} method={} match_min={} tolerance_bps={}",
@@ -7512,7 +7663,7 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         catalog_path,
         signature_path,
         keys_dir,
-        canaries_dir,
+        canaries_dir: canaries_dir.clone(),
         check_dev_downloads: args.check_dev_downloads,
         check_launch_sources: args.check_launch_sources,
         hf_token_file,
@@ -11207,6 +11358,11 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .unwrap_or_else(|| repo_path("catalog/canaries"))?;
     let canaries_dir = absolutize(canaries_dir)?;
     let artifact_path = absolutize(args.artifact_path.clone())?;
+    let vision_projector_path = args
+        .vision_projector_path
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
     let report_output = args
         .report_output
         .as_ref()
@@ -11239,6 +11395,10 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
     verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
+    verify_calibration_vision_projector_matches_catalog(
+        artifact,
+        vision_projector_path.as_deref(),
+    )?;
     let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
         &model.canary.set_id,
@@ -11247,18 +11407,37 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     )?;
     let canary_set_sha256 =
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
-    let mut backend = catalog_calibration_backend(artifact, &artifact_path, &args)?;
+    let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
+    let mut backend = catalog_calibration_backend(
+        artifact,
+        &artifact_path,
+        vision_projector_path.as_deref(),
+        &args,
+    )?;
     let mut reports = Vec::with_capacity(prompts.len());
     for prompt in &prompts {
-        reports.push(calibrate_canary_prompt(
-            backend.as_mut(),
-            model,
-            prompt,
-            args.seed,
-            args.include_output,
-        )?);
+        let process_ids = backend.process_ids();
+        let (mut report, baseline, peak) =
+            measure_calibration_memory(&calibration_memory, &process_ids, || {
+                calibrate_canary_prompt(
+                    backend.as_mut(),
+                    model,
+                    prompt,
+                    args.seed,
+                    args.include_output,
+                )
+            })?;
+        report.calibration_baseline_memory_bytes = baseline;
+        report.calibration_peak_memory_bytes = peak;
+        reports.push(report);
     }
     let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
+    let modality_fingerprints =
+        aggregate_calibrated_modality_fingerprints(model, &prompts, &reports)?;
+    let modality_resource_profiles =
+        aggregate_calibrated_modality_resource_profiles(model, &reports, &calibration_memory)?;
+    let endpoint_calibration =
+        catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
     let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
     let matches_existing = existing
         .as_ref()
@@ -11276,6 +11455,9 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         canary_set_sha256,
         prompt_count: reports.len(),
         catalog_fingerprint,
+        modality_fingerprints,
+        modality_resource_profiles,
+        endpoint_calibration,
         existing_catalog_fingerprint: existing,
         matches_existing_catalog: matches_existing,
         prompts: reports,
@@ -11290,6 +11472,16 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         println!("Canary set: {}", report.canary_set);
         println!("Prompts: {}", report.prompt_count);
         println!("Catalog fingerprint: {}", report.catalog_fingerprint);
+        println!(
+            "Endpoint calibration: {} families / {} cases ({})",
+            report.endpoint_calibration.family_count,
+            report.endpoint_calibration.case_count,
+            if report.endpoint_calibration.ok {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
         if let Some(existing) = &report.existing_catalog_fingerprint {
             println!("Existing catalog fingerprint: {existing}");
             println!(
@@ -11314,7 +11506,662 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     if args.require_match {
         ensure_calibration_matches_catalog(&report)?;
     }
+    let endpoint_errors = validate_endpoint_calibration_report(
+        &model.adapter.endpoint_families,
+        &report.endpoint_calibration,
+    );
+    ensure!(
+        endpoint_errors.is_empty(),
+        "endpoint-family calibration matrix failed: {}",
+        endpoint_errors.join("; ")
+    );
     Ok(())
+}
+
+#[derive(Default)]
+struct CatalogEndpointCalibrationFixtures {
+    audio: Option<Vec<u8>>,
+}
+
+fn catalog_endpoint_calibration_report(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> EndpointCalibrationReport {
+    let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    run_endpoint_calibration_matrix(
+        &model.adapter.endpoint_families,
+        &substitutions,
+        |contract, _case, request| {
+            catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)
+        },
+    )
+}
+
+fn catalog_endpoint_calibration_fixtures(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> (BTreeMap<String, Value>, CatalogEndpointCalibrationFixtures) {
+    let mut substitutions = BTreeMap::from([("$MODEL".to_owned(), json!(model.model_id))]);
+    let mut fixtures = CatalogEndpointCalibrationFixtures::default();
+    for prompt in prompts {
+        if let Some(voice) = prompt.voice.as_deref().filter(|value| !value.is_empty()) {
+            substitutions
+                .entry("$VOICE".to_owned())
+                .or_insert_with(|| json!(voice));
+        }
+        if fixtures.audio.is_none() {
+            if let Some(encoded) = prompt.audio_b64.as_deref() {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    substitutions.insert("$AUDIO_BASE64".to_owned(), json!(encoded));
+                    substitutions.insert(
+                        "$AUDIO_BLAKE3".to_owned(),
+                        json!(blake3::hash(&bytes).to_hex().to_string()),
+                    );
+                    fixtures.audio = Some(bytes);
+                }
+            }
+        }
+        for message in &prompt.messages {
+            collect_endpoint_media_fixture_substitutions(message, &mut substitutions);
+        }
+    }
+    (substitutions, fixtures)
+}
+
+fn collect_endpoint_media_fixture_substitutions(
+    value: &Value,
+    substitutions: &mut BTreeMap<String, Value>,
+) {
+    match value {
+        Value::String(value) if value.starts_with("data:image/") => {
+            substitutions
+                .entry("$IMAGE_DATA_URL".to_owned())
+                .or_insert_with(|| json!(value));
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_endpoint_media_fixture_substitutions(item, substitutions);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(data) = object
+                .get("video")
+                .and_then(|video| video.get("data"))
+                .and_then(Value::as_str)
+            {
+                substitutions
+                    .entry("$VIDEO_BASE64".to_owned())
+                    .or_insert_with(|| json!(data));
+            }
+            if let Some(data) = object
+                .get("input_audio")
+                .and_then(|audio| audio.get("data"))
+                .and_then(Value::as_str)
+            {
+                substitutions
+                    .entry("$AUDIO_BASE64".to_owned())
+                    .or_insert_with(|| json!(data));
+            }
+            for child in object.values() {
+                collect_endpoint_media_fixture_substitutions(child, substitutions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn catalog_endpoint_calibration_execute(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<EndpointCalibrationExecution, String> {
+    let transport = catalog_endpoint_calibration_transport(contract, request, fixtures)
+        .map_err(|error| format!("building provider transport: {error:#}"))?;
+    let (translation, handled_request_attributes) =
+        catalog_endpoint_calibration_translation(model, contract, request, &transport)
+            .map_err(|error| format!("translating endpoint request: {error:#}"))?;
+    let sealed = catalog_endpoint_calibration_seal(contract, request, transport)
+        .map_err(|error| format!("sealing provider request: {error:#}"))?;
+    let output = provider_engine_session_response_with_sampling(
+        backend,
+        Some(&model.model_id),
+        &model.adapter,
+        &model.sampling,
+        &sealed,
+        None,
+    )
+    .map_err(|error| format!("executing provider request: {error:#}"))?;
+    let response = catalog_endpoint_calibration_response(&contract.family, request, &output)
+        .map_err(|error| format!("normalizing public response: {error:#}"))?;
+    Ok(EndpointCalibrationExecution {
+        provider_translation_fingerprint: stable_value_hash(&translation),
+        handled_request_attributes,
+        backend_execution_fingerprint: provider_session_output_fingerprint(&output),
+        response,
+    })
+}
+
+fn catalog_endpoint_calibration_transport(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    let kind = provider_endpoint_transport_kind(&contract.family)?;
+    let mut transport = json!({"kind": kind});
+    if matches!(
+        contract.family.as_str(),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+    ) {
+        let bytes = if contract.family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+            let encoded = request
+                .get("inputs")
+                .and_then(Value::as_str)
+                .context("HF ASR request is missing base64 inputs")?;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .context("HF ASR inputs are not valid base64")?
+        } else {
+            fixtures
+                .audio
+                .clone()
+                .context("OpenAI transcription calibration has no audio fixture")?
+        };
+        let file = request.get("file").and_then(Value::as_object);
+        transport["audio"] = json!({
+            "encoding": "hex",
+            "data": hex_encode(&bytes),
+            "content_type": file
+                .and_then(|file| file.get("content_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("audio/wav"),
+            "filename": file
+                .and_then(|file| file.get("filename"))
+                .and_then(Value::as_str)
+                .unwrap_or("calibration.wav"),
+        });
+    }
+    Ok(transport)
+}
+
+fn catalog_endpoint_calibration_seal(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &Value,
+    mut transport: Value,
+) -> Result<Value> {
+    let transport_fingerprint = stable_value_hash(&transport);
+    transport["contract_request"] = request.clone();
+    transport["mayhem_contract"] = json!({
+        "schema_version": 1,
+        "endpoint_family": contract.family,
+        "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "normalized_request_fingerprint": stable_value_hash(request),
+        "transport_request_fingerprint": transport_fingerprint,
+    });
+    Ok(transport)
+}
+
+fn catalog_endpoint_calibration_translation(
+    model: &catalog::CatalogModel,
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &Value,
+    transport: &Value,
+) -> Result<(Value, BTreeSet<String>)> {
+    let translation = match contract.family.as_str() {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+        | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
+            serde_json::to_value(provider_engine_request_from_endpoint_body_with_sampling(
+                &contract.family,
+                request,
+                &model.adapter,
+                &model.sampling,
+            )?)?
+        }
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
+            let inputs = provider_embedding_input_texts_from_body(request)?;
+            let dimensions = request
+                .get("dimensions")
+                .and_then(Value::as_u64)
+                .map(usize::try_from)
+                .transpose()
+                .context("embedding dimensions overflowed usize")?;
+            serde_json::to_value(mayhem_engine::EmbeddingRequest { inputs, dimensions })?
+        }
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => serde_json::to_value(
+            provider_image_generation_request_from_body(&contract.family, request)?,
+        )?,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+        | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => serde_json::to_value(
+            provider_audio_transcription_request_from_body(&contract.family, request, transport)?
+                .engine,
+        )?,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+            serde_json::to_value(provider_speech_request_from_body(
+                &contract.family,
+                request,
+            )?)?
+        }
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => serde_json::to_value(
+            provider_media_generation_request_from_body(&contract.family, request)?,
+        )?,
+        other => bail!("endpoint family {other} has no provider calibration translation"),
+    };
+    let handled = contract
+        .request_attributes
+        .iter()
+        .filter(|path| {
+            calibration_value_has_path(request, path)
+                && calibration_endpoint_attribute_is_handled(&contract.family, path, request)
+        })
+        .cloned()
+        .collect();
+    Ok((translation, handled))
+}
+
+fn calibration_endpoint_attribute_is_handled(family: &str, path: &str, request: &Value) -> bool {
+    match family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS => match path {
+            "model"
+            | "messages"
+            | "max_tokens"
+            | "max_completion_tokens"
+            | "temperature"
+            | "top_p"
+            | "top_k"
+            | "min_p"
+            | "repeat_penalty"
+            | "frequency_penalty"
+            | "presence_penalty"
+            | "seed"
+            | "stop"
+            | "tools"
+            | "tool_choice"
+            | "response_format"
+            | "stream"
+            | "stream_options.include_usage" => true,
+            "parallel_tool_calls" => request
+                .get(path)
+                .and_then(Value::as_bool)
+                .is_some_and(|enabled| !enabled),
+            _ => false,
+        },
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => matches!(
+            path,
+            "model"
+                | "prompt"
+                | "max_tokens"
+                | "temperature"
+                | "top_p"
+                | "top_k"
+                | "min_p"
+                | "frequency_penalty"
+                | "presence_penalty"
+                | "seed"
+                | "stop"
+                | "stream"
+        ),
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => match path {
+            "model" | "input" | "stream" | "max_output_tokens" | "temperature" | "top_p"
+            | "top_k" | "min_p" | "tools" | "tool_choice" | "text" => true,
+            "parallel_tool_calls" => request
+                .get(path)
+                .and_then(Value::as_bool)
+                .is_some_and(|enabled| !enabled),
+            _ => false,
+        },
+        mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => matches!(
+            path,
+            "model"
+                | "messages"
+                | "messages.role"
+                | "messages.name"
+                | "messages.tool_calls"
+                | "messages.tool_call_id"
+                | "messages.content.type"
+                | "messages.content.text"
+                | "messages.content.image_url.url"
+                | "messages.content.input_audio.data"
+                | "messages.content.input_audio.format"
+                | "messages.content.video.data"
+                | "messages.content.video.content_type"
+                | "messages.content.video.num_frames"
+                | "messages.content.video.fps"
+                | "stream"
+                | "max_tokens"
+                | "temperature"
+                | "top_p"
+                | "top_k"
+                | "min_p"
+                | "seed"
+                | "tools"
+                | "tool_choice"
+                | "response_format"
+        ),
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
+            matches!(path, "model" | "input" | "encoding_format" | "dimensions")
+        }
+        mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
+            matches!(path, "inputs" | "dimensions")
+        }
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => matches!(
+            path,
+            "model"
+                | "prompt"
+                | "n"
+                | "size"
+                | "response_format"
+                | "negative_prompt"
+                | "steps"
+                | "cfg_scale"
+                | "seed"
+                | "scheduler"
+        ),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => matches!(
+            path,
+            "inputs"
+                | "parameters.guidance_scale"
+                | "parameters.negative_prompt"
+                | "parameters.num_inference_steps"
+                | "parameters.width"
+                | "parameters.height"
+                | "parameters.scheduler"
+                | "parameters.seed"
+        ),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => {
+            matches!(path, "file" | "model" | "language" | "prompt")
+        }
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => path == "inputs",
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => matches!(
+            path,
+            "model" | "input" | "voice" | "response_format" | "speed"
+        ),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => matches!(
+            path,
+            "inputs" | "parameters.voice" | "parameters.speed" | "parameters.speaker_id"
+        ),
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => true,
+        _ => false,
+    }
+}
+
+fn calibration_value_has_path(value: &Value, path: &str) -> bool {
+    fn has(value: &Value, segments: &[&str]) -> bool {
+        if segments.is_empty() {
+            return true;
+        }
+        match value {
+            Value::Object(object) => object
+                .get(segments[0])
+                .is_some_and(|child| has(child, &segments[1..])),
+            Value::Array(items) => items.iter().any(|item| has(item, segments)),
+            _ => false,
+        }
+    }
+    has(value, &path.split('.').collect::<Vec<_>>())
+}
+
+fn provider_session_output_fingerprint(output: &ProviderSessionOutput) -> String {
+    stable_value_hash(&json!({
+        "content": output.content,
+        "tool": output.tool,
+        "embeddings": output.embeddings,
+        "artifacts": output.artifacts.iter().map(|artifact| json!({
+            "id": artifact.id,
+            "content_type": artifact.content_type,
+            "bytes": artifact.bytes.len(),
+            "blake3": blake3::hash(&artifact.bytes).to_hex().to_string(),
+        })).collect::<Vec<_>>(),
+        "finish_reason": output.finish_reason,
+        "prompt_tokens": output.prompt_tokens,
+        "completion_tokens": output.completion_tokens,
+        "token_ids": output.token_ids,
+        "usage": output.usage.units(),
+    }))
+}
+
+fn catalog_endpoint_calibration_response(
+    family: &str,
+    request: &Value,
+    output: &ProviderSessionOutput,
+) -> Result<Value> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("hf-model");
+    let usage = json!({
+        "prompt_tokens": output.prompt_tokens,
+        "completion_tokens": output.completion_tokens,
+        "total_tokens": output.prompt_tokens.saturating_add(output.completion_tokens),
+        "units": output.usage.units(),
+    });
+    let mayhem = json!({"calibration": true});
+    match family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
+            let mut message = json!({
+                "role": "assistant",
+                "content": output.content,
+            });
+            if let Some(tool) = &output.tool {
+                message["content"] = Value::Null;
+                message["tool_calls"] = json!([tool]);
+            }
+            Ok(json!({
+                "id": "chatcmpl-calibration",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": output.finish_reason,
+                }],
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => Ok(json!({
+            "id": "cmpl-calibration",
+            "object": "text_completion",
+            "created": 1,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "text": output.content,
+                "finish_reason": output.finish_reason,
+            }],
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => Ok(json!({
+            "id": "resp-calibration",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": model,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output.content}],
+            }],
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
+            let embeddings = output
+                .embeddings
+                .as_ref()
+                .context("embedding backend produced no embeddings")?;
+            Ok(json!({
+                "object": "list",
+                "data": embeddings.iter().enumerate().map(|(index, embedding)| json!({
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": embedding,
+                })).collect::<Vec<_>>(),
+                "model": model,
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
+        mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => Ok(json!({
+            "embeddings": output
+                .embeddings
+                .as_ref()
+                .context("embedding backend produced no embeddings")?,
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => Ok(json!({
+            "id": "img-calibration",
+            "object": "images.response",
+            "created": 1,
+            "model": model,
+            "data": output.artifacts.iter().map(|artifact| json!({
+                "b64_json": base64::engine::general_purpose::STANDARD.encode(&artifact.bytes),
+            })).collect::<Vec<_>>(),
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
+            let artifact = output
+                .artifacts
+                .first()
+                .context("image backend produced no artifact")?;
+            Ok(json!({
+                "image": base64::engine::general_purpose::STANDARD.encode(&artifact.bytes),
+                "content_type": artifact.content_type,
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => Ok(json!({
+            "text": output.content,
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => Ok(json!({
+            "text": output.content,
+            "usage": usage,
+            "mayhem": mayhem,
+        })),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+            let artifact = output
+                .artifacts
+                .first()
+                .context("speech backend produced no artifact")?;
+            Ok(json!({
+                "audio": base64::engine::general_purpose::STANDARD.encode(&artifact.bytes),
+                "content_type": artifact.content_type,
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
+            let artifact = output
+                .artifacts
+                .first()
+                .context("video backend produced no artifact")?;
+            ensure!(
+                artifact.content_type.starts_with("video/"),
+                "video backend produced non-video content type {}",
+                artifact.content_type
+            );
+            Ok(json!({
+                "id": "video_calibration",
+                "object": "video",
+                "model": model,
+                "status": "completed",
+                "progress": 100,
+                "created_at": 1,
+                "completed_at": 1,
+                "expires_at": 3_601,
+                "error": Value::Null,
+                "prompt": request.get("prompt").cloned().unwrap_or_else(|| json!("calibration")),
+                "size": request.get("size").cloned().unwrap_or_else(|| json!("720x1280")),
+                "seconds": request.get("seconds").cloned().unwrap_or_else(|| json!("4")),
+                "usage": usage,
+                "mayhem": {
+                    "calibration": true,
+                    "artifact_blake3": blake3::hash(&artifact.bytes).to_hex().to_string(),
+                },
+            }))
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            let artifact = output
+                .artifacts
+                .first()
+                .context("video backend produced no artifact")?;
+            ensure!(
+                artifact.content_type.starts_with("video/"),
+                "video backend produced non-video content type {}",
+                artifact.content_type
+            );
+            Ok(json!({
+                "video": base64::engine::general_purpose::STANDARD.encode(&artifact.bytes),
+                "content_type": artifact.content_type,
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
+            let artifact = output
+                .artifacts
+                .first()
+                .context("audio generation backend produced no artifact")?;
+            ensure!(
+                artifact.content_type.starts_with("audio/"),
+                "audio generation backend produced non-audio content type {}",
+                artifact.content_type
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&artifact.bytes);
+            let artifact_field = if family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+                "music"
+            } else {
+                "audio"
+            };
+            let object = if family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+                "music.generation"
+            } else {
+                "audio.generation"
+            };
+            let mut response = json!({
+                "id": "audio-calibration",
+                "object": object,
+                "content_type": artifact.content_type,
+                "usage": usage,
+                "mayhem": mayhem,
+            });
+            response[artifact_field] = json!(encoded);
+            if family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+                response["sampling_rate"] = json!(wav_sample_rate(&artifact.bytes)
+                    .context("HF text-to-audio calibration artifact is not a valid WAV")?);
+                let response = response
+                    .as_object_mut()
+                    .context("HF audio calibration response is not an object")?;
+                response.remove("id");
+                response.remove("object");
+            }
+            Ok(response)
+        }
+        other => bail!("endpoint family {other} has no public calibration response mapper"),
+    }
 }
 
 fn verify_calibration_artifact_matches_catalog(
@@ -11357,6 +12204,66 @@ fn verify_calibration_artifact_matches_catalog(
     Ok(())
 }
 
+fn verify_calibration_vision_projector_matches_catalog(
+    artifact: &catalog::CatalogArtifact,
+    vision_projector_path: Option<&Path>,
+) -> Result<()> {
+    match (artifact.sidecars.get("mmproj"), vision_projector_path) {
+        (Some(sidecar), Some(path)) => verify_calibration_bound_file(
+            path,
+            &sidecar.artifact_root_kind,
+            &sidecar.artifact_root,
+            sidecar.weights_bytes,
+            "vision projector",
+        ),
+        (Some(_), None) => bail!(
+            "catalog artifact declares an admin-bound mmproj; pass --vision-projector-path so calibration proves the image path"
+        ),
+        (None, Some(_)) => bail!(
+            "--vision-projector-path is only allowed when the catalog artifact declares the mmproj sidecar"
+        ),
+        (None, None) => Ok(()),
+    }
+}
+
+fn verify_calibration_bound_file(
+    path: &Path,
+    artifact_root_kind: &str,
+    artifact_root: &str,
+    weights_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        artifact_root_kind == "blake3_merkle_v1",
+        "canary calibration requires admin {label} artifact_root_kind blake3_merkle_v1 for {}; catalog has {}",
+        path.display(),
+        artifact_root_kind
+    );
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "canary calibration requires a local {label} file matching the admin catalog: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() == weights_bytes,
+        "local {label} size mismatch for {}; expected admin catalog weights_bytes {}, got {}",
+        path.display(),
+        weights_bytes,
+        metadata.len()
+    );
+    let merkle = build_merkle_manifest(path, DEFAULT_CHUNK_SIZE)
+        .with_context(|| format!("Merkle-verifying {label} {}", path.display()))?;
+    ensure!(
+        merkle.root == artifact_root,
+        "local {label} root mismatch for {}; expected admin catalog artifact_root {}, got {}",
+        path.display(),
+        artifact_root,
+        merkle.root
+    );
+    Ok(())
+}
+
 fn validate_calibration_args_for_artifact(
     artifact: &catalog::CatalogArtifact,
     args: &CatalogCalibrateCanaryArgs,
@@ -11390,6 +12297,256 @@ fn validate_calibration_args_for_artifact(
     Ok(())
 }
 
+fn calibration_memory_context(
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+    args: &CatalogCalibrateCanaryArgs,
+) -> Result<CalibrationMemoryContext> {
+    let disk_path = artifact_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let hardware = probe(ProbeOptions {
+        disk_path,
+        run_disk_bench: false,
+        disk_bench_mib: 1,
+        fixture: None,
+    });
+    let verdict = hardware
+        .backend_verdicts
+        .iter()
+        .find(|verdict| verdict.backend == artifact.engine)
+        .with_context(|| {
+            format!(
+                "hardware probe did not report the {} calibration backend",
+                artifact.engine
+            )
+        })?;
+    let pool = provider_memory_pool(&hardware, verdict, &artifact.engine);
+    let reserve_basis = pool.total_bytes.max(pool.available_bytes);
+    let (reserve_bytes, reserve_source) =
+        provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
+    let f13_budget_bytes = pool.available_bytes.saturating_sub(reserve_bytes);
+    ensure!(
+        f13_budget_bytes > 0,
+        "F13 calibration budget is empty: {} available minus {} reserve",
+        human_bytes(pool.available_bytes),
+        human_bytes(reserve_bytes)
+    );
+
+    let (probe, measurement_source) = if pool.unified || pool.pool == "system_memory" {
+        (CalibrationMemoryProbe::ProcessRss, "process_rss")
+    } else if hardware
+        .gpus
+        .iter()
+        .any(|gpu| gpu.vendor == GpuVendor::Nvidia)
+    {
+        (
+            CalibrationMemoryProbe::NvidiaDevice,
+            "nvidia_smi_device_memory",
+        )
+    } else if hardware.gpus.iter().any(|gpu| gpu.vendor == GpuVendor::Amd) {
+        (CalibrationMemoryProbe::AmdDevice, "rocm_smi_device_memory")
+    } else {
+        bail!(
+            "calibration backend {} uses dedicated accelerator memory, but no supported NVIDIA/AMD memory probe is available",
+            artifact.engine
+        );
+    };
+
+    Ok(CalibrationMemoryContext {
+        f13_budget_bytes,
+        source: format!(
+            "{measurement_source}; pool={}; {}; {}",
+            pool.pool, pool.source, reserve_source
+        ),
+        probe,
+    })
+}
+
+fn calibration_memory_bytes(
+    context: &CalibrationMemoryContext,
+    process_ids: &[u32],
+) -> Result<u64> {
+    match context.probe {
+        CalibrationMemoryProbe::ProcessRss => {
+            let mut total = 0_u64;
+            let mut missing = Vec::new();
+            for pid in process_ids {
+                match provider_process_rss_bytes(*pid) {
+                    Some(bytes) => total = total.saturating_add(bytes),
+                    None => missing.push(*pid),
+                }
+            }
+            ensure!(
+                missing.is_empty(),
+                "failed to read calibration RSS for pid(s) {}",
+                missing
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            ensure!(total > 0, "calibration process RSS probe returned zero");
+            Ok(total)
+        }
+        CalibrationMemoryProbe::NvidiaDevice => calibration_nvidia_memory_bytes(),
+        CalibrationMemoryProbe::AmdDevice => calibration_amd_memory_bytes(),
+    }
+}
+
+fn calibration_nvidia_memory_bytes() -> Result<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .context("running nvidia-smi calibration memory probe")?;
+    ensure!(
+        output.status.success(),
+        "nvidia-smi calibration memory probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut total_mib = 0_f64;
+    let mut count = 0_u64;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let value = line
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("invalid nvidia-smi memory.used value {line:?}"))?;
+        ensure!(
+            value.is_finite() && value >= 0.0,
+            "invalid NVIDIA memory value"
+        );
+        total_mib += value;
+        count = count.saturating_add(1);
+    }
+    ensure!(count > 0, "nvidia-smi reported no GPU memory values");
+    let bytes = (total_mib * 1024.0 * 1024.0).ceil();
+    ensure!(bytes <= u64::MAX as f64, "NVIDIA memory reading overflowed");
+    Ok((bytes as u64).max(1))
+}
+
+fn calibration_amd_memory_bytes() -> Result<u64> {
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--json"])
+        .output()
+        .context("running rocm-smi calibration memory probe")?;
+    ensure!(
+        output.status.success(),
+        "rocm-smi calibration memory probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .context("parsing rocm-smi calibration memory JSON")?;
+    let mut readings = Vec::new();
+    collect_amd_used_vram_bytes(&value, &mut readings);
+    ensure!(
+        !readings.is_empty(),
+        "rocm-smi JSON contained no used VRAM byte readings"
+    );
+    Ok(readings.into_iter().fold(0_u64, u64::saturating_add).max(1))
+}
+
+fn collect_amd_used_vram_bytes(value: &Value, readings: &mut Vec<u64>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let normalized = key.to_ascii_lowercase();
+                if normalized.contains("vram")
+                    && normalized.contains("used")
+                    && normalized.contains("memory")
+                    && !normalized.contains("percent")
+                {
+                    if let Some(bytes) = json_u64_measurement(value) {
+                        readings.push(bytes);
+                        continue;
+                    }
+                }
+                collect_amd_used_vram_bytes(value, readings);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_amd_used_vram_bytes(value, readings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_u64_measurement(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value.as_str().and_then(|value| {
+            value
+                .split_whitespace()
+                .next()
+                .map(|value| value.replace(',', ""))?
+                .parse::<u64>()
+                .ok()
+        })
+    })
+}
+
+fn measure_calibration_memory<T>(
+    context: &CalibrationMemoryContext,
+    process_ids: &[u32],
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, u64, u64)> {
+    let mut process_ids = process_ids.to_vec();
+    process_ids.push(std::process::id());
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    let baseline = calibration_memory_bytes(context, &process_ids)?;
+    ensure!(
+        baseline <= context.f13_budget_bytes,
+        "calibration baseline memory {} exceeds F13 budget {} ({})",
+        human_bytes(baseline),
+        human_bytes(context.f13_budget_bytes),
+        context.source
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU64::new(baseline));
+    let successful_samples = Arc::new(AtomicU64::new(0));
+    let sampler_context = context.clone();
+    let sampler_process_ids = process_ids.clone();
+    let sampler_stop = Arc::clone(&stop);
+    let sampler_peak = Arc::clone(&peak);
+    let sampler_successful_samples = Arc::clone(&successful_samples);
+    let sampler = std::thread::spawn(move || loop {
+        if let Ok(bytes) = calibration_memory_bytes(&sampler_context, &sampler_process_ids) {
+            sampler_peak.fetch_max(bytes, Ordering::AcqRel);
+            sampler_successful_samples.fetch_add(1, Ordering::AcqRel);
+        }
+        if sampler_stop.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    });
+
+    let operation_result = operation();
+    let final_sample = calibration_memory_bytes(context, &process_ids);
+    stop.store(true, Ordering::Release);
+    sampler
+        .join()
+        .map_err(|_| anyhow!("calibration memory sampler panicked"))?;
+    let value = operation_result?;
+    let final_sample = final_sample?;
+    peak.fetch_max(final_sample, Ordering::AcqRel);
+    ensure!(
+        successful_samples.load(Ordering::Acquire) > 0,
+        "calibration memory sampler produced no successful in-flight readings"
+    );
+    let peak = peak.load(Ordering::Acquire);
+    ensure!(
+        peak <= context.f13_budget_bytes,
+        "calibration peak memory {} exceeds F13 budget {} ({})",
+        human_bytes(peak),
+        human_bytes(context.f13_budget_bytes),
+        context.source
+    );
+    Ok((value, baseline, peak))
+}
+
 fn catalog_canary_artifact_binding(
     artifact: &catalog::CatalogArtifact,
 ) -> CatalogCanaryArtifactBinding {
@@ -11405,6 +12562,25 @@ fn catalog_canary_artifact_binding(
         tokenizer_sha256: artifact.tokenizer_sha256.clone(),
         chat_template_sha256: artifact.chat_template_sha256.clone(),
         min_compute_cap: artifact.min_compute_cap.clone(),
+        artifact_sidecars: artifact
+            .sidecars
+            .iter()
+            .map(|(name, sidecar)| {
+                (
+                    name.clone(),
+                    CatalogCanarySidecarBinding {
+                        source_kind: sidecar.source.kind.clone(),
+                        source_repo: sidecar.source.repo.clone(),
+                        source_revision: sidecar.source.revision.clone(),
+                        source_path: sidecar.path.clone(),
+                        artifact_root: sidecar.artifact_root.clone(),
+                        artifact_root_kind: sidecar.artifact_root_kind.clone(),
+                        source_sha256: sidecar.source_sha256.clone(),
+                        weights_bytes: sidecar.weights_bytes,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -11684,6 +12860,7 @@ fn required_launch_output_canary_method(model: &catalog::CatalogModel) -> Option
         return None;
     }
     match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => Some(CANARY_VERIFICATION_TOKEN_FINGERPRINT),
         MODEL_CLASS_EMBEDDING => Some(CANARY_VERIFICATION_EMBEDDING_COSINE),
         MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION => {
             Some(CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH)
@@ -11884,11 +13061,7 @@ fn catalog_canary_evidence_report(
         {
             continue;
         }
-        let canary_check = canary_set_matrix_check(
-            &canaries_dir,
-            &model.canary.set_id,
-            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
-        );
+        let canary_check = canary_set_matrix_check(&canaries_dir, model);
         let canary_set_sha256 = match canary_set_file_sha256(&canaries_dir, &model.canary.set_id) {
             Ok(hash) => Some(hash),
             Err(err) => {
@@ -11917,6 +13090,19 @@ fn catalog_canary_evidence_report(
                 ));
             }
             let expected_fingerprint = existing_catalog_canary_fingerprint(model, artifact_name);
+            let expected_modality_fingerprints = model
+                .modality_assessment
+                .calibrated_fingerprints
+                .get(artifact_name)
+                .cloned();
+            let expected_modality_resource_profiles = Some(
+                model
+                    .modality_assessment
+                    .resource_profiles
+                    .get(artifact_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
                 match expected_fingerprint.as_deref() {
                     Some(value) if is_hex_len(value, 64) => {}
@@ -11927,6 +13113,18 @@ fn catalog_canary_evidence_report(
                         "canary fingerprint missing artifact {artifact_name}"
                     )),
                 }
+                validate_modality_fingerprint_evidence(
+                    model,
+                    artifact_name,
+                    expected_modality_fingerprints.as_ref(),
+                    &mut entry_errors,
+                );
+                validate_modality_resource_profile_evidence(
+                    model,
+                    artifact_name,
+                    expected_modality_resource_profiles.as_ref(),
+                    &mut entry_errors,
+                );
             }
             let expected_token_prefixes = model.canary.token_prefixes.get(artifact_name).cloned();
             let expected_perceptual_hashes =
@@ -11973,6 +13171,8 @@ fn catalog_canary_evidence_report(
                 canary_set_sha256: canary_set_sha256.clone(),
                 prompt_count,
                 expected_fingerprint,
+                expected_modality_fingerprints,
+                expected_modality_resource_profiles,
                 expected_token_prefixes,
                 expected_perceptual_hashes,
                 expected_embedding_vectors,
@@ -11981,6 +13181,8 @@ fn catalog_canary_evidence_report(
                 expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
+                report_modality_fingerprints: None,
+                report_modality_resource_profiles: None,
                 report_token_prefixes: None,
                 report_perceptual_hashes: None,
                 report_embedding_vectors: None,
@@ -11989,6 +13191,8 @@ fn catalog_canary_evidence_report(
                 report_canary_set_sha256: None,
                 report_artifact_binding: None,
                 matches_catalog: None,
+                modality_fingerprints_match_catalog: None,
+                modality_resource_profiles_match_catalog: None,
                 token_prefixes_match_catalog: None,
                 method_values_match_catalog: None,
                 ok: entry_errors.is_empty(),
@@ -12048,6 +13252,9 @@ fn catalog_canary_evidence_report(
 
         entry.report_path = Some(path.clone());
         entry.report_fingerprint = Some(calibration.catalog_fingerprint.clone());
+        entry.report_modality_fingerprints = Some(calibration.modality_fingerprints.clone());
+        entry.report_modality_resource_profiles =
+            Some(calibration.modality_resource_profiles.clone());
         let report_token_prefixes = calibration
             .prompts
             .iter()
@@ -12115,6 +13322,16 @@ fn catalog_canary_evidence_report(
             .as_ref()
             .map(|expected| expected == &calibration.catalog_fingerprint);
         entry.matches_catalog = matches_catalog;
+        let modality_fingerprints_match_catalog = entry
+            .expected_modality_fingerprints
+            .as_ref()
+            .map(|expected| expected == &calibration.modality_fingerprints);
+        entry.modality_fingerprints_match_catalog = modality_fingerprints_match_catalog;
+        let modality_resource_profiles_match_catalog = entry
+            .expected_modality_resource_profiles
+            .as_ref()
+            .map(|expected| expected == &calibration.modality_resource_profiles);
+        entry.modality_resource_profiles_match_catalog = modality_resource_profiles_match_catalog;
         let token_prefixes_match_catalog = entry
             .expected_token_prefixes
             .as_ref()
@@ -12164,6 +13381,19 @@ fn catalog_canary_evidence_report(
                     .to_owned(),
             );
         }
+        let calibration_model = catalog_doc
+            .models
+            .iter()
+            .find(|model| model.model_id == entry.model_id)
+            .expect("evidence entry model comes from catalog");
+        entry.errors.extend(
+            validate_endpoint_calibration_report(
+                &calibration_model.adapter.endpoint_families,
+                &calibration.endpoint_calibration,
+            )
+            .into_iter()
+            .map(|error| format!("endpoint calibration: {error}")),
+        );
         if calibration.prompt_count != calibration.prompts.len() {
             entry.errors.push(format!(
                 "report prompt_count {} does not match {} prompt reports",
@@ -12184,6 +13414,26 @@ fn catalog_canary_evidence_report(
                 .errors
                 .push("report catalog_fingerprint must be 32-byte hex".to_owned());
         }
+        validate_modality_fingerprint_evidence(
+            catalog_doc
+                .models
+                .iter()
+                .find(|model| model.model_id == entry.model_id)
+                .expect("evidence entry model comes from catalog"),
+            &entry.artifact,
+            Some(&calibration.modality_fingerprints),
+            &mut entry.errors,
+        );
+        validate_modality_resource_profile_evidence(
+            catalog_doc
+                .models
+                .iter()
+                .find(|model| model.model_id == entry.model_id)
+                .expect("evidence entry model comes from catalog"),
+            &entry.artifact,
+            Some(&calibration.modality_resource_profiles),
+            &mut entry.errors,
+        );
         if !is_hex_len(&calibration.canary_set_sha256, 64) {
             entry
                 .errors
@@ -12219,6 +13469,21 @@ fn catalog_canary_evidence_report(
                 calibration.catalog_fingerprint,
                 entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
             ));
+        }
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && modality_fingerprints_match_catalog != Some(true)
+        {
+            entry.errors.push(
+                "report modality fingerprints do not match catalog modality evidence".to_owned(),
+            );
+        }
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && modality_resource_profiles_match_catalog != Some(true)
+        {
+            entry.errors.push(
+                "report modality resource profiles do not match catalog calibration evidence"
+                    .to_owned(),
+            );
         }
         let mut prompt_ids = BTreeSet::new();
         for prompt in &calibration.prompts {
@@ -12347,6 +13612,104 @@ fn validate_expected_canary_method_values(
             )),
         },
         _ => {}
+    }
+}
+
+fn validate_modality_fingerprint_evidence(
+    model: &catalog::CatalogModel,
+    artifact: &str,
+    fingerprints: Option<&BTreeMap<String, String>>,
+    errors: &mut Vec<String>,
+) {
+    let Some(fingerprints) = fingerprints else {
+        errors.push(format!(
+            "modality calibration fingerprints missing artifact {artifact}"
+        ));
+        return;
+    };
+    for modality in &model.adapter.modality_set {
+        match fingerprints.get(modality) {
+            Some(value) if is_hex_len(value, 64) => {}
+            Some(_) => errors.push(format!(
+                "modality calibration fingerprint for {artifact}/{modality} must be 32-byte hex"
+            )),
+            None => errors.push(format!(
+                "modality calibration fingerprints for {artifact} missing served modality {modality}"
+            )),
+        }
+    }
+    for modality in fingerprints.keys() {
+        if !model.adapter.modality_set.contains(modality) {
+            errors.push(format!(
+                "modality calibration fingerprints for {artifact} reference disabled modality {modality}"
+            ));
+        }
+    }
+}
+
+fn validate_modality_resource_profile_evidence(
+    model: &catalog::CatalogModel,
+    artifact: &str,
+    profiles: Option<&BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
+    errors: &mut Vec<String>,
+) {
+    let non_text_modalities = model
+        .adapter
+        .modality_set
+        .iter()
+        .map(String::as_str)
+        .filter(|modality| *modality != "text")
+        .collect::<BTreeSet<_>>();
+    let Some(profiles) = profiles else {
+        if !non_text_modalities.is_empty() {
+            errors.push(format!(
+                "modality resource profiles missing artifact {artifact}"
+            ));
+        }
+        return;
+    };
+    for modality in &non_text_modalities {
+        let Some(profile) = profiles.get(*modality) else {
+            errors.push(format!(
+                "modality resource profiles for {artifact} missing served modality {modality}"
+            ));
+            continue;
+        };
+        let expected_unit = match *modality {
+            "image" => "pixel",
+            "audio" => "second",
+            "video" => "frame",
+            "embedding" => "input_token",
+            _ => "",
+        };
+        if profile.unit != expected_unit {
+            errors.push(format!(
+                "modality resource profile for {artifact}/{modality} unit must be {expected_unit}"
+            ));
+        }
+        if profile.measurement_source.trim().is_empty()
+            || profile.max_item_bytes == 0
+            || profile.max_item_units == 0
+            || profile.measured_item_bytes != profile.max_item_bytes
+            || profile.measured_item_units != profile.max_item_units
+            || profile.measured_working_set_bytes == 0
+            || profile.calibration_baseline_memory_bytes == 0
+            || profile.calibration_peak_memory_bytes < profile.calibration_baseline_memory_bytes
+            || profile.calibration_peak_memory_bytes > profile.calibration_f13_budget_bytes
+            || profile.default_max_inflight_items != 1
+            || profile.default_max_items_per_request != 1
+        {
+            errors.push(format!(
+                "modality resource profile for {artifact}/{modality} is not a valid one-item F13 calibration"
+            ));
+        }
+    }
+    for modality in profiles.keys() {
+        if !non_text_modalities.contains(modality.as_str()) {
+            errors.push(format!(
+                "modality resource profiles for {artifact} reference disabled or text modality {modality}"
+            ));
+        }
     }
 }
 
@@ -12535,6 +13898,57 @@ fn apply_canary_report_fingerprints(
             }
             other => bail!("cannot apply unsupported canary verification_method {other}"),
         }
+        let modality_fingerprints =
+            entry
+                .report_modality_fingerprints
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "calibration report for {} / {} has no modality fingerprints",
+                        entry.model_id, entry.artifact
+                    )
+                })?;
+        let assessment = model
+            .get_mut("modality_assessment")
+            .and_then(Value::as_object_mut)
+            .with_context(|| {
+                format!("model {} has no modality_assessment object", entry.model_id)
+            })?;
+        let calibrated = assessment
+            .entry("calibrated_fingerprints")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} modality_assessment.calibrated_fingerprints is not an object",
+                    entry.model_id
+                )
+            })?;
+        calibrated.insert(entry.artifact.clone(), json!(modality_fingerprints));
+        let modality_resource_profiles = entry
+            .report_modality_resource_profiles
+            .as_ref()
+            .with_context(|| {
+                format!(
+                    "calibration report for {} / {} has no modality resource profiles",
+                    entry.model_id, entry.artifact
+                )
+            })?;
+        let resources = assessment
+            .entry("resource_profiles")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} modality_assessment.resource_profiles is not an object",
+                    entry.model_id
+                )
+            })?;
+        if modality_resource_profiles.is_empty() {
+            resources.remove(&entry.artifact);
+        } else {
+            resources.insert(entry.artifact.clone(), json!(modality_resource_profiles));
+        }
         applied += 1;
     }
     Ok(applied)
@@ -12588,6 +14002,7 @@ struct CatalogCanaryCalibrationPlanInput<'a> {
     model: &'a catalog::CatalogModel,
     artifact_name: &'a str,
     artifact: &'a catalog::CatalogArtifact,
+    artifact_base: &'a Path,
     artifact_path: &'a Path,
     report_path: &'a Path,
     trt_engine_dir: Option<&'a Path>,
@@ -12620,11 +14035,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         {
             continue;
         }
-        let canary_check = canary_set_matrix_check(
-            &canaries_dir,
-            &model.canary.set_id,
-            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
-        );
+        let canary_check = canary_set_matrix_check(&canaries_dir, model);
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Some(required_method) = required_output_method {
@@ -12674,6 +14085,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                     model,
                     artifact_name,
                     artifact,
+                    artifact_base: &artifact_base,
                     artifact_path: &artifact_path,
                     report_path: &report_path,
                     trt_engine_dir: trt_engine_dir.as_deref(),
@@ -12768,6 +14180,7 @@ fn catalog_canary_calibration_plan_command(
         model,
         artifact_name,
         artifact,
+        artifact_base,
         artifact_path,
         report_path,
         trt_engine_dir,
@@ -12783,6 +14196,10 @@ fn catalog_canary_calibration_plan_command(
     push_plan_value_arg(&mut argv, "--model", &model.model_id);
     push_plan_value_arg(&mut argv, "--artifact", artifact_name);
     push_plan_path_arg(&mut argv, "--artifact-path", artifact_path);
+    if let Some(sidecar) = artifact.sidecars.get("mmproj") {
+        let path = catalog_canary_plan_sidecar_path(artifact_base, sidecar);
+        push_plan_path_arg(&mut argv, "--vision-projector-path", &path);
+    }
     push_plan_value_arg(&mut argv, "--ctx-size", args.ctx_size.max(1).to_string());
     push_plan_value_arg(&mut argv, "--seed", args.seed.to_string());
     if let Some(threads) = args.threads {
@@ -12790,6 +14207,9 @@ fn catalog_canary_calibration_plan_command(
     }
     if let Some(gpu_layers) = args.gpu_layers {
         push_plan_value_arg(&mut argv, "--gpu-layers", gpu_layers.to_string());
+    }
+    if let Some(memory_reserve) = &args.memory_reserve {
+        push_plan_value_arg(&mut argv, "--memory-reserve", memory_reserve);
     }
     if artifact.engine == "trt-llm" {
         if let Some(trt_engine_dir) = trt_engine_dir {
@@ -12833,6 +14253,17 @@ fn catalog_canary_plan_artifact_path(
         .join(safe_path_component(&artifact.source.repo))
         .join(safe_path_component(&artifact.source.revision))
         .join(&artifact.path)
+}
+
+fn catalog_canary_plan_sidecar_path(
+    artifact_base: &Path,
+    sidecar: &catalog::CatalogArtifactSidecar,
+) -> PathBuf {
+    artifact_base
+        .join(safe_path_component(&sidecar.source.kind))
+        .join(safe_path_component(&sidecar.source.repo))
+        .join(safe_path_component(&sidecar.source.revision))
+        .join(&sidecar.path)
 }
 
 fn catalog_canary_plan_apply_command(
@@ -12934,11 +14365,7 @@ fn catalog_canary_matrix_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(
-            &canaries_dir,
-            &model.canary.set_id,
-            model.canary.verification_method.as_str() == "token_fingerprint",
-        );
+        let canary_check = canary_set_matrix_check(&canaries_dir, model);
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
@@ -12954,6 +14381,26 @@ fn catalog_canary_matrix_report(
             let mut embedding_vector_count = None;
             let mut transcript_count = None;
             let mut audio_fingerprint_count = None;
+            let modality_fingerprints = model
+                .modality_assessment
+                .calibrated_fingerprints
+                .get(artifact_name);
+            let modality_resource_profiles = model
+                .modality_assessment
+                .resource_profiles
+                .get(artifact_name);
+            validate_modality_fingerprint_evidence(
+                model,
+                artifact_name,
+                modality_fingerprints,
+                &mut entry_errors,
+            );
+            validate_modality_resource_profile_evidence(
+                model,
+                artifact_name,
+                modality_resource_profiles,
+                &mut entry_errors,
+            );
             if let Some(required_method) = required_launch_output_canary_method(model) {
                 if model.canary.verification_method != required_method {
                     entry_errors.push(format!(
@@ -13134,6 +14581,8 @@ fn catalog_canary_matrix_report(
                 embedding_vector_count,
                 transcript_count,
                 audio_fingerprint_count,
+                modality_fingerprint_count: modality_fingerprints.map(BTreeMap::len),
+                modality_resource_profile_count: modality_resource_profiles.map(BTreeMap::len),
                 calibration_status,
                 ok,
                 errors: entry_errors,
@@ -13173,6 +14622,7 @@ fn catalog_canary_matrix_report(
     }
 }
 
+#[derive(Debug)]
 struct CanarySetMatrixInfo {
     prompt_count: usize,
     prompt_ids: Vec<String>,
@@ -13180,16 +14630,18 @@ struct CanarySetMatrixInfo {
 
 fn canary_set_matrix_check(
     canaries_dir: &Path,
-    set_id: &str,
-    require_messages: bool,
+    model: &catalog::CatalogModel,
 ) -> std::result::Result<CanarySetMatrixInfo, String> {
+    let set_id = &model.canary.set_id;
+    let require_messages =
+        model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT;
     let path = canaries_dir.join(format!("{set_id}.json"));
     let doc: CanarySetDocument = serde_json::from_value(
         read_json_file(&path)
             .map_err(|err| format!("reading canary set {}: {err}", path.display()))?,
     )
     .map_err(|err| format!("parsing canary set {}: {err}", path.display()))?;
-    if doc.set_id != set_id {
+    if doc.set_id != set_id.as_str() {
         return Err(format!(
             "canary file {} declares set {}",
             path.display(),
@@ -13200,25 +14652,143 @@ fn canary_set_matrix_check(
         return Err(format!("canary set {set_id} has no prompts"));
     }
     let mut prompt_ids = Vec::with_capacity(doc.prompts.len());
-    for prompt in doc.prompts {
+    for prompt in &doc.prompts {
         if prompt.id.trim().is_empty() {
             return Err(format!("canary set {set_id} has an empty prompt id"));
         }
         if require_messages && prompt.messages.is_empty() {
             return Err(format!("canary prompt {} has no messages", prompt.id));
         }
-        if prompt.temperature.unwrap_or(0.0).abs() > f64::EPSILON {
+        if prompt
+            .temperature
+            .is_some_and(|temperature| temperature > 0.0)
+            && prompt.seed.is_none()
+        {
             return Err(format!(
-                "canary prompt {} in {set_id} must use temperature 0",
+                "canary prompt {} in {set_id} must pin seed when temperature is non-zero",
                 prompt.id
             ));
         }
-        prompt_ids.push(prompt.id);
+        if let Some(repeat_penalty) = prompt.repeat_penalty {
+            match model.sampling.repeat_penalty {
+                Some(expected) if sampling_float_eq(repeat_penalty, expected) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "canary prompt {} in {set_id} repeat_penalty must match the signed model profile",
+                        prompt.id
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "canary prompt {} in {set_id} sets server-controlled repeat_penalty but the signed model profile does not",
+                        prompt.id
+                    ));
+                }
+            }
+        }
+        prompt_ids.push(prompt.id.clone());
+    }
+    if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
+        validate_canary_sampling_range(model, &doc.prompts)?;
     }
     Ok(CanarySetMatrixInfo {
         prompt_count: prompt_ids.len(),
         prompt_ids,
     })
+}
+
+fn sampling_float_eq(left: f64, right: f64) -> bool {
+    (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0)
+}
+
+fn canary_prompt_uses_model_sampling_defaults(
+    prompt: &CanaryPrompt,
+    defaults: &catalog::CatalogSamplingProfile,
+) -> bool {
+    prompt.temperature.is_none_or(|value| {
+        defaults
+            .temperature
+            .is_some_and(|default| sampling_float_eq(value, default))
+    }) && prompt.top_p.is_none_or(|value| {
+        defaults
+            .top_p
+            .is_some_and(|default| sampling_float_eq(value, default))
+    }) && prompt
+        .top_k
+        .is_none_or(|value| defaults.top_k == Some(value))
+        && prompt.min_p.is_none_or(|value| {
+            defaults
+                .min_p
+                .is_some_and(|default| sampling_float_eq(value, default))
+        })
+        && prompt.repeat_penalty.is_none_or(|value| {
+            defaults
+                .repeat_penalty
+                .is_some_and(|default| sampling_float_eq(value, default))
+        })
+}
+
+fn validate_canary_sampling_range(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> std::result::Result<(), String> {
+    let set_id = &model.canary.set_id;
+    let defaults = &model.sampling;
+    if !prompts
+        .iter()
+        .any(|prompt| canary_prompt_uses_model_sampling_defaults(prompt, defaults))
+    {
+        return Err(format!(
+            "canary set {set_id} has no probe at the signed model sampling defaults"
+        ));
+    }
+
+    if let Some(default_temperature) = defaults.temperature.filter(|value| *value > 0.0) {
+        let temperatures = prompts
+            .iter()
+            .map(|prompt| prompt.temperature.unwrap_or(default_temperature))
+            .collect::<Vec<_>>();
+        let distinct = temperatures
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<BTreeSet<_>>();
+        if distinct.len() < 3
+            || !temperatures
+                .iter()
+                .any(|value| *value < default_temperature)
+            || !temperatures
+                .iter()
+                .any(|value| *value > default_temperature)
+        {
+            return Err(format!(
+                "canary set {set_id} must span at least three temperatures below, at, and above the signed default {default_temperature}"
+            ));
+        }
+    }
+
+    let top_k_override = prompts.iter().any(|prompt| {
+        prompt
+            .top_k
+            .is_some_and(|value| defaults.top_k != Some(value))
+    });
+    if !top_k_override {
+        return Err(format!(
+            "canary set {set_id} must include a client-set top_k probe distinct from the model default"
+        ));
+    }
+    let min_p_override = prompts.iter().any(|prompt| {
+        prompt.min_p.is_some_and(|value| {
+            defaults
+                .min_p
+                .is_none_or(|default| !sampling_float_eq(value, default))
+        })
+    });
+    if !min_p_override {
+        return Err(format!(
+            "canary set {set_id} must include a client-set min_p probe distinct from the model default"
+        ));
+    }
+    Ok(())
 }
 
 fn canary_set_file_sha256(
@@ -13231,6 +14801,7 @@ fn canary_set_file_sha256(
 fn catalog_calibration_backend(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
+    vision_projector_path: Option<&Path>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
     let mut config = match artifact.engine.as_str() {
@@ -13258,6 +14829,14 @@ fn catalog_calibration_backend(
     }
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
+    }
+    if let Some(path) = vision_projector_path {
+        let sidecar = artifact
+            .sidecars
+            .get("mmproj")
+            .context("verified vision projector is missing its catalog sidecar")?;
+        config.vision_projector =
+            Some(ModelArtifact::gguf(path).with_sha256(sidecar.source_sha256.clone()));
     }
 
     match artifact.engine.as_str() {
@@ -13367,9 +14946,13 @@ fn calibrate_token_canary_prompt(
     include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
     let body = canary_probe_request(&model.model_id, prompt);
-    let mut request = provider_engine_request_from_body(&body, &model.adapter)?;
-    request.temperature = Some(prompt.temperature.unwrap_or(0.0) as f32);
-    request.seed = Some(seed);
+    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        &body,
+        &model.adapter,
+        &model.sampling,
+    )?;
+    request.seed = Some(prompt.seed.unwrap_or(seed));
     let max_tokens = request.max_new_tokens;
     let mut token_ids = Vec::new();
     let output = backend
@@ -13394,6 +14977,9 @@ fn calibrate_token_canary_prompt(
         embedding_vector: None,
         transcript: None,
         audio_fingerprint: None,
+        resource_items: calibration_chat_resource_items(&body)?,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
         output_text: include_output.then_some(output.text),
     })
 }
@@ -13402,30 +14988,25 @@ fn calibrate_image_perceptual_hash_prompt(
     backend: &mut dyn EngineBackend,
     prompt: &CanaryPrompt,
     seed: u32,
-    include_output: bool,
+    _include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
-    let mut request = GenerateRequest::new(canary_prompt_text(prompt)?);
-    request.temperature = Some(prompt.temperature.unwrap_or(0.0) as f32);
+    let mut request = EngineImageGenerationRequest::new(canary_prompt_text(prompt)?);
     request.seed = Some(prompt.seed.unwrap_or(seed));
-    request.artifact_count = Some(1);
-    if let Some(max_tokens) = prompt.max_tokens {
-        request.max_new_tokens = max_tokens.max(1);
-    }
+    request.image_count = 1;
     if let Some((width, height)) = prompt
         .size
         .as_deref()
         .map(parse_canary_image_size)
         .transpose()?
     {
-        request.width = Some(width);
-        request.height = Some(height);
+        request.width = width;
+        request.height = height;
     }
-    request.steps = Some(prompt.steps.unwrap_or(1).max(1));
-    request.cfg_scale = prompt.cfg_scale.or(Some(1.0));
+    request.steps = prompt.steps.unwrap_or(1).max(1);
+    request.guidance_scale = prompt.cfg_scale.unwrap_or(1.0);
     let mut artifacts = Vec::new();
-    let mut token_sink = NoopTokenSink;
-    let output = backend
-        .generate_with_artifacts(request, &mut token_sink, &mut |chunk: ArtifactChunk| {
+    backend
+        .generate_image(request, &mut |chunk: ArtifactChunk| {
             artifacts.push(chunk);
             Ok(())
         })
@@ -13442,11 +15023,25 @@ fn calibrate_image_perceptual_hash_prompt(
             )
         })?;
     let perceptual_hash = image_average_hash_hex(&artifact.bytes).map_err(anyhow::Error::msg)?;
+    let (width, height) = ImageReader::new(io::Cursor::new(&artifact.bytes))
+        .with_guessed_format()
+        .context("image canary output format is invalid")?
+        .into_dimensions()
+        .context("image canary output cannot be decoded")?;
+    let resource_items = BTreeMap::from([(
+        "image".to_owned(),
+        CanaryCalibrationResourceItem {
+            unit: "pixel".to_owned(),
+            item_count: 1,
+            item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX),
+            item_units: u64::from(width).saturating_mul(u64::from(height)),
+        },
+    )]);
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
-        prompt_tokens: output.usage.prompt_tokens,
-        completion_tokens: output.usage.completion_tokens,
+        prompt_tokens: 0,
+        completion_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
         fingerprint: perceptual_hash.clone(),
@@ -13454,7 +15049,10 @@ fn calibrate_image_perceptual_hash_prompt(
         embedding_vector: None,
         transcript: None,
         audio_fingerprint: None,
-        output_text: include_output.then_some(output.text),
+        resource_items,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
+        output_text: None,
     })
 }
 
@@ -13463,6 +15061,7 @@ fn calibrate_embedding_cosine_prompt(
     prompt: &CanaryPrompt,
 ) -> Result<CanaryCalibrationPromptReport> {
     let input = canary_prompt_text(prompt)?;
+    let input_bytes = u64::try_from(input.len()).unwrap_or(u64::MAX);
     let output = backend
         .embed(mayhem_engine::EmbeddingRequest::new(input))
         .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
@@ -13478,6 +15077,15 @@ fn calibrate_embedding_cosine_prompt(
         );
     }
     let fingerprint = embedding_vector_fingerprint(&vector);
+    let resource_items = BTreeMap::from([(
+        "embedding".to_owned(),
+        CanaryCalibrationResourceItem {
+            unit: "input_token".to_owned(),
+            item_count: 1,
+            item_bytes: input_bytes,
+            item_units: u64::from(output.usage.prompt_tokens.max(1)),
+        },
+    )]);
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
@@ -13490,6 +15098,9 @@ fn calibrate_embedding_cosine_prompt(
         embedding_vector: Some(vector),
         transcript: None,
         audio_fingerprint: None,
+        resource_items,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
         output_text: None,
     })
 }
@@ -13500,6 +15111,8 @@ fn calibrate_transcript_match_prompt(
     include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
     let request = canary_audio_transcription_request(prompt)?;
+    let audio_bytes = u64::try_from(request.audio.len()).unwrap_or(u64::MAX);
+    let measured_audio_seconds = wav_duration_seconds_ceil(&request.audio).unwrap_or(1);
     let output = backend
         .transcribe(request)
         .with_context(|| format!("transcribing canary prompt {}", prompt.id))?;
@@ -13511,6 +15124,15 @@ fn calibrate_transcript_match_prompt(
     }
     let normalized = normalize_canary_transcript(&output.text);
     let fingerprint = blake3_bytes_hex(normalized.as_bytes());
+    let resource_items = BTreeMap::from([(
+        "audio".to_owned(),
+        CanaryCalibrationResourceItem {
+            unit: "second".to_owned(),
+            item_count: 1,
+            item_bytes: audio_bytes,
+            item_units: output.audio_seconds.max(measured_audio_seconds).max(1),
+        },
+    )]);
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
@@ -13523,6 +15145,9 @@ fn calibrate_transcript_match_prompt(
         embedding_vector: None,
         transcript: Some(output.text.clone()),
         audio_fingerprint: None,
+        resource_items,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
         output_text: include_output.then_some(output.text),
     })
 }
@@ -13543,7 +15168,7 @@ fn calibrate_audio_fingerprint_prompt(
         speed: None,
     };
     let mut artifacts = Vec::new();
-    backend
+    let speech = backend
         .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
             artifacts.push(chunk);
             Ok(())
@@ -13556,6 +15181,15 @@ fn calibrate_audio_fingerprint_prompt(
         .or_else(|| artifacts.first())
         .with_context(|| format!("TTS canary prompt {} produced no audio artifact", prompt.id))?;
     let fingerprint = audio_fingerprint(&artifact.bytes);
+    let resource_items = BTreeMap::from([(
+        "audio".to_owned(),
+        CanaryCalibrationResourceItem {
+            unit: "second".to_owned(),
+            item_count: 1,
+            item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX),
+            item_units: speech.audio_seconds.max(1),
+        },
+    )]);
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
@@ -13568,6 +15202,9 @@ fn calibrate_audio_fingerprint_prompt(
         embedding_vector: None,
         transcript: None,
         audio_fingerprint: Some(fingerprint),
+        resource_items,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
         output_text: None,
     })
 }
@@ -13596,6 +15233,153 @@ fn canary_messages_text(messages: &[Value]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn calibration_chat_resource_items(
+    body: &Value,
+) -> Result<BTreeMap<String, CanaryCalibrationResourceItem>> {
+    let mut resources = BTreeMap::new();
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for part in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match part.get("type").and_then(Value::as_str) {
+                Some("image_url") => {
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .or_else(|| part.get("url"))
+                        .and_then(Value::as_str)
+                        .context("calibration image_url is missing image_url.url")?;
+                    let (content_type, bytes) = calibration_data_url(url)?;
+                    ensure!(
+                        matches!(content_type.as_str(), "image/png" | "image/jpeg"),
+                        "calibration image must be a PNG or JPEG data URL"
+                    );
+                    let (width, height) = ImageReader::new(io::Cursor::new(&bytes))
+                        .with_guessed_format()
+                        .context("calibration image format is invalid")?
+                        .into_dimensions()
+                        .context("calibration image cannot be decoded")?;
+                    add_calibration_resource_item(
+                        &mut resources,
+                        "image",
+                        "pixel",
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        u64::from(width).saturating_mul(u64::from(height)),
+                    )?;
+                }
+                Some("input_audio") => {
+                    let audio = part
+                        .get("input_audio")
+                        .context("calibration input_audio is missing input_audio")?;
+                    let encoded = audio
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .context("calibration input_audio.data is required")?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .context("calibration input_audio.data is invalid base64")?;
+                    let seconds = wav_duration_seconds_ceil(&bytes)
+                        .context("calibration input_audio is not a valid WAV")?;
+                    add_calibration_resource_item(
+                        &mut resources,
+                        "audio",
+                        "second",
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        seconds,
+                    )?;
+                }
+                Some("video") | Some("video_url") | Some("input_video") => {
+                    let video = part
+                        .get("video")
+                        .or_else(|| part.get("video_url"))
+                        .or_else(|| part.get("input_video"))
+                        .unwrap_or(part);
+                    let encoded = video
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .context("calibration video input requires inline base64 data")?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .context("calibration video data is invalid base64")?;
+                    let frames = video
+                        .get("frames")
+                        .or_else(|| part.get("frames"))
+                        .and_then(Value::as_u64)
+                        .filter(|frames| *frames > 0)
+                        .context("calibration video input requires a positive frames count")?;
+                    add_calibration_resource_item(
+                        &mut resources,
+                        "video",
+                        "frame",
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        frames,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(resources)
+}
+
+fn calibration_data_url(url: &str) -> Result<(String, Vec<u8>)> {
+    let rest = url
+        .strip_prefix("data:")
+        .context("calibration media must be an inline data URL")?;
+    let (metadata, encoded) = rest
+        .split_once(',')
+        .context("calibration media data URL is malformed")?;
+    let mut metadata = metadata.split(';');
+    let content_type = metadata.next().unwrap_or_default().to_ascii_lowercase();
+    ensure!(
+        metadata.any(|entry| entry.eq_ignore_ascii_case("base64")),
+        "calibration media data URL must be base64"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("calibration media data URL contains invalid base64")?;
+    ensure!(!bytes.is_empty(), "calibration media item is empty");
+    Ok((content_type, bytes))
+}
+
+fn add_calibration_resource_item(
+    resources: &mut BTreeMap<String, CanaryCalibrationResourceItem>,
+    modality: &str,
+    unit: &str,
+    item_bytes: u64,
+    item_units: u64,
+) -> Result<()> {
+    ensure!(
+        item_bytes > 0 && item_units > 0,
+        "calibration {modality} item must have positive bytes and {unit}s"
+    );
+    let resource =
+        resources
+            .entry(modality.to_owned())
+            .or_insert_with(|| CanaryCalibrationResourceItem {
+                unit: unit.to_owned(),
+                item_count: 0,
+                item_bytes: 0,
+                item_units: 0,
+            });
+    ensure!(
+        resource.unit == unit,
+        "calibration {modality} resource unit changed within one request"
+    );
+    resource.item_count = resource.item_count.saturating_add(1);
+    resource.item_bytes = resource.item_bytes.max(item_bytes);
+    resource.item_units = resource.item_units.max(item_units);
+    Ok(())
 }
 
 fn parse_canary_image_size(value: &str) -> Result<(u32, u32)> {
@@ -13647,6 +15431,12 @@ fn canary_token_fingerprint(tokens: impl IntoIterator<Item = i32>) -> String {
 }
 
 fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> String {
+    aggregate_canary_fingerprint_refs(prompts.iter())
+}
+
+fn aggregate_canary_fingerprint_refs<'a>(
+    prompts: impl IntoIterator<Item = &'a CanaryCalibrationPromptReport>,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     for prompt in prompts {
         let prompt_id = prompt.prompt_id.as_bytes();
@@ -13655,6 +15445,157 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
         hasher.update(prompt.fingerprint.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn aggregate_calibrated_modality_fingerprints(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+    reports: &[CanaryCalibrationPromptReport],
+) -> Result<BTreeMap<String, String>> {
+    ensure!(
+        prompts.len() == reports.len(),
+        "calibration prompt/report cardinality mismatch"
+    );
+    for (prompt, report) in prompts.iter().zip(reports) {
+        ensure!(
+            prompt.id == report.prompt_id,
+            "calibration prompt/report order mismatch for {} and {}",
+            prompt.id,
+            report.prompt_id
+        );
+    }
+    let mut fingerprints = BTreeMap::new();
+    for modality in &model.adapter.modality_set {
+        let selected = prompts
+            .iter()
+            .zip(reports)
+            .filter_map(|(prompt, report)| {
+                provider_canary_prompt_modalities(model, prompt)
+                    .contains(modality)
+                    .then_some(report)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            !selected.is_empty(),
+            "served modality {modality} has no calibration prompt in canary set {}",
+            model.canary.set_id
+        );
+        fingerprints.insert(
+            modality.clone(),
+            aggregate_canary_fingerprint_refs(selected.into_iter()),
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn aggregate_calibrated_modality_resource_profiles(
+    model: &catalog::CatalogModel,
+    reports: &[CanaryCalibrationPromptReport],
+    memory: &CalibrationMemoryContext,
+) -> Result<BTreeMap<String, catalog::CatalogModalityResourceProfile>> {
+    let mut profiles = BTreeMap::new();
+    for modality in model
+        .adapter
+        .modality_set
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+    {
+        let mut candidates = reports
+            .iter()
+            .filter_map(|report| {
+                report
+                    .resource_items
+                    .get(modality)
+                    .map(|resource| (report, resource))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            !candidates.is_empty(),
+            "served modality {modality} has no one-item resource calibration in canary set {}",
+            model.canary.set_id
+        );
+        for (report, resource) in &candidates {
+            ensure!(
+                report.resource_items.len() == 1,
+                "calibration prompt {} combines non-text modalities; use an isolated one-item prompt so memory can be attributed to {modality}",
+                report.prompt_id
+            );
+            ensure!(
+                resource.item_count == 1,
+                "calibration prompt {} must contain exactly one {modality} item, got {}",
+                report.prompt_id,
+                resource.item_count
+            );
+            ensure!(
+                report.calibration_baseline_memory_bytes > 0
+                    && report.calibration_peak_memory_bytes
+                        >= report.calibration_baseline_memory_bytes,
+                "calibration prompt {} has invalid memory measurements",
+                report.prompt_id
+            );
+            ensure!(
+                report.calibration_peak_memory_bytes <= memory.f13_budget_bytes,
+                "calibration prompt {} peak memory exceeds its F13 budget",
+                report.prompt_id
+            );
+        }
+        candidates.sort_by_key(|(_, resource)| (resource.item_units, resource.item_bytes));
+        let (report, resource) = candidates
+            .pop()
+            .expect("non-empty resource calibration candidates");
+        let observed_delta = report
+            .calibration_peak_memory_bytes
+            .saturating_sub(report.calibration_baseline_memory_bytes);
+        let decoded_floor = calibration_resource_working_set_floor(modality, resource);
+        let measured_working_set_bytes = observed_delta.max(decoded_floor).max(1);
+        ensure!(
+            report
+                .calibration_baseline_memory_bytes
+                .saturating_add(measured_working_set_bytes)
+                <= memory.f13_budget_bytes,
+            "calibration prompt {} decoded {modality} working set does not fit its F13 budget",
+            report.prompt_id
+        );
+        profiles.insert(
+            modality.clone(),
+            catalog::CatalogModalityResourceProfile {
+                unit: resource.unit.clone(),
+                measurement_source: memory.source.clone(),
+                max_item_bytes: resource.item_bytes,
+                max_item_units: resource.item_units,
+                measured_item_bytes: resource.item_bytes,
+                measured_item_units: resource.item_units,
+                measured_working_set_bytes,
+                calibration_baseline_memory_bytes: report.calibration_baseline_memory_bytes,
+                calibration_peak_memory_bytes: report.calibration_peak_memory_bytes,
+                calibration_f13_budget_bytes: memory.f13_budget_bytes,
+                default_max_inflight_items: 1,
+                default_max_items_per_request: 1,
+            },
+        );
+    }
+    Ok(profiles)
+}
+
+fn calibration_resource_working_set_floor(
+    modality: &str,
+    resource: &CanaryCalibrationResourceItem,
+) -> u64 {
+    match modality {
+        // RGB float32 is the smallest honest decoded tensor floor for an image.
+        "image" => resource.item_units.saturating_mul(3).saturating_mul(4),
+        // 48 kHz mono float32 is a conservative decoded audio floor per second.
+        "audio" => resource.item_units.saturating_mul(48_000).saturating_mul(4),
+        // One 224x224 RGB float32 tensor per decoded frame is the minimum honest video floor.
+        "video" => resource
+            .item_units
+            .saturating_mul(224)
+            .saturating_mul(224)
+            .saturating_mul(3)
+            .saturating_mul(4),
+        _ => resource.item_bytes,
+    }
+    .max(resource.item_bytes)
 }
 
 fn existing_catalog_canary_fingerprint(
@@ -20423,6 +22364,7 @@ struct UpPlan {
     provider_workers: Vec<UpProviderWorker>,
     provider_auto_fit: bool,
     provider_gpu_layers: Option<u32>,
+    provider_disable_modalities: Vec<String>,
     provider_hardware_quote_kind: Option<String>,
     provider_hardware_quote_command: Option<PathBuf>,
     provider_hardware_quote_timeout_seconds: u64,
@@ -20831,6 +22773,7 @@ fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
         disk_path: None,
         skip_disk_bench: false,
         ctx: None,
+        disable_modalities: plan.provider_disable_modalities.clone(),
         memory_reserve: None,
         json: true,
         dev_skip_catalog_verify: false,
@@ -20940,6 +22883,7 @@ async fn up_add_selected_provider_workers(
             &candidate.enclave.enclave_id,
             plan.provider_gpu_layers,
             Some(candidate.served_ctx),
+            &candidate.served_modalities,
             worker_name,
         )?;
         let response = post_gateway_json(
@@ -21019,6 +22963,9 @@ fn resolve_up_provider_workers(args: &UpArgs) -> Result<Vec<UpProviderWorker>> {
         }
         if args.provider_gpu_layers.is_some() {
             bail!("--provider-gpu-layers requires --provider");
+        }
+        if !args.provider_disable_modalities.is_empty() {
+            bail!("--provider-disable-modality requires --provider");
         }
         return Ok(Vec::new());
     }
@@ -21101,6 +23048,10 @@ fn up_provider_worker_slug(value: &str) -> String {
 
 async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let provider_workers = resolve_up_provider_workers(args)?;
+    let provider_disable_modalities =
+        normalized_provider_disabled_modalities(&args.provider_disable_modalities)?
+            .into_iter()
+            .collect::<Vec<_>>();
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -21309,6 +23260,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         provider_workers,
         provider_auto_fit: args.auto_fit,
         provider_gpu_layers: args.provider_gpu_layers,
+        provider_disable_modalities,
         provider_hardware_quote_kind: args.provider_hardware_quote_kind.clone(),
         provider_hardware_quote_command,
         provider_hardware_quote_timeout_seconds: args.provider_hardware_quote_timeout_seconds,
@@ -21796,6 +23748,9 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             }
             if let Some(gpu_layers) = plan.provider_gpu_layers {
                 provider_args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
+            }
+            for modality in &plan.provider_disable_modalities {
+                provider_args.extend(["--disable-modality".to_owned(), modality.clone()]);
             }
             if let (Some(kind), Some(command)) = (
                 plan.provider_hardware_quote_kind.as_ref(),
@@ -23156,6 +25111,12 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             args.dev_catalog_path.clone()
         {
             let catalog_path = absolutize(dev_catalog_path)?;
+            let canaries_dir = args
+                .dev_canaries_dir
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+            let canaries_dir = absolutize(canaries_dir)?;
             let catalog_hash = if args.dev_skip_catalog_verify {
                 blake3_file_hex(&catalog_path)?
             } else {
@@ -23171,17 +25132,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     .map(Ok)
                     .unwrap_or_else(|| repo_path("catalog/keys"))?;
                 let keys_dir = absolutize(keys_dir)?;
-                let canaries_dir = args
-                    .dev_canaries_dir
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(|| repo_path("catalog/canaries"))?;
-                let canaries_dir = absolutize(canaries_dir)?;
                 let report = catalog::verify(catalog::VerifyOptions {
                     catalog_path: catalog_path.clone(),
                     signature_path,
                     keys_dir,
-                    canaries_dir,
+                    canaries_dir: canaries_dir.clone(),
                     check_dev_downloads: false,
                     check_launch_sources: false,
                     hf_token_file: None,
@@ -23195,8 +25150,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 .with_context(|| format!("loading local dev catalog {}", catalog_path.display()))?;
             let catalog_json = fs::read_to_string(&catalog_path)
                 .with_context(|| format!("reading local dev catalog {}", catalog_path.display()))?;
-            let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
-                .context("loading canary registry from local gateway catalog")?;
+            let canary_json_by_set = load_catalog_canary_json_by_set(&catalog_doc, &canaries_dir)?;
+            let canary_registry = GatewayState::canary_registry_from_catalog_and_canary_json(
+                &catalog_json,
+                &canary_json_by_set,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("loading verified canary registry from local gateway catalog")?;
             let trust = if args.dev_skip_catalog_verify {
                 "dev-local-unverified"
             } else {
@@ -23230,9 +25190,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                                 catalog_files.catalog_path.display()
                             )
                         })?;
+                    let canary_json_by_set =
+                        load_catalog_canary_json_by_set(&catalog_doc, &catalog_files.canaries_dir)?;
                     let canary_registry =
-                        GatewayState::canary_registry_from_catalog_json(&catalog_json)
-                            .context("loading canary registry from gateway catalog")?;
+                        GatewayState::canary_registry_from_catalog_and_canary_json(
+                            &catalog_json,
+                            &canary_json_by_set,
+                        )
+                        .map_err(anyhow::Error::msg)
+                        .context("loading verified canary registry from gateway catalog")?;
                     (
                         Some(catalog_doc),
                         canary_registry,
@@ -23616,6 +25582,11 @@ async fn models(args: ModelsArgs) -> Result<()> {
         }
         None => None,
     };
+    let modality_filter = args
+        .modality
+        .as_deref()
+        .map(normalize_provider_modality)
+        .transpose()?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -23625,15 +25596,18 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.gateway {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
         let models = fetch_gateway_models_allow_empty(&client, &gateway_root).await?;
-        let summaries = filter_model_summaries_by_require_kyb(
-            filter_model_summaries_by_quant(
-                filter_model_summaries_by_min_att_tier(
-                    gateway_model_summaries(&models)?,
-                    args.min_att_tier,
+        let summaries = filter_model_summaries_by_modality(
+            filter_model_summaries_by_require_kyb(
+                filter_model_summaries_by_quant(
+                    filter_model_summaries_by_min_att_tier(
+                        gateway_model_summaries(&models)?,
+                        args.min_att_tier,
+                    ),
+                    quant_filter.as_deref(),
                 ),
-                quant_filter.as_deref(),
+                args.require_kyb,
             ),
-            args.require_kyb,
+            modality_filter.as_deref(),
         );
         let report = json!({
             "ok": true,
@@ -23642,6 +25616,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
             "min_att_tier": args.min_att_tier,
             "quant": quant_filter,
             "require_kyb": args.require_kyb,
+            "modality": modality_filter,
             "models": summaries,
         });
 
@@ -23663,19 +25638,22 @@ async fn models(args: ModelsArgs) -> Result<()> {
             disk_bench_mib: 1,
             fixture: None,
         });
-        let catalog_report = catalog_list_report(
-            &catalog_doc,
-            files.catalog_path,
-            files.signature_path,
-            release.catalog_hash.clone(),
-            release.key_id.clone(),
-            CatalogListTier::Launch,
-            Some(&hardware),
-            Some(CatalogListLocalRunContext {
-                contract: &contract,
-                hardware: &hardware,
-                home: &home,
-            }),
+        let catalog_report = filter_catalog_list_report_by_modality(
+            catalog_list_report(
+                &catalog_doc,
+                files.catalog_path,
+                files.signature_path,
+                release.catalog_hash.clone(),
+                release.key_id.clone(),
+                CatalogListTier::Launch,
+                Some(&hardware),
+                Some(CatalogListLocalRunContext {
+                    contract: &contract,
+                    hardware: &hardware,
+                    home: &home,
+                }),
+            ),
+            modality_filter.as_deref(),
         );
 
         if args.json {
@@ -23684,6 +25662,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
                 "source": "ledger_catalog",
                 "rpc_url": rpc_url,
                 "release": release,
+                "modality": modality_filter,
                 "catalog": catalog_report,
             });
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -25247,15 +27226,19 @@ async fn price_show(args: PriceShowArgs) -> Result<()> {
 #[derive(Debug, Clone, Serialize)]
 struct TestModel {
     id: String,
+    family: String,
     tools: bool,
     json: bool,
     context: u64,
+    sampling: catalog::CatalogSamplingProfile,
     binary_hashes_by_enclave: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct ModelSummary {
     id: String,
+    modalities: Vec<String>,
+    served_modalities: BTreeMap<String, u64>,
     providers_online: u64,
     rooms: u64,
     denom: String,
@@ -25316,6 +27299,14 @@ struct CanaryPrompt {
     #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
+    top_p: Option<f64>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    min_p: Option<f64>,
+    #[serde(default)]
+    repeat_penalty: Option<f64>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     prompt: Option<String>,
@@ -25366,6 +27357,19 @@ struct CatalogCanaryArtifactBinding {
     tokenizer_sha256: Option<String>,
     chat_template_sha256: Option<String>,
     min_compute_cap: Option<String>,
+    artifact_sidecars: BTreeMap<String, CatalogCanarySidecarBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct CatalogCanarySidecarBinding {
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    artifact_root: String,
+    artifact_root_kind: String,
+    source_sha256: String,
+    weights_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25399,7 +27403,33 @@ struct CanaryCalibrationPromptReport {
     transcript: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audio_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resource_items: BTreeMap<String, CanaryCalibrationResourceItem>,
+    calibration_baseline_memory_bytes: u64,
+    calibration_peak_memory_bytes: u64,
     output_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CanaryCalibrationResourceItem {
+    unit: String,
+    item_count: u32,
+    item_bytes: u64,
+    item_units: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CalibrationMemoryContext {
+    f13_budget_bytes: u64,
+    source: String,
+    probe: CalibrationMemoryProbe,
+}
+
+#[derive(Clone, Debug)]
+enum CalibrationMemoryProbe {
+    ProcessRss,
+    NvidiaDevice,
+    AmdDevice,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25415,6 +27445,9 @@ struct CatalogCanaryCalibrationReport {
     canary_set_sha256: String,
     prompt_count: usize,
     catalog_fingerprint: String,
+    modality_fingerprints: BTreeMap<String, String>,
+    modality_resource_profiles: BTreeMap<String, catalog::CatalogModalityResourceProfile>,
+    endpoint_calibration: EndpointCalibrationReport,
     existing_catalog_fingerprint: Option<String>,
     matches_existing_catalog: Option<bool>,
     prompts: Vec<CanaryCalibrationPromptReport>,
@@ -25447,6 +27480,8 @@ struct CatalogCanaryMatrixEntry {
     embedding_vector_count: Option<usize>,
     transcript_count: Option<usize>,
     audio_fingerprint_count: Option<usize>,
+    modality_fingerprint_count: Option<usize>,
+    modality_resource_profile_count: Option<usize>,
     calibration_status: String,
     ok: bool,
     errors: Vec<String>,
@@ -25520,6 +27555,9 @@ struct CatalogCanaryEvidenceEntry {
     canary_set_sha256: Option<String>,
     prompt_count: Option<usize>,
     expected_fingerprint: Option<String>,
+    expected_modality_fingerprints: Option<BTreeMap<String, String>>,
+    expected_modality_resource_profiles:
+        Option<BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
     expected_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     expected_perceptual_hashes: Option<BTreeMap<String, String>>,
     expected_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
@@ -25528,6 +27566,9 @@ struct CatalogCanaryEvidenceEntry {
     expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
+    report_modality_fingerprints: Option<BTreeMap<String, String>>,
+    report_modality_resource_profiles:
+        Option<BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
     report_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     report_perceptual_hashes: Option<BTreeMap<String, String>>,
     report_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
@@ -25536,6 +27577,8 @@ struct CatalogCanaryEvidenceEntry {
     report_canary_set_sha256: Option<String>,
     report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
+    modality_fingerprints_match_catalog: Option<bool>,
+    modality_resource_profiles_match_catalog: Option<bool>,
     token_prefixes_match_catalog: Option<bool>,
     method_values_match_catalog: Option<bool>,
     ok: bool,
@@ -25816,12 +27859,29 @@ fn canary_probe_request(model_id: &str, prompt: &CanaryPrompt) -> Value {
     let mut request = json!({
         "model": model_id,
         "messages": &prompt.messages,
-        "temperature": prompt.temperature.unwrap_or(0.0),
         "max_tokens": prompt.max_tokens.unwrap_or(128),
         "stream": false,
     });
     if let Some(tools) = &prompt.tools {
         request["tools"] = json!(tools);
+    }
+    if let Some(temperature) = prompt.temperature {
+        request["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = prompt.top_p {
+        request["top_p"] = json!(top_p);
+    }
+    if let Some(top_k) = prompt.top_k {
+        request["top_k"] = json!(top_k);
+    }
+    if let Some(min_p) = prompt.min_p {
+        request["min_p"] = json!(min_p);
+    }
+    if let Some(repeat_penalty) = prompt.repeat_penalty {
+        request["repeat_penalty"] = json!(repeat_penalty);
+    }
+    if let Some(seed) = prompt.seed {
+        request["seed"] = json!(seed);
     }
     request
 }
@@ -26036,10 +28096,12 @@ async fn fetch_gateway_models_allow_empty_with_token(
 struct CatalogReleaseFiles {
     catalog_path: PathBuf,
     signature_path: PathBuf,
+    canaries_dir: PathBuf,
 }
 
 struct ProviderResolvedCatalog {
     catalog_path: PathBuf,
+    canaries_dir: PathBuf,
     catalog_hash: String,
     catalog_doc: catalog::CatalogDocument,
     source: String,
@@ -26151,7 +28213,7 @@ async fn fetch_catalog_release_files(
         catalog_path: catalog_path.clone(),
         signature_path: signature_path.clone(),
         keys_dir,
-        canaries_dir,
+        canaries_dir: canaries_dir.clone(),
         check_dev_downloads: false,
         check_launch_sources: false,
         hf_token_file: None,
@@ -26170,7 +28232,34 @@ async fn fetch_catalog_release_files(
     Ok(CatalogReleaseFiles {
         catalog_path,
         signature_path,
+        canaries_dir,
     })
+}
+
+fn load_catalog_canary_json_by_set(
+    catalog: &catalog::CatalogDocument,
+    canaries_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    for set_id in catalog
+        .models
+        .iter()
+        .map(|model| model.canary.set_id.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        let mut components = Path::new(set_id).components();
+        if set_id.is_empty()
+            || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            bail!("catalog canary set id {set_id:?} is not a safe file name");
+        }
+        let path = canaries_dir.join(format!("{set_id}.json"));
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("reading catalog canary set {}", path.display()))?;
+        result.insert(set_id.to_owned(), raw);
+    }
+    Ok(result)
 }
 
 async fn cache_release_url(
@@ -26248,6 +28337,12 @@ fn gateway_model_view(model: &Value) -> Result<TestModel> {
         .context("gateway model missing id")?;
     Ok(TestModel {
         id: id.to_owned(),
+        family: model
+            .get("mayhem")
+            .and_then(|mayhem| mayhem.get("family"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         tools: model_tool_capable(model),
         json: model
             .get("mayhem")
@@ -26261,6 +28356,14 @@ fn gateway_model_view(model: &Value) -> Result<TestModel> {
             .and_then(|caps| caps.get("ctx"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        sampling: serde_json::from_value(
+            model
+                .get("mayhem")
+                .and_then(|mayhem| mayhem.get("sampling"))
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        )
+        .context("gateway model has an invalid sampling profile")?,
         binary_hashes_by_enclave: model
             .get("mayhem")
             .and_then(|mayhem| mayhem.get("route_candidates"))
@@ -26408,6 +28511,26 @@ fn filter_model_summaries_by_require_kyb(
         .collect()
 }
 
+fn filter_model_summaries_by_modality(
+    summaries: Vec<ModelSummary>,
+    modality: Option<&str>,
+) -> Vec<ModelSummary> {
+    let Some(modality) = modality else {
+        return summaries;
+    };
+    summaries
+        .into_iter()
+        .filter(|summary| {
+            summary
+                .served_modalities
+                .get(modality)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+        .collect()
+}
+
 fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
     let id = model
         .get("id")
@@ -26456,6 +28579,8 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         .collect::<Result<Vec<ProviderKybInfo>>>()?;
     Ok(ModelSummary {
         id: id.to_owned(),
+        modalities: gateway_catalog_modalities(mayhem),
+        served_modalities: gateway_served_modality_counts(mayhem),
         providers_online: mayhem
             .get("providers_online")
             .and_then(Value::as_u64)
@@ -26486,6 +28611,46 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         prompt_confidential,
         prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
     })
+}
+
+fn gateway_catalog_modalities(mayhem: &Value) -> Vec<String> {
+    mayhem
+        .get("adapter")
+        .and_then(|adapter| adapter.get("modality_set"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|modality| normalize_provider_modality(modality).ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn gateway_served_modality_counts(mayhem: &Value) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for candidate in mayhem
+        .get("route_candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let mut route_modalities = BTreeSet::new();
+        for modality in candidate
+            .get("served_modalities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|modality| normalize_provider_modality(modality).ok())
+        {
+            route_modalities.insert(modality);
+        }
+        for modality in route_modalities {
+            *counts.entry(modality).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn gateway_price_rate_map(price: &Value) -> Vec<RateMapEntry> {
@@ -26910,14 +29075,55 @@ fn opencode_models_from_gateway(models: &[Value]) -> Result<Map<String, Value>> 
                 },
                 "tool_call": view.tools,
                 "reasoning": false,
-                "options": {
-                    "temperature": 0,
-                    "top_p": 1
-                }
+                "options": opencode_sampling_options(&view)
             }),
         );
     }
     Ok(out)
+}
+
+fn opencode_sampling_options(model: &TestModel) -> Value {
+    let sampling = if model.sampling.is_empty() {
+        inferred_opencode_sampling(model)
+    } else {
+        model.sampling.clone()
+    };
+    let mut options = Map::new();
+    for (name, value) in [
+        ("temperature", sampling.temperature.map(Value::from)),
+        ("top_p", sampling.top_p.map(Value::from)),
+        ("top_k", sampling.top_k.map(Value::from)),
+        ("min_p", sampling.min_p.map(Value::from)),
+    ] {
+        if let Some(value) = value {
+            options.insert(name.to_owned(), value);
+        }
+    }
+    Value::Object(options)
+}
+
+fn inferred_opencode_sampling(model: &TestModel) -> catalog::CatalogSamplingProfile {
+    let identity = format!("{} {}", model.id, model.family).to_ascii_lowercase();
+    if ["qwen3", "reasoning", "thinking", "deepseek-r1"]
+        .iter()
+        .any(|needle| identity.contains(needle))
+    {
+        catalog::CatalogSamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: None,
+            repeat_penalty: None,
+        }
+    } else {
+        catalog::CatalogSamplingProfile {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+        }
+    }
 }
 
 fn ensure_enabled_provider(root: &mut Map<String, Value>, provider_id: &str) -> bool {
@@ -27271,12 +29477,24 @@ fn print_models_report(report: &Value) -> Result<()> {
     if report["require_kyb"].as_bool() == Some(true) {
         println!("Filter: admin-KYB'd provider required");
     }
+    if let Some(modality) = report["modality"].as_str() {
+        println!("Filter: live provider modality {modality}");
+    }
     println!(
         "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
     );
     println!(
-        "{:<44} {:>9} {:>5} {:>23} {:>10} {:>7} {:>5} {:>5}  {:<44}",
-        "MODEL", "PROVIDERS", "ROOMS", "RATE MAP", "QUANT", "CTX", "TOOLS", "JSON", "ATTESTATION"
+        "{:<38} {:>9} {:>5} {:>21} {:>10} {:>7} {:>5} {:>5} {:<20}  {:<36}",
+        "MODEL",
+        "PROVIDERS",
+        "ROOMS",
+        "RATE MAP",
+        "QUANT",
+        "CTX",
+        "TOOLS",
+        "JSON",
+        "MODALITIES",
+        "ATTESTATION"
     );
     for model in report["models"]
         .as_array()
@@ -27295,18 +29513,29 @@ fn print_models_report(report: &Value) -> Result<()> {
         let context = model["context"].as_u64().unwrap_or(0);
         let tools = bool_mark(model["tools"].as_bool().unwrap_or(false));
         let json = bool_mark(model["json"].as_bool().unwrap_or(false));
+        let modalities = model["served_modalities"]
+            .as_object()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(modality, count)| format!("{modality}:{}", count.as_u64().unwrap_or(0)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
         let attestation = attestation_summary_for_model(model);
         println!(
-            "{:<44} {:>9} {:>5} {:>23} {:>10} {:>7} {:>5} {:>5}  {:<44}",
-            truncate_for_table(id, 44),
+            "{:<38} {:>9} {:>5} {:>21} {:>10} {:>7} {:>5} {:>5} {:<20}  {:<36}",
+            truncate_for_table(id, 38),
             providers,
             rooms,
-            truncate_for_table(&price, 23),
+            truncate_for_table(&price, 21),
             truncate_for_table(&quant, 10),
             context,
             tools,
             json,
-            truncate_for_table(&attestation, 44)
+            truncate_for_table(&modalities, 20),
+            truncate_for_table(&attestation, 36)
         );
     }
     Ok(())
@@ -28033,7 +30262,7 @@ fn epoch_receipt_messages(
     for chunk in chunks {
         let message = json!({
             "t": "epoch.receipt_chunk",
-            "v": 1,
+            "v": HEARTBEAT_SCHEMA_VERSION,
             "epoch": epoch,
             "receipt_id": receipt_id,
             "payload_id": payload_id,
@@ -30711,6 +32940,8 @@ struct LedgerServe {
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     served_ctx: Option<u64>,
+    #[serde(default)]
+    served_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hardware_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31035,6 +33266,8 @@ struct ProviderCandidate {
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
     served_ctx: u64,
+    served_modalities: Vec<String>,
+    modality_capacities: BTreeMap<String, HeartbeatModalityCapacity>,
     feasibility: ProviderCtxFeasibility,
     ctx_bracket_schedule: CtxBracketSchedule,
 }
@@ -31042,6 +33275,7 @@ struct ProviderCandidate {
 #[derive(Debug, Clone)]
 struct ProviderJoinContextTerms {
     served_ctx: u64,
+    served_modalities: Vec<String>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
 }
@@ -31068,6 +33302,7 @@ struct ProviderCtxFeasibility {
     estimated_weights_bytes: u64,
     estimated_kv_bytes: u64,
     estimated_overhead_bytes: u64,
+    estimated_media_bytes: u64,
     memory_budget: ProviderMemoryBudget,
 }
 
@@ -31085,6 +33320,7 @@ impl ProviderCtxFeasibility {
             estimated_weights_bytes: 0,
             estimated_kv_bytes: 0,
             estimated_overhead_bytes: 0,
+            estimated_media_bytes: 0,
             memory_budget: ProviderMemoryBudget::not_applicable(),
         }
     }
@@ -31126,6 +33362,7 @@ struct ProviderMemoryEstimate {
     weights_bytes: u64,
     kv_bytes: u64,
     overhead_bytes: u64,
+    media_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -31251,7 +33488,7 @@ struct HeartbeatContext<'a> {
     identity_anchor: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderLoadSnapshot {
     active_slots: u64,
     active_requests: u64,
@@ -31261,6 +33498,7 @@ struct ProviderLoadSnapshot {
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
     accepting_new: bool,
+    modality_active_items: BTreeMap<String, u32>,
 }
 
 impl Default for ProviderLoadSnapshot {
@@ -31274,6 +33512,7 @@ impl Default for ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_active_items: BTreeMap::new(),
         }
     }
 }
@@ -31298,6 +33537,7 @@ impl ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_active_items: BTreeMap::new(),
         }
     }
 }
@@ -31311,6 +33551,8 @@ struct ProviderHeartbeatLoad {
     rolling_tok_s_milli: Arc<AtomicU64>,
     accepting_new: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
+    modality_max_inflight_items: Arc<BTreeMap<String, u64>>,
 }
 
 impl Default for ProviderHeartbeatLoad {
@@ -31323,11 +33565,33 @@ impl Default for ProviderHeartbeatLoad {
             rolling_tok_s_milli: Arc::new(AtomicU64::new(0)),
             accepting_new: Arc::new(AtomicBool::new(true)),
             stop: Arc::new(AtomicBool::new(false)),
+            modality_active_items: Arc::new(BTreeMap::new()),
+            modality_max_inflight_items: Arc::new(BTreeMap::new()),
         }
     }
 }
 
 impl ProviderHeartbeatLoad {
+    fn new(capacities: &BTreeMap<String, HeartbeatModalityCapacity>) -> Self {
+        Self {
+            modality_active_items: Arc::new(
+                capacities
+                    .keys()
+                    .map(|modality| (modality.clone(), AtomicU64::new(0)))
+                    .collect(),
+            ),
+            modality_max_inflight_items: Arc::new(
+                capacities
+                    .iter()
+                    .map(|(modality, capacity)| {
+                        (modality.clone(), u64::from(capacity.max_inflight_items))
+                    })
+                    .collect(),
+            ),
+            ..Self::default()
+        }
+    }
+
     fn snapshot(&self, max_sessions: u32) -> ProviderLoadSnapshot {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
@@ -31353,6 +33617,16 @@ impl ProviderHeartbeatLoad {
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
             accepting_new: self.accepting_new.load(Ordering::Relaxed),
+            modality_active_items: self
+                .modality_active_items
+                .iter()
+                .map(|(modality, active)| {
+                    (
+                        modality.clone(),
+                        u32::try_from(active.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -31361,13 +33635,41 @@ impl ProviderHeartbeatLoad {
         self.active_slots.store(active, Ordering::Relaxed);
     }
 
-    fn begin_request(&self) -> ProviderRequestLoadGuard {
+    fn begin_request(
+        &self,
+        modality_items: BTreeMap<String, u32>,
+    ) -> Result<ProviderRequestLoadGuard> {
+        let mut reserved = Vec::new();
+        for (modality, item_count) in &modality_items {
+            let Some(counter) = self.modality_active_items.get(modality) else {
+                self.release_modality_items(&reserved);
+                bail!("provider has no live capacity counter for {modality}");
+            };
+            let Some(limit) = self.modality_max_inflight_items.get(modality).copied() else {
+                self.release_modality_items(&reserved);
+                bail!("provider has no in-flight capacity limit for {modality}");
+            };
+            let item_count = u64::from(*item_count);
+            let reserved_ok = counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    active.checked_add(item_count).filter(|next| *next <= limit)
+                })
+                .is_ok();
+            if !reserved_ok {
+                self.release_modality_items(&reserved);
+                bail!(
+                    "provider {modality} capacity is full; request needs {item_count} item(s), limit {limit}"
+                );
+            }
+            reserved.push((modality.clone(), item_count));
+        }
         self.active_requests.fetch_add(1, Ordering::Relaxed);
-        ProviderRequestLoadGuard {
+        Ok(ProviderRequestLoadGuard {
             load: self.clone(),
+            modality_items,
             started: Instant::now(),
             finished: false,
-        }
+        })
     }
 
     fn record_ttft_ms(&self, ttft_ms: u64) {
@@ -31393,12 +33695,27 @@ impl ProviderHeartbeatLoad {
         self.accepting_new.load(Ordering::Relaxed)
     }
 
-    fn finish_request(&self) {
+    fn finish_request(&self, modality_items: &BTreeMap<String, u32>) {
         let _ =
             self.active_requests
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_sub(1)
                 });
+        let reserved = modality_items
+            .iter()
+            .map(|(modality, count)| (modality.clone(), u64::from(*count)))
+            .collect::<Vec<_>>();
+        self.release_modality_items(&reserved);
+    }
+
+    fn release_modality_items(&self, reserved: &[(String, u64)]) {
+        for (modality, count) in reserved.iter().rev() {
+            if let Some(counter) = self.modality_active_items.get(modality) {
+                let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    active.checked_sub(*count)
+                });
+            }
+        }
     }
 
     fn store_rolling_ms(&self, target: &AtomicU64, sample: u64) {
@@ -32008,6 +34325,7 @@ fn provider_session_quality_value(
 
 struct ProviderRequestLoadGuard {
     load: ProviderHeartbeatLoad,
+    modality_items: BTreeMap<String, u32>,
     started: Instant,
     finished: bool,
 }
@@ -32027,7 +34345,7 @@ impl ProviderRequestLoadGuard {
 
     fn finish(&mut self) {
         if !self.finished {
-            self.load.finish_request();
+            self.load.finish_request(&self.modality_items);
             self.finished = true;
         }
     }
@@ -32071,6 +34389,7 @@ struct ProviderSessionContext<'a> {
     selected: &'a ProviderCandidate,
     backend_runtime: &'a ProviderBackendRuntime,
     artifact_paths: &'a ProviderArtifactPaths,
+    canaries_dir: &'a Path,
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
@@ -32115,6 +34434,7 @@ struct ActiveProviderSession {
     locked_per_req_au: MoneyAu,
     locked_min_session_au: MoneyAu,
     served_ctx: u32,
+    required_modalities: Vec<String>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
@@ -32149,6 +34469,9 @@ struct ProviderSessionTerms {
     enclave_id: String,
     model_id: String,
     adapter: catalog::CatalogAdapter,
+    sampling: catalog::CatalogSamplingProfile,
+    served_modalities: Vec<String>,
+    modality_capacities: BTreeMap<String, HeartbeatModalityCapacity>,
     room_ids: Vec<String>,
     price_ver: u64,
     rate_map: Vec<RateMapEntry>,
@@ -32265,7 +34588,14 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         terms: &ProviderSessionTerms,
         body: &Value,
     ) -> Result<ProviderSessionOutput> {
-        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body, None)
+        provider_engine_session_response_with_sampling(
+            self.backend.as_mut(),
+            Some(&terms.model_id),
+            &terms.adapter,
+            &terms.sampling,
+            body,
+            None,
+        )
     }
 
     fn respond_streaming(
@@ -32274,7 +34604,14 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         body: &Value,
         stream: Option<&mut ProviderSessionLiveStream<'_>>,
     ) -> Result<ProviderSessionOutput> {
-        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body, stream)
+        provider_engine_session_response_with_sampling(
+            self.backend.as_mut(),
+            Some(&terms.model_id),
+            &terms.adapter,
+            &terms.sampling,
+            body,
+            stream,
+        )
     }
 }
 
@@ -32495,7 +34832,12 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
     let home = absolutize(home)?;
     let computed = compute_provider_serve_plan(&home, &args).await?;
     let selection = &computed.selection;
-    let up_command = provider_auto_fit_up_command(&home, selection, computed.gpu_layers);
+    let up_command = provider_auto_fit_up_command(
+        &home,
+        selection,
+        computed.gpu_layers,
+        &args.disable_modalities,
+    );
     let selected = selection
         .candidates
         .iter()
@@ -32594,6 +34936,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         disk_path: None,
         skip_disk_bench: false,
         ctx: args.ctx,
+        disable_modalities: args.disable_modalities.clone(),
         memory_reserve: None,
         json: true,
         dev_skip_catalog_verify: false,
@@ -32618,6 +34961,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         &selected.enclave.enclave_id,
         computed.gpu_layers,
         Some(selected.served_ctx),
+        &selected.served_modalities,
         None,
     )?;
     let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
@@ -32705,6 +35049,7 @@ fn provider_serve_child_config(
     enclave: &str,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
+    served_modalities: &[String],
     name: Option<String>,
 ) -> Result<Value> {
     let config_path = config_path_for_home(home);
@@ -32747,6 +35092,15 @@ fn provider_serve_child_config(
     }
     if let Some(ctx) = ctx.filter(|ctx| *ctx > 0) {
         args.extend(["--ctx".to_owned(), ctx.to_string()]);
+    }
+    let catalog_modalities = served_modalities
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for modality in ["text", "embedding", "image", "video", "audio"] {
+        if !catalog_modalities.contains(modality) {
+            args.extend(["--disable-modality".to_owned(), modality.to_owned()]);
+        }
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
     Ok(json!({
@@ -32820,6 +35174,7 @@ fn provider_start_args_for_serve_plan(
         heartbeat_count: 1,
         min_ask_au: 0,
         ctx: args.ctx,
+        disable_modalities: args.disable_modalities.clone(),
         memory_reserve: args.memory_reserve.clone(),
         vllm_memory_utilization: None,
         disk_reserve: None,
@@ -32834,6 +35189,7 @@ fn provider_start_args_for_serve_plan(
         print_json: args.json,
         dev_skip_catalog_verify: args.dev_skip_catalog_verify,
         load_progress: None,
+        modality_limits: BTreeMap::new(),
     }
 }
 
@@ -32841,6 +35197,7 @@ fn provider_auto_fit_up_command(
     home: &Path,
     selection: &ProviderAutoFitSelection,
     gpu_layers: Option<u32>,
+    disabled_modalities: &[String],
 ) -> String {
     let enclaves = selection
         .candidates
@@ -32860,6 +35217,10 @@ fn provider_auto_fit_up_command(
     if let Some(gpu_layers) = gpu_layers {
         parts.push("--provider-gpu-layers".to_owned());
         parts.push(gpu_layers.to_string());
+    }
+    for modality in disabled_modalities {
+        parts.push("--provider-disable-modality".to_owned());
+        parts.push(shell_single_quote(modality));
     }
     parts.join(" ")
 }
@@ -33181,9 +35542,15 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
     let candidates =
         build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
-    let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
+    let initial_selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
+    apply_provider_config_defaults(&mut args, config.as_ref(), &initial_selected);
+    let candidates =
+        build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
+    let selected = select_provider_candidate(
+        &candidates,
+        Some(initial_selected.enclave.enclave_id.as_str()),
+    )?;
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
-    apply_provider_config_defaults(&mut args, config.as_ref(), &selected);
     let protection_config = ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
         bail!(
@@ -33397,24 +35764,28 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let device_key = provider_attestation_device_key(&attestation)?;
     write_provider_load_progress_stage(&args, "prepare attestation", "attest", "complete", 100);
 
-    let session_responder = if args.serve_sessions {
-        Some(provider_session_responder(&ProviderSessionContext {
-            args: &args,
-            home: &home,
-            keypair_path: &keypair_path,
-            password: &password,
-            wallet: &wallet,
-            selected: &selected,
-            backend_runtime: &backend_runtime,
-            artifact_paths: &artifact_paths,
-            rooms: &rooms,
-            attestation: &attestation,
-            attestation_head: &attestation.report_head,
-            identity_anchor: &identity_anchor,
-            rules: &rules,
-        })?)
+    let session_context = ProviderSessionContext {
+        args: &args,
+        home: &home,
+        keypair_path: &keypair_path,
+        password: &password,
+        wallet: &wallet,
+        selected: &selected,
+        backend_runtime: &backend_runtime,
+        artifact_paths: &artifact_paths,
+        canaries_dir: &provider_catalog.canaries_dir,
+        rooms: &rooms,
+        attestation: &attestation,
+        attestation_head: &attestation.report_head,
+        identity_anchor: &identity_anchor,
+        rules: &rules,
+    };
+    let (session_responder, modality_health) = if args.serve_sessions {
+        let (responder, health) =
+            provider_session_responder_with_modality_health(&session_context)?;
+        (Some(responder), health)
     } else {
-        None
+        (None, Vec::new())
     };
 
     provider_log(&args, "Submitting provider opt-in feature records");
@@ -33446,7 +35817,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     .await?;
     write_provider_load_progress_stage(&args, "join canonical rooms", "register", "complete", 100);
 
-    let heartbeats = if args.no_heartbeat {
+    let heartbeats = if args.no_heartbeat || !args.serve_sessions {
         Vec::new()
     } else {
         emit_provider_heartbeats(HeartbeatContext {
@@ -33506,6 +35877,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "provider": wallet.public_key.clone(),
         "catalog": {
             "path": provider_catalog.catalog_path,
+            "canaries_dir": provider_catalog.canaries_dir,
             "hash": provider_catalog.catalog_hash,
             "source": provider_catalog.source,
         },
@@ -33565,9 +35937,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "rooms": room_features,
         },
         "heartbeats": heartbeats,
+        "modality_health": modality_health,
         "self_test": {
             "ok": true,
-            "kind": "sealed-manifest-attestation-heartbeat",
+            "kind": "sealed-manifest-attestation-functional-modality-heartbeat",
         },
         "session_rpc_url": if args.serve_sessions { Some(session_rpc_url.as_str()) } else { None },
     });
@@ -33602,6 +35975,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 selected: &selected,
                 backend_runtime: &backend_runtime,
                 artifact_paths: &artifact_paths,
+                canaries_dir: &provider_catalog.canaries_dir,
                 rooms: &rooms,
                 attestation: &attestation,
                 attestation_head: &attestation.report_head,
@@ -33936,8 +36310,12 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         && args.memory_reserve.is_none()
         && args.vllm_memory_utilization.is_none()
         && args.disk_reserve.is_none()
+        && args.modality_concurrency.is_empty()
+        && args.modality_max_items.is_empty()
+        && args.modality_max_bytes.is_empty()
+        && args.modality_max_units.is_empty()
     {
-        bail!("set at least one of --max-concurrent, --accept-rate, --budget, --memory-reserve, --vllm-memory-utilization, or --disk-reserve");
+        bail!("set at least one provider/session/resource/modality limit");
     }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -34003,6 +36381,7 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         provider_disk_reserve_bytes(Some(disk_reserve))?;
         toml_table_set_string(table, "disk_reserve", disk_reserve.to_owned());
     }
+    set_provider_modality_limits(table, &args)?;
     write_config_toml_value(&path, &config)?;
     let report = json!({
         "ok": true,
@@ -34018,6 +36397,140 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         print_provider_limits_report(&report);
     }
     Ok(())
+}
+
+fn set_provider_modality_limits(
+    limits: &mut toml::map::Map<String, toml::Value>,
+    args: &ProviderLimitsSetArgs,
+) -> Result<()> {
+    for assignment in &args.modality_concurrency {
+        let (modality, value) =
+            parse_provider_modality_limit_assignment(assignment, "--modality-concurrency")?;
+        let value = parse_bounded_provider_modality_u32(
+            value,
+            "--modality-concurrency",
+            MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS,
+        )?;
+        let table = ensure_provider_modality_limits_table(limits, &modality)?;
+        toml_table_set_u64(table, "max_inflight_items", u64::from(value))?;
+    }
+    for assignment in &args.modality_max_items {
+        let (modality, value) =
+            parse_provider_modality_limit_assignment(assignment, "--modality-max-items")?;
+        let value = parse_bounded_provider_modality_u32(
+            value,
+            "--modality-max-items",
+            MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST,
+        )?;
+        let table = ensure_provider_modality_limits_table(limits, &modality)?;
+        toml_table_set_u64(table, "max_items_per_request", u64::from(value))?;
+    }
+    for assignment in &args.modality_max_bytes {
+        let (modality, value) =
+            parse_provider_modality_limit_assignment(assignment, "--modality-max-bytes")?;
+        let value = parse_provider_modality_bytes(value)?;
+        ensure!(
+            value <= MAX_PROVIDER_MODALITY_ITEM_BYTES,
+            "--modality-max-bytes exceeds the {}-byte schema/security ceiling",
+            MAX_PROVIDER_MODALITY_ITEM_BYTES
+        );
+        let table = ensure_provider_modality_limits_table(limits, &modality)?;
+        toml_table_set_u64(table, "max_item_bytes", value)?;
+    }
+    for assignment in &args.modality_max_units {
+        let (modality, value) =
+            parse_provider_modality_limit_assignment(assignment, "--modality-max-units")?;
+        let value = value.parse::<u64>().with_context(|| {
+            format!("--modality-max-units value must be an integer, got {value:?}")
+        })?;
+        ensure!(
+            (1..=MAX_PROVIDER_MODALITY_ITEM_UNITS).contains(&value),
+            "--modality-max-units must be between 1 and {MAX_PROVIDER_MODALITY_ITEM_UNITS}"
+        );
+        let table = ensure_provider_modality_limits_table(limits, &modality)?;
+        toml_table_set_u64(table, "max_item_units", value)?;
+    }
+    Ok(())
+}
+
+fn parse_provider_modality_limit_assignment<'a>(
+    assignment: &'a str,
+    flag: &str,
+) -> Result<(String, &'a str)> {
+    let (modality, value) = assignment
+        .split_once('=')
+        .with_context(|| format!("{flag} must be MODALITY=VALUE"))?;
+    let modality = normalize_provider_modality(modality)?;
+    ensure!(
+        modality != "text",
+        "{flag} does not apply to text generation"
+    );
+    let value = value.trim();
+    ensure!(!value.is_empty(), "{flag} value must not be empty");
+    Ok((modality, value))
+}
+
+fn parse_bounded_provider_modality_u32(value: &str, flag: &str, max: u32) -> Result<u32> {
+    let value = value
+        .parse::<u32>()
+        .with_context(|| format!("{flag} value must be an integer, got {value:?}"))?;
+    ensure!(
+        (1..=max).contains(&value),
+        "{flag} must be between 1 and {max}"
+    );
+    Ok(value)
+}
+
+fn parse_provider_modality_bytes(value: &str) -> Result<u64> {
+    let lower = value.trim().to_ascii_lowercase();
+    let suffixes = [
+        ("gib", 1024_u64.pow(3)),
+        ("gb", 1024_u64.pow(3)),
+        ("mib", 1024_u64.pow(2)),
+        ("mb", 1024_u64.pow(2)),
+        ("kib", 1024_u64),
+        ("kb", 1024_u64),
+        ("b", 1_u64),
+    ];
+    let (number, multiplier) = suffixes
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            lower
+                .strip_suffix(suffix)
+                .map(|number| (number.trim(), *multiplier))
+        })
+        .unwrap_or((lower.as_str(), 1));
+    let number = number
+        .parse::<f64>()
+        .with_context(|| format!("--modality-max-bytes has invalid size {value:?}"))?;
+    ensure!(
+        number.is_finite() && number > 0.0,
+        "--modality-max-bytes must be positive"
+    );
+    let bytes = (number * multiplier as f64).ceil();
+    ensure!(
+        bytes <= u64::MAX as f64,
+        "--modality-max-bytes is too large"
+    );
+    Ok(bytes as u64)
+}
+
+fn ensure_provider_modality_limits_table<'a>(
+    limits: &'a mut toml::map::Map<String, toml::Value>,
+    modality: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    let modalities = limits
+        .entry("modalities".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let modalities = modalities
+        .as_table_mut()
+        .context("provider limits modalities exists but is not a TOML table")?;
+    let modality = modalities
+        .entry(modality.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    modality
+        .as_table_mut()
+        .context("provider modality limit exists but is not a TOML table")
 }
 
 async fn provider_drain(args: ProviderDrainArgs) -> Result<()> {
@@ -34269,6 +36782,23 @@ fn apply_provider_limit_defaults(
             args.serve_budget_period_seconds = value;
         }
     }
+    if let Some(modalities) = &limits.modalities {
+        for (modality, configured) in modalities {
+            let target = args.modality_limits.entry(modality.clone()).or_default();
+            if configured.max_inflight_items.is_some() {
+                target.max_inflight_items = configured.max_inflight_items;
+            }
+            if configured.max_items_per_request.is_some() {
+                target.max_items_per_request = configured.max_items_per_request;
+            }
+            if configured.max_item_bytes.is_some() {
+                target.max_item_bytes = configured.max_item_bytes;
+            }
+            if configured.max_item_units.is_some() {
+                target.max_item_units = configured.max_item_units;
+            }
+        }
+    }
 }
 
 fn apply_provider_resource_config_defaults(
@@ -34289,6 +36819,12 @@ fn apply_provider_resource_config_defaults(
     }
     if args.disk_reserve.is_none() {
         args.disk_reserve = limits.disk_reserve.clone();
+    }
+    if let Some(modalities) = &limits.modalities {
+        for (modality, configured) in modalities {
+            args.modality_limits
+                .insert(modality.clone(), configured.clone());
+        }
     }
 }
 
@@ -34331,6 +36867,10 @@ fn provider_limits_value(config: &toml::Value, target: Option<&str>) -> Value {
             .and_then(|limits| limits.get(key))
             .and_then(toml::Value::as_str)
     };
+    let modalities = limits
+        .and_then(|limits| limits.get("modalities"))
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
     json!({
         "max_sessions": get_u64("max_sessions"),
         "accept_rate_per_minute": get_u64("accept_rate_per_minute").unwrap_or(0),
@@ -34340,6 +36880,7 @@ fn provider_limits_value(config: &toml::Value, target: Option<&str>) -> Value {
         "memory_reserve": get_str("memory_reserve"),
         "vllm_memory_utilization_pct": get_u64("vllm_memory_utilization_pct"),
         "disk_reserve": get_str("disk_reserve"),
+        "modalities": modalities,
     })
 }
 
@@ -34532,7 +37073,9 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
             price_ctx_bracket.as_deref().unwrap_or("base")
         )
     })?;
-    let serve_terms = provider_join_context_terms_from_price(&enclave, served_ctx, price)?;
+    let served_modalities = ledger_enclave_served_modalities(&enclave, &args.disable_modalities)?;
+    let serve_terms =
+        provider_join_context_terms_from_price(&enclave, served_ctx, served_modalities, price)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
     let hardware_fingerprint = current_provider_hardware_fingerprint();
     let provider_feature = ensure_provider_registered(
@@ -34575,6 +37118,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "enclave": enclave,
         "price": price,
         "hardware_fingerprint": hardware_fingerprint,
+        "served_modalities": serve_terms.served_modalities,
         "rooms": rooms,
         "features": {
             "provider": provider_feature,
@@ -34859,6 +37403,7 @@ fn provider_lifecycle_intent_with_anchors(
         let join_terms =
             join_terms.context("join_enclave lifecycle intent requires committed context terms")?;
         value["served_ctx"] = json!(join_terms.served_ctx);
+        value["served_modalities"] = json!(&join_terms.served_modalities);
         value["ctx_bracket"] = match &join_terms.ctx_bracket {
             Some(ctx_bracket) => json!(ctx_bracket),
             None => Value::Null,
@@ -34988,6 +37533,7 @@ fn price_ctx_bracket_for_model_class(
 fn provider_join_context_terms_from_price(
     enclave: &LedgerEnclave,
     served_ctx: u64,
+    served_modalities: Vec<String>,
     price: &LedgerPriceSchedule,
 ) -> Result<ProviderJoinContextTerms> {
     let current = current_au_usd_price(price).with_context(|| {
@@ -35006,6 +37552,7 @@ fn provider_join_context_terms_from_price(
         )?;
         return Ok(ProviderJoinContextTerms {
             served_ctx,
+            served_modalities,
             ctx_bracket: Some(ctx_bracket),
             ctx_bracket_table_ver: Some(ctx_bracket_table_ver),
         });
@@ -35015,6 +37562,7 @@ fn provider_join_context_terms_from_price(
     }
     Ok(ProviderJoinContextTerms {
         served_ctx,
+        served_modalities,
         ctx_bracket: None,
         ctx_bracket_table_ver: None,
     })
@@ -35027,7 +37575,12 @@ fn provider_join_context_terms_for_candidate(
         .price
         .as_ref()
         .context("selected provider enclave has no current admin price")?;
-    provider_join_context_terms_from_price(&selected.enclave, selected.served_ctx, price)
+    provider_join_context_terms_from_price(
+        &selected.enclave,
+        selected.served_ctx,
+        selected.served_modalities.clone(),
+        price,
+    )
 }
 
 fn admin_role_marker_ok(role: Option<&str>) -> bool {
@@ -36025,6 +38578,12 @@ async fn resolve_provider_start_catalog(
             .map(Ok)
             .unwrap_or_else(|| repo_path("catalog/models.json"))?;
         let catalog_path = absolutize(catalog_path)?;
+        let canaries_dir = args
+            .canaries_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+        let canaries_dir = absolutize(canaries_dir)?;
         let catalog_hash = verify_or_hash_catalog(args, &catalog_path)?;
         let catalog_doc = catalog::load_document(&catalog_path)?;
         let trust = if args.dev_skip_catalog_verify {
@@ -36034,6 +38593,7 @@ async fn resolve_provider_start_catalog(
         };
         return Ok(ProviderResolvedCatalog {
             catalog_path,
+            canaries_dir,
             catalog_hash,
             catalog_doc,
             source: format!("{trust}:{rpc_url}"),
@@ -36054,6 +38614,7 @@ async fn resolve_provider_start_catalog(
     })?;
     Ok(ProviderResolvedCatalog {
         catalog_path: files.catalog_path,
+        canaries_dir: files.canaries_dir,
         catalog_hash: release.catalog_hash.clone(),
         catalog_doc,
         source: format!("ledger-catalog-current:{rpc_url}:{}", release.catalog_hash),
@@ -36406,6 +38967,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         let route_caps = gateway_caps_from_contract(&enclave.caps);
         let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
         let active_serve = active_serves_by_key.get(&serving_key).copied();
+        let served_modalities = active_serve
+            .map(|serve| serve.served_modalities.clone())
+            .unwrap_or_default();
+        if served_modalities.is_empty() {
+            continue;
+        }
         let served_ctx = active_serve
             .and_then(|serve| serve.served_ctx)
             .and_then(|ctx| u32::try_from(ctx).ok())
@@ -36466,6 +39033,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         let route_caps = gateway_caps_from_contract(&enclave.caps);
         let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
         let active_serve = active_serves_by_key.get(&serving_key).copied();
+        let served_modalities = active_serve
+            .map(|serve| serve.served_modalities.clone())
+            .unwrap_or_default();
+        if served_modalities.is_empty() {
+            continue;
+        }
         let served_ctx = active_serve
             .and_then(|serve| serve.served_ctx)
             .and_then(|ctx| u32::try_from(ctx).ok())
@@ -36511,6 +39084,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                         .get(serving.provider.as_str())
                         .map(|provider| provider.accepted_rails.clone())
                         .unwrap_or_default(),
+                    served_modalities,
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
@@ -36602,6 +39176,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 model_class: class_by_model
                     .remove(&model_id)
                     .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
+                family: String::new(),
                 providers_online,
                 rooms,
                 price_ref_au: gateway_price_ref_from_ledger_with_history(
@@ -36620,6 +39195,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
                 adapter: mayhem_gateway::openai::ShapeAdapterInfo::default(),
+                sampling: SamplingProfile::default(),
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
                 source: "contract".to_owned(),
                 kyb_identities,
@@ -36727,24 +39303,24 @@ fn filter_gateway_models_by_app_version(
     models: Vec<GatewayModel>,
     catalog_doc: &catalog::CatalogDocument,
 ) -> Result<(Vec<GatewayModel>, Vec<ModelVersionGate>)> {
-    let min_versions = catalog_doc
+    let catalog_models = catalog_doc
         .models
         .iter()
-        .filter_map(|model| {
-            model
-                .min_app_version
-                .as_ref()
-                .map(|version| (model.model_id.as_str(), version.as_str()))
-        })
+        .map(|model| (model.model_id.as_str(), model))
         .collect::<BTreeMap<_, _>>();
     let mut allowed = Vec::new();
     let mut blocked = Vec::new();
     for mut model in models {
-        if let Some(min_app_version) = min_versions.get(model.id.as_str()).copied() {
-            model.mayhem.min_app_version = Some(min_app_version.to_owned());
-            if let Some(gate) = model_app_version_gate(&model.id, Some(min_app_version))? {
-                blocked.push(gate);
-                continue;
+        if let Some(catalog_model) = catalog_models.get(model.id.as_str()).copied() {
+            model.mayhem.family = catalog_model.family.clone();
+            model.mayhem.adapter = gateway_shape_adapter(&catalog_model.adapter);
+            model.mayhem.sampling = gateway_sampling_profile(&catalog_model.sampling);
+            if let Some(min_app_version) = catalog_model.min_app_version.as_deref() {
+                model.mayhem.min_app_version = Some(min_app_version.to_owned());
+                if let Some(gate) = model_app_version_gate(&model.id, Some(min_app_version))? {
+                    blocked.push(gate);
+                    continue;
+                }
             }
         }
         allowed.push(model);
@@ -36753,6 +39329,26 @@ fn filter_gateway_models_by_app_version(
         bail!("{}", version_gate_summary("route", &blocked));
     }
     Ok((allowed, blocked))
+}
+
+fn gateway_shape_adapter(adapter: &catalog::CatalogAdapter) -> ShapeAdapterInfo {
+    ShapeAdapterInfo {
+        endpoint_families: adapter.endpoint_families.clone(),
+        chat_template_id: adapter.chat_template_id.clone(),
+        tool_call_strategy: adapter.tool_call_strategy.clone(),
+        reasoning_passthrough: adapter.reasoning_passthrough.clone(),
+        modality_set: adapter.modality_set.clone(),
+    }
+}
+
+fn gateway_sampling_profile(sampling: &catalog::CatalogSamplingProfile) -> SamplingProfile {
+    SamplingProfile {
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        min_p: sampling.min_p,
+        repeat_penalty: sampling.repeat_penalty,
+    }
 }
 
 fn price_sort_key(price: &LedgerPriceRecord) -> (MoneyAu, MoneyAu, MoneyAu, MoneyAu, MoneyAu, u64) {
@@ -37402,34 +39998,169 @@ fn provider_kv_bytes_per_token(
     Ok(((model.params_b.max(0.1) * base_per_billion as f64).ceil() as u64).max(1024))
 }
 
+fn provider_modality_capacities(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    served_modalities: &[String],
+    configured: &BTreeMap<String, ConfigProviderModalityLimits>,
+) -> Result<BTreeMap<String, HeartbeatModalityCapacity>> {
+    for modality in configured.keys() {
+        ensure!(
+            model.adapter.modality_set.contains(modality),
+            "provider modality limit {modality} is not declared by catalog model {}",
+            model.model_id
+        );
+        ensure!(
+            modality != "text",
+            "text does not use media capacity limits"
+        );
+    }
+    let profiles = model
+        .modality_assessment
+        .resource_profiles
+        .get(artifact_name);
+    let mut capacities = BTreeMap::new();
+    for modality in served_modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+    {
+        let profile = profiles
+            .and_then(|profiles| profiles.get(modality))
+            .with_context(|| {
+                format!(
+                    "catalog artifact {artifact_name} has no calibrated resource profile for served modality {modality}"
+                )
+            })?;
+        let configured = configured.get(modality);
+        let max_inflight_items = configured
+            .and_then(|limits| limits.max_inflight_items)
+            .unwrap_or(profile.default_max_inflight_items);
+        let max_items_per_request = configured
+            .and_then(|limits| limits.max_items_per_request)
+            .unwrap_or(profile.default_max_items_per_request);
+        let max_item_bytes = configured
+            .and_then(|limits| limits.max_item_bytes)
+            .unwrap_or(profile.max_item_bytes);
+        let max_item_units = configured
+            .and_then(|limits| limits.max_item_units)
+            .unwrap_or(profile.max_item_units);
+        ensure!(
+            (1..=MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS).contains(&max_inflight_items),
+            "provider {modality} concurrency must be between 1 and {MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS}"
+        );
+        ensure!(
+            (1..=MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST).contains(&max_items_per_request)
+                && max_items_per_request <= max_inflight_items,
+            "provider {modality} max items per request must be positive and no greater than its in-flight limit"
+        );
+        ensure!(
+            (1..=MAX_PROVIDER_MODALITY_ITEM_BYTES).contains(&max_item_bytes),
+            "provider {modality} max item bytes must be between 1 and {MAX_PROVIDER_MODALITY_ITEM_BYTES}"
+        );
+        ensure!(
+            (1..=MAX_PROVIDER_MODALITY_ITEM_UNITS).contains(&max_item_units),
+            "provider {modality} max item units must be between 1 and {MAX_PROVIDER_MODALITY_ITEM_UNITS}"
+        );
+        let by_bytes = multiply_ratio_ceil(
+            profile.measured_working_set_bytes,
+            max_item_bytes,
+            profile.measured_item_bytes,
+        );
+        let by_units = multiply_ratio_ceil(
+            profile.measured_working_set_bytes,
+            max_item_units,
+            profile.measured_item_units,
+        );
+        capacities.insert(
+            modality.clone(),
+            HeartbeatModalityCapacity {
+                unit: profile.unit.clone(),
+                max_inflight_items,
+                active_items: 0,
+                max_items_per_request,
+                max_item_bytes,
+                max_item_units,
+                working_set_bytes_per_item: by_bytes.max(by_units).max(1),
+            },
+        );
+    }
+    Ok(capacities)
+}
+
+fn multiply_ratio_ceil(value: u64, numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return u64::MAX;
+    }
+    let scaled = u128::from(value)
+        .saturating_mul(u128::from(numerator))
+        .saturating_add(u128::from(denominator).saturating_sub(1))
+        / u128::from(denominator);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+fn provider_modality_reserved_bytes(
+    capacities: &BTreeMap<String, HeartbeatModalityCapacity>,
+) -> u64 {
+    capacities.values().fold(0_u64, |total, capacity| {
+        total.saturating_add(
+            capacity
+                .working_set_bytes_per_item
+                .saturating_mul(u64::from(capacity.max_inflight_items)),
+        )
+    })
+}
+
 fn provider_memory_estimate(
     enclave: &LedgerEnclave,
     model: &catalog::CatalogModel,
+    artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
+    served_modalities: &[String],
+    configured_modalities: &BTreeMap<String, ConfigProviderModalityLimits>,
     served_ctx: u64,
 ) -> Result<ProviderMemoryEstimate> {
     let weights_bytes = artifact.weights_bytes;
     let kv_bytes =
         served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact)?);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024);
+    let media_bytes = provider_modality_reserved_bytes(&provider_modality_capacities(
+        model,
+        artifact_name,
+        served_modalities,
+        configured_modalities,
+    )?);
     Ok(ProviderMemoryEstimate {
         required_bytes: weights_bytes
             .saturating_add(kv_bytes)
-            .saturating_add(overhead_bytes),
+            .saturating_add(overhead_bytes)
+            .saturating_add(media_bytes),
         weights_bytes,
         kv_bytes,
         overhead_bytes,
+        media_bytes,
     })
 }
 
 fn provider_model_memory_fit(
     enclave: &LedgerEnclave,
     model: &catalog::CatalogModel,
+    artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
+    served_modalities: &[String],
+    configured_modalities: &BTreeMap<String, ConfigProviderModalityLimits>,
     usable_bytes: u64,
     requested_ctx: u64,
 ) -> Result<mayhem_hwprobe::ModelMemoryFit> {
-    let overhead_bytes = (artifact.weights_bytes / 5).max(512 * 1024 * 1024);
+    let overhead_bytes = (artifact.weights_bytes / 5)
+        .max(512 * 1024 * 1024)
+        .saturating_add(provider_modality_reserved_bytes(
+            &provider_modality_capacities(
+                model,
+                artifact_name,
+                served_modalities,
+                configured_modalities,
+            )?,
+        ));
     Ok(model_memory_fit(
         usable_bytes,
         artifact.weights_bytes,
@@ -37540,7 +40271,9 @@ fn write_provider_memory_claim(
 fn provider_context_feasibility(
     enclave: &LedgerEnclave,
     model: &catalog::CatalogModel,
+    artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
+    served_modalities: &[String],
     verdict: &BackendVerdict,
     hardware: &HardwareReport,
     args: &ProviderStartArgs,
@@ -37552,22 +40285,34 @@ fn provider_context_feasibility(
         let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
         let memory_budget =
             provider_memory_budget(hardware, verdict, enclave, args, claimed_bytes)?;
-        let estimate = provider_memory_estimate(enclave, model, artifact, requested_ctx)?;
+        let estimate = provider_memory_estimate(
+            enclave,
+            model,
+            artifact_name,
+            artifact,
+            served_modalities,
+            &args.modality_limits,
+            requested_ctx,
+        )?;
         let fit = provider_model_memory_fit(
             enclave,
             model,
+            artifact_name,
             artifact,
+            served_modalities,
+            &args.modality_limits,
             memory_budget.budget_bytes,
             requested_ctx,
         )?;
         if estimate.required_bytes > memory_budget.budget_bytes {
             bail!(
-                "model {} needs {} (weights {}, working memory {}, overhead {}) but only {} is usable after reserve {} and local claims {} in {}",
+                "model {} needs {} (weights {}, working memory {}, overhead {}, modality reserve {}) but only {} is usable after reserve {} and local claims {} in {}",
                 model.model_id,
                 human_bytes(estimate.required_bytes),
                 human_bytes(estimate.weights_bytes),
                 human_bytes(estimate.kv_bytes),
                 human_bytes(estimate.overhead_bytes),
+                human_bytes(estimate.media_bytes),
                 human_bytes(memory_budget.budget_bytes),
                 human_bytes(memory_budget.reserve_bytes),
                 human_bytes(memory_budget.claimed_bytes),
@@ -37585,6 +40330,7 @@ fn provider_context_feasibility(
             estimated_weights_bytes: estimate.weights_bytes,
             estimated_kv_bytes: estimate.kv_bytes,
             estimated_overhead_bytes: estimate.overhead_bytes,
+            estimated_media_bytes: estimate.media_bytes,
             memory_budget,
         });
     }
@@ -37593,7 +40339,10 @@ fn provider_context_feasibility(
     let requested_fit = provider_model_memory_fit(
         enclave,
         model,
+        artifact_name,
         artifact,
+        served_modalities,
+        &args.modality_limits,
         memory_budget.budget_bytes,
         requested_ctx,
     )?;
@@ -37608,9 +40357,25 @@ fn provider_context_feasibility(
             model.model_id
         );
     };
-    let mut min_estimate = provider_memory_estimate(enclave, model, artifact, min_ctx)?;
+    let mut min_estimate = provider_memory_estimate(
+        enclave,
+        model,
+        artifact_name,
+        artifact,
+        served_modalities,
+        &args.modality_limits,
+        min_ctx,
+    )?;
     for served_ctx in candidates {
-        let estimate = provider_memory_estimate(enclave, model, artifact, served_ctx)?;
+        let estimate = provider_memory_estimate(
+            enclave,
+            model,
+            artifact_name,
+            artifact,
+            served_modalities,
+            &args.modality_limits,
+            served_ctx,
+        )?;
         if served_ctx == min_ctx {
             min_estimate = estimate;
         }
@@ -37635,6 +40400,7 @@ fn provider_context_feasibility(
                 estimated_weights_bytes: estimate.weights_bytes,
                 estimated_kv_bytes: estimate.kv_bytes,
                 estimated_overhead_bytes: estimate.overhead_bytes,
+                estimated_media_bytes: estimate.media_bytes,
                 memory_budget,
             });
         }
@@ -38408,10 +41174,23 @@ fn build_provider_candidates(
             ));
             continue;
         }
+        let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
+            Ok(modalities) => modalities,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("resolving served modalities: {err:#}"),
+                    None,
+                ));
+                continue;
+            }
+        };
         let feasibility = match provider_context_feasibility(
             enclave,
             model,
+            &artifact_name,
             &artifact,
+            &served_modalities,
             verdict,
             hardware,
             args,
@@ -38429,6 +41208,22 @@ fn build_provider_candidates(
             }
         };
         let served_ctx = feasibility.served_ctx;
+        let modality_capacities = match provider_modality_capacities(
+            model,
+            &artifact_name,
+            &served_modalities,
+            &args.modality_limits,
+        ) {
+            Ok(capacities) => capacities,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("resolving modality capacity: {err:#}"),
+                    None,
+                ));
+                continue;
+            }
+        };
         let price_ctx_bracket = price_ctx_bracket_for_model_class(
             &enclave.model_class,
             served_ctx,
@@ -38461,6 +41256,8 @@ fn build_provider_candidates(
             verdict: verdict.clone(),
             price: Some(price),
             served_ctx,
+            served_modalities,
+            modality_capacities,
             feasibility,
             ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
         });
@@ -38524,6 +41321,98 @@ fn build_provider_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn normalize_provider_modality(value: &str) -> Result<String> {
+    let modality = value.trim().to_ascii_lowercase();
+    if !matches!(
+        modality.as_str(),
+        "text" | "embedding" | "image" | "video" | "audio"
+    ) {
+        bail!("unsupported provider modality {value:?}; expected text, embedding, image, video, or audio");
+    }
+    Ok(modality)
+}
+
+fn normalized_provider_disabled_modalities(values: &[String]) -> Result<BTreeSet<String>> {
+    let mut disabled = BTreeSet::new();
+    for value in values {
+        let modality = normalize_provider_modality(value)?;
+        if !disabled.insert(modality.clone()) {
+            bail!("provider modality {modality} is disabled more than once");
+        }
+    }
+    Ok(disabled)
+}
+
+fn provider_core_modalities(model_class: &str) -> BTreeSet<&'static str> {
+    match model_class {
+        DEFAULT_MODEL_CLASS => BTreeSet::from(["text"]),
+        MODEL_CLASS_EMBEDDING => BTreeSet::from(["embedding"]),
+        MODEL_CLASS_IMAGE_GENERATION => BTreeSet::from(["image"]),
+        MODEL_CLASS_VIDEO_GENERATION => BTreeSet::from(["video"]),
+        MODEL_CLASS_STT => BTreeSet::from(["audio", "text"]),
+        MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+            BTreeSet::from(["audio"])
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
+fn resolve_provider_served_modalities(
+    model_class: &str,
+    enabled: &[String],
+    disabled_values: &[String],
+) -> Result<Vec<String>> {
+    if enabled.is_empty() {
+        bail!(
+            "catalog modality_set is empty; the admin must publish an explicit modality assessment"
+        );
+    }
+    let disabled = normalized_provider_disabled_modalities(disabled_values)?;
+    let core = provider_core_modalities(model_class);
+    if let Some(modality) = disabled
+        .iter()
+        .find(|modality| core.contains(modality.as_str()) && enabled.contains(modality))
+    {
+        bail!("provider cannot disable core {modality} modality for model class {model_class}");
+    }
+    let served = enabled
+        .iter()
+        .filter(|modality| !disabled.contains(modality.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if served.is_empty() {
+        bail!("provider modality opt-out would leave no served modalities");
+    }
+    Ok(served)
+}
+
+fn provider_served_modalities(
+    model: &catalog::CatalogModel,
+    disabled: &[String],
+) -> Result<Vec<String>> {
+    resolve_provider_served_modalities(&model.model_class, &model.adapter.modality_set, disabled)
+}
+
+fn ledger_enclave_served_modalities(
+    enclave: &LedgerEnclave,
+    disabled: &[String],
+) -> Result<Vec<String>> {
+    let enabled = enclave
+        .caps
+        .get("modality_set")
+        .and_then(Value::as_array)
+        .context("admin enclave caps are missing explicit modality_set")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .context("admin enclave caps modality_set entries must be strings")
+                .and_then(normalize_provider_modality)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    resolve_provider_served_modalities(&enclave.model_class, &enabled, disabled)
 }
 
 fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) -> bool {
@@ -39518,6 +42407,18 @@ fn serve_state_matches_context_terms(
     if existing.get("served_ctx").and_then(Value::as_u64) != Some(serve_terms.served_ctx) {
         return false;
     }
+    let existing_modalities = existing
+        .get("served_modalities")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    let expected_modalities = serve_terms
+        .served_modalities
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if existing_modalities.as_deref() != Some(expected_modalities.as_slice()) {
+        return false;
+    }
     let existing_ctx_bracket = existing.get("ctx_bracket").and_then(Value::as_str);
     if existing_ctx_bracket != serve_terms.ctx_bracket.as_deref() {
         return false;
@@ -39993,7 +42894,18 @@ async fn send_provider_heartbeat_round(
 ) -> Result<Vec<Value>> {
     let mut sent = Vec::new();
     let caps = provider_heartbeat_caps(selected);
-    let (tok_s, tok_s_source) = provider_heartbeat_tok_s(load, selected.verdict.est_tok_s);
+    let (tok_s, tok_s_source) = provider_heartbeat_tok_s(&load, selected.verdict.est_tok_s);
+    let mut modality_capacity = selected.modality_capacities.clone();
+    for (modality, active_items) in &load.modality_active_items {
+        let capacity = modality_capacity
+            .get_mut(modality)
+            .with_context(|| format!("heartbeat load references unknown modality {modality}"))?;
+        ensure!(
+            *active_items <= capacity.max_inflight_items,
+            "heartbeat active {modality} items exceed configured in-flight limit"
+        );
+        capacity.active_items = *active_items;
+    }
     for room in rooms {
         if join_rooms {
             bridge
@@ -40004,7 +42916,7 @@ async fn send_provider_heartbeat_round(
         let ts = unix_epoch_millis()?;
         let mut heartbeat = json!({
             "t": "hb",
-            "v": 1,
+            "v": HEARTBEAT_SCHEMA_VERSION,
             "contract_version": CONTRACT_VERSION,
             "provider": provider_pubkey,
             "enclave_id": selected.enclave.enclave_id,
@@ -40040,6 +42952,8 @@ async fn send_provider_heartbeat_round(
                 "json": caps.json,
                 "ctx": caps.ctx,
                 "vision": caps.vision,
+                "served_modalities": &selected.served_modalities,
+                "modality_capacity": &modality_capacity,
             },
             "att": {
                 "epoch": attestation.report.boot_epoch,
@@ -40068,13 +42982,14 @@ async fn send_provider_heartbeat_round(
             "transport_peer": transport_peer,
             "accepting_new": load.accepting_new,
             "identity_anchor": identity_anchor,
+            "served_modalities": &selected.served_modalities,
         }));
     }
     Ok(sent)
 }
 
 fn provider_heartbeat_tok_s(
-    load: ProviderLoadSnapshot,
+    load: &ProviderLoadSnapshot,
     cold_start_prior: Option<f64>,
 ) -> (Option<f64>, &'static str) {
     if let Some(measured) = load.measured_tok_s_milli {
@@ -40209,6 +43124,13 @@ fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
     if !backend_supports_tool_calls(&selected.enclave.backend) {
         caps.tools = false;
     }
+    if !selected
+        .served_modalities
+        .iter()
+        .any(|modality| modality == "image")
+    {
+        caps.vision = false;
+    }
     caps
 }
 
@@ -40298,7 +43220,7 @@ async fn serve_provider_sessions(
     );
 
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
-    let heartbeat_load = ProviderHeartbeatLoad::default();
+    let heartbeat_load = ProviderHeartbeatLoad::new(&ctx.selected.modality_capacities);
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
     let engine_watchdog_restart_after_millis = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MS",
@@ -40408,7 +43330,10 @@ async fn serve_provider_sessions(
                 match reload_provider_session_responder(
                     &mut responder,
                     reason.clone(),
-                    || provider_session_responder(&ctx),
+                    || {
+                        provider_session_responder_with_modality_health(&ctx)
+                            .map(|(responder, _)| responder)
+                    },
                 ) {
                     Ok(()) => {
                         engine_recovery.mark_recovered();
@@ -40535,7 +43460,10 @@ async fn serve_provider_sessions(
                     match reload_provider_session_responder(
                         &mut responder,
                         restart_reason,
-                        || provider_session_responder(&ctx),
+                        || {
+                            provider_session_responder_with_modality_health(&ctx)
+                                .map(|(responder, _)| responder)
+                        },
                     ) {
                         Ok(()) => {
                             engine_watchdog.reset_after_restart();
@@ -41052,6 +43980,454 @@ fn provider_session_request_body_from_frame(
         .map_err(|err| anyhow::anyhow!("reassembling s.req body_ref failed: {err}"))
 }
 
+fn validate_provider_session_modalities(required: &[String], served: &[String]) -> Result<()> {
+    if required.is_empty() {
+        bail!("spend voucher required_modalities must not be empty");
+    }
+    let mut seen = BTreeSet::new();
+    for modality in required {
+        let modality = normalize_provider_modality(modality)?;
+        if !seen.insert(modality.clone()) {
+            bail!("spend voucher required_modalities duplicates {modality}");
+        }
+        if !served.contains(&modality) {
+            bail!("provider does not serve required {modality} modality");
+        }
+    }
+    Ok(())
+}
+
+fn provider_session_request_modalities(family: &str, body: &Value) -> Result<Vec<String>> {
+    let mut modalities = match provider_endpoint_transport_kind(family)? {
+        "embedding" => vec!["embedding".to_owned()],
+        "image_generation" => vec!["image".to_owned()],
+        "audio_speech" | "audio_generation" | "music_generation" => vec!["audio".to_owned()],
+        "audio_transcription" => vec!["audio".to_owned(), "text".to_owned()],
+        "video_generation" => vec!["video".to_owned()],
+        "chat" => vec!["text".to_owned()],
+        other => bail!("unsupported provider request kind {other}"),
+    };
+    if provider_endpoint_transport_kind(family)? == "chat" {
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for message in messages {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("image_url") if !modalities.iter().any(|value| value == "image") => {
+                        modalities.push("image".to_owned());
+                    }
+                    Some("input_audio") if !modalities.iter().any(|value| value == "audio") => {
+                        modalities.push("audio".to_owned());
+                    }
+                    Some("video") if !modalities.iter().any(|value| value == "video") => {
+                        modalities.push("video".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(modalities)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderChatMediaStats {
+    image_count: u32,
+    image_max_bytes: u64,
+    image_max_pixels: u64,
+    audio_count: u32,
+    audio_max_bytes: u64,
+    audio_max_seconds: u64,
+    audio_seconds: u64,
+    video_count: u32,
+    video_max_bytes: u64,
+    video_max_frames: u64,
+}
+
+fn provider_chat_media_stats(body: &Value) -> Result<ProviderChatMediaStats> {
+    let mut stats = ProviderChatMediaStats::default();
+    let mut media_parts = 0_u64;
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("image_url") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .or_else(|| part.get("url"))
+                        .and_then(Value::as_str)
+                        .context("image_url content is missing image_url.url")?;
+                    let (bytes, pixels) = validate_provider_chat_image_data_url(url)?;
+                    stats.image_count = stats.image_count.saturating_add(1);
+                    stats.image_max_bytes = stats.image_max_bytes.max(bytes);
+                    stats.image_max_pixels = stats.image_max_pixels.max(pixels);
+                }
+                Some("input_audio") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let audio = part
+                        .get("input_audio")
+                        .context("input_audio content is missing input_audio")?;
+                    let (bytes, seconds) = validate_provider_chat_audio_input(audio)?;
+                    stats.audio_count = stats.audio_count.saturating_add(1);
+                    stats.audio_max_bytes = stats.audio_max_bytes.max(bytes);
+                    stats.audio_max_seconds = stats.audio_max_seconds.max(seconds);
+                    stats.audio_seconds = stats.audio_seconds.saturating_add(seconds);
+                }
+                Some("video") => {
+                    media_parts = media_parts.saturating_add(1);
+                    let video = part
+                        .get("video")
+                        .context("video content is missing video")?;
+                    let (bytes, frames) = validate_provider_chat_video_input(video)?;
+                    stats.video_count = stats.video_count.saturating_add(1);
+                    stats.video_max_bytes = stats.video_max_bytes.max(bytes);
+                    stats.video_max_frames = stats.video_max_frames.max(frames);
+                }
+                _ => {}
+            }
+        }
+    }
+    ensure!(
+        media_parts <= u64::from(MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST),
+        "chat request exceeds the provider media schema item ceiling"
+    );
+    Ok(stats)
+}
+
+fn validate_provider_chat_image_data_url(url: &str) -> Result<(u64, u64)> {
+    let rest = url
+        .strip_prefix("data:")
+        .context("remote image URLs are not fetched; use a base64 image data URL")?;
+    let (metadata, encoded) = rest
+        .split_once(',')
+        .context("image data URL is malformed")?;
+    let mut metadata_parts = metadata.split(';');
+    let content_type = metadata_parts.next().unwrap_or_default();
+    ensure!(
+        matches!(content_type, "image/png" | "image/jpeg")
+            && metadata_parts.any(|entry| entry == "base64"),
+        "image data URL must be base64 PNG or JPEG"
+    );
+    ensure!(
+        encoded.len()
+            <= usize::try_from(MAX_PROVIDER_MODALITY_ITEM_BYTES)
+                .unwrap_or(usize::MAX / 4)
+                .saturating_mul(4)
+                .div_ceil(3)
+                .saturating_add(4),
+        "image input exceeds the provider media schema byte ceiling"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("image data URL contains invalid base64")?;
+    ensure!(
+        !bytes.is_empty()
+            && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PROVIDER_MODALITY_ITEM_BYTES,
+        "image input exceeds the provider media schema byte ceiling"
+    );
+    let (width, height) = ImageReader::new(io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .context("image input format is invalid")?
+        .into_dimensions()
+        .context("image input cannot be decoded")?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    ensure!(
+        width > 0 && height > 0 && pixels <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
+        "image input exceeds the provider media schema pixel ceiling"
+    );
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), pixels))
+}
+
+fn validate_provider_chat_audio_input(audio: &Value) -> Result<(u64, u64)> {
+    let format = audio
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("wav")
+        .to_ascii_lowercase();
+    ensure!(
+        format == "wav",
+        "input_audio currently requires format=wav for bounded decoding and exact metering"
+    );
+    let encoded = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("input_audio.data is required")?;
+    ensure!(
+        encoded.len()
+            <= usize::try_from(MAX_PROVIDER_MODALITY_ITEM_BYTES)
+                .unwrap_or(usize::MAX / 4)
+                .saturating_mul(4)
+                .div_ceil(3)
+                .saturating_add(4),
+        "audio input exceeds the provider media schema byte ceiling"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("input_audio.data contains invalid base64")?;
+    ensure!(
+        !bytes.is_empty()
+            && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PROVIDER_MODALITY_ITEM_BYTES,
+        "audio input exceeds the provider media schema byte ceiling"
+    );
+    let seconds =
+        wav_duration_seconds_ceil(&bytes).context("input_audio is not a valid bounded WAV")?;
+    ensure!(
+        (1..=MAX_PROVIDER_MODALITY_ITEM_UNITS).contains(&seconds),
+        "audio input exceeds the provider media schema duration ceiling"
+    );
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), seconds))
+}
+
+fn validate_provider_chat_video_input(video: &Value) -> Result<(u64, u64)> {
+    let content_type = video
+        .get("content_type")
+        .and_then(Value::as_str)
+        .context("video.content_type is required")?;
+    ensure!(
+        matches!(content_type, "video/mp4" | "video/webm" | "video/quicktime"),
+        "video.content_type must be video/mp4, video/webm, or video/quicktime"
+    );
+    let encoded = video
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("video.data is required")?;
+    ensure!(
+        encoded.len()
+            <= usize::try_from(MAX_PROVIDER_MODALITY_ITEM_BYTES)
+                .unwrap_or(usize::MAX / 4)
+                .saturating_mul(4)
+                .div_ceil(3)
+                .saturating_add(4),
+        "video input exceeds the provider media schema byte ceiling"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("video.data contains invalid base64")?;
+    ensure!(
+        !bytes.is_empty()
+            && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PROVIDER_MODALITY_ITEM_BYTES,
+        "video input exceeds the provider media schema byte ceiling"
+    );
+    let frames = video
+        .get("num_frames")
+        .and_then(Value::as_u64)
+        .filter(|frames| *frames > 0)
+        .context("video.num_frames must be a positive integer")?;
+    ensure!(
+        frames <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
+        "video input exceeds the provider media schema frame ceiling"
+    );
+    if let Some(fps) = video.get("fps") {
+        fps.as_f64()
+            .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
+            .context("video.fps must be a finite number between 0 and 240")?;
+    }
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
+}
+
+fn validate_provider_session_request_modalities(
+    active: &ActiveProviderSession,
+    terms: &ProviderSessionTerms,
+    body: &Value,
+) -> Result<BTreeMap<String, u32>> {
+    let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
+    validate_provider_session_modalities(&active.required_modalities, &terms.served_modalities)?;
+    let actual = provider_session_request_modalities(verified.family, verified.request)?;
+    if actual != active.required_modalities {
+        bail!(
+            "request modalities {:?} do not match signed voucher modalities {:?}",
+            actual,
+            active.required_modalities
+        );
+    }
+    let load = provider_session_modality_load(verified.family, verified.request, body)?;
+    for modality in actual.iter().filter(|modality| modality.as_str() != "text") {
+        let request = load
+            .get(modality)
+            .with_context(|| format!("request has no measured {modality} load"))?;
+        let capacity = terms
+            .modality_capacities
+            .get(modality)
+            .with_context(|| format!("provider has no advertised {modality} capacity"))?;
+        ensure!(
+            request.item_count > 0
+                && request.item_count <= capacity.max_items_per_request
+                && request.max_item_bytes > 0
+                && request.max_item_bytes <= capacity.max_item_bytes
+                && request.max_item_units > 0
+                && request.max_item_units <= capacity.max_item_units,
+            "request exceeds provider {modality} capacity: items {} of {}, bytes {} of {}, units {} of {}",
+            request.item_count,
+            capacity.max_items_per_request,
+            request.max_item_bytes,
+            capacity.max_item_bytes,
+            request.max_item_units,
+            capacity.max_item_units
+        );
+    }
+    Ok(load
+        .into_iter()
+        .map(|(modality, load)| (modality, load.item_count))
+        .collect())
+}
+
+fn provider_session_modality_load(
+    family: &str,
+    body: &Value,
+    transport_body: &Value,
+) -> Result<BTreeMap<String, ModalityRequestLoad>> {
+    match provider_endpoint_transport_kind(family)? {
+        "chat" => {
+            let media = provider_chat_media_stats(body)?;
+            let mut load = BTreeMap::new();
+            if media.image_count > 0 {
+                load.insert(
+                    "image".to_owned(),
+                    ModalityRequestLoad {
+                        item_count: media.image_count,
+                        max_item_bytes: media.image_max_bytes,
+                        max_item_units: media.image_max_pixels,
+                    },
+                );
+            }
+            if media.audio_count > 0 {
+                load.insert(
+                    "audio".to_owned(),
+                    ModalityRequestLoad {
+                        item_count: media.audio_count,
+                        max_item_bytes: media.audio_max_bytes,
+                        max_item_units: media.audio_max_seconds,
+                    },
+                );
+            }
+            if media.video_count > 0 {
+                load.insert(
+                    "video".to_owned(),
+                    ModalityRequestLoad {
+                        item_count: media.video_count,
+                        max_item_bytes: media.video_max_bytes,
+                        max_item_units: media.video_max_frames,
+                    },
+                );
+            }
+            Ok(load)
+        }
+        "embedding" => {
+            let inputs = provider_embedding_input_texts_from_body(body)?;
+            let max_item_bytes = inputs
+                .iter()
+                .map(|input| u64::try_from(input.len()).unwrap_or(u64::MAX))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let max_item_units = inputs
+                .iter()
+                .map(|input| rough_text_tokens(input))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            Ok(BTreeMap::from([(
+                "embedding".to_owned(),
+                ModalityRequestLoad {
+                    item_count: u32::try_from(inputs.len()).unwrap_or(u32::MAX).max(1),
+                    max_item_bytes,
+                    max_item_units,
+                },
+            )]))
+        }
+        "image_generation" => {
+            let request = provider_image_generation_request_from_body(family, body)?;
+            Ok(BTreeMap::from([(
+                "image".to_owned(),
+                ModalityRequestLoad {
+                    item_count: request.image_count,
+                    max_item_bytes: 1,
+                    max_item_units: u64::from(request.width)
+                        .saturating_mul(u64::from(request.height)),
+                },
+            )]))
+        }
+        "audio_transcription" => {
+            let request =
+                provider_audio_transcription_request_from_body(family, body, transport_body)?;
+            Ok(BTreeMap::from([(
+                "audio".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: u64::try_from(request.engine.audio.len())
+                        .unwrap_or(u64::MAX)
+                        .max(1),
+                    max_item_units: request.audio_seconds.max(1),
+                },
+            )]))
+        }
+        "audio_speech" => {
+            let request = provider_speech_request_from_body(family, body)?;
+            let estimated_seconds = u64::try_from(request.input.chars().count())
+                .unwrap_or(u64::MAX)
+                .div_ceil(12)
+                .max(1);
+            Ok(BTreeMap::from([(
+                "audio".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 1,
+                    max_item_units: estimated_seconds,
+                },
+            )]))
+        }
+        "video_generation" => {
+            let request = provider_media_generation_request_from_body(family, body)?;
+            let frames = request
+                .frame_count
+                .or_else(|| {
+                    request
+                        .duration_seconds
+                        .map(|seconds| seconds.saturating_mul(24))
+                })
+                .unwrap_or(1)
+                .max(1);
+            Ok(BTreeMap::from([(
+                "video".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 1,
+                    max_item_units: frames,
+                },
+            )]))
+        }
+        "audio_generation" | "music_generation" => {
+            let request = provider_media_generation_request_from_body(family, body)?;
+            Ok(BTreeMap::from([(
+                "audio".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 1,
+                    max_item_units: request.duration_seconds.unwrap_or(1).max(1),
+                },
+            )]))
+        }
+        other => bail!("unsupported provider request kind {other}"),
+    }
+}
+
 fn provider_session_request_timeout() -> Result<Duration> {
     let configured = std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MS").ok();
     provider_session_request_timeout_from(configured.as_deref())
@@ -41072,11 +44448,7 @@ fn provider_session_request_timeout_from(configured: Option<&str>) -> Result<Dur
 }
 
 fn provider_session_request_limits(terms: &ProviderSessionTerms) -> Result<(usize, usize)> {
-    let ctx = usize::try_from(terms.ctx).context("provider context exceeds platform range")?;
-    let derived_max = ctx
-        .checked_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
-        .context("provider request byte limit overflowed platform range")?
-        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+    let (derived_max, derived_max_chunks) = provider_session_derived_request_limits(terms)?;
     let max_bytes = match std::env::var("MAYHEM_PROVIDER_SESSION_MAX_REQUEST_BYTES").ok() {
         Some(value) => value
             .trim()
@@ -41086,6 +44458,10 @@ fn provider_session_request_limits(terms: &ProviderSessionTerms) -> Result<(usiz
             .context("MAYHEM_PROVIDER_SESSION_MAX_REQUEST_BYTES must be a positive integer")?,
         None => derived_max,
     };
+    ensure!(
+        max_bytes >= derived_max,
+        "MAYHEM_PROVIDER_SESSION_MAX_REQUEST_BYTES ({max_bytes}) is below the {derived_max}-byte context + advertised modality transport budget"
+    );
     let max_chunks = match std::env::var("MAYHEM_SESSION_MAX_PAYLOAD_CHUNKS").ok() {
         Some(value) => value
             .trim()
@@ -41093,9 +44469,43 @@ fn provider_session_request_limits(terms: &ProviderSessionTerms) -> Result<(usiz
             .ok()
             .filter(|value| *value > 0)
             .context("MAYHEM_SESSION_MAX_PAYLOAD_CHUNKS must be a positive integer")?,
-        None => DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+        None => derived_max_chunks,
     };
     Ok((max_bytes, max_chunks))
+}
+
+fn provider_session_derived_request_limits(terms: &ProviderSessionTerms) -> Result<(usize, usize)> {
+    let ctx = usize::try_from(terms.ctx).context("provider context exceeds platform range")?;
+    let text_budget = ctx
+        .checked_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
+        .context("provider request byte limit overflowed platform range")?;
+    let media_budget = terms
+        .modality_capacities
+        .values()
+        .map(|capacity| {
+            let raw_bytes = capacity
+                .max_item_bytes
+                .saturating_mul(u64::from(capacity.max_items_per_request));
+            provider_session_base64_encoded_len(raw_bytes)
+        })
+        .fold(0_u64, u64::saturating_add);
+    let media_budget = usize::try_from(media_budget).unwrap_or(usize::MAX);
+    let derived_max = text_budget
+        .saturating_add(media_budget)
+        .saturating_add(DEFAULT_PROVIDER_SESSION_REQUEST_JSON_OVERHEAD_BYTES)
+        .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+    let derived_max_chunks = derived_max
+        .div_ceil(1024)
+        .max(DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS);
+    Ok((derived_max, derived_max_chunks))
+}
+
+fn provider_session_base64_encoded_len(raw_bytes: u64) -> u64 {
+    let full_groups = raw_bytes / 3;
+    let remainder = raw_bytes % 3;
+    full_groups
+        .saturating_mul(4)
+        .saturating_add(if remainder == 0 { 0 } else { 4 })
 }
 
 fn record_provider_session_request_progress(
@@ -41271,6 +44681,7 @@ async fn handle_provider_session_frame(
                             locked_per_req_au: spend_voucher.body.locked_per_req_au,
                             locked_min_session_au: spend_voucher.body.locked_min_session_au,
                             served_ctx: spend_voucher.body.served_ctx,
+                            required_modalities: spend_voucher.body.required_modalities.clone(),
                             ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                             ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                             checkpoint_every,
@@ -41487,10 +44898,66 @@ async fn handle_provider_session_frame(
                     return Ok(());
                 }
             };
+            let modality_items = match validate_provider_session_request_modalities(
+                &active, terms, &body,
+            ) {
+                Ok(items) => items,
+                Err(err) => {
+                    provider_session_debug(format!(
+                            "request modality/capacity validation failed for session {session_id}: {err:#}"
+                        ));
+                    send_provider_session_error(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        request_id,
+                        "modality_capacity",
+                        &err.to_string(),
+                    )
+                    .await?;
+                    send_provider_session_close(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        "err:modality_capacity",
+                    )
+                    .await?;
+                    sessions.remove(&session_id);
+                    pending_requests.remove(&session_id);
+                    remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                    heartbeat_load.set_active_sessions(sessions.len());
+                    return Ok(());
+                }
+            };
             provider_session_debug(format!(
                 "building response for session {session_id} request {request_id}"
             ));
-            let mut request_load = heartbeat_load.begin_request();
+            let mut request_load = match heartbeat_load.begin_request(modality_items) {
+                Ok(load) => load,
+                Err(err) => {
+                    send_provider_session_error(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        request_id,
+                        "capacity",
+                        &err.to_string(),
+                    )
+                    .await?;
+                    send_provider_session_close(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        "err:capacity",
+                    )
+                    .await?;
+                    sessions.remove(&session_id);
+                    pending_requests.remove(&session_id);
+                    remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                    heartbeat_load.set_active_sessions(sessions.len());
+                    return Ok(());
+                }
+            };
             let request_started = request_load.started();
             let mut live_stream = responder.supports_live_text_streaming().then(|| {
                 ProviderSessionLiveStream::new(
@@ -43119,20 +46586,45 @@ fn provider_session_prompt_hash(body: &Value) -> String {
 }
 
 fn provider_session_prompt_text(body: &Value) -> String {
-    if body.get("kind").and_then(Value::as_str) == Some("embedding") {
+    let endpoint_family = body
+        .get("mayhem_contract")
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    let body = body.get("contract_request").unwrap_or(body);
+    if matches!(
+        endpoint_family,
+        Some(
+            mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
+        )
+    ) {
         return provider_embedding_prompt_text(body);
     }
-    if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
-        return stable_json_value(body).to_string();
-    }
     if matches!(
-        body.get("kind").and_then(Value::as_str),
-        Some("audio_transcription" | "audio_speech")
+        endpoint_family,
+        Some(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+        )
     ) {
         return stable_json_value(body).to_string();
     }
-    body.get("messages")
-        .and_then(Value::as_array)
+    if matches!(
+        endpoint_family,
+        Some(
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+                | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+                | mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+                | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+                | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+        )
+    ) {
+        return stable_json_value(body).to_string();
+    }
+    endpoint_family
+        .and_then(|family| provider_endpoint_messages(family, body).ok())
+        .or_else(|| body.get("messages").and_then(Value::as_array).cloned())
         .map(|messages| {
             messages
                 .iter()
@@ -43157,6 +46649,7 @@ fn provider_embedding_prompt_text(body: &Value) -> String {
 fn provider_embedding_input_texts_from_body(body: &Value) -> Result<Vec<String>> {
     let input = body
         .get("input")
+        .or_else(|| body.get("inputs"))
         .context("embedding request missing input")?;
     provider_embedding_input_texts_from_value(input)
 }
@@ -43388,6 +46881,279 @@ fn provider_session_responder(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProviderModalityHealthReport {
+    prompt_id: String,
+    modalities: Vec<String>,
+    engine: String,
+    ok: bool,
+}
+
+fn provider_modality_self_test(
+    ctx: &ProviderSessionContext<'_>,
+    responder: &mut dyn ProviderSessionResponder,
+    canaries_dir: &Path,
+) -> Result<Vec<ProviderModalityHealthReport>> {
+    let terms = provider_session_terms(ctx)?;
+    let prompts = load_canary_prompts_checked(
+        Some(canaries_dir),
+        &ctx.selected.model.canary.set_id,
+        None,
+        false,
+    )?;
+    let served = ctx
+        .selected
+        .served_modalities
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut missing = served.clone();
+    let mut candidates = prompts
+        .iter()
+        .filter_map(|prompt| {
+            let modalities = provider_canary_prompt_modalities(&ctx.selected.model, prompt);
+            (!modalities.is_empty() && modalities.iter().all(|modality| served.contains(modality)))
+                .then_some((prompt, modalities))
+        })
+        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    while !missing.is_empty() {
+        candidates.sort_by_key(|(_, modalities)| {
+            std::cmp::Reverse(
+                modalities
+                    .iter()
+                    .filter(|modality| missing.contains(*modality))
+                    .count(),
+            )
+        });
+        let Some((prompt, modalities)) = candidates
+            .iter()
+            .find(|(_, modalities)| modalities.iter().any(|modality| missing.contains(modality)))
+            .cloned()
+        else {
+            bail!(
+                "provider cannot advertise modalities {}: canary set {} has no functional prompt covering {}",
+                served.iter().cloned().collect::<Vec<_>>().join(","),
+                ctx.selected.model.canary.set_id,
+                missing.iter().cloned().collect::<Vec<_>>().join(",")
+            );
+        };
+        for modality in &modalities {
+            missing.remove(modality);
+        }
+        selected.push((prompt, modalities));
+    }
+
+    let mut reports = Vec::new();
+    for (prompt, modalities) in selected {
+        let body = provider_canary_self_test_body(&ctx.selected.model, prompt)?;
+        let body = provider_seal_local_contract_request(
+            &body,
+            &ctx.selected.model.adapter,
+            &ctx.selected.model.model_id,
+        )?;
+        let output = responder
+            .respond(&terms, &body)
+            .with_context(|| format!("functional modality canary {} failed", prompt.id))?;
+        validate_provider_canary_self_test_output(&ctx.selected.model, &output).with_context(
+            || {
+                format!(
+                    "functional modality canary {} returned invalid output",
+                    prompt.id
+                )
+            },
+        )?;
+        reports.push(ProviderModalityHealthReport {
+            prompt_id: prompt.id.clone(),
+            modalities: modalities.into_iter().collect(),
+            engine: ctx.selected.artifact.engine.clone(),
+            ok: true,
+        });
+    }
+    ensure!(
+        responder.component_healthy(),
+        "provider engine became unhealthy during functional modality self-test"
+    );
+    Ok(reports)
+}
+
+fn provider_session_responder_with_modality_health(
+    ctx: &ProviderSessionContext<'_>,
+) -> Result<(
+    Box<dyn ProviderSessionResponder>,
+    Vec<ProviderModalityHealthReport>,
+)> {
+    let mut responder = provider_session_responder(ctx)?;
+    let health = provider_modality_self_test(ctx, responder.as_mut(), ctx.canaries_dir)?;
+    Ok((responder, health))
+}
+
+fn provider_canary_prompt_modalities(
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+) -> BTreeSet<String> {
+    match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => {
+            let mut modalities = BTreeSet::new();
+            if !prompt.messages.is_empty() {
+                modalities.insert("text".to_owned());
+            }
+            for message in &prompt.messages {
+                for part in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("image_url") => {
+                            modalities.insert("image".to_owned());
+                        }
+                        Some("input_audio") => {
+                            modalities.insert("audio".to_owned());
+                        }
+                        Some("video") | Some("video_url") | Some("input_video") => {
+                            modalities.insert("video".to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            modalities
+        }
+        "embedding" => BTreeSet::from(["embedding".to_owned()]),
+        "image-generation" => BTreeSet::from(["image".to_owned()]),
+        "video-generation" => BTreeSet::from(["video".to_owned()]),
+        "stt" => BTreeSet::from(["audio".to_owned(), "text".to_owned()]),
+        "tts" | "audio-generation" | "music-generation" => BTreeSet::from(["audio".to_owned()]),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn provider_canary_self_test_body(
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+) -> Result<Value> {
+    match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => Ok(json!({
+            "messages": &prompt.messages,
+            "tools": &prompt.tools,
+            "temperature": prompt.temperature,
+            "top_p": prompt.top_p,
+            "top_k": prompt.top_k,
+            "min_p": prompt.min_p,
+            "seed": prompt.seed,
+            "max_tokens": prompt.max_tokens.unwrap_or(4).clamp(1, 4),
+            "stream": false,
+        })),
+        "embedding" => Ok(json!({
+            "kind": "embedding",
+            "input": canary_prompt_text(prompt)?,
+        })),
+        "image-generation" => Ok(json!({
+            "kind": "image_generation",
+            "prompt": canary_prompt_text(prompt)?,
+            "n": 1,
+            "size": prompt.size.clone().unwrap_or_else(|| "64x64".to_owned()),
+            "steps": prompt.steps.unwrap_or(1).clamp(1, 2),
+            "cfg_scale": prompt.cfg_scale.unwrap_or(1.0),
+            "seed": prompt.seed.unwrap_or(7),
+        })),
+        "video-generation" => Ok(json!({
+            "kind": "video_generation",
+            "prompt": canary_prompt_text(prompt)?,
+            "seconds": "4",
+            "size": prompt.size.clone().unwrap_or_else(|| "1280x720".to_owned()),
+        })),
+        "stt" => {
+            let audio = base64::engine::general_purpose::STANDARD
+                .decode(
+                    prompt
+                        .audio_b64
+                        .as_deref()
+                        .context("STT modality canary is missing audio_b64")?,
+                )
+                .context("STT modality canary audio_b64 is invalid")?;
+            Ok(json!({
+                "kind": "audio_transcription",
+                "audio": {
+                    "encoding": "hex",
+                    "data": hex_encode(&audio),
+                    "content_type": prompt.content_type.clone().unwrap_or_else(|| "audio/wav".to_owned()),
+                },
+                "audio_seconds": wav_duration_seconds_ceil(&audio).unwrap_or(1),
+                "language": prompt.language,
+            }))
+        }
+        "tts" => Ok(json!({
+            "kind": "audio_speech",
+            "input": canary_prompt_text(prompt)?,
+            "voice": prompt.voice,
+            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
+        })),
+        "audio-generation" => Ok(json!({
+            "kind": "audio_generation",
+            "prompt": canary_prompt_text(prompt)?,
+            "duration_seconds": 1.0,
+            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
+            "seed": prompt.seed.unwrap_or(7),
+        })),
+        "music-generation" => Ok(json!({
+            "kind": "music_generation",
+            "prompt": canary_prompt_text(prompt)?,
+            "duration_seconds": 1.0,
+            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
+            "seed": prompt.seed.unwrap_or(7),
+        })),
+        other => bail!("functional modality self-test is not wired for model_class {other}"),
+    }
+}
+
+fn validate_provider_canary_self_test_output(
+    model: &catalog::CatalogModel,
+    output: &ProviderSessionOutput,
+) -> Result<()> {
+    match model.model_class.as_str() {
+        DEFAULT_MODEL_CLASS | "stt" => ensure!(
+            !output.content.trim().is_empty() || output.tool.is_some(),
+            "text modality canary produced no text or tool output"
+        ),
+        "embedding" => ensure!(
+            output
+                .embeddings
+                .as_ref()
+                .is_some_and(|embeddings| !embeddings.is_empty()
+                    && embeddings.iter().all(|row| !row.is_empty())),
+            "embedding modality canary produced no embedding vectors"
+        ),
+        "image-generation" => ensure!(
+            output
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.content_type.starts_with("image/")),
+            "image modality canary produced no image artifact"
+        ),
+        "video-generation" => ensure!(
+            output
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.content_type.starts_with("video/")),
+            "video modality canary produced no video artifact"
+        ),
+        "tts" | "audio-generation" | "music-generation" => ensure!(
+            output
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.content_type.starts_with("audio/")),
+            "audio modality canary produced no audio artifact"
+        ),
+        other => {
+            bail!("functional modality output validation is not wired for model_class {other}")
+        }
+    }
+    Ok(())
 }
 
 fn provider_engine_load_config(
@@ -43851,6 +47617,9 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
         adapter: ctx.selected.model.adapter.clone(),
+        sampling: ctx.selected.model.sampling.clone(),
+        served_modalities: ctx.selected.served_modalities.clone(),
+        modality_capacities: ctx.selected.modality_capacities.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
         rate_map: price.rate_map.clone(),
@@ -43926,14 +47695,24 @@ fn provider_session_contract_decision(
             "enclave record is explicitly not admin-created".to_owned(),
         );
     }
-    if !contract.serves.iter().any(|serve| {
+    let active_serve = contract.serves.iter().find(|serve| {
         serve.provider == terms.provider
             && serve.enclave_id == terms.enclave_id
             && serve.status == "active"
-    }) {
+    });
+    if active_serve.is_none() {
         return reject(
             "SERVE",
             "provider is no longer actively serving this admin enclave".to_owned(),
+        );
+    }
+    if active_serve.map(|serve| serve.served_modalities.as_slice())
+        != Some(terms.served_modalities.as_slice())
+    {
+        return reject(
+            "SERVE",
+            "provider committed modalities changed; restart against current contract state"
+                .to_owned(),
         );
     }
     let Some(schedule) = contract
@@ -44108,6 +47887,7 @@ fn provider_session_spend_reservation_value(
         "price_ver": spend_voucher.body.price_ver,
         "rules_ver": terms.rules_ver,
         "served_ctx": spend_voucher.body.served_ctx,
+        "required_modalities": spend_voucher.body.required_modalities,
         "ctx_bracket": spend_voucher.body.ctx_bracket,
         "ctx_bracket_table_ver": spend_voucher.body.ctx_bracket_table_ver,
         "max_spend_au": money_au_json(spend_voucher.body.max_spend_au),
@@ -44129,6 +47909,7 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "price_ver": value.get("price_ver").cloned().unwrap_or(Value::Null),
         "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
         "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
+        "required_modalities": value.get("required_modalities").cloned().unwrap_or(Value::Null),
         "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
         "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
         "max_spend_au": value.get("max_spend_au").cloned().unwrap_or(Value::Null),
@@ -44301,6 +48082,12 @@ fn provider_session_open_decision(
             "VOUCHER",
             "voucher served_ctx does not match provider committed context".to_owned(),
         );
+    }
+    if let Err(err) = validate_provider_session_modalities(
+        &voucher.body.required_modalities,
+        &terms.served_modalities,
+    ) {
+        return reject("MODALITY", err.to_string());
     }
     if frame.get("served_ctx").and_then(Value::as_u64) != Some(u64::from(voucher.body.served_ctx)) {
         return reject("VOUCHER", "frame served_ctx mismatch".to_owned());
@@ -44538,14 +48325,262 @@ fn provider_session_configured_limit(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+struct ProviderVerifiedEndpointRequest<'a> {
+    family: &'a str,
+    request: &'a Value,
+}
+
+fn provider_verify_endpoint_request<'a>(
+    transport_body: &'a Value,
+    expected_model_id: Option<&str>,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<ProviderVerifiedEndpointRequest<'a>> {
+    let metadata = transport_body
+        .get("mayhem_contract")
+        .and_then(Value::as_object)
+        .context("provider request missing mayhem_contract envelope")?;
+    ensure!(
+        metadata.get("schema_version").and_then(Value::as_u64) == Some(1),
+        "provider request has unsupported mayhem_contract schema_version"
+    );
+    let family = metadata
+        .get("endpoint_family")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("provider request missing endpoint_family")?;
+    let contract = adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == family)
+        .with_context(|| format!("provider model does not expose endpoint family {family}"))?;
+    let declared_contract_fingerprint = metadata
+        .get("endpoint_contract_fingerprint")
+        .and_then(Value::as_str)
+        .context("provider request missing endpoint contract fingerprint")?;
+    ensure!(
+        declared_contract_fingerprint == mayhem_proto::endpoint_contract_fingerprint(contract),
+        "provider request endpoint contract fingerprint does not match the local signed catalog"
+    );
+    let request = transport_body
+        .get("contract_request")
+        .context("provider request missing normalized contract_request")?;
+    let declared_request_fingerprint = metadata
+        .get("normalized_request_fingerprint")
+        .and_then(Value::as_str)
+        .context("provider request missing normalized request fingerprint")?;
+    ensure!(
+        declared_request_fingerprint == stable_value_hash(request),
+        "provider normalized request fingerprint mismatch"
+    );
+    let mut transport = transport_body.clone();
+    if let Some(object) = transport.as_object_mut() {
+        object.remove("mayhem_contract");
+        object.remove("contract_request");
+    }
+    let declared_transport_fingerprint = metadata
+        .get("transport_request_fingerprint")
+        .and_then(Value::as_str)
+        .context("provider request missing transport request fingerprint")?;
+    ensure!(
+        declared_transport_fingerprint == stable_value_hash(&transport),
+        "provider transport request fingerprint mismatch"
+    );
+    mayhem_proto::validate_endpoint_request(contract, request).map_err(|violations| {
+        anyhow::anyhow!(
+            "provider request violates signed endpoint contract: {}",
+            violations
+                .iter()
+                .take(4)
+                .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
+    if let Some(expected_model_id) = expected_model_id {
+        ensure!(
+            request.get("model").and_then(Value::as_str) == Some(expected_model_id),
+            "provider request model does not match the loaded canonical model"
+        );
+    }
+    ensure!(
+        transport_body.get("kind").and_then(Value::as_str)
+            == Some(provider_endpoint_transport_kind(family)?),
+        "provider request transport kind does not match endpoint family {family}"
+    );
+    Ok(ProviderVerifiedEndpointRequest { family, request })
+}
+
+fn provider_endpoint_transport_kind(family: &str) -> Result<&'static str> {
+    match family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+        | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => Ok("chat"),
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
+            Ok("embedding")
+        }
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => Ok("image_generation"),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+        | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => Ok("audio_transcription"),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+            Ok("audio_speech")
+        }
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            Ok("video_generation")
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => Ok("audio_generation"),
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => Ok("music_generation"),
+        _ => bail!("unsupported provider endpoint family {family}"),
+    }
+}
+
+fn provider_seal_local_contract_request(
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+    model_id: &str,
+) -> Result<Value> {
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("chat");
+    let family = provider_local_endpoint_family(kind);
+    let contract = adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == family)
+        .with_context(|| format!("test adapter missing endpoint family {family}"))?;
+    let mut request = body.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.remove("kind");
+        object.remove("endpoint_family");
+        object.remove("mayhem_contract");
+        object.remove("contract_request");
+        object.entry("model").or_insert_with(|| json!(model_id));
+    }
+    if family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS {
+        let audio = body
+            .get("audio")
+            .and_then(|value| value.get("data"))
+            .and_then(Value::as_str)
+            .map(|value| hex_decode_vec(value, "test audio"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut public = json!({
+            "model": request.get("model").cloned().unwrap_or_else(|| json!("test/model")),
+            "file": {
+                "filename": body.get("audio").and_then(|value| value.get("filename")).and_then(Value::as_str).unwrap_or("test.wav"),
+                "content_type": body.get("audio").and_then(|value| value.get("content_type")).and_then(Value::as_str).unwrap_or("audio/wav"),
+                "bytes": audio.len(),
+                "blake3": blake3::hash(&audio).to_hex().to_string(),
+            }
+        });
+        for key in [
+            "response_format",
+            "language",
+            "prompt",
+            "temperature",
+            "timestamp_granularities",
+            "stream",
+        ] {
+            if let Some(value) = request.get(key) {
+                public[key] = value.clone();
+            }
+        }
+        request = public;
+    }
+    let mut transport = json!({"kind": provider_endpoint_transport_kind(family)?});
+    for key in ["audio", "audio_seconds"] {
+        if let Some(value) = body.get(key) {
+            transport[key] = value.clone();
+        }
+    }
+    let transport_fingerprint = stable_value_hash(&transport);
+    transport["contract_request"] = request.clone();
+    transport["mayhem_contract"] = json!({
+        "schema_version": 1,
+        "endpoint_family": family,
+        "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "normalized_request_fingerprint": stable_value_hash(&request),
+        "transport_request_fingerprint": transport_fingerprint,
+    });
+    Ok(transport)
+}
+
+fn provider_local_endpoint_family(kind: &str) -> &'static str {
+    match kind {
+        "embedding" => mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+        "image_generation" => mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        "audio_transcription" => mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+        "audio_speech" => mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+        "video_generation" => mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+        "audio_generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+        "music_generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        _ => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+    }
+}
+
+#[cfg(test)]
+fn provider_test_seal_contract_request(
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<Value> {
+    provider_seal_local_contract_request(body, adapter, "test/model@4bit")
+}
+
+#[cfg(test)]
+fn provider_test_endpoint_family(kind: &str) -> &'static str {
+    provider_local_endpoint_family(kind)
+}
+
+#[cfg(test)]
 fn provider_engine_session_response(
     backend: &mut dyn EngineBackend,
     adapter: &catalog::CatalogAdapter,
     body: &Value,
+    live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
+) -> Result<ProviderSessionOutput> {
+    let mut adapter = adapter.clone();
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("chat");
+    let family = provider_test_endpoint_family(kind);
+    if !adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == family)
+    {
+        adapter.endpoint_families.push(
+            catalog::endpoint_contract_template(family).with_context(|| {
+                format!("test endpoint family {family} has no built-in contract")
+            })?,
+        );
+    }
+    let sealed = provider_test_seal_contract_request(body, &adapter)?;
+    provider_engine_session_response_with_sampling(
+        backend,
+        None,
+        &adapter,
+        &catalog::CatalogSamplingProfile::default(),
+        &sealed,
+        live_stream,
+    )
+}
+
+fn provider_engine_session_response_with_sampling(
+    backend: &mut dyn EngineBackend,
+    expected_model_id: Option<&str>,
+    adapter: &catalog::CatalogAdapter,
+    sampling: &catalog::CatalogSamplingProfile,
+    body: &Value,
     mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
 ) -> Result<ProviderSessionOutput> {
-    if body.get("kind").and_then(Value::as_str) == Some("audio_transcription") {
-        let request = provider_audio_transcription_request_from_body(body)?;
+    let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
+    let endpoint_family = verified.family;
+    let request_body = verified.request;
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+    ) {
+        let request =
+            provider_audio_transcription_request_from_body(endpoint_family, request_body, body)?;
         let audio_seconds = request.audio_seconds;
         let output = backend
             .transcribe(request.engine)
@@ -44563,8 +48598,11 @@ fn provider_engine_session_response(
         });
     }
 
-    if body.get("kind").and_then(Value::as_str) == Some("audio_speech") {
-        let request = provider_speech_request_from_body(body)?;
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+    ) {
+        let request = provider_speech_request_from_body(endpoint_family, request_body)?;
         let input_characters = u64::try_from(request.input.chars().count())
             .context("audio_speech input character count overflowed u64")?;
         let mut artifact_chunks = Vec::new();
@@ -44591,19 +48629,24 @@ fn provider_engine_session_response(
         });
     }
 
-    if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
-        let (request, image_count, steps) = provider_image_generation_request_from_body(body)?;
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+    ) {
+        let request = provider_image_generation_request_from_body(endpoint_family, request_body)?;
+        let image_count = request.image_count;
+        let steps = u64::from(request.steps);
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .generate_with_artifacts(
-                request,
-                &mut |_chunk: mayhem_engine::TokenChunk| Ok(()),
-                &mut |chunk: ArtifactChunk| {
-                    artifact_chunks.push(chunk);
-                    Ok(())
-                },
-            )
+            .generate_image(request, &mut |chunk: ArtifactChunk| {
+                artifact_chunks.push(chunk);
+                Ok(())
+            })
             .context("generating provider session image artifact with mayhem-engine")?;
+        ensure!(
+            output.image_count == image_count && u64::from(output.steps) == steps,
+            "provider image engine changed the requested image count or step count"
+        );
         let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
         if artifacts.is_empty() {
             bail!("provider image generation engine produced no image artifacts");
@@ -44620,7 +48663,7 @@ fn provider_engine_session_response(
             tool: None,
             embeddings: None,
             artifacts,
-            finish_reason: output.finish_reason.to_string(),
+            finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
             completion_tokens: 0,
             token_ids: Vec::new(),
@@ -44628,10 +48671,133 @@ fn provider_engine_session_response(
         });
     }
 
-    if body.get("kind").and_then(Value::as_str) == Some("embedding") {
-        let inputs = provider_embedding_input_texts_from_body(body)?;
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+    ) {
+        let request = provider_media_generation_request_from_body(endpoint_family, request_body)?;
+        let requested_duration = request.duration_seconds;
+        let requested_frames = request.frame_count;
+        let mut artifact_chunks = Vec::new();
+        let output = backend
+            .generate_video(request, &mut |chunk: ArtifactChunk| {
+                artifact_chunks.push(chunk);
+                Ok(())
+            })
+            .context("generating provider session video artifact with mayhem-engine")?;
+        ensure!(
+            output.duration_seconds > 0 && output.frame_count > 0,
+            "provider video engine returned zero duration or frames"
+        );
+        if let Some(expected) = requested_duration {
+            ensure!(
+                output.duration_seconds == expected,
+                "provider video engine returned {} seconds, expected {expected}",
+                output.duration_seconds
+            );
+        }
+        if let Some(expected) = requested_frames {
+            ensure!(
+                output.frame_count == expected,
+                "provider video engine returned {} frames, expected {expected}",
+                output.frame_count
+            );
+        }
+        let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
+        ensure!(
+            !artifacts.is_empty()
+                && artifacts
+                    .iter()
+                    .all(|artifact| artifact.content_type.starts_with("video/")),
+            "provider video generation engine produced no valid video artifact"
+        );
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            tool: None,
+            embeddings: None,
+            artifacts,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: provider_video_generation_usage(output.duration_seconds, output.frame_count),
+        });
+    }
+
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    ) {
+        let request = provider_media_generation_request_from_body(endpoint_family, request_body)?;
+        let requested_duration = request.duration_seconds;
+        let input_characters = u64::try_from(request.prompt.chars().count())
+            .context("media generation prompt character count overflowed u64")?;
+        let mut artifact_chunks = Vec::new();
+        let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+            backend
+                .generate_music(request, &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                })
+                .context("generating provider session music artifact with mayhem-engine")?
+        } else {
+            backend
+                .generate_audio(request, &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                })
+                .context("generating provider session audio artifact with mayhem-engine")?
+        };
+        ensure!(
+            output.duration_seconds > 0,
+            "provider audio engine returned zero duration"
+        );
+        if let Some(expected) = requested_duration {
+            ensure!(
+                output.duration_seconds == expected,
+                "provider audio engine returned {} seconds, expected {expected}",
+                output.duration_seconds
+            );
+        }
+        let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
+        ensure!(
+            !artifacts.is_empty()
+                && artifacts
+                    .iter()
+                    .all(|artifact| artifact.content_type.starts_with("audio/")),
+            "provider audio generation engine produced no valid audio artifact"
+        );
+        if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+            ensure!(
+                artifacts.iter().all(|artifact| {
+                    artifact.content_type == "audio/wav"
+                        && wav_sample_rate(&artifact.bytes).is_some()
+                }),
+                "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+            );
+        }
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            tool: None,
+            embeddings: None,
+            artifacts,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: provider_audio_generation_usage(input_characters, output.duration_seconds),
+        });
+    }
+
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
+    ) {
+        let inputs = provider_embedding_input_texts_from_body(request_body)?;
         let prompt_tokens = provider_embedding_input_token_count(&inputs);
-        let dimensions = body
+        let dimensions = request_body
             .get("dimensions")
             .and_then(Value::as_u64)
             .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
@@ -44652,11 +48818,28 @@ fn provider_engine_session_response(
         });
     }
 
-    let tool_mode = provider_engine_tool_request(body, adapter)?.map(|(strategy, _)| strategy);
-    let request = provider_engine_request_from_body(body, adapter)?;
+    ensure!(
+        matches!(
+            endpoint_family,
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        ),
+        "provider endpoint family {endpoint_family} has no engine execution path"
+    );
+
+    let tool_mode =
+        provider_engine_tool_request(request_body, adapter)?.map(|(strategy, _)| strategy);
+    let request = provider_engine_request_from_endpoint_body_with_sampling(
+        endpoint_family,
+        request_body,
+        adapter,
+        sampling,
+    )?;
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
-    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
+    let prompt_tokens = rough_text_tokens(&request.prompt);
     let output = backend
         .generate_with_artifacts(
             request,
@@ -44696,7 +48879,7 @@ fn provider_engine_session_response(
     };
     let completion_tokens = u64::from(output.usage.completion_tokens);
     Ok(ProviderSessionOutput {
-        usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+        usage: provider_chat_receipt_usage(request_body, prompt_tokens, completion_tokens),
         content: if tool.is_some() {
             String::new()
         } else {
@@ -44722,9 +48905,11 @@ struct ProviderAudioTranscriptionRequest {
 }
 
 fn provider_audio_transcription_request_from_body(
+    endpoint_family: &str,
     body: &Value,
+    transport_body: &Value,
 ) -> Result<ProviderAudioTranscriptionRequest> {
-    let audio = body
+    let audio = transport_body
         .get("audio")
         .context("audio_transcription request missing audio")?;
     let encoding = audio
@@ -44740,10 +48925,55 @@ fn provider_audio_transcription_request_from_body(
         .filter(|value| !value.is_empty())
         .context("audio_transcription audio.data missing")?;
     let bytes = hex_decode_vec(bytes_hex, "audio_transcription audio.data")?;
-    let audio_seconds = body
-        .get("audio_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| wav_duration_seconds_ceil(&bytes).unwrap_or(1));
+    if endpoint_family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+        let encoded = body
+            .get("inputs")
+            .and_then(Value::as_str)
+            .context("HF ASR contract request missing base64 inputs")?;
+        let contract_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .context("HF ASR inputs are not valid base64")?;
+        ensure!(
+            contract_bytes == bytes,
+            "HF ASR transported audio differs from the signed contract input"
+        );
+    } else {
+        let file = body
+            .get("file")
+            .and_then(Value::as_object)
+            .context("audio_transcription contract request missing file descriptor")?;
+        ensure!(
+            file.get("bytes").and_then(Value::as_u64)
+                == Some(u64::try_from(bytes.len()).context("audio byte count overflowed u64")?),
+            "audio_transcription file byte count does not match transported audio"
+        );
+        let bytes_blake3 = blake3::hash(&bytes).to_hex().to_string();
+        ensure!(
+            file.get("blake3").and_then(Value::as_str) == Some(bytes_blake3.as_str()),
+            "audio_transcription file digest does not match transported audio"
+        );
+        if let Some(expected_content_type) = file.get("content_type").and_then(Value::as_str) {
+            ensure!(
+                audio.get("content_type").and_then(Value::as_str) == Some(expected_content_type),
+                "audio_transcription content type does not match transported audio"
+            );
+        }
+        if let Some(expected_filename) = file.get("filename").and_then(Value::as_str) {
+            ensure!(
+                audio.get("filename").and_then(Value::as_str) == Some(expected_filename),
+                "audio_transcription filename does not match transported audio"
+            );
+        }
+    }
+    let audio_seconds = wav_duration_seconds_ceil(&bytes)
+        .context("audio_transcription audio is not a valid bounded WAV")?
+        .max(1);
+    if let Some(declared) = transport_body.get("audio_seconds").and_then(Value::as_u64) {
+        ensure!(
+            declared == audio_seconds,
+            "audio_transcription declared {declared} seconds but bounded WAV is {audio_seconds} seconds"
+        );
+    }
     Ok(ProviderAudioTranscriptionRequest {
         engine: EngineAudioTranscriptionRequest {
             audio: bytes,
@@ -44766,9 +48996,15 @@ fn provider_audio_transcription_request_from_body(
     })
 }
 
-fn provider_speech_request_from_body(body: &Value) -> Result<SpeechRequest> {
+fn provider_speech_request_from_body(endpoint_family: &str, body: &Value) -> Result<SpeechRequest> {
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let input_key = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH {
+        "inputs"
+    } else {
+        "input"
+    };
     let input = body
-        .get("input")
+        .get(input_key)
         .and_then(Value::as_str)
         .filter(|input| !input.trim().is_empty())
         .context("audio_speech request missing input")?
@@ -44777,6 +49013,8 @@ fn provider_speech_request_from_body(body: &Value) -> Result<SpeechRequest> {
         input,
         voice: body
             .get("voice")
+            .or_else(|| parameters.and_then(|parameters| parameters.get("voice")))
+            .or_else(|| parameters.and_then(|parameters| parameters.get("speaker_id")))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned),
@@ -44786,46 +49024,98 @@ fn provider_speech_request_from_body(body: &Value) -> Result<SpeechRequest> {
                 .unwrap_or("wav")
                 .to_owned(),
         ),
-        speed: body.get("speed").and_then(Value::as_f64),
+        speed: body
+            .get("speed")
+            .or_else(|| parameters.and_then(|parameters| parameters.get("speed")))
+            .and_then(Value::as_f64),
     })
 }
 
 fn provider_image_generation_request_from_body(
+    endpoint_family: &str,
     body: &Value,
-) -> Result<(GenerateRequest, u32, u64)> {
+) -> Result<EngineImageGenerationRequest> {
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let prompt_key = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
+        "inputs"
+    } else {
+        "prompt"
+    };
     let prompt = body
-        .get("prompt")
+        .get(prompt_key)
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .context("image_generation request missing prompt")?
         .to_owned();
-    let image_count = body
-        .get("n")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .clamp(1, 4);
-    let image_count = u32::try_from(image_count).context("image_generation n overflowed u32")?;
+    let image_count = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
+        1
+    } else {
+        u32::try_from(body.get("n").and_then(Value::as_u64).unwrap_or(1))
+            .context("image_generation n overflowed u32")?
+    };
     let steps = body
         .get("steps")
         .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .clamp(1, 150);
+        .or_else(|| {
+            parameters
+                .and_then(|parameters| parameters.get("num_inference_steps"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(1);
     let cfg_scale = body
         .get("cfg_scale")
         .and_then(Value::as_f64)
-        .unwrap_or(1.0)
-        .clamp(0.0, 50.0) as f32;
-    let (width, height) = provider_image_generation_size(body)?;
-    let mut request = GenerateRequest::new(prompt);
-    request.artifact_count = Some(image_count);
-    request.steps = Some(u32::try_from(steps).context("image_generation steps overflowed u32")?);
-    request.cfg_scale = Some(cfg_scale);
-    request.width = Some(width);
-    request.height = Some(height);
-    if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
+        .or_else(|| {
+            parameters
+                .and_then(|parameters| parameters.get("guidance_scale"))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(1.0) as f32;
+    let (width, height) = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
+        (
+            parameters
+                .and_then(|parameters| parameters.get("width"))
+                .and_then(Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .context("image_generation width overflowed u32")?
+                .unwrap_or(512),
+            parameters
+                .and_then(|parameters| parameters.get("height"))
+                .and_then(Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .context("image_generation height overflowed u32")?
+                .unwrap_or(512),
+        )
+    } else {
+        provider_image_generation_size(body)?
+    };
+    let mut request = EngineImageGenerationRequest::new(prompt);
+    request.image_count = image_count;
+    request.steps = u32::try_from(steps).context("image_generation steps overflowed u32")?;
+    request.guidance_scale = cfg_scale;
+    request.width = width;
+    request.height = height;
+    request.negative_prompt = body
+        .get("negative_prompt")
+        .or_else(|| parameters.and_then(|parameters| parameters.get("negative_prompt")))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    request.scheduler = body
+        .get("scheduler")
+        .or_else(|| parameters.and_then(|parameters| parameters.get("scheduler")))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let seed = body
+        .get("seed")
+        .or_else(|| parameters.and_then(|parameters| parameters.get("seed")))
+        .and_then(Value::as_u64);
+    if let Some(seed) = seed {
         request.seed = Some(u32::try_from(seed).context("image_generation seed exceeds u32")?);
     }
-    Ok((request, image_count, steps))
+    request.validate()?;
+    Ok(request)
 }
 
 fn provider_image_generation_size(body: &Value) -> Result<(u32, u32)> {
@@ -44848,6 +49138,97 @@ fn provider_image_generation_size(body: &Value) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+fn provider_media_generation_request_from_body(
+    endpoint_family: &str,
+    body: &Value,
+) -> Result<EngineMediaGenerationRequest> {
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let generation_parameters = parameters
+        .and_then(|parameters| parameters.get("generation_parameters"))
+        .and_then(Value::as_object);
+    let prompt_key = if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    ) {
+        "inputs"
+    } else {
+        "prompt"
+    };
+    let prompt = body
+        .get(prompt_key)
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .context("media generation request missing prompt")?
+        .to_owned();
+    let duration_seconds = body
+        .get("duration_seconds")
+        .and_then(provider_duration_seconds_ceil)
+        .or_else(|| {
+            parameters
+                .and_then(|parameters| parameters.get("duration_seconds"))
+                .and_then(provider_duration_seconds_ceil)
+        })
+        .or_else(|| {
+            body.get("seconds").and_then(|seconds| {
+                seconds
+                    .as_u64()
+                    .or_else(|| seconds.as_str().and_then(|value| value.parse().ok()))
+            })
+        });
+    let frame_count = parameters
+        .and_then(|parameters| parameters.get("num_frames"))
+        .and_then(Value::as_u64);
+    let duration_seconds = duration_seconds.or_else(|| {
+        let frames = frame_count?;
+        let fps = parameters
+            .and_then(|parameters| parameters.get("fps"))
+            .and_then(Value::as_f64)
+            .filter(|fps| fps.is_finite() && *fps > 0.0)?;
+        Some(((frames as f64) / fps).ceil().max(1.0) as u64)
+    });
+    let frame_count = frame_count.or_else(|| {
+        (endpoint_family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS).then(|| {
+            duration_seconds
+                .unwrap_or(4)
+                .max(1)
+                .saturating_mul(DEFAULT_VIDEO_GENERATION_FPS)
+        })
+    });
+    let step_count = parameters
+        .and_then(|parameters| parameters.get("num_inference_steps"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            generation_parameters
+                .and_then(|parameters| parameters.get("max_new_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| body.get("max_new_tokens").and_then(Value::as_u64));
+    let response_format = body
+        .get("response_format")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let request = EngineMediaGenerationRequest {
+        endpoint_family: endpoint_family.to_owned(),
+        prompt,
+        request: body.clone(),
+        duration_seconds,
+        frame_count,
+        step_count,
+        response_format,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn provider_duration_seconds_ceil(value: &Value) -> Option<u64> {
+    value.as_u64().filter(|value| *value > 0).or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
+            .map(|value| value.ceil() as u64)
+    })
+}
+
 fn provider_image_generation_usage(image_count: u64, steps: u64) -> ReceiptUsage {
     ReceiptUsage::from_units([
         (USAGE_IMAGE, image_count),
@@ -44860,6 +49241,20 @@ fn provider_audio_transcription_usage(audio_seconds: u64) -> ReceiptUsage {
 }
 
 fn provider_audio_speech_usage(input_characters: u64, audio_seconds: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (USAGE_INPUT_CHARACTER, input_characters),
+        (USAGE_AUDIO_SECOND, audio_seconds),
+    ])
+}
+
+fn provider_video_generation_usage(video_seconds: u64, frame_count: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (USAGE_VIDEO_SECOND, video_seconds),
+        (USAGE_FRAME, frame_count),
+    ])
+}
+
+fn provider_audio_generation_usage(input_characters: u64, audio_seconds: u64) -> ReceiptUsage {
     ReceiptUsage::from_units([
         (USAGE_INPUT_CHARACTER, input_characters),
         (USAGE_AUDIO_SECOND, audio_seconds),
@@ -44922,35 +49317,51 @@ fn provider_session_artifacts_from_chunks(
     Ok(artifacts)
 }
 
-fn provider_engine_request_from_body(
+fn provider_engine_request_from_endpoint_body_with_sampling(
+    endpoint_family: &str,
     body: &Value,
     adapter: &catalog::CatalogAdapter,
+    sampling: &catalog::CatalogSamplingProfile,
 ) -> Result<GenerateRequest> {
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let prompt = provider_engine_prompt(messages, adapter)?;
+    let messages = provider_endpoint_messages(endpoint_family, body)?;
+    let prompt = provider_engine_prompt(&messages, adapter)?;
     let mut request = GenerateRequest::new(prompt);
-    request.media = provider_engine_media_inputs(messages);
+    request.messages = messages.clone();
+    request.media = provider_engine_media_inputs(&messages);
     if let Some(max_tokens) = body
         .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            body.get("max_completion_tokens")
+                .filter(|value| !value.is_null())
+        })
+        .or_else(|| {
+            body.get("max_output_tokens")
+                .filter(|value| !value.is_null())
+        })
         .and_then(Value::as_u64)
     {
         request.max_new_tokens = u32::try_from(max_tokens)
             .context("max_tokens exceeds provider engine request range")?;
     }
-    if let Some(temperature) = body.get("temperature").and_then(Value::as_f64) {
-        request.temperature = Some(temperature as f32);
-    }
-    if let Some(top_p) = body.get("top_p").and_then(Value::as_f64) {
-        request.top_p = Some(top_p as f32);
-    }
-    if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
-        request.seed = Some(u32::try_from(seed).context("seed exceeds u32")?);
-    }
+    request.temperature = provider_optional_f64(body, "temperature")?
+        .or(sampling.temperature)
+        .map(|value| value as f32);
+    request.top_p = provider_optional_f64(body, "top_p")?
+        .or(sampling.top_p)
+        .map(|value| value as f32);
+    request.top_k = provider_optional_i32(body, "top_k")?.or(sampling.top_k);
+    request.min_p = provider_optional_f64(body, "min_p")?
+        .or(sampling.min_p)
+        .map(|value| value as f32);
+    request.repeat_penalty = provider_repeat_penalty(body, sampling)?.map(|value| value as f32);
+    request.frequency_penalty =
+        provider_optional_f64(body, "frequency_penalty")?.map(|value| value as f32);
+    request.presence_penalty =
+        provider_optional_f64(body, "presence_penalty")?.map(|value| value as f32);
+    request.stop = provider_stop_sequences(body)?;
+    request.seed = provider_optional_u32(body, "seed")?;
+    request.validate_sampling()?;
     if let Some((strategy, tools)) = provider_engine_tool_request(body, adapter)? {
         match strategy {
             ProviderEngineToolStrategy::MayhemJson => {
@@ -44970,6 +49381,145 @@ fn provider_engine_request_from_body(
         });
     }
     Ok(request)
+}
+
+#[cfg(test)]
+fn provider_engine_request_from_body(
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<GenerateRequest> {
+    provider_engine_request_from_endpoint_body_with_sampling(
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        body,
+        adapter,
+        &catalog::CatalogSamplingProfile::default(),
+    )
+}
+
+fn provider_endpoint_messages(endpoint_family: &str, body: &Value) -> Result<Vec<Value>> {
+    match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => Ok(body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()),
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => {
+            let prompt = provider_prompt_value_text(
+                body.get("prompt")
+                    .context("completion request missing prompt")?,
+            );
+            ensure!(!prompt.is_empty(), "completion prompt must not be empty");
+            Ok(vec![json!({"role":"user", "content":prompt})])
+        }
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => {
+            let input = body
+                .get("input")
+                .context("Responses request missing input")?;
+            match input {
+                Value::String(text) if !text.trim().is_empty() => {
+                    Ok(vec![json!({"role":"user", "content":text})])
+                }
+                Value::Array(items) if !items.is_empty() => Ok(items.clone()),
+                _ => bail!("Responses input must be a non-empty string or message array"),
+            }
+        }
+        other => bail!("endpoint family {other} is not a conversational text surface"),
+    }
+}
+
+fn provider_prompt_value_text(prompt: &Value) -> String {
+    match prompt {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| item.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        value => value.to_string(),
+    }
+}
+
+fn provider_stop_sequences(body: &Value) -> Result<Vec<String>> {
+    match body.get("stop") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(value)) if !value.is_empty() => Ok(vec![value.clone()]),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .context("stop array entries must be non-empty strings")
+            })
+            .collect(),
+        Some(_) => bail!("stop must be a string, an array of strings, or null"),
+    }
+}
+
+fn provider_optional_f64(body: &Value, field: &str) -> Result<Option<f64>> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .with_context(|| format!("{field} must be a JSON number")),
+    }
+}
+
+fn provider_optional_i32(body: &Value, field: &str) -> Result<Option<i32>> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .context(format!("{field} must be a JSON integer"))
+            .and_then(|value| {
+                i32::try_from(value)
+                    .map(Some)
+                    .with_context(|| format!("{field} exceeds the signed 32-bit range"))
+            }),
+    }
+}
+
+fn provider_optional_u32(body: &Value, field: &str) -> Result<Option<u32>> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .context(format!("{field} must be a non-negative JSON integer"))
+            .and_then(|value| {
+                u32::try_from(value)
+                    .map(Some)
+                    .with_context(|| format!("{field} exceeds the unsigned 32-bit range"))
+            }),
+    }
+}
+
+fn provider_repeat_penalty(
+    body: &Value,
+    sampling: &catalog::CatalogSamplingProfile,
+) -> Result<Option<f64>> {
+    let submitted = provider_optional_f64(body, "repeat_penalty")?;
+    match (submitted, sampling.repeat_penalty) {
+        (None, expected) => Ok(expected),
+        (Some(submitted), Some(expected))
+            if (submitted - expected).abs()
+                <= f64::EPSILON * submitted.abs().max(expected.abs()).max(1.0) =>
+        {
+            Ok(Some(expected))
+        }
+        (Some(_), Some(_)) => {
+            bail!("repeat_penalty is server-controlled and must match the signed model profile")
+        }
+        (Some(_), None) => {
+            bail!("repeat_penalty is server-controlled and is not enabled for this model")
+        }
+    }
 }
 
 fn provider_engine_media_inputs(messages: &[Value]) -> Vec<MediaInput> {
@@ -44995,6 +49545,8 @@ fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
                 content_type: data_url_content_type(&url),
                 url: Some(url),
                 data: None,
+                num_frames: None,
+                fps: None,
             })
         }
         Some("input_audio") => {
@@ -45009,6 +49561,32 @@ fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
                 content_type: Some(audio_content_type(format).to_owned()),
                 url: None,
                 data: Some(data),
+                num_frames: None,
+                fps: None,
+            })
+        }
+        Some("video") => {
+            let video = part.get("video")?;
+            let data = video.get("data").and_then(Value::as_str)?.to_owned();
+            if data.is_empty() {
+                return None;
+            }
+            Some(MediaInput {
+                kind: "video".to_owned(),
+                content_type: video
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                url: None,
+                data: Some(data),
+                num_frames: video
+                    .get("num_frames")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                fps: video
+                    .get("fps")
+                    .and_then(Value::as_f64)
+                    .map(|value| value as f32),
             })
         }
         _ => None,
@@ -45222,6 +49800,11 @@ fn provider_response_json_schema(body: &Value) -> Value {
     body.get("response_format")
         .and_then(|format| format.get("json_schema"))
         .and_then(|json_schema| json_schema.get("schema"))
+        .or_else(|| {
+            body.get("text")
+                .and_then(|text| text.get("format"))
+                .and_then(|format| format.get("schema"))
+        })
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true }))
 }
@@ -45316,7 +49899,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         let content = format!("Tool result received: {tool_result}");
         let completion_tokens = rough_text_tokens(&content);
         return ProviderSessionOutput {
-            usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+            usage: provider_chat_receipt_usage(body, prompt_tokens, completion_tokens),
             completion_tokens,
             token_ids: synthetic_provider_token_ids(completion_tokens),
             content,
@@ -45330,7 +49913,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     let prompt_lower = prompt.to_lowercase();
     if prompt.contains(OPENCODE_TEST_MARKER) || prompt_lower.contains("bash tool") {
         return ProviderSessionOutput {
-            usage: ReceiptUsage::text(prompt_tokens, 1),
+            usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
             tool: Some(json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
@@ -45347,7 +49930,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     }
     if let Some(tool_name) = provider_requested_tool_name(body) {
         return ProviderSessionOutput {
-            usage: ReceiptUsage::text(prompt_tokens, 1),
+            usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
             tool: Some(json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
@@ -45378,7 +49961,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     };
     let completion_tokens = rough_text_tokens(&content);
     ProviderSessionOutput {
-        usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+        usage: provider_chat_receipt_usage(body, prompt_tokens, completion_tokens),
         completion_tokens,
         token_ids: synthetic_provider_token_ids(completion_tokens),
         content,
@@ -45388,6 +49971,18 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         finish_reason: "stop".to_owned(),
         prompt_tokens,
     }
+}
+
+fn provider_chat_receipt_usage(
+    body: &Value,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> ReceiptUsage {
+    let _ = provider_chat_media_stats(body);
+    ReceiptUsage::from_units([
+        (INPUT_TOKEN_UNIT, prompt_tokens),
+        (OUTPUT_TOKEN_UNIT, completion_tokens),
+    ])
 }
 
 fn provider_requested_tool_name(body: &Value) -> Option<String> {
@@ -45425,6 +50020,11 @@ fn provider_wants_json(body: &Value) -> bool {
     matches!(
         body.get("response_format")
             .and_then(|format| format.get("type"))
+            .or_else(|| {
+                body.get("text")
+                    .and_then(|text| text.get("format"))
+                    .and_then(|format| format.get("type"))
+            })
             .and_then(Value::as_str),
         Some("json_object" | "json_schema")
     )
@@ -45673,6 +50273,38 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn wav_sample_rate(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.checked_add(chunk_len)?;
+        if chunk_end > bytes.len() {
+            return None;
+        }
+        if chunk_id == b"fmt " && chunk_len >= 16 {
+            let sample_rate = u32::from_le_bytes([
+                bytes[chunk_start + 4],
+                bytes[chunk_start + 5],
+                bytes[chunk_start + 6],
+                bytes[chunk_start + 7],
+            ]);
+            return (sample_rate > 0).then_some(sample_rate);
+        }
+        offset = chunk_end.checked_add(chunk_len % 2)?;
+    }
+    None
 }
 
 fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
@@ -46854,9 +51486,13 @@ mod tests {
         speech_audio_seconds: u64,
         artifact_chunks: Vec<ArtifactChunk>,
         last_request: Option<GenerateRequest>,
+        last_image_request: Option<EngineImageGenerationRequest>,
         last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
         last_transcription_request: Option<EngineAudioTranscriptionRequest>,
         last_speech_request: Option<SpeechRequest>,
+        last_video_request: Option<EngineMediaGenerationRequest>,
+        last_audio_request: Option<EngineMediaGenerationRequest>,
+        last_music_request: Option<EngineMediaGenerationRequest>,
     }
 
     impl FakeEngineBackend {
@@ -46878,9 +51514,13 @@ mod tests {
                 speech_audio_seconds: 3,
                 artifact_chunks: Vec::new(),
                 last_request: None,
+                last_image_request: None,
                 last_embedding_request: None,
                 last_transcription_request: None,
                 last_speech_request: None,
+                last_video_request: None,
+                last_audio_request: None,
+                last_music_request: None,
             }
         }
 
@@ -46944,6 +51584,22 @@ mod tests {
             Ok(self.embedding_output.clone())
         }
 
+        fn generate_image(
+            &mut self,
+            request: EngineImageGenerationRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::ImageGenerationOutput> {
+            let output = mayhem_engine::ImageGenerationOutput {
+                image_count: request.image_count,
+                steps: request.steps,
+            };
+            self.last_image_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(output)
+        }
+
         fn transcribe(
             &mut self,
             request: EngineAudioTranscriptionRequest,
@@ -46964,6 +51620,57 @@ mod tests {
             Ok(mayhem_engine::SpeechOutput {
                 audio_seconds: self.speech_audio_seconds,
             })
+        }
+
+        fn generate_video(
+            &mut self,
+            request: EngineMediaGenerationRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
+            let output = mayhem_engine::MediaGenerationOutput {
+                duration_seconds: request.duration_seconds.unwrap_or(1),
+                frame_count: request.frame_count.unwrap_or(24),
+                step_count: request.step_count.unwrap_or(1),
+            };
+            self.last_video_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(output)
+        }
+
+        fn generate_audio(
+            &mut self,
+            request: EngineMediaGenerationRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
+            let output = mayhem_engine::MediaGenerationOutput {
+                duration_seconds: request.duration_seconds.unwrap_or(1),
+                frame_count: 0,
+                step_count: request.step_count.unwrap_or(1),
+            };
+            self.last_audio_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(output)
+        }
+
+        fn generate_music(
+            &mut self,
+            request: EngineMediaGenerationRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
+            let output = mayhem_engine::MediaGenerationOutput {
+                duration_seconds: request.duration_seconds.unwrap_or(1),
+                frame_count: 0,
+                step_count: request.step_count.unwrap_or(1),
+            };
+            self.last_music_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(output)
         }
     }
 
@@ -46988,6 +51695,17 @@ mod tests {
         bytes.extend_from_slice(&data_len.to_le_bytes());
         bytes.resize(44 + data_len as usize, 0);
         bytes
+    }
+
+    fn tiny_png_data_url() -> String {
+        let mut bytes = io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+        )
     }
 
     #[test]
@@ -47765,6 +52483,8 @@ mod tests {
             },
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            served_modalities: vec!["text".to_owned()],
+            modality_capacities: BTreeMap::new(),
             feasibility: ProviderCtxFeasibility::not_applicable(
                 4096,
                 catalog.models[0].caps.ctx_max,
@@ -47826,6 +52546,10 @@ mod tests {
             memory_reserve: None,
             vllm_memory_utilization: None,
             disk_reserve: None,
+            modality_concurrency: Vec::new(),
+            modality_max_items: Vec::new(),
+            modality_max_bytes: Vec::new(),
+            modality_max_units: Vec::new(),
             json: true,
         })
         .unwrap();
@@ -47847,6 +52571,10 @@ mod tests {
             memory_reserve: Some("15%".to_owned()),
             vllm_memory_utilization: None,
             disk_reserve: None,
+            modality_concurrency: Vec::new(),
+            modality_max_items: Vec::new(),
+            modality_max_bytes: Vec::new(),
+            modality_max_units: Vec::new(),
             json: true,
         })
         .unwrap_err();
@@ -49386,12 +54114,29 @@ mod tests {
 
     #[test]
     fn admin_publish_catalog_payload_anchors_signed_release_urls() {
+        let temp = test_temp_dir("mayhem-admin-publish-catalog");
+        let catalog_path = temp.join("models.json");
+        write_semantically_valid_test_catalog(&catalog_path);
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "08".repeat(32)).unwrap();
+        let signature_path = temp.join("models.json.sig");
+        let keys_dir = temp.join("keys");
+        catalog_sign_report(CatalogSignRequest {
+            catalog_path: catalog_path.clone(),
+            signature_output: signature_path.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        })
+        .unwrap();
         let args = AdminPublishCatalogArgs {
             tx: test_admin_tx_args(),
-            catalog_path: None,
-            signature_path: None,
-            keys_dir: None,
-            canaries_dir: None,
+            catalog_path: Some(catalog_path.clone()),
+            signature_path: Some(signature_path),
+            keys_dir: Some(keys_dir),
+            canaries_dir: Some(repo_path("catalog/canaries").unwrap()),
             catalog_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json".to_owned(),
             signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
             canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
@@ -49404,8 +54149,7 @@ mod tests {
         assert_eq!(payload["source_kind"], "huggingface");
         assert!(is_hex_len(payload["catalog_hash"].as_str().unwrap(), 64));
         assert!(is_hex_len(payload["signature_hash"].as_str().unwrap(), 64));
-        let catalog_doc =
-            catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let catalog_doc = catalog::load_document(&catalog_path).unwrap();
         let expected_artifact_count = catalog_doc
             .models
             .iter()
@@ -49420,6 +54164,7 @@ mod tests {
                     .unwrap()
                     .ends_with("/canaries/canary-launch-v1.json")
         }));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -49596,6 +54341,20 @@ mod tests {
     }},
     "caps": {{ "tools": true, "json": true, "ctx_max": 8192, "vision": false }},
     "requirements": {{ "min_ram_gb": 1, "min_vram_gb_full_offload": 0, "cpu_flags": [], "backends": ["llama.cpp"] }},
+    "adapter": {{
+      "modality_set": ["text"],
+      "endpoint_families": [{{
+        "family": "openai_chat_completions",
+        "request_attributes": ["model", "messages"],
+        "required_request_attributes": ["model", "messages"],
+        "response_attributes": ["id", "object", "created", "model", "choices", "usage", "mayhem"],
+        "required_response_attributes": [],
+        "request_attribute_specs": {{}},
+        "response_attribute_specs": {{}},
+        "interaction_groups": []
+      }}]
+    }},
+    "modality_assessment": {{ "detected": ["text"], "evidence": ["test fixture"] }},
     "canary": {{ "set_id": "canary-dev-v1", "match_min": 0.9, "fingerprints": {{}} }},
     "price_ref_au": {{ "denom": "au_usd", "in_per_1k": "20", "out_per_1k": "60" }}
   }}]
@@ -50548,6 +55307,7 @@ mod tests {
         );
         let join_terms = ProviderJoinContextTerms {
             served_ctx: 8192,
+            served_modalities: vec!["text".to_owned()],
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
         };
@@ -50660,6 +55420,7 @@ mod tests {
             model_id: contract.enclaves[0].model_id.clone(),
             status: "active".to_owned(),
             served_ctx: None,
+            served_modalities: vec!["text".to_owned()],
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec!["room-a".to_owned()],
@@ -50707,6 +55468,7 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
             served_ctx: None,
+            served_modalities: vec!["text".to_owned()],
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![],
@@ -51090,6 +55852,31 @@ mod tests {
         assert!(matches!(*command, ProviderCommands::Start(_)));
     }
 
+    fn test_modality_capacities(modality: &str) -> BTreeMap<String, HeartbeatModalityCapacity> {
+        if modality == "text" {
+            return BTreeMap::new();
+        }
+        let unit = match modality {
+            "image" => "pixel",
+            "audio" => "second",
+            "video" => "frame",
+            "embedding" => "input_token",
+            _ => "unit",
+        };
+        BTreeMap::from([(
+            modality.to_owned(),
+            HeartbeatModalityCapacity {
+                unit: unit.to_owned(),
+                max_inflight_items: 1,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 1024,
+                max_item_units: 1024,
+                working_set_bytes_per_item: 1024,
+            },
+        )])
+    }
+
     fn test_auto_fit_candidate(
         nibble: char,
         model_id: &str,
@@ -51179,6 +55966,8 @@ mod tests {
                 pending: None,
             }),
             served_ctx: 8192,
+            served_modalities: vec![modality.to_owned()],
+            modality_capacities: test_modality_capacities(modality),
             feasibility: ProviderCtxFeasibility {
                 requested_ctx: 8192,
                 served_ctx: 8192,
@@ -51190,6 +55979,7 @@ mod tests {
                 estimated_weights_bytes: required_gib * GIB_BYTES,
                 estimated_kv_bytes: 0,
                 estimated_overhead_bytes: 0,
+                estimated_media_bytes: 0,
                 memory_budget: ProviderMemoryBudget {
                     pool: "dedicated_vram".to_owned(),
                     source: "test".to_owned(),
@@ -51537,11 +56327,104 @@ mod tests {
         });
         let artifact = catalog.models[0].artifacts.get("gguf-q4_k_m").unwrap();
 
-        let estimate =
-            provider_memory_estimate(&contract.enclaves[0], &catalog.models[0], artifact, 262_144)
-                .unwrap();
+        let estimate = provider_memory_estimate(
+            &contract.enclaves[0],
+            &catalog.models[0],
+            "gguf-q4_k_m",
+            artifact,
+            &["text".to_owned()],
+            &BTreeMap::new(),
+            262_144,
+        )
+        .unwrap();
 
         assert_eq!(estimate.kv_bytes, 262_144 * 20_480);
+    }
+
+    #[test]
+    fn provider_memory_estimate_reserves_calibrated_media_concurrency() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0]
+            .adapter
+            .modality_set
+            .push("image".to_owned());
+        add_test_model_modality_evidence(&mut catalog.models[0], "gguf-q4_k_m", "image");
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts.get("gguf-q4_k_m").unwrap();
+        let configured = BTreeMap::from([(
+            "image".to_owned(),
+            ConfigProviderModalityLimits {
+                max_inflight_items: Some(3),
+                max_items_per_request: Some(1),
+                max_item_bytes: None,
+                max_item_units: None,
+            },
+        )]);
+
+        let estimate = provider_memory_estimate(
+            &contract.enclaves[0],
+            &catalog.models[0],
+            "gguf-q4_k_m",
+            artifact,
+            &["text".to_owned(), "image".to_owned()],
+            &configured,
+            4096,
+        )
+        .unwrap();
+
+        assert_eq!(estimate.media_bytes, 30);
+        assert_eq!(
+            estimate.required_bytes,
+            estimate.weights_bytes
+                + estimate.kv_bytes
+                + estimate.overhead_bytes
+                + estimate.media_bytes
+        );
+    }
+
+    #[test]
+    fn modality_resource_profile_uses_decoded_video_floor_and_f13_gate() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0]
+            .adapter
+            .modality_set
+            .push("video".to_owned());
+        let mut report = test_calibration_prompt("video-max", "aa".repeat(32));
+        report.resource_items.insert(
+            "video".to_owned(),
+            CanaryCalibrationResourceItem {
+                unit: "frame".to_owned(),
+                item_count: 1,
+                item_bytes: 1024,
+                item_units: 2,
+            },
+        );
+        report.calibration_baseline_memory_bytes = 1_000_000;
+        report.calibration_peak_memory_bytes = 1_500_000;
+        let mut memory = CalibrationMemoryContext {
+            f13_budget_bytes: 4_000_000,
+            source: "test-device-memory".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+        };
+
+        let profiles = aggregate_calibrated_modality_resource_profiles(
+            &catalog.models[0],
+            std::slice::from_ref(&report),
+            &memory,
+        )
+        .unwrap();
+        let profile = &profiles["video"];
+        assert_eq!(profile.measured_working_set_bytes, 2 * 224 * 224 * 3 * 4);
+        assert_eq!(profile.default_max_inflight_items, 1);
+        assert_eq!(profile.default_max_items_per_request, 1);
+
+        memory.f13_budget_bytes = 2_000_000;
+        let error =
+            aggregate_calibrated_modality_resource_profiles(&catalog.models[0], &[report], &memory)
+                .unwrap_err();
+        assert!(error.to_string().contains("decoded video working set"));
     }
 
     #[test]
@@ -51629,10 +56512,16 @@ mod tests {
         catalog.models[0].caps.ctx_max = 512;
         catalog.models[0].caps.output_modality = Some("embedding".to_owned());
         catalog.models[0].caps.output_modalities = vec!["embedding".to_owned()];
-        catalog.models[0].adapter.request_shape_family = "openai_embeddings".to_owned();
+        catalog.models[0].adapter.endpoint_families = [
+            mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+            mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION,
+        ]
+        .into_iter()
+        .map(|family| catalog::endpoint_contract_template(family).unwrap())
+        .collect();
         catalog.models[0].adapter.tool_call_strategy = "none".to_owned();
         catalog.models[0].adapter.modality_set = vec!["embedding".to_owned()];
-        catalog.models[0].adapter.response_normalization = "openai_embeddings".to_owned();
+        add_test_model_modality_evidence(&mut catalog.models[0], "gguf-q4_k_m", "embedding");
 
         let mut contract = test_contract(&root);
         contract.enclaves[0].model_class = "embedding".to_owned();
@@ -52702,6 +57591,7 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            served_modalities: vec!["text".to_owned()],
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec!["aa".repeat(16)],
@@ -52736,6 +57626,7 @@ mod tests {
             model_id: second_model_id.clone(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            served_modalities: vec!["text".to_owned()],
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![second_room_id],
@@ -52848,6 +57739,7 @@ mod tests {
             model_id: model_id.clone(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            served_modalities: vec!["text".to_owned()],
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![tier3_room_id],
@@ -53639,6 +58531,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_per_req_au: terms.per_req_au,
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -53714,6 +58607,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_per_req_au: terms.per_req_au,
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -53764,6 +58658,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_per_req_au: terms.per_req_au,
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -53822,6 +58717,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 8192,
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -53857,6 +58753,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_per_req_au: terms.per_req_au,
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -53969,6 +58866,85 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_engine_request_applies_signed_sampling_defaults_with_client_precedence() {
+        let sampling = catalog::CatalogSamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.02),
+            repeat_penalty: Some(1.05),
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "sample" }],
+            "temperature": 0.3,
+            "top_k": 42,
+            "seed": 77
+        });
+
+        let request = provider_engine_request_from_endpoint_body_with_sampling(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            &body,
+            &catalog::CatalogAdapter::default(),
+            &sampling,
+        )
+        .unwrap();
+
+        assert_eq!(request.temperature, Some(0.3));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.top_k, Some(42));
+        assert_eq!(request.min_p, Some(0.02));
+        assert_eq!(request.repeat_penalty, Some(1.05));
+        assert_eq!(request.seed, Some(77));
+    }
+
+    #[test]
+    fn provider_engine_request_rejects_conflicting_server_repeat_penalty() {
+        let sampling = catalog::CatalogSamplingProfile {
+            repeat_penalty: Some(1.05),
+            ..catalog::CatalogSamplingProfile::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "sample" }],
+            "repeat_penalty": 1.2
+        });
+
+        let error = provider_engine_request_from_endpoint_body_with_sampling(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            &body,
+            &catalog::CatalogAdapter::default(),
+            &sampling,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("server-controlled"));
+    }
+
+    #[test]
+    fn provider_session_request_budget_covers_advertised_media_after_base64_expansion() {
+        let mut terms = test_provider_session_terms();
+        terms.ctx = 4096;
+        terms.modality_capacities.insert(
+            "video".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "frame".to_owned(),
+                max_inflight_items: 1,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 64 * 1024 * 1024,
+                max_item_units: 1024,
+                working_set_bytes_per_item: 1,
+            },
+        );
+
+        let (max_bytes, max_chunks) = provider_session_derived_request_limits(&terms).unwrap();
+        let encoded_video = provider_session_base64_encoded_len(64 * 1024 * 1024) as usize;
+
+        assert!(max_bytes >= encoded_video + 4096 * 256);
+        assert!(max_bytes > DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+        assert!(max_chunks >= max_bytes.div_ceil(1024));
+    }
+
+    #[test]
     fn provider_engine_request_uses_openai_tool_call_adapter_schema() {
         let adapter = catalog::CatalogAdapter {
             tool_call_strategy: "openai_tool_calls".to_owned(),
@@ -54029,6 +59005,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ..catalog::CatalogAdapter::default()
         };
         let body = json!({
+            "model": "test/model@4bit",
             "messages": [{
                 "role": "user",
                 "reasoning": "scratchpad stays only for preserve adapters",
@@ -54061,7 +59038,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "content": [
                     { "type": "text", "text": "describe this" },
                     { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } },
-                    { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+                    { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } },
+                    { "type": "video", "video": { "data": "dmlkZW8=", "content_type": "video/mp4", "num_frames": 8, "fps": 2.0 } }
                 ]
             }]
         });
@@ -54069,7 +59047,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let request =
             provider_engine_request_from_body(&body, &catalog::CatalogAdapter::default()).unwrap();
 
-        assert_eq!(request.media.len(), 2);
+        assert_eq!(
+            request.messages,
+            body["messages"].as_array().unwrap().clone()
+        );
+        assert_eq!(request.media.len(), 3);
         assert_eq!(request.media[0].kind, "image");
         assert_eq!(request.media[0].content_type.as_deref(), Some("image/png"));
         assert_eq!(
@@ -54079,9 +59061,136 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.media[1].kind, "audio");
         assert_eq!(request.media[1].content_type.as_deref(), Some("audio/wav"));
         assert_eq!(request.media[1].data.as_deref(), Some("UklGRg=="));
+        assert_eq!(request.media[2].kind, "video");
+        assert_eq!(request.media[2].content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(request.media[2].data.as_deref(), Some("dmlkZW8="));
+        assert_eq!(request.media[2].num_frames, Some(8));
+        assert_eq!(request.media[2].fps, Some(2.0));
         assert!(request.prompt.contains("describe this"));
         assert!(request.prompt.contains("[image:"));
         assert!(request.prompt.contains("[audio:wav:"));
+    }
+
+    #[test]
+    fn provider_validates_and_meters_signed_chat_modalities() {
+        let png = tiny_png_data_url();
+        let wav = base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000));
+        let body = json!({
+            "model": "test/model@4bit",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe and transcribe" },
+                    { "type": "image_url", "image_url": { "url": png } },
+                    { "type": "input_audio", "input_audio": { "data": wav, "format": "wav" } }
+                ]
+            }]
+        });
+        let mut terms = test_provider_session_terms();
+        terms.served_modalities = vec!["text".to_owned(), "image".to_owned(), "audio".to_owned()];
+        terms.modality_capacities = BTreeMap::from([
+            (
+                "image".to_owned(),
+                test_heartbeat_modality_capacity("image"),
+            ),
+            (
+                "audio".to_owned(),
+                test_heartbeat_modality_capacity("audio"),
+            ),
+        ]);
+        let active = test_active_provider_session(
+            &terms,
+            vec!["text".to_owned(), "image".to_owned(), "audio".to_owned()],
+        );
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+
+        validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+        let stats = provider_chat_media_stats(&body).unwrap();
+        assert_eq!(stats.image_count, 1);
+        assert_eq!(stats.audio_seconds, 1);
+        let usage = provider_chat_receipt_usage(&body, 7, 3);
+        assert_eq!(usage.get(INPUT_TOKEN_UNIT), 7);
+        assert_eq!(usage.get(OUTPUT_TOKEN_UNIT), 3);
+        assert_eq!(usage.get(USAGE_IMAGE), 0);
+        assert_eq!(usage.get(USAGE_AUDIO_SECOND), 0);
+    }
+
+    #[test]
+    fn provider_modalities_default_all_enabled_and_only_allow_non_core_opt_out() {
+        let enabled = vec![
+            "text".to_owned(),
+            "image".to_owned(),
+            "audio".to_owned(),
+            "video".to_owned(),
+        ];
+
+        assert_eq!(
+            resolve_provider_served_modalities(DEFAULT_MODEL_CLASS, &enabled, &[]).unwrap(),
+            enabled
+        );
+        assert_eq!(
+            resolve_provider_served_modalities(
+                DEFAULT_MODEL_CLASS,
+                &enabled,
+                &["image".to_owned(), "video".to_owned()],
+            )
+            .unwrap(),
+            vec!["text".to_owned(), "audio".to_owned()]
+        );
+        let error =
+            resolve_provider_served_modalities(DEFAULT_MODEL_CLASS, &enabled, &["text".to_owned()])
+                .unwrap_err();
+        assert!(error.to_string().contains("cannot disable core text"));
+    }
+
+    #[test]
+    fn provider_rejects_unsigned_or_unserved_chat_modalities() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image_url", "image_url": { "url": tiny_png_data_url() } }
+                ]
+            }]
+        });
+        let mut terms = test_provider_session_terms();
+        terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+        let text_only_voucher = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let err = validate_provider_session_request_modalities(&text_only_voucher, &terms, &sealed)
+            .expect_err("actual image input must be bound by the signed voucher");
+        assert!(err.to_string().contains("do not match signed voucher"));
+
+        terms.served_modalities = vec!["text".to_owned()];
+        let image_voucher =
+            test_active_provider_session(&terms, vec!["text".to_owned(), "image".to_owned()]);
+        let err = validate_provider_session_request_modalities(&image_voucher, &terms, &sealed)
+            .expect_err("a text-only provider must reject image work");
+        assert!(err.to_string().contains("does not serve required image"));
+    }
+
+    #[test]
+    fn provider_rejects_remote_or_malformed_media_before_engine_dispatch() {
+        let mut terms = test_provider_session_terms();
+        terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        let active =
+            test_active_provider_session(&terms, vec!["text".to_owned(), "image".to_owned()]);
+        let remote = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image_url", "image_url": { "url": "https://example.invalid/a.png" } }
+                ]
+            }]
+        });
+        let sealed = provider_test_seal_contract_request(&remote, &terms.adapter).unwrap();
+        let err = validate_provider_session_request_modalities(&active, &terms, &sealed)
+            .expect_err("providers must never fetch request media");
+        assert!(err
+            .to_string()
+            .contains("remote image URLs are not fetched"));
     }
 
     #[test]
@@ -54176,11 +59285,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(output.content, "engine says hi");
         assert!(output.tool.is_none());
         assert_eq!(output.finish_reason, "stop");
-        assert_eq!(output.prompt_tokens, 1);
-        assert_eq!(output.completion_tokens, 2);
-        assert_eq!(output.usage.input_tokens(), 1);
-        assert_eq!(output.usage.output_tokens(), 2);
         let request = backend.last_request.expect("engine request");
+        assert_eq!(output.prompt_tokens, rough_text_tokens(&request.prompt));
+        assert_eq!(output.completion_tokens, 2);
+        assert_eq!(output.usage.input_tokens(), output.prompt_tokens);
+        assert_eq!(output.usage.output_tokens(), 2);
         assert!(request.prompt.contains("user: hello"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
@@ -54283,12 +59392,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(output.usage.get(USAGE_STEP), 3);
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
-        let request = backend.last_request.expect("image generation request");
+        let request = backend
+            .last_image_request
+            .expect("image generation request");
         assert_eq!(request.prompt, "draw a red square");
-        assert_eq!(request.artifact_count, Some(1));
-        assert_eq!(request.width, Some(64));
-        assert_eq!(request.height, Some(64));
-        assert_eq!(request.steps, Some(3));
+        assert_eq!(request.image_count, 1);
+        assert_eq!(request.width, 64);
+        assert_eq!(request.height, 64);
+        assert_eq!(request.steps, 3);
         assert_eq!(request.seed, Some(9));
     }
 
@@ -54304,7 +59415,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "filename": "hello.wav",
                 "data": hex_encode(&wav)
             },
-            "audio_seconds": 2,
+            "audio_seconds": 1,
             "language": "en"
         });
 
@@ -54318,7 +59429,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(output.content, "hello mayhem");
         assert!(output.artifacts.is_empty());
-        assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 2);
+        assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 1);
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
         let request = backend
@@ -54365,6 +59476,174 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.input, "hello");
         assert_eq!(request.voice.as_deref(), Some("launch"));
         assert_eq!(request.response_format.as_deref(), Some("wav"));
+    }
+
+    #[test]
+    fn provider_engine_session_response_uses_video_generation_units() {
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "video-1".to_owned(),
+            index: 0,
+            content_type: "video/mp4".to_owned(),
+            bytes: b"video".to_vec(),
+            final_chunk: true,
+        }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "a red square moving left",
+            "seconds": "4",
+            "size": "1280x720"
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.artifacts[0].content_type, "video/mp4");
+        assert_eq!(output.usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(output.usage.get(USAGE_FRAME), 96);
+        let request = backend.last_video_request.expect("video request");
+        assert_eq!(request.prompt, "a red square moving left");
+        assert_eq!(request.duration_seconds, Some(4));
+        assert_eq!(request.request["size"], json!("1280x720"));
+    }
+
+    #[test]
+    fn provider_engine_session_response_keeps_audio_and_music_generation_distinct() {
+        let artifact = ArtifactChunk {
+            artifact_id: "audio-1".to_owned(),
+            index: 0,
+            content_type: "audio/wav".to_owned(),
+            bytes: tiny_wav_bytes(16_000),
+            final_chunk: true,
+        };
+        let mut audio_backend =
+            FakeEngineBackend::new("").with_artifact_chunks(vec![artifact.clone()]);
+        let audio_body = json!({
+            "kind": "audio_generation",
+            "prompt": "noise",
+            "duration_seconds": 2.0,
+            "response_format": "wav",
+            "temperature": 0.6
+        });
+        let audio = provider_engine_session_response(
+            &mut audio_backend,
+            &catalog::CatalogAdapter::default(),
+            &audio_body,
+            None,
+        )
+        .unwrap();
+        assert!(audio_backend.last_audio_request.is_some());
+        assert!(audio_backend.last_music_request.is_none());
+        assert_eq!(audio.usage.get(USAGE_INPUT_CHARACTER), 5);
+        assert_eq!(audio.usage.get(USAGE_AUDIO_SECOND), 2);
+
+        let mut music_backend = FakeEngineBackend::new("").with_artifact_chunks(vec![artifact]);
+        let music_body = json!({
+            "kind": "music_generation",
+            "prompt": "piano",
+            "duration_seconds": 3.0,
+            "response_format": "wav",
+            "seed": 7
+        });
+        let music = provider_engine_session_response(
+            &mut music_backend,
+            &catalog::CatalogAdapter::default(),
+            &music_body,
+            None,
+        )
+        .unwrap();
+        assert!(music_backend.last_music_request.is_some());
+        assert!(music_backend.last_audio_request.is_none());
+        assert_eq!(music.usage.get(USAGE_INPUT_CHARACTER), 5);
+        assert_eq!(music.usage.get(USAGE_AUDIO_SECOND), 3);
+    }
+
+    #[test]
+    fn generation_calibration_maps_every_public_response_contract() {
+        for (family, request, content_type, expected_artifact_field) in [
+            (
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                json!({
+                    "model": "test/video",
+                    "prompt": "moving square",
+                    "seconds": "4",
+                    "size": "1280x720"
+                }),
+                "video/mp4",
+                None,
+            ),
+            (
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                json!({
+                    "inputs": "moving square",
+                    "parameters": {"num_frames": 8, "fps": 4.0}
+                }),
+                "video/mp4",
+                Some("video"),
+            ),
+            (
+                mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+                json!({"model": "test/audio", "prompt": "wind"}),
+                "audio/wav",
+                Some("audio"),
+            ),
+            (
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+                json!({"model": "test/music", "prompt": "piano"}),
+                "audio/wav",
+                Some("music"),
+            ),
+            (
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+                json!({"inputs": "rain"}),
+                "audio/wav",
+                Some("audio"),
+            ),
+        ] {
+            let usage = if content_type.starts_with("video/") {
+                provider_video_generation_usage(4, 96)
+            } else {
+                provider_audio_generation_usage(5, 3)
+            };
+            let output = ProviderSessionOutput {
+                content: String::new(),
+                tool: None,
+                embeddings: None,
+                artifacts: vec![ProviderSessionArtifact {
+                    id: "calibration-artifact".to_owned(),
+                    content_type: content_type.to_owned(),
+                    bytes: if content_type.starts_with("audio/") {
+                        tiny_wav_bytes(16_000)
+                    } else {
+                        b"calibration artifact".to_vec()
+                    },
+                }],
+                finish_reason: "stop".to_owned(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                token_ids: Vec::new(),
+                usage,
+            };
+            let response = catalog_endpoint_calibration_response(family, &request, &output)
+                .unwrap_or_else(|err| panic!("{family} response mapping failed: {err:#}"));
+            let contract = mayhem_proto::endpoint_family_contract_template(family).unwrap();
+            mayhem_proto::validate_endpoint_response(&contract, &response).unwrap_or_else(
+                |violations| panic!("{family} response violations: {violations:?}"),
+            );
+            if let Some(field) = expected_artifact_field {
+                assert!(response.get(field).is_some(), "{family} missing {field}");
+            }
+            if family == mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS {
+                assert!(response.get("music").is_none());
+            }
+            if family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+                assert!(response.get("audio").is_none());
+            }
+        }
     }
 
     #[test]
@@ -54841,6 +60120,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut catalog = test_catalog(&root);
         catalog.models[0].caps.vision = true;
         catalog.models[0].adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        add_test_model_modality_evidence(&mut catalog.models[0], "gguf-q4_k_m", "image");
         catalog.models[0]
             .artifacts
             .get_mut("gguf-q4_k_m")
@@ -54979,6 +60259,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             },
             price: None,
             served_ctx: 1,
+            served_modalities: vec!["audio".to_owned()],
+            modality_capacities: test_modality_capacities("audio"),
             feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
@@ -55066,6 +60348,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             verdict,
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            served_modalities: vec!["text".to_owned()],
+            modality_capacities: BTreeMap::new(),
             feasibility: ProviderCtxFeasibility::not_applicable(
                 4096,
                 catalog.models[0].caps.ctx_max,
@@ -55103,6 +60387,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_per_req_au: 0,
                     locked_min_session_au: 0,
                     served_ctx: 8192,
+                    required_modalities: vec!["text".to_owned()],
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -55150,6 +60435,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_per_req_au: 0,
                     locked_min_session_au: 0,
                     served_ctx: 8192,
+                    required_modalities: vec!["text".to_owned()],
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -55196,6 +60482,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_per_req_au: 0,
                     locked_min_session_au: 0,
                     served_ctx: 8192,
+                    required_modalities: vec!["text".to_owned()],
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -55673,7 +60960,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 est_wait_ms: 0,
                 ttft_ms: 0,
                 measured_tok_s_milli: None,
-                accepting_new: true
+                accepting_new: true,
+                modality_active_items: BTreeMap::new(),
             }
         );
         load.set_accepting_new(false);
@@ -55687,7 +60975,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_heartbeat_load_tracks_queue_and_measured_perf() {
         let load = ProviderHeartbeatLoad::default();
         load.set_active_sessions(3);
-        let mut request = load.begin_request();
+        let mut request = load.begin_request(BTreeMap::new()).unwrap();
 
         let busy = load.snapshot(4);
         assert_eq!(busy.active_slots, 3);
@@ -55707,9 +60995,55 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(measured.ttft_ms, 125);
         assert_eq!(measured.measured_tok_s_milli, Some(20_000));
         assert_eq!(
-            provider_heartbeat_tok_s(measured, Some(30.0)),
+            provider_heartbeat_tok_s(&measured, Some(30.0)),
             (Some(20.0), "measured")
         );
+    }
+
+    #[test]
+    fn provider_modality_capacity_reservations_are_atomic_and_release_on_drop() {
+        let capacities = BTreeMap::from([
+            (
+                "audio".to_owned(),
+                test_heartbeat_modality_capacity("audio"),
+            ),
+            (
+                "image".to_owned(),
+                test_heartbeat_modality_capacity("image"),
+            ),
+        ]);
+        let load = ProviderHeartbeatLoad::new(&capacities);
+
+        let err = match load.begin_request(BTreeMap::from([
+            ("audio".to_owned(), 1),
+            ("image".to_owned(), 2),
+        ])) {
+            Ok(_) => panic!("a failed later reservation must roll back earlier modalities"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("image capacity is full"));
+        assert_eq!(
+            load.snapshot(4).modality_active_items,
+            BTreeMap::from([("audio".to_owned(), 0), ("image".to_owned(), 0)])
+        );
+
+        let first = load
+            .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
+            .unwrap();
+        assert_eq!(load.snapshot(4).modality_active_items["image"], 1);
+        let err = match load.begin_request(BTreeMap::from([("image".to_owned(), 1)])) {
+            Ok(_) => panic!("a held image slot must refuse another image"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("image capacity is full"));
+        drop(first);
+        assert_eq!(load.snapshot(4).modality_active_items["image"], 0);
+
+        let released = load
+            .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
+            .expect("dropping a request guard must restore capacity");
+        drop(released);
+        assert_eq!(load.snapshot(4).active_requests, 0);
     }
 
     #[test]
@@ -55962,10 +61296,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_active_items: BTreeMap::new(),
         };
 
         assert_eq!(
-            provider_heartbeat_tok_s(snapshot, Some(42.0)),
+            provider_heartbeat_tok_s(&snapshot, Some(42.0)),
             (Some(42.0), "hwprobe_cold_start_prior")
         );
     }
@@ -57466,6 +62801,10 @@ State initialization...
                 }
             })]),
             temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: Some(20),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.05),
             max_tokens: Some(16),
             prompt: None,
             input: None,
@@ -57482,6 +62821,10 @@ State initialization...
         };
 
         let request = canary_probe_request("admin/model", &prompt);
+        assert_eq!(request["top_p"], 0.9);
+        assert_eq!(request["top_k"], 20);
+        assert_eq!(request["min_p"], 0.05);
+        assert_eq!(request["repeat_penalty"], 1.05);
 
         assert_eq!(request["model"], "admin/model");
         assert_eq!(
@@ -57626,6 +62969,8 @@ State initialization...
         catalog.models[0]
             .artifacts
             .insert("nvfp4".to_owned(), trt_artifact);
+        add_test_model_modality_evidence(&mut catalog.models[0], "gguf-q4_k_m", "text");
+        add_test_model_modality_evidence(&mut catalog.models[0], "nvfp4", "text");
         catalog.models[0]
             .canary
             .fingerprints
@@ -57661,7 +63006,7 @@ State initialization...
     }
 
     #[test]
-    fn canary_matrix_detects_missing_backend_fingerprint_and_nonzero_prompt_temperature() {
+    fn canary_matrix_detects_missing_backend_fingerprint_and_unseeded_hot_prompt() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
         catalog.models[0].canary.set_id = "test-canary-hot".to_owned();
@@ -57691,7 +63036,105 @@ State initialization...
         assert!(report
             .errors
             .iter()
-            .any(|error| error.contains("must use temperature 0")));
+            .any(|error| error.contains("must pin seed")));
+    }
+
+    #[test]
+    fn canary_matrix_accepts_seeded_model_profile_range_and_client_sampler_points() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.canary.set_id = "test-canary-profile-range".to_owned();
+        model.sampling = catalog::CatalogSamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.05),
+        };
+        let canaries_dir = test_canary_dir_with_prompts(
+            &model.canary.set_id,
+            json!([
+                {
+                    "id": "profile-default",
+                    "messages": [{"role": "user", "content": "default"}],
+                    "temperature": 0.6,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.05,
+                    "seed": 101,
+                    "max_tokens": 8
+                },
+                {
+                    "id": "profile-low",
+                    "messages": [{"role": "user", "content": "low"}],
+                    "temperature": 0.2,
+                    "top_k": 10,
+                    "min_p": 0.01,
+                    "seed": 102,
+                    "max_tokens": 8
+                },
+                {
+                    "id": "profile-high",
+                    "messages": [{"role": "user", "content": "high"}],
+                    "temperature": 1.0,
+                    "top_k": 40,
+                    "min_p": 0.1,
+                    "seed": 103,
+                    "max_tokens": 8
+                }
+            ]),
+        );
+
+        let result = canary_set_matrix_check(&canaries_dir, model).unwrap();
+        assert_eq!(result.prompt_count, 3);
+        assert_eq!(
+            result.prompt_ids,
+            vec!["profile-default", "profile-low", "profile-high"]
+        );
+    }
+
+    #[test]
+    fn canary_matrix_rejects_profile_without_both_sides_of_temperature_range() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.canary.set_id = "test-canary-one-sided-range".to_owned();
+        model.sampling = catalog::CatalogSamplingProfile {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.05),
+            repeat_penalty: None,
+        };
+        let canaries_dir = test_canary_dir_with_prompts(
+            &model.canary.set_id,
+            json!([
+                {
+                    "id": "profile-default",
+                    "messages": [{"role": "user", "content": "default"}],
+                    "temperature": 0.6,
+                    "seed": 101
+                },
+                {
+                    "id": "profile-low-a",
+                    "messages": [{"role": "user", "content": "low a"}],
+                    "temperature": 0.2,
+                    "top_k": 10,
+                    "min_p": 0.01,
+                    "seed": 102
+                },
+                {
+                    "id": "profile-low-b",
+                    "messages": [{"role": "user", "content": "low b"}],
+                    "temperature": 0.4,
+                    "top_k": 40,
+                    "min_p": 0.1,
+                    "seed": 103
+                }
+            ]),
+        );
+
+        let error = canary_set_matrix_check(&canaries_dir, model).unwrap_err();
+        assert!(error.contains("below, at, and above"), "{error}");
     }
 
     #[test]
@@ -57731,6 +63174,7 @@ State initialization...
             "gguf-q4_k_m".to_owned(),
             BTreeMap::from([("p1".to_owned(), "e0e0d8d8d8f83e56".to_owned())]),
         );
+        add_test_model_modality_evidence(&mut catalog.models[0], "gguf-q4_k_m", "text");
         let canaries_dir = test_canary_dir("test-image-canary", 0.0);
 
         let report = catalog_canary_matrix_report(
@@ -57825,6 +63269,22 @@ State initialization...
     }
 
     #[test]
+    fn calibration_memory_sampler_handles_fast_operations() {
+        let context = CalibrationMemoryContext {
+            f13_budget_bytes: u64::MAX,
+            source: "test-process-rss".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+        };
+
+        let (value, baseline, peak) =
+            measure_calibration_memory(&context, &[], || Ok(7_u8)).unwrap();
+
+        assert_eq!(value, 7);
+        assert!(baseline > 0);
+        assert!(peak >= baseline);
+    }
+
+    #[test]
     fn canary_apply_writes_non_text_method_values() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -57856,6 +63316,9 @@ State initialization...
             embedding_vector: Some(vector.clone()),
             transcript: None,
             audio_fingerprint: None,
+            resource_items: BTreeMap::new(),
+            calibration_baseline_memory_bytes: 1,
+            calibration_peak_memory_bytes: 1,
             output_text: None,
         }];
         stamp_test_calibration_report(&mut calibration, &canaries_dir);
@@ -57873,6 +63336,7 @@ State initialization...
         let mut catalog_value = json!({
             "models": [{
                 "model_id": catalog.models[0].model_id.clone(),
+                "modality_assessment": {},
                 "canary": {
                     "set_id": "test-embedding-canary",
                     "verification_method": "embedding_cosine"
@@ -58058,6 +63522,60 @@ State initialization...
         assert_eq!(report.artifact_count, 1);
         assert_eq!(report.report_count, 1);
         assert_eq!(report.entries[0].matches_catalog, Some(true));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_missing_endpoint_calibration_row() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.endpoint_calibration.families[0].cases.pop();
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+        );
+
+        assert!(!report.ok);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("endpoint calibration") && error.contains("case count differs")
+        }));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_failed_endpoint_calibration_row() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.endpoint_calibration.families[0].cases[0].ok = false;
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+        );
+
+        assert!(!report.ok);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("endpoint calibration") && error.contains("contains failed rows")
+        }));
     }
 
     #[test]
@@ -58365,6 +63883,7 @@ State initialization...
         let mut catalog_value = json!({
             "models": [{
                 "model_id": "test/model@4bit",
+                "modality_assessment": {},
                 "canary": {
                     "fingerprints": {
                         "gguf-q4_k_m": "00".repeat(32)
@@ -59258,7 +64777,7 @@ State initialization...
         ));
         fs::create_dir_all(&temp).unwrap();
         let catalog_path = temp.join("models.json");
-        fs::copy(repo_path("catalog/models.json").unwrap(), &catalog_path).unwrap();
+        write_semantically_valid_test_catalog(&catalog_path);
         let seed_file = temp.join("catalog-seed.hex");
         fs::write(&seed_file, "08".repeat(32)).unwrap();
         let signature_output = temp.join("models.json.sig");
@@ -59676,6 +65195,59 @@ State initialization...
         assert_eq!(model["tool_call"], false);
         assert_eq!(model["limit"]["context"], 4096);
         assert_eq!(model["limit"]["output"], 4096);
+        assert_eq!(model["options"]["temperature"], 0.7);
+        assert_eq!(model["options"]["top_p"], 0.9);
+    }
+
+    #[test]
+    fn opencode_model_config_uses_catalog_sampling_and_never_blanket_zero() {
+        let models = opencode_models_from_gateway(&[
+            json!({
+                "id": "mayhem/qwen-profile",
+                "mayhem": {
+                    "family": "qwen3.6",
+                    "caps": { "tools": true, "json": true, "ctx": 262144 },
+                    "sampling": {
+                        "temperature": 0.6,
+                        "top_p": 0.95,
+                        "top_k": 20,
+                        "min_p": 0.02
+                    }
+                }
+            }),
+            json!({
+                "id": "mayhem/qwen3-thinking-no-card",
+                "mayhem": {
+                    "family": "qwen3-thinking",
+                    "caps": { "tools": true, "json": true, "ctx": 32768 }
+                }
+            }),
+            json!({
+                "id": "mayhem/explicit-greedy",
+                "mayhem": {
+                    "family": "fixture",
+                    "caps": { "tools": false, "json": false, "ctx": 4096 },
+                    "sampling": { "temperature": 0.0, "top_p": 1.0 }
+                }
+            }),
+        ])
+        .unwrap();
+
+        assert_eq!(models["mayhem/qwen-profile"]["options"]["temperature"], 0.6);
+        assert_eq!(models["mayhem/qwen-profile"]["options"]["top_k"], 20);
+        assert_eq!(models["mayhem/qwen-profile"]["options"]["min_p"], 0.02);
+        assert_eq!(
+            models["mayhem/qwen3-thinking-no-card"]["options"]["temperature"],
+            0.6
+        );
+        assert_eq!(
+            models["mayhem/qwen3-thinking-no-card"]["options"]["top_k"],
+            20
+        );
+        assert_eq!(
+            models["mayhem/explicit-greedy"]["options"]["temperature"],
+            0.0
+        );
     }
 
     #[test]
@@ -59783,6 +65355,7 @@ State initialization...
             heartbeat_count: 1,
             min_ask_au: 0,
             ctx: None,
+            disable_modalities: Vec::new(),
             memory_reserve: None,
             vllm_memory_utilization: None,
             disk_reserve: None,
@@ -59797,6 +65370,7 @@ State initialization...
             print_json: true,
             dev_skip_catalog_verify: true,
             load_progress: None,
+            modality_limits: BTreeMap::new(),
         }
     }
 
@@ -59857,6 +65431,9 @@ State initialization...
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
+            sampling: catalog::CatalogSamplingProfile::default(),
+            served_modalities: vec!["text".to_owned()],
+            modality_capacities: BTreeMap::new(),
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
             rate_map: text_generation_rate_map(1, 2),
@@ -59868,6 +65445,27 @@ State initialization...
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        }
+    }
+
+    fn test_active_provider_session(
+        terms: &ProviderSessionTerms,
+        required_modalities: Vec<String>,
+    ) -> ActiveProviderSession {
+        ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: "66".repeat(32),
+            session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
+            price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities,
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
+            checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         }
     }
 
@@ -59884,6 +65482,7 @@ State initialization...
             locked_per_req_au: terms.per_req_au,
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
+            required_modalities: vec!["text".to_owned()],
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             max_spend_au: 1000,
@@ -59920,6 +65519,7 @@ State initialization...
                 "locked_per_req_au": money_au_json(voucher_body.locked_per_req_au),
                 "locked_min_session_au": money_au_json(voucher_body.locked_min_session_au),
                 "served_ctx": voucher_body.served_ctx,
+                "required_modalities": voucher_body.required_modalities,
                 "ctx_bracket": voucher_body.ctx_bracket.clone(),
                 "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
                 "max_spend_au": money_au_json(voucher_body.max_spend_au),
@@ -59974,6 +65574,9 @@ State initialization...
             embedding_vector: None,
             transcript: None,
             audio_fingerprint: None,
+            resource_items: BTreeMap::new(),
+            calibration_baseline_memory_bytes: 1,
+            calibration_peak_memory_bytes: 1,
             output_text: None,
         }
     }
@@ -59990,6 +65593,10 @@ State initialization...
         model.canary.token_prefixes.insert(
             artifact.to_owned(),
             BTreeMap::from([("p1".to_owned(), vec![1])]),
+        );
+        model.modality_assessment.calibrated_fingerprints.insert(
+            artifact.to_owned(),
+            BTreeMap::from([("text".to_owned(), "cc".repeat(32))]),
         );
     }
 
@@ -60015,6 +65622,7 @@ State initialization...
                 tokenizer_sha256: None,
                 chat_template_sha256: None,
                 min_compute_cap: None,
+                artifact_sidecars: BTreeMap::new(),
             },
             runtime_config: CatalogCanaryRuntimeConfig {
                 ctx_size: 1024,
@@ -60034,8 +65642,62 @@ State initialization...
             matches_existing_catalog: existing.as_ref().map(|existing| existing == &fingerprint),
             existing_catalog_fingerprint: existing,
             catalog_fingerprint: fingerprint,
+            modality_fingerprints: BTreeMap::from([("text".to_owned(), "cc".repeat(32))]),
+            modality_resource_profiles: BTreeMap::new(),
+            endpoint_calibration: test_endpoint_calibration_report(),
             prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
         }
+    }
+
+    fn test_endpoint_calibration_report() -> EndpointCalibrationReport {
+        let contract = catalog::CatalogAdapter::default()
+            .endpoint_families
+            .into_iter()
+            .next()
+            .unwrap();
+        let report = run_endpoint_calibration_matrix(
+            std::slice::from_ref(&contract),
+            &BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]),
+            |contract, _case, request| {
+                Ok(EndpointCalibrationExecution {
+                    provider_translation_fingerprint: "11".repeat(32),
+                    handled_request_attributes: contract
+                        .request_attributes
+                        .iter()
+                        .filter(|path| calibration_value_has_path(request, path))
+                        .cloned()
+                        .collect(),
+                    backend_execution_fingerprint: "22".repeat(32),
+                    response: json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "test/model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        },
+                        "mayhem": {}
+                    }),
+                })
+            },
+        );
+        assert!(
+            report.ok,
+            "synthetic endpoint report failed: {:#?}",
+            report
+                .families
+                .iter()
+                .flat_map(|family| &family.cases)
+                .find(|case| !case.ok)
+        );
+        report
     }
 
     fn stamp_test_calibration_report(report: &mut CatalogCanaryCalibrationReport, dir: &Path) {
@@ -60050,10 +65712,12 @@ State initialization...
             model: "test/model".to_owned(),
             artifact: "gguf-q4_k_m".to_owned(),
             artifact_path: PathBuf::from("/tmp/model.gguf"),
+            vision_projector_path: None,
             prompt_id: None,
             ctx_size: 1024,
             threads: None,
             gpu_layers: None,
+            memory_reserve: None,
             seed: 0,
             include_output: false,
             report_output: None,
@@ -60086,6 +65750,7 @@ State initialization...
             seed: 0,
             threads: None,
             gpu_layers: None,
+            memory_reserve: None,
             trt_tensor_parallel: None,
             trt_kv_cache_dtype: None,
             trt_max_batch_size: None,
@@ -60368,6 +66033,7 @@ State initialization...
             provider_workers,
             provider_auto_fit: false,
             provider_gpu_layers: Some(0),
+            provider_disable_modalities: Vec::new(),
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
@@ -60853,6 +66519,7 @@ State initialization...
             enclaves: None,
             auto_fit: false,
             provider_gpu_layers: None,
+            provider_disable_modalities: Vec::new(),
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
@@ -60946,6 +66613,31 @@ State initialization...
         );
     }
 
+    fn write_semantically_valid_test_catalog(path: &Path) {
+        let mut catalog = read_json_file(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let models = catalog
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("repo catalog models array");
+        let launch = models
+            .iter()
+            .find(|model| {
+                model.get("model_id").and_then(Value::as_str)
+                    == Some("qwen/qwen2.5-1.5b-instruct@small")
+            })
+            .cloned()
+            .expect("signed test model must remain in the catalog");
+        let mut dev_a = launch.clone();
+        dev_a["model_id"] = json!("test/signed-text-dev-a");
+        dev_a["tier"] = json!("dev");
+        let mut dev_b = launch.clone();
+        dev_b["model_id"] = json!("test/signed-text-dev-b");
+        dev_b["tier"] = json!("dev");
+        *models = vec![dev_a, dev_b, launch];
+        catalog["catalog_id"] = json!("mayhem-test-signed-catalog");
+        write_json_file(path, &catalog).unwrap();
+    }
+
     fn test_catalog(root: &str) -> catalog::CatalogDocument {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
@@ -61012,6 +66704,13 @@ State initialization...
                     backends: vec!["llama.cpp".to_owned()],
                 },
                 adapter: catalog::CatalogAdapter::default(),
+                modality_assessment: catalog::CatalogModalityAssessment {
+                    detected: vec!["text".to_owned()],
+                    evidence: vec!["test fixture".to_owned()],
+                    calibrated_fingerprints: BTreeMap::new(),
+                    resource_profiles: BTreeMap::new(),
+                },
+                sampling: catalog::CatalogSamplingProfile::default(),
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,
@@ -61031,6 +66730,81 @@ State initialization...
                     rate_map: Vec::new(),
                 },
             }],
+        }
+    }
+
+    fn test_modality_resource_profile(modality: &str) -> catalog::CatalogModalityResourceProfile {
+        catalog::CatalogModalityResourceProfile {
+            unit: match modality {
+                "image" => "pixel",
+                "audio" => "second",
+                "video" => "frame",
+                "embedding" => "input_token",
+                _ => "",
+            }
+            .to_owned(),
+            measurement_source: "test-fixture".to_owned(),
+            max_item_bytes: 1,
+            max_item_units: 1,
+            measured_item_bytes: 1,
+            measured_item_units: 1,
+            measured_working_set_bytes: 10,
+            calibration_baseline_memory_bytes: 100,
+            calibration_peak_memory_bytes: 110,
+            calibration_f13_budget_bytes: 200,
+            default_max_inflight_items: 1,
+            default_max_items_per_request: 1,
+        }
+    }
+
+    fn add_test_model_modality_evidence(
+        model: &mut catalog::CatalogModel,
+        artifact: &str,
+        modality: &str,
+    ) {
+        if !model
+            .modality_assessment
+            .detected
+            .iter()
+            .any(|detected| detected == modality)
+        {
+            model.modality_assessment.detected.push(modality.to_owned());
+        }
+        model
+            .modality_assessment
+            .calibrated_fingerprints
+            .entry(artifact.to_owned())
+            .or_default()
+            .insert(modality.to_owned(), "f".repeat(64));
+        if modality != "text" {
+            model
+                .modality_assessment
+                .resource_profiles
+                .entry(artifact.to_owned())
+                .or_default()
+                .insert(
+                    modality.to_owned(),
+                    test_modality_resource_profile(modality),
+                );
+        }
+    }
+
+    fn test_heartbeat_modality_capacity(modality: &str) -> HeartbeatModalityCapacity {
+        HeartbeatModalityCapacity {
+            unit: match modality {
+                "image" => "pixel",
+                "audio" => "second",
+                "video" => "frame",
+                "embedding" => "input_token",
+                _ => "",
+            }
+            .to_owned(),
+            max_inflight_items: 1,
+            active_items: 0,
+            max_items_per_request: 1,
+            max_item_bytes: u64::MAX,
+            max_item_units: u64::MAX,
+            working_set_bytes_per_item: 1,
         }
     }
 
@@ -61150,6 +66924,7 @@ State initialization...
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
                 served_ctx: Some(4096),
+                served_modalities: vec!["text".to_owned()],
                 hardware_fingerprint: Some("77".repeat(32)),
                 device_key: Some("88".repeat(32)),
                 rooms: vec![room_id],

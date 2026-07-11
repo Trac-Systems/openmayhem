@@ -6,28 +6,29 @@ use axum::{
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use mayhem_gateway::openai::{
-    openai_router, validate_loopback_dashboard_bind, AudioSpeechOutput, AudioSpeechRequest,
-    AudioTranscriptionOutput, AudioTranscriptionRequest, ChatCompletionRequest, ChatMessage,
-    ChatOutput, EmbeddingOutput, EmbeddingRequest, GatewayArtifactOutput, GatewayAudioSpeechFuture,
-    GatewayAudioSpeechResult, GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult,
-    GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
-    GatewayEmbeddingFuture, GatewayEmbeddingResult, GatewayImageGenerationFuture,
-    GatewayImageGenerationResult, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
-    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
-    GatewaySessionResult, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
-    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, ShapeAdapterInfo,
-    ToolCallOutput, Usage,
+    openai_router, validate_loopback_dashboard_bind, ArtifactGenerationOutput,
+    ArtifactGenerationRequest, AudioSpeechOutput, AudioSpeechRequest, AudioTranscriptionOutput,
+    AudioTranscriptionRequest, ChatCompletionRequest, ChatMessage, ChatOutput, EmbeddingOutput,
+    EmbeddingRequest, GatewayArtifactGenerationFuture, GatewayArtifactGenerationResult,
+    GatewayArtifactOutput, GatewayAudioSpeechFuture, GatewayAudioSpeechResult,
+    GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult, GatewayCanaryModelConfig,
+    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
+    GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
+    GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
+    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewayState, ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps,
+    PriceRefAu, ProviderSignedReceipt, SamplingProfile, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, audio_fingerprint, image_average_hash_hex, normalize_rate_map,
     priced_usage_au, text_generation_rate_map, token_fingerprint, HeartbeatAttestation,
-    HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat,
-    ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
+    HeartbeatCaps, HeartbeatModalityCapacity, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
+    ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
     catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
     CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use std::{
@@ -165,6 +166,72 @@ impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
                 backend: self.name().to_owned(),
                 direct_session: true,
                 provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactGenerationDirectSessionBackend;
+
+impl GatewaySessionBackend for ArtifactGenerationDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-artifact-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_artifact_generation<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ArtifactGenerationRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayArtifactGenerationFuture<'a> {
+        Box::pin(async move {
+            let (content_type, bytes, usage) = if request.output_modality == "video" {
+                (
+                    "video/mp4",
+                    b"mayhem-test-mp4".to_vec(),
+                    ReceiptUsage::from_units([
+                        (USAGE_VIDEO_SECOND, request.duration_seconds),
+                        (USAGE_FRAME, request.frame_count),
+                    ]),
+                )
+            } else {
+                (
+                    "audio/wav",
+                    tiny_wav_bytes(16_000),
+                    ReceiptUsage::from_units([
+                        (
+                            USAGE_INPUT_CHARACTER,
+                            u64::try_from(request.prompt.chars().count()).unwrap(),
+                        ),
+                        (USAGE_AUDIO_SECOND, request.duration_seconds),
+                    ]),
+                )
+            };
+            let artifact_id = format!("{}-test", request.output_modality);
+            Ok(GatewayArtifactGenerationResult {
+                output: ArtifactGenerationOutput {
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: artifact_id,
+                        content_type: content_type.to_owned(),
+                        blake3: blake3::hash(&bytes).to_hex().to_string(),
+                        bytes,
+                    }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
                 quality: None,
             })
         })
@@ -1053,7 +1120,7 @@ async fn production_gateway_without_live_provider_refuses_local_chat_shim() {
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
-        .contains("local dev shim"));
+        .contains("no provider available"));
     assert!(state.receipts().is_empty());
 
     let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
@@ -1091,17 +1158,26 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
 
 #[tokio::test]
 async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
+    let embedding_contract =
+        mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS)
+            .unwrap();
     let catalog = json!({
         "models": [{
             "model_id": "mayhem/tier2-model",
             "model_class": "embedding",
             "caps": { "tools": true, "json": true, "ctx_max": 4096, "vision": false },
+            "adapter": {
+                "endpoint_families": [embedding_contract],
+                "chat_template_id": "none",
+                "tool_call_strategy": "none",
+                "reasoning_passthrough": "strip",
+                "modality_set": ["embedding"]
+            },
             "price_ref_au": {
                 "denom": "au_usd",
                 "ver": 1,
                 "rate_map": [
-                    { "unit": "input_token", "per_unit_au": "10", "granularity": 1000 },
-                    { "unit": "output_token", "per_unit_au": "30", "granularity": 1000 }
+                    { "unit": "input_token", "per_unit_au": "10", "granularity": 1000 }
                 ]
             },
             "attestation_tiers": { "T1": 1, "T2": 2 }
@@ -1239,7 +1315,7 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
-        .contains("does not support embeddings"));
+        .contains("does not expose endpoint family openai_embeddings"));
 }
 
 #[tokio::test]
@@ -1260,7 +1336,7 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
 
     let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["object"], "images.response");
     assert_eq!(body["model"], "admin/image-fixture");
     assert_eq!(body["data"].as_array().expect("image data").len(), 1);
@@ -1370,7 +1446,7 @@ async fn image_generation_scales_step_usage_by_resolution_and_validates_size() {
     let (status, body) =
         json_request(app.clone(), Method::POST, "/v1/images/generations", request).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["usage"][USAGE_IMAGE], 1);
     assert_eq!(body["usage"][USAGE_STEP], 12);
     let receipt = &state.receipts()[0].receipt;
@@ -1394,6 +1470,152 @@ async fn image_generation_scales_step_usage_by_resolution_and_validates_size() {
         .as_str()
         .expect("bad size message")
         .contains("maximum"));
+}
+
+#[tokio::test]
+async fn video_generation_supports_full_bounded_job_lifecycle_and_hf_overlap() {
+    let state = test_gateway_state_from_models(vec![routed_video_generation_test_model()])
+        .with_session_backend(Arc::new(ArtifactGenerationDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let (status, created) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/videos",
+        json!({
+            "model": "admin/video-fixture",
+            "prompt": "a small red square moving left",
+            "seconds": "4",
+            "size": "1280x720"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["object"], "video");
+    assert_eq!(created["status"], "completed");
+    assert_eq!(created["usage"][USAGE_VIDEO_SECOND], 4);
+    assert_eq!(created["usage"][USAGE_FRAME], 96);
+    assert_eq!(created["mayhem"]["receipt"]["rail"], "fiat");
+    let video_id = created["id"].as_str().expect("video id").to_owned();
+
+    let (list_status, list) = json_request(
+        app.clone(),
+        Method::GET,
+        "/v1/videos?limit=1&order=desc",
+        json!({}),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["object"], "list");
+    assert_eq!(list["data"][0]["id"], video_id);
+    assert_eq!(list["has_more"], false);
+
+    let retrieve_uri = format!("/v1/videos/{video_id}");
+    let (retrieve_status, retrieved) =
+        json_request(app.clone(), Method::GET, &retrieve_uri, json!({})).await;
+    assert_eq!(retrieve_status, StatusCode::OK, "{retrieved}");
+    assert_eq!(retrieved["id"], video_id);
+
+    let content_uri = format!("/v1/videos/{video_id}/content");
+    let (content_status, content_headers, content) =
+        raw_request(app.clone(), Method::GET, &content_uri, None).await;
+    assert_eq!(content_status, StatusCode::OK);
+    assert_eq!(content_headers["content-type"], "video/mp4");
+    assert_eq!(content, b"mayhem-test-mp4");
+    assert!(content_headers.contains_key("x-mayhem-artifact-blake3"));
+
+    let (hf_status, hf_headers, hf_video) = raw_request(
+        app.clone(),
+        Method::POST,
+        "/hf-inference/models/admin/video-fixture",
+        Some(json!({
+            "inputs": "a blue square moving right",
+            "parameters": {
+                "num_frames": 8,
+                "fps": 4.0,
+                "num_inference_steps": 2
+            }
+        })),
+    )
+    .await;
+    assert_eq!(hf_status, StatusCode::OK);
+    assert_eq!(hf_headers["content-type"], "video/mp4");
+    assert_eq!(hf_video, b"mayhem-test-mp4");
+    assert!(hf_headers.contains_key("x-mayhem-receipt"));
+
+    let (delete_status, deleted) =
+        json_request(app.clone(), Method::DELETE, &retrieve_uri, json!({})).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["id"], video_id);
+    assert_eq!(deleted["deleted"], true);
+
+    let (missing_status, missing) = json_request(app, Method::GET, &retrieve_uri, json!({})).await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(state.receipts().len(), 2);
+}
+
+#[tokio::test]
+async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
+    let state = test_gateway_state_from_models(vec![
+        routed_general_audio_generation_test_model(),
+        routed_music_generation_test_model(),
+    ])
+    .with_session_backend(Arc::new(ArtifactGenerationDirectSessionBackend));
+    let app = openai_router(state.clone());
+
+    let (audio_status, audio) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/audio/generations",
+        json!({
+            "model": "admin/audio-generation-fixture",
+            "prompt": "wind",
+            "duration_seconds": 2,
+            "response_format": "wav",
+            "seed": 7
+        }),
+    )
+    .await;
+    assert_eq!(audio_status, StatusCode::OK, "{audio}");
+    assert_eq!(audio["object"], "audio.generation");
+    assert_eq!(audio["usage"][USAGE_INPUT_CHARACTER], 4);
+    assert_eq!(audio["usage"][USAGE_AUDIO_SECOND], 2);
+    assert_eq!(audio["mayhem"]["receipt"]["rail"], "fiat");
+
+    let (music_status, music) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "piano",
+            "duration_seconds": 3,
+            "response_format": "wav",
+            "seed": 9
+        }),
+    )
+    .await;
+    assert_eq!(music_status, StatusCode::OK, "{music}");
+    assert_eq!(music["object"], "music.generation");
+    assert_eq!(music["usage"][USAGE_INPUT_CHARACTER], 5);
+    assert_eq!(music["usage"][USAGE_AUDIO_SECOND], 3);
+    assert_eq!(music["mayhem"]["receipt"]["rail"], "fiat");
+
+    let (hf_status, hf_headers, hf_audio) = raw_request(
+        app,
+        Method::POST,
+        "/hf-inference/models/admin/audio-generation-fixture",
+        Some(json!({
+            "inputs": "rain",
+            "parameters": {"duration_seconds": 2}
+        })),
+    )
+    .await;
+    assert_eq!(hf_status, StatusCode::OK);
+    assert_eq!(hf_headers["content-type"], "audio/wav");
+    assert_eq!(hf_headers["x-mayhem-sampling-rate"], "16000");
+    assert_eq!(hf_audio, tiny_wav_bytes(16_000));
+    assert!(hf_headers.contains_key("x-mayhem-receipt"));
+    assert_eq!(state.receipts().len(), 3);
 }
 
 #[tokio::test]
@@ -1747,6 +1969,16 @@ async fn chat_completion_rejects_image_content_for_non_vision_model() {
 async fn chat_completion_preserves_image_content_for_vision_direct_session() {
     let mut model = routed_test_model();
     model.mayhem.caps.vision = true;
+    model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        candidate.caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx_max": 8192,
+            "vision": true,
+        });
+    }
     let seen_content = Arc::new(Mutex::new(Vec::new()));
     let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         VisionInspectBackend {
@@ -1754,24 +1986,32 @@ async fn chat_completion_preserves_image_content_for_vision_direct_session() {
         },
     ));
     let app = openai_router(state);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let image_url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+    );
     let request = json!({
         "model": "mayhem/routed-test",
         "messages": [{
             "role": "user",
             "content": [
                 { "type": "text", "text": "describe this" },
-                { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } }
+                { "type": "image_url", "image_url": { "url": image_url } }
             ]
         }]
     });
 
     let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["choices"][0]["message"]["content"], "vision ok");
     assert_eq!(
         seen_content.lock().expect("seen content")[0][1]["image_url"]["url"],
-        "data:image/png;base64,aW1hZ2U="
+        image_url
     );
 }
 
@@ -2453,7 +2693,16 @@ fn routed_embedding_test_model() -> GatewayModel {
         output_modalities: vec!["embedding".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["embedding".to_owned()];
+    model.mayhem.adapter.endpoint_families = vec![
+        mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS)
+            .unwrap(),
+        mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION,
+        )
+        .unwrap(),
+    ];
     for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["embedding".to_owned()];
         candidate.price_ver = 3;
         candidate.caps = serde_json::json!({
             "ctx_max": 8192,
@@ -2503,9 +2752,12 @@ fn routed_image_generation_test_model() -> GatewayModel {
         output_modalities: vec!["image".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["image".to_owned()];
-    model.mayhem.adapter.request_shape_family = "openai_images".to_owned();
-    model.mayhem.adapter.response_normalization = "openai_images".to_owned();
+    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+    )
+    .unwrap()];
     for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["image".to_owned()];
         candidate.price_ver = 4;
         candidate.caps = serde_json::json!({
             "ctx_max": 4096,
@@ -2515,6 +2767,138 @@ fn routed_image_generation_test_model() -> GatewayModel {
             "max_image_steps": 50,
             "output_modality": "image",
             "output_modalities": ["image"]
+        });
+    }
+    model
+}
+
+fn routed_video_generation_test_model() -> GatewayModel {
+    routed_artifact_generation_test_model(
+        "admin/video-fixture",
+        "video-generation",
+        "video",
+        &"58".repeat(32),
+        8,
+        &[
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ],
+        vec![
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 100,
+                granularity: 1,
+            },
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_FRAME.to_owned(),
+                per_unit_au: 2,
+                granularity: 1,
+            },
+        ],
+    )
+}
+
+fn routed_general_audio_generation_test_model() -> GatewayModel {
+    routed_artifact_generation_test_model(
+        "admin/audio-generation-fixture",
+        "audio-generation",
+        "audio",
+        &"59".repeat(32),
+        9,
+        &[
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+        ],
+        vec![
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 100,
+                granularity: 1,
+            },
+        ],
+    )
+}
+
+fn routed_music_generation_test_model() -> GatewayModel {
+    routed_artifact_generation_test_model(
+        "admin/music-generation-fixture",
+        "music-generation",
+        "audio",
+        &"60".repeat(32),
+        10,
+        &[
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+        ],
+        vec![
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 125,
+                granularity: 1,
+            },
+        ],
+    )
+}
+
+fn routed_artifact_generation_test_model(
+    id: &str,
+    model_class: &str,
+    modality: &str,
+    provider: &str,
+    price_ver: u64,
+    endpoint_families: &[&str],
+    rate_map: Vec<mayhem_gateway::RateMapEntry>,
+) -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&[provider.to_owned()]);
+    model.id = id.to_owned();
+    model.mayhem.model_class = model_class.to_owned();
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
+        ver: price_ver,
+        rate_map,
+        per_req_au: 0,
+        min_session_au: 0,
+        derivation: None,
+        history: Vec::new(),
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 4096,
+        vision: false,
+        image: false,
+        video: modality == "video",
+        audio: modality == "audio",
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
+        output_modality: Some(modality.to_owned()),
+        output_modalities: vec![modality.to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec![modality.to_owned()];
+    model.mayhem.adapter.endpoint_families = endpoint_families
+        .iter()
+        .map(|family| mayhem_proto::endpoint_family_contract_template(family).unwrap())
+        .collect();
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec![modality.to_owned()];
+        candidate.price_ver = price_ver;
+        candidate.caps = json!({
+            "ctx_max": 4096,
+            "video": modality == "video",
+            "audio": modality == "audio",
+            "output_modality": modality,
+            "output_modalities": [modality],
         });
     }
     model
@@ -2559,9 +2943,12 @@ fn routed_audio_speech_test_model() -> GatewayModel {
         output_modalities: vec!["audio".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["audio".to_owned()];
-    model.mayhem.adapter.request_shape_family = "openai_audio_speech".to_owned();
-    model.mayhem.adapter.response_normalization = "openai_audio_speech".to_owned();
+    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+    )
+    .unwrap()];
     for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["audio".to_owned()];
         candidate.price_ver = 5;
         candidate.caps = serde_json::json!({
             "ctx_max": 4096,
@@ -2605,9 +2992,12 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
         output_modalities: vec!["text".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["audio".to_owned(), "text".to_owned()];
-    model.mayhem.adapter.request_shape_family = "openai_audio_transcriptions".to_owned();
-    model.mayhem.adapter.response_normalization = "openai_audio_transcriptions".to_owned();
+    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+    )
+    .unwrap()];
     for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["audio".to_owned(), "text".to_owned()];
         candidate.price_ver = 6;
         candidate.caps = serde_json::json!({
             "ctx_max": 4096,
@@ -2815,13 +3205,20 @@ fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
 fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
     stable_value_hash_for_test(&json!({
         "kind": "image_generation",
+        "model": &request.model,
         "prompt": &request.prompt,
         "n": request.n.unwrap_or(1).clamp(1, 4),
         "size": request.size.as_deref().unwrap_or("512x512"),
         "steps": image_steps_for_test(request),
         "cfg_scale": image_cfg_scale_for_test(request),
         "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS),
         "seed": request.seed,
+        "quality": request.quality,
+        "style": request.style,
+        "negative_prompt": request.negative_prompt,
+        "scheduler": request.scheduler,
+        "user": request.user,
     }))
 }
 
@@ -2841,16 +3238,21 @@ fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
 fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
     stable_value_hash_for_test(&json!({
         "kind": "audio_speech",
+        "model": &request.model,
         "input": &request.input,
         "response_format": request.response_format.as_deref().unwrap_or("wav"),
+        "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH),
         "voice": request.voice.as_deref(),
         "speed": request.speed,
+        "instructions": request.instructions,
+        "stream_format": request.stream_format,
     }))
 }
 
 fn audio_transcription_prompt_hash_for_test(request: &AudioTranscriptionRequest) -> String {
     stable_value_hash_for_test(&json!({
         "kind": "audio_transcription",
+        "model": &request.model,
         "audio": {
             "encoding": "hex",
             "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
@@ -2859,8 +3261,16 @@ fn audio_transcription_prompt_hash_for_test(request: &AudioTranscriptionRequest)
         },
         "audio_seconds": wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
         "response_format": request.response_format.as_deref().unwrap_or("json"),
+        "endpoint_family": &request.endpoint_family,
         "language": request.language.as_deref(),
         "prompt": request.prompt.as_deref(),
+        "temperature": request.temperature,
+        "timestamp_granularities": if request.timestamp_granularities.is_empty() {
+            Value::Null
+        } else {
+            json!(&request.timestamp_granularities)
+        },
+        "stream": request.stream,
     }))
 }
 
@@ -2943,6 +3353,11 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     }],
                     tools: None,
                     max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
                     prompt: None,
                     input: None,
                     audio_b64: None,
@@ -2993,6 +3408,11 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     messages: Vec::new(),
                     tools: None,
                     max_tokens: 1,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
                     prompt: Some("fixed image canary".to_owned()),
                     input: None,
                     audio_b64: None,
@@ -3040,6 +3460,11 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     messages: Vec::new(),
                     tools: None,
                     max_tokens: 1,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
                     prompt: None,
                     input: Some("fixed embedding canary".to_owned()),
                     audio_b64: None,
@@ -3087,6 +3512,11 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     messages: Vec::new(),
                     tools: None,
                     max_tokens: 1,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
                     prompt: None,
                     input: None,
                     audio_b64: Some(base64::engine::general_purpose::STANDARD.encode(audio)),
@@ -3134,6 +3564,11 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     messages: Vec::new(),
                     tools: None,
                     max_tokens: 1,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
                     prompt: None,
                     input: Some("fixed speech canary".to_owned()),
                     audio_b64: None,
@@ -3176,6 +3611,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
         owned_by: "mayhem".to_owned(),
         mayhem: MayhemModelInfo {
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
+            family: "test".to_owned(),
             providers_online: 1,
             rooms: 1,
             price_ref_au: PriceRefAu {
@@ -3209,6 +3645,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 output_modalities: vec!["text".to_owned()],
             },
             adapter: ShapeAdapterInfo::default(),
+            sampling: SamplingProfile::default(),
             failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
@@ -3227,6 +3664,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     GatewayRouteCandidate {
         provider: provider.to_owned(),
         accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+        served_modalities: vec!["text".to_owned()],
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,
@@ -3309,6 +3747,33 @@ fn test_provider_heartbeat(
                 .get("vision")
                 .and_then(Value::as_bool)
                 .unwrap_or(model.mayhem.caps.vision),
+            served_modalities: candidate.served_modalities.clone(),
+            modality_capacity: candidate
+                .served_modalities
+                .iter()
+                .filter(|modality| modality.as_str() != "text")
+                .map(|modality| {
+                    let unit = match modality.as_str() {
+                        "image" => "pixel",
+                        "audio" => "second",
+                        "video" => "frame",
+                        "embedding" => "input_token",
+                        _ => "unit",
+                    };
+                    (
+                        modality.clone(),
+                        HeartbeatModalityCapacity {
+                            unit: unit.to_owned(),
+                            max_inflight_items: 16,
+                            active_items: 0,
+                            max_items_per_request: 4,
+                            max_item_bytes: 256 * 1024 * 1024,
+                            max_item_units: 100_000_000,
+                            working_set_bytes_per_item: 1024,
+                        },
+                    )
+                })
+                .collect(),
         },
         att: HeartbeatAttestation {
             epoch: 3,
@@ -3523,7 +3988,7 @@ async fn legacy_completions_return_text_completion_shape_and_stream() {
     assert!(body["choices"][0]["text"]
         .as_str()
         .expect("completion text")
-        .contains("Mayhem completion"));
+        .contains("Mayhem response"));
     assert_eq!(body["mayhem"]["billable"], false);
     assert_eq!(body["mayhem"]["dev_session"], true);
     assert_eq!(body["mayhem"]["receipt"], Value::Null);

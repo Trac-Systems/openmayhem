@@ -248,7 +248,11 @@ const MODEL_CLASSES = new Set([
 ]);
 const RATE_MAP_MAX_ENTRIES = 16;
 const MODEL_CLASS_RATE_UNITS = Object.freeze({
-  [DEFAULT_MODEL_CLASS]: new Set(['input_token', 'cached_input_token', 'output_token']),
+  [DEFAULT_MODEL_CLASS]: new Set([
+    'input_token',
+    'cached_input_token',
+    'output_token',
+  ]),
   embedding: new Set(['input_token', 'embedding']),
   'image-generation': new Set(['image', 'step']),
   'video-generation': new Set(['video_second', 'frame']),
@@ -258,6 +262,7 @@ const MODEL_CLASS_RATE_UNITS = Object.freeze({
   'music-generation': new Set(['input_character', 'audio_second']),
 });
 const CAP_OUTPUT_MODALITIES = new Set(['text', 'embedding', 'image', 'video', 'audio']);
+const ENCLAVE_MODALITIES = new Set(['text', 'embedding', 'image', 'video', 'audio']);
 const MODEL_CLASS_OUTPUT_MODALITIES = Object.freeze({
   [DEFAULT_MODEL_CLASS]: new Set(['text']),
   embedding: new Set(['embedding']),
@@ -306,6 +311,7 @@ const ENCLAVE_CAP_FIELDS = new Set([
   ...ENCLAVE_CAP_STRING_FIELDS,
   'output_modality',
   'output_modalities',
+  'modality_set',
 ]);
 const ROOM_POLICY_FIELDS = new Set([
   'region_hint',
@@ -358,6 +364,9 @@ const canonicalSpendVoucherBody = (body) => {
     locked_min_session_au: body.locked_min_session_au,
     served_ctx: body.served_ctx,
   };
+  if (Array.isArray(body.required_modalities) && body.required_modalities.length > 0) {
+    canonical.required_modalities = body.required_modalities;
+  }
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.max_spend_au = body.max_spend_au;
@@ -423,6 +432,7 @@ export const spendReservationEvidence = (value) => ({
   price_ver: value.price_ver,
   rules_ver: value.rules_ver,
   served_ctx: value.served_ctx,
+  required_modalities: value.required_modalities,
   ctx_bracket: value.ctx_bracket,
   ctx_bracket_table_ver: value.ctx_bracket_table_ver,
   max_spend_au: value.max_spend_au,
@@ -1340,6 +1350,7 @@ class MayhemContract extends Contract {
           intent.device_key ?? null,
           {
             served_ctx: intent.served_ctx,
+            served_modalities: intent.served_modalities,
             ctx_bracket: intent.ctx_bracket,
             ctx_bracket_table_ver: intent.ctx_bracket_table_ver,
           }
@@ -1447,6 +1458,7 @@ class MayhemContract extends Contract {
         this.compareAu(existing.locked_per_req_au, normalized.locked_per_req_au) !== 0 ||
         this.compareAu(existing.locked_min_session_au, normalized.locked_min_session_au) !== 0 ||
         existing.served_ctx !== normalized.served_ctx ||
+        stableJson(existing.required_modalities) !== stableJson(normalized.required_modalities) ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
         this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
@@ -1486,6 +1498,7 @@ class MayhemContract extends Contract {
       locked_per_req_au: normalized.locked_per_req_au,
       locked_min_session_au: normalized.locked_min_session_au,
       served_ctx: normalized.served_ctx,
+      required_modalities: normalized.required_modalities.slice(),
       ctx_bracket: normalized.ctx_bracket,
       ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
@@ -2789,16 +2802,12 @@ class MayhemContract extends Contract {
 
   async joinEnclave() {
     const shapeError = this.validateExactCommandValue(
-      ['op', 'enclave_id'],
+      ['op', 'enclave_id', 'served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver'],
       'join_enclave',
-      ['hardware_fingerprint', 'device_key', 'served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']
+      ['hardware_fingerprint', 'device_key']
     );
     if (shapeError) return shapeError;
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
-    const hasServeTerms =
-      hasOwn(this.value, 'served_ctx') ||
-      hasOwn(this.value, 'ctx_bracket') ||
-      hasOwn(this.value, 'ctx_bracket_table_ver');
 
     return this.applyJoinEnclave(
       this.address,
@@ -2806,13 +2815,12 @@ class MayhemContract extends Contract {
       this.tx,
       this.value.hardware_fingerprint ?? null,
       this.value.device_key ?? null,
-      hasServeTerms
-        ? {
-            served_ctx: this.value.served_ctx,
-            ctx_bracket: this.value.ctx_bracket,
-            ctx_bracket_table_ver: this.value.ctx_bracket_table_ver,
-          }
-        : null
+      {
+        served_ctx: this.value.served_ctx,
+        served_modalities: this.value.served_modalities,
+        ctx_bracket: this.value.ctx_bracket,
+        ctx_bracket_table_ver: this.value.ctx_bracket_table_ver,
+      }
     );
   }
 
@@ -3225,6 +3233,8 @@ class MayhemContract extends Contract {
     });
     if (rateError) return rateError;
     const priceRateMap = this.normalizeRateMap(this.value.rate_map);
+    const modalityRateError = this.validateEnclaveModalityRateMap(enclave, priceRateMap);
+    if (modalityRateError) return modalityRateError;
     const perReqAu = this.normalizeAu(this.value.per_req_au, 'Enclave price per_req_au');
     if (perReqAu instanceof Error) return perReqAu;
     const minSessionAu = this.normalizeAu(this.value.min_session_au, 'Enclave price min_session_au');
@@ -6562,6 +6572,7 @@ class MayhemContract extends Contract {
                 'enclave_id',
                 'nonce',
                 'served_ctx',
+                'served_modalities',
                 'ctx_bracket',
                 'ctx_bracket_table_ver',
                 'hardware_fingerprint',
@@ -6569,7 +6580,7 @@ class MayhemContract extends Contract {
               ]
             : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
-      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']
+      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver']
       : allowed;
     const allowedSet = new Set(allowed);
     const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
@@ -6592,6 +6603,10 @@ class MayhemContract extends Contract {
       (!Number.isSafeInteger(intent.served_ctx) || intent.served_ctx < 0)
     ) {
       return new Error('Invalid provider served context.');
+    }
+    if (hasOwn(intent, 'served_modalities')) {
+      const modalitiesError = this.validateModalitySet(intent.served_modalities, 'provider served_modalities');
+      if (modalitiesError) return modalitiesError;
     }
     if (
       hasOwn(intent, 'ctx_bracket') &&
@@ -6621,15 +6636,37 @@ class MayhemContract extends Contract {
   }
 
   async normalizeProviderServeTerms(enclaveId, terms, label) {
-    if (terms === null || terms === undefined) return null;
+    if (terms === null || terms === undefined) {
+      return new Error(`${label} terms are required.`);
+    }
     if (!terms || typeof terms !== 'object' || Array.isArray(terms)) {
       return new Error(`${label} terms must be an object.`);
     }
-    for (const field of ['served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']) {
+    for (const field of ['served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver']) {
       if (!hasOwn(terms, field)) return new Error(`${label} terms are missing ${field}.`);
     }
     if (!Number.isSafeInteger(terms.served_ctx) || terms.served_ctx < 0) {
       return new Error(`Invalid ${label} served context.`);
+    }
+    const servedModalitiesError = this.validateModalitySet(
+      terms.served_modalities,
+      `${label} served_modalities`
+    );
+    if (servedModalitiesError) return servedModalitiesError;
+    const enclave = await this.get(`enclave/${enclaveId}`);
+    if (!enclave || enclave.status !== 'active') return new Error('Enclave is not active.');
+    const enclaveModalitiesError = this.validateModalitySet(
+      enclave.caps?.modality_set,
+      'admin enclave modality_set'
+    );
+    if (enclaveModalitiesError) return enclaveModalitiesError;
+    const enclaveModalities = new Set(enclave.caps.modality_set);
+    if (terms.served_modalities.some((modality) => !enclaveModalities.has(modality))) {
+      return new Error(`${label} served_modalities must be a subset of the admin enclave modality_set.`);
+    }
+    const coreModalities = this.coreModalitiesForModelClass(this.modelClassFor(enclave));
+    if ([...coreModalities].some((modality) => !terms.served_modalities.includes(modality))) {
+      return new Error(`${label} cannot disable a core model modality.`);
     }
     const table = terms.ctx_bracket_table_ver === null || terms.ctx_bracket_table_ver === undefined
       ? null
@@ -6646,6 +6683,7 @@ class MayhemContract extends Contract {
     if (ctxMeta instanceof Error) return ctxMeta;
     return {
       served_ctx: terms.served_ctx,
+      served_modalities: terms.served_modalities.slice(),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
     };
@@ -6657,6 +6695,20 @@ class MayhemContract extends Contract {
     }
     if (serve.served_ctx !== normalized.served_ctx) {
       return new Error('Spend reservation served context does not match provider committed context.');
+    }
+    const servedModalitiesError = this.validateModalitySet(
+      serve.served_modalities,
+      'provider committed served_modalities'
+    );
+    if (servedModalitiesError) return servedModalitiesError;
+    const requiredModalitiesError = this.validateModalitySet(
+      normalized.required_modalities,
+      'spend reservation required_modalities'
+    );
+    if (requiredModalitiesError) return requiredModalitiesError;
+    const servedModalities = new Set(serve.served_modalities);
+    if (normalized.required_modalities.some((modality) => !servedModalities.has(modality))) {
+      return new Error('Provider committed modalities do not cover the spend reservation.');
     }
     if ((serve.ctx_bracket ?? null) !== (normalized.ctx_bracket ?? null)) {
       return new Error('Spend reservation context bracket does not match provider committed context.');
@@ -7073,6 +7125,21 @@ class MayhemContract extends Contract {
     if (hasCtx && hasCtxMax && caps.ctx !== caps.ctx_max) {
       return new Error('Enclave caps ctx and ctx_max must match when both are set.');
     }
+    const modalitySetError = this.validateModalitySet(caps.modality_set, 'Enclave caps modality_set');
+    if (modalitySetError) return modalitySetError;
+    const coreModalities = this.coreModalitiesForModelClass(modelClass);
+    if ([...coreModalities].some((modality) => !caps.modality_set.includes(modality))) {
+      return new Error(`Enclave caps modality_set is missing a core modality for model_class ${modelClass}.`);
+    }
+    if (caps.vision === true && !caps.modality_set.includes('image')) {
+      return new Error('Enclave caps vision requires image in modality_set.');
+    }
+    if (caps.audio === true && !caps.modality_set.includes('audio')) {
+      return new Error('Enclave caps audio requires audio in modality_set.');
+    }
+    if (caps.video === true && !caps.modality_set.includes('video')) {
+      return new Error('Enclave caps video requires video in modality_set.');
+    }
     const allowedOutputModalities = MODEL_CLASS_OUTPUT_MODALITIES[modelClass] ?? new Set();
     const validateOutputModality = (modality, label) => {
       if (typeof modality !== 'string' || modality.length === 0 || modality.length > 32) {
@@ -7116,6 +7183,42 @@ class MayhemContract extends Contract {
       }
     }
     return null;
+  }
+
+  validateModalitySet(value, label) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
+      return new Error(`${label} must be a non-empty array with at most 8 entries.`);
+    }
+    const seen = new Set();
+    for (const modality of value) {
+      if (typeof modality !== 'string' || !ENCLAVE_MODALITIES.has(modality)) {
+        return new Error(`${label} contains unsupported modality ${String(modality)}.`);
+      }
+      if (seen.has(modality)) return new Error(`${label} contains duplicate modality ${modality}.`);
+      seen.add(modality);
+    }
+    return null;
+  }
+
+  coreModalitiesForModelClass(modelClass) {
+    switch (modelClass) {
+      case DEFAULT_MODEL_CLASS:
+        return new Set(['text']);
+      case 'embedding':
+        return new Set(['embedding']);
+      case 'image-generation':
+        return new Set(['image']);
+      case 'video-generation':
+        return new Set(['video']);
+      case 'stt':
+        return new Set(['audio', 'text']);
+      case 'tts':
+      case 'audio-generation':
+      case 'music-generation':
+        return new Set(['audio']);
+      default:
+        return new Set();
+    }
   }
 
   validateEnclaveArtifactBinding(value) {
@@ -7914,6 +8017,40 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateEnclaveModalityRateMap(enclave, rateMap) {
+    const modalityError = this.validateModalitySet(
+      enclave?.caps?.modality_set,
+      'Enclave caps modality_set'
+    );
+    if (modalityError) return modalityError;
+    const modelClass = this.modelClassFor(enclave);
+    const required = new Set();
+    if (modelClass === DEFAULT_MODEL_CLASS) {
+      required.add('input_token');
+      required.add('output_token');
+    } else if (modelClass === 'embedding') {
+      required.add('input_token');
+    } else if (modelClass === 'image-generation') {
+      required.add('image');
+      required.add('step');
+    } else if (modelClass === 'video-generation') {
+      required.add('video_second');
+      required.add('frame');
+    } else if (modelClass === 'tts' || modelClass === 'audio-generation' || modelClass === 'music-generation') {
+      required.add('input_character');
+      required.add('audio_second');
+    } else if (modelClass === 'stt') {
+      required.add('audio_second');
+    }
+    const units = new Set(rateMap.map((entry) => entry.unit));
+    for (const unit of required) {
+      if (!units.has(unit)) {
+        return new Error(`Enclave price rate_map is missing required modality unit ${unit}.`);
+      }
+    }
+    return null;
+  }
+
   normalizeRateMap(rateMap) {
     return rateMap
       .map((entry) => ({
@@ -8088,6 +8225,7 @@ class MayhemContract extends Contract {
         'locked_per_req_au',
         'locked_min_session_au',
         'served_ctx',
+        'required_modalities',
         'ctx_bracket',
         'ctx_bracket_table_ver',
         'max_spend_au',
@@ -8123,6 +8261,11 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(voucher.served_ctx) || voucher.served_ctx < 0) {
       return new Error('Invalid spend voucher served context.');
     }
+    const modalityError = this.validateModalitySet(
+      voucher.required_modalities,
+      'spend voucher required_modalities'
+    );
+    if (modalityError) return modalityError;
     const table = voucher.ctx_bracket_table_ver === null || voucher.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
@@ -8156,6 +8299,7 @@ class MayhemContract extends Contract {
       locked_per_req_au: lockedPerReqAu,
       locked_min_session_au: lockedMinSessionAu,
       served_ctx: voucher.served_ctx,
+      required_modalities: voucher.required_modalities.slice(),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       max_spend_au: maxSpendAu,
@@ -8187,6 +8331,7 @@ class MayhemContract extends Contract {
         'price_ver',
         'rules_ver',
         'served_ctx',
+        'required_modalities',
         'ctx_bracket',
         'ctx_bracket_table_ver',
         'max_spend_au',
@@ -8215,6 +8360,11 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.served_ctx) || value.served_ctx < 0) {
       return new Error('Invalid spend reservation served context.');
     }
+    const modalityError = this.validateModalitySet(
+      value.required_modalities,
+      'spend reservation required_modalities'
+    );
+    if (modalityError) return modalityError;
     const activeTable = value.ctx_bracket_table_ver === null || value.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableAt(value.at);
@@ -8253,6 +8403,9 @@ class MayhemContract extends Contract {
     if (voucher.body.served_ctx !== value.served_ctx) {
       return new Error('Spend reservation voucher served context mismatch.');
     }
+    if (stableJson(voucher.body.required_modalities) !== stableJson(value.required_modalities)) {
+      return new Error('Spend reservation voucher required modalities mismatch.');
+    }
     if (voucher.body.ctx_bracket !== value.ctx_bracket) {
       return new Error('Spend reservation voucher context bracket mismatch.');
     }
@@ -8277,6 +8430,7 @@ class MayhemContract extends Contract {
       locked_per_req_au: voucher.body.locked_per_req_au,
       locked_min_session_au: voucher.body.locked_min_session_au,
       served_ctx: value.served_ctx,
+      required_modalities: value.required_modalities.slice(),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
@@ -8290,6 +8444,7 @@ class MayhemContract extends Contract {
         locked_per_req_au: voucher.body.locked_per_req_au,
         locked_min_session_au: voucher.body.locked_min_session_au,
         served_ctx: voucher.body.served_ctx,
+        required_modalities: voucher.body.required_modalities,
         ctx_bracket: voucher.body.ctx_bracket,
         ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
         max_spend_au: voucher.body.max_spend_au,
@@ -8355,6 +8510,11 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(session.served_ctx) || session.served_ctx < 0) {
         return new Error('Invalid spend hold served context.');
       }
+      const modalityError = this.validateModalitySet(
+        session.required_modalities,
+        'spend hold required_modalities'
+      );
+      if (modalityError) return modalityError;
       const table = session.ctx_bracket_table_ver === null || session.ctx_bracket_table_ver === undefined
         ? null
         : await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
@@ -8381,6 +8541,7 @@ class MayhemContract extends Contract {
         ...session,
         locked_per_req_au: this.normalizeAu(session.locked_per_req_au, 'spend hold locked per-request price'),
         locked_min_session_au: this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price'),
+        required_modalities: session.required_modalities.slice(),
         max_spend_au: this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false }),
       })),
     };

@@ -40,7 +40,7 @@ pub const CRATE_NAME: &str = "mayhem-gateway";
 pub const DEFAULT_MAX_REPORT_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS: u64 = 5 * 60;
 pub const DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS: u64 = 120;
-pub const HEARTBEAT_SCHEMA_VERSION: u32 = 1;
+pub const HEARTBEAT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
@@ -235,6 +235,19 @@ pub struct HeartbeatCaps {
     pub json: bool,
     pub ctx: u32,
     pub vision: bool,
+    pub served_modalities: Vec<String>,
+    pub modality_capacity: BTreeMap<String, HeartbeatModalityCapacity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatModalityCapacity {
+    pub unit: String,
+    pub max_inflight_items: u32,
+    pub active_items: u32,
+    pub max_items_per_request: u32,
+    pub max_item_bytes: u64,
+    pub max_item_units: u64,
+    pub working_set_bytes_per_item: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2297,6 +2310,74 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
             reason: "must be greater than zero".to_owned(),
         });
     }
+    if heartbeat.caps.served_modalities.is_empty() || heartbeat.caps.served_modalities.len() > 8 {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "caps.served_modalities",
+            reason: "must contain 1..=8 entries".to_owned(),
+        });
+    }
+    let mut modalities = HashSet::new();
+    for modality in &heartbeat.caps.served_modalities {
+        if !matches!(
+            modality.as_str(),
+            "text" | "embedding" | "image" | "video" | "audio"
+        ) {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.served_modalities",
+                reason: format!("contains unsupported modality {modality}"),
+            });
+        }
+        if !modalities.insert(modality) {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.served_modalities",
+                reason: format!("contains duplicate modality {modality}"),
+            });
+        }
+    }
+    for modality in heartbeat
+        .caps
+        .served_modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+    {
+        let Some(capacity) = heartbeat.caps.modality_capacity.get(modality) else {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.modality_capacity",
+                reason: format!("missing served modality {modality}"),
+            });
+        };
+        let expected_unit = match modality.as_str() {
+            "image" => "pixel",
+            "audio" => "second",
+            "video" => "frame",
+            "embedding" => "input_token",
+            _ => unreachable!("served modality was validated above"),
+        };
+        if capacity.unit != expected_unit
+            || capacity.max_inflight_items == 0
+            || capacity.active_items > capacity.max_inflight_items
+            || capacity.max_items_per_request == 0
+            || capacity.max_items_per_request > capacity.max_inflight_items
+            || capacity.max_item_bytes == 0
+            || capacity.max_item_units == 0
+            || capacity.working_set_bytes_per_item == 0
+        {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.modality_capacity",
+                reason: format!(
+                    "{modality} must advertise unit {expected_unit}, positive measured limits, active <= in-flight, and per-request <= in-flight"
+                ),
+            });
+        }
+    }
+    for modality in heartbeat.caps.modality_capacity.keys() {
+        if modality == "text" || !modalities.contains(modality) {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.modality_capacity",
+                reason: format!("contains unserved or text modality {modality}"),
+            });
+        }
+    }
     if heartbeat
         .perf
         .tok_s
@@ -2716,6 +2797,84 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_requires_measured_capacity_for_every_non_text_modality() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "af");
+        heartbeat["caps"]["served_modalities"] = json!(["text", "image"]);
+        resign_heartbeat(&signing_key, &mut heartbeat);
+
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("an image heartbeat without measured capacity must fail closed");
+        assert!(matches!(
+            err,
+            GatewayError::BadHeartbeatField {
+                field: "caps.modality_capacity",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("missing served modality image"));
+    }
+
+    #[test]
+    fn heartbeat_rejects_invalid_or_unserved_modality_capacity() {
+        let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "b0");
+        heartbeat["caps"]["served_modalities"] = json!(["text", "audio"]);
+        heartbeat["caps"]["modality_capacity"] = json!({
+            "audio": {
+                "unit": "second",
+                "max_inflight_items": 1,
+                "active_items": 2,
+                "max_items_per_request": 1,
+                "max_item_bytes": 1024,
+                "max_item_units": 60,
+                "working_set_bytes_per_item": 2048
+            }
+        });
+        resign_heartbeat(&signing_key, &mut heartbeat);
+
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("active modality items cannot exceed their measured limit");
+        assert!(matches!(
+            err,
+            GatewayError::BadHeartbeatField {
+                field: "caps.modality_capacity",
+                ..
+            }
+        ));
+
+        heartbeat["caps"]["served_modalities"] = json!(["text"]);
+        heartbeat["caps"]["modality_capacity"]["audio"]["active_items"] = json!(0);
+        heartbeat["nonce"] = json!(format!("b1{}", "00".repeat(31)));
+        resign_heartbeat(&signing_key, &mut heartbeat);
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("capacity cannot be advertised for an unserved modality");
+        assert!(err.to_string().contains("unserved or text modality audio"));
+    }
+
+    #[test]
     fn heartbeat_receiver_logs_bad_signature_and_replay_drops() {
         let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
         let provider = hex::encode(signing_key.verifying_key().to_bytes());
@@ -2784,14 +2943,25 @@ mod tests {
             "price_ver": 3,
             "min_ask_au": "0",
             "accepting_new": true,
-            "caps": { "tools": true, "json": true, "ctx": 8192, "vision": false },
+            "caps": {
+                "tools": true,
+                "json": true,
+                "ctx": 8192,
+                "vision": false,
+                "served_modalities": ["text"],
+                "modality_capacity": {}
+            },
             "att": { "epoch": 81, "head": "44".repeat(32) },
             "ts": now_millis,
             "nonce": format!("{nonce_prefix}{}", "00".repeat(31)),
         });
-        let payload = heartbeat_signing_payload(&heartbeat).expect("signing payload");
+        resign_heartbeat(signing_key, &mut heartbeat);
+        heartbeat
+    }
+
+    fn resign_heartbeat(signing_key: &SigningKey, heartbeat: &mut Value) {
+        let payload = heartbeat_signing_payload(heartbeat).expect("signing payload");
         let signature = signing_key.sign(&payload);
         heartbeat["sig"] = json!(hex::encode(signature.to_bytes()));
-        heartbeat
     }
 }

@@ -144,6 +144,9 @@ pub struct RequestRequirements {
     pub requires_tools: bool,
     pub requires_json: bool,
     pub requires_vision: bool,
+    #[serde(default)]
+    pub required_modalities: Vec<String>,
+    pub modality_load: BTreeMap<String, ModalityRequestLoad>,
     pub min_ctx: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -165,6 +168,13 @@ pub struct RequestRequirements {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModalityRequestLoad {
+    pub item_count: u32,
+    pub max_item_bytes: u64,
+    pub max_item_units: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IneligibilityReason {
     ConsentVersion,
     Reputation,
@@ -174,6 +184,7 @@ pub enum IneligibilityReason {
     Draining,
     Saturated,
     Capabilities,
+    ModalityCapacity,
     Price,
     ProviderMinAsk,
     ProbationConcurrentLimit,
@@ -286,6 +297,8 @@ impl Default for RequestRequirements {
             requires_tools: false,
             requires_json: false,
             requires_vision: false,
+            required_modalities: Vec::new(),
+            modality_load: BTreeMap::new(),
             min_ctx: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -632,9 +645,44 @@ pub fn evaluate_eligibility(
     if request.requires_tools && !heartbeat.caps.tools
         || request.requires_json && !heartbeat.caps.json
         || request.requires_vision && !heartbeat.caps.vision
+        || request.required_modalities.iter().any(|modality| {
+            !heartbeat.caps.served_modalities.contains(modality)
+                || !entry.contract.caps.served_modalities.contains(modality)
+        })
         || heartbeat.caps.ctx < request.min_ctx
     {
         return Err(IneligibilityReason::Capabilities);
+    }
+    for modality in request
+        .required_modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+    {
+        let Some(load) = request.modality_load.get(modality) else {
+            return Err(IneligibilityReason::ModalityCapacity);
+        };
+        let Some(capacity) = heartbeat.caps.modality_capacity.get(modality) else {
+            return Err(IneligibilityReason::ModalityCapacity);
+        };
+        if load.item_count == 0
+            || load.max_item_bytes == 0
+            || load.max_item_units == 0
+            || load.item_count > capacity.max_items_per_request
+            || load.max_item_bytes > capacity.max_item_bytes
+            || load.max_item_units > capacity.max_item_units
+            || capacity.active_items.saturating_add(load.item_count) > capacity.max_inflight_items
+        {
+            return Err(IneligibilityReason::ModalityCapacity);
+        }
+    }
+    if request.modality_load.iter().any(|(modality, load)| {
+        modality == "text"
+            || !request.required_modalities.contains(modality)
+            || load.item_count == 0
+            || load.max_item_bytes == 0
+            || load.max_item_units == 0
+    }) {
+        return Err(IneligibilityReason::ModalityCapacity);
     }
     let estimated_price_au = estimate_request_price_au(&entry.contract, request);
     if request
@@ -1085,7 +1133,8 @@ mod tests {
 
     use crate::text_generation_rate_map;
     use crate::{
-        HeartbeatAttestation, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProbationCaps,
+        HeartbeatAttestation, HeartbeatModalityCapacity, HeartbeatPerf, HeartbeatQueue,
+        HeartbeatSlots, ProbationCaps,
     };
 
     fn key() -> ProviderKey {
@@ -1106,6 +1155,8 @@ mod tests {
             json: true,
             ctx: 8192,
             vision: false,
+            served_modalities: vec!["text".to_owned()],
+            modality_capacity: BTreeMap::new(),
         }
     }
 
@@ -1309,6 +1360,59 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    #[test]
+    fn modality_gate_requires_contract_and_heartbeat_agreement() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        let request = RequestRequirements {
+            required_modalities: vec!["text".to_owned(), "image".to_owned()],
+            modality_load: BTreeMap::from([(
+                "image".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 1024,
+                    max_item_units: 4096,
+                },
+            )]),
+            ..eligible_request(now + 1)
+        };
+
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::Capabilities)
+        );
+
+        entry.contract.caps.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::Capabilities),
+            "a heartbeat cannot silently omit a committed modality"
+        );
+
+        entry.heartbeat.as_mut().unwrap().caps.served_modalities =
+            vec!["text".to_owned(), "image".to_owned()];
+        entry.heartbeat.as_mut().unwrap().caps.vision = true;
+        entry
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .caps
+            .modality_capacity
+            .insert(
+                "image".to_owned(),
+                HeartbeatModalityCapacity {
+                    unit: "pixel".to_owned(),
+                    max_inflight_items: 1,
+                    active_items: 0,
+                    max_items_per_request: 1,
+                    max_item_bytes: 1024,
+                    max_item_units: 4096,
+                    working_set_bytes_per_item: 1024,
+                },
+            );
+        assert!(evaluate_eligibility(&entry, &request).is_ok());
     }
 
     #[test]

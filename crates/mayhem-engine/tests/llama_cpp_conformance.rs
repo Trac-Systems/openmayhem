@@ -171,6 +171,8 @@ fn gguf_vision_model_smoke_describes_real_image() -> TestResult {
         content_type: Some("image/png".to_owned()),
         url: None,
         data: Some(RED_SQUARE_PNG_BASE64.to_owned()),
+        num_frames: None,
+        fps: None,
     });
 
     let output = backend.generate(request, &mut |_chunk| Ok(()))?;

@@ -10,6 +10,7 @@ import {
   executeTnkSettlementFeature,
   makeIdentity,
   makeVerifier,
+  seedSpendHoldsForApply,
   signConsent,
   textRateMap,
   tnkSettlementFeatureKey,
@@ -48,6 +49,7 @@ const cleanExitEnclave = {
     embeddings: false,
     tools: false,
     ctx: 8192,
+    modality_set: ['text'],
   },
 };
 const cleanExitModelRef = {
@@ -169,6 +171,7 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
       gross_au: provider.gross_au,
     })),
   };
+  await seedSpendHoldsForApply(storage, applyValue);
   const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
   assert.deepEqual(applied, {
     ok: true,
@@ -178,6 +181,7 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
     debited_au: '3000000',
     earned_au: '2550000',
     fee_au: '450000',
+    burn_au: '0',
     rails: ['tnk'],
   });
   const applyState = (await storage.get('epoch/apply/state')).value;
@@ -365,7 +369,14 @@ test('MayhemContract tnkSettlement releases clean-exit provider earnings after h
     ctx.contract,
     ctx.storage,
     'joinEnclave',
-    { op: 'join_enclave', enclave_id: cleanExitEnclaveId },
+    {
+      op: 'join_enclave',
+      enclave_id: cleanExitEnclaveId,
+      served_ctx: 8192,
+      served_modalities: ['text'],
+      ctx_bracket: 'le8k',
+      ctx_bracket_table_ver: 1,
+    },
     provider.publicKey,
     23
   );

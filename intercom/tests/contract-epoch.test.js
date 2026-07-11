@@ -58,6 +58,7 @@ const epochEnclaveRegistration = {
     embeddings: false,
     tools: false,
     ctx: 32768,
+    modality_set: ['text'],
   },
 };
 

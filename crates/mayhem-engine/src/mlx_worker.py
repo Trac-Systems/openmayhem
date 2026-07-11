@@ -1,3 +1,4 @@
+import inspect
 import json
 import sys
 
@@ -10,6 +11,22 @@ ctx_size = 2048
 def send(message):
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def required_sampling_kwargs(callable_obj, kwargs, requested):
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return kwargs
+    missing = sorted(name for name in requested if name not in parameters)
+    if missing:
+        raise ValueError(
+            "MLX backend does not support requested sampling parameter(s): "
+            + ", ".join(missing)
+        )
+    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 def encode_text(text):
@@ -94,10 +111,22 @@ def handle_generate(request_id, payload):
         raise ValueError(
             "MLX backend does not support grammar-constrained tool calls; advertise caps.tools=false"
         )
+    if payload.get("frequency_penalty") is not None:
+        raise ValueError(
+            "MLX backend does not support frequency_penalty; omit it from this artifact endpoint contract"
+        )
+    if payload.get("presence_penalty") is not None:
+        raise ValueError(
+            "MLX backend does not support presence_penalty; omit it from this artifact endpoint contract"
+        )
+    if payload.get("stop"):
+        raise ValueError(
+            "MLX backend does not support stop sequences; omit stop from this artifact endpoint contract"
+        )
 
     import mlx.core as mx
     from mlx_lm import stream_generate
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
     seed = payload.get("seed")
     if seed is not None:
@@ -105,7 +134,23 @@ def handle_generate(request_id, payload):
 
     temperature = float(payload.get("temperature") or 0.0)
     top_p = float(payload.get("top_p") or 0.0)
-    sampler = make_sampler(temp=temperature, top_p=top_p)
+    sampler_kwargs = {"temp": temperature, "top_p": top_p}
+    requested = set()
+    if payload.get("top_k") is not None:
+        sampler_kwargs["top_k"] = int(payload.get("top_k"))
+        requested.add("top_k")
+    if payload.get("min_p") is not None:
+        sampler_kwargs["min_p"] = float(payload.get("min_p"))
+        requested.add("min_p")
+    sampler = make_sampler(
+        **required_sampling_kwargs(make_sampler, sampler_kwargs, requested)
+    )
+    repeat_penalty = payload.get("repeat_penalty")
+    logits_processors = make_logits_processors(
+        repetition_penalty=(
+            None if repeat_penalty is None else float(repeat_penalty)
+        )
+    )
 
     text = ""
     completion_tokens = 0
@@ -116,6 +161,7 @@ def handle_generate(request_id, payload):
         prompt,
         max_tokens=max_tokens,
         sampler=sampler,
+        logits_processors=logits_processors,
         max_kv_size=ctx_size,
     ):
         segment = str(getattr(response, "text", ""))

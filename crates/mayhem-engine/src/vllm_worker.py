@@ -1,8 +1,12 @@
 import asyncio
+import base64
+import copy
 import inspect
+import io
 import json
 import os
 import sys
+import wave
 
 
 protocol_stdout = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
@@ -12,6 +16,7 @@ sys.stdout = sys.stderr
 
 engine = None
 tokenizer = None
+processor = None
 ctx_size = 2048
 event_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(event_loop)
@@ -31,6 +36,17 @@ def accepted_kwargs(callable_obj, kwargs):
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
         return kwargs
     return {key: value for key, value in kwargs.items() if key in parameters}
+
+
+def required_sampling_kwargs(callable_obj, kwargs, requested):
+    accepted = accepted_kwargs(callable_obj, kwargs)
+    missing = sorted(name for name in requested if name not in accepted)
+    if missing:
+        raise ValueError(
+            "vLLM backend does not support requested sampling parameter(s): "
+            + ", ".join(missing)
+        )
+    return accepted
 
 
 def import_attr(candidates):
@@ -158,6 +174,31 @@ def make_sampling_params(payload):
     top_p = payload.get("top_p")
     if top_p is not None and float(top_p) > 0.0:
         kwargs["top_p"] = float(top_p)
+    requested = set()
+    top_k = payload.get("top_k")
+    if top_k is not None:
+        kwargs["top_k"] = int(top_k)
+        requested.add("top_k")
+    min_p = payload.get("min_p")
+    if min_p is not None:
+        kwargs["min_p"] = float(min_p)
+        requested.add("min_p")
+    repeat_penalty = payload.get("repeat_penalty")
+    if repeat_penalty is not None:
+        kwargs["repetition_penalty"] = float(repeat_penalty)
+        requested.add("repetition_penalty")
+    frequency_penalty = payload.get("frequency_penalty")
+    if frequency_penalty is not None:
+        kwargs["frequency_penalty"] = float(frequency_penalty)
+        requested.add("frequency_penalty")
+    presence_penalty = payload.get("presence_penalty")
+    if presence_penalty is not None:
+        kwargs["presence_penalty"] = float(presence_penalty)
+        requested.add("presence_penalty")
+    stop = payload.get("stop") or []
+    if stop:
+        kwargs["stop"] = [str(value) for value in stop]
+        requested.add("stop")
     if payload.get("seed") is not None:
         kwargs["seed"] = int(payload.get("seed"))
     if bool(payload.get("ignore_eos")):
@@ -172,7 +213,7 @@ def make_sampling_params(payload):
         kwargs["output_kind"] = getattr(RequestOutputKind, "DELTA")
     except Exception:
         pass
-    return SamplingParams(**accepted_kwargs(SamplingParams, kwargs))
+    return SamplingParams(**required_sampling_kwargs(SamplingParams, kwargs, requested))
 
 
 def create_engine(payload):
@@ -201,6 +242,8 @@ def create_engine(payload):
         ),
         "tensor_parallel_size": tensor_parallel,
         "enforce_eager": bool(payload.get("enforce_eager", True)),
+        "limit_mm_per_prompt": {"image": 1, "audio": 1, "video": 1},
+        "mm_processor_cache_gb": 0,
     }
     dtype = payload.get("dtype")
     if dtype:
@@ -236,12 +279,166 @@ def request_max_tokens(payload):
     return 64 if value is None else int(value)
 
 
+def inline_media_bytes(item):
+    data = item.get("data")
+    if data:
+        try:
+            return base64.b64decode(str(data), validate=True)
+        except Exception as exc:
+            raise ValueError("multimodal data is not valid base64") from exc
+    url = item.get("url")
+    if not url:
+        raise ValueError("multimodal input is missing inline data")
+    url = str(url)
+    if not url.startswith("data:"):
+        raise ValueError("remote media URLs are forbidden; use inline base64 data")
+    header, separator, encoded = url.partition(",")
+    if not separator or ";base64" not in header:
+        raise ValueError("multimodal data URL must be base64 encoded")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("multimodal data URL contains invalid base64") from exc
+
+
+def decode_image(item):
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(inline_media_bytes(item)))
+    image.load()
+    return image.convert("RGB")
+
+
+def decode_audio(item):
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(inline_media_bytes(item)), "rb") as wav:
+            channels = int(wav.getnchannels())
+            sample_width = int(wav.getsampwidth())
+            sample_rate = int(wav.getframerate())
+            frames = wav.readframes(wav.getnframes())
+    except Exception as exc:
+        raise ValueError("multimodal audio must be a bounded PCM WAV") from exc
+    dtype_by_width = {1: np.uint8, 2: np.int16, 4: np.int32}
+    dtype = dtype_by_width.get(sample_width)
+    if dtype is None or channels <= 0 or sample_rate <= 0:
+        raise ValueError("multimodal WAV sample format is unsupported")
+    samples = np.frombuffer(frames, dtype=dtype).astype(np.float32)
+    if sample_width == 1:
+        samples = (samples - 128.0) / 128.0
+    else:
+        samples /= float(1 << (sample_width * 8 - 1))
+    if channels > 1:
+        if samples.size % channels:
+            raise ValueError("multimodal WAV channel data is malformed")
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples, sample_rate
+
+
+def decode_video(item):
+    import av
+    import numpy as np
+
+    requested = int(item.get("num_frames") or 8)
+    if requested <= 0 or requested > 1024:
+        raise ValueError("multimodal video num_frames must be between 1 and 1024")
+    try:
+        container = av.open(io.BytesIO(inline_media_bytes(item)))
+        stream = container.streams.video[0]
+    except Exception as exc:
+        raise ValueError("multimodal video container cannot be decoded") from exc
+    total = int(getattr(stream, "frames", 0) or 0)
+    wanted = None
+    if total > 0:
+        wanted = set(np.linspace(0, total - 1, min(requested, total), dtype=int).tolist())
+    frames = []
+    try:
+        for index, frame in enumerate(container.decode(stream)):
+            if wanted is None:
+                if len(frames) < requested:
+                    frames.append(frame.to_ndarray(format="rgb24"))
+                else:
+                    break
+            elif index in wanted:
+                frames.append(frame.to_ndarray(format="rgb24"))
+                if len(frames) == len(wanted):
+                    break
+    finally:
+        container.close()
+    if not frames:
+        raise ValueError("multimodal video contains no decodable frames")
+    return np.stack(frames)
+
+
+def decode_multimodal_data(payload):
+    grouped = {}
+    for item in payload.get("media") or []:
+        kind = str(item.get("kind") or "")
+        if kind == "image":
+            value = decode_image(item)
+        elif kind == "audio":
+            value = decode_audio(item)
+        elif kind == "video":
+            value = decode_video(item)
+        else:
+            raise ValueError(f"unsupported multimodal input kind {kind!r}")
+        grouped.setdefault(kind, []).append(value)
+    return {
+        kind: values[0] if len(values) == 1 else values
+        for kind, values in grouped.items()
+    }
+
+
+def processor_chat_messages(messages):
+    prepared = copy.deepcopy(messages)
+    for message in prepared:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        normalized = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind == "image_url":
+                normalized.append({"type": "image"})
+            elif kind == "input_audio":
+                normalized.append({"type": "audio"})
+            elif kind == "video":
+                normalized.append({"type": "video"})
+            else:
+                normalized.append(part)
+        message["content"] = normalized
+    return prepared
+
+
+def multimodal_engine_prompt(payload, mm_data):
+    prompt = str(payload.get("prompt", ""))
+    if not mm_data:
+        return prompt, prompt
+    if processor is None or not hasattr(processor, "apply_chat_template"):
+        raise RuntimeError("multimodal request requires the model AutoProcessor/chat template")
+    messages = payload.get("messages") or []
+    if not messages:
+        raise ValueError("multimodal request is missing structured chat messages")
+    try:
+        rendered = processor.apply_chat_template(
+            processor_chat_messages(messages),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception as exc:
+        raise ValueError(f"model multimodal chat template failed: {exc}") from exc
+    rendered = str(rendered)
+    return rendered, {"prompt": rendered, "multi_modal_data": mm_data}
+
+
 async def async_handle_generate(request_id, payload):
     if engine is None:
         raise RuntimeError("model has not been loaded")
 
     max_tokens = request_max_tokens(payload)
-    prompt = str(payload.get("prompt", ""))
+    mm_data = decode_multimodal_data(payload)
+    prompt, engine_prompt = multimodal_engine_prompt(payload, mm_data)
     prompt_tokens = encode_text(prompt)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
         raise ValueError(
@@ -260,7 +457,7 @@ async def async_handle_generate(request_id, payload):
     token_ids = []
     finish_reason = "length"
     async for output in engine.generate(
-        request_id=f"mayhem-{request_id}", prompt=prompt, sampling_params=sampling_params
+        request_id=f"mayhem-{request_id}", prompt=engine_prompt, sampling_params=sampling_params
     ):
         for completion in getattr(output, "outputs", []) or []:
             chunk_text = str(getattr(completion, "text", "") or "")
@@ -304,16 +501,21 @@ async def async_handle_generate(request_id, payload):
 
 
 def handle_load(payload):
-    global engine, tokenizer, ctx_size, model_path
+    global engine, tokenizer, processor, ctx_size, model_path
     model_path = str(payload["path"])
     ctx_size = positive_int(payload.get("ctx_size"), 2048)
     engine = create_engine(payload)
     try:
-        from transformers import AutoTokenizer
+        from transformers import AutoProcessor, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+        try:
+            processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=False)
+        except Exception:
+            processor = None
     except Exception:
         tokenizer = None
+        processor = None
     get_tokenizer()
     return {
         "n_ctx_train": model_ctx(ctx_size),

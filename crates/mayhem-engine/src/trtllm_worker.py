@@ -42,6 +42,17 @@ def accepted_kwargs(callable_obj, kwargs):
     return {key: value for key, value in kwargs.items() if key in parameters}
 
 
+def required_sampling_kwargs(callable_obj, kwargs, requested):
+    accepted = accepted_kwargs(callable_obj, kwargs)
+    missing = sorted(name for name in requested if name not in accepted)
+    if missing:
+        raise ValueError(
+            "TensorRT-LLM backend does not support requested sampling parameter(s): "
+            + ", ".join(missing)
+        )
+    return accepted
+
+
 def has_engine_payload(path):
     if not path or not os.path.isdir(path):
         return False
@@ -238,12 +249,39 @@ def make_sampling_params(payload):
     top_p = payload.get("top_p")
     if top_p is not None and float(top_p) > 0.0:
         kwargs["top_p"] = float(top_p)
+    requested = set()
+    top_k = payload.get("top_k")
+    if top_k is not None:
+        kwargs["top_k"] = int(top_k)
+        requested.add("top_k")
+    min_p = payload.get("min_p")
+    if min_p is not None:
+        kwargs["min_p"] = float(min_p)
+        requested.add("min_p")
+    repeat_penalty = payload.get("repeat_penalty")
+    if repeat_penalty is not None:
+        kwargs["repetition_penalty"] = float(repeat_penalty)
+        requested.add("repetition_penalty")
+    frequency_penalty = payload.get("frequency_penalty")
+    if frequency_penalty is not None:
+        kwargs["frequency_penalty"] = float(frequency_penalty)
+        requested.add("frequency_penalty")
+    presence_penalty = payload.get("presence_penalty")
+    if presence_penalty is not None:
+        kwargs["presence_penalty"] = float(presence_penalty)
+        requested.add("presence_penalty")
+    stop = payload.get("stop") or []
+    if stop:
+        kwargs["stop"] = [str(value) for value in stop]
+        requested.add("stop")
     if payload.get("seed") is not None:
         kwargs["seed"] = int(payload.get("seed"))
         kwargs["random_seed"] = int(payload.get("seed"))
 
     try:
-        return SamplingParams(**accepted_kwargs(SamplingParams, kwargs))
+        return SamplingParams(
+            **required_sampling_kwargs(SamplingParams, kwargs, requested)
+        )
     except TypeError:
         minimal = {
             "max_tokens": kwargs["max_tokens"],
@@ -251,7 +289,12 @@ def make_sampling_params(payload):
         }
         if "top_p" in kwargs:
             minimal["top_p"] = kwargs["top_p"]
-        return SamplingParams(**accepted_kwargs(SamplingParams, minimal))
+        for name in requested:
+            if name in kwargs:
+                minimal[name] = kwargs[name]
+        return SamplingParams(
+            **required_sampling_kwargs(SamplingParams, minimal, requested)
+        )
 
 
 def tokenizer_token_id(*names):
@@ -327,11 +370,25 @@ def runner_generate_batch_tokens(prompt_batches, payload, max_tokens):
     if kwargs["temperature"] <= 0.0:
         kwargs["temperature"] = 1.0
         kwargs["top_k"] = 1
+    else:
+        if payload.get("top_k") is not None:
+            kwargs["top_k"] = int(payload.get("top_k"))
+        if payload.get("min_p") is not None:
+            kwargs["min_p"] = float(payload.get("min_p"))
+        if payload.get("repeat_penalty") is not None:
+            kwargs["repetition_penalty"] = float(payload.get("repeat_penalty"))
     if payload.get("seed") is not None:
         kwargs["random_seed"] = int(payload.get("seed"))
 
     with torch.no_grad():
-        outputs = model.generate(**kwargs)
+        requested = {
+            name
+            for name in ("top_k", "min_p", "repetition_penalty")
+            if name in kwargs
+        }
+        outputs = model.generate(
+            **required_sampling_kwargs(model.generate, kwargs, requested)
+        )
         torch.cuda.synchronize()
     return runner_batch_output_tokens(
         outputs, [len(prompt_tokens) for prompt_tokens in prompt_batches], max_tokens
@@ -446,6 +503,9 @@ def batch_generation_settings(payload):
         bool(payload.get("ignore_eos")),
         float(payload.get("temperature") or 0.0),
         float(payload.get("top_p") or 0.0),
+        payload.get("top_k"),
+        payload.get("min_p"),
+        payload.get("repeat_penalty"),
         payload.get("seed"),
     )
 
