@@ -58,7 +58,7 @@ use mayhem_gateway::{
         GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore,
         GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo,
         ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS,
-        MAX_ROUTE_MAX_WAIT_MS,
+        MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     HardwareQuoteVerifierCommand, HeartbeatReceiver, ProbationCaps, ProbationPolicy,
@@ -308,6 +308,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
+    /// Manage user-side preferred provider routing.
+    Providers {
+        #[command(subcommand)]
+        command: UserProvidersCommands,
+    },
     /// Admin-only canonical contract control-plane commands.
     Admin {
         #[command(subcommand)]
@@ -430,6 +435,25 @@ enum ProviderCommands {
         #[command(subcommand)]
         command: ProviderRoomsCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum UserProvidersCommands {
+    /// Manage the strict preferred-provider list for a model.
+    Prefer {
+        #[command(subcommand)]
+        command: PreferredProviderCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PreferredProviderCommands {
+    /// Append a provider to the model's strict preference order.
+    Add(PreferredProviderChangeArgs),
+    /// Remove a provider; removing the last restores normal discovery.
+    Remove(PreferredProviderChangeArgs),
+    /// List the model's strict preferred-provider order.
+    List(PreferredProviderListArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1015,6 +1039,39 @@ struct ReputationArgs {
     provider: Option<String>,
 
     /// Print machine-readable reputation.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PreferredProviderChangeArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Canonical catalog model id whose provider order is being changed.
+    #[arg(long)]
+    model: String,
+
+    /// Provider public key shown by `mayhem history` or `mayhem models --gateway`.
+    provider_pubkey: String,
+
+    /// Print a machine-readable preference report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PreferredProviderListArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Canonical catalog model id whose provider order is being listed.
+    #[arg(long)]
+    model: String,
+
+    /// Print a machine-readable preference report.
     #[arg(long)]
     json: bool,
 }
@@ -5464,6 +5521,7 @@ struct ConfigUser {
     max_price_au: Option<MoneyAu>,
     max_wait_seconds: Option<u64>,
     min_ctx: Option<u64>,
+    preferred_providers: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5566,6 +5624,7 @@ async fn mayhem_main() -> Result<()> {
             CatalogCommands::CanaryPlan(args) => catalog_canary_plan(args),
         },
         Commands::Provider { verbose, command } => provider_command(*command, verbose).await,
+        Commands::Providers { command } => user_providers_command(command),
         Commands::Admin { command } => admin(*command).await,
         Commands::Up(args) => up(args).await,
         Commands::Use(args) => use_gateway(args).await,
@@ -22658,6 +22717,51 @@ struct GatewayLedgerWatcherConfig {
     rail: String,
 }
 
+fn spawn_gateway_preferred_provider_watcher(
+    state: GatewayState,
+    home: PathBuf,
+    initial: BTreeMap<String, Vec<String>>,
+) {
+    tokio::spawn(async move {
+        let mut applied = initial;
+        let mut last_error = None;
+        loop {
+            match read_preferred_provider_map(&home) {
+                Ok(preferred_providers) => {
+                    if preferred_providers != applied {
+                        match state.replace_preferred_providers(preferred_providers.clone()) {
+                            Ok(()) => {
+                                applied = preferred_providers;
+                                last_error = None;
+                            }
+                            Err(err) => {
+                                if last_error.as_deref() != Some(err.as_str()) {
+                                    eprintln!(
+                                        "Gateway preferred-provider config rejected; retaining last valid list: {err}"
+                                    );
+                                    last_error = Some(err);
+                                }
+                            }
+                        }
+                    } else {
+                        last_error = None;
+                    }
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!(
+                            "Gateway preferred-provider config unreadable; retaining last valid list: {message}"
+                        );
+                        last_error = Some(message);
+                    }
+                }
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    });
+}
+
 fn spawn_gateway_ledger_watcher(state: GatewayState, config: GatewayLedgerWatcherConfig) {
     tokio::spawn(async move {
         loop {
@@ -22932,6 +23036,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             u32::try_from(value).context("user.min_ctx exceeds supported token count")
         })
         .transpose()?;
+    let preferred_providers = preferred_provider_map_from_config(config.as_ref())?;
     let token_store_path = gateway_token_store_path(&home);
     let token_store = read_gateway_token_store(&token_store_path)?;
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
@@ -23301,6 +23406,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"))
         .with_access_control(access_control);
+    state
+        .replace_preferred_providers(preferred_providers.clone())
+        .map_err(anyhow::Error::msg)?;
     let state = match payment_directory {
         Some(directory) => state.with_payment_directory(directory),
         None => state,
@@ -23311,6 +23419,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     if let Some(config) = ledger_watcher {
         spawn_gateway_ledger_watcher(state.clone(), config);
     }
+    spawn_gateway_preferred_provider_watcher(
+        state.clone(),
+        home.clone(),
+        preferred_providers.clone(),
+    );
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
@@ -23341,6 +23454,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "default_max_price_au": default_max_price_au,
         "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
+        "preferred_provider_models": preferred_providers.len(),
         "access": {
             "require_auth": require_gateway_auth,
             "token_store": token_store_path,
@@ -24454,6 +24568,204 @@ fn print_reputation_report(report: &Value) {
             .and_then(value_money_au)
             .unwrap_or(0),
     );
+}
+
+const MAX_PREFERRED_PROVIDER_MODELS: usize = 1_024;
+
+fn user_providers_command(command: UserProvidersCommands) -> Result<()> {
+    match command {
+        UserProvidersCommands::Prefer { command } => match command {
+            PreferredProviderCommands::Add(args) => preferred_provider_change(args, true),
+            PreferredProviderCommands::Remove(args) => preferred_provider_change(args, false),
+            PreferredProviderCommands::List(args) => preferred_provider_list(args),
+        },
+    }
+}
+
+fn preferred_provider_model_id(value: &str) -> Result<String> {
+    let model = value.trim();
+    if model.is_empty() || model.len() > 512 {
+        bail!("--model must contain 1..=512 bytes");
+    }
+    if model.chars().any(char::is_whitespace) {
+        bail!("--model must not contain whitespace");
+    }
+    Ok(model.to_owned())
+}
+
+fn preferred_provider_pubkey(value: &str) -> Result<String> {
+    let provider = value.trim().to_ascii_lowercase();
+    if !is_hex_len(&provider, 64) {
+        bail!("provider-pubkey must be a 32-byte hexadecimal public key");
+    }
+    Ok(provider)
+}
+
+fn normalize_preferred_provider_map(
+    preferred_providers: BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    if preferred_providers.len() > MAX_PREFERRED_PROVIDER_MODELS {
+        bail!("user.preferred_providers exceeds the {MAX_PREFERRED_PROVIDER_MODELS}-model limit");
+    }
+    preferred_providers
+        .into_iter()
+        .map(|(model, providers)| {
+            let model = preferred_provider_model_id(&model)?;
+            if providers.is_empty() || providers.len() > MAX_PREFERRED_PROVIDERS_PER_MODEL {
+                bail!(
+                    "preferred provider list for {model} must contain 1..={MAX_PREFERRED_PROVIDERS_PER_MODEL} entries"
+                );
+            }
+            let mut normalized = Vec::with_capacity(providers.len());
+            let mut seen = BTreeSet::new();
+            for provider in providers {
+                let provider = preferred_provider_pubkey(&provider)?;
+                if !seen.insert(provider.clone()) {
+                    bail!("preferred provider list for {model} contains a duplicate public key");
+                }
+                normalized.push(provider);
+            }
+            Ok((model, normalized))
+        })
+        .collect()
+}
+
+fn preferred_provider_map_from_config(
+    config: Option<&MayhemConfig>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    normalize_preferred_provider_map(
+        config
+            .and_then(|config| config.user.as_ref())
+            .and_then(|user| user.preferred_providers.clone())
+            .unwrap_or_default(),
+    )
+}
+
+fn read_preferred_provider_map(home: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+    let config = read_mayhem_config(home)?;
+    preferred_provider_map_from_config(config.as_ref())
+}
+
+fn write_preferred_provider_map(
+    path: &Path,
+    preferred_providers: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let mut config = read_config_toml_value(path)?;
+    if preferred_providers.is_empty() {
+        toml_remove_path(&mut config, "user.preferred_providers")?;
+    } else {
+        let preferred = preferred_providers
+            .iter()
+            .map(|(model, providers)| {
+                (
+                    model.clone(),
+                    toml::Value::Array(
+                        providers.iter().cloned().map(toml::Value::String).collect(),
+                    ),
+                )
+            })
+            .collect::<toml::map::Map<_, _>>();
+        ensure_toml_table_path(&mut config, &["user"])?.insert(
+            "preferred_providers".to_owned(),
+            toml::Value::Table(preferred),
+        );
+    }
+    write_config_toml_value(path, &config)
+}
+
+fn preferred_provider_report(
+    home: &Path,
+    path: &Path,
+    model: &str,
+    providers: &[String],
+    changed: Option<bool>,
+) -> Value {
+    json!({
+        "ok": true,
+        "home": home,
+        "path": path,
+        "model": model,
+        "providers": providers,
+        "strict": !providers.is_empty(),
+        "changed": changed,
+    })
+}
+
+fn preferred_provider_change(args: PreferredProviderChangeArgs, add: bool) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let model = preferred_provider_model_id(&args.model)?;
+    let provider = preferred_provider_pubkey(&args.provider_pubkey)?;
+    let mut preferred_providers = read_preferred_provider_map(&home)?;
+    let changed = if add {
+        if !preferred_providers.contains_key(&model)
+            && preferred_providers.len() >= MAX_PREFERRED_PROVIDER_MODELS
+        {
+            bail!("preferred provider model limit reached");
+        }
+        let providers = preferred_providers.entry(model.clone()).or_default();
+        if providers.iter().any(|existing| existing == &provider) {
+            false
+        } else {
+            if providers.len() >= MAX_PREFERRED_PROVIDERS_PER_MODEL {
+                bail!(
+                    "preferred provider limit reached for {model} ({MAX_PREFERRED_PROVIDERS_PER_MODEL})"
+                );
+            }
+            providers.push(provider);
+            true
+        }
+    } else if let Some(providers) = preferred_providers.get_mut(&model) {
+        let before = providers.len();
+        providers.retain(|existing| existing != &provider);
+        let changed = providers.len() != before;
+        if providers.is_empty() {
+            preferred_providers.remove(&model);
+        }
+        changed
+    } else {
+        false
+    };
+    normalize_preferred_provider_map(preferred_providers.clone())?;
+    write_preferred_provider_map(&path, &preferred_providers)?;
+    let providers = preferred_providers.get(&model).cloned().unwrap_or_default();
+    let report = preferred_provider_report(&home, &path, &model, &providers, Some(changed));
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Preferred providers for {}: {}",
+            model,
+            if providers.is_empty() {
+                "none (normal discovery)".to_owned()
+            } else {
+                providers.join(",")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn preferred_provider_list(args: PreferredProviderListArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let model = preferred_provider_model_id(&args.model)?;
+    let preferred_providers = read_preferred_provider_map(&home)?;
+    let providers = preferred_providers.get(&model).cloned().unwrap_or_default();
+    let report = preferred_provider_report(&home, &path, &model, &providers, None);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if providers.is_empty() {
+        println!("No preferred providers for {model}; normal discovery is active.");
+    } else {
+        println!("Preferred providers for {model}:");
+        for (index, provider) in providers.iter().enumerate() {
+            println!("{}. {provider}", index + 1);
+        }
+    }
+    Ok(())
 }
 
 fn config_get(args: ConfigGetArgs) -> Result<()> {
@@ -47119,6 +47431,141 @@ mod tests {
         assert_eq!(args.model.as_deref(), Some("model-a"));
         assert_eq!(args.timeout_seconds, 2);
         assert!(args.json);
+    }
+
+    #[test]
+    fn providers_prefer_cli_parses_add_remove_and_list() {
+        let provider = "ab".repeat(32);
+        let add = Cli::try_parse_from([
+            "mayhem",
+            "providers",
+            "prefer",
+            "add",
+            "--home",
+            "/tmp/mayhem-preferred",
+            "--model",
+            "hauhaucs/example@nvfp4",
+            &provider,
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Providers { command } = add.command else {
+            panic!("expected user providers command");
+        };
+        let UserProvidersCommands::Prefer { command } = command;
+        let PreferredProviderCommands::Add(args) = command else {
+            panic!("expected preferred provider add command");
+        };
+        assert_eq!(
+            args.home.as_deref(),
+            Some(Path::new("/tmp/mayhem-preferred"))
+        );
+        assert_eq!(args.model, "hauhaucs/example@nvfp4");
+        assert_eq!(args.provider_pubkey, provider);
+        assert!(args.json);
+
+        let remove = Cli::try_parse_from([
+            "mayhem",
+            "providers",
+            "prefer",
+            "remove",
+            "--model",
+            "hauhaucs/example@nvfp4",
+            &provider,
+        ])
+        .unwrap();
+        let Commands::Providers { command } = remove.command else {
+            panic!("expected user providers command");
+        };
+        let UserProvidersCommands::Prefer { command } = command;
+        assert!(matches!(command, PreferredProviderCommands::Remove(_)));
+
+        let list = Cli::try_parse_from([
+            "mayhem",
+            "providers",
+            "prefer",
+            "list",
+            "--model",
+            "hauhaucs/example@nvfp4",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Providers { command } = list.command else {
+            panic!("expected user providers command");
+        };
+        let UserProvidersCommands::Prefer { command } = command;
+        let PreferredProviderCommands::List(args) = command else {
+            panic!("expected preferred provider list command");
+        };
+        assert_eq!(args.model, "hauhaucs/example@nvfp4");
+        assert!(args.json);
+    }
+
+    #[test]
+    fn preferred_provider_config_preserves_order_and_removal_restores_discovery() {
+        let home = test_temp_dir("mayhem-preferred-providers");
+        let model = "hauhaucs/example.model@nvfp4";
+        let provider_a_upper = "AB".repeat(32);
+        let provider_a = provider_a_upper.to_ascii_lowercase();
+        let provider_b = "cd".repeat(32);
+
+        let change = |provider_pubkey: &str, add: bool| {
+            preferred_provider_change(
+                PreferredProviderChangeArgs {
+                    home: Some(home.clone()),
+                    model: model.to_owned(),
+                    provider_pubkey: provider_pubkey.to_owned(),
+                    json: true,
+                },
+                add,
+            )
+        };
+
+        change(&provider_a_upper, true).unwrap();
+        change(&provider_b, true).unwrap();
+        change(&provider_a, true).unwrap();
+        assert_eq!(
+            read_preferred_provider_map(&home).unwrap().get(model),
+            Some(&vec![provider_a.clone(), provider_b.clone()])
+        );
+
+        let config_path = config_path_for_home(&home);
+        let parsed = read_mayhem_config(&home).unwrap().unwrap();
+        assert_eq!(
+            preferred_provider_map_from_config(Some(&parsed))
+                .unwrap()
+                .get(model),
+            Some(&vec![provider_a.clone(), provider_b.clone()])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        change(&provider_a, false).unwrap();
+        assert_eq!(
+            read_preferred_provider_map(&home).unwrap().get(model),
+            Some(&vec![provider_b.clone()])
+        );
+        change(&provider_b, false).unwrap();
+        assert!(read_preferred_provider_map(&home).unwrap().is_empty());
+        let raw = read_config_toml_value(&config_path).unwrap();
+        assert!(toml_get_path(&raw, "user.preferred_providers").is_none());
+
+        assert!(change("not-a-provider-key", true).is_err());
+        assert!(preferred_provider_model_id("model with spaces").is_err());
+
+        let oversized = (0..=MAX_PREFERRED_PROVIDERS_PER_MODEL)
+            .map(|index| format!("{:064x}", index + 1))
+            .collect::<Vec<_>>();
+        assert!(
+            normalize_preferred_provider_map(BTreeMap::from([(model.to_owned(), oversized,)]))
+                .is_err()
+        );
+
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

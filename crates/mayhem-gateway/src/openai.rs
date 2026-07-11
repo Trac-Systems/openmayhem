@@ -125,6 +125,8 @@ const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
 const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
+const X_MAYHEM_PREFER_PROVIDERS_HEADER: &str = "x-mayhem-prefer-providers";
+pub const MAX_PREFERRED_PROVIDERS_PER_MODEL: usize = 64;
 const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
 const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
@@ -191,6 +193,7 @@ pub struct GatewayState {
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
+    preferred_providers: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     access_control: Arc<GatewayAccessControl>,
     hidden_update_models: Arc<Vec<GatewayUpdateModelNotice>>,
     epoch_seconds: u64,
@@ -1716,6 +1719,7 @@ impl GatewayState {
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
+            preferred_providers: Arc::new(Mutex::new(BTreeMap::new())),
             access_control: Arc::new(GatewayAccessControl::disabled()),
             hidden_update_models: Arc::new(Vec::new()),
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
@@ -1893,6 +1897,17 @@ impl GatewayState {
     pub fn with_default_min_ctx(mut self, min_ctx: Option<u32>) -> Self {
         self.default_min_ctx = min_ctx.filter(|value| *value > 0);
         self
+    }
+
+    pub fn replace_preferred_providers(
+        &self,
+        preferred_providers: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), String> {
+        validate_preferred_provider_map(&preferred_providers)?;
+        *self
+            .preferred_providers
+            .lock_recover("preferred provider store") = preferred_providers;
+        Ok(())
     }
 
     fn request_options_from_headers(
@@ -5785,6 +5800,7 @@ struct GatewayRequestOptions {
     min_ctx: Option<u32>,
     quant: Option<String>,
     failover_overrides: GatewayFailoverPolicyConfig,
+    preferred_providers: Option<Vec<String>>,
     access_token: Option<GatewayTokenAttribution>,
 }
 
@@ -5798,6 +5814,7 @@ impl Default for GatewayRequestOptions {
             min_ctx: None,
             quant: None,
             failover_overrides: GatewayFailoverPolicyConfig::default(),
+            preferred_providers: None,
             access_token: None,
         }
     }
@@ -6566,9 +6583,80 @@ impl GatewayRequestOptions {
             min_ctx: parse_x_mayhem_min_ctx(headers)?,
             quant: parse_x_mayhem_quant(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
+            preferred_providers: parse_x_mayhem_prefer_providers(headers)?,
             access_token: None,
         })
     }
+}
+
+fn valid_provider_pubkey(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn validate_preferred_provider_map(
+    preferred_providers: &BTreeMap<String, Vec<String>>,
+) -> Result<(), String> {
+    for (model, providers) in preferred_providers {
+        if model.trim().is_empty() {
+            return Err("preferred provider model id must not be empty".to_owned());
+        }
+        if providers.is_empty() || providers.len() > MAX_PREFERRED_PROVIDERS_PER_MODEL {
+            return Err(format!(
+                "preferred provider list for {model} must contain 1..={MAX_PREFERRED_PROVIDERS_PER_MODEL} entries"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for provider in providers {
+            if !valid_provider_pubkey(provider) {
+                return Err(format!(
+                    "preferred provider for {model} must be a 32-byte hexadecimal public key"
+                ));
+            }
+            if !seen.insert(provider.to_ascii_lowercase()) {
+                return Err(format!(
+                    "preferred provider list for {model} contains a duplicate public key"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_x_mayhem_prefer_providers(headers: &HeaderMap) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_PREFER_PROVIDERS_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Prefer-Providers must be an ASCII comma-separated provider list",
+            Some("X-Mayhem-Prefer-Providers"),
+        )
+    })?;
+    let providers = value
+        .split(',')
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if providers.is_empty() || providers.len() > MAX_PREFERRED_PROVIDERS_PER_MODEL {
+        return Err(ApiError::bad_request(
+            format!(
+                "X-Mayhem-Prefer-Providers must contain 1..={MAX_PREFERRED_PROVIDERS_PER_MODEL} provider public keys"
+            ),
+            Some("X-Mayhem-Prefer-Providers"),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    if providers
+        .iter()
+        .any(|provider| !valid_provider_pubkey(provider) || !seen.insert(provider.clone()))
+    {
+        return Err(ApiError::bad_request(
+            "X-Mayhem-Prefer-Providers requires unique 32-byte hexadecimal provider public keys",
+            Some("X-Mayhem-Prefer-Providers"),
+        ));
+    }
+    Ok(Some(providers))
 }
 
 fn parse_x_mayhem_max_wait_ms(headers: &HeaderMap) -> Result<u64, ApiError> {
@@ -10856,6 +10944,11 @@ async fn run_embedding_with_route_retry(
         ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options)
     })
     .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if waited {
             return Err(route_wait_expired_error(&options));
@@ -10869,13 +10962,8 @@ async fn run_embedding_with_route_retry(
         ));
     }
 
-    let attempt_count = if eligible_routes.is_empty() {
-        1
-    } else {
-        eligible_routes
-            .len()
-            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    };
+    let attempt_count =
+        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
 
     for attempt_index in 0..attempt_count {
@@ -10937,6 +11025,11 @@ async fn run_image_generation_with_route_retry(
         ordered_route_candidates_for_image_generation_with_options(state, model, request, &options)
     })
     .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if waited {
             return Err(route_wait_expired_error(&options));
@@ -10950,13 +11043,8 @@ async fn run_image_generation_with_route_retry(
         ));
     }
 
-    let attempt_count = if eligible_routes.is_empty() {
-        1
-    } else {
-        eligible_routes
-            .len()
-            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    };
+    let attempt_count =
+        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
 
     for attempt_index in 0..attempt_count {
@@ -11022,6 +11110,11 @@ async fn run_audio_speech_with_route_retry(
         ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options)
     })
     .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if waited {
             return Err(route_wait_expired_error(&options));
@@ -11035,13 +11128,8 @@ async fn run_audio_speech_with_route_retry(
         ));
     }
 
-    let attempt_count = if eligible_routes.is_empty() {
-        1
-    } else {
-        eligible_routes
-            .len()
-            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    };
+    let attempt_count =
+        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -11108,6 +11196,11 @@ async fn run_audio_transcription_with_route_retry(
         )
     })
     .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if waited {
             return Err(route_wait_expired_error(&options));
@@ -11121,13 +11214,8 @@ async fn run_audio_transcription_with_route_retry(
         ));
     }
 
-    let attempt_count = if eligible_routes.is_empty() {
-        1
-    } else {
-        eligible_routes
-            .len()
-            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    };
+    let attempt_count =
+        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -11176,11 +11264,89 @@ async fn run_audio_transcription_with_route_retry(
     ))
 }
 
+impl GatewayState {
+    fn preferred_provider_order(
+        &self,
+        model: &GatewayModel,
+        options: &GatewayRequestOptions,
+    ) -> Option<Vec<String>> {
+        options.preferred_providers.clone().or_else(|| {
+            self.preferred_providers
+                .lock_recover("preferred provider store")
+                .get(&model.id)
+                .cloned()
+        })
+    }
+}
+
+fn order_strict_preferred_routes<'a>(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    routes: Vec<&'a GatewayRouteCandidate>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let Some(preferred) = state.preferred_provider_order(model, options) else {
+        return routes;
+    };
+    let mut ordered = Vec::new();
+    let mut seen = BTreeSet::new();
+    for provider in preferred {
+        for route in routes
+            .iter()
+            .copied()
+            .filter(|route| route.provider.eq_ignore_ascii_case(&provider))
+        {
+            if seen.insert(route_key(route)) {
+                ordered.push(route);
+            }
+        }
+    }
+    ordered
+}
+
+fn preferred_provider_refusal_error(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+) -> Option<ApiError> {
+    let preferred = state.preferred_provider_order(model, options)?;
+    Some(ApiError::service_unavailable(
+        format!(
+            "none of your {} preferred providers for {} are available or eligible right now",
+            preferred.len(),
+            model.id
+        ),
+        Some(if options.preferred_providers.is_some() {
+            "X-Mayhem-Prefer-Providers"
+        } else {
+            "model"
+        }),
+    ))
+}
+
+fn preferred_route_attempt_count(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    eligible_routes: usize,
+) -> usize {
+    if eligible_routes == 0 {
+        1
+    } else if state.preferred_provider_order(model, options).is_some() {
+        eligible_routes
+    } else {
+        eligible_routes.min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    }
+}
+
 fn no_eligible_route_error(
     state: &GatewayState,
     model: &GatewayModel,
     options: &GatewayRequestOptions,
 ) -> ApiError {
+    if let Some(error) = preferred_provider_refusal_error(state, model, options) {
+        return error;
+    }
     let rail = state.receipt_config.rail.clone();
     let rail_candidates = model
         .mayhem
@@ -11254,6 +11420,9 @@ fn chat_context_capacity_error(
     request: &ChatCompletionRequest,
     options: &GatewayRequestOptions,
 ) -> Option<ApiError> {
+    if let Some(error) = preferred_provider_refusal_error(state, model, options) {
+        return Some(error);
+    }
     let required_ctx = effective_context_floor(
         options.min_ctx,
         rough_tokens(&chat_prompt_text(request)),
@@ -11363,10 +11532,18 @@ fn route_static_filters_have_candidates(
     model: &GatewayModel,
     options: &GatewayRequestOptions,
 ) -> bool {
+    let preferred = state.preferred_provider_order(model, options);
     model
         .mayhem
         .route_candidates
         .iter()
+        .filter(|candidate| {
+            preferred.as_ref().map_or(true, |providers| {
+                providers
+                    .iter()
+                    .any(|provider| candidate.provider.eq_ignore_ascii_case(provider))
+            })
+        })
         .filter(|candidate| {
             candidate
                 .accepted_rails
@@ -11577,6 +11754,11 @@ async fn prepare_live_direct_chat_session(
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options)
     })
     .await;
+    if eligible_route_refs.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
         if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
             return Err(error);
@@ -11608,9 +11790,8 @@ async fn prepare_live_direct_chat_session(
     }
     let eligible_routes = eligible_route_refs.into_iter().cloned().collect::<Vec<_>>();
 
-    let attempt_count = eligible_routes
-        .len()
-        .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS));
+    let attempt_count =
+        preferred_route_attempt_count(&state, &model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index);
@@ -12827,6 +13008,11 @@ async fn run_chat_with_route_retry(
         ordered_route_candidates_for_request_with_options(state, model, request, &options)
     })
     .await;
+    if eligible_routes.is_empty() {
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
+            return Err(error);
+        }
+    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
             return Err(error);
@@ -12858,15 +13044,7 @@ async fn run_chat_with_route_retry(
             eligible_routes.insert(0, winner_route);
         }
     }
-    let max_attempts = if eligible_routes.is_empty() {
-        1
-    } else {
-        model
-            .mayhem
-            .route_candidates
-            .len()
-            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    };
+    let max_attempts = preferred_route_attempt_count(state, model, &options, eligible_routes.len());
     let mut last_retryable_error = None;
     let mut partials = Vec::new();
     let mut attempted_route_keys = BTreeSet::new();
@@ -12993,7 +13171,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
     options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = route_selection_seed(model, request, now_millis_u64());
-    ordered_route_candidates_for_request_with_max_price_seed(
+    let routes = ordered_route_candidates_for_request_with_max_price_seed(
         state,
         model,
         request,
@@ -13003,7 +13181,8 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         options.quant.as_deref(),
         state.generation_floor_tok_s_for_model(model, options),
         seed,
-    )
+    );
+    order_strict_preferred_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_embedding_with_options<'a>(
@@ -13013,7 +13192,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
     options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = embedding_route_selection_seed(model, inputs, now_millis_u64());
-    ordered_route_candidates_for_embedding_with_max_price_seed(
+    let routes = ordered_route_candidates_for_embedding_with_max_price_seed(
         state,
         model,
         inputs,
@@ -13026,7 +13205,8 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
             DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
         ),
         seed,
-    )
+    );
+    order_strict_preferred_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_image_generation_with_options<'a>(
@@ -13036,7 +13216,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
     options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = image_generation_route_selection_seed(model, request, now_millis_u64());
-    ordered_route_candidates_for_image_generation_with_max_price_seed(
+    let routes = ordered_route_candidates_for_image_generation_with_max_price_seed(
         state,
         model,
         request,
@@ -13045,7 +13225,8 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
         options.quant.as_deref(),
         state.throughput_floor_for_model(model, options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
         seed,
-    )
+    );
+    order_strict_preferred_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_audio_speech_with_options<'a>(
@@ -13056,7 +13237,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_speech_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
-    ordered_route_candidates_for_requirements_with_seed(
+    let routes = ordered_route_candidates_for_requirements_with_seed(
         state,
         model,
         options.min_att_tier,
@@ -13071,7 +13252,8 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
             state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
-    )
+    );
+    order_strict_preferred_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
@@ -13082,7 +13264,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_transcription_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
-    ordered_route_candidates_for_requirements_with_seed(
+    let routes = ordered_route_candidates_for_requirements_with_seed(
         state,
         model,
         options.min_att_tier,
@@ -13097,7 +13279,8 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
             state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
-    )
+    );
+    order_strict_preferred_routes(state, model, options, routes)
 }
 
 async fn run_hedge_probes_if_requested(
@@ -13107,7 +13290,10 @@ async fn run_hedge_probes_if_requested(
     routes: &[&GatewayRouteCandidate],
     options: &GatewayRequestOptions,
 ) -> Result<GatewayHedgeProbeOutcome, ApiError> {
-    if !options.hedge_requested || routes.len() < 2 {
+    if !options.hedge_requested
+        || routes.len() < 2
+        || state.preferred_provider_order(model, options).is_some()
+    {
         return Ok(GatewayHedgeProbeOutcome::default());
     }
     let first_invocation =
@@ -21392,6 +21578,138 @@ mod tests {
     }
 
     #[test]
+    fn preferred_provider_header_is_bounded_ordered_and_unique() {
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_MAYHEM_PREFER_PROVIDERS_HEADER,
+            HeaderValue::from_str(&format!("{first}, {second}")).unwrap(),
+        );
+        let options = GatewayRequestOptions::from_headers(&headers).unwrap();
+        assert_eq!(
+            options.preferred_providers,
+            Some(vec![first.clone(), second.clone()])
+        );
+
+        headers.insert(
+            X_MAYHEM_PREFER_PROVIDERS_HEADER,
+            HeaderValue::from_str(&format!("{first},{first}")).unwrap(),
+        );
+        let duplicate = GatewayRequestOptions::from_headers(&headers).unwrap_err();
+        assert_eq!(duplicate.param, Some("X-Mayhem-Prefer-Providers"));
+
+        headers.insert(
+            X_MAYHEM_PREFER_PROVIDERS_HEADER,
+            HeaderValue::from_static(""),
+        );
+        assert!(GatewayRequestOptions::from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn preferred_provider_routing_restricts_orders_sweeps_and_restores_discovery() {
+        let model = test_routed_model(3);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let first = model.mayhem.route_candidates[2].provider.clone();
+        let second = model.mayhem.route_candidates[0].provider.clone();
+        let excluded = model.mayhem.route_candidates[1].provider.clone();
+        state
+            .replace_preferred_providers(BTreeMap::from([(
+                model.id.clone(),
+                vec![first.clone(), second.clone()],
+            )]))
+            .unwrap();
+
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+        let ordered =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|route| route.provider.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()]
+        );
+        assert!(!ordered.iter().any(|route| route.provider == excluded));
+
+        state.cool_route_provider(&model.mayhem.route_candidates[2], now_millis_u64());
+        let swept =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].provider, second);
+
+        state.cool_route_provider(&model.mayhem.route_candidates[0], now_millis_u64());
+        let exhausted =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+        assert!(exhausted.is_empty());
+        let refusal = preferred_provider_refusal_error(&state, &model, &options).unwrap();
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(refusal
+            .message
+            .contains("none of your 2 preferred providers"));
+        assert!(refusal.message.contains(&model.id));
+
+        state.replace_preferred_providers(BTreeMap::new()).unwrap();
+        state
+            .provider_cooloffs
+            .lock_recover("provider cooloff map")
+            .clear();
+        let discovery =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+        assert_eq!(discovery.len(), 3);
+    }
+
+    #[test]
+    fn request_header_overrides_persistent_preference_and_hard_gates_still_apply() {
+        let mut model = test_routed_model(3);
+        model.mayhem.route_candidates[0].served_ctx = Some(4_096);
+        model.mayhem.route_candidates[1].served_ctx = Some(16_384);
+        model.mayhem.route_candidates[2].served_ctx = Some(16_384);
+        model.mayhem.route_candidates[2].min_ask_au = MoneyAu::MAX;
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        state
+            .replace_preferred_providers(BTreeMap::from([(
+                model.id.clone(),
+                vec![model.mayhem.route_candidates[0].provider.clone()],
+            )]))
+            .unwrap();
+
+        let header_order = [
+            model.mayhem.route_candidates[2].provider.clone(),
+            model.mayhem.route_candidates[0].provider.clone(),
+            model.mayhem.route_candidates[1].provider.clone(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_MAYHEM_PREFER_PROVIDERS_HEADER,
+            HeaderValue::from_str(&header_order.join(",")).unwrap(),
+        );
+        headers.insert(X_MAYHEM_MIN_CTX_HEADER, HeaderValue::from_static("8192"));
+        headers.insert(
+            X_MAYHEM_MAX_PRICE_AU_HEADER,
+            HeaderValue::from_str(&(MoneyAu::MAX - 1).to_string()).unwrap(),
+        );
+        let options = GatewayRequestOptions::from_headers(&headers).unwrap();
+        let selected =
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].provider,
+            model.mayhem.route_candidates[1].provider
+        );
+        assert_eq!(
+            preferred_route_attempt_count(&state, &model, &options, selected.len()),
+            1
+        );
+    }
+
+    #[test]
     fn route_selection_uses_anchored_reputation_weight() {
         let neutral_model = test_routed_model(2);
         let neutral_state = test_gateway_state_from_models(vec![neutral_model.clone()]);
@@ -22317,6 +22635,44 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert!(receipts[1].receipt.body.final_receipt);
         assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 1);
+    }
+
+    #[tokio::test]
+    async fn preferred_provider_failover_stays_in_strict_order_without_discovery_escape() {
+        let model = test_routed_model(3);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let preferred = vec![
+            model.mayhem.route_candidates[2].provider.clone(),
+            model.mayhem.route_candidates[0].provider.clone(),
+        ];
+        let excluded = model.mayhem.route_candidates[1].provider.clone();
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(PartialThenSuccessBackend {
+                attempts,
+                providers: providers.clone(),
+            }),
+        );
+        state
+            .replace_preferred_providers(BTreeMap::from([(model.id.clone(), preferred.clone())]))
+            .unwrap();
+        let mut request = test_chat_request(&model.id);
+        request.max_tokens = Some(8);
+        let options = GatewayRequestOptions {
+            hedge_requested: true,
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+
+        let run = run_chat_with_route_retry(&state, &model, &request, options)
+            .await
+            .expect("strict preferred failover should use the second pinned provider");
+
+        assert_eq!(run.result.output.content.as_deref(), Some("hello world"));
+        let observed = providers.lock().expect("providers lock").clone();
+        assert_eq!(observed, preferred);
+        assert!(!observed.iter().any(|provider| provider == &excluded));
+        assert_eq!(run.invocation.hedge.actual_probe_count, 0);
     }
 
     #[tokio::test]
