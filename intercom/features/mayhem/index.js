@@ -15,6 +15,8 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RESULT_POLL_MS = 50;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
+const DEFAULT_PENDING_MAX = 256;
+const DEFAULT_PROCESSED_IN_FLIGHT_MAX = 256;
 
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
@@ -112,6 +114,13 @@ class MayhemFeature extends Feature {
       ? config.cacheTtlMs
       : DEFAULT_CACHE_TTL_MS;
     this.cacheMax = Number.isSafeInteger(config.cacheMax) ? config.cacheMax : DEFAULT_CACHE_MAX;
+    this.pendingMax = Number.isSafeInteger(config.pendingMax) && config.pendingMax > 0
+      ? config.pendingMax
+      : DEFAULT_PENDING_MAX;
+    this.processedInFlightMax = Number.isSafeInteger(config.processedInFlightMax) &&
+      config.processedInFlightMax > 0
+      ? config.processedInFlightMax
+      : DEFAULT_PROCESSED_IN_FLIGHT_MAX;
     this.serviceHandler = typeof config.serviceHandler === 'function' ? config.serviceHandler : null;
     this.pending = new Map();
     this.processed = new Map();
@@ -155,6 +164,9 @@ class MayhemFeature extends Feature {
     const requestId = requestIdFor(feature, key, canonicalValue);
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
+    if (this.pending.size >= this.pendingMax) {
+      throw new Error('Mayhem feature relay pending-request limit reached.');
+    }
 
     const message = {
       control: RELAY_CONTROL_REQUEST,
@@ -201,6 +213,9 @@ class MayhemFeature extends Feature {
     const requestId = serviceRequestIdFor(service, canonicalValue);
     const existing = this.servicePending.get(requestId);
     if (existing) return await existing.promise;
+    if (this.servicePending.size >= this.pendingMax) {
+      throw new Error('Mayhem service relay pending-request limit reached.');
+    }
 
     const message = {
       control: SERVICE_CONTROL_REQUEST,
@@ -327,6 +342,14 @@ class MayhemFeature extends Feature {
     }
   }
 
+  _processedInFlight(map) {
+    let count = 0;
+    for (const entry of map.values()) {
+      if (entry.pending === true) count += 1;
+    }
+    return count;
+  }
+
   async _handleRequest(payload) {
     if (!this.peer.base?.writable) return;
     const admin = await this._adminKey();
@@ -344,6 +367,16 @@ class MayhemFeature extends Feature {
 
     this._pruneProcessed();
     let cached = this.processed.get(expectedId);
+    if (!cached && this._processedInFlight(this.processed) >= this.processedInFlightMax) {
+      this.peer.sidechannel.broadcast(this.channel, {
+        control: RELAY_CONTROL_RESULT,
+        version: RELAY_VERSION,
+        request_id: expectedId,
+        to: transport,
+        response: relayError('Admin feature relay is busy; retry this signed request.', expectedId),
+      });
+      return;
+    }
     if (!cached) {
       const promise = this._applyRelayed(message.key, stableValue(message.value), expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
@@ -399,6 +432,16 @@ class MayhemFeature extends Feature {
 
     this._pruneMap(this.serviceProcessed);
     let cached = this.serviceProcessed.get(expectedId);
+    if (!cached && this._processedInFlight(this.serviceProcessed) >= this.processedInFlightMax) {
+      this.peer.sidechannel.broadcast(this.channel, {
+        control: SERVICE_CONTROL_RESULT,
+        version: RELAY_VERSION,
+        request_id: expectedId,
+        to: transport,
+        response: relayError('Mayhem admin service is busy; retry this signed request.', expectedId),
+      });
+      return;
+    }
     if (!cached) {
       const promise = Promise.resolve()
         .then(() => this.serviceHandler(message.service, stableValue(message.value)))

@@ -1,8 +1,8 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
-import c from '../../node_modules/compact-encoding/index.js';
 import crypto from 'crypto';
 import PeerWallet from 'trac-wallet';
+import { boundedJsonEncoding } from '../bounded-json.js';
 
 const DEFAULT_MUX_RETRY_MAX = 5;
 const DEFAULT_MUX_RETRY_DELAY_MS = 50;
@@ -12,6 +12,9 @@ const DEFAULT_OPEN_RETRY_RESET_MS = 2_000;
 const DEFAULT_FLUSH_TIMEOUT_MS = 10_000;
 const DEFAULT_DIRECT_CONNECT_MAX_WAIT_MS = 120_000;
 const DEFAULT_DIRECT_CONNECT_POLL_MS = 100;
+const DEFAULT_MAX_CHANNELS = 1024;
+const DEFAULT_MAX_CHANNEL_NAME_BYTES = 256;
+const DEFAULT_CHANNEL_OPEN_TIMEOUT_MS = 120_000;
 
 const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
   Number.isSafeInteger(value) && value >= min ? value : fallback
@@ -77,6 +80,8 @@ class Sidechannel extends Feature {
     this.channels = new Map();
     this.connections = new Map();
     this.rateLimits = new Map();
+    this.preparedConnections = new WeakSet();
+    this.closedConnections = new WeakSet();
     this.started = false;
     this._dhtBootPromise = null;
     this.onMessage = typeof config.onMessage === 'function' ? config.onMessage : null;
@@ -113,9 +118,20 @@ class Sidechannel extends Feature {
       DEFAULT_DIRECT_CONNECT_POLL_MS,
       { min: 1 }
     );
-    this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes)
+    this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes) && config.maxMessageBytes > 0
       ? config.maxMessageBytes
       : 1_000_000;
+    this.maxChannels = safeIntegerOr(config.maxChannels, DEFAULT_MAX_CHANNELS, { min: 1 });
+    this.maxChannelNameBytes = safeIntegerOr(
+      config.maxChannelNameBytes,
+      DEFAULT_MAX_CHANNEL_NAME_BYTES,
+      { min: 1 }
+    );
+    this.channelOpenTimeoutMs = safeIntegerOr(
+      config.channelOpenTimeoutMs,
+      DEFAULT_CHANNEL_OPEN_TIMEOUT_MS,
+      { min: 1 }
+    );
     this.maxMessageBytesByChannel = new Map();
     const channelLimitEntries = config.maxMessageBytesByChannel instanceof Map
       ? Array.from(config.maxMessageBytesByChannel.entries())
@@ -737,6 +753,8 @@ class Sidechannel extends Feature {
     const channel = String(name || '').trim();
     if (!channel) return null;
     if (this.channels.has(channel)) return this.channels.get(channel);
+    if (b4a.byteLength(channel, 'utf8') > this.maxChannelNameBytes) return null;
+    if (this.channels.size >= this.maxChannels) return null;
     if (this._inviteRequired(channel)) {
       const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
       const selfIsInviter = this.inviterKeys && selfKey && this.inviterKeys.has(selfKey);
@@ -807,15 +825,17 @@ class Sidechannel extends Feature {
   }
 
   _openChannelForConnectionUnchecked(connection, entry) {
+    if (this.closedConnections.has(connection)) return;
     const mux = connection.userData;
     if (!mux || typeof mux.createChannel !== 'function') {
       const tries = (connection.__sidechannelMuxTries || 0) + 1;
       connection.__sidechannelMuxTries = tries;
       if (tries <= this.muxRetryMax) {
-        setTimeout(
-          () => this._openChannelForConnection(connection, entry),
-          this.muxRetryDelayMs
-        );
+        setTimeout(() => {
+          if (!this.closedConnections.has(connection)) {
+            this._openChannelForConnection(connection, entry);
+          }
+        }, this.muxRetryDelayMs);
       } else if (this.debug) {
         console.log(`[sidechannel:${entry.name}] mux not ready for connection.`);
       }
@@ -848,10 +868,16 @@ class Sidechannel extends Feature {
       console.log(`[sidechannel:${entry.name}] opening channel for ${remoteKey}`);
     }
 
+    let record = null;
     const channel = mux.createChannel({
       protocol: entry.protocol,
-      onopen() {},
-      onclose() {}
+      onopen: () => {
+        if (record?.openTimer) clearTimeout(record.openTimer);
+      },
+      onclose: () => {
+        if (record?.openTimer) clearTimeout(record.openTimer);
+        if (perConn.get(entry.name) === record) perConn.delete(entry.name);
+      }
     });
     if (!channel) {
       if (this.debug) {
@@ -861,7 +887,10 @@ class Sidechannel extends Feature {
     }
 
     const message = channel.addMessage({
-      encoding: c.json,
+      encoding: boundedJsonEncoding(
+        this._maxMessageBytes(entry.name),
+        `Sidechannel ${entry.name} message`
+      ),
       onmessage: (payload) => {
         try {
           if (this._isBlocked(connection)) return;
@@ -1022,8 +1051,19 @@ class Sidechannel extends Feature {
       }
     });
 
-    const record = { channel, message, retries: 0, authSent: false };
+    record = { channel, message, retries: 0, authSent: false, openTimer: null };
     perConn.set(entry.name, record);
+
+    record.openTimer = setTimeout(() => {
+      if (perConn.get(entry.name) !== record || record.channel?.opened === true) return;
+      try {
+        record.channel?.close?.();
+      } catch (_e) {}
+      perConn.delete(entry.name);
+      if (this.debug) {
+        console.log(`[sidechannel:${entry.name}] open timed out for ${this._getRemoteKey(connection)}`);
+      }
+    }, this.channelOpenTimeoutMs);
 
     channel.open();
     channel
@@ -1035,11 +1075,13 @@ class Sidechannel extends Feature {
           );
         }
         if (opened) {
+          if (record.openTimer) clearTimeout(record.openTimer);
           if (perConn._openRetries) perConn._openRetries.delete(entry.name);
           this._sendWelcome(record, entry, connection);
           this._sendAuth(record, entry);
           return;
         }
+        if (record.openTimer) clearTimeout(record.openTimer);
         const now = this._now();
         const state = perConn._openRetries?.get(entry.name) || { count: 0, lastAt: 0 };
         // If the last attempt was a while ago, start a fresh retry burst.
@@ -1056,7 +1098,11 @@ class Sidechannel extends Feature {
           } catch (_e) {}
           perConn.delete(entry.name);
           setTimeout(
-            () => this._openChannelForConnection(connection, entry),
+            () => {
+              if (!this.closedConnections.has(connection)) {
+                this._openChannelForConnection(connection, entry);
+              }
+            },
             this.openRetryBaseMs * retryCount
           );
           return;
@@ -1070,6 +1116,7 @@ class Sidechannel extends Feature {
         perConn.delete(entry.name);
       })
       .catch((error) => {
+        if (record?.openTimer) clearTimeout(record.openTimer);
         this._reportEventError(`open ${entry.name}`, error, connection);
       });
   }
@@ -1308,16 +1355,7 @@ class Sidechannel extends Feature {
     }
     this._dhtBootPromise = bootPromise;
 
-    this.peer.swarm.on('connection', (connection) => {
-      if (this._isBlocked(connection)) return;
-      for (const entry of this.channels.values()) {
-        this._openChannelForConnection(connection, entry);
-      }
-
-      connection.on('close', () => {
-        this.connections.delete(connection);
-      });
-    });
+    this.peer.swarm.on('connection', (connection) => this._prepareConnection(connection));
 
     for (const entry of this.channels.values()) {
       this.peer.swarm.join(entry.topic, { server: true, client: true });
@@ -1338,17 +1376,40 @@ class Sidechannel extends Feature {
 
     if (this.peer.swarm.connections) {
       for (const connection of this.peer.swarm.connections) {
-        for (const entry of this.channels.values()) {
-          this._openChannelForConnection(connection, entry);
-        }
+        this._prepareConnection(connection);
       }
     }
+  }
+
+  _prepareConnection(connection) {
+    if (!connection || this.closedConnections.has(connection) || this._isBlocked(connection)) return;
+    if (!this.preparedConnections.has(connection)) {
+      this.preparedConnections.add(connection);
+      connection.on('close', () => this._dropConnection(connection));
+    }
+    for (const entry of this.channels.values()) {
+      this._openChannelForConnection(connection, entry);
+    }
+  }
+
+  _dropConnection(connection) {
+    this.closedConnections.add(connection);
+    const perConn = this.connections.get(connection);
+    if (perConn) {
+      for (const record of perConn.values()) {
+        if (record?.openTimer) clearTimeout(record.openTimer);
+      }
+    }
+    this.connections.delete(connection);
+    this.rateLimits.delete(connection);
   }
 
   async stop() {
     this.started = false;
     this._dhtBootPromise = null;
+    for (const connection of this.connections.keys()) this._dropConnection(connection);
     this.connections.clear();
+    this.rateLimits.clear();
   }
 }
 

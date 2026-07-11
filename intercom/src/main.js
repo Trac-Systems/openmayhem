@@ -400,6 +400,18 @@ const sidechannelDirectConnectPollMs = parseInteger(
   ),
   100
 );
+const sidechannelMaxChannels = parseInteger(
+  flagValue('sidechannel-max-channels', env.SIDECHANNEL_MAX_CHANNELS || ''),
+  1024
+);
+const sidechannelMaxChannelNameBytes = parseInteger(
+  flagValue('sidechannel-max-channel-name-bytes', env.SIDECHANNEL_MAX_CHANNEL_NAME_BYTES || ''),
+  256
+);
+const sidechannelChannelOpenTimeoutMs = parseInteger(
+  flagValue('sidechannel-channel-open-timeout-ms', env.SIDECHANNEL_CHANNEL_OPEN_TIMEOUT_MS || ''),
+  120_000
+);
 if (
   sidechannelMuxRetryMax < 0 ||
   sidechannelMuxRetryDelayMs <= 0 ||
@@ -408,7 +420,10 @@ if (
   sidechannelOpenRetryResetMs <= 0 ||
   sidechannelFlushTimeoutMs <= 0 ||
   sidechannelDirectConnectMaxWaitMs <= 0 ||
-  sidechannelDirectConnectPollMs <= 0
+  sidechannelDirectConnectPollMs <= 0 ||
+  sidechannelMaxChannels <= 0 ||
+  sidechannelMaxChannelNameBytes <= 0 ||
+  sidechannelChannelOpenTimeoutMs <= 0
 ) {
   throw new Error('Sidechannel retry and flush timing values are invalid.');
 }
@@ -491,6 +506,25 @@ const directSessionConnectPollMs = Number.parseInt(
     '',
   10
 );
+const directSessionOpenMaxWaitMs = Number.parseInt(
+  (flags['session-open-max-wait-ms'] && String(flags['session-open-max-wait-ms'])) ||
+    env.SESSION_OPEN_MAX_WAIT_MS ||
+    '',
+  10
+);
+const directSessionMaxSessions = Number.parseInt(
+  (flags['session-max-sessions'] && String(flags['session-max-sessions'])) ||
+    env.SESSION_MAX_SESSIONS ||
+    '',
+  10
+);
+const directSessionMaxSessionsPerConnection = Number.parseInt(
+  (flags['session-max-sessions-per-connection'] &&
+    String(flags['session-max-sessions-per-connection'])) ||
+    env.SESSION_MAX_SESSIONS_PER_CONNECTION ||
+    '',
+  10
+);
 
 const scBridgeEnabled = parseBool(
   (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
@@ -516,6 +550,54 @@ const scBridgeDebug = parseBool(
   (flags['sc-bridge-debug'] && String(flags['sc-bridge-debug'])) || env.SC_BRIDGE_DEBUG || '',
   false
 );
+const scBridgeMaxClients = parseInteger(
+  flagValue('sc-bridge-max-clients', env.SC_BRIDGE_MAX_CLIENTS || ''),
+  64
+);
+const scBridgeMaxMessageBytes = parseInteger(
+  flagValue('sc-bridge-max-message-bytes', env.SC_BRIDGE_MAX_MESSAGE_BYTES || ''),
+  2 * 1024 * 1024
+);
+const scBridgeMaxSubscriptionsPerClient = parseInteger(
+  flagValue(
+    'sc-bridge-max-subscriptions-per-client',
+    env.SC_BRIDGE_MAX_SUBSCRIPTIONS_PER_CLIENT || ''
+  ),
+  4096
+);
+const scBridgeMaxOutboundMessagesPerClient = parseInteger(
+  flagValue(
+    'sc-bridge-max-outbound-messages-per-client',
+    env.SC_BRIDGE_MAX_OUTBOUND_MESSAGES_PER_CLIENT || ''
+  ),
+  4096
+);
+const scBridgeMaxOutboundBytesPerClient = parseInteger(
+  flagValue(
+    'sc-bridge-max-outbound-bytes-per-client',
+    env.SC_BRIDGE_MAX_OUTBOUND_BYTES_PER_CLIENT || ''
+  ),
+  64 * 1024 * 1024
+);
+const scBridgeAuthTimeoutMs = parseInteger(
+  flagValue('sc-bridge-auth-timeout-ms', env.SC_BRIDGE_AUTH_TIMEOUT_MS || ''),
+  10_000
+);
+const scBridgeMaxCliQueue = parseInteger(
+  flagValue('sc-bridge-max-cli-queue', env.SC_BRIDGE_MAX_CLI_QUEUE || ''),
+  64
+);
+if (
+  scBridgeMaxClients <= 0 ||
+  scBridgeMaxMessageBytes <= 0 ||
+  scBridgeMaxSubscriptionsPerClient <= 0 ||
+  scBridgeMaxOutboundMessagesPerClient <= 0 ||
+  scBridgeMaxOutboundBytesPerClient <= 0 ||
+  scBridgeAuthTimeoutMs <= 0 ||
+  scBridgeMaxCliQueue <= 0
+) {
+  throw new Error('SC-Bridge resource limits must be positive.');
+}
 
 const rpcEnabled = parseBool(
   (flags.rpc && String(flags.rpc)) || env.PEER_RPC || '',
@@ -765,6 +847,13 @@ if (scBridgeEnabled) {
     debug: scBridgeDebug,
     cliEnabled: scBridgeCliEnabled,
     requireAuth: true,
+    maxClients: scBridgeMaxClients,
+    maxMessageBytes: scBridgeMaxMessageBytes,
+    maxSubscriptionsPerClient: scBridgeMaxSubscriptionsPerClient,
+    maxOutboundMessagesPerClient: scBridgeMaxOutboundMessagesPerClient,
+    maxOutboundBytesPerClient: scBridgeMaxOutboundBytesPerClient,
+    authTimeoutMs: scBridgeAuthTimeoutMs,
+    maxCliQueue: scBridgeMaxCliQueue,
     info: {
       app: 'mayhem',
       network: networkEnv,
@@ -808,6 +897,15 @@ const directSession = new DirectSession(peer, {
   connectPollMs: Number.isSafeInteger(directSessionConnectPollMs)
     ? directSessionConnectPollMs
     : undefined,
+  openMaxWaitMs: Number.isSafeInteger(directSessionOpenMaxWaitMs)
+    ? directSessionOpenMaxWaitMs
+    : undefined,
+  maxSessions: Number.isSafeInteger(directSessionMaxSessions)
+    ? directSessionMaxSessions
+    : undefined,
+  maxSessionsPerConnection: Number.isSafeInteger(directSessionMaxSessionsPerConnection)
+    ? directSessionMaxSessionsPerConnection
+    : undefined,
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
     : null,
@@ -829,6 +927,9 @@ const sidechannel = new Sidechannel(peer, {
   flushTimeoutMs: sidechannelFlushTimeoutMs,
   directConnectMaxWaitMs: sidechannelDirectConnectMaxWaitMs,
   directConnectPollMs: sidechannelDirectConnectPollMs,
+  maxChannels: sidechannelMaxChannels,
+  maxChannelNameBytes: sidechannelMaxChannelNameBytes,
+  channelOpenTimeoutMs: sidechannelChannelOpenTimeoutMs,
   powEnabled: true,
   powDifficulty: mayhemRelayPowDifficulty,
   powRequiredChannels: [MAYHEM_RELAY_CHANNEL],

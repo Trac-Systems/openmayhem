@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
 import DirectSession from '../features/direct-session/index.js';
+import { boundedJsonEncoding } from '../features/bounded-json.js';
 import { isLocalPeer, loopbackSessionInfo } from '../features/sc-bridge/loopback.js';
 
 const sessionId = 'ab'.repeat(32);
@@ -19,6 +20,9 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.sendDrainTimeoutMs, 0);
   assert.equal(stats.connectMaxWaitMs, 120_000);
   assert.equal(stats.connectPollMs, 100);
+  assert.equal(stats.openMaxWaitMs, 120_000);
+  assert.equal(stats.maxSessions, 1024);
+  assert.equal(stats.maxSessionsPerConnection, 128);
   assert.equal(stats.sessionCount, 0);
 });
 
@@ -86,13 +90,15 @@ test('DirectSession rejects oversized frames before transport send', () => {
   );
 });
 
-test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
+test('DirectSession receive bucket closes an offender instead of silently losing a frame', () => {
   const frames = [];
   const frame = { t: 's.delta', d: 'token'.repeat(8) };
   const frameBytes = new DirectSession({}, {})._frameBytes(frame);
+  let closed = 0;
   const directSession = new DirectSession(
     {},
     {
+      maxFrameBytes: frameBytes + 1,
       rateBytesPerSecond: 1,
       rateBurstBytes: frameBytes + 1,
       onFrame: (event) => frames.push(event),
@@ -100,15 +106,67 @@ test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
   );
   const receiveLimiter = directSession._newLimiter();
 
-  directSession._handleFrame({ sessionId, remote, receiveLimiter }, frame);
-  directSession._handleFrame({ sessionId, remote, receiveLimiter }, frame);
+  const session = {
+    sessionId,
+    remote,
+    receiveLimiter,
+    drainWaiters: new Set(),
+    channel: { close: () => { closed += 1; } },
+    closed: false,
+  };
+  directSession._handleFrame(session, frame);
+  directSession._handleFrame(session, frame);
+  directSession._handleFrame(session, frame);
 
   assert.equal(frames.length, 1);
+  assert.equal(closed, 1);
+  assert.equal(session.closed, true);
   assert.equal(frames[0].session_id, sessionId);
   assert.equal(frames[0].channel, `mx/s/${sessionId}`);
   assert.equal(frames[0].direct, true);
   assert.equal(frames[0].relayed, false);
   assert.deepEqual(frames[0].frame, frame);
+});
+
+test('DirectSession sender throttles a valid multi-frame payload instead of rejecting it', async () => {
+  const directSession = new DirectSession({}, {
+    maxFrameBytes: 128,
+    rateBytesPerSecond: 10_000,
+    rateBurstBytes: 128,
+  });
+  const session = {
+    sessionId,
+    sendLimiter: directSession._newLimiter(),
+    channel: { closed: false, destroyed: false },
+    closed: false,
+  };
+
+  await directSession._acquireSendRate(session, 100);
+  await assert.doesNotReject(directSession._acquireSendRate(session, 100));
+});
+
+test('bounded JSON drops a complete oversized payload before UTF-8 decode', () => {
+  const encoding = boundedJsonEncoding(64, 'test frame');
+  const state = { buffer: b4a.concat([b4a.from([65]), b4a.alloc(65)]), start: 0, end: 66 };
+  assert.equal(encoding.decode(state), null);
+  assert.equal(state.start, 66);
+});
+
+test('DirectSession bounds inbound sessions per connection and globally', () => {
+  const connection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const directSession = new DirectSession({}, {
+    maxSessions: 2,
+    maxSessionsPerConnection: 1,
+  });
+  directSession.sessions.set(`${remote}:${sessionId}`, {
+    sessionId,
+    remote,
+    connection,
+    closed: false,
+  });
+
+  assert.equal(directSession._hasSessionCapacity(connection, sessionId), true);
+  assert.equal(directSession._hasSessionCapacity(connection, 'ef'.repeat(32)), false);
 });
 
 test('DirectSession drops a malformed frame and still accepts the next valid frame', () => {

@@ -161,6 +161,47 @@ test('admin writer deduplicates a retried relay request by deterministic request
   assert.equal(writer.appended.length, 1);
 });
 
+test('admin writer bounds concurrent remote relay work and returns retryable busy', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const replies = [];
+  const writerFeature = new MayhemFeature(writer.peer, { processedInFlightMax: 1 });
+  writerFeature.key = 'mayhem';
+  writerFeature.processed.set('already-running', {
+    at: Date.now(),
+    pending: true,
+    promise: new Promise(() => {}),
+  });
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: () => true,
+    broadcast(_channel, message) {
+      replies.push(message);
+      return true;
+    },
+  };
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const payload = {
+    from: providerKey,
+    sig: `signed:${providerKey}`,
+    message: {
+      control: 'mayhem_feature_request',
+      version: 1,
+      request_id: requestIdFor('mayhem', key, value),
+      feature: 'mayhem',
+      key,
+      value,
+    },
+  };
+
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+
+  assert.equal(writer.appended.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].response.status, 'rejected');
+  assert.match(replies[0].response.message, /busy/);
+});
+
 test('admin writer retries a previously rejected deterministic relay request', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });

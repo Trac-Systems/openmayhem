@@ -122,3 +122,55 @@ test('required DHT bootstrap failure rejects sidechannel startup for supervisor 
   await assert.rejects(sidechannel.start(), /injected DHT bootstrap failure/);
   assert.equal(sidechannel.started, false);
 });
+
+test('sidechannel decoder drops oversized JSON before parsing it', () => {
+  let encoding = null;
+  const channel = {
+    opened: true,
+    addMessage(options) {
+      encoding = options.encoding;
+      return { send: () => true };
+    },
+    open() {},
+    close() {},
+    fullyOpened: async () => true,
+  };
+  const connection = {
+    remotePublicKey: b4a.from('dd'.repeat(32), 'hex'),
+    userData: {
+      pair() {},
+      createChannel: () => channel,
+    },
+  };
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    maxMessageBytes: 64,
+  });
+  sidechannel._openChannelForConnection(connection, sidechannel.channels.get(entryChannel));
+
+  assert.ok(encoding);
+  const state = { buffer: b4a.concat([b4a.from([65]), b4a.alloc(65)]), start: 0, end: 66 };
+  assert.equal(encoding.decode(state), null);
+  assert.equal(state.start, 66);
+});
+
+test('sidechannel bounds channel names/count and reclaims limiter state under connection churn', () => {
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    maxChannels: 2,
+    maxChannelNameBytes: 32,
+  });
+  assert.ok(sidechannel._registerChannel('room-one'));
+  assert.equal(sidechannel._registerChannel('room-two'), null);
+  assert.equal(sidechannel._registerChannel('x'.repeat(33)), null);
+
+  for (let index = 0; index < 1000; index += 1) {
+    const connection = { remotePublicKey: b4a.alloc(32, index % 255) };
+    sidechannel._getLimiter(connection);
+    sidechannel._dropConnection(connection);
+  }
+  assert.equal(sidechannel.rateLimits.size, 0);
+  assert.equal(sidechannel.connections.size, 0);
+});

@@ -3,12 +3,29 @@ import b4a from 'b4a';
 import ws from 'bare-ws';
 import { dispatchContainedClientRequest } from './containment.js';
 import {
+  addBoundedSubscriptions,
+  messageByteLength,
+  writeBoundedClientPayload,
+} from './bounded-client.js';
+import {
   isLocalPeer,
   keyHex,
   localPeerKey,
   loopbackSessionInfo,
   normalizePeerKey,
 } from './loopback.js';
+
+const DEFAULT_MAX_CLIENTS = 64;
+const DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_CLIENT = 4096;
+const DEFAULT_MAX_OUTBOUND_MESSAGES_PER_CLIENT = 4096;
+const DEFAULT_MAX_OUTBOUND_BYTES_PER_CLIENT = 64 * 1024 * 1024;
+const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_CLI_QUEUE = 64;
+
+const safePositiveInteger = (value, fallback) => (
+  Number.isSafeInteger(value) && value > 0 ? value : fallback
+);
 
 const normalizeText = (value) => {
   if (value === null || value === undefined) return '';
@@ -73,6 +90,7 @@ class ScBridge extends Feature {
     this.clients = new Set();
     this.cliHandlers = null;
     this.cliQueue = Promise.resolve();
+    this.cliQueued = 0;
 
     this.host = typeof config.host === 'string' ? config.host : '127.0.0.1';
     this.port = Number.isSafeInteger(config.port) ? config.port : 49222;
@@ -80,6 +98,25 @@ class ScBridge extends Feature {
     this.requireAuth = config.requireAuth !== false;
     this.cliEnabled = config.cliEnabled === true;
     this.debug = config.debug === true;
+    this.maxClients = safePositiveInteger(config.maxClients, DEFAULT_MAX_CLIENTS);
+    this.maxMessageBytes = safePositiveInteger(
+      config.maxMessageBytes,
+      DEFAULT_MAX_MESSAGE_BYTES
+    );
+    this.maxSubscriptionsPerClient = safePositiveInteger(
+      config.maxSubscriptionsPerClient,
+      DEFAULT_MAX_SUBSCRIPTIONS_PER_CLIENT
+    );
+    this.maxOutboundMessagesPerClient = safePositiveInteger(
+      config.maxOutboundMessagesPerClient,
+      DEFAULT_MAX_OUTBOUND_MESSAGES_PER_CLIENT
+    );
+    this.maxOutboundBytesPerClient = safePositiveInteger(
+      config.maxOutboundBytesPerClient,
+      DEFAULT_MAX_OUTBOUND_BYTES_PER_CLIENT
+    );
+    this.authTimeoutMs = safePositiveInteger(config.authTimeoutMs, DEFAULT_AUTH_TIMEOUT_MS);
+    this.maxCliQueue = safePositiveInteger(config.maxCliQueue, DEFAULT_MAX_CLI_QUEUE);
 
     this.defaultFilterRaw = typeof config.filter === 'string' ? config.filter : '';
     this.defaultFilter = parseFilter(this.defaultFilterRaw);
@@ -99,15 +136,32 @@ class ScBridge extends Feature {
   }
 
   _broadcastToClient(client, payload) {
-    try {
-      const data = JSON.stringify(payload);
-      client.socket.write(data);
-    } catch (err) {
-      if (this.debug) {
-        console.log(
-          `[sc-bridge] client ${client?.id ?? '?'} write failed: ${err?.message ?? err}`
-        );
-      }
+    return writeBoundedClientPayload(
+      client,
+      payload,
+      {
+        maxMessageBytes: this.maxMessageBytes,
+        maxOutboundMessages: this.maxOutboundMessagesPerClient,
+        maxOutboundBytes: this.maxOutboundBytesPerClient,
+      },
+      (reason) => this._dropClient(client, reason, true)
+    );
+  }
+
+  _dropClient(client, reason, destroySocket = false) {
+    if (!client || client.closed) return;
+    client.closed = true;
+    if (client.authTimer) clearTimeout(client.authTimer);
+    client.outboundQueue.length = 0;
+    client.outboundBytes = 0;
+    this.clients.delete(client);
+    if (this.debug) {
+      console.log(`[sc-bridge] client ${client.id} disconnected: ${reason}`);
+    }
+    if (destroySocket) {
+      try {
+        client.socket.destroy?.(new Error(reason));
+      } catch (_e) {}
     }
   }
 
@@ -249,6 +303,10 @@ class ScBridge extends Feature {
       if (message.token === this.token) {
         client.authed = true;
         client.ready = true;
+        if (client.authTimer) {
+          clearTimeout(client.authTimer);
+          client.authTimer = null;
+        }
         reply({ type: 'auth_ok' });
         return;
       }
@@ -299,8 +357,13 @@ class ScBridge extends Feature {
         reply({ type: 'pong', ts: Date.now() });
         return;
       case 'set_filter': {
-        client.filter = parseFilter(message.filter || '');
-        reply({ type: 'filter_set', filter: message.filter || '' });
+        const filter = String(message.filter || '');
+        if (b4a.byteLength(filter, 'utf8') > this.maxMessageBytes) {
+          sendError('Filter is too large.');
+          return;
+        }
+        client.filter = parseFilter(filter);
+        reply({ type: 'filter_set', filter });
         return;
       }
       case 'clear_filter': {
@@ -315,7 +378,10 @@ class ScBridge extends Feature {
             ? [message.channel]
             : [];
         if (!client.channels) client.channels = new Set();
-        for (const ch of channels) client.channels.add(String(ch));
+        if (!this._addSubscriptions(client.channels, channels)) {
+          sendError('Sidechannel subscription limit reached.');
+          return;
+        }
         client.sidechannelMuted = false;
         reply({ type: 'subscribed', channels: Array.from(client.channels) });
         return;
@@ -341,7 +407,10 @@ class ScBridge extends Feature {
         if (sessionIds.some((sessionId) => String(sessionId) === '*')) {
           client.sessionAll = true;
         }
-        for (const sessionId of sessionIds) client.sessionIds.add(String(sessionId));
+        if (!this._addSubscriptions(client.sessionIds, sessionIds)) {
+          sendError('Session subscription limit reached.');
+          return;
+        }
         if (message.sidechannel === false) {
           client.sidechannelMuted = true;
         } else if (message.sidechannel === true) {
@@ -665,6 +734,11 @@ class ScBridge extends Feature {
   }
 
   _handleSocketData(client, data) {
+    const bytes = messageByteLength(data);
+    if (bytes > this.maxMessageBytes) {
+      this._dropClient(client, `inbound message exceeds ${this.maxMessageBytes} bytes`, true);
+      return;
+    }
     let text = '';
     if (typeof data === 'string') text = data;
     else if (b4a.isBuffer(data)) text = b4a.toString(data, 'utf8');
@@ -731,9 +805,20 @@ class ScBridge extends Feature {
   }
 
   _enqueueCli(command) {
+    if (this.cliQueued >= this.maxCliQueue) {
+      return Promise.reject(new Error('SC-Bridge CLI queue limit reached.'));
+    }
+    this.cliQueued += 1;
     const run = async () => this._withConsoleCapture(() => this._dispatchCli(command));
-    this.cliQueue = this.cliQueue.then(run, run);
-    return this.cliQueue;
+    const queued = this.cliQueue.then(run, run);
+    this.cliQueue = queued.catch(() => null);
+    return queued.finally(() => {
+      this.cliQueued = Math.max(0, this.cliQueued - 1);
+    });
+  }
+
+  _addSubscriptions(target, values) {
+    return addBoundedSubscriptions(target, values, this.maxSubscriptionsPerClient);
   }
 
   async _ensureCliHandlers() {
@@ -826,6 +911,12 @@ class ScBridge extends Feature {
     }
     this.started = true;
     this.server = new ws.Server({ host: this.host, port: this.port }, (socket) => {
+      if (this.clients.size >= this.maxClients) {
+        try {
+          socket.destroy?.(new Error('SC-Bridge client limit reached.'));
+        } catch (_e) {}
+        return;
+      }
       const client = {
         id: this.nextClientId++,
         socket,
@@ -835,8 +926,18 @@ class ScBridge extends Feature {
         channels: null,
         sessionIds: null,
         sessionAll: false,
+        outboundQueue: [],
+        outboundBytes: 0,
+        writing: false,
+        closed: false,
+        authTimer: null,
       };
       this.clients.add(client);
+      if (this.requireAuth) {
+        client.authTimer = setTimeout(() => {
+          if (!client.authed) this._dropClient(client, 'authentication timed out', true);
+        }, this.authTimeoutMs);
+      }
       if (this.debug) {
         console.log(`[sc-bridge] client ${client.id} connected`);
       }
@@ -853,10 +954,7 @@ class ScBridge extends Feature {
 
       socket.on('data', (data) => this._handleSocketData(client, data));
       const cleanup = () => {
-        if (this.debug && this.clients.has(client)) {
-          console.log(`[sc-bridge] client ${client.id} disconnected`);
-        }
-        this.clients.delete(client);
+        this._dropClient(client, 'socket closed', false);
       };
       socket.on('close', cleanup);
       socket.on('end', cleanup);
@@ -871,6 +969,7 @@ class ScBridge extends Feature {
     } catch (_e) {}
     this.server = null;
     this.started = false;
+    for (const client of this.clients) this._dropClient(client, 'bridge stopped', true);
     this.clients.clear();
   }
 }
