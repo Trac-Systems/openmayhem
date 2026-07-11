@@ -1889,7 +1889,9 @@ fn collect_nvidia_eat_tokens(value: &Value, tokens: &mut Vec<String>) {
                 && values[0].as_str() == Some("JWT")
                 && values[1].as_str().is_some_and(looks_like_jwt)
             {
-                tokens.push(values[1].as_str().unwrap().to_owned());
+                if let Some(token) = values[1].as_str() {
+                    tokens.push(token.to_owned());
+                }
             }
             for child in values {
                 collect_nvidia_eat_tokens(child, tokens);

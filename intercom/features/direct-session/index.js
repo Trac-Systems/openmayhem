@@ -195,6 +195,15 @@ class DirectSession extends Feature {
   }
 
   _prepareConnection(connection) {
+    try {
+      return this._prepareConnectionUnchecked(connection);
+    } catch (error) {
+      this._reportEventError('connection setup', error);
+      return false;
+    }
+  }
+
+  _prepareConnectionUnchecked(connection) {
     if (!connection || this.pairedConnections.has(connection)) return;
     const mux = this._muxForConnection(connection);
     if (!mux) return;
@@ -202,7 +211,11 @@ class DirectSession extends Feature {
     mux.pair({ protocol: SESSION_PROTOCOL }, (id) => {
       const sessionId = id ? b4a.toString(id, 'hex') : null;
       if (!normalizeSessionId(sessionId)) return;
-      this._ensureSession(connection, sessionId);
+      try {
+        this._ensureSession(connection, sessionId);
+      } catch (error) {
+        this._reportEventError(`inbound session ${sessionId}`, error);
+      }
     });
     connection.on('close', () => this._dropConnection(connection));
   }
@@ -300,16 +313,30 @@ class DirectSession extends Feature {
       );
     }
     if (this.onFrame) {
-      this.onFrame({
-        session_id: session.sessionId,
-        channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
-        protocol: SESSION_PROTOCOL,
-        remote: session.remote,
-        direct: true,
-        relayed: false,
-        frame,
-      });
+      try {
+        const result = this.onFrame({
+          session_id: session.sessionId,
+          channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
+          protocol: SESSION_PROTOCOL,
+          remote: session.remote,
+          direct: true,
+          relayed: false,
+          frame,
+        });
+        if (result && typeof result.catch === 'function') {
+          result.catch((error) => this._reportEventError(`session ${session.sessionId}`, error));
+        }
+      } catch (error) {
+        this._reportEventError(`session ${session.sessionId}`, error);
+      }
     }
+  }
+
+  _reportEventError(scope, error) {
+    console.error(
+      `[direct-session] ${scope} failed without stopping the peer:`,
+      error?.message ?? error
+    );
   }
 
   _validateFrame(frame, throwOnError = true) {

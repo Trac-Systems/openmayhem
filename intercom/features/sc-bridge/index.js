@@ -1,6 +1,7 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
 import ws from 'bare-ws';
+import { dispatchContainedClientRequest } from './containment.js';
 import {
   isLocalPeer,
   keyHex,
@@ -676,7 +677,13 @@ class ScBridge extends Feature {
       this._sendError(client, 'Invalid JSON.');
       return;
     }
-    this._handleClientMessage(client, msg);
+    dispatchContainedClientRequest(() => this._handleClientMessage(client, msg), (error) => {
+      console.error(
+        `[sc-bridge] client ${client?.id ?? '?'} request failed without stopping the bridge:`,
+        error?.message ?? error
+      );
+      this._sendError(client, error?.message ?? 'Request failed.');
+    });
   }
 
   _formatLogArgs(args) {

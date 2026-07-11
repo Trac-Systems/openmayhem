@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import b4a from 'b4a';
 import Sidechannel from '../features/sidechannel/index.js';
 import {
   MAYHEM_RELAY_CHANNEL,
@@ -51,4 +52,73 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
     false
   );
   assert.equal(sidechannel.broadcast(sessionChannel, { data: 'x'.repeat(20_000) }), true);
+});
+
+test('a rejected remote message handler is contained and later messages still run', async () => {
+  let incoming;
+  let calls = 0;
+  const channel = {
+    opened: true,
+    addMessage({ onmessage }) {
+      incoming = onmessage;
+      return { send: () => true };
+    },
+    open() {},
+    close() {},
+    fullyOpened: async () => true,
+  };
+  const connection = {
+    remotePublicKey: b4a.from('cc'.repeat(32), 'hex'),
+    userData: {
+      pair() {},
+      createChannel: () => channel,
+    },
+  };
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    relayEnabled: false,
+    onMessage: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('injected poisoned message');
+    },
+  });
+  sidechannel._openChannelForConnection(connection, sidechannel.channels.get(entryChannel));
+  assert.equal(typeof incoming, 'function');
+
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.doesNotThrow(() => incoming({ id: 'first', from: 'cc'.repeat(32), message: { n: 1 } }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.doesNotThrow(() => incoming({ id: 'second', from: 'cc'.repeat(32), message: { n: 2 } }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(calls, 2);
+});
+
+test('required DHT bootstrap failure rejects sidechannel startup for supervisor recovery', async () => {
+  const startupPeer = {
+    ...peer,
+    swarm: {
+      dht: {
+        async fullyBootstrapped() {
+          throw new Error('injected DHT bootstrap failure');
+        },
+      },
+      connections: [],
+      on() {},
+      join() {},
+      async flush() {},
+    },
+  };
+  const sidechannel = new Sidechannel(startupPeer, {
+    channels: [entryChannel],
+    entryChannel,
+  });
+
+  await assert.rejects(sidechannel.start(), /injected DHT bootstrap failure/);
+  assert.equal(sidechannel.started, false);
 });

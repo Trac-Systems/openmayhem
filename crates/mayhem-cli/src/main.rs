@@ -11,6 +11,7 @@ use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -226,6 +227,8 @@ const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
+const MAYHEMD_RESTART_STABLE_AFTER_MILLIS: u64 = 60_000;
+const MAYHEMD_CRASH_LOOP_THRESHOLD: u64 = 5;
 const DEFAULT_RELEASE_FEED_URL: &str =
     "https://api.github.com/repos/Trac-Systems/openmayhem/releases/latest";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
@@ -21769,6 +21772,11 @@ fn write_supervisor_child(
     }
     writeln!(out, "restart = true")?;
     writeln!(out, "restart_backoff_ms = 1000")?;
+    writeln!(
+        out,
+        "restart_stable_after_ms = {MAYHEMD_RESTART_STABLE_AFTER_MILLIS}"
+    )?;
+    writeln!(out, "crash_loop_threshold = {MAYHEMD_CRASH_LOOP_THRESHOLD}")?;
     writeln!(out)?;
     Ok(())
 }
@@ -22006,6 +22014,11 @@ fn supervisor_child_processes(state: Option<&Value>) -> Vec<Value> {
                         "name": child.get("name").and_then(Value::as_str).unwrap_or(""),
                         "pid": if pid == 0 { Value::Null } else { json!(pid) },
                         "running": pid != 0 && process_is_running(pid),
+                        "restart_pending": child.get("restart_pending").cloned().unwrap_or(Value::Bool(false)),
+                        "restarts": child.get("restarts").cloned().unwrap_or_else(|| json!(0)),
+                        "consecutive_failures": child.get("consecutive_failures").cloned().unwrap_or_else(|| json!(0)),
+                        "crash_loop": child.get("crash_loop").cloned().unwrap_or(Value::Bool(false)),
+                        "last_uptime_ms": child.get("last_uptime_ms").cloned().unwrap_or(Value::Null),
                         "last_exit": child.get("last_exit").cloned().unwrap_or(Value::Null),
                         "last_error": child.get("last_error").cloned().unwrap_or(Value::Null),
                     })
@@ -22636,39 +22649,59 @@ struct GatewayLedgerWatcherConfig {
 
 fn spawn_gateway_ledger_watcher(state: GatewayState, config: GatewayLedgerWatcherConfig) {
     tokio::spawn(async move {
-        let rpc = match PeerRpcClient::new(&config.rpc_url) {
-            Ok(rpc) => rpc,
-            Err(err) => {
-                eprintln!("Gateway ledger watcher disabled: {err:#}");
-                return;
-            }
-        };
-        let mut last_error = None;
         loop {
-            let refresh = async {
-                let balance =
-                    read_user_balance_au(&rpc, &config.wallet_public_key, &config.rail).await?;
-                let payments =
-                    canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
-                Result::<_, anyhow::Error>::Ok((balance, payments))
-            }
-            .await;
-            match refresh {
-                Ok((balance, payments)) => {
-                    state.update_ledger_payment_state(balance, payments);
-                    last_error = None;
+            let component_state = state.clone();
+            let component_config = config.clone();
+            match tokio::spawn(async move {
+                run_gateway_ledger_watcher(component_state, component_config).await
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    eprintln!("Gateway ledger watcher stopped unexpectedly; restarting");
+                }
+                Ok(Err(err)) => {
+                    eprintln!("Gateway ledger watcher component failed; restarting: {err:#}");
                 }
                 Err(err) => {
-                    let message = format!("{err:#}");
-                    if last_error.as_deref() != Some(message.as_str()) {
-                        eprintln!("Gateway ledger watcher retrying: {message}");
-                        last_error = Some(message);
-                    }
+                    eprintln!("Gateway ledger watcher component panicked; restarting: {err}");
                 }
             }
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(1)).await;
         }
     });
+}
+
+async fn run_gateway_ledger_watcher(
+    state: GatewayState,
+    config: GatewayLedgerWatcherConfig,
+) -> Result<()> {
+    let rpc = PeerRpcClient::new(&config.rpc_url).context("creating gateway ledger watcher RPC")?;
+    let mut last_error = None;
+    loop {
+        let refresh = async {
+            let balance =
+                read_user_balance_au(&rpc, &config.wallet_public_key, &config.rail).await?;
+            let payments =
+                canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
+            Result::<_, anyhow::Error>::Ok((balance, payments))
+        }
+        .await;
+        match refresh {
+            Ok((balance, payments)) => {
+                state.update_ledger_payment_state(balance, payments);
+                last_error = None;
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                if last_error.as_deref() != Some(message.as_str()) {
+                    eprintln!("Gateway ledger watcher retrying: {message}");
+                    last_error = Some(message);
+                }
+            }
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
 }
 
 fn gateway_provider_heartbeat_channels(models: &[GatewayModel]) -> Vec<String> {
@@ -22692,10 +22725,24 @@ fn spawn_gateway_provider_heartbeat_watcher(
     }
     tokio::spawn(async move {
         loop {
-            if let Err(err) = run_gateway_provider_heartbeat_watcher(&state, &config).await {
-                eprintln!("Gateway provider heartbeat watcher reconnecting: {err:#}");
-                sleep(Duration::from_secs(1)).await;
+            let component_state = state.clone();
+            let component_config = config.clone();
+            match tokio::spawn(async move {
+                run_gateway_provider_heartbeat_watcher(&component_state, &component_config).await
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    eprintln!("Gateway provider heartbeat watcher stopped unexpectedly; restarting")
+                }
+                Ok(Err(err)) => {
+                    eprintln!("Gateway provider heartbeat watcher reconnecting: {err:#}")
+                }
+                Err(err) => eprintln!(
+                    "Gateway provider heartbeat watcher component panicked; restarting: {err}"
+                ),
             }
+            sleep(Duration::from_secs(1)).await;
         }
     });
 }
@@ -24208,6 +24255,34 @@ fn print_status_report(report: &Value) {
         }
     } else {
         println!("Mayhemd: not started");
+    }
+    if let Some(children) = supervisor["status"]["children"].as_object() {
+        for child in children.values().filter(|child| {
+            child.get("crash_loop").and_then(Value::as_bool) == Some(true)
+                || child.get("restart_pending").and_then(Value::as_bool) == Some(true)
+        }) {
+            println!(
+                "  child {}: {} restarts={} consecutive_failures={} last_exit={}",
+                child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                if child.get("crash_loop").and_then(Value::as_bool) == Some(true) {
+                    "CRASH LOOP"
+                } else {
+                    "restart pending"
+                },
+                child.get("restarts").and_then(Value::as_u64).unwrap_or(0),
+                child
+                    .get("consecutive_failures")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                child
+                    .get("last_exit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+        }
     }
     println!(
         "Peer RPC: {}",
@@ -31759,6 +31834,9 @@ enum ProviderSessionDecision {
 
 trait ProviderSessionResponder {
     fn mode(&self) -> &'static str;
+    fn component_healthy(&mut self) -> bool {
+        true
+    }
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
@@ -31805,6 +31883,10 @@ impl ProviderSessionResponder for UnavailableProviderSessionResponder {
         "provider-engine-unavailable"
     }
 
+    fn component_healthy(&mut self) -> bool {
+        false
+    }
+
     fn respond(
         &mut self,
         _terms: &ProviderSessionTerms,
@@ -31827,6 +31909,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         true
     }
 
+    fn component_healthy(&mut self) -> bool {
+        self.backend.component_healthy()
+    }
+
     fn process_ids(&self) -> Vec<u32> {
         self.backend.process_ids()
     }
@@ -31847,6 +31933,93 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body, stream)
     }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderEngineRecovery {
+    reason: Option<String>,
+    retry_at: Option<Instant>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    next_delay: Duration,
+}
+
+impl ProviderEngineRecovery {
+    fn new(initial_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            reason: None,
+            retry_at: None,
+            initial_delay,
+            max_delay,
+            next_delay: initial_delay,
+        }
+    }
+
+    fn mark_failed(&mut self, reason: impl Into<String>) {
+        if self.reason.is_none() {
+            self.retry_at = Some(Instant::now());
+            self.next_delay = self.initial_delay;
+        }
+        self.reason = Some(reason.into());
+    }
+
+    fn mark_reload_failed(&mut self, reason: impl Into<String>, now: Instant) {
+        self.reason = Some(reason.into());
+        self.retry_at = Some(now + self.next_delay);
+        self.next_delay = (self.next_delay * 2).min(self.max_delay);
+    }
+
+    fn mark_recovered(&mut self) {
+        self.reason = None;
+        self.retry_at = None;
+        self.next_delay = self.initial_delay;
+    }
+
+    fn pending(&self) -> bool {
+        self.reason.is_some()
+    }
+
+    fn retry_due(&self, now: Instant) -> bool {
+        self.pending() && self.retry_at.is_some_and(|retry_at| now >= retry_at)
+    }
+
+    fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    fn rejection(&self) -> Option<ProviderRuntimeFloorRejection> {
+        self.reason
+            .as_ref()
+            .map(|reason| ProviderRuntimeFloorRejection {
+                code: "ENGINE_UNAVAILABLE",
+                reason: format!(
+                    "provider engine component is reloading after a contained failure: {reason}"
+                ),
+            })
+    }
+}
+
+fn provider_engine_component_failure(
+    responder: &mut dyn ProviderSessionResponder,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let reason = format!("{error:#}");
+    (reason.contains("provider engine panicked") || !responder.component_healthy())
+        .then_some(reason)
+}
+
+fn reload_provider_session_responder(
+    responder: &mut Box<dyn ProviderSessionResponder>,
+    reason: String,
+    loader: impl FnOnce() -> Result<Box<dyn ProviderSessionResponder>>,
+) -> Result<()> {
+    let old_responder = std::mem::replace(
+        responder,
+        Box::new(UnavailableProviderSessionResponder { reason }),
+    );
+    drop(old_responder);
+    *responder = loader()?;
+    Ok(())
 }
 
 struct ProviderServePlanComputed {
@@ -32239,6 +32412,8 @@ fn provider_serve_child_config(
         "args": args,
         "restart": true,
         "restart_backoff_ms": 1000,
+        "restart_stable_after_ms": MAYHEMD_RESTART_STABLE_AFTER_MILLIS,
+        "crash_loop_threshold": MAYHEMD_CRASH_LOOP_THRESHOLD,
     }))
 }
 
@@ -39565,6 +39740,31 @@ fn provider_heartbeat_tok_s(
     (cold_start_prior, "hwprobe_cold_start_prior")
 }
 
+fn spawn_provider_session_heartbeat_task(
+    ctx: ProviderSessionHeartbeatTask,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(run_provider_session_heartbeats(ctx))
+}
+
+fn provider_panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_owned()
+}
+
+fn contain_provider_request<T>(request: impl FnOnce() -> Result<T>) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(request)).unwrap_or_else(|panic| {
+        Err(anyhow!(
+            "provider engine panicked while serving this request: {}",
+            provider_panic_message(panic)
+        ))
+    })
+}
+
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
     let mut retry_delay = ctx.heartbeat_reconnect_initial;
     while !ctx.load.is_stopped() {
@@ -39722,6 +39922,8 @@ async fn serve_provider_sessions(
         DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
         "provider heartbeat TTL",
     )?);
+    let component_poll_interval =
+        provider_heartbeat_reconnect_initial.min(bridge_liveness_interval);
     let request_stall_timeout = provider_session_request_timeout()?;
     let mut bridge = reconnect_provider_session_bridge(
         &sc_bridge_url,
@@ -39770,31 +39972,31 @@ async fn serve_provider_sessions(
             .then(|| Duration::from_millis(engine_watchdog_restart_after_millis)),
         engine_watchdog_restart_cooldown,
     );
-    let heartbeat_task = heartbeat_enabled.then(|| {
-        tokio::spawn(run_provider_session_heartbeats(
-            ProviderSessionHeartbeatTask {
-                home: ctx.home.to_path_buf(),
-                sc_bridge_url: sc_bridge_url.clone(),
-                sc_bridge_token: sc_bridge_token.clone(),
-                keypair_path: ctx.keypair_path.to_path_buf(),
-                password: ctx.password.to_owned(),
-                provider_pubkey: ctx.wallet.public_key.clone(),
-                selected: ctx.selected.clone(),
-                rooms: ctx.rooms.to_vec(),
-                attestation: ctx.attestation.clone(),
-                attestation_head: ctx.attestation_head.to_owned(),
-                identity_anchor: ctx.identity_anchor.to_owned(),
-                min_ask_au: ctx.args.min_ask_au,
-                max_sessions: protection_config.max_sessions,
-                load: heartbeat_load.clone(),
-                bridge_operation_timeout,
-                heartbeat_interval: provider_heartbeat_interval,
-                heartbeat_reconnect_initial: provider_heartbeat_reconnect_initial,
-                heartbeat_reconnect_max: provider_heartbeat_reconnect_max,
-                heartbeat_ttl: provider_heartbeat_ttl,
-            },
-        ))
+    let heartbeat_task_config = heartbeat_enabled.then(|| ProviderSessionHeartbeatTask {
+        home: ctx.home.to_path_buf(),
+        sc_bridge_url: sc_bridge_url.clone(),
+        sc_bridge_token: sc_bridge_token.clone(),
+        keypair_path: ctx.keypair_path.to_path_buf(),
+        password: ctx.password.to_owned(),
+        provider_pubkey: ctx.wallet.public_key.clone(),
+        selected: ctx.selected.clone(),
+        rooms: ctx.rooms.to_vec(),
+        attestation: ctx.attestation.clone(),
+        attestation_head: ctx.attestation_head.to_owned(),
+        identity_anchor: ctx.identity_anchor.to_owned(),
+        min_ask_au: ctx.args.min_ask_au,
+        max_sessions: protection_config.max_sessions,
+        load: heartbeat_load.clone(),
+        bridge_operation_timeout,
+        heartbeat_interval: provider_heartbeat_interval,
+        heartbeat_reconnect_initial: provider_heartbeat_reconnect_initial,
+        heartbeat_reconnect_max: provider_heartbeat_reconnect_max,
+        heartbeat_ttl: provider_heartbeat_ttl,
     });
+    let mut heartbeat_task = heartbeat_task_config
+        .clone()
+        .map(spawn_provider_session_heartbeat_task);
+    let mut heartbeat_restart_at = None::<Instant>;
     let deadline = (ctx.args.serve_sessions_seconds > 0)
         .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
     let mut sessions = HashMap::new();
@@ -39804,6 +40006,10 @@ async fn serve_provider_sessions(
     let mut draining = false;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut engine_watchdog_reject: Option<ProviderRuntimeFloorRejection> = None;
+    let mut engine_recovery = ProviderEngineRecovery::new(
+        provider_heartbeat_reconnect_initial,
+        provider_heartbeat_reconnect_max,
+    );
     let drain_paths = provider_drain_flag_paths(
         ctx.home,
         &ctx.wallet.public_key,
@@ -39811,6 +40017,73 @@ async fn serve_provider_sessions(
     );
     let serve_result: Result<()> = async {
         loop {
+            if heartbeat_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some(finished) = heartbeat_task.take() {
+                    match finished.await {
+                        Ok(Ok(())) => provider_session_debug(
+                            "live provider heartbeat component stopped unexpectedly; scheduling restart",
+                        ),
+                        Ok(Err(err)) => provider_session_debug(format!(
+                            "live provider heartbeat component failed; scheduling restart: {err:#}"
+                        )),
+                        Err(err) => provider_session_debug(format!(
+                            "live provider heartbeat component panicked; scheduling restart: {err}"
+                        )),
+                    }
+                    heartbeat_restart_at =
+                        Some(Instant::now() + provider_heartbeat_reconnect_initial);
+                }
+            }
+            if heartbeat_task.is_none()
+                && heartbeat_restart_at.is_some_and(|restart_at| Instant::now() >= restart_at)
+            {
+                if let Some(config) = heartbeat_task_config.clone() {
+                    provider_session_debug("restarting live provider heartbeat component");
+                    heartbeat_task = Some(spawn_provider_session_heartbeat_task(config));
+                    heartbeat_restart_at = None;
+                }
+            }
+            if !engine_recovery.pending() && !responder.component_healthy() {
+                heartbeat_load.set_accepting_new(false);
+                engine_recovery.mark_failed(
+                    "provider engine child exited while idle; no user session caused the failure",
+                );
+            }
+            if engine_recovery.retry_due(Instant::now()) {
+                heartbeat_load.set_accepting_new(false);
+                let reason = engine_recovery
+                    .reason()
+                    .unwrap_or("engine component failure")
+                    .to_owned();
+                provider_session_debug(format!(
+                    "reloading provider engine after contained component failure: {reason}"
+                ));
+                match reload_provider_session_responder(
+                    &mut responder,
+                    reason.clone(),
+                    || provider_session_responder(&ctx),
+                ) {
+                    Ok(()) => {
+                        engine_recovery.mark_recovered();
+                        engine_watchdog.reset_after_restart();
+                        engine_watchdog_reject = None;
+                        provider_log(
+                            ctx.args,
+                            "Provider engine reloaded after a contained component failure; heartbeats and session admission will resume.",
+                        );
+                    }
+                    Err(err) => {
+                        let failure = format!(
+                            "provider engine reload failed after {reason}: {err:#}"
+                        );
+                        provider_session_debug(&failure);
+                        engine_recovery.mark_reload_failed(failure, Instant::now());
+                    }
+                }
+            }
             if bridge_liveness_checked_at.elapsed() >= bridge_liveness_interval {
                 match timeout(bridge_operation_timeout, bridge.ping()).await {
                     Ok(Ok(_)) => {
@@ -39878,7 +40151,7 @@ async fn serve_provider_sessions(
                 }
                 runtime_floor_reject = next_runtime_floor_reject;
             }
-            let watchdog_action = if draining {
+            let watchdog_action = if draining || engine_recovery.pending() {
                 ProviderEngineWatchdogAction::Healthy
             } else {
                 let rss =
@@ -39892,7 +40165,7 @@ async fn serve_provider_sessions(
             };
             match watchdog_action {
                 ProviderEngineWatchdogAction::Healthy => {
-                    if engine_watchdog_reject.take().is_some() {
+                    if !engine_recovery.pending() && engine_watchdog_reject.take().is_some() {
                         provider_session_debug(
                             "engine watchdog pressure cleared; accepting new sessions again when other floors allow",
                         );
@@ -39915,16 +40188,12 @@ async fn serve_provider_sessions(
                     heartbeat_load.set_accepting_new(false);
                     let restart_reason = reject.reason.clone();
                     engine_watchdog_reject = Some(reject);
-                    let old_responder = std::mem::replace(
+                    match reload_provider_session_responder(
                         &mut responder,
-                        Box::new(UnavailableProviderSessionResponder {
-                            reason: restart_reason,
-                        }),
-                    );
-                    drop(old_responder);
-                    match provider_session_responder(&ctx) {
-                        Ok(next_responder) => {
-                            responder = next_responder;
+                        restart_reason,
+                        || provider_session_responder(&ctx),
+                    ) {
+                        Ok(()) => {
                             engine_watchdog.reset_after_restart();
                             engine_watchdog_reject = None;
                             provider_log(
@@ -39933,16 +40202,20 @@ async fn serve_provider_sessions(
                             );
                         }
                         Err(err) => {
-                            provider_session_debug(format!(
+                            let failure = format!(
                                 "engine watchdog reload failed; continuing to refuse new sessions: {err:#}"
-                            ));
+                            );
+                            provider_session_debug(&failure);
+                            engine_recovery.mark_reload_failed(failure, Instant::now());
                         }
                     }
                 }
             }
             if !draining {
                 heartbeat_load.set_accepting_new(
-                    runtime_floor_reject.is_none() && engine_watchdog_reject.is_none(),
+                    runtime_floor_reject.is_none()
+                        && engine_watchdog_reject.is_none()
+                        && !engine_recovery.pending(),
                 );
             }
             if !draining {
@@ -39979,9 +40252,10 @@ async fn serve_provider_sessions(
             let wait = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .filter(|remaining| !remaining.is_zero())
-                .unwrap_or_else(|| Duration::from_secs(1));
+                .map(|remaining| remaining.min(component_poll_interval))
+                .unwrap_or(component_poll_interval);
             let wait = if draining {
-                Duration::from_secs(1)
+                component_poll_interval
             } else {
                 wait
             };
@@ -40013,6 +40287,10 @@ async fn serve_provider_sessions(
                         })
                         .unwrap_or("")
                         .to_owned();
+                    let session_reject = runtime_floor_reject
+                        .clone()
+                        .or_else(|| engine_watchdog_reject.clone())
+                        .or_else(|| engine_recovery.rejection());
                     if let Err(err) = handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
@@ -40023,9 +40301,8 @@ async fn serve_provider_sessions(
                         &terms,
                         &runtime,
                         responder.as_mut(),
-                        runtime_floor_reject
-                            .clone()
-                            .or_else(|| engine_watchdog_reject.clone()),
+                        &mut engine_recovery,
+                        session_reject,
                         request_stall_timeout,
                         event,
                     )
@@ -40078,7 +40355,27 @@ async fn serve_provider_sessions(
                         .await?;
                     bridge_liveness_checked_at = Instant::now();
                 }
-                Err(err) => return Err(err).context("reading provider session frame"),
+                Err(err) => {
+                    let dropped = clear_provider_sessions_after_bridge_drop(
+                        &mut sessions,
+                        &mut pending_requests,
+                        &mut pending_payloads,
+                        &heartbeat_load,
+                    );
+                    provider_session_debug(format!(
+                        "SC-Bridge provider session reader failed ({err}); dropped {dropped} active session(s), reconnecting without stopping the provider"
+                    ));
+                    bridge = reconnect_provider_session_bridge(
+                        &sc_bridge_url,
+                        &sc_bridge_token,
+                        &admin_transport_peer,
+                        deadline,
+                        provider_heartbeat_reconnect_initial,
+                        provider_heartbeat_reconnect_max,
+                    )
+                    .await?;
+                    bridge_liveness_checked_at = Instant::now();
+                }
             }
         }
         Ok(())
@@ -40374,6 +40671,7 @@ async fn handle_provider_session_frame(
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     responder: &mut dyn ProviderSessionResponder,
+    engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
     request_stall_timeout: Duration,
     event: Value,
@@ -40689,7 +40987,9 @@ async fn handle_provider_session_frame(
                     heartbeat_load.clone(),
                 )
             });
-            let response = responder.respond_streaming(terms, &body, live_stream.as_mut());
+            let response = contain_provider_request(|| {
+                responder.respond_streaming(terms, &body, live_stream.as_mut())
+            });
             let output = match response {
                 Ok(output) => {
                     if live_stream
@@ -40748,6 +41048,13 @@ async fn handle_provider_session_frame(
                 }
                 Err(err) => {
                     request_load.finish();
+                    if let Some(reason) = provider_engine_component_failure(responder, &err) {
+                        heartbeat_load.set_accepting_new(false);
+                        provider_session_debug(format!(
+                            "provider engine component failed during session {session_id}; scheduling isolated reload: {reason}"
+                        ));
+                        engine_recovery.mark_failed(reason);
+                    }
                     let err_text = format!("{err:#}");
                     if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
                         provider_session_debug(format!(
@@ -53792,6 +54099,78 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(pending_payloads
             .keys()
             .any(|key| key.starts_with("healthy:")));
+    }
+
+    #[test]
+    fn provider_engine_panic_is_scoped_to_one_request() {
+        let failed = contain_provider_request::<()>(|| panic!("injected engine failure"));
+        assert!(failed
+            .unwrap_err()
+            .to_string()
+            .contains("injected engine failure"));
+
+        let next = contain_provider_request(|| Ok::<_, anyhow::Error>("healthy response"));
+        assert_eq!(next.unwrap(), "healthy response");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_engine_child_is_replaced_without_exiting_provider_loop() {
+        struct ChildBackedResponder {
+            child: std::process::Child,
+        }
+
+        impl ProviderSessionResponder for ChildBackedResponder {
+            fn mode(&self) -> &'static str {
+                "child-backed-test"
+            }
+
+            fn component_healthy(&mut self) -> bool {
+                matches!(self.child.try_wait(), Ok(None))
+            }
+
+            fn respond(
+                &mut self,
+                _terms: &ProviderSessionTerms,
+                _body: &Value,
+            ) -> Result<ProviderSessionOutput> {
+                bail!("injected engine child failure")
+            }
+        }
+
+        impl Drop for ChildBackedResponder {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn test engine child");
+        child.kill().expect("kill test engine child");
+        child.wait().expect("reap test engine child");
+        let mut responder: Box<dyn ProviderSessionResponder> =
+            Box::new(ChildBackedResponder { child });
+
+        let reason = provider_engine_component_failure(
+            responder.as_mut(),
+            &anyhow!("engine child exited before replying"),
+        )
+        .expect("dead engine child requires component reload");
+        let mut recovery =
+            ProviderEngineRecovery::new(Duration::from_millis(10), Duration::from_millis(100));
+        recovery.mark_failed(reason.clone());
+        assert!(recovery.retry_due(Instant::now()));
+
+        reload_provider_session_responder(&mut responder, reason, || {
+            Ok(Box::new(DeterministicProviderSessionResponder))
+        })
+        .expect("component reload succeeds");
+        recovery.mark_recovered();
+        assert_eq!(responder.mode(), "deterministic-dev-shim");
+        assert!(!recovery.pending());
     }
 
     #[test]

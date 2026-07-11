@@ -638,6 +638,9 @@ impl ArtifactSink for NoopArtifactSink {
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
+    fn component_healthy(&mut self) -> bool {
+        true
+    }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
@@ -3096,6 +3099,15 @@ mod mlx_backend {
             Ok(loaded)
         }
 
+        fn component_healthy(&mut self) -> bool {
+            self.loaded.is_none()
+                || self
+                    .worker
+                    .get_mut()
+                    .as_mut()
+                    .is_some_and(|worker| matches!(worker.child.try_wait(), Ok(None)))
+        }
+
         fn process_ids(&self) -> Vec<u32> {
             self.worker
                 .borrow()
@@ -3491,6 +3503,15 @@ mod vllm_backend {
             };
             self.loaded = Some(loaded.clone());
             Ok(loaded)
+        }
+
+        fn component_healthy(&mut self) -> bool {
+            self.loaded.is_none()
+                || self
+                    .worker
+                    .get_mut()
+                    .as_mut()
+                    .is_some_and(|worker| matches!(worker.child.try_wait(), Ok(None)))
         }
 
         fn process_ids(&self) -> Vec<u32> {
@@ -4490,6 +4511,15 @@ mod trt_llm_backend {
             };
             self.loaded = Some(loaded.clone());
             Ok(loaded)
+        }
+
+        fn component_healthy(&mut self) -> bool {
+            self.loaded.is_none()
+                || self
+                    .worker
+                    .get_mut()
+                    .as_mut()
+                    .is_some_and(|worker| matches!(worker.child.try_wait(), Ok(None)))
         }
 
         fn process_ids(&self) -> Vec<u32> {

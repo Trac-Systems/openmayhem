@@ -111,6 +111,45 @@ test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
   assert.deepEqual(frames[0].frame, frame);
 });
 
+test('DirectSession drops a malformed frame and still accepts the next valid frame', () => {
+  const frames = [];
+  const directSession = new DirectSession({}, { onFrame: (event) => frames.push(event) });
+  const session = {
+    sessionId,
+    remote,
+    receiveLimiter: directSession._newLimiter(),
+  };
+
+  assert.doesNotThrow(() => directSession._handleFrame(session, { missing: 'type' }));
+  assert.doesNotThrow(() => directSession._handleFrame(session, { t: 's.delta', d: 'healthy' }));
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].frame.d, 'healthy');
+});
+
+test('DirectSession contains a throwing client frame handler and accepts the next frame', () => {
+  let calls = 0;
+  const directSession = new DirectSession({}, {
+    onFrame: () => {
+      calls += 1;
+      if (calls === 1) throw new Error('injected frame failure');
+    },
+  });
+  const session = {
+    sessionId,
+    remote,
+    receiveLimiter: directSession._newLimiter(),
+  };
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.doesNotThrow(() => directSession._handleFrame(session, { t: 's.delta', d: 'one' }));
+    assert.doesNotThrow(() => directSession._handleFrame(session, { t: 's.delta', d: 'two' }));
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(calls, 2);
+});
+
 test('DirectSession reuses an inbound session even when the swarm connection list races', async () => {
   const directSession = new DirectSession({ swarm: { connections: [] } }, {});
   const existing = {

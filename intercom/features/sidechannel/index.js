@@ -376,9 +376,20 @@ class Sidechannel extends Feature {
       if (!this._remoteAuthorized(channel, connection)) continue;
       const record = perConn.get(channel);
       if (record?.message) {
-        record.message.send(relayed);
+        try {
+          record.message.send(relayed);
+        } catch (error) {
+          this._reportEventError(`relay ${channel}`, error, connection);
+        }
       }
     }
+  }
+
+  _reportEventError(scope, error, connection = null) {
+    console.error(
+      `[sidechannel] ${scope} failed for ${this._getRemoteKey(connection)} without stopping the peer:`,
+      error?.message ?? error
+    );
   }
 
   _powRequired(channel) {
@@ -787,6 +798,15 @@ class Sidechannel extends Feature {
   }
 
   _openChannelForConnection(connection, entry) {
+    try {
+      return this._openChannelForConnectionUnchecked(connection, entry);
+    } catch (error) {
+      this._reportEventError(`open ${entry?.name ?? 'unknown channel'}`, error, connection);
+      return false;
+    }
+  }
+
+  _openChannelForConnectionUnchecked(connection, entry) {
     const mux = connection.userData;
     if (!mux || typeof mux.createChannel !== 'function') {
       const tries = (connection.__sidechannelMuxTries || 0) + 1;
@@ -843,150 +863,162 @@ class Sidechannel extends Feature {
     const message = channel.addMessage({
       encoding: c.json,
       onmessage: (payload) => {
-        if (this._isBlocked(connection)) return;
-        let payloadJson = null;
         try {
-          payloadJson = JSON.stringify(payload);
-        } catch (_e) {
-          return;
-        }
-        const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
-        const maxMessageBytes = this._maxMessageBytes(entry.name);
-        if (payloadBytes > maxMessageBytes) {
-          this._checkRate(connection, payloadBytes);
-          if (this.debug) {
-            console.log(
-              `[sidechannel:${entry.name}] drop (message too large: ${payloadBytes} > ${maxMessageBytes})`
-            );
+          if (this._isBlocked(connection)) return;
+          let payloadJson = null;
+          try {
+            payloadJson = JSON.stringify(payload);
+          } catch (_e) {
+            return;
           }
-          return;
-        }
-        if (this.debug) {
-          console.log(
-            `[sidechannel:${entry.name}] recv ${payloadBytes} bytes from ${this._getRemoteKey(connection)}`
-          );
-        }
-        if (!this._checkInvite(payload, entry.name, connection)) {
-          if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (invite) from ${this._getRemoteKey(connection)}`);
-          }
-          return;
-        }
-        if (!this._checkPow(payload, entry.name)) {
-          if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (invalid pow) from ${this._getRemoteKey(connection)}`);
-          }
-          return;
-        }
-        if (!this._checkRate(connection, payloadBytes)) {
-          if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (rate limit) from ${this._getRemoteKey(connection)}`);
-          }
-          return;
-        }
-
-        // Allow a minimal auth handshake even on owner-only channels so invite-only + owner-only
-        // channels can authorize listeners without giving them write access.
-        const controlEarly = payload?.message?.control;
-        const isAuthControl = controlEarly === 'auth';
-        const isWelcomeControl = controlEarly === 'welcome';
-        if (this._ownerWriteOnly(entry.name) && !isAuthControl && !isWelcomeControl) {
-          const ownerKey = this._getOwnerKey(entry.name);
-          const author = normalizeKeyHex(payload?.from);
-          // NOTE: payload.from is user-supplied; verify message signature to prevent spoofing.
-          const sigOk = ownerKey ? this._verifySig(payload, ownerKey) : false;
-          if (!ownerKey || !author || author !== ownerKey || !sigOk) {
+          const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
+          const maxMessageBytes = this._maxMessageBytes(entry.name);
+          if (payloadBytes > maxMessageBytes) {
+            this._checkRate(connection, payloadBytes);
             if (this.debug) {
-              const sigHex = payload?.sig || payload?.signature || '';
-              const hash = sha256Hex(this._sigBase(payload));
               console.log(
-                `[sidechannel:${entry.name}] drop (owner-only) author=${author} owner=${ownerKey} sigOk=${sigOk} sigLen=${sigHex.length} hash=${hash} fromRemote=${this._getRemoteKey(connection)}`
+                `[sidechannel:${entry.name}] drop (message too large: ${payloadBytes} > ${maxMessageBytes})`
               );
             }
             return;
           }
-        }
-        const payloadId =
-          payload?.id ?? `${payload?.from ?? 'unknown'}:${payload?.ts ?? 0}:${payload?.channel ?? entry.name}`;
-        const now = this._now();
-        if (this._rememberSeen(payloadId, now)) {
           if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (duplicate) ${payloadId}`);
+            console.log(
+              `[sidechannel:${entry.name}] recv ${payloadBytes} bytes from ${this._getRemoteKey(connection)}`
+            );
           }
-          return;
-        }
-        const control = payload?.message?.control;
-        const requestedChannel = payload?.message?.channel;
-        const isWelcome = this._isWelcomeMessage(payload);
-        const embeddedWelcome = this._extractWelcome(payload);
-        let welcomeOk = false;
-        if (embeddedWelcome) {
-          welcomeOk = this._verifyWelcome(embeddedWelcome, entry.name, connection);
-          if (!welcomeOk && isWelcome) {
+          if (!this._checkInvite(payload, entry.name, connection)) {
             if (this.debug) {
-              console.log(`[sidechannel:${entry.name}] drop (invalid welcome) from ${this._getRemoteKey(connection)}`);
+              console.log(`[sidechannel:${entry.name}] drop (invite) from ${this._getRemoteKey(connection)}`);
             }
             return;
           }
-        } else if (isWelcome) {
-          if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (missing welcome) from ${this._getRemoteKey(connection)}`);
+          if (!this._checkPow(payload, entry.name)) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (invalid pow) from ${this._getRemoteKey(connection)}`);
+            }
+            return;
           }
-          return;
-        }
-        if (this._welcomeRequired(entry.name) && !this._isWelcomed(entry.name) && !welcomeOk) {
-          if (this.debug) {
-            console.log(`[sidechannel:${entry.name}] drop (awaiting welcome) from ${this._getRemoteKey(connection)}`);
+          if (!this._checkRate(connection, payloadBytes)) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (rate limit) from ${this._getRemoteKey(connection)}`);
+            }
+            return;
           }
-          return;
-        }
-        if (control === 'open_channel' && this.allowRemoteOpen && typeof requestedChannel === 'string') {
-          const target = requestedChannel.trim();
-          if (target.length > 0) {
-            const welcome = payload?.message?.welcome || payload?.message?.invite?.welcome;
-            if (welcome) {
-              if (!this._verifyWelcome(welcome, target, connection)) {
-                if (this.debug) {
-                  console.log(`[sidechannel] open denied (welcome) for ${target} from ${this._getRemoteKey(connection)}`);
-                }
-                return;
-              }
-            } else if (this._welcomeRequired(target)) {
+
+
+          // Allow a minimal auth handshake even on owner-only channels so invite-only + owner-only
+          // channels can authorize listeners without giving them write access.
+          const controlEarly = payload?.message?.control;
+          const isAuthControl = controlEarly === 'auth';
+          const isWelcomeControl = controlEarly === 'welcome';
+          if (this._ownerWriteOnly(entry.name) && !isAuthControl && !isWelcomeControl) {
+            const ownerKey = this._getOwnerKey(entry.name);
+            const author = normalizeKeyHex(payload?.from);
+            // NOTE: payload.from is user-supplied; verify message signature to prevent spoofing.
+            const sigOk = ownerKey ? this._verifySig(payload, ownerKey) : false;
+            if (!ownerKey || !author || author !== ownerKey || !sigOk) {
               if (this.debug) {
+                const sigHex = payload?.sig || payload?.signature || '';
+                const hash = sha256Hex(this._sigBase(payload));
                 console.log(
-                  `[sidechannel] open denied (missing welcome) for ${target} from ${this._getRemoteKey(connection)}`
+                  `[sidechannel:${entry.name}] drop (owner-only) author=${author} owner=${ownerKey} sigOk=${sigOk} sigLen=${sigHex.length} hash=${hash} fromRemote=${this._getRemoteKey(connection)}`
                 );
               }
               return;
             }
-            if (this._inviteRequired(target)) {
-              const invite = payload?.message?.invite;
-              if (!invite || !this._verifyInvite(invite, target, connection)) {
+          }
+          const payloadId =
+            payload?.id ?? `${payload?.from ?? 'unknown'}:${payload?.ts ?? 0}:${payload?.channel ?? entry.name}`;
+          const now = this._now();
+          if (this._rememberSeen(payloadId, now)) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (duplicate) ${payloadId}`);
+            }
+            return;
+          }
+          const control = payload?.message?.control;
+          const requestedChannel = payload?.message?.channel;
+          const isWelcome = this._isWelcomeMessage(payload);
+          const embeddedWelcome = this._extractWelcome(payload);
+          let welcomeOk = false;
+          if (embeddedWelcome) {
+            welcomeOk = this._verifyWelcome(embeddedWelcome, entry.name, connection);
+            if (!welcomeOk && isWelcome) {
+              if (this.debug) {
+                console.log(`[sidechannel:${entry.name}] drop (invalid welcome) from ${this._getRemoteKey(connection)}`);
+              }
+              return;
+            }
+          } else if (isWelcome) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (missing welcome) from ${this._getRemoteKey(connection)}`);
+            }
+            return;
+          }
+          if (this._welcomeRequired(entry.name) && !this._isWelcomed(entry.name) && !welcomeOk) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (awaiting welcome) from ${this._getRemoteKey(connection)}`);
+            }
+            return;
+          }
+          if (control === 'open_channel' && this.allowRemoteOpen && typeof requestedChannel === 'string') {
+            const target = requestedChannel.trim();
+            if (target.length > 0) {
+              const welcome = payload?.message?.welcome || payload?.message?.invite?.welcome;
+              if (welcome) {
+                if (!this._verifyWelcome(welcome, target, connection)) {
+                  if (this.debug) {
+                    console.log(`[sidechannel] open denied (welcome) for ${target} from ${this._getRemoteKey(connection)}`);
+                  }
+                  return;
+                }
+              } else if (this._welcomeRequired(target)) {
                 if (this.debug) {
-                  console.log(`[sidechannel] open denied (invite) for ${target} from ${this._getRemoteKey(connection)}`);
+                  console.log(
+                    `[sidechannel] open denied (missing welcome) for ${target} from ${this._getRemoteKey(connection)}`
+                  );
                 }
                 return;
               }
+              if (this._inviteRequired(target)) {
+                const invite = payload?.message?.invite;
+                if (!invite || !this._verifyInvite(invite, target, connection)) {
+                  if (this.debug) {
+                    console.log(`[sidechannel] open denied (invite) for ${target} from ${this._getRemoteKey(connection)}`);
+                  }
+                  return;
+                }
+              }
+              if (this.autoJoinOnOpen) {
+                this.addChannel(target).catch((error) => {
+                  this._reportEventError(`auto-join ${target}`, error, connection);
+                });
+                console.log(`[sidechannel] auto-joined channel: ${target}`);
+              } else {
+                console.log(`[sidechannel] channel request received: ${target}`);
+              }
             }
-            if (this.autoJoinOnOpen) {
-              this.addChannel(target).catch(() => {});
-              console.log(`[sidechannel] auto-joined channel: ${target}`);
-            } else {
-              console.log(`[sidechannel] channel request received: ${target}`);
-            }
-          }
-        } else {
-          // Avoid spamming logs for handshake control messages.
-          if (control === 'auth') return;
-          if (this.onMessage) {
-            this.onMessage(entry.name, payload, connection);
           } else {
-            const from = payload?.from ?? 'unknown';
-            const msg = payload?.message ?? payload;
-            console.log(`[sidechannel:${entry.name}] ${from}:`, msg);
+            // Avoid spamming logs for handshake control messages.
+            if (control === 'auth') return;
+            if (this.onMessage) {
+              const handled = this.onMessage(entry.name, payload, connection);
+              if (handled && typeof handled.catch === 'function') {
+                handled.catch((error) => {
+                  this._reportEventError(`message handler ${entry.name}`, error, connection);
+                });
+              }
+            } else {
+              const from = payload?.from ?? 'unknown';
+              const msg = payload?.message ?? payload;
+              console.log(`[sidechannel:${entry.name}] ${from}:`, msg);
+            }
           }
+          this._relay(entry.name, payload, connection);
+        } catch (error) {
+          this._reportEventError(`incoming message ${entry.name}`, error, connection);
         }
-        this._relay(entry.name, payload, connection);
       }
     });
 
@@ -1037,7 +1069,9 @@ class Sidechannel extends Feature {
         } catch (_e) {}
         perConn.delete(entry.name);
       })
-      .catch(() => {});
+      .catch((error) => {
+        this._reportEventError(`open ${entry.name}`, error, connection);
+      });
   }
 
   async addChannel(name) {
@@ -1048,7 +1082,9 @@ class Sidechannel extends Feature {
       {
         const flushP = Promise.resolve()
           .then(() => this.peer.swarm.flush())
-          .catch(() => {});
+          .catch((error) => {
+            this._reportEventError(`flush after joining ${entry.name}`, error);
+          });
         await Promise.race([
           flushP,
           new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
@@ -1147,7 +1183,9 @@ class Sidechannel extends Feature {
         if (typeof this.peer.swarm.flush === 'function') {
           const flushP = Promise.resolve()
             .then(() => this.peer.swarm.flush())
-            .catch(() => {});
+            .catch((error) => {
+              this._reportEventError(`flush after leaving ${entry.name}`, error);
+            });
           await Promise.race([
             flushP,
             new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
@@ -1233,9 +1271,15 @@ class Sidechannel extends Feature {
             .then((opened) => {
               if (opened) record.message.send(payload);
             })
-            .catch(() => {});
+            .catch((error) => {
+              this._reportEventError(`deferred send ${channel}`, error, connection);
+            });
         } else {
-          record.message.send(payload);
+          try {
+            record.message.send(payload);
+          } catch (error) {
+            this._reportEventError(`send ${channel}`, error, connection);
+          }
         }
       } else if (this.debug) {
         console.log(`[sidechannel:${channel}] no message session for connection.`);
@@ -1259,8 +1303,7 @@ class Sidechannel extends Feature {
     if (dht && typeof dht.fullyBootstrapped === 'function') {
       if (this.debug) console.log('[sidechannel] waiting for DHT bootstrap...');
       bootPromise = Promise.resolve()
-        .then(() => dht.fullyBootstrapped())
-        .catch(() => {});
+        .then(() => dht.fullyBootstrapped());
       await bootPromise;
     }
     this._dhtBootPromise = bootPromise;
@@ -1283,7 +1326,9 @@ class Sidechannel extends Feature {
     {
       const flushP = Promise.resolve()
         .then(() => this.peer.swarm.flush())
-        .catch(() => {});
+        .catch((error) => {
+          this._reportEventError('startup swarm flush', error);
+        });
       await Promise.race([
         flushP,
         new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),

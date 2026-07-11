@@ -720,11 +720,8 @@ pub fn eligible_candidates(
 
     let mut candidates = base
         .drain(..)
-        .map(|(entry, estimated_price_au, effective_ttft_ms)| {
-            let heartbeat = entry
-                .heartbeat
-                .as_ref()
-                .expect("eligible candidates have live heartbeats");
+        .filter_map(|(entry, estimated_price_au, effective_ttft_ms)| {
+            let heartbeat = entry.heartbeat.as_ref()?;
             let reputation = entry.contract.reputation.clamp(0.0, 1.0);
             let available = (1.0 - heartbeat.sat).clamp(0.0, 1.0);
             let price_norm = ((estimated_price_au.max(1) as f64) / median_price).max(f64::EPSILON);
@@ -747,7 +744,7 @@ pub fn eligible_candidates(
                 * engine_backlog_factor
                 * capacity_mismatch_factor
                 * probation_weight_multiplier(&entry);
-            SelectionCandidate {
+            Some(SelectionCandidate {
                 entry,
                 estimated_price_au,
                 effective_ttft_ms,
@@ -762,7 +759,7 @@ pub fn eligible_candidates(
                 capacity_group,
                 capacity_group_factor: 1.0,
                 weight,
-            }
+            })
         })
         .collect::<Vec<_>>();
     apply_capacity_group_factors(&mut candidates);

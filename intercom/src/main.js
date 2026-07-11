@@ -6,6 +6,7 @@ import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
 import { createServer as createRpcServer } from './rpc.js';
+import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
@@ -20,6 +21,10 @@ import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
 } from '../features/mayhem/index.js';
+
+const fatalRuntimeError = installFatalRuntimeErrorPolicy(
+  typeof Bare !== 'undefined' ? Bare : null
+);
 
 const { argv, env, storeLabel, flags } = getPearRuntime();
 
@@ -61,20 +66,19 @@ const postInternalStripeCheckout = (
       chunks.push(chunk);
     });
     response.on('end', () => {
-      const text = b4a.toString(b4a.concat(chunks), 'utf8');
-      let parsed;
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        reject(new Error('Stripe worker returned invalid JSON.'));
-        return;
+        const text = b4a.toString(b4a.concat(chunks), 'utf8');
+        const parsed = JSON.parse(text);
+        if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
+          reject(new Error(parsed?.error || `Stripe worker returned HTTP ${response.statusCode}.`));
+          return;
+        }
+        resolve(parsed);
+      } catch (error) {
+        reject(new Error(`Stripe worker returned an invalid response: ${error?.message ?? error}`));
       }
-      if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
-        reject(new Error(parsed?.error || `Stripe worker returned HTTP ${response.statusCode}.`));
-        return;
-      }
-      resolve(parsed);
     });
+    response.on('error', reject);
   });
   request.setTimeout(timeoutMs, () => {
     request.destroy(new Error(`Stripe worker request timed out after ${timeoutMs}ms.`));
@@ -852,11 +856,7 @@ peer.sidechannel = sidechannel;
 if (scBridge) {
   scBridge.attachSidechannel(sidechannel);
   scBridge.attachDirectSession(directSession);
-  try {
-    scBridge.start();
-  } catch (err) {
-    console.error('SC-Bridge failed to start:', err?.message ?? err);
-  }
+  scBridge.start();
   peer.scBridge = scBridge;
 }
 
@@ -869,23 +869,13 @@ if (rpcEnabled) {
   rpcServer.listen(rpcPort, rpcHost, () => {
     console.log('RPC: ready', `http://${rpcHost}:${rpcPort}/v1`);
   });
+  rpcServer.on('error', (error) => fatalRuntimeError('RPC server error', error));
   peer.rpcServer = rpcServer;
 }
 
-try {
-  directSession.start();
-} catch (err) {
-  console.error('Direct session failed to start:', err?.message ?? err);
-}
-
-sidechannel
-  .start()
-  .then(() => {
-    console.log('Sidechannel: ready');
-  })
-  .catch((err) => {
-    console.error('Sidechannel failed to start:', err?.message ?? err);
-  });
+directSession.start();
+await sidechannel.start();
+console.log('Sidechannel: ready');
 
 if (headless) {
   console.log('Terminal: disabled (headless)');

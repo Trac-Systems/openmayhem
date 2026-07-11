@@ -651,6 +651,49 @@ test('Stripe service relay binds the request identity and deduplicates retries',
   assert.equal(writer.appended.length, 0);
 });
 
+test('poisoned relay service request is rejected locally and a retry still runs', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const writerFeature = new MayhemFeature(writer.peer, {
+    async serviceHandler() {
+      serviceCalls += 1;
+      if (serviceCalls === 1) throw new Error('injected relay poison');
+      return { ok: true, checkout_session: { url: 'https://checkout.stripe.com/c/pay/retry' } };
+    },
+  });
+  writerFeature.key = 'mayhem';
+  const responses = [];
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: () => true,
+    broadcast: (_channel, message) => {
+      responses.push(message.response);
+      return true;
+    },
+  };
+  const value = stripeCheckoutValue();
+  const requestId = serviceRequestIdFor('stripe_checkout', value);
+  const payload = {
+    from: providerKey,
+    sig: `signed:${providerKey}`,
+    message: {
+      control: 'mayhem_service_request',
+      version: 1,
+      request_id: requestId,
+      service: 'stripe_checkout',
+      value,
+    },
+  };
+
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+
+  assert.equal(serviceCalls, 2);
+  assert.equal(responses[0].ok, false);
+  assert.match(responses[0].message, /injected relay poison/);
+  assert.equal(responses[1].ok, true);
+});
+
 test('admin-writer RPC keeps the local append path', async () => {
   const writer = peerFor(adminKey, { writable: true });
   let appendCalls = 0;

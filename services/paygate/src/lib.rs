@@ -494,9 +494,7 @@ pub struct PeerRpcContractPoster {
 impl Default for PaygateConfig {
     fn default() -> Self {
         Self {
-            bind: DEFAULT_BIND
-                .parse()
-                .expect("default paygate bind address is valid"),
+            bind: SocketAddr::from(([127, 0, 0, 1], 11_436)),
             contract_rpc_url: DEFAULT_CONTRACT_RPC_URL.to_owned(),
             contract_dry_run: false,
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
@@ -1533,7 +1531,10 @@ async fn handle_stripe_event(
     let result = match event.event_type.as_str() {
         "payment_intent.succeeded" => handle_stripe_payment_intent_succeeded(state, &event).await,
         "charge.dispute.created" => handle_stripe_dispute_created(state, &event).await,
-        _ => unreachable!("handled Stripe event types checked above"),
+        _ => {
+            state.stripe_events.lock().await.fail(&event.id);
+            return Ok(ignored_stripe_event_response(event));
+        }
     };
     match result {
         Ok((record, contract)) => {

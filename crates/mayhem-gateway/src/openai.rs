@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -82,6 +82,24 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 type SharedState = Arc<GatewayState>;
+
+trait RecoverMutex<T> {
+    fn lock_recover(&self, label: &str) -> MutexGuard<'_, T>;
+}
+
+impl<T> RecoverMutex<T> for Mutex<T> {
+    fn lock_recover(&self, label: &str) -> MutexGuard<'_, T> {
+        match self.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!(
+                    "Mayhem gateway recovered poisoned {label}; request containment preserved"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+}
 
 const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
 const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/canary-dev-v1.json");
@@ -681,18 +699,13 @@ impl GatewayAccessControl {
 
     pub fn has_active_tokens(&self, now: u64) -> bool {
         self.store
-            .lock()
-            .expect("gateway token store poisoned")
+            .lock_recover("gateway token store")
             .active_token_count(now)
             > 0
     }
 
     pub fn token_count(&self) -> usize {
-        self.store
-            .lock()
-            .expect("gateway token store poisoned")
-            .tokens
-            .len()
+        self.store.lock_recover("gateway token store").tokens.len()
     }
 
     fn authorize(
@@ -711,7 +724,7 @@ impl GatewayAccessControl {
         };
         let token_hash = gateway_token_hash(&raw_token);
         let now = now_secs();
-        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let mut store = self.store.lock_recover("gateway token store");
         self.reload_store(&mut store)?;
         let token = store
             .tokens
@@ -767,7 +780,7 @@ impl GatewayAccessControl {
             return Ok(());
         };
         let now = now_secs();
-        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let mut store = self.store.lock_recover("gateway token store");
         let token = store
             .tokens
             .iter_mut()
@@ -794,7 +807,7 @@ impl GatewayAccessControl {
             return Ok(());
         }
         let now = now_secs();
-        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let mut store = self.store.lock_recover("gateway token store");
         let Some(token) = store
             .tokens
             .iter_mut()
@@ -810,7 +823,7 @@ impl GatewayAccessControl {
 
     fn summary(&self) -> Value {
         let now = now_secs();
-        let store = self.store.lock().expect("gateway token store poisoned");
+        let store = self.store.lock_recover("gateway token store");
         let tokens = store
             .tokens
             .iter()
@@ -845,10 +858,7 @@ impl GatewayAccessControl {
         let Some(limit) = token.max_rate_per_minute else {
             return Ok(());
         };
-        let mut windows = self
-            .rate_windows
-            .lock()
-            .expect("gateway token rate windows poisoned");
+        let mut windows = self.rate_windows.lock_recover("gateway token rate windows");
         let window =
             windows
                 .entry(token.token_id.clone())
@@ -1693,43 +1703,31 @@ impl GatewayState {
 
     pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
         self.receipt_config.balance_au = balance_au;
-        *self
-            .ledger_balance_au
-            .lock()
-            .expect("gateway balance store poisoned") = balance_au;
+        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
         self
     }
 
     pub fn with_payment_directory(self, payment_directory: Value) -> Self {
         *self
             .payment_directory
-            .lock()
-            .expect("gateway payment directory poisoned") = Some(payment_directory);
+            .lock_recover("gateway payment directory") = Some(payment_directory);
         self
     }
 
     pub fn update_ledger_payment_state(&self, balance_au: MoneyAu, payment_directory: Value) {
-        *self
-            .ledger_balance_au
-            .lock()
-            .expect("gateway balance store poisoned") = balance_au;
+        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
         *self
             .payment_directory
-            .lock()
-            .expect("gateway payment directory poisoned") = Some(payment_directory);
+            .lock_recover("gateway payment directory") = Some(payment_directory);
     }
 
     fn ledger_balance_au(&self) -> MoneyAu {
-        *self
-            .ledger_balance_au
-            .lock()
-            .expect("gateway balance store poisoned")
+        *self.ledger_balance_au.lock_recover("gateway balance store")
     }
 
     fn payment_directory(&self) -> Option<Value> {
         self.payment_directory
-            .lock()
-            .expect("gateway payment directory poisoned")
+            .lock_recover("gateway payment directory")
             .clone()
     }
 
@@ -1778,7 +1776,7 @@ impl GatewayState {
     pub fn with_provider_heartbeats(self, heartbeats: Vec<ProviderHeartbeat>) -> Self {
         let now = now_millis_u64();
         {
-            let mut table = self.provider_table.lock().expect("provider table poisoned");
+            let mut table = self.provider_table.lock_recover("provider table");
             for heartbeat in heartbeats {
                 table.upsert_heartbeat(heartbeat, now);
             }
@@ -1789,16 +1787,14 @@ impl GatewayState {
     pub fn with_provider_heartbeat_ttl_millis(mut self, ttl_millis: u64) -> Self {
         self.provider_heartbeat_ttl_millis = ttl_millis;
         self.provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .set_heartbeat_ttl_millis(ttl_millis);
         self
     }
 
     pub fn ingest_provider_heartbeat(&self, heartbeat: ProviderHeartbeat, received_at_millis: u64) {
         self.provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .upsert_heartbeat(heartbeat, received_at_millis);
     }
 
@@ -1936,38 +1932,32 @@ impl GatewayState {
     }
 
     pub fn receipts(&self) -> Vec<StoredReceipt> {
-        self.receipts
-            .lock()
-            .expect("receipt store poisoned")
-            .clone()
+        self.receipts.lock_recover("receipt store").clone()
     }
 
     pub fn probes(&self) -> Vec<StoredProbeEvent> {
-        self.probes.lock().expect("probe store poisoned").clone()
+        self.probes.lock_recover("probe store").clone()
     }
 
     pub fn reputation_events(&self) -> Vec<StoredReputationEvent> {
         self.reputation_events
-            .lock()
-            .expect("reputation event store poisoned")
+            .lock_recover("reputation event store")
             .clone()
     }
 
     pub fn paused_sessions(&self) -> Vec<PausedSession> {
         self.paused_sessions
-            .lock()
-            .expect("paused session store poisoned")
+            .lock_recover("paused session store")
             .clone()
     }
 
     fn receipt_count(&self) -> usize {
-        self.receipts.lock().expect("receipt store poisoned").len()
+        self.receipts.lock_recover("receipt store").len()
     }
 
     fn paused_session_count(&self) -> usize {
         self.paused_sessions
-            .lock()
-            .expect("paused session store poisoned")
+            .lock_recover("paused session store")
             .len()
     }
 
@@ -1975,7 +1965,7 @@ impl GatewayState {
         let spend_delta = receipt.access_token.as_ref().and_then(|access_token| {
             let session_id = receipt.receipt.body.session_id.as_str();
             let cumulative = receipt.receipt.body.au_owed_cum;
-            let receipts = self.receipts.lock().expect("receipt store poisoned");
+            let receipts = self.receipts.lock_recover("receipt store");
             let previous = receipts
                 .iter()
                 .filter(|existing| {
@@ -1990,10 +1980,7 @@ impl GatewayState {
                 .filter(|delta| *delta > 0)
                 .map(|delta| (access_token.clone(), delta))
         });
-        self.receipts
-            .lock()
-            .expect("receipt store poisoned")
-            .push(receipt);
+        self.receipts.lock_recover("receipt store").push(receipt);
         if let Some((access_token, delta)) = spend_delta {
             self.access_control.record_spend(&access_token, delta)?;
         }
@@ -2001,17 +1988,13 @@ impl GatewayState {
     }
 
     fn record_probe(&self, probe: StoredProbeEvent) {
-        self.probes
-            .lock()
-            .expect("probe store poisoned")
-            .push(probe);
+        self.probes.lock_recover("probe store").push(probe);
     }
 
     fn record_reputation_event(&self, event: StoredReputationEvent) {
         let mut events = self
             .reputation_events
-            .lock()
-            .expect("reputation event store poisoned");
+            .lock_recover("reputation event store");
         if events.iter().any(|existing| {
             existing.provider == event.provider && existing.event_id == event.event_id
         }) {
@@ -2022,8 +2005,7 @@ impl GatewayState {
 
     fn pause_session(&self, paused: PausedSession) {
         self.paused_sessions
-            .lock()
-            .expect("paused session store poisoned")
+            .lock_recover("paused session store")
             .push(paused);
     }
 
@@ -2573,7 +2555,7 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "sessions_active": 0,
         "sessions_paused": state.paused_session_count(),
         "receipts": state.receipt_count(),
-        "probes": state.probes.lock().expect("probe store poisoned").len(),
+        "probes": state.probes.lock_recover("probe store").len(),
         "update_notice": update_notice,
         "access": state.access_summary(),
     }))
@@ -3268,10 +3250,7 @@ fn dashboard_network_html(
     chart_options: &DashboardChartOptions,
 ) -> String {
     let entries = {
-        let table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let table = state.provider_table.lock_recover("provider table");
         table.entries(now_millis_u64())
     };
     let provider_count = state
@@ -6232,7 +6211,7 @@ fn seed_dev_fallback_heartbeats(
     models: &[GatewayModel],
 ) {
     let now = now_millis_u64();
-    let mut table = provider_table.lock().expect("provider table poisoned");
+    let mut table = provider_table.lock_recover("provider table");
     for model in models {
         for candidate in &model.mayhem.route_candidates {
             table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
@@ -8723,11 +8702,13 @@ async fn collect_direct_session_output(
                 if finish_reason.is_none() {
                     let output_tokens = streamed_output_token_count(&content, &token_ids);
                     if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
-                        let err = direct_session_throughput_floor_error(
-                            session_id,
-                            tok_s,
-                            failover.min_tok_s.expect("floor checked"),
-                        );
+                        let min_tok_s = failover.min_tok_s.ok_or_else(|| {
+                            GatewaySessionError::new(
+                                "throughput watchdog reported a violation without a configured floor",
+                            )
+                        })?;
+                        let err =
+                            direct_session_throughput_floor_error(session_id, tok_s, min_tok_s);
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
                             tool_call.clone(),
@@ -8859,15 +8840,25 @@ async fn collect_direct_session_output(
             })
     });
     let artifacts = finish_session_artifacts(artifact_builders)?;
+    let finish_reason = finish_reason.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {session_id} ended without a final delta"
+        ))
+    })?;
+    let provider_receipt = final_provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {session_id} ended without a final receipt"
+        ))
+    })?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
             content: tool_call.is_none().then_some(content),
             tool_call,
             artifacts,
-            finish_reason: finish_reason.expect("loop ended with final delta"),
+            finish_reason,
             usage,
         },
-        provider_receipt: final_provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt,
         token_ids,
         quality,
     })
@@ -8976,7 +8967,11 @@ async fn collect_direct_session_embedding_output(
 
     let completed_at_millis = now_millis_u64();
     let output = EmbeddingOutput {
-        embeddings: embeddings.expect("loop ended with embeddings"),
+        embeddings: embeddings.ok_or_else(|| {
+            GatewaySessionError::new(format!(
+                "provider embedding session {session_id} ended without embeddings"
+            ))
+        })?,
         usage: usage.unwrap_or_else(|| embedding_usage_for_inputs(inputs)),
     };
     let quality = provider_quality.or_else(|| {
@@ -8991,9 +8986,14 @@ async fn collect_direct_session_embedding_output(
                 ),
             })
     });
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider embedding session {session_id} ended without a final receipt"
+        ))
+    })?;
     Ok(DirectEmbeddingSessionCollected {
         output,
-        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt,
         quality,
     })
 }
@@ -9097,9 +9097,14 @@ async fn collect_direct_session_image_generation_output(
                 ),
             })
     });
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider image session {session_id} ended without a final receipt"
+        ))
+    })?;
     Ok(DirectImageGenerationSessionCollected {
         output: ImageGenerationOutput { artifacts, usage },
-        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt,
         quality,
     })
 }
@@ -9202,9 +9207,14 @@ async fn collect_direct_session_audio_speech_output(
                 ),
             })
     });
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider audio speech session {session_id} ended without a final receipt"
+        ))
+    })?;
     Ok(DirectAudioSpeechSessionCollected {
         output: AudioSpeechOutput { artifacts, usage },
-        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt,
         quality,
     })
 }
@@ -9309,9 +9319,14 @@ async fn collect_direct_session_audio_transcription_output(
                 ),
             })
     });
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider audio transcription session {session_id} ended without a final receipt"
+        ))
+    })?;
     Ok(DirectAudioTranscriptionSessionCollected {
         output: AudioTranscriptionOutput { text, usage },
-        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt,
         quality,
     })
 }
@@ -11801,10 +11816,15 @@ async fn run_live_direct_chat_sse_inner(
                 if finish_reason.is_none() {
                     let output_tokens = streamed_output_token_count(&content, &token_ids);
                     if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
+                        let min_tok_s = failover.min_tok_s.ok_or_else(|| {
+                            GatewaySessionError::new(
+                                "throughput watchdog reported a violation without a configured floor",
+                            )
+                        })?;
                         let err = direct_session_throughput_floor_error(
                             &session.invocation.session_id,
                             tok_s,
-                            failover.min_tok_s.expect("floor checked"),
+                            min_tok_s,
                         );
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
@@ -11944,14 +11964,25 @@ async fn run_live_direct_chat_sse_inner(
                 ),
             });
     let artifacts = finish_session_artifacts(artifact_builders)?;
+    let finish_reason = finish_reason.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {} ended without a final delta",
+            session.invocation.session_id
+        ))
+    })?;
     let output = ChatOutput {
         content: tool_call.is_none().then_some(content),
         tool_call,
         artifacts,
-        finish_reason: finish_reason.expect("loop ended with final delta"),
+        finish_reason,
         usage,
     };
-    let provider_receipt = final_provider_receipt.expect("loop ended with provider receipt");
+    let provider_receipt = final_provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {} ended without a final receipt",
+            session.invocation.session_id
+        ))
+    })?;
     let receipt_ack = direct_session_receipt_ack(
         &session.request,
         &output,
@@ -12648,10 +12679,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
     let mut remaining_entries = {
-        let table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let table = state.provider_table.lock_recover("provider table");
         table
             .entries(now_millis)
             .into_iter()
@@ -12745,10 +12773,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
     let mut remaining_entries = {
-        let table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let table = state.provider_table.lock_recover("provider table");
         table
             .entries(now_millis)
             .into_iter()
@@ -12842,10 +12867,7 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
     let mut remaining_entries = {
-        let table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let table = state.provider_table.lock_recover("provider table");
         table
             .entries(now_millis)
             .into_iter()
@@ -12929,10 +12951,7 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
     let mut remaining_entries = {
-        let table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let table = state.provider_table.lock_recover("provider table");
         table
             .entries(now_millis)
             .into_iter()
@@ -12993,7 +13012,7 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
 impl GatewayState {
     fn refresh_provider_table_routes(&self, model: &GatewayModel) {
         let now = now_millis_u64();
-        let mut table = self.provider_table.lock().expect("provider table poisoned");
+        let mut table = self.provider_table.lock_recover("provider table");
         for candidate in &model.mayhem.route_candidates {
             table.upsert_contract(contract_snapshot_for_route(
                 model,
@@ -13009,16 +13028,14 @@ impl GatewayState {
     fn cool_route_provider(&self, route: &GatewayRouteCandidate, now_millis: u64) -> u64 {
         let cooled_until = now_millis.saturating_add(DEFAULT_PROVIDER_COOLOFF_MILLIS);
         self.provider_cooloffs
-            .lock()
-            .expect("provider cooloff map poisoned")
+            .lock_recover("provider cooloff map")
             .insert(route_key(route), cooled_until);
         cooled_until
     }
 
     fn route_provider_in_cooloff(&self, route: &GatewayRouteCandidate, now_millis: u64) -> bool {
         self.provider_cooloffs
-            .lock()
-            .expect("provider cooloff map poisoned")
+            .lock_recover("provider cooloff map")
             .get(&route_key(route))
             .is_some_and(|cooled_until| *cooled_until > now_millis)
     }
@@ -13034,8 +13051,7 @@ impl GatewayState {
         let key = route_key(route);
         let now = now_millis_u64();
         self.provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .entries(now)
             .into_iter()
             .find(|entry| entry.key == key)
@@ -13048,8 +13064,7 @@ impl GatewayState {
         let route = route?;
         let key = route_key(route);
         self.provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .entries(now_millis_u64())
             .into_iter()
             .find(|entry| entry.key == key)
@@ -13098,8 +13113,7 @@ impl GatewayState {
         };
         let Some(sticky_provider) = self
             .chat_affinity
-            .lock()
-            .expect("chat affinity map poisoned")
+            .lock_recover("chat affinity map")
             .get(&key)
             .cloned()
         else {
@@ -13128,8 +13142,7 @@ impl GatewayState {
             return;
         };
         self.chat_affinity
-            .lock()
-            .expect("chat affinity map poisoned")
+            .lock_recover("chat affinity map")
             .insert(key, route_key(route));
     }
 }
@@ -13461,8 +13474,7 @@ fn record_route_observation(
     let key = route_key(route);
     let maybe_event = state
         .provider_table
-        .lock()
-        .expect("provider table poisoned")
+        .lock_recover("provider table")
         .record_observation_at(&key, sample, now_millis_u64());
     if let Some(event) = maybe_event {
         state.record_reputation_event(stored_underdelivery_reputation_event(
@@ -13608,10 +13620,7 @@ fn record_capacity_mismatch_if_advertised(
     let key = route_key(route);
     let now_millis = now_millis_u64();
     let maybe_event = {
-        let mut table = state
-            .provider_table
-            .lock()
-            .expect("provider table poisoned");
+        let mut table = state.provider_table.lock_recover("provider table");
         let advertised_free_capacity = table
             .entries(now_millis)
             .into_iter()
@@ -14520,8 +14529,7 @@ impl GatewayState {
         let route_key = canary_route_key(model, invocation);
         let should_probe = self
             .canary_scheduler
-            .lock()
-            .expect("canary scheduler poisoned")
+            .lock_recover("canary scheduler")
             .should_probe(&route_key, self.canary_policy);
         if !should_probe {
             return;
@@ -18623,14 +18631,14 @@ fn make_id(prefix: &str) -> String {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
+        .unwrap_or(Duration::ZERO)
         .as_secs()
 }
 
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
+        .unwrap_or(Duration::ZERO)
         .as_millis()
 }
 
@@ -18747,6 +18755,23 @@ mod tests {
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
+
+    #[test]
+    fn poisoned_gateway_mutex_does_not_cascade_into_later_requests() {
+        let shared = Arc::new(Mutex::new(vec!["before"]));
+        let poisoned = shared.clone();
+        let failed = std::thread::spawn(move || {
+            let mut state = poisoned.lock().expect("initial lock");
+            state.push("during");
+            panic!("injected request failure while holding shared state");
+        })
+        .join();
+        assert!(failed.is_err());
+
+        let mut recovered = shared.lock_recover("injected test state");
+        recovered.push("after");
+        assert_eq!(&*recovered, &["before", "during", "after"]);
+    }
 
     #[test]
     fn sc_bridge_direct_session_defaults_only_bound_connection_opening() {
@@ -20911,10 +20936,7 @@ mod tests {
 
         let penalized_key = route_key(&model.mayhem.route_candidates[0]);
         {
-            let mut table = state
-                .provider_table
-                .lock()
-                .expect("provider table poisoned");
+            let mut table = state.provider_table.lock_recover("provider table");
             for _ in 0..5 {
                 table.record_observation(
                     &penalized_key,
@@ -21056,8 +21078,7 @@ mod tests {
 
         state
             .provider_cooloffs
-            .lock()
-            .expect("provider cooloff map poisoned")
+            .lock_recover("provider cooloff map")
             .insert(route_key(cooled_route), 0);
         let readmitted_order =
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
@@ -21538,10 +21559,7 @@ mod tests {
         let key = route_key(circuit_route);
         let now = now_millis_u64();
         {
-            let mut table = state
-                .provider_table
-                .lock()
-                .expect("provider table poisoned");
+            let mut table = state.provider_table.lock_recover("provider table");
             for offset in
                 0..crate::provider_table::DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
             {
@@ -21565,8 +21583,7 @@ mod tests {
 
         state
             .provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .record_observation_at(
                 &key,
                 ProviderObservationSample {
@@ -21701,8 +21718,7 @@ mod tests {
         );
         let skipped_observation = state
             .provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .entries(now_millis_u64())
             .into_iter()
             .find(|entry| entry.key == skipped_small_key)
@@ -21873,8 +21889,7 @@ mod tests {
         saturated.q.engine_backlog = 0;
         honest_state
             .provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .upsert_heartbeat(saturated, now_millis_u64());
         for _ in 0..3 {
             record_retryable_route_attempt(
@@ -21887,8 +21902,7 @@ mod tests {
         assert!(honest_state.reputation_events().is_empty());
         let entry = honest_state
             .provider_table
-            .lock()
-            .expect("provider table poisoned")
+            .lock_recover("provider table")
             .entries(now_millis_u64())
             .into_iter()
             .next()
@@ -21965,8 +21979,7 @@ mod tests {
         let affinity_key = chat_affinity_key(&model, &request).expect("affinity key");
         let sticky_key = state
             .chat_affinity
-            .lock()
-            .expect("chat affinity map poisoned")
+            .lock_recover("chat affinity map")
             .get(&affinity_key)
             .cloned()
             .expect("affinity recorded");

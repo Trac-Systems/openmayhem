@@ -24,6 +24,8 @@ const DEFAULT_BIND: &str = "127.0.0.1:11437";
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 const DEFAULT_PID_FILE: &str = "mayhemd.pid";
 const DEFAULT_STATE_FILE: &str = "mayhemd-state.json";
+const DEFAULT_RESTART_STABLE_AFTER_MS: u64 = 60_000;
+const DEFAULT_CRASH_LOOP_THRESHOLD: u64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhemd")]
@@ -100,6 +102,10 @@ struct ChildConfig {
     restart: bool,
     #[serde(default = "default_backoff_ms")]
     restart_backoff_ms: u64,
+    #[serde(default = "default_restart_stable_after_ms")]
+    restart_stable_after_ms: u64,
+    #[serde(default = "default_crash_loop_threshold")]
+    crash_loop_threshold: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,9 +128,13 @@ struct ChildState {
     pid: Option<u32>,
     running: bool,
     restart: bool,
+    restart_pending: bool,
     restarts: u64,
+    consecutive_failures: u64,
+    crash_loop: bool,
     started_at_ms: Option<u64>,
     stopped_at_ms: Option<u64>,
+    last_uptime_ms: Option<u64>,
     last_exit: Option<String>,
     last_error: Option<String>,
 }
@@ -256,8 +266,8 @@ async fn run_supervisor(
     let mut tasks = JoinSet::new();
     let mut child_shutdowns = BTreeMap::<String, watch::Sender<bool>>::new();
 
-    tasks.spawn(status_server(
-        status_listener,
+    tasks.spawn(supervise_status_server(
+        Arc::new(status_listener),
         runtime.clone(),
         shutdown_rx.clone(),
         control_tx,
@@ -294,6 +304,18 @@ async fn run_supervisor(
                 )
                 .await;
             }
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                match completed {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(err))) => {
+                        return Err(err).context("supervisor component failed");
+                    }
+                    Some(Err(err)) => {
+                        bail!("supervisor component task panicked: {err}");
+                    }
+                    None => {}
+                }
+            }
         }
     }
 
@@ -320,8 +342,62 @@ fn spawn_supervised_child(
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     child_shutdowns.insert(child.name.clone(), shutdown_tx);
-    tasks.spawn(supervise_child(child, runtime.clone(), shutdown_rx));
+    tasks.spawn(supervise_child_component(
+        child,
+        runtime.clone(),
+        shutdown_rx,
+    ));
     Ok(())
+}
+
+async fn supervise_child_component(
+    child: ChildConfig,
+    runtime: SupervisorRuntime,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let component_backoff = Duration::from_millis(child.restart_backoff_ms.max(250));
+    loop {
+        let task = tokio::spawn(supervise_child(
+            child.clone(),
+            runtime.clone(),
+            shutdown.clone(),
+        ));
+        let failure = match task.await {
+            Ok(Ok(())) if *shutdown.borrow() => return Ok(()),
+            Ok(Ok(())) if !child.restart => {
+                while !*shutdown.borrow() {
+                    if shutdown.changed().await.is_err() {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+            Ok(Ok(())) => "child supervisor stopped unexpectedly".to_owned(),
+            Ok(Err(err)) => format!("child supervisor failed: {err:#}"),
+            Err(err) => format!("child supervisor panicked: {err}"),
+        };
+        eprintln!(
+            "mayhemd component fault for child {}: {}; restarting supervision",
+            child.name, failure
+        );
+        if let Err(err) = runtime
+            .mark_child_component_failure(&child.name, failure)
+            .await
+        {
+            eprintln!(
+                "mayhemd could not persist component fault for child {}: {err:#}",
+                child.name
+            );
+        }
+        tokio::select! {
+            _ = sleep(component_backoff) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 async fn handle_supervisor_command(
@@ -396,7 +472,11 @@ async fn supervise_child(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut restarts = 0_u64;
-    let mut backoff = Duration::from_millis(child.restart_backoff_ms.max(250));
+    let mut consecutive_failures = 0_u64;
+    let initial_backoff = Duration::from_millis(child.restart_backoff_ms.max(250));
+    let stable_after = Duration::from_millis(child.restart_stable_after_ms.max(1));
+    let crash_loop_threshold = child.crash_loop_threshold.max(1);
+    let mut backoff = initial_backoff;
     loop {
         if *shutdown.borrow() {
             runtime
@@ -410,6 +490,7 @@ async fn supervise_child(
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
+        command.kill_on_drop(true);
         if let Some(cwd) = &child.cwd {
             command.current_dir(cwd);
         }
@@ -420,50 +501,98 @@ async fn supervise_child(
         match command.spawn() {
             Ok(mut process) => {
                 let pid = process.id();
+                let started = std::time::Instant::now();
                 runtime
-                    .mark_child_started(&child, pid, restarts)
+                    .mark_child_started(&child, pid, restarts, consecutive_failures)
                     .await
                     .with_context(|| format!("updating child {} state", child.name))?;
-                tokio::select! {
-                    status = process.wait() => {
-                        let status = status.with_context(|| format!("waiting for child {}", child.name))?;
-                        let exit = exit_status_string(status);
-                        runtime
-                            .mark_child_stopped(&child.name, exit.clone(), None)
-                            .await?;
-                        if !child.restart || *shutdown.borrow() {
-                            return Ok(());
-                        }
-                        restarts = restarts.saturating_add(1);
-                        runtime
-                            .mark_child_restart_pending(&child.name, restarts)
-                            .await?;
-                    }
-                    changed = shutdown.changed() => {
-                        changed.context("watching supervisor shutdown")?;
-                        if *shutdown.borrow() {
-                            let _ = process.kill().await;
-                            let _ = process.wait().await;
+                let stable_sleep = sleep(stable_after);
+                tokio::pin!(stable_sleep);
+                let mut stable = false;
+                loop {
+                    tokio::select! {
+                        status = process.wait() => {
+                            let uptime = started.elapsed();
+                            let exit = match status {
+                                Ok(status) => exit_status_string(status),
+                                Err(err) => format!("wait failed: {err}"),
+                            };
+                            if stable || uptime >= stable_after {
+                                consecutive_failures = 0;
+                                backoff = initial_backoff;
+                            }
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            restarts = restarts.saturating_add(1);
+                            let crash_loop = consecutive_failures >= crash_loop_threshold;
+                            eprintln!(
+                                "mayhemd child {} exited ({exit}) after {}ms; restart #{restarts}, consecutive failure #{consecutive_failures}{}",
+                                child.name,
+                                duration_millis(uptime),
+                                if crash_loop { " [CRASH LOOP]" } else { "" },
+                            );
                             runtime
-                                .mark_child_stopped(&child.name, "killed by supervisor shutdown".to_owned(), None)
+                                .mark_child_failed(
+                                    &child.name,
+                                    exit,
+                                    None,
+                                    duration_millis(uptime),
+                                    restarts,
+                                    consecutive_failures,
+                                    crash_loop,
+                                    child.restart && !*shutdown.borrow(),
+                                )
                                 .await?;
-                            return Ok(());
+                            if !child.restart || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                            break;
+                        }
+                        _ = stable_sleep.as_mut(), if !stable => {
+                            stable = true;
+                            consecutive_failures = 0;
+                            backoff = initial_backoff;
+                            if let Err(err) = runtime.mark_child_stable(&child.name).await {
+                                eprintln!("mayhemd could not persist stable state for child {}: {err:#}", child.name);
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            changed.context("watching supervisor shutdown")?;
+                            if *shutdown.borrow() {
+                                let _ = process.kill().await;
+                                let _ = process.wait().await;
+                                runtime
+                                    .mark_child_stopped(&child.name, "killed by supervisor shutdown".to_owned(), None)
+                                    .await?;
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
             Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                restarts = restarts.saturating_add(1);
+                let crash_loop = consecutive_failures >= crash_loop_threshold;
+                eprintln!(
+                    "mayhemd child {} spawn failed; restart #{restarts}, consecutive failure #{consecutive_failures}{}: {err}",
+                    child.name,
+                    if crash_loop { " [CRASH LOOP]" } else { "" },
+                );
                 runtime
-                    .mark_child_stopped(
+                    .mark_child_failed(
                         &child.name,
                         "spawn failed".to_owned(),
                         Some(err.to_string()),
+                        0,
+                        restarts,
+                        consecutive_failures,
+                        crash_loop,
+                        child.restart && !*shutdown.borrow(),
                     )
                     .await?;
                 if !child.restart {
                     return Ok(());
                 }
-                restarts = restarts.saturating_add(1);
             }
         }
 
@@ -480,8 +609,39 @@ async fn supervise_child(
     }
 }
 
+async fn supervise_status_server(
+    listener: Arc<TcpListener>,
+    runtime: SupervisorRuntime,
+    mut shutdown: watch::Receiver<bool>,
+    control_tx: mpsc::Sender<SupervisorCommand>,
+) -> Result<()> {
+    loop {
+        let task = tokio::spawn(status_server(
+            listener.clone(),
+            runtime.clone(),
+            shutdown.clone(),
+            control_tx.clone(),
+        ));
+        let failure = match task.await {
+            Ok(Ok(())) if *shutdown.borrow() => return Ok(()),
+            Ok(Ok(())) => "status server stopped unexpectedly".to_owned(),
+            Ok(Err(err)) => format!("status server failed: {err:#}"),
+            Err(err) => format!("status server panicked: {err}"),
+        };
+        eprintln!("mayhemd critical component fault: {failure}; restarting status server");
+        tokio::select! {
+            _ = sleep(Duration::from_millis(250)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 async fn status_server(
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     runtime: SupervisorRuntime,
     mut shutdown: watch::Receiver<bool>,
     control_tx: mpsc::Sender<SupervisorCommand>,
@@ -525,7 +685,11 @@ async fn handle_status_connection(
         .map(|(_, body)| body)
         .unwrap_or("");
     match (method, path) {
-        ("GET", "/health") => write_http_json(&mut stream, 200, &json!({ "ok": true })).await,
+        ("GET", "/health") => {
+            let snapshot = runtime.snapshot().await;
+            let (status, report) = supervisor_health_report(&snapshot);
+            write_http_json(&mut stream, status, &report).await
+        }
         ("GET", "/status") | ("GET", "/") => {
             let snapshot = runtime.snapshot().await;
             write_http_json(&mut stream, 200, &snapshot).await
@@ -589,6 +753,7 @@ async fn write_http_json<T: Serialize>(
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let bytes = serde_json::to_vec_pretty(body)?;
@@ -600,6 +765,31 @@ async fn write_http_json<T: Serialize>(
     stream.write_all(&bytes).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn recompute_supervisor_health(state: &mut SupervisorState) {
+    state.ok = state.children.values().all(|child| !child.crash_loop);
+}
+
+fn supervisor_health_report(state: &SupervisorState) -> (u16, serde_json::Value) {
+    let crash_loop_children = state
+        .children
+        .values()
+        .filter(|child| child.crash_loop)
+        .map(|child| child.name.clone())
+        .collect::<Vec<_>>();
+    let status = if state.ok { 200 } else { 503 };
+    (
+        status,
+        json!({
+            "ok": state.ok,
+            "crash_loop_children": crash_loop_children,
+        }),
+    )
 }
 
 impl SupervisorRuntime {
@@ -622,6 +812,7 @@ impl SupervisorRuntime {
         child: &ChildConfig,
         pid: Option<u32>,
         restarts: u64,
+        consecutive_failures: u64,
     ) -> Result<()> {
         {
             let mut state = self.state.lock().await;
@@ -631,11 +822,13 @@ impl SupervisorRuntime {
                 .or_insert_with(|| child.initial_state());
             entry.pid = pid;
             entry.running = true;
+            entry.restart_pending = false;
             entry.restarts = restarts;
+            entry.consecutive_failures = consecutive_failures;
+            entry.crash_loop = consecutive_failures >= child.crash_loop_threshold.max(1);
             entry.started_at_ms = Some(unix_epoch_millis()?);
             entry.stopped_at_ms = None;
-            entry.last_exit = None;
-            entry.last_error = None;
+            recompute_supervisor_health(&mut state);
         }
         self.persist_state().await
     }
@@ -651,20 +844,74 @@ impl SupervisorRuntime {
             if let Some(entry) = state.children.get_mut(name) {
                 entry.pid = None;
                 entry.running = false;
+                entry.restart_pending = false;
                 entry.stopped_at_ms = Some(unix_epoch_millis()?);
                 entry.last_exit = Some(exit);
                 entry.last_error = error;
+                entry.crash_loop = false;
             }
+            recompute_supervisor_health(&mut state);
         }
         self.persist_state().await
     }
 
-    async fn mark_child_restart_pending(&self, name: &str, restarts: u64) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    async fn mark_child_failed(
+        &self,
+        name: &str,
+        exit: String,
+        error: Option<String>,
+        uptime_ms: u64,
+        restarts: u64,
+        consecutive_failures: u64,
+        crash_loop: bool,
+        restart_pending: bool,
+    ) -> Result<()> {
         {
             let mut state = self.state.lock().await;
             if let Some(entry) = state.children.get_mut(name) {
+                entry.pid = None;
+                entry.running = false;
+                entry.restart_pending = restart_pending;
                 entry.restarts = restarts;
+                entry.consecutive_failures = consecutive_failures;
+                entry.crash_loop = crash_loop;
+                entry.stopped_at_ms = Some(unix_epoch_millis()?);
+                entry.last_uptime_ms = Some(uptime_ms);
+                entry.last_exit = Some(exit);
+                entry.last_error = error;
             }
+            recompute_supervisor_health(&mut state);
+        }
+        self.persist_state().await
+    }
+
+    async fn mark_child_stable(&self, name: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state.children.get_mut(name) {
+                entry.consecutive_failures = 0;
+                entry.crash_loop = false;
+            }
+            recompute_supervisor_health(&mut state);
+        }
+        self.persist_state().await
+    }
+
+    async fn mark_child_component_failure(&self, name: &str, error: String) -> Result<()> {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state.children.get_mut(name) {
+                entry.pid = None;
+                entry.running = false;
+                entry.restart_pending = true;
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.crash_loop = true;
+                entry.stopped_at_ms = Some(unix_epoch_millis()?);
+                entry.last_exit = Some("supervisor component fault".to_owned());
+                entry.last_error = Some(error);
+            }
+            recompute_supervisor_health(&mut state);
         }
         self.persist_state().await
     }
@@ -678,6 +925,7 @@ impl SupervisorRuntime {
             state
                 .children
                 .insert(child.name.clone(), child.initial_state());
+            recompute_supervisor_health(&mut state);
         }
         self.persist_state().await
     }
@@ -685,7 +933,9 @@ impl SupervisorRuntime {
     async fn remove_child_config(&self, name: &str) -> Result<bool> {
         let removed = {
             let mut state = self.state.lock().await;
-            state.children.remove(name).is_some()
+            let removed = state.children.remove(name).is_some();
+            recompute_supervisor_health(&mut state);
+            removed
         };
         self.persist_state().await?;
         Ok(removed)
@@ -701,9 +951,13 @@ impl ChildConfig {
             pid: None,
             running: false,
             restart: self.restart,
+            restart_pending: false,
             restarts: 0,
+            consecutive_failures: 0,
+            crash_loop: false,
             started_at_ms: None,
             stopped_at_ms: None,
+            last_uptime_ms: None,
             last_exit: None,
             last_error: None,
         }
@@ -725,6 +979,18 @@ fn validate_children(children: &[ChildConfig]) -> Result<()> {
         }
         if child.command.trim().is_empty() {
             bail!("supervisor child {} command must not be empty", child.name);
+        }
+        if child.restart_stable_after_ms == 0 {
+            bail!(
+                "supervisor child {} restart_stable_after_ms must be positive",
+                child.name
+            );
+        }
+        if child.crash_loop_threshold == 0 {
+            bail!(
+                "supervisor child {} crash_loop_threshold must be positive",
+                child.name
+            );
         }
         if names.insert(child.name.as_str(), 1).is_some() {
             bail!("duplicate supervisor child name {}", child.name);
@@ -808,6 +1074,14 @@ fn default_backoff_ms() -> u64 {
     1_000
 }
 
+fn default_restart_stable_after_ms() -> u64 {
+    DEFAULT_RESTART_STABLE_AFTER_MS
+}
+
+fn default_crash_loop_threshold() -> u64 {
+    DEFAULT_CRASH_LOOP_THRESHOLD
+}
+
 fn example_config() -> &'static str {
     r#"[supervisor]
 bind = "127.0.0.1:11437"
@@ -818,18 +1092,57 @@ command = "mayhem"
 args = ["use", "--home", "/absolute/path/to/.mayhem"]
 restart = true
 restart_backoff_ms = 1000
+restart_stable_after_ms = 60000
+crash_loop_threshold = 5
 
 [[supervisor.children]]
 name = "paygate"
 command = "mayhem-paygate"
 args = ["--config", "/absolute/path/to/paygate.toml"]
 restart = true
+restart_backoff_ms = 1000
+restart_stable_after_ms = 60000
+crash_loop_threshold = 5
 "#
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime(temp: &Path, children: &[ChildConfig]) -> SupervisorRuntime {
+        SupervisorRuntime {
+            state: Arc::new(Mutex::new(SupervisorState {
+                ok: true,
+                pid: std::process::id(),
+                started_at_ms: unix_epoch_millis().unwrap(),
+                bind: "127.0.0.1:0".to_owned(),
+                config_path: None,
+                pid_file: temp.join("mayhemd.pid"),
+                state_file: temp.join("mayhemd-state.json"),
+                children: initial_child_states(children),
+            })),
+            state_file: temp.join("mayhemd-state.json"),
+        }
+    }
+
+    async fn wait_for_test_state(
+        timeout: Duration,
+        mut ready: impl FnMut(&SupervisorState) -> bool,
+        runtime: &SupervisorRuntime,
+    ) -> SupervisorState {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let snapshot = runtime.snapshot().await;
+                if ready(&snapshot) {
+                    return snapshot;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("supervisor state condition should become true")
+    }
 
     #[test]
     fn parses_supervisor_children_from_toml() {
@@ -865,6 +1178,8 @@ mod tests {
                 env: BTreeMap::new(),
                 restart: true,
                 restart_backoff_ms: 1_000,
+                restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+                crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
             },
             ChildConfig {
                 name: "gateway".to_owned(),
@@ -874,6 +1189,8 @@ mod tests {
                 env: BTreeMap::new(),
                 restart: true,
                 restart_backoff_ms: 1_000,
+                restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+                crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
             },
         ];
         assert!(validate_children(&children).is_err());
@@ -894,6 +1211,8 @@ mod tests {
             env: BTreeMap::new(),
             restart: true,
             restart_backoff_ms: 1_000,
+            restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+            crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
         };
         let states = initial_child_states(&[child]);
         let state = states.get("peer").unwrap();
@@ -913,6 +1232,8 @@ mod tests {
                 env: BTreeMap::new(),
                 restart: false,
                 restart_backoff_ms: 250,
+                restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+                crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
             }
         }
         #[cfg(not(windows))]
@@ -925,6 +1246,8 @@ mod tests {
                 env: BTreeMap::new(),
                 restart: false,
                 restart_backoff_ms: 250,
+                restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+                crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
             }
         }
     }
@@ -933,19 +1256,7 @@ mod tests {
     async fn supervisor_control_add_remove_child_updates_state() {
         let temp = env::temp_dir().join(format!("mayhemd-control-test-{}", std::process::id()));
         fs::create_dir_all(&temp).unwrap();
-        let runtime = SupervisorRuntime {
-            state: Arc::new(Mutex::new(SupervisorState {
-                ok: true,
-                pid: std::process::id(),
-                started_at_ms: unix_epoch_millis().unwrap(),
-                bind: "127.0.0.1:0".to_owned(),
-                config_path: None,
-                pid_file: temp.join("mayhemd.pid"),
-                state_file: temp.join("mayhemd-state.json"),
-                children: BTreeMap::new(),
-            })),
-            state_file: temp.join("mayhemd-state.json"),
-        };
+        let runtime = test_runtime(&temp, &[]);
         let mut tasks = JoinSet::new();
         let mut child_shutdowns = BTreeMap::new();
 
@@ -991,6 +1302,131 @@ mod tests {
             .await
             .expect("removed child task should stop");
         assert!(joined.expect("child task result").is_ok());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crashed_provider_command_restarts_full_load_and_heartbeat_lifecycle() {
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-reload-test-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let script = r#"
+count_file="$1/count"
+events_file="$1/events"
+count=0
+if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf 'load-%s\nheartbeat-%s\n' "$count" "$count" >> "$events_file"
+if [ "$count" -eq 1 ]; then exit 71; fi
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+"#;
+        let child = ChildConfig {
+            name: "provider".to_owned(),
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                script.to_owned(),
+                "mayhemd-provider-test".to_owned(),
+                temp.display().to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            restart: true,
+            restart_backoff_ms: 25,
+            restart_stable_after_ms: 5_000,
+            crash_loop_threshold: 3,
+        };
+        let runtime = test_runtime(&temp, std::slice::from_ref(&child));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_child_component(
+            child,
+            runtime.clone(),
+            shutdown_rx,
+        ));
+
+        let snapshot = wait_for_test_state(
+            Duration::from_secs(5),
+            |state| {
+                fs::read_to_string(temp.join("events"))
+                    .map(|events| events.contains("load-2") && events.contains("heartbeat-2"))
+                    .unwrap_or(false)
+                    && state.children["provider"].running
+            },
+            &runtime,
+        )
+        .await;
+        let provider = &snapshot.children["provider"];
+        assert_eq!(provider.restarts, 1);
+        assert!(!provider.crash_loop);
+        assert!(snapshot.ok);
+        let (health_status, health) = supervisor_health_report(&snapshot);
+        assert_eq!(health_status, 200);
+        assert_eq!(health["ok"], json!(true));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("provider supervisor should stop")
+            .expect("provider supervisor task should join")
+            .expect("provider supervisor should finish cleanly");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_child_failures_surface_a_crash_loop() {
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-crash-loop-test-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let child = ChildConfig {
+            name: "provider".to_owned(),
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "exit 73".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            restart: true,
+            restart_backoff_ms: 25,
+            restart_stable_after_ms: 5_000,
+            crash_loop_threshold: 2,
+        };
+        let runtime = test_runtime(&temp, std::slice::from_ref(&child));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_child_component(
+            child,
+            runtime.clone(),
+            shutdown_rx,
+        ));
+
+        let snapshot = wait_for_test_state(
+            Duration::from_secs(5),
+            |state| state.children["provider"].crash_loop,
+            &runtime,
+        )
+        .await;
+        let provider = &snapshot.children["provider"];
+        assert!(provider.restarts >= 2);
+        assert!(provider.consecutive_failures >= 2);
+        assert_eq!(provider.last_exit.as_deref(), Some("exit 73"));
+        assert!(!snapshot.ok);
+        let (health_status, health) = supervisor_health_report(&snapshot);
+        assert_eq!(health_status, 503);
+        assert_eq!(health["crash_loop_children"], json!(["provider"]));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("crash-loop supervisor should stop")
+            .expect("crash-loop supervisor task should join")
+            .expect("crash-loop supervisor should finish cleanly");
         let _ = fs::remove_dir_all(temp);
     }
 }
