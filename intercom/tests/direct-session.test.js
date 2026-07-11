@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import b4a from 'b4a';
 import DirectSession from '../features/direct-session/index.js';
 import { isLocalPeer, loopbackSessionInfo } from '../features/sc-bridge/loopback.js';
 
@@ -100,6 +101,24 @@ test('DirectSession reuses an inbound session even when the swarm connection lis
   assert.equal(opened.opened, true);
   assert.equal(opened.direct, true);
   assert.equal(opened.relayed, false);
+});
+
+test('DirectSession pins an already-connected peer for automatic reconnects', async () => {
+  const joined = [];
+  const connection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const directSession = new DirectSession({
+    swarm: {
+      connections: [connection],
+      joinPeer: (key) => joined.push(b4a.toString(key, 'hex')),
+    },
+  }, {});
+
+  const connected = await directSession.connectPeer(remote, 25);
+
+  assert.deepEqual(joined, [remote]);
+  assert.equal(connected.remote, remote);
+  assert.equal(connected.connected, true);
+  assert.equal(connected.direct, true);
 });
 
 test('ScBridge loopback helpers identify local direct session routes', () => {

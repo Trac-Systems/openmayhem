@@ -25,11 +25,9 @@ use crate::{
         DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
-        default_ttft_timeout_millis, effective_context_floor, midstream_stalled_after,
-        x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode, SessionFailoverState,
-        SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS,
-        DEFAULT_PROVIDER_COOLOFF_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
-        DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
+        effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
+        RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
+        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
     pricing::{
         normalize_rate_map, priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
@@ -461,8 +459,8 @@ impl GatewayFailoverPolicyConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GatewayFailoverInvocation {
     pub open_timeout_ms: u64,
-    pub ttft_timeout_ms: u64,
-    pub stall_timeout_ms: u64,
+    pub ttft_timeout_ms: Option<u64>,
+    pub stall_timeout_ms: Option<u64>,
     pub min_tok_s: Option<f64>,
 }
 
@@ -470,26 +468,22 @@ impl Default for GatewayFailoverInvocation {
     fn default() -> Self {
         Self {
             open_timeout_ms: DEFAULT_OPEN_TIMEOUT_MILLIS,
-            ttft_timeout_ms: DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
-            stall_timeout_ms: DEFAULT_STALL_TIMEOUT_MILLIS,
+            ttft_timeout_ms: None,
+            stall_timeout_ms: None,
             min_tok_s: None,
         }
     }
 }
 
 impl GatewayFailoverInvocation {
-    fn from_config_for_prompt(config: GatewayFailoverPolicyConfig, prompt_tokens: u64) -> Self {
+    fn from_config_for_prompt(config: GatewayFailoverPolicyConfig, _prompt_tokens: u64) -> Self {
         let config = config.sanitized();
         Self {
             open_timeout_ms: config
                 .open_timeout_ms
                 .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS),
-            ttft_timeout_ms: config
-                .ttft_timeout_ms
-                .unwrap_or_else(|| default_ttft_timeout_millis(prompt_tokens)),
-            stall_timeout_ms: config
-                .stall_timeout_ms
-                .unwrap_or(DEFAULT_STALL_TIMEOUT_MILLIS),
+            ttft_timeout_ms: config.ttft_timeout_ms,
+            stall_timeout_ms: config.stall_timeout_ms,
             min_tok_s: config.min_tok_s,
         }
     }
@@ -498,12 +492,12 @@ impl GatewayFailoverInvocation {
         Duration::from_millis(self.open_timeout_ms)
     }
 
-    fn ttft_timeout(self) -> Duration {
-        Duration::from_millis(self.ttft_timeout_ms)
+    fn ttft_timeout(self) -> Option<Duration> {
+        self.ttft_timeout_ms.map(Duration::from_millis)
     }
 
-    fn stall_timeout(self) -> Duration {
-        Duration::from_millis(self.stall_timeout_ms)
+    fn stall_timeout(self) -> Option<Duration> {
+        self.stall_timeout_ms.map(Duration::from_millis)
     }
 }
 
@@ -1486,8 +1480,8 @@ pub struct ScBridgeGatewaySessionConfig {
     pub url: String,
     pub token: String,
     pub open_timeout: Duration,
-    pub ttft_timeout: Duration,
-    pub frame_timeout: Duration,
+    pub ttft_timeout: Option<Duration>,
+    pub frame_timeout: Option<Duration>,
     pub min_tok_s: Option<f64>,
 }
 
@@ -6812,8 +6806,8 @@ impl ScBridgeGatewaySessionConfig {
             url: url.into(),
             token: token.into(),
             open_timeout: Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS),
-            ttft_timeout: Duration::from_millis(DEFAULT_TTFT_BASE_TIMEOUT_MILLIS),
-            frame_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
+            ttft_timeout: None,
+            frame_timeout: None,
             min_tok_s: None,
         }
     }
@@ -8034,21 +8028,35 @@ async fn next_session_frame(
     wait: Duration,
     expected_types: &[&str],
 ) -> Result<Value, GatewaySessionError> {
-    let deadline = Instant::now() + wait;
+    next_session_frame_with_optional_wait(bridge, session_id, Some(wait), expected_types).await
+}
+
+async fn next_session_frame_with_optional_wait(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    wait: Option<Duration>,
+    expected_types: &[&str],
+) -> Result<Value, GatewaySessionError> {
+    let deadline = wait.map(|wait| Instant::now() + wait);
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(GatewaySessionError::new(format!(
-                "timed out waiting for {} on session {}",
-                expected_types.join("|"),
-                session_id
-            )));
-        }
-        match bridge.next_session_frame(remaining).await {
-            Ok(event) => {
-                if event.get("session_id").and_then(Value::as_str) != Some(session_id) {
-                    continue;
+        let event = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(GatewaySessionError::new(format!(
+                        "timed out waiting for {} on session {}",
+                        expected_types.join("|"),
+                        session_id
+                    )));
                 }
+                bridge
+                    .next_session_frame_for(session_id, Some(remaining))
+                    .await
+            }
+            None => bridge.next_session_frame_for(session_id, None).await,
+        };
+        match event {
+            Ok(event) => {
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
                 let frame_type = frame.get("t").and_then(Value::as_str).unwrap_or("");
                 if expected_types.contains(&frame_type) {
@@ -8297,8 +8305,8 @@ struct DirectSessionWatchdog {
     started_at_millis: u64,
     first_delta_at_millis: Option<u64>,
     last_delta_at_millis: Option<u64>,
-    ttft_timeout_millis: u64,
-    idle_timeout_millis: u64,
+    ttft_timeout_millis: Option<u64>,
+    idle_timeout_millis: Option<u64>,
     overall_timeout_millis: Option<u64>,
     min_tok_s: Option<f64>,
 }
@@ -8306,8 +8314,8 @@ struct DirectSessionWatchdog {
 impl DirectSessionWatchdog {
     fn new(
         started_at_millis: u64,
-        ttft_timeout: Duration,
-        idle_timeout: Duration,
+        ttft_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
         overall_timeout: Option<Duration>,
         min_tok_s: Option<f64>,
     ) -> Self {
@@ -8315,8 +8323,8 @@ impl DirectSessionWatchdog {
             started_at_millis,
             first_delta_at_millis: None,
             last_delta_at_millis: None,
-            ttft_timeout_millis: duration_millis_u64(ttft_timeout),
-            idle_timeout_millis: duration_millis_u64(idle_timeout),
+            ttft_timeout_millis: ttft_timeout.map(duration_millis_u64),
+            idle_timeout_millis: idle_timeout.map(duration_millis_u64),
             overall_timeout_millis: overall_timeout.map(duration_millis_u64),
             min_tok_s: min_tok_s.filter(|value| value.is_finite() && *value > 0.0),
         }
@@ -8335,40 +8343,46 @@ impl DirectSessionWatchdog {
             return Some(DirectSessionTimeoutKind::OverallBudget);
         }
         if self.first_delta_at_millis.is_none() {
-            if now_millis.saturating_sub(self.started_at_millis) > self.ttft_timeout_millis {
+            if self
+                .ttft_timeout_millis
+                .is_some_and(|timeout| now_millis.saturating_sub(self.started_at_millis) > timeout)
+            {
                 return Some(DirectSessionTimeoutKind::TimeToFirstToken);
             }
             return None;
         }
-        midstream_stalled_after(
-            self.last_delta_at_millis,
-            now_millis,
-            self.idle_timeout_millis,
-        )
-        .then_some(DirectSessionTimeoutKind::IdleGap)
+        self.idle_timeout_millis.and_then(|timeout| {
+            midstream_stalled_after(self.last_delta_at_millis, now_millis, timeout)
+                .then_some(DirectSessionTimeoutKind::IdleGap)
+        })
     }
 
-    fn next_wait_millis(&self, now_millis: u64) -> Result<u64, DirectSessionTimeoutKind> {
+    fn next_wait_millis(&self, now_millis: u64) -> Result<Option<u64>, DirectSessionTimeoutKind> {
         if let Some(kind) = self.timeout_kind(now_millis) {
             return Err(kind);
         }
         let mut deadline = if let Some(last_delta) = self.last_delta_at_millis {
-            last_delta
-                .saturating_add(self.idle_timeout_millis)
-                .saturating_add(1)
+            self.idle_timeout_millis
+                .map(|timeout| last_delta.saturating_add(timeout).saturating_add(1))
         } else {
-            self.started_at_millis
-                .saturating_add(self.ttft_timeout_millis)
-                .saturating_add(1)
+            self.ttft_timeout_millis.map(|timeout| {
+                self.started_at_millis
+                    .saturating_add(timeout)
+                    .saturating_add(1)
+            })
         };
         if let Some(overall) = self.overall_timeout_millis {
-            deadline = deadline.min(
-                self.started_at_millis
-                    .saturating_add(overall)
-                    .saturating_add(1),
+            let overall_deadline = self
+                .started_at_millis
+                .saturating_add(overall)
+                .saturating_add(1);
+            deadline = Some(
+                deadline
+                    .map(|deadline| deadline.min(overall_deadline))
+                    .unwrap_or(overall_deadline),
             );
         }
-        Ok(deadline.saturating_sub(now_millis).max(1))
+        Ok(deadline.map(|deadline| deadline.saturating_sub(now_millis).max(1)))
     }
 
     fn timeout_error(&self, session_id: &str, now_millis: u64) -> GatewaySessionError {
@@ -8588,10 +8602,10 @@ async fn collect_direct_session_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = match next_session_frame(
+        let frame = match next_session_frame_with_optional_wait(
             bridge,
             session_id,
-            Duration::from_millis(remaining_millis),
+            remaining_millis.map(Duration::from_millis),
             &[
                 "s.delta",
                 "s.delta_chunk",
@@ -8884,10 +8898,10 @@ async fn collect_direct_session_embedding_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame(
+        let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
-            Duration::from_millis(remaining_millis),
+            remaining_millis.map(Duration::from_millis),
             &[
                 "s.delta",
                 "s.delta_chunk",
@@ -8999,10 +9013,10 @@ async fn collect_direct_session_image_generation_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame(
+        let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
-            Duration::from_millis(remaining_millis),
+            remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
         .await
@@ -9105,10 +9119,10 @@ async fn collect_direct_session_audio_speech_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame(
+        let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
-            Duration::from_millis(remaining_millis),
+            remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
         .await
@@ -9210,10 +9224,10 @@ async fn collect_direct_session_audio_transcription_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame(
+        let frame = next_session_frame_with_optional_wait(
             bridge,
             session_id,
-            Duration::from_millis(remaining_millis),
+            remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
         .await
@@ -11576,7 +11590,11 @@ async fn run_live_direct_chat_sse_inner(
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, &session.invocation.session_id))?;
         let wait_millis = if latest_checkpoint_ack_frame.is_some() {
-            remaining_millis.min(DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS)
+            Some(
+                remaining_millis
+                    .unwrap_or(DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS)
+                    .min(DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS),
+            )
         } else {
             remaining_millis
         };
@@ -11592,10 +11610,10 @@ async fn run_live_direct_chat_sse_inner(
                     now_millis_u64(),
                 ));
             }
-            result = next_session_frame(
+            result = next_session_frame_with_optional_wait(
                 &mut session.bridge,
                 &session.invocation.session_id,
-                Duration::from_millis(wait_millis),
+                wait_millis.map(Duration::from_millis),
                 &[
                     "s.delta",
                     "s.delta_chunk",
@@ -18701,24 +18719,16 @@ mod tests {
     };
 
     #[test]
-    fn sc_bridge_direct_session_defaults_match_f11_failover_timeouts() {
+    fn sc_bridge_direct_session_defaults_only_bound_connection_opening() {
         let config = ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:49222", "token");
         assert_eq!(
             config.open_timeout,
             Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
         );
-        assert_eq!(
-            config.ttft_timeout,
-            Duration::from_millis(DEFAULT_TTFT_BASE_TIMEOUT_MILLIS)
-        );
-        assert_eq!(
-            config.frame_timeout,
-            Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
-        );
+        assert_eq!(config.ttft_timeout, None);
+        assert_eq!(config.frame_timeout, None);
         assert_eq!(config.min_tok_s, None);
         assert_eq!(config.open_timeout, Duration::from_secs(90));
-        assert_eq!(config.ttft_timeout, Duration::from_secs(90));
-        assert_eq!(config.frame_timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -18755,18 +18765,18 @@ mod tests {
     fn direct_session_watchdog_resets_idle_gap_per_delta() {
         let mut watchdog = DirectSessionWatchdog::new(
             0,
-            Duration::from_millis(15),
-            Duration::from_millis(15),
+            Some(Duration::from_millis(15)),
+            Some(Duration::from_millis(15)),
             None,
             None,
         );
-        assert_eq!(watchdog.next_wait_millis(15), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(15), Ok(Some(1)));
         watchdog.record_delta(10);
-        assert_eq!(watchdog.next_wait_millis(25), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(25), Ok(Some(1)));
         watchdog.record_delta(25);
-        assert_eq!(watchdog.next_wait_millis(40), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(40), Ok(Some(1)));
         watchdog.record_delta(40);
-        assert_eq!(watchdog.next_wait_millis(55), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(55), Ok(Some(1)));
         assert_eq!(
             watchdog.next_wait_millis(56),
             Err(DirectSessionTimeoutKind::IdleGap)
@@ -18777,12 +18787,12 @@ mod tests {
     fn direct_session_watchdog_trips_ttft_before_first_delta() {
         let watchdog = DirectSessionWatchdog::new(
             100,
-            Duration::from_millis(10),
-            Duration::from_millis(15),
+            Some(Duration::from_millis(10)),
+            Some(Duration::from_millis(15)),
             None,
             None,
         );
-        assert_eq!(watchdog.next_wait_millis(110), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(110), Ok(Some(1)));
         assert_eq!(
             watchdog.next_wait_millis(111),
             Err(DirectSessionTimeoutKind::TimeToFirstToken)
@@ -18793,13 +18803,13 @@ mod tests {
     fn direct_session_watchdog_has_distinct_overall_budget() {
         let mut watchdog = DirectSessionWatchdog::new(
             0,
-            Duration::from_millis(10),
-            Duration::from_millis(10),
+            Some(Duration::from_millis(10)),
+            Some(Duration::from_millis(10)),
             Some(Duration::from_millis(30)),
             None,
         );
         watchdog.record_delta(25);
-        assert_eq!(watchdog.next_wait_millis(30), Ok(1));
+        assert_eq!(watchdog.next_wait_millis(30), Ok(Some(1)));
         assert_eq!(
             watchdog.next_wait_millis(31),
             Err(DirectSessionTimeoutKind::OverallBudget)
@@ -18810,8 +18820,8 @@ mod tests {
     fn direct_session_watchdog_detects_throughput_floor_after_sample_window() {
         let mut watchdog = DirectSessionWatchdog::new(
             0,
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
             None,
             Some(5.0),
         );
@@ -18820,6 +18830,14 @@ mod tests {
         assert_eq!(watchdog.throughput_floor_violation(1, 1_000), None);
         assert_eq!(watchdog.throughput_floor_violation(1, 1_100), Some(1.0));
         assert_eq!(watchdog.throughput_floor_violation(5, 1_000), None);
+    }
+
+    #[test]
+    fn direct_session_watchdog_waits_without_a_guessed_compute_deadline() {
+        let mut watchdog = DirectSessionWatchdog::new(0, None, None, None, None);
+        assert_eq!(watchdog.next_wait_millis(u64::MAX), Ok(None));
+        watchdog.record_delta(u64::MAX - 1);
+        assert_eq!(watchdog.next_wait_millis(u64::MAX), Ok(None));
     }
 
     #[test]
@@ -18863,13 +18881,13 @@ mod tests {
             .expect("invocation");
 
         assert_eq!(invocation.failover.open_timeout_ms, 4_000);
-        assert_eq!(invocation.failover.ttft_timeout_ms, 7_000);
-        assert_eq!(invocation.failover.stall_timeout_ms, 6_000);
+        assert_eq!(invocation.failover.ttft_timeout_ms, Some(7_000));
+        assert_eq!(invocation.failover.stall_timeout_ms, Some(6_000));
         assert_eq!(invocation.failover.min_tok_s, Some(30.0));
     }
 
     #[test]
-    fn failover_thresholds_scale_default_ttft_with_prompt_tokens() {
+    fn large_prompts_do_not_gain_a_synthetic_default_deadline() {
         let model = test_model();
         let state = GatewayState::from_models(vec![model.clone()]);
         let mut request = test_chat_request(&model.id);
@@ -18891,12 +18909,12 @@ mod tests {
             invocation.failover.open_timeout_ms,
             DEFAULT_OPEN_TIMEOUT_MILLIS
         );
-        assert_eq!(invocation.failover.stall_timeout_ms, 30_000);
-        assert_eq!(invocation.failover.ttft_timeout_ms, 190_000);
+        assert_eq!(invocation.failover.stall_timeout_ms, None);
+        assert_eq!(invocation.failover.ttft_timeout_ms, None);
     }
 
     #[test]
-    fn one_shot_failover_deadlines_scale_with_work_size() {
+    fn one_shot_work_has_no_synthetic_default_deadline() {
         let model = test_model();
         let state = GatewayState::from_models(vec![model.clone()]);
 
@@ -18931,10 +18949,8 @@ mod tests {
                 &GatewayRequestOptions::default(),
             )
             .expect("large image invocation");
-        assert!(
-            large_image_invocation.failover.ttft_timeout_ms
-                > small_image_invocation.failover.ttft_timeout_ms
-        );
+        assert_eq!(small_image_invocation.failover.ttft_timeout_ms, None);
+        assert_eq!(large_image_invocation.failover.ttft_timeout_ms, None);
 
         let small_embedding = vec!["alpha".to_owned()];
         let large_embedding = vec!["alpha ".repeat(5_000)];
@@ -18954,10 +18970,8 @@ mod tests {
                 &GatewayRequestOptions::default(),
             )
             .expect("large embedding invocation");
-        assert!(
-            large_embedding_invocation.failover.ttft_timeout_ms
-                > small_embedding_invocation.failover.ttft_timeout_ms
-        );
+        assert_eq!(small_embedding_invocation.failover.ttft_timeout_ms, None);
+        assert_eq!(large_embedding_invocation.failover.ttft_timeout_ms, None);
 
         let small_audio = AudioSpeechRequest {
             model: model.id.clone(),
@@ -18984,10 +18998,8 @@ mod tests {
                 &GatewayRequestOptions::default(),
             )
             .expect("large audio invocation");
-        assert!(
-            large_audio_invocation.failover.ttft_timeout_ms
-                > small_audio_invocation.failover.ttft_timeout_ms
-        );
+        assert_eq!(small_audio_invocation.failover.ttft_timeout_ms, None);
+        assert_eq!(large_audio_invocation.failover.ttft_timeout_ms, None);
     }
 
     #[test]
@@ -19905,8 +19917,8 @@ mod tests {
             test_provider_receipt_with_finality(&model, &request, &output, &invocation, 2, false);
         let mut watchdog = DirectSessionWatchdog::new(
             1_000,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
             None,
             None,
         );
@@ -19942,8 +19954,8 @@ mod tests {
         let output = test_chat_output();
         let mut watchdog = DirectSessionWatchdog::new(
             1_000,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
             None,
             None,
         );

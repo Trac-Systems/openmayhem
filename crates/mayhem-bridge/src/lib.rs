@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -272,24 +272,67 @@ impl ScBridgeClient {
         self.next_event_of_type("session_frame", wait).await
     }
 
+    pub async fn next_session_frame_unbounded(&mut self) -> Result<Value> {
+        if let Some(event) = self.pop_queued_event("session_frame") {
+            return Ok(event);
+        }
+
+        self.read_event_of_type("session_frame").await
+    }
+
+    pub async fn next_session_frame_for(
+        &mut self,
+        session_id: impl AsRef<str>,
+        wait: Option<Duration>,
+    ) -> Result<Value> {
+        let session_id = session_id.as_ref();
+        let deadline = wait.map(|wait| Instant::now() + wait);
+        let mut deferred = Vec::new();
+        let result = async {
+            loop {
+                let event = match deadline {
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Err(BridgeError::Timeout);
+                        }
+                        self.next_session_frame(remaining).await?
+                    }
+                    None => self.next_session_frame_unbounded().await?,
+                };
+                if event.get("session_id").and_then(Value::as_str) == Some(session_id) {
+                    return Ok(event);
+                }
+                deferred.push(event);
+            }
+        }
+        .await;
+        for event in deferred.into_iter().rev() {
+            self.requeue_event_front(event);
+        }
+        result
+    }
+
     pub fn requeue_event_front(&mut self, event: Value) {
         self.queued_events.push_front(event);
     }
 
     async fn next_event_of_type(&mut self, expected_type: &str, wait: Duration) -> Result<Value> {
-        timeout(wait, async {
-            loop {
-                let message = self.read_json().await?;
-                if message.get("type").and_then(Value::as_str) == Some(expected_type) {
-                    return Ok(message);
-                }
-                if is_async_event(&message) {
-                    self.queued_events.push_back(message);
-                }
+        timeout(wait, self.read_event_of_type(expected_type))
+            .await
+            .map_err(|_| BridgeError::Timeout)?
+    }
+
+    async fn read_event_of_type(&mut self, expected_type: &str) -> Result<Value> {
+        loop {
+            let message = self.read_json().await?;
+            if message.get("type").and_then(Value::as_str) == Some(expected_type) {
+                return Ok(message);
             }
-        })
-        .await
-        .map_err(|_| BridgeError::Timeout)?
+            if is_async_event(&message) {
+                self.queued_events.push_back(message);
+            }
+        }
     }
 
     fn pop_queued_event(&mut self, expected_type: &str) -> Option<Value> {
@@ -492,5 +535,63 @@ mod tests {
         assert_eq!(config.url.host_str(), Some("127.0.0.1"));
         assert_eq!(config.url.port(), Some(49222));
         assert_eq!(config.token, "token");
+    }
+
+    #[tokio::test]
+    async fn targeted_session_wait_defers_other_session_frames_in_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wanted = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        let server_wanted = wanted.clone();
+        let server_other = other.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = socket.next().await.unwrap().unwrap();
+            let auth: Value = match auth {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected auth text, got {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": auth["id"], "type": "auth_ok"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            for session_id in [server_other, server_wanted] {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "type": "session_frame",
+                            "session_id": session_id,
+                            "frame": {"t": "s.open"},
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut client = ScBridgeClient::connect(
+            ScBridgeConfig::new(format!("ws://{address}"), "token").unwrap(),
+        )
+        .await
+        .unwrap();
+        let selected = client
+            .next_session_frame_for(&wanted, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(selected["session_id"], wanted);
+        let deferred = client
+            .next_session_frame(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(deferred["session_id"], other);
+        server.await.unwrap();
     }
 }

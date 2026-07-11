@@ -14,10 +14,6 @@ pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = ADMIN_RELAY_CONNECT_BUDGET_MILLIS
     + OPEN_TIMEOUT_SAFETY_MARGIN_MILLIS;
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
 pub const DEFAULT_PROVIDER_COOLOFF_MILLIS: u64 = 30_000;
-pub const DEFAULT_STALL_TIMEOUT_MILLIS: u64 = 30_000;
-pub const DEFAULT_TTFT_BASE_TIMEOUT_MILLIS: u64 = DEFAULT_OPEN_TIMEOUT_MILLIS;
-pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP: u64 = 1_000;
-pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP_MILLIS: u64 = 1_000;
 
 pub fn effective_context_floor(
     user_min_ctx: Option<u32>,
@@ -28,13 +24,6 @@ pub fn effective_context_floor(
         .saturating_add(output_headroom_tokens)
         .min(u64::from(u32::MAX)) as u32;
     user_min_ctx.unwrap_or(0).max(conversation_floor)
-}
-
-pub fn default_ttft_timeout_millis(prompt_tokens: u64) -> u64 {
-    let prompt_steps = prompt_tokens.saturating_add(DEFAULT_TTFT_PROMPT_TOKEN_STEP - 1)
-        / DEFAULT_TTFT_PROMPT_TOKEN_STEP;
-    DEFAULT_TTFT_BASE_TIMEOUT_MILLIS
-        .saturating_add(prompt_steps.saturating_mul(DEFAULT_TTFT_PROMPT_TOKEN_STEP_MILLIS))
 }
 
 pub fn midstream_stalled_after(
@@ -51,7 +40,7 @@ pub struct FailoverPolicy {
     pub open_timeout_millis: u64,
     pub max_open_attempts: u8,
     pub provider_cooloff_millis: u64,
-    pub stall_timeout_millis: u64,
+    pub stall_timeout_millis: Option<u64>,
     pub checkpoint_every: CheckpointPolicy,
     pub hedge_enabled: bool,
 }
@@ -174,7 +163,7 @@ impl Default for FailoverPolicy {
             open_timeout_millis: DEFAULT_OPEN_TIMEOUT_MILLIS,
             max_open_attempts: DEFAULT_MAX_OPEN_ATTEMPTS,
             provider_cooloff_millis: DEFAULT_PROVIDER_COOLOFF_MILLIS,
-            stall_timeout_millis: DEFAULT_STALL_TIMEOUT_MILLIS,
+            stall_timeout_millis: None,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
                 ms: 30_000,
@@ -389,11 +378,9 @@ impl SessionFailoverState {
     }
 
     pub fn midstream_stalled(&self, now_millis: u64) -> bool {
-        midstream_stalled_after(
-            self.last_delta_at_millis,
-            now_millis,
-            self.policy.stall_timeout_millis,
-        )
+        self.policy.stall_timeout_millis.is_some_and(|timeout| {
+            midstream_stalled_after(self.last_delta_at_millis, now_millis, timeout)
+        })
     }
 
     pub fn record_midstream_stall(&mut self, now_millis: u64) -> Option<RedispatchPlan> {
@@ -601,6 +588,7 @@ mod tests {
     #[test]
     fn midstream_stall_returns_partial_receipt_and_cumulative_redispatch_accounting() {
         let policy = FailoverPolicy {
+            stall_timeout_millis: Some(30_000),
             checkpoint_every: CheckpointPolicy {
                 tokens: 8,
                 ms: 30_000,

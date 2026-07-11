@@ -117,15 +117,17 @@ class DirectSession extends Feature {
   async connectPeer(remote, waitMs = 10_000) {
     const normalizedRemote = this._normalizeRemote(remote);
     if (!normalizedRemote) throw new Error('Invalid remote peer key.');
+    if (!this.peer?.swarm?.joinPeer) {
+      throw new Error('Peer swarm does not support targeted peer joins.');
+    }
+    // Mark the peer explicit even when a transient topic connection already exists.
+    // Hyperswarm then maintains the direct connection after either side reconnects.
+    this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
     const existing = this._findConnection(normalizedRemote);
     if (existing) {
       this._prepareConnection(existing);
       return this._peerInfo(normalizedRemote, true);
     }
-    if (!this.peer?.swarm?.joinPeer) {
-      throw new Error('Peer swarm does not support targeted peer joins.');
-    }
-    this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
     const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, 120_000));
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {

@@ -23110,16 +23110,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             session_config.open_timeout = Duration::from_secs(seconds);
         }
         if let Some(seconds) = args.session_ttft_timeout_seconds {
-            session_config.ttft_timeout = Duration::from_secs(seconds);
+            session_config.ttft_timeout = Some(Duration::from_secs(seconds));
         }
         if let Some(seconds) = args.session_frame_timeout_seconds {
-            session_config.frame_timeout = Duration::from_secs(seconds);
+            session_config.frame_timeout = Some(Duration::from_secs(seconds));
         }
         session_config.min_tok_s = args.min_tok_s;
         let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
             open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
-            ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
-            stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
+            ttft_timeout_ms: session_config.ttft_timeout.map(duration_millis_u64),
+            stall_timeout_ms: session_config.frame_timeout.map(duration_millis_u64),
             min_tok_s: session_config.min_tok_s,
         };
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
@@ -39571,7 +39571,14 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_url.as_deref(),
         ctx.args.sc_bridge_token.as_deref(),
     )?;
-    let mut bridge = connect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token).await?;
+    let admin_transport_peer = provider_admin_transport_peer(runtime.rpc).await?;
+    let mut bridge = reconnect_provider_session_bridge(
+        &sc_bridge_url,
+        &sc_bridge_token,
+        &admin_transport_peer,
+        None,
+    )
+    .await?;
     let mut bridge_liveness_checked_at = Instant::now();
 
     provider_log(
@@ -39649,6 +39656,7 @@ async fn serve_provider_sessions(
                         bridge = reconnect_provider_session_bridge(
                             &sc_bridge_url,
                             &sc_bridge_token,
+                            &admin_transport_peer,
                             deadline,
                         )
                         .await?;
@@ -39871,8 +39879,13 @@ async fn serve_provider_sessions(
                         "SC-Bridge closed provider session stream; dropped {dropped} active session(s), reconnecting"
                     ));
                     bridge =
-                        reconnect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token, deadline)
-                            .await?;
+                        reconnect_provider_session_bridge(
+                            &sc_bridge_url,
+                            &sc_bridge_token,
+                            &admin_transport_peer,
+                            deadline,
+                        )
+                        .await?;
                     bridge_liveness_checked_at = Instant::now();
                 }
                 Err(err) => return Err(err).context("reading provider session frame"),
@@ -39902,6 +39915,7 @@ async fn serve_provider_sessions(
 async fn connect_provider_session_bridge(
     sc_bridge_url: &str,
     sc_bridge_token: &str,
+    admin_transport_peer: &str,
 ) -> Result<ScBridgeClient> {
     provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
     let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
@@ -39922,6 +39936,16 @@ async fn connect_provider_session_bridge(
     {
         bail!("SC-Bridge does not support all-session subscription; update the local Intercom app");
     }
+    provider_session_debug(format!(
+        "pinning outbound direct connection to admin transport peer {admin_transport_peer}"
+    ));
+    bridge
+        .peer_connect(
+            admin_transport_peer,
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS),
+        )
+        .await
+        .context("pinning the provider's outbound direct connection to the canonical admin")?;
     provider_session_debug("session frame subscription ready");
     Ok(bridge)
 }
@@ -39929,6 +39953,7 @@ async fn connect_provider_session_bridge(
 async fn reconnect_provider_session_bridge(
     sc_bridge_url: &str,
     sc_bridge_token: &str,
+    admin_transport_peer: &str,
     deadline: Option<Instant>,
 ) -> Result<ScBridgeClient> {
     let mut delay = Duration::from_millis(250);
@@ -39936,7 +39961,9 @@ async fn reconnect_provider_session_bridge(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             bail!("provider session serving deadline reached while reconnecting to SC-Bridge");
         }
-        match connect_provider_session_bridge(sc_bridge_url, sc_bridge_token).await {
+        match connect_provider_session_bridge(sc_bridge_url, sc_bridge_token, admin_transport_peer)
+            .await
+        {
             Ok(bridge) => return Ok(bridge),
             Err(err) => {
                 provider_session_debug(format!(
@@ -39956,6 +39983,15 @@ async fn reconnect_provider_session_bridge(
             }
         }
     }
+}
+
+async fn provider_admin_transport_peer(rpc: &PeerRpcClient) -> Result<String> {
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_owned))
+        .filter(|value| is_hex_len(value, 64))
+        .context("contract state admin is missing or is not a 32-byte peer public key")?;
+    Ok(admin)
 }
 
 fn clear_provider_sessions_after_bridge_drop(
@@ -41536,13 +41572,11 @@ async fn wait_for_provider_receipt_ack(
                 active.session_id
             );
         }
-        match bridge.next_session_frame(remaining).await {
+        match bridge
+            .next_session_frame_for(&active.session_id, Some(remaining))
+            .await
+        {
             Ok(event) => {
-                if event.get("session_id").and_then(Value::as_str)
-                    != Some(active.session_id.as_str())
-                {
-                    continue;
-                }
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
                 match frame.get("t").and_then(Value::as_str) {
                     Some("s.receipt_ack") => {
