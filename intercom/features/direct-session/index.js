@@ -96,6 +96,14 @@ class DirectSession extends Feature {
     const normalizedSession = normalizeSessionId(sessionId);
     if (!normalizedRemote) throw new Error('Invalid remote peer key.');
     if (!normalizedSession) throw new Error('Invalid session_id.');
+    const existing = this.sessions.get(sessionKey(normalizedRemote, normalizedSession));
+    if (existing) {
+      if (existing.channel?.opened !== true) {
+        const opened = await existing.channel.fullyOpened();
+        if (!opened) throw new Error(`Session ${normalizedSession} was not opened.`);
+      }
+      return this._sessionInfo(existing);
+    }
     const connection = this._findConnection(normalizedRemote);
     if (!connection) throw new Error(`No direct connection to ${normalizedRemote}.`);
     const session = this._ensureSession(connection, normalizedSession);

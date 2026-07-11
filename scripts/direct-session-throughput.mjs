@@ -17,8 +17,9 @@ function usage() {
     --provider-url ws://HOST:PORT --provider-token TOKEN \\
     --user-url ws://HOST:PORT --user-token TOKEN [options]
 
-Measures delivered direct mx/s session throughput between two already-running
-SC-Bridge peers. Tokens are synthetic session delta frames, not model output.
+Measures delivered direct mx/s session throughput between two running
+SC-Bridge peers. It establishes the targeted peer connection before opening the
+session. Tokens are synthetic session delta frames, not model output.
 
 Required:
   --provider-url URL       Provider SC-Bridge WebSocket URL
@@ -396,6 +397,18 @@ async function main() {
     ]);
     const providerPubkey = peerPubkey(providerInfo, 'provider');
     const userPubkey = peerPubkey(userInfo, 'user');
+    const targetedConnections = await Promise.all([
+      provider.request({
+        type: 'peer_connect',
+        remote: userPubkey,
+        wait_ms: waitConnectionsMs,
+      }, 'peer_connected', waitConnectionsMs + 5000),
+      user.request({
+        type: 'peer_connect',
+        remote: providerPubkey,
+        wait_ms: waitConnectionsMs,
+      }, 'peer_connected', waitConnectionsMs + 5000),
+    ]);
     const connectionStats = await waitForDirectConnections(provider, user, waitConnectionsMs);
     await Promise.all([
       provider.request({ type: 'session_subscribe', session_ids: [sessionId] }, 'session_subscribed', timeoutMs),
@@ -476,6 +489,10 @@ async function main() {
         user: userSessionStats,
       },
       connection_stats: connectionStats,
+      targeted_connections: {
+        provider: targetedConnections[0],
+        user: targetedConnections[1],
+      },
       opened: {
         provider: providerOpen,
         user: userOpen,

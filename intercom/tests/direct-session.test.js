@@ -84,6 +84,24 @@ test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
   assert.deepEqual(frames[0].frame, frame);
 });
 
+test('DirectSession reuses an inbound session even when the swarm connection list races', async () => {
+  const directSession = new DirectSession({ swarm: { connections: [] } }, {});
+  const existing = {
+    sessionId,
+    remote,
+    channel: { opened: true },
+  };
+  directSession.sessions.set(`${remote}:${sessionId}`, existing);
+
+  const opened = await directSession.open(remote, sessionId);
+
+  assert.equal(opened.session_id, sessionId);
+  assert.equal(opened.remote, remote);
+  assert.equal(opened.opened, true);
+  assert.equal(opened.direct, true);
+  assert.equal(opened.relayed, false);
+});
+
 test('ScBridge loopback helpers identify local direct session routes', () => {
   const peer = { wallet: { publicKey: localPeer.toUpperCase() } };
   assert.equal(isLocalPeer(localPeer, peer, null), true);

@@ -238,7 +238,7 @@ test('relay rejects admin operations before network send', async () => {
   assert.equal(broadcasts, 0);
 });
 
-test('participant waits for the direct admin relay channel before sending', async () => {
+test('participant retries through the direct admin relay channel until acknowledged', async () => {
   const participant = peerFor(providerKey);
   const events = [];
   participant.peer.sidechannel = {
@@ -252,15 +252,17 @@ test('participant waits for the direct admin relay channel before sending', asyn
       return false;
     },
   };
-  const feature = new MayhemFeature(participant.peer, { timeoutMs: 2_000 });
+  const feature = new MayhemFeature(participant.peer, { timeoutMs: 25, retryMs: 5 });
   feature.key = 'mayhem';
 
-  await feature.relay(`consent/${providerKey}/1/rules-hash`, consentValue());
+  const result = await feature.relay(`consent/${providerKey}/1/rules-hash`, consentValue());
 
-  assert.deepEqual(events, [
-    ['connect', adminKey, MAYHEM_RELAY_CHANNEL, 2_000],
-    ['broadcast'],
-  ]);
+  assert.equal(result.ok, false);
+  assert.ok(events.length >= 4);
+  for (let index = 0; index < events.length; index += 2) {
+    assert.deepEqual(events[index], ['connect', adminKey, MAYHEM_RELAY_CHANNEL, 25]);
+    assert.deepEqual(events[index + 1], ['broadcast']);
+  }
 });
 
 test('participant does not broadcast when the canonical admin channel is unavailable', async () => {
@@ -285,6 +287,61 @@ test('participant does not broadcast when the canonical admin channel is unavail
   assert.equal(result.ok, false);
   assert.match(result.message, /direct channel to the canonical admin/);
   assert.equal(broadcasts, 0);
+});
+
+test('participant reconnects the direct admin channel while a relay is pending', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 10,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 500, retryMs: 10 });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+
+  let connectAttempts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      connectAttempts += 1;
+      return connectAttempts >= 2;
+    },
+    verifyPayload(payload, expectedKey) {
+      return payload.from === expectedKey && payload.sig === `signed:${payload.from}`;
+    },
+    broadcast(channel, message) {
+      const payload = {
+        from: providerKey,
+        message,
+        sig: `signed:${providerKey}`,
+      };
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(channel, payload));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload(payload, expectedKey) {
+      return payload.from === expectedKey && payload.sig === `signed:${payload.from}`;
+    },
+    broadcast(channel, message) {
+      const payload = {
+        from: adminKey,
+        message,
+        sig: `signed:${adminKey}`,
+      };
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(channel, payload));
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const result = await participantFeature.relay(key, consentValue());
+
+  assert.equal(result.ok, true);
+  assert.ok(connectAttempts >= 2);
+  assert.equal(writer.appended.length, 1);
 });
 
 test('relay accepts only the dedicated channel and drops oversized feature envelopes', async () => {

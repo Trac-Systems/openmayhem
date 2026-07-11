@@ -136,10 +136,6 @@ class MayhemFeature extends Feature {
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
 
-    let resolvePending;
-    const promise = new Promise((resolve) => {
-      resolvePending = resolve;
-    });
     const message = {
       control: RELAY_CONTROL_REQUEST,
       version: RELAY_VERSION,
@@ -151,34 +147,18 @@ class MayhemFeature extends Feature {
     if (this.relayMessageBytes(message) > this.maxMessageBytes) {
       throw new Error(`Mayhem feature relay payload exceeds ${this.maxMessageBytes} bytes.`);
     }
-    if (!(await this._connectAdminTransport(admin, sidechannel))) {
-      return relayError(
+    return await this._relayUntilAcknowledged({
+      admin,
+      sidechannel,
+      requestId,
+      message,
+      pending: this.pending,
+      unavailableMessage:
         'Mayhem feature relay could not establish its direct channel to the canonical admin.',
-        requestId
-      );
-    }
-    const send = () => sidechannel.broadcast(this.channel, message);
-    this.pending.set(requestId, { promise, resolve: resolvePending });
-
-    if (!send()) {
-      this.pending.delete(requestId);
-      return relayError('Mayhem feature relay could not send the signed intent.', requestId);
-    }
-
-    const retry = setInterval(send, this.retryMs);
-    const timeout = setTimeout(() => {
-      const current = this.pending.get(requestId);
-      if (!current) return;
-      this.pending.delete(requestId);
-      current.resolve(relayError('Mayhem feature relay timed out before the admin writer acknowledged it.', requestId));
-    }, this.timeoutMs);
-
-    try {
-      return await promise;
-    } finally {
-      clearInterval(retry);
-      clearTimeout(timeout);
-    }
+      unsentMessage: 'Mayhem feature relay could not send the signed intent.',
+      timeoutMessage:
+        'Mayhem feature relay timed out before the admin writer acknowledged it.',
+    });
   }
 
   async requestService(service, value) {
@@ -202,10 +182,6 @@ class MayhemFeature extends Feature {
     const existing = this.servicePending.get(requestId);
     if (existing) return await existing.promise;
 
-    let resolvePending;
-    const promise = new Promise((resolve) => {
-      resolvePending = resolve;
-    });
     const message = {
       control: SERVICE_CONTROL_REQUEST,
       version: RELAY_VERSION,
@@ -216,26 +192,62 @@ class MayhemFeature extends Feature {
     if (this.relayMessageBytes(message) > this.maxMessageBytes) {
       throw new Error(`Mayhem service relay payload exceeds ${this.maxMessageBytes} bytes.`);
     }
-    if (!(await this._connectAdminTransport(admin, sidechannel))) {
-      return relayError(
+    return await this._relayUntilAcknowledged({
+      admin,
+      sidechannel,
+      requestId,
+      message,
+      pending: this.servicePending,
+      unavailableMessage:
         'Mayhem service relay could not establish its direct channel to the canonical admin.',
-        requestId
-      );
-    }
-    const send = () => sidechannel.broadcast(this.channel, message);
-    this.servicePending.set(requestId, { promise, resolve: resolvePending });
-    if (!send()) {
-      this.servicePending.delete(requestId);
-      return relayError('Mayhem service relay could not send the signed request.', requestId);
-    }
+      unsentMessage: 'Mayhem service relay could not send the signed request.',
+      timeoutMessage: 'Mayhem service relay timed out before the admin replied.',
+    });
+  }
 
-    const retry = setInterval(send, this.retryMs);
+  async _relayUntilAcknowledged({
+    admin,
+    sidechannel,
+    requestId,
+    message,
+    pending,
+    unavailableMessage,
+    unsentMessage,
+    timeoutMessage,
+  }) {
+    let resolvePending;
+    const promise = new Promise((resolve) => {
+      resolvePending = resolve;
+    });
+    pending.set(requestId, { promise, resolve: resolvePending });
+
+    let connected = false;
+    let sent = false;
+    let attemptInFlight = false;
+    const attempt = async () => {
+      if (attemptInFlight || !pending.has(requestId)) return;
+      attemptInFlight = true;
+      try {
+        if (!(await this._connectAdminTransport(admin, sidechannel))) return;
+        connected = true;
+        if (sidechannel.broadcast(this.channel, message)) sent = true;
+      } catch (_error) {
+        // A later retry makes a fresh direct-admin connection attempt.
+      } finally {
+        attemptInFlight = false;
+      }
+    };
+
+    const retry = setInterval(() => void attempt(), this.retryMs);
     const timeout = setTimeout(() => {
-      const current = this.servicePending.get(requestId);
+      const current = pending.get(requestId);
       if (!current) return;
-      this.servicePending.delete(requestId);
-      current.resolve(relayError('Mayhem service relay timed out before the admin replied.', requestId));
+      pending.delete(requestId);
+      const messageText = !connected ? unavailableMessage : !sent ? unsentMessage : timeoutMessage;
+      current.resolve(relayError(messageText, requestId));
     }, this.timeoutMs);
+    void attempt();
+
     try {
       return await promise;
     } finally {

@@ -39807,7 +39807,18 @@ async fn serve_provider_sessions(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                     ));
-                    handle_provider_session_frame(
+                    let event_session_id = event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            event
+                                .get("frame")
+                                .and_then(|frame| frame.get("session_id"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("")
+                        .to_owned();
+                    if let Err(err) = handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
                         &mut pending_requests,
@@ -39822,7 +39833,19 @@ async fn serve_provider_sessions(
                             .or_else(|| engine_watchdog_reject.clone()),
                         event,
                     )
-                    .await?;
+                    .await
+                    {
+                        provider_session_debug(format!(
+                            "session {event_session_id} failed without stopping provider serving: {err:#}"
+                        ));
+                        discard_provider_session_state(
+                            &mut sessions,
+                            &mut pending_requests,
+                            &mut pending_payloads,
+                            &event_session_id,
+                        );
+                        heartbeat_load.set_active_sessions(sessions.len());
+                    }
                 }
                 Err(BridgeError::Timeout) => {
                     expire_provider_pending_sessions(
@@ -39947,6 +39970,17 @@ fn clear_provider_sessions_after_bridge_drop(
     pending_payloads.clear();
     heartbeat_load.set_active_sessions(0);
     dropped
+}
+
+fn discard_provider_session_state(
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    session_id: &str,
+) {
+    sessions.remove(session_id);
+    pending_requests.remove(session_id);
+    remove_provider_session_pending_payloads(pending_payloads, session_id);
 }
 
 async fn expire_provider_pending_sessions(
@@ -40134,10 +40168,12 @@ async fn handle_provider_session_frame(
                 "handling s.open for session {session_id} from {remote}"
             ));
             provider_session_debug(format!("opening provider side of session {session_id}"));
-            bridge
-                .session_open(&remote, &session_id)
-                .await
-                .context("opening provider side direct session")?;
+            if let Err(err) = open_provider_direct_session(bridge, &remote, &session_id).await {
+                provider_session_debug(format!(
+                    "could not open provider side of session {session_id}; leaving the provider online for a clean client retry: {err:#}"
+                ));
+                return Ok(());
+            }
             provider_session_debug(format!("provider side session {session_id} opened"));
             let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
             let contract = read_contract_catalog(runtime.rpc).await?;
@@ -40608,6 +40644,35 @@ async fn handle_provider_session_frame(
         _ => {}
     }
     Ok(())
+}
+
+async fn open_provider_direct_session(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+) -> Result<()> {
+    match bridge.session_open(remote, session_id).await {
+        Ok(_) => Ok(()),
+        Err(err) if provider_bridge_error_missing_direct_connection(&err) => {
+            provider_session_debug(format!(
+                "direct connection to {remote} disappeared while opening session {session_id}; reconnecting through the official DHT"
+            ));
+            bridge
+                .peer_connect(remote, Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS))
+                .await
+                .context("reconnecting provider to direct session peer")?;
+            bridge
+                .session_open(remote, session_id)
+                .await
+                .context("opening provider side direct session after reconnect")?;
+            Ok(())
+        }
+        Err(err) => Err(err).context("opening provider side direct session"),
+    }
+}
+
+fn provider_bridge_error_missing_direct_connection(error: &BridgeError) -> bool {
+    error.to_string().contains("No direct connection")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53438,6 +53503,68 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(pending_requests.is_empty());
         assert!(pending_payloads.is_empty());
         assert_eq!(load.snapshot(4).active_slots, 0);
+    }
+
+    #[test]
+    fn provider_session_failure_isolated_to_the_failed_session() {
+        let mut sessions = HashMap::new();
+        let mut pending_requests = HashMap::new();
+        let mut pending_payloads = HashMap::new();
+        for id in ["failed", "healthy"] {
+            sessions.insert(
+                id.to_owned(),
+                ActiveProviderSession {
+                    remote: format!("remote-{id}"),
+                    rail: "tap".to_owned(),
+                    user_pubkey: "aa".repeat(32),
+                    session_id: id.to_owned(),
+                    price_ver: 1,
+                    locked_rate_map: text_generation_rate_map(1, 2),
+                    locked_per_req_au: 0,
+                    locked_min_session_au: 0,
+                    served_ctx: 8192,
+                    ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                    ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+                    checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                },
+            );
+            pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
+            pending_payloads.insert(
+                provider_session_payload_key(id, "r1", &"bb".repeat(32)),
+                PendingProviderPayload::default(),
+            );
+        }
+
+        discard_provider_session_state(
+            &mut sessions,
+            &mut pending_requests,
+            &mut pending_payloads,
+            "failed",
+        );
+
+        assert!(!sessions.contains_key("failed"));
+        assert!(!pending_requests.contains_key("failed"));
+        assert!(pending_payloads
+            .keys()
+            .all(|key| !key.starts_with("failed:")));
+        assert!(sessions.contains_key("healthy"));
+        assert!(pending_requests.contains_key("healthy"));
+        assert!(pending_payloads
+            .keys()
+            .any(|key| key.starts_with("healthy:")));
+    }
+
+    #[test]
+    fn provider_direct_session_reconnects_only_for_missing_connection() {
+        assert!(provider_bridge_error_missing_direct_connection(
+            &BridgeError::Protocol(format!(
+                "Session open failed: No direct connection to {}.",
+                "ab".repeat(32)
+            ))
+        ));
+        assert!(!provider_bridge_error_missing_direct_connection(
+            &BridgeError::Protocol("Session open failed: invalid session".to_owned())
+        ));
     }
 
     #[test]
