@@ -66627,13 +66627,7 @@ State initialization...
             })
             .cloned()
             .expect("signed test model must remain in the catalog");
-        let mut dev_a = launch.clone();
-        dev_a["model_id"] = json!("test/signed-text-dev-a");
-        dev_a["tier"] = json!("dev");
-        let mut dev_b = launch.clone();
-        dev_b["model_id"] = json!("test/signed-text-dev-b");
-        dev_b["tier"] = json!("dev");
-        *models = vec![dev_a, dev_b, launch];
+        *models = vec![launch];
         catalog["catalog_id"] = json!("mayhem-test-signed-catalog");
         write_json_file(path, &catalog).unwrap();
     }

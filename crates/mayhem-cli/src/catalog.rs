@@ -456,9 +456,6 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         canary_sets.insert(model.canary.set_id.clone());
         validate_model(model, &mut errors);
     }
-    if dev_model_count < 2 {
-        errors.push("catalog must contain at least two dev entries".to_owned());
-    }
     if launch_model_count < 1 {
         errors.push("catalog must contain at least one launch entry".to_owned());
     }
