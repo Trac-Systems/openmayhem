@@ -21559,8 +21559,11 @@ fn write_up_supervisor_config(plan: &UpPlan) -> Result<()> {
     if let Some(parent) = plan.supervisor_config_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(&plan.supervisor_config_path, up_supervisor_config(plan)?)
-        .with_context(|| format!("writing {}", plan.supervisor_config_path.display()))
+    write_private_file(
+        &plan.supervisor_config_path,
+        up_supervisor_config(plan)?.as_bytes(),
+    )
+    .with_context(|| format!("writing {}", plan.supervisor_config_path.display()))
 }
 
 fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
@@ -26537,7 +26540,7 @@ fn merge_mayhem_opencode_config(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&root)?)
+    write_private_file(path, &serde_json::to_vec_pretty(&root)?)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(OpencodeMergeReport {
         path: path.to_path_buf(),
@@ -45604,9 +45607,31 @@ fn write_config_toml_value(path: &Path, value: &toml::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(path, toml::to_string_pretty(value)?)
+    write_private_file(path, toml::to_string_pretty(value)?.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 fn canonical_config_key(key: &str) -> Result<&'static str> {
@@ -46276,7 +46301,7 @@ fn write_config(
         toml_string(rpc_url),
         toml_string(DEFAULT_GATEWAY_URL),
     );
-    fs::write(&config_path, contents)
+    write_private_file(&config_path, contents.as_bytes())
         .with_context(|| format!("writing {}", config_path.display()))?;
     Ok(config_path)
 }
@@ -56678,6 +56703,12 @@ State initialization...
         assert!(first.starts_with("sk-mayhem-"));
         merge_mayhem_opencode_config(&config_path, "http://127.0.0.1:11435", None, false, &first)
             .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let second = ensure_opencode_gateway_token(&home, &config_path).unwrap();
         assert_eq!(second, first);
 
@@ -56688,6 +56719,26 @@ State initialization...
         assert_eq!(store.tokens.len(), 1);
         assert_eq!(store.tokens[0].name, OPENCODE_GATEWAY_TOKEN_NAME);
         assert_eq!(store.tokens[0].token_hash, gateway_token_hash(&first));
+
+        let mut revoked = store;
+        revoked.tokens[0].revoked_at = Some(unix_epoch_seconds().unwrap());
+        write_gateway_token_store(&store_path, &revoked).unwrap();
+        let replacement = ensure_opencode_gateway_token(&home, &config_path).unwrap();
+        assert_ne!(replacement, first);
+        merge_mayhem_opencode_config(
+            &config_path,
+            "http://127.0.0.1:11435",
+            None,
+            false,
+            &replacement,
+        )
+        .unwrap();
+        assert_eq!(
+            read_opencode_gateway_token(&config_path)
+                .unwrap()
+                .as_deref(),
+            Some(replacement.as_str())
+        );
 
         let _ = fs::remove_dir_all(home);
     }
@@ -59929,6 +59980,40 @@ State initialization...
         assert!(!text.contains("--enclave"));
         assert!(!text.contains("--gpu-layers"));
         assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn up_runtime_configs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_temp_dir("mayhem-up-private-config");
+        let plan = test_up_supervisor_plan(home.clone(), Vec::new());
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&plan.supervisor_config_path, "stale").unwrap();
+        fs::set_permissions(
+            &plan.supervisor_config_path,
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        write_up_supervisor_config(&plan).unwrap();
+        let supervisor_mode = fs::metadata(&plan.supervisor_config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(supervisor_mode, 0o600);
+
+        let config = toml::Value::Table(toml::map::Map::new());
+        write_config_toml_value(&plan.config_path, &config).unwrap();
+        let config_mode = fs::metadata(&plan.config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o600);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -139,6 +139,73 @@ struct ChildState {
     last_error: Option<String>,
 }
 
+const REDACTED_ARGUMENT: &str = "[REDACTED]";
+
+fn sensitive_argument_flag(value: &str) -> bool {
+    let normalized = value
+        .trim_start_matches('-')
+        .replace('_', "-")
+        .to_ascii_lowercase();
+    normalized == "password"
+        || normalized.ends_with("-password")
+        || normalized == "token"
+        || normalized.ends_with("-token")
+        || normalized == "secret"
+        || normalized.ends_with("-secret")
+        || normalized == "api-key"
+        || normalized.ends_with("-api-key")
+        || normalized == "private-key"
+        || normalized.ends_with("-private-key")
+        || normalized == "credential"
+        || normalized.ends_with("-credential")
+}
+
+fn url_contains_credentials(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let authority_start = scheme_end + 3;
+    let suffix = &value[authority_start..];
+    let authority_end = suffix
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(suffix.len());
+    if suffix[..authority_end].contains('@') {
+        return true;
+    }
+    let Some((_, query)) = value.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|field| {
+        let name = field.split_once('=').map_or(field, |(name, _)| name);
+        sensitive_argument_flag(name)
+    })
+}
+
+fn redact_child_args(args: &[String]) -> Vec<String> {
+    let mut redact_next = false;
+    args.iter()
+        .map(|arg| {
+            if redact_next {
+                redact_next = false;
+                return REDACTED_ARGUMENT.to_owned();
+            }
+            if let Some((flag, _)) = arg.split_once('=') {
+                if flag.starts_with('-') && sensitive_argument_flag(flag) {
+                    return format!("{flag}={REDACTED_ARGUMENT}");
+                }
+            }
+            if arg.starts_with('-') && sensitive_argument_flag(arg) {
+                redact_next = true;
+                return arg.clone();
+            }
+            if url_contains_credentials(arg) {
+                return "[REDACTED_URL]".to_owned();
+            }
+            arg.clone()
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct SupervisorRuntime {
     state: Arc<Mutex<SupervisorState>>,
@@ -802,7 +869,8 @@ impl SupervisorRuntime {
         if let Some(parent) = self.state_file.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        fs::write(&self.state_file, serde_json::to_vec_pretty(&snapshot)?)
+        let bytes = serde_json::to_vec_pretty(&snapshot)?;
+        write_private_file(&self.state_file, &bytes)
             .with_context(|| format!("writing {}", self.state_file.display()))?;
         Ok(())
     }
@@ -947,7 +1015,7 @@ impl ChildConfig {
         ChildState {
             name: self.name.clone(),
             command: self.command.clone(),
-            args: self.args.clone(),
+            args: redact_child_args(&self.args),
             pid: None,
             running: false,
             restart: self.restart,
@@ -961,6 +1029,28 @@ impl ChildConfig {
             last_exit: None,
             last_error: None,
         }
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)?;
+        Ok(())
     }
 }
 
@@ -1219,6 +1309,63 @@ mod tests {
         assert!(!state.running);
         assert_eq!(state.command, "pear");
         assert_eq!(state.args, ["run", "intercom"]);
+    }
+
+    #[test]
+    fn supervisor_state_redacts_credentials_without_changing_launch_config() {
+        let child = ChildConfig {
+            name: "peer".to_owned(),
+            command: "pear-runtime".to_owned(),
+            args: vec![
+                "run".to_owned(),
+                ".".to_owned(),
+                "--sc-bridge-token".to_owned(),
+                "bridge-secret".to_owned(),
+                "--wallet-password=hunter2".to_owned(),
+                "https://user:pass@example.test/path".to_owned(),
+                "https://example.test/path?api_key=query-secret".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            restart: true,
+            restart_backoff_ms: 1_000,
+            restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
+            crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+        };
+
+        let state = child.initial_state();
+        assert_eq!(child.args[3], "bridge-secret");
+        assert_eq!(state.args[3], REDACTED_ARGUMENT);
+        assert_eq!(state.args[4], "--wallet-password=[REDACTED]");
+        assert_eq!(state.args[5], "[REDACTED_URL]");
+        assert_eq!(state.args[6], "[REDACTED_URL]");
+        let serialized = serde_json::to_string(&state).unwrap();
+        for secret in ["bridge-secret", "hunter2", "user:pass", "query-secret"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_supervisor_state_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp =
+            env::temp_dir().join(format!("mayhemd-private-state-test-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let runtime = test_runtime(&temp, &[]);
+        fs::write(&runtime.state_file, b"stale").unwrap();
+        fs::set_permissions(&runtime.state_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        runtime.persist_state().await.unwrap();
+
+        let mode = fs::metadata(&runtime.state_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn long_running_test_child(name: &str) -> ChildConfig {
