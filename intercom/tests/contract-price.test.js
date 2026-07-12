@@ -31,6 +31,7 @@ const providerJoin = {
   enclave_id: enclaveId,
   served_ctx: 32768,
   served_modalities: ['text'],
+  served_specialities: {},
   ctx_bracket: priceCtxBracket,
   ctx_bracket_table_ver: priceCtxBracketTableVer,
 };
@@ -71,6 +72,7 @@ const enclaveRegistration = {
     tools: false,
     ctx: 32768,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 
@@ -339,6 +341,7 @@ test('MayhemContract bills multimodal LLM input through token rates only', async
       audio: true,
       video: true,
       modality_set: ['text', 'image', 'audio', 'video'],
+      speciality_levels: {},
     },
   });
 
@@ -1131,6 +1134,7 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
       output_modality: 'image',
       output_modalities: ['image'],
       modality_set: ['image'],
+      speciality_levels: {},
     },
   };
 

@@ -312,6 +312,7 @@ const ENCLAVE_CAP_FIELDS = new Set([
   'output_modality',
   'output_modalities',
   'modality_set',
+  'speciality_levels',
 ]);
 const ROOM_POLICY_FIELDS = new Set([
   'region_hint',
@@ -367,6 +368,10 @@ const canonicalSpendVoucherBody = (body) => {
   if (Array.isArray(body.required_modalities) && body.required_modalities.length > 0) {
     canonical.required_modalities = body.required_modalities;
   }
+  if (body.required_specialities && typeof body.required_specialities === 'object' &&
+      !Array.isArray(body.required_specialities) && Object.keys(body.required_specialities).length > 0) {
+    canonical.required_specialities = body.required_specialities;
+  }
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.max_spend_au = body.max_spend_au;
@@ -395,6 +400,10 @@ const canonicalReceiptBody = (body) => {
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
   canonical.usage = body.usage;
+  if (body.usage_attribution && typeof body.usage_attribution === 'object' &&
+      !Array.isArray(body.usage_attribution) && Object.keys(body.usage_attribution).length > 0) {
+    canonical.usage_attribution = body.usage_attribution;
+  }
   canonical.au_owed_cum = body.au_owed_cum;
   canonical.prompt_hash = body.prompt_hash;
   canonical.ts = body.ts;
@@ -420,24 +429,36 @@ export const spendVoucherMessage = (body, signingVersion = SIGNING_MESSAGE_VERSI
     body: canonicalSpendVoucherBody(body),
   });
 };
-export const spendReservationEvidence = (value) => ({
-  contract_version: value.contract_version,
-  session_id: value.session_id,
-  epoch: value.epoch,
-  at: value.at,
-  rail: value.rail,
-  user: value.user,
-  provider: value.provider,
-  enclave_id: value.enclave_id,
-  price_ver: value.price_ver,
-  rules_ver: value.rules_ver,
-  served_ctx: value.served_ctx,
-  required_modalities: value.required_modalities,
-  ctx_bracket: value.ctx_bracket,
-  ctx_bracket_table_ver: value.ctx_bracket_table_ver,
-  max_spend_au: value.max_spend_au,
-  voucher: stableValue(value.voucher),
-});
+export const spendReservationEvidence = (value) => {
+  const voucher = stableValue(value.voucher);
+  if (voucher?.required_specialities && typeof voucher.required_specialities === 'object' &&
+      !Array.isArray(voucher.required_specialities) && Object.keys(voucher.required_specialities).length === 0) {
+    delete voucher.required_specialities;
+  }
+  const evidence = {
+    contract_version: value.contract_version,
+    session_id: value.session_id,
+    epoch: value.epoch,
+    at: value.at,
+    rail: value.rail,
+    user: value.user,
+    provider: value.provider,
+    enclave_id: value.enclave_id,
+    price_ver: value.price_ver,
+    rules_ver: value.rules_ver,
+    served_ctx: value.served_ctx,
+    required_modalities: value.required_modalities,
+    ctx_bracket: value.ctx_bracket,
+    ctx_bracket_table_ver: value.ctx_bracket_table_ver,
+    max_spend_au: value.max_spend_au,
+    voucher,
+  };
+  if (value.required_specialities && typeof value.required_specialities === 'object' &&
+      !Array.isArray(value.required_specialities) && Object.keys(value.required_specialities).length > 0) {
+    evidence.required_specialities = value.required_specialities;
+  }
+  return evidence;
+};
 export const spendReservationMessage = (value) =>
   `mayhem-spend-reservation-v1${stableJson(spendReservationEvidence(value))}`;
 export const probeResultEvidence = (value, auditor) => ({
@@ -1351,6 +1372,7 @@ class MayhemContract extends Contract {
           {
             served_ctx: intent.served_ctx,
             served_modalities: intent.served_modalities,
+            served_specialities: intent.served_specialities,
             ctx_bracket: intent.ctx_bracket,
             ctx_bracket_table_ver: intent.ctx_bracket_table_ver,
           }
@@ -1459,6 +1481,7 @@ class MayhemContract extends Contract {
         this.compareAu(existing.locked_min_session_au, normalized.locked_min_session_au) !== 0 ||
         existing.served_ctx !== normalized.served_ctx ||
         stableJson(existing.required_modalities) !== stableJson(normalized.required_modalities) ||
+        stableJson(existing.required_specialities) !== stableJson(normalized.required_specialities) ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
         this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
@@ -1499,6 +1522,7 @@ class MayhemContract extends Contract {
       locked_min_session_au: normalized.locked_min_session_au,
       served_ctx: normalized.served_ctx,
       required_modalities: normalized.required_modalities.slice(),
+      required_specialities: cloneValue(normalized.required_specialities),
       ctx_bracket: normalized.ctx_bracket,
       ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
@@ -2802,7 +2826,7 @@ class MayhemContract extends Contract {
 
   async joinEnclave() {
     const shapeError = this.validateExactCommandValue(
-      ['op', 'enclave_id', 'served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver'],
+      ['op', 'enclave_id', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver'],
       'join_enclave',
       ['hardware_fingerprint', 'device_key']
     );
@@ -2818,6 +2842,7 @@ class MayhemContract extends Contract {
       {
         served_ctx: this.value.served_ctx,
         served_modalities: this.value.served_modalities,
+        served_specialities: this.value.served_specialities,
         ctx_bracket: this.value.ctx_bracket,
         ctx_bracket_table_ver: this.value.ctx_bracket_table_ver,
       }
@@ -6573,6 +6598,7 @@ class MayhemContract extends Contract {
                 'nonce',
                 'served_ctx',
                 'served_modalities',
+                'served_specialities',
                 'ctx_bracket',
                 'ctx_bracket_table_ver',
                 'hardware_fingerprint',
@@ -6580,7 +6606,7 @@ class MayhemContract extends Contract {
               ]
             : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
-      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver']
+      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver']
       : allowed;
     const allowedSet = new Set(allowed);
     const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
@@ -6607,6 +6633,14 @@ class MayhemContract extends Contract {
     if (hasOwn(intent, 'served_modalities')) {
       const modalitiesError = this.validateModalitySet(intent.served_modalities, 'provider served_modalities');
       if (modalitiesError) return modalitiesError;
+    }
+    if (hasOwn(intent, 'served_specialities')) {
+      const specialitiesError = this.validateSpecialityLevelMap(
+        intent.served_specialities,
+        'provider served_specialities',
+        { allowEmpty: true }
+      );
+      if (specialitiesError) return specialitiesError;
     }
     if (
       hasOwn(intent, 'ctx_bracket') &&
@@ -6642,7 +6676,7 @@ class MayhemContract extends Contract {
     if (!terms || typeof terms !== 'object' || Array.isArray(terms)) {
       return new Error(`${label} terms must be an object.`);
     }
-    for (const field of ['served_ctx', 'served_modalities', 'ctx_bracket', 'ctx_bracket_table_ver']) {
+    for (const field of ['served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver']) {
       if (!hasOwn(terms, field)) return new Error(`${label} terms are missing ${field}.`);
     }
     if (!Number.isSafeInteger(terms.served_ctx) || terms.served_ctx < 0) {
@@ -6668,6 +6702,29 @@ class MayhemContract extends Contract {
     if ([...coreModalities].some((modality) => !terms.served_modalities.includes(modality))) {
       return new Error(`${label} cannot disable a core model modality.`);
     }
+    const enclaveSpecialitiesError = this.validateSpecialityLevelMap(
+      enclave.caps?.speciality_levels,
+      'admin enclave speciality_levels',
+      { allowEmpty: true }
+    );
+    if (enclaveSpecialitiesError) return enclaveSpecialitiesError;
+    const servedSpecialitiesError = this.validateSpecialityLevelMap(
+      terms.served_specialities,
+      `${label} served_specialities`,
+      { allowEmpty: true }
+    );
+    if (servedSpecialitiesError) return servedSpecialitiesError;
+    const adminSpecialityNames = Object.keys(enclave.caps.speciality_levels).sort(compareCodepoint);
+    const servedSpecialityNames = Object.keys(terms.served_specialities).sort(compareCodepoint);
+    if (stableJson(servedSpecialityNames) !== stableJson(adminSpecialityNames)) {
+      return new Error(`${label} served_specialities must cover exactly the admin enclave speciality names.`);
+    }
+    for (const name of adminSpecialityNames) {
+      const available = new Set(enclave.caps.speciality_levels[name]);
+      if (terms.served_specialities[name].some((level) => !available.has(level))) {
+        return new Error(`${label} served_specialities ${name} must be a subset of the admin enclave levels.`);
+      }
+    }
     const table = terms.ctx_bracket_table_ver === null || terms.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableByVersion(terms.ctx_bracket_table_ver);
@@ -6684,6 +6741,11 @@ class MayhemContract extends Contract {
     return {
       served_ctx: terms.served_ctx,
       served_modalities: terms.served_modalities.slice(),
+      served_specialities: Object.fromEntries(
+        Object.entries(terms.served_specialities)
+          .sort(([left], [right]) => compareCodepoint(left, right))
+          .map(([name, levels]) => [name, levels.slice()])
+      ),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
     };
@@ -6709,6 +6771,27 @@ class MayhemContract extends Contract {
     const servedModalities = new Set(serve.served_modalities);
     if (normalized.required_modalities.some((modality) => !servedModalities.has(modality))) {
       return new Error('Provider committed modalities do not cover the spend reservation.');
+    }
+    const servedSpecialitiesError = this.validateSpecialityLevelMap(
+      serve.served_specialities,
+      'provider committed served_specialities',
+      { allowEmpty: true }
+    );
+    if (servedSpecialitiesError) return servedSpecialitiesError;
+    const requiredSpecialitiesError = this.validateSpecialitySelection(
+      normalized.required_specialities,
+      'spend reservation required_specialities'
+    );
+    if (requiredSpecialitiesError) return requiredSpecialitiesError;
+    const servedSpecialityNames = Object.keys(serve.served_specialities).sort(compareCodepoint);
+    const requiredSpecialityNames = Object.keys(normalized.required_specialities).sort(compareCodepoint);
+    if (stableJson(servedSpecialityNames) !== stableJson(requiredSpecialityNames)) {
+      return new Error('Spend reservation must bind every provider committed speciality.');
+    }
+    for (const [name, level] of Object.entries(normalized.required_specialities)) {
+      if (!serve.served_specialities[name].includes(level)) {
+        return new Error('Provider committed specialities do not cover the spend reservation.');
+      }
     }
     if ((serve.ctx_bracket ?? null) !== (normalized.ctx_bracket ?? null)) {
       return new Error('Spend reservation context bracket does not match provider committed context.');
@@ -7127,6 +7210,12 @@ class MayhemContract extends Contract {
     }
     const modalitySetError = this.validateModalitySet(caps.modality_set, 'Enclave caps modality_set');
     if (modalitySetError) return modalitySetError;
+    const specialityLevelsError = this.validateSpecialityLevelMap(
+      caps.speciality_levels,
+      'Enclave caps speciality_levels',
+      { allowEmpty: true }
+    );
+    if (specialityLevelsError) return specialityLevelsError;
     const coreModalities = this.coreModalitiesForModelClass(modelClass);
     if ([...coreModalities].some((modality) => !caps.modality_set.includes(modality))) {
       return new Error(`Enclave caps modality_set is missing a core modality for model_class ${modelClass}.`);
@@ -7196,6 +7285,54 @@ class MayhemContract extends Contract {
       }
       if (seen.has(modality)) return new Error(`${label} contains duplicate modality ${modality}.`);
       seen.add(modality);
+    }
+    return null;
+  }
+
+  validateSpecialityLevelMap(value, label, { allowEmpty = false } = {}) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error(`${label} must be an object.`);
+    }
+    const names = Object.keys(value);
+    if ((!allowEmpty && names.length === 0) || names.length > 16) {
+      return new Error(`${label} must contain between ${allowEmpty ? 0 : 1} and 16 specialities.`);
+    }
+    for (const name of names) {
+      if (!this.isSafeKeyPart(name) || name.length > 128) {
+        return new Error(`${label} contains invalid speciality ${String(name)}.`);
+      }
+      const levels = value[name];
+      if (!Array.isArray(levels) || levels.length === 0 || levels.length > 16) {
+        return new Error(`${label} ${name} must contain between 1 and 16 levels.`);
+      }
+      const seen = new Set();
+      for (const level of levels) {
+        if (typeof level !== 'string' || !this.isSafeKeyPart(level) || level.length > 128) {
+          return new Error(`${label} ${name} contains an invalid level.`);
+        }
+        if (seen.has(level)) return new Error(`${label} ${name} contains duplicate level ${level}.`);
+        seen.add(level);
+      }
+    }
+    return null;
+  }
+
+  validateSpecialitySelection(value, label, { allowEmpty = true } = {}) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error(`${label} must be an object.`);
+    }
+    const names = Object.keys(value);
+    if ((!allowEmpty && names.length === 0) || names.length > 16) {
+      return new Error(`${label} must contain between ${allowEmpty ? 0 : 1} and 16 specialities.`);
+    }
+    for (const name of names) {
+      const level = value[name];
+      if (!this.isSafeKeyPart(name) || name.length > 128) {
+        return new Error(`${label} contains an invalid speciality name.`);
+      }
+      if (typeof level !== 'string' || !this.isSafeKeyPart(level) || level.length > 128) {
+        return new Error(`${label} ${name} contains an invalid level.`);
+      }
     }
     return null;
   }
@@ -8214,24 +8351,26 @@ class MayhemContract extends Contract {
   }
 
   async normalizeSpendVoucherForReserve(voucher) {
+    const voucherFields = [
+      'session_id',
+      'rail',
+      'enclave_id',
+      'price_ver',
+      'locked_rate_map',
+      'locked_per_req_au',
+      'locked_min_session_au',
+      'served_ctx',
+      'required_modalities',
+      'ctx_bracket',
+      'ctx_bracket_table_ver',
+      'max_spend_au',
+      'checkpoint_every',
+      'user_sig',
+    ];
+    if (hasOwn(voucher, 'required_specialities')) voucherFields.push('required_specialities');
     const shapeError = this.validateExactObjectKeys(
       voucher,
-      [
-        'session_id',
-        'rail',
-        'enclave_id',
-        'price_ver',
-        'locked_rate_map',
-        'locked_per_req_au',
-        'locked_min_session_au',
-        'served_ctx',
-        'required_modalities',
-        'ctx_bracket',
-        'ctx_bracket_table_ver',
-        'max_spend_au',
-        'checkpoint_every',
-        'user_sig',
-      ],
+      voucherFields,
       'spend voucher'
     );
     if (shapeError) return shapeError;
@@ -8266,6 +8405,15 @@ class MayhemContract extends Contract {
       'spend voucher required_modalities'
     );
     if (modalityError) return modalityError;
+    const requiredSpecialities = voucher.required_specialities ?? {};
+    const specialitiesError = this.validateSpecialitySelection(
+      requiredSpecialities,
+      'spend voucher required_specialities'
+    );
+    if (specialitiesError) return specialitiesError;
+    const normalizedSpecialities = Object.fromEntries(
+      Object.entries(requiredSpecialities).sort(([left], [right]) => compareCodepoint(left, right))
+    );
     const table = voucher.ctx_bracket_table_ver === null || voucher.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
@@ -8300,6 +8448,7 @@ class MayhemContract extends Contract {
       locked_min_session_au: lockedMinSessionAu,
       served_ctx: voucher.served_ctx,
       required_modalities: voucher.required_modalities.slice(),
+      required_specialities: normalizedSpecialities,
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       max_spend_au: maxSpendAu,
@@ -8316,28 +8465,30 @@ class MayhemContract extends Contract {
   }
 
   async normalizeSpendReserveValue(value) {
+    const reserveFields = [
+      'op',
+      'contract_version',
+      'session_id',
+      'epoch',
+      'at',
+      'rail',
+      'user',
+      'provider',
+      'enclave_id',
+      'price_ver',
+      'rules_ver',
+      'served_ctx',
+      'required_modalities',
+      'ctx_bracket',
+      'ctx_bracket_table_ver',
+      'max_spend_au',
+      'voucher',
+      'provider_sig',
+    ];
+    if (hasOwn(value, 'required_specialities')) reserveFields.push('required_specialities');
     const shapeError = this.validateExactObjectKeys(
       value,
-      [
-        'op',
-        'contract_version',
-        'session_id',
-        'epoch',
-        'at',
-        'rail',
-        'user',
-        'provider',
-        'enclave_id',
-        'price_ver',
-        'rules_ver',
-        'served_ctx',
-        'required_modalities',
-        'ctx_bracket',
-        'ctx_bracket_table_ver',
-        'max_spend_au',
-        'voucher',
-        'provider_sig',
-      ],
+      reserveFields,
       'spend reservation feature'
     );
     if (shapeError) return shapeError;
@@ -8365,6 +8516,15 @@ class MayhemContract extends Contract {
       'spend reservation required_modalities'
     );
     if (modalityError) return modalityError;
+    const requiredSpecialities = value.required_specialities ?? {};
+    const specialitiesError = this.validateSpecialitySelection(
+      requiredSpecialities,
+      'spend reservation required_specialities'
+    );
+    if (specialitiesError) return specialitiesError;
+    const normalizedSpecialities = Object.fromEntries(
+      Object.entries(requiredSpecialities).sort(([left], [right]) => compareCodepoint(left, right))
+    );
     const activeTable = value.ctx_bracket_table_ver === null || value.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableAt(value.at);
@@ -8406,6 +8566,9 @@ class MayhemContract extends Contract {
     if (stableJson(voucher.body.required_modalities) !== stableJson(value.required_modalities)) {
       return new Error('Spend reservation voucher required modalities mismatch.');
     }
+    if (stableJson(voucher.body.required_specialities) !== stableJson(normalizedSpecialities)) {
+      return new Error('Spend reservation voucher required specialities mismatch.');
+    }
     if (voucher.body.ctx_bracket !== value.ctx_bracket) {
       return new Error('Spend reservation voucher context bracket mismatch.');
     }
@@ -8431,6 +8594,7 @@ class MayhemContract extends Contract {
       locked_min_session_au: voucher.body.locked_min_session_au,
       served_ctx: value.served_ctx,
       required_modalities: value.required_modalities.slice(),
+      required_specialities: normalizedSpecialities,
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
@@ -8445,6 +8609,7 @@ class MayhemContract extends Contract {
         locked_min_session_au: voucher.body.locked_min_session_au,
         served_ctx: voucher.body.served_ctx,
         required_modalities: voucher.body.required_modalities,
+        required_specialities: voucher.body.required_specialities,
         ctx_bracket: voucher.body.ctx_bracket,
         ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
         max_spend_au: voucher.body.max_spend_au,
@@ -8515,6 +8680,11 @@ class MayhemContract extends Contract {
         'spend hold required_modalities'
       );
       if (modalityError) return modalityError;
+      const specialitiesError = this.validateSpecialitySelection(
+        session.required_specialities ?? {},
+        'spend hold required_specialities'
+      );
+      if (specialitiesError) return specialitiesError;
       const table = session.ctx_bracket_table_ver === null || session.ctx_bracket_table_ver === undefined
         ? null
         : await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
@@ -8542,6 +8712,7 @@ class MayhemContract extends Contract {
         locked_per_req_au: this.normalizeAu(session.locked_per_req_au, 'spend hold locked per-request price'),
         locked_min_session_au: this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price'),
         required_modalities: session.required_modalities.slice(),
+        required_specialities: cloneValue(session.required_specialities ?? {}),
         max_spend_au: this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false }),
       })),
     };
@@ -9822,6 +9993,25 @@ class MayhemContract extends Contract {
     return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => compareCodepoint(left, right)));
   }
 
+  normalizeReceiptUsageAttribution(source) {
+    if (source === undefined || source === null) return {};
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+      return new Error('Receipt usage attribution must be an object.');
+    }
+    const allowed = new Set(['reasoning_output_tokens', 'vision_input_tokens']);
+    const normalized = {};
+    for (const [axis, count] of Object.entries(source)) {
+      if (!allowed.has(axis)) return new Error(`Unsupported receipt usage attribution ${axis}.`);
+      if (!Number.isSafeInteger(count) || count < 0) {
+        return new Error('Invalid receipt usage attribution count.');
+      }
+      if (count > 0) normalized[axis] = count;
+    }
+    return Object.fromEntries(
+      Object.entries(normalized).sort(([left], [right]) => compareCodepoint(left, right))
+    );
+  }
+
   async normalizeReceiptEnvelope(value, options = {}) {
     const targetSchemaVersion = options.targetSchemaVersion ?? SESSION_RECEIPT_SCHEMA_VERSION;
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -9853,6 +10043,9 @@ class MayhemContract extends Contract {
       prompt_hash: bodySource.prompt_hash,
       ts: bodySource.ts,
     };
+    if (hasOwn(bodySource, 'usage_attribution')) {
+      body.usage_attribution = cloneValue(bodySource.usage_attribution);
+    }
     if (hasOwn(bodySource, 'locked_per_req_au')) body.locked_per_req_au = bodySource.locked_per_req_au;
     if (hasOwn(bodySource, 'locked_min_session_au')) body.locked_min_session_au = bodySource.locked_min_session_au;
     if (hasOwn(bodySource, 'served_ctx')) body.served_ctx = bodySource.served_ctx;
@@ -9937,6 +10130,17 @@ class MayhemContract extends Contract {
     if (usage instanceof Error) return usage;
     if (stableJson(usage) !== stableJson(body.usage)) {
       return new Error('Receipt usage must be canonical.');
+    }
+    const usageAttribution = this.normalizeReceiptUsageAttribution(body.usage_attribution);
+    if (usageAttribution instanceof Error) return usageAttribution;
+    if (stableJson(usageAttribution) !== stableJson(body.usage_attribution ?? {})) {
+      return new Error('Receipt usage attribution must be canonical.');
+    }
+    if ((usageAttribution.reasoning_output_tokens ?? 0) > (usage.output_token ?? 0)) {
+      return new Error('Receipt reasoning attribution exceeds billed output tokens.');
+    }
+    if ((usageAttribution.vision_input_tokens ?? 0) > (usage.input_token ?? 0)) {
+      return new Error('Receipt vision attribution exceeds billed input tokens.');
     }
     const auOwedCum = this.normalizeAu(body.au_owed_cum, 'receipt cumulative amount');
     if (auOwedCum instanceof Error) {

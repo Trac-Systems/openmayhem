@@ -26,6 +26,7 @@ const providerJoinFor = (targetEnclaveId) => ({
   enclave_id: targetEnclaveId,
   served_ctx: 32768,
   served_modalities: ['text'],
+  served_specialities: {},
   ctx_bracket: 'le32k',
   ctx_bracket_table_ver: 1,
 });
@@ -52,6 +53,7 @@ const enclaveRegistration = {
     tools: false,
     ctx: 32768,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 

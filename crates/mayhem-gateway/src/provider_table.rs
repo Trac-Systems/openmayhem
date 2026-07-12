@@ -4,8 +4,8 @@ use mayhem_proto::{MoneyAu, ReceiptUsage};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    priced_usage_au, text_usage_au, HeartbeatCaps, ProviderHeartbeat, ProviderProbation,
-    RateMapEntry,
+    priced_usage_au, rate_gate_basis_au, text_usage_au, HeartbeatCaps, ProviderHeartbeat,
+    ProviderProbation, RateMapEntry,
 };
 
 pub const DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS: u64 = 60_000;
@@ -146,6 +146,8 @@ pub struct RequestRequirements {
     pub requires_vision: bool,
     #[serde(default)]
     pub required_modalities: Vec<String>,
+    #[serde(default)]
+    pub required_specialities: BTreeMap<String, String>,
     pub modality_load: BTreeMap<String, ModalityRequestLoad>,
     pub min_ctx: u32,
     pub input_tokens: u64,
@@ -184,6 +186,7 @@ pub enum IneligibilityReason {
     Draining,
     Saturated,
     Capabilities,
+    Speciality,
     ModalityCapacity,
     Price,
     ProviderMinAsk,
@@ -298,6 +301,7 @@ impl Default for RequestRequirements {
             requires_json: false,
             requires_vision: false,
             required_modalities: Vec::new(),
+            required_specialities: BTreeMap::new(),
             modality_load: BTreeMap::new(),
             min_ctx: 0,
             input_tokens: 0,
@@ -653,6 +657,21 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Capabilities);
     }
+    if request.required_specialities.iter().any(|(name, level)| {
+        !heartbeat
+            .caps
+            .served_specialities
+            .get(name)
+            .is_some_and(|levels| levels.contains(level))
+            || !entry
+                .contract
+                .caps
+                .served_specialities
+                .get(name)
+                .is_some_and(|levels| levels.contains(level))
+    }) {
+        return Err(IneligibilityReason::Speciality);
+    }
     for modality in request
         .required_modalities
         .iter()
@@ -685,13 +704,18 @@ pub fn evaluate_eligibility(
         return Err(IneligibilityReason::ModalityCapacity);
     }
     let estimated_price_au = estimate_request_price_au(&entry.contract, request);
+    let market_rate_au = rate_gate_basis_au(
+        &entry.contract.rate_map,
+        entry.contract.per_req_au,
+        entry.contract.min_session_au,
+    );
     if request
         .max_price_au
-        .is_some_and(|max_price_au| estimated_price_au > max_price_au)
+        .is_some_and(|max_price_au| market_rate_au > max_price_au)
     {
         return Err(IneligibilityReason::Price);
     }
-    if MoneyAu::from(heartbeat.min_ask_au) > estimated_price_au {
+    if MoneyAu::from(heartbeat.min_ask_au) > market_rate_au {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
     if let Some(floor) = request
@@ -1156,6 +1180,7 @@ mod tests {
             ctx: 8192,
             vision: false,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacity: BTreeMap::new(),
         }
     }
@@ -1352,7 +1377,7 @@ mod tests {
             input_tokens: 6,
             output_tokens: 0,
             usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 6)]),
-            max_price_au: Some(2_000),
+            max_price_au: Some(250_000),
             ..eligible_request(now + 1)
         };
 
@@ -1360,6 +1385,47 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    #[test]
+    fn rate_band_gates_do_not_change_with_request_volume() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        let mut low_volume = eligible_request(now + 1);
+        low_volume.usage = ReceiptUsage::text(1, 1);
+        low_volume.input_tokens = 1;
+        low_volume.output_tokens = 1;
+        low_volume.max_price_au = Some(85);
+        let mut high_volume = low_volume.clone();
+        high_volume.usage = ReceiptUsage::text(1_000_000, 1_000_000);
+        high_volume.input_tokens = 1_000_000;
+        high_volume.output_tokens = 1_000_000;
+
+        assert_eq!(evaluate_eligibility(&entry, &low_volume), Ok(1));
+        assert_eq!(evaluate_eligibility(&entry, &high_volume), Ok(80_000));
+
+        low_volume.max_price_au = Some(84);
+        high_volume.max_price_au = Some(84);
+        assert_eq!(
+            evaluate_eligibility(&entry, &low_volume),
+            Err(IneligibilityReason::Price)
+        );
+        assert_eq!(
+            evaluate_eligibility(&entry, &high_volume),
+            Err(IneligibilityReason::Price)
+        );
+
+        low_volume.max_price_au = Some(85);
+        high_volume.max_price_au = Some(85);
+        entry.heartbeat.as_mut().unwrap().min_ask_au = 86;
+        assert_eq!(
+            evaluate_eligibility(&entry, &low_volume),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
+        assert_eq!(
+            evaluate_eligibility(&entry, &high_volume),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
     }
 
     #[test]
@@ -1775,7 +1841,7 @@ mod tests {
             .heartbeat
             .as_mut()
             .expect("heartbeat")
-            .min_ask_au = 81;
+            .min_ask_au = 86;
         assert_eq!(
             evaluate_eligibility(&ask_limited, &request),
             Err(IneligibilityReason::ProviderMinAsk)
@@ -1784,7 +1850,7 @@ mod tests {
             .heartbeat
             .as_mut()
             .expect("heartbeat")
-            .min_ask_au = 80;
+            .min_ask_au = 85;
         assert_eq!(evaluate_eligibility(&ask_limited, &request), Ok(80));
 
         let mut throughput_limited = request.clone();

@@ -50,6 +50,7 @@ const cleanExitEnclave = {
     tools: false,
     ctx: 8192,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 const cleanExitModelRef = {
@@ -374,6 +375,7 @@ test('MayhemContract tnkSettlement releases clean-exit provider earnings after h
       enclave_id: cleanExitEnclaveId,
       served_ctx: 8192,
       served_modalities: ['text'],
+      served_specialities: {},
       ctx_bracket: 'le8k',
       ctx_bracket_table_ver: 1,
     },

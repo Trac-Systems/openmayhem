@@ -49,6 +49,75 @@ def required_sampling_kwargs(callable_obj, kwargs, requested):
     return accepted
 
 
+def speciality_maps(payload):
+    template_kwargs = {}
+    sampling_kwargs = {}
+    prompt_suffixes = []
+    seen_names = set()
+    for item in payload.get("speciality_parameters") or []:
+        if not isinstance(item, dict):
+            raise ValueError("vLLM speciality parameter must be an object")
+        name = str(item.get("name") or "")
+        target = str(item.get("target") or "")
+        native_path = str(item.get("native_path") or "")
+        if not name or name in seen_names or not native_path:
+            raise ValueError("vLLM speciality parameters require unique names and native paths")
+        seen_names.add(name)
+        value = item.get("value")
+        if target == "chat_template_kwarg":
+            key = native_kwarg_name(native_path, "chat_template_kwargs.")
+            if key in template_kwargs:
+                raise ValueError(f"duplicate vLLM chat-template speciality mapping {key!r}")
+            template_kwargs[key] = value
+        elif target == "sampling_parameter":
+            key = native_kwarg_name(native_path, "sampling_params.")
+            if key in sampling_kwargs:
+                raise ValueError(f"duplicate vLLM sampling speciality mapping {key!r}")
+            sampling_kwargs[key] = value
+        elif target == "prompt_suffix":
+            if not isinstance(value, str):
+                raise ValueError(f"vLLM prompt-suffix speciality {name!r} must map to a string")
+            prompt_suffixes.append(value)
+        else:
+            raise ValueError(f"unsupported vLLM speciality target {target!r}")
+    return template_kwargs, sampling_kwargs, prompt_suffixes
+
+
+def native_kwarg_name(native_path, prefix):
+    key = str(native_path)
+    if key.startswith(prefix):
+        key = key[len(prefix) :]
+    if not key or not key.isidentifier():
+        raise ValueError(f"native speciality path {native_path!r} is not a callable keyword")
+    return key
+
+
+def required_call_kwargs(callable_obj, kwargs, required, label):
+    accepted = accepted_kwargs(callable_obj, kwargs)
+    missing = sorted(name for name in required if name not in accepted)
+    if missing:
+        raise ValueError(
+            f"vLLM {label} does not support requested speciality parameter(s): "
+            + ", ".join(missing)
+        )
+    return accepted
+
+
+def reasoning_enabled(payload):
+    for item in payload.get("speciality_parameters") or []:
+        haystack = f"{item.get('name', '')} {item.get('native_path', '')}".lower()
+        if "reason" not in haystack and "think" not in haystack:
+            continue
+        value = item.get("value")
+        level = str(item.get("level") or "").lower()
+        if value is False or value == 0 or str(value).lower() in ("false", "off", "none", "disabled"):
+            return False
+        if level in ("none", "off", "disabled"):
+            return False
+        return True
+    return False
+
+
 def import_attr(candidates):
     last_error = None
     for module_name, attr_name in candidates:
@@ -165,7 +234,7 @@ def tool_call_schema(tools):
     }
 
 
-def make_sampling_params(payload):
+def make_sampling_params(payload, speciality_sampling_kwargs=None):
     SamplingParams = import_attr((("vllm", "SamplingParams"),))
     kwargs = {
         "max_tokens": int(payload.get("max_new_tokens") or 64),
@@ -204,6 +273,13 @@ def make_sampling_params(payload):
     if bool(payload.get("ignore_eos")):
         kwargs["ignore_eos"] = True
         kwargs["min_tokens"] = kwargs["max_tokens"]
+    for name, value in (speciality_sampling_kwargs or {}).items():
+        if name in kwargs:
+            raise ValueError(
+                f"vLLM speciality sampling parameter {name!r} conflicts with a standard request field"
+            )
+        kwargs[name] = value
+        requested.add(name)
     structured = make_structured_outputs_params(payload.get("grammar"))
     if structured is not None:
         kwargs["structured_outputs"] = structured
@@ -411,25 +487,50 @@ def processor_chat_messages(messages):
     return prepared
 
 
-def multimodal_engine_prompt(payload, mm_data):
-    prompt = str(payload.get("prompt", ""))
-    if not mm_data:
-        return prompt, prompt
-    if processor is None or not hasattr(processor, "apply_chat_template"):
-        raise RuntimeError("multimodal request requires the model AutoProcessor/chat template")
-    messages = payload.get("messages") or []
-    if not messages:
-        raise ValueError("multimodal request is missing structured chat messages")
+def render_chat_template(renderer, messages, template_kwargs, label):
+    if renderer is None or not hasattr(renderer, "apply_chat_template"):
+        raise RuntimeError(f"requested speciality requires the model {label}/chat template")
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        **template_kwargs,
+    }
     try:
-        rendered = processor.apply_chat_template(
-            processor_chat_messages(messages),
-            tokenize=False,
-            add_generation_prompt=True,
+        return str(
+            renderer.apply_chat_template(
+                messages,
+                **required_call_kwargs(
+                    renderer.apply_chat_template,
+                    kwargs,
+                    set(template_kwargs),
+                    f"{label} chat template",
+                ),
+            )
         )
     except Exception as exc:
-        raise ValueError(f"model multimodal chat template failed: {exc}") from exc
-    rendered = str(rendered)
-    return rendered, {"prompt": rendered, "multi_modal_data": mm_data}
+        raise ValueError(f"model {label} chat template failed: {exc}") from exc
+
+
+def multimodal_engine_prompt(payload, mm_data, template_kwargs, prompt_suffixes):
+    prompt = str(payload.get("prompt", ""))
+    messages = payload.get("messages") or []
+    if mm_data:
+        if not messages:
+            raise ValueError("multimodal request is missing structured chat messages")
+        rendered = render_chat_template(
+            processor,
+            processor_chat_messages(messages),
+            template_kwargs,
+            "multimodal processor",
+        )
+        rendered += "".join(prompt_suffixes)
+        return rendered, {"prompt": rendered, "multi_modal_data": mm_data}
+    if template_kwargs:
+        if not messages:
+            raise ValueError("chat-template speciality request is missing structured chat messages")
+        prompt = render_chat_template(tokenizer, messages, template_kwargs, "tokenizer")
+    prompt += "".join(prompt_suffixes)
+    return prompt, prompt
 
 
 async def async_handle_generate(request_id, payload):
@@ -437,8 +538,11 @@ async def async_handle_generate(request_id, payload):
         raise RuntimeError("model has not been loaded")
 
     max_tokens = request_max_tokens(payload)
+    template_kwargs, sampling_kwargs, prompt_suffixes = speciality_maps(payload)
     mm_data = decode_multimodal_data(payload)
-    prompt, engine_prompt = multimodal_engine_prompt(payload, mm_data)
+    prompt, engine_prompt = multimodal_engine_prompt(
+        payload, mm_data, template_kwargs, prompt_suffixes
+    )
     prompt_tokens = encode_text(prompt)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
         raise ValueError(
@@ -451,14 +555,20 @@ async def async_handle_generate(request_id, payload):
             "finish_reason": "length",
         }
 
-    sampling_params = make_sampling_params(payload)
+    sampling_params = make_sampling_params(payload, sampling_kwargs)
     text = ""
     completion_tokens = 0
     token_ids = []
     finish_reason = "length"
+    reasoning_tokens = 0
+    reasoning_active = reasoning_enabled(payload)
+    actual_prompt_tokens = len(prompt_tokens)
     async for output in engine.generate(
         request_id=f"mayhem-{request_id}", prompt=engine_prompt, sampling_params=sampling_params
     ):
+        output_prompt_ids = getattr(output, "prompt_token_ids", None)
+        if output_prompt_ids is not None:
+            actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
         for completion in getattr(output, "outputs", []) or []:
             chunk_text = str(getattr(completion, "text", "") or "")
             ids = getattr(completion, "token_ids", None) or []
@@ -480,7 +590,11 @@ async def async_handle_generate(request_id, payload):
                     )
                     completion_tokens += 1
                     token_ids.append(int(token))
+                    if reasoning_active:
+                        reasoning_tokens += 1
                 text += chunk_text
+                if reasoning_active and "</think>" in text:
+                    reasoning_active = False
             reason = getattr(completion, "finish_reason", None)
             if reason is not None:
                 finish_reason = "stop" if str(reason) == "stop" else "length"
@@ -492,9 +606,11 @@ async def async_handle_generate(request_id, payload):
     return {
         "text": text,
         "usage": {
-            "prompt_tokens": len(prompt_tokens),
+            "prompt_tokens": actual_prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": len(prompt_tokens) + completion_tokens,
+            "total_tokens": actual_prompt_tokens + completion_tokens,
+            "reasoning_tokens": min(reasoning_tokens, completion_tokens),
+            "vision_tokens": max(0, actual_prompt_tokens - len(prompt_tokens)) if mm_data else 0,
         },
         "finish_reason": finish_reason,
     }

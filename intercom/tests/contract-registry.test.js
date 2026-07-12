@@ -80,6 +80,7 @@ const enclaveRegistration = {
     tools: false,
     ctx: 32768,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 
@@ -92,6 +93,7 @@ const enclaveUpdate = {
     tools: true,
     ctx: 32768,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 
@@ -140,6 +142,7 @@ const providerJoin = {
   enclave_id: enclaveId,
   served_ctx: 32768,
   served_modalities: ['text'],
+  served_specialities: {},
   ctx_bracket: 'le32k',
   ctx_bracket_table_ver: 1,
 };
@@ -301,6 +304,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     status: 'tombstoned',
     served_ctx: 32768,
     served_modalities: ['text'],
+    served_specialities: {},
     ctx_bracket: 'le32k',
     ctx_bracket_table_ver: 1,
     joined_at: makeTxKey(8),
@@ -361,6 +365,7 @@ test('MayhemContract requires model_class and allows admin model classes', async
       embeddings: true,
       ctx: 8192,
       modality_set: ['embedding'],
+      speciality_levels: {},
     },
   };
   const registered = await execute(
@@ -404,6 +409,7 @@ test('MayhemContract requires model_class and allows admin model classes', async
       output_modality: 'audio',
       output_modalities: ['audio'],
       modality_set: ['audio'],
+      speciality_levels: {},
     },
   };
   const musicRegistered = await execute(
@@ -482,6 +488,7 @@ test('MayhemContract rejects unsupported model classes and mismatched model refe
         embeddings: true,
         ctx: 8192,
         modality_set: ['embedding'],
+        speciality_levels: {},
       },
     },
     admin.publicKey,
@@ -526,6 +533,7 @@ test('MayhemContract stores admin-bound enclave artifact sidecars only when cano
         ...enclaveRegistration.caps,
         vision: true,
         modality_set: ['text', 'image'],
+        speciality_levels: {},
       },
     },
     admin.publicKey,
@@ -840,6 +848,7 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     enclave_id: enclaveId,
     served_ctx: 32768,
     served_modalities: ['text'],
+    served_specialities: {},
     ctx_bracket: 'le32k',
     ctx_bracket_table_ver: 1,
     nonce: 'b'.repeat(64),
@@ -1147,6 +1156,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         tools: false,
         ctx: 0,
         modality_set: ['text'],
+        speciality_levels: {},
       },
     },
     admin.publicKey,
@@ -1160,6 +1170,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     ctx_max: 8192,
     vision: false,
     modality_set: ['text'],
+    speciality_levels: {},
   };
   const accepted = await execute(
     contract,
@@ -1242,6 +1253,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     output_modality: 'image',
     output_modalities: ['image'],
     modality_set: ['image'],
+    speciality_levels: {},
     max_image_width: 1024,
     max_image_height: 1024,
     max_image_steps: 50,
@@ -1276,6 +1288,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
         image: true,
         output_modality: 'image',
         modality_set: ['text', 'image'],
+        speciality_levels: {},
       },
     },
     admin.publicKey,
@@ -2114,6 +2127,120 @@ test('MayhemContract admin verifies and revokes provider KYB without raw documen
   assert.equal(await storage.get(`kyb/${replacement.publicKey}`), null);
 });
 
+test('MayhemContract lets providers narrow but never invent admin speciality levels', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const specialityEnclave = {
+    ...enclaveRegistration,
+    caps: {
+      ...enclaveRegistration.caps,
+      speciality_levels: {
+        reasoning_effort: ['none', 'high'],
+        verbosity: ['concise', 'detailed'],
+      },
+    },
+  };
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: specialityEnclave,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: specialityEnclave.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+  const join = {
+    ...providerJoin,
+    served_specialities: {
+      reasoning_effort: ['none'],
+      verbosity: ['concise', 'detailed'],
+    },
+  };
+
+  const arbitraryName = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      ...join,
+      served_specialities: {
+        ...join.served_specialities,
+        arbitrary_model: ['provider-choice'],
+      },
+    },
+    provider.publicKey,
+    6
+  );
+  assert.match(arbitraryName.message, /exactly the admin enclave speciality names/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  const arbitraryLevel = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      ...join,
+      served_specialities: {
+        ...join.served_specialities,
+        reasoning_effort: ['ultra'],
+      },
+    },
+    provider.publicKey,
+    7
+  );
+  assert.match(arbitraryLevel.message, /must be a subset of the admin enclave levels/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  const accepted = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    join,
+    provider.publicKey,
+    8
+  );
+  assert.equal(accepted.ok, true, accepted.message);
+  assert.deepEqual(
+    (await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.served_specialities,
+    join.served_specialities
+  );
+});
+
 test('MayhemContract rejects provider-authored serving terms on joins', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
@@ -2172,6 +2299,7 @@ test('MayhemContract rejects provider-authored serving terms on joins', async ()
       enclave_id: enclaveId,
       served_ctx: 32768,
       served_modalities: ['text'],
+      served_specialities: {},
       ctx_bracket: 'le32k',
       ctx_bracket_table_ver: 1,
       model_id: 'provider/custom@4bit',
@@ -2419,6 +2547,7 @@ test('MayhemContract rejects unsafe canonical registry identifiers', async () =>
       enclave_id: 'bad/enclave',
       served_ctx: 32768,
       served_modalities: ['text'],
+      served_specialities: {},
       ctx_bracket: 'le32k',
       ctx_bracket_table_ver: 1,
     },

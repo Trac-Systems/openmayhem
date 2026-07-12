@@ -29,6 +29,110 @@ def required_sampling_kwargs(callable_obj, kwargs, requested):
     return {key: value for key, value in kwargs.items() if key in parameters}
 
 
+def speciality_maps(payload):
+    template_kwargs = {}
+    sampling_kwargs = {}
+    prompt_suffixes = []
+    seen_names = set()
+    for item in payload.get("speciality_parameters") or []:
+        if not isinstance(item, dict):
+            raise ValueError("MLX speciality parameter must be an object")
+        name = str(item.get("name") or "")
+        target = str(item.get("target") or "")
+        native_path = str(item.get("native_path") or "")
+        if not name or name in seen_names or not native_path:
+            raise ValueError("MLX speciality parameters require unique names and native paths")
+        seen_names.add(name)
+        value = item.get("value")
+        if target == "chat_template_kwarg":
+            key = native_kwarg_name(native_path, "chat_template_kwargs.")
+            if key in template_kwargs:
+                raise ValueError(f"duplicate MLX chat-template speciality mapping {key!r}")
+            template_kwargs[key] = value
+        elif target == "sampling_parameter":
+            key = native_kwarg_name(native_path, "sampling_params.")
+            if key in sampling_kwargs:
+                raise ValueError(f"duplicate MLX sampling speciality mapping {key!r}")
+            sampling_kwargs[key] = value
+        elif target == "prompt_suffix":
+            if not isinstance(value, str):
+                raise ValueError(f"MLX prompt-suffix speciality {name!r} must map to a string")
+            prompt_suffixes.append(value)
+        else:
+            raise ValueError(f"unsupported MLX speciality target {target!r}")
+    return template_kwargs, sampling_kwargs, prompt_suffixes
+
+
+def native_kwarg_name(native_path, prefix):
+    key = str(native_path)
+    if key.startswith(prefix):
+        key = key[len(prefix) :]
+    if not key or not key.isidentifier():
+        raise ValueError(f"native speciality path {native_path!r} is not a callable keyword")
+    return key
+
+
+def required_call_kwargs(callable_obj, kwargs, required, label):
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return kwargs
+    missing = sorted(name for name in required if name not in parameters)
+    if missing:
+        raise ValueError(
+            f"MLX {label} does not support requested speciality parameter(s): "
+            + ", ".join(missing)
+        )
+    return {key: value for key, value in kwargs.items() if key in parameters}
+
+
+def reasoning_enabled(payload):
+    for item in payload.get("speciality_parameters") or []:
+        haystack = f"{item.get('name', '')} {item.get('native_path', '')}".lower()
+        if "reason" not in haystack and "think" not in haystack:
+            continue
+        value = item.get("value")
+        level = str(item.get("level") or "").lower()
+        if value is False or value == 0 or str(value).lower() in ("false", "off", "none", "disabled"):
+            return False
+        if level in ("none", "off", "disabled"):
+            return False
+        return True
+    return False
+
+
+def request_prompt(payload, template_kwargs, prompt_suffixes):
+    prompt = str(payload.get("prompt", ""))
+    if template_kwargs:
+        messages = payload.get("messages") or []
+        if not messages:
+            raise ValueError("MLX chat-template speciality request is missing structured messages")
+        if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+            raise ValueError("MLX tokenizer does not expose the requested chat-template speciality")
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            **template_kwargs,
+        }
+        try:
+            prompt = str(
+                tokenizer.apply_chat_template(
+                    messages,
+                    **required_call_kwargs(
+                        tokenizer.apply_chat_template,
+                        kwargs,
+                        set(template_kwargs),
+                        "chat template",
+                    ),
+                )
+            )
+        except Exception as exc:
+            raise ValueError(f"MLX model chat template failed: {exc}") from exc
+    return prompt + "".join(prompt_suffixes)
+
+
 def encode_text(text):
     if tokenizer is None:
         raise RuntimeError("model has not been loaded")
@@ -93,7 +197,8 @@ def handle_generate(request_id, payload):
         raise RuntimeError("model has not been loaded")
 
     max_tokens = int(payload.get("max_new_tokens") or 64)
-    prompt = str(payload.get("prompt", ""))
+    template_kwargs, sampling_kwargs, prompt_suffixes = speciality_maps(payload)
+    prompt = request_prompt(payload, template_kwargs, prompt_suffixes)
     prompt_tokens = encode_text(prompt)
     if len(prompt_tokens) >= ctx_size:
         raise ValueError(
@@ -142,6 +247,13 @@ def handle_generate(request_id, payload):
     if payload.get("min_p") is not None:
         sampler_kwargs["min_p"] = float(payload.get("min_p"))
         requested.add("min_p")
+    for name, value in sampling_kwargs.items():
+        if name in sampler_kwargs:
+            raise ValueError(
+                f"MLX speciality sampling parameter {name!r} conflicts with a standard request field"
+            )
+        sampler_kwargs[name] = value
+        requested.add(name)
     sampler = make_sampler(
         **required_sampling_kwargs(make_sampler, sampler_kwargs, requested)
     )
@@ -155,6 +267,8 @@ def handle_generate(request_id, payload):
     text = ""
     completion_tokens = 0
     finish_reason = "length"
+    reasoning_tokens = 0
+    reasoning_active = reasoning_enabled(payload)
     for response in stream_generate(
         model,
         tokenizer,
@@ -184,8 +298,12 @@ def handle_generate(request_id, payload):
                     },
                 }
             )
+            if reasoning_active:
+                reasoning_tokens += 1
         if segment:
             text += segment
+            if reasoning_active and "</think>" in text:
+                reasoning_active = False
         completion_tokens = max(completion_tokens, generated)
         final_reason = getattr(response, "finish_reason", None)
         if final_reason is not None:
@@ -198,6 +316,8 @@ def handle_generate(request_id, payload):
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "total_tokens": len(prompt_tokens) + completion_tokens,
+            "reasoning_tokens": min(reasoning_tokens, completion_tokens),
+            "vision_tokens": 0,
         },
         "finish_reason": normalize_finish_reason(finish_reason),
     }

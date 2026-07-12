@@ -277,7 +277,7 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
       enclave_id: body.enclave_id,
       model_id: body.model_id,
       model_class: 'text-generation',
-      caps: { chat: true, ctx: 8192, modality_set: ['text'] },
+      caps: { chat: true, ctx: 8192, modality_set: ['text'], speciality_levels: {} },
     },
   });
 
@@ -300,4 +300,56 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
   });
   assert.equal(aliasUsage instanceof Error, true);
   assert.match(aliasUsage.message, /Receipt usage must be canonical/);
+
+  const attributedBody = {
+    ...body,
+    usage_attribution: {
+      reasoning_output_tokens: 15,
+      vision_input_tokens: 4,
+    },
+  };
+  const attributedMessage = b4a.from(receiptMessage(attributedBody));
+  const attributedEnvelope = {
+    body: attributedBody,
+    enclave_pubkey: enclave.publicKey,
+    enclave_sig: b4a.toString(enclave.wallet.sign(attributedMessage), 'hex'),
+    user_sig: b4a.toString(user.wallet.sign(attributedMessage), 'hex'),
+  };
+  const attributed = await contract.normalizeReceiptEnvelope(attributedEnvelope);
+  assert.equal(attributed instanceof Error, false, attributed.message);
+  assert.deepEqual(attributed.body.usage_attribution, attributedBody.usage_attribution);
+  assert.equal(attributed.body.au_owed_cum, body.au_owed_cum);
+  assert.equal(contract.verifyReceiptEnvelope(attributed), true);
+  assert.notEqual(receiptMessage(body), receiptMessage(attributedBody));
+  assert.equal(contract.verifyReceiptEnvelope({ ...normalized, body: attributedBody }), false);
+
+  const excessiveReasoning = await contract.normalizeReceiptEnvelope({
+    ...attributedEnvelope,
+    body: {
+      ...attributedBody,
+      usage_attribution: { reasoning_output_tokens: 21 },
+    },
+  });
+  assert.equal(excessiveReasoning instanceof Error, true);
+  assert.match(excessiveReasoning.message, /reasoning attribution exceeds billed output/i);
+
+  const excessiveVision = await contract.normalizeReceiptEnvelope({
+    ...attributedEnvelope,
+    body: {
+      ...attributedBody,
+      usage_attribution: { vision_input_tokens: 11 },
+    },
+  });
+  assert.equal(excessiveVision instanceof Error, true);
+  assert.match(excessiveVision.message, /vision attribution exceeds billed input/i);
+
+  const unknownAttribution = await contract.normalizeReceiptEnvelope({
+    ...attributedEnvelope,
+    body: {
+      ...attributedBody,
+      usage_attribution: { provider_claimed_tokens: 1 },
+    },
+  });
+  assert.equal(unknownAttribution instanceof Error, true);
+  assert.match(unknownAttribution.message, /unsupported receipt usage attribution/i);
 });

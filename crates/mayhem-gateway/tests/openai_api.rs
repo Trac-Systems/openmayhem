@@ -16,8 +16,9 @@ use mayhem_gateway::openai::{
     GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
     GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
     GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewayState, ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps,
-    PriceRefAu, ProviderSignedReceipt, SamplingProfile, ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
+    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, SamplingProfile,
+    ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, audio_fingerprint, image_average_hash_hex, normalize_rate_map,
@@ -26,9 +27,11 @@ use mayhem_gateway::{
     ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
-    catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, EndpointAttributeSpec,
+    EndpointSpecialityMapping, EndpointSpecialityTarget, EndpointValueType,
+    ModelSpecialityDescriptor, ModelSpecialityLevel, ReceiptBody, ReceiptUsage, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use std::{
@@ -64,6 +67,74 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                         "direct session response from {} via {}",
                         model.id, invocation.session_id
                     )),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: vec![1, 2, 3, 4],
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SpecialityTransportRecord {
+    endpoint_request: Value,
+    reasoning_effort: Option<String>,
+    speciality_values: BTreeMap<String, Value>,
+    effective_specialities: BTreeMap<String, String>,
+    voucher_specialities: BTreeMap<String, String>,
+    top_k: Option<i32>,
+    min_p: Option<f64>,
+}
+
+#[derive(Debug)]
+struct SpecialityRecordingBackend {
+    records: Arc<Mutex<Vec<SpecialityTransportRecord>>>,
+}
+
+impl GatewaySessionBackend for SpecialityRecordingBackend {
+    fn name(&self) -> &str {
+        "speciality-recording"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            self.records
+                .lock()
+                .expect("speciality transport records")
+                .push(SpecialityTransportRecord {
+                    endpoint_request: request.endpoint_request.clone().unwrap_or(Value::Null),
+                    reasoning_effort: request.reasoning_effort.clone(),
+                    speciality_values: request.speciality_values.clone(),
+                    effective_specialities: request.effective_specialities.clone(),
+                    voucher_specialities: invocation
+                        .spend_voucher
+                        .body
+                        .required_specialities
+                        .clone(),
+                    top_k: request.top_k,
+                    min_p: request.min_p,
+                });
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 4;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!("speciality response from {}", model.id)),
                     tool_call: None,
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
@@ -909,6 +980,67 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
 }
 
 #[derive(Debug)]
+struct SpecialityCanaryBackend {
+    calls: Arc<Mutex<Vec<(BTreeMap<String, String>, BTreeMap<String, String>)>>>,
+}
+
+impl GatewaySessionBackend for SpecialityCanaryBackend {
+    fn name(&self) -> &str {
+        "test-speciality-canary"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().expect("calls lock").push((
+                request.effective_specialities.clone(),
+                invocation.spend_voucher.body.required_specialities.clone(),
+            ));
+            let is_canary = request
+                .messages
+                .iter()
+                .any(|message| message.content.to_string().contains("fixed canary"));
+            let effort = request
+                .effective_specialities
+                .get("reasoning_effort")
+                .map(String::as_str)
+                .unwrap_or("low");
+            let token_ids = if !is_canary {
+                vec![1]
+            } else if effort == "high" {
+                vec![9]
+            } else {
+                vec![4]
+            };
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = token_ids.len() as u64;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!("{effort} speciality canary output")),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids,
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
 struct ContextNeedleBackend {
     answer_needle: bool,
 }
@@ -1154,6 +1286,180 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
         body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
         "mayhem_json"
     );
+}
+
+#[tokio::test]
+async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availability() {
+    let providers = ["91".repeat(32), "92".repeat(32)];
+    let mut model = routed_test_model_with_providers(&providers);
+    model.mayhem.adapter.specialities = vec![ModelSpecialityDescriptor {
+        name: "reasoning_effort".to_owned(),
+        mechanism: "enum".to_owned(),
+        default_level: "low".to_owned(),
+        levels: vec![
+            ModelSpecialityLevel {
+                name: "low".to_owned(),
+                rank: 1,
+                native_value: json!("low"),
+                default_max_output_tokens: Some(4_096),
+                max_reasoning_tokens: Some(1_024),
+            },
+            ModelSpecialityLevel {
+                name: "high".to_owned(),
+                rank: 2,
+                native_value: json!("high"),
+                default_max_output_tokens: Some(8_192),
+                max_reasoning_tokens: Some(4_096),
+            },
+            ModelSpecialityLevel {
+                name: "xhigh".to_owned(),
+                rank: 3,
+                native_value: json!("xhigh"),
+                default_max_output_tokens: Some(16_384),
+                max_reasoning_tokens: Some(8_192),
+            },
+        ],
+        research_evidence: vec!["pinned model-card fixture".to_owned()],
+    }];
+    model.mayhem.speciality_calibrations = BTreeMap::from([(
+        "nvfp4".to_owned(),
+        BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            BTreeMap::from([
+                (
+                    "low".to_owned(),
+                    GatewaySpecialityCalibration {
+                        fingerprint: "11".repeat(32),
+                        output_tokens: 1_000,
+                        reasoning_tokens: 250,
+                    },
+                ),
+                (
+                    "high".to_owned(),
+                    GatewaySpecialityCalibration {
+                        fingerprint: "22".repeat(32),
+                        output_tokens: 2_000,
+                        reasoning_tokens: 1_500,
+                    },
+                ),
+                (
+                    "xhigh".to_owned(),
+                    GatewaySpecialityCalibration {
+                        fingerprint: "33".repeat(32),
+                        output_tokens: 3_000,
+                        reasoning_tokens: 2_500,
+                    },
+                ),
+            ]),
+        )]),
+    )]);
+    model.mayhem.route_candidates[0].served_specialities = BTreeMap::from([(
+        "reasoning_effort".to_owned(),
+        vec!["low".to_owned(), "high".to_owned()],
+    )]);
+    model.mayhem.route_candidates[1].served_specialities =
+        BTreeMap::from([("reasoning_effort".to_owned(), vec!["low".to_owned()])]);
+    let state = test_gateway_state_from_models(vec![model]);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let token_query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let user_path = format!("/mayhem/dashboard?{token_query}&speciality=reasoning_effort%3Dhigh");
+    let provider_path =
+        format!("/mayhem/dashboard/provider?{token_query}&speciality=reasoning_effort%3Dhigh");
+    let network_path =
+        format!("/mayhem/dashboard/network?{token_query}&speciality=reasoning_effort%3Dhigh");
+    let app = openai_router(state);
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let availability = &body["data"][0]["mayhem"]["speciality_availability"]["reasoning_effort"];
+    assert_eq!(availability["default_level"], "low");
+    assert_eq!(availability["levels"]["low"]["live_provider_count"], 2);
+    assert_eq!(availability["levels"]["high"]["live_provider_count"], 1);
+    assert_eq!(availability["levels"]["xhigh"]["live_provider_count"], 0);
+    assert_eq!(availability["levels"]["xhigh"]["available"], false);
+    assert_eq!(
+        availability["levels"]["high"]["expected_volume"]["output_tokens_min"],
+        2_000
+    );
+    assert_eq!(
+        availability["levels"]["high"]["expected_volume"]["expected_output_cost_au_min"],
+        "120"
+    );
+    assert_eq!(
+        body["data"][0]["mayhem"]["route_candidates"][1]["served_specialities"]["reasoning_effort"],
+        json!(["low"])
+    );
+
+    let (status, _, user_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &user_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let user_html = String::from_utf8(user_bytes).expect("user dashboard html");
+    assert!(user_html.contains("reasoning_effort=high"));
+    assert!(user_html.contains("2000 tokens"));
+
+    let (status, _, provider_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let provider_html = String::from_utf8(provider_bytes).expect("provider dashboard html");
+    assert!(provider_html.contains("reasoning_effort:low|high"));
+    assert!(provider_html.contains("Expected output cost"));
+
+    let (status, _, network_bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &network_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let network_html = String::from_utf8(network_bytes).expect("network dashboard html");
+    assert!(network_html.contains("reasoning_effort=high"));
+    assert!(network_html.contains("1 live"));
+    assert!(network_html.contains("2000 tokens"));
+    assert!(network_html.contains("Expected output cost"));
+    assert!(network_html.contains("$0.00000000000000012"));
+    assert!(network_html.contains("reasoning_effort:low|high"));
+    assert_no_external_urls(&user_html);
+    assert_no_external_urls(&provider_html);
+    assert_no_external_urls(&network_html);
+
+    if let Some(dir) = std::env::var_os("MAYHEM_DASHBOARD_VISUAL_DIR") {
+        fs::create_dir_all(&dir).expect("create dashboard visual dir");
+        fs::write(
+            PathBuf::from(&dir).join("mayhem-user-effort.html"),
+            user_html,
+        )
+        .expect("write user dashboard visual html");
+        fs::write(
+            PathBuf::from(&dir).join("mayhem-provider-effort.html"),
+            provider_html,
+        )
+        .expect("write provider dashboard visual html");
+        fs::write(
+            PathBuf::from(&dir).join("mayhem-network-effort.html"),
+            network_html,
+        )
+        .expect("write network dashboard visual html");
+    }
 }
 
 #[tokio::test]
@@ -2132,6 +2438,102 @@ async fn automatic_canary_probe_accepts_exact_catalog_token_prefix() {
 }
 
 #[tokio::test]
+async fn automatic_speciality_canary_binds_each_served_level_and_catches_substitution() {
+    let provider = "55".repeat(32);
+    let mut model = routed_test_model_with_specialities(std::slice::from_ref(&provider));
+    model
+        .mayhem
+        .adapter
+        .specialities
+        .retain(|descriptor| descriptor.name == "reasoning_effort");
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .first_mut()
+        .expect("chat endpoint contract");
+    contract
+        .request_attributes
+        .retain(|name| name != "verbosity");
+    contract.request_attribute_specs.remove("verbosity");
+    contract.speciality_mappings.remove("verbosity");
+    model.mayhem.route_candidates[0]
+        .served_specialities
+        .retain(|name, _| name == "reasoning_effort");
+    let expected_for = |tokens: &[i32]| {
+        let prompt = token_fingerprint(tokens.iter().copied()).digest;
+        aggregate_canary_fingerprints([("fixed-probe", prompt.as_str())])
+    };
+    let mut registry = test_canary_registry(&[4]);
+    registry
+        .models
+        .get_mut("mayhem/routed-test")
+        .expect("canary config")
+        .speciality_calibrations_by_artifact_root = BTreeMap::from([(
+        "aa".repeat(32),
+        BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            BTreeMap::from([
+                (
+                    "low".to_owned(),
+                    GatewaySpecialityCalibration {
+                        fingerprint: expected_for(&[4]),
+                        output_tokens: 1,
+                        reasoning_tokens: 0,
+                    },
+                ),
+                (
+                    "high".to_owned(),
+                    GatewaySpecialityCalibration {
+                        fingerprint: expected_for(&[5, 5]),
+                        output_tokens: 2,
+                        reasoning_tokens: 0,
+                    },
+                ),
+            ]),
+        )]),
+    )]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model])
+        .with_canary_registry(registry)
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(SpecialityCanaryBackend {
+            calls: calls.clone(),
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use high effort." }],
+        "reasoning_effort": "high"
+    });
+
+    let (status, _) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(state.receipts().len(), 3);
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    assert!(!probes[0].pass);
+    assert_eq!(probes[0].match_bps, 5_000);
+    assert_eq!(probes[0].evidence["evidence"]["levels"][0]["level"], "low");
+    assert_eq!(probes[0].evidence["evidence"]["levels"][0]["pass"], true);
+    assert_eq!(probes[0].evidence["evidence"]["levels"][1]["level"], "high");
+    assert_eq!(probes[0].evidence["evidence"]["levels"][1]["pass"], false);
+    let calls = calls.lock().expect("calls lock");
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|(request_levels, voucher_levels)| {
+        request_levels == voucher_levels && request_levels.get("reasoning_effort").is_some()
+    }));
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(levels, _)| levels["reasoning_effort"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["high", "low", "high"]
+    );
+}
+
+#[tokio::test]
 async fn automatic_context_needle_probe_marks_long_context_truncation_slashable() {
     let mut model = routed_test_model();
     model.mayhem.caps.ctx = 131_072;
@@ -3040,6 +3442,7 @@ fn signed_image_provider_receipt(
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
+        usage_attribution: BTreeMap::new(),
         au_owed_cum: priced_usage_au(
             &invocation.spend_voucher.body.locked_rate_map,
             invocation.spend_voucher.body.locked_per_req_au,
@@ -3117,6 +3520,7 @@ fn signed_provider_receipt_for_test(
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
+        usage_attribution: BTreeMap::new(),
         au_owed_cum: priced_usage_au(
             &invocation.spend_voucher.body.locked_rate_map,
             invocation.spend_voucher.body.locked_per_req_au,
@@ -3383,6 +3787,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,
@@ -3435,6 +3840,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,
@@ -3487,6 +3893,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 )]),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,
@@ -3539,6 +3946,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     BTreeMap::from([("fixed-stt".to_owned(), "Hello, mayhem!".to_owned())]),
                 )]),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,
@@ -3591,6 +3999,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-tts".to_owned(), expected_fingerprint)]),
                 )]),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,
@@ -3645,6 +4054,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 output_modalities: vec!["text".to_owned()],
             },
             adapter: ShapeAdapterInfo::default(),
+            speciality_calibrations: BTreeMap::new(),
             sampling: SamplingProfile::default(),
             failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
             source: "contract".to_owned(),
@@ -3658,6 +4068,115 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
     }
 }
 
+fn routed_test_model_with_specialities(providers: &[String]) -> GatewayModel {
+    let mut model = routed_test_model_with_providers(providers);
+    let specialities = vec![
+        ModelSpecialityDescriptor {
+            name: "reasoning_effort".to_owned(),
+            mechanism: "enum".to_owned(),
+            default_level: "low".to_owned(),
+            levels: vec![
+                ModelSpecialityLevel {
+                    name: "low".to_owned(),
+                    rank: 0,
+                    native_value: json!("low"),
+                    default_max_output_tokens: Some(8),
+                    max_reasoning_tokens: Some(4),
+                },
+                ModelSpecialityLevel {
+                    name: "high".to_owned(),
+                    rank: 1,
+                    native_value: json!("high"),
+                    default_max_output_tokens: Some(32),
+                    max_reasoning_tokens: Some(24),
+                },
+            ],
+            research_evidence: vec!["test family documentation".to_owned()],
+        },
+        ModelSpecialityDescriptor {
+            name: "verbosity".to_owned(),
+            mechanism: "string_enum".to_owned(),
+            default_level: "concise".to_owned(),
+            levels: vec![
+                ModelSpecialityLevel {
+                    name: "concise".to_owned(),
+                    rank: 0,
+                    native_value: json!("short"),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+                ModelSpecialityLevel {
+                    name: "detailed".to_owned(),
+                    rank: 1,
+                    native_value: json!("long"),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+            ],
+            research_evidence: vec!["test family documentation".to_owned()],
+        },
+    ];
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter_mut()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+        .expect("chat endpoint contract");
+    for (descriptor, target, native_path) in [
+        (
+            &specialities[0],
+            EndpointSpecialityTarget::ChatTemplateKwarg,
+            "reasoning_effort",
+        ),
+        (
+            &specialities[1],
+            EndpointSpecialityTarget::SamplingParameter,
+            "verbosity",
+        ),
+    ] {
+        contract.request_attributes.push(descriptor.name.clone());
+        let levels = descriptor
+            .levels
+            .iter()
+            .map(|level| json!(level.name))
+            .collect::<Vec<_>>();
+        let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
+        spec.default = Some(json!(descriptor.default_level));
+        spec.enum_values = levels.clone();
+        spec.calibration_values = levels;
+        contract
+            .request_attribute_specs
+            .insert(descriptor.name.clone(), spec);
+        contract.speciality_mappings.insert(
+            descriptor.name.clone(),
+            EndpointSpecialityMapping {
+                request_path: descriptor.name.clone(),
+                target,
+                native_path: native_path.to_owned(),
+            },
+        );
+    }
+    let served_specialities = specialities
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.name.clone(),
+                descriptor
+                    .levels
+                    .iter()
+                    .map(|level| level.name.clone())
+                    .collect(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    model.mayhem.adapter.specialities = specialities;
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_specialities = served_specialities.clone();
+    }
+    model
+}
+
 fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     let identity = routed_test_identity();
     let room_id = format!("{:02x}", idx + 160).repeat(16);
@@ -3665,6 +4184,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         provider: provider.to_owned(),
         accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
         served_modalities: vec!["text".to_owned()],
+        served_specialities: BTreeMap::new(),
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,
@@ -3748,6 +4268,7 @@ fn test_provider_heartbeat(
                 .and_then(Value::as_bool)
                 .unwrap_or(model.mayhem.caps.vision),
             served_modalities: candidate.served_modalities.clone(),
+            served_specialities: candidate.served_specialities.clone(),
             modality_capacity: candidate
                 .served_modalities
                 .iter()
@@ -3806,6 +4327,116 @@ fn routed_test_identity() -> CatalogEnclaveIdentity {
         manifest_hash: "bb".repeat(32),
         binary_hash: "cc".repeat(32),
     }
+}
+
+#[tokio::test]
+async fn capability_body_transport_is_identical_for_curl_sdk_and_opencode() {
+    let provider = "5a".repeat(32);
+    let model = routed_test_model_with_specialities(std::slice::from_ref(&provider));
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
+        SpecialityRecordingBackend {
+            records: records.clone(),
+        },
+    ));
+    let app = openai_router(state);
+    let base = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{"role": "user", "content": "compare the transport"}]
+    });
+    let options = json!({
+        "reasoning_effort": "high",
+        "verbosity": "detailed",
+        "top_k": 42,
+        "min_p": 0.08,
+        "max_completion_tokens": 24
+    });
+    let merge_options = |mut request: Value, options: &Value| {
+        request
+            .as_object_mut()
+            .expect("request object")
+            .extend(options.as_object().expect("options object").clone());
+        request
+    };
+    let curl_body = merge_options(base.clone(), &options);
+    let sdk_extra_body = merge_options(base.clone(), &options);
+    let opencode_options = merge_options(base, &options);
+    assert_eq!(curl_body, sdk_extra_body);
+    assert_eq!(sdk_extra_body, opencode_options);
+
+    for request in [curl_body, sdk_extra_body, opencode_options] {
+        let (status, body) =
+            json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+    }
+
+    let records = records.lock().expect("speciality transport records");
+    assert_eq!(records.len(), 3);
+    let expected_specialities = BTreeMap::from([
+        ("reasoning_effort".to_owned(), "high".to_owned()),
+        ("verbosity".to_owned(), "detailed".to_owned()),
+    ]);
+    for record in records.iter() {
+        assert_eq!(record.endpoint_request["reasoning_effort"], "high");
+        assert_eq!(record.endpoint_request["verbosity"], "detailed");
+        assert_eq!(record.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(record.speciality_values["verbosity"], "detailed");
+        assert_eq!(record.effective_specialities, expected_specialities);
+        assert_eq!(record.voucher_specialities, expected_specialities);
+        assert_eq!(record.top_k, Some(42));
+        assert_eq!(record.min_p, Some(0.08));
+    }
+}
+
+#[tokio::test]
+async fn capability_body_transport_rejects_unknown_fields_and_levels_before_dispatch() {
+    let provider = "5b".repeat(32);
+    let model = routed_test_model_with_specialities(std::slice::from_ref(&provider));
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
+        SpecialityRecordingBackend {
+            records: records.clone(),
+        },
+    ));
+    let app = openai_router(state);
+
+    let (status, body) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/chat/completions",
+        json!({
+            "model": "mayhem/routed-test",
+            "messages": [{"role": "user", "content": "reject unknown"}],
+            "provider_native": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("unknown-field error")
+        .contains("provider_native"));
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        json!({
+            "model": "mayhem/routed-test",
+            "messages": [{"role": "user", "content": "reject unsupported"}],
+            "reasoning_effort": "medium"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("unsupported-level error")
+        .contains("reasoning_effort"));
+    assert!(records
+        .lock()
+        .expect("speciality transport records")
+        .is_empty());
 }
 
 #[tokio::test]

@@ -52,8 +52,9 @@ use mayhem_enclave::{
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
-    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
+    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
@@ -69,12 +70,13 @@ use mayhem_gateway::{
         ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL,
         MAX_ROUTE_MAX_WAIT_MS,
     },
-    priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
-    HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
-    ModalityRequestLoad, ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry,
-    ReputationEvent, ReputationEventKind, DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
-    DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION,
-    INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    priced_usage_au, rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
+    text_rate_per_1k_au, HardwareQuoteVerifierCommand, HeartbeatModalityCapacity,
+    HeartbeatReceiver, ModalityRequestLoad, ProbationCaps, ProbationPolicy, ProviderProbation,
+    RateMapEntry, ReputationEvent, ReputationEventKind,
+    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
+    OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
@@ -1236,6 +1238,10 @@ struct UpArgs {
     #[arg(long = "provider-disable-modality", value_delimiter = ',')]
     provider_disable_modalities: Vec<String>,
 
+    /// Bound admin-defined model speciality levels for supervised providers, e.g. reasoning_effort=none,high. Repeat per speciality.
+    #[arg(long = "provider-speciality-levels", value_name = "NAME=LEVEL,...")]
+    provider_speciality_levels: Vec<String>,
+
     /// Hardware quote kind emitted by the supervised provider, for example tpm2_quote_ek or nvidia_nvtrust_offline_jwt.
     #[arg(long)]
     provider_hardware_quote_kind: Option<String>,
@@ -1603,6 +1609,10 @@ struct ModelsArgs {
     /// Show models supporting this modality; live mode requires at least one serving provider.
     #[arg(long)]
     modality: Option<String>,
+
+    /// Show models supporting NAME=LEVEL; live mode requires a fresh serving provider.
+    #[arg(long, value_name = "NAME=LEVEL")]
+    speciality: Option<String>,
 
     /// Print a machine-readable model list.
     #[arg(long)]
@@ -5019,6 +5029,10 @@ struct ProviderJoinArgs {
     /// Disable a non-core catalog modality. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
     disable_modalities: Vec<String>,
+
+    /// Bound admin-defined model speciality levels, e.g. reasoning_effort=none,high. Repeat per speciality.
+    #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
+    speciality_levels: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -5123,6 +5137,10 @@ struct ProviderServePlanArgs {
     #[arg(long = "disable-modality", value_delimiter = ',')]
     disable_modalities: Vec<String>,
 
+    /// Bound admin-defined model speciality levels, e.g. reasoning_effort=none,high. Repeat per speciality.
+    #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
+    speciality_levels: Vec<String>,
+
     /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
@@ -5156,6 +5174,10 @@ struct ProviderServeAddArgs {
     /// Disable a non-core catalog modality for this worker. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
     disable_modalities: Vec<String>,
+
+    /// Bound admin-defined model speciality levels for this worker. Repeat per speciality.
+    #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
+    speciality_levels: Vec<String>,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -5303,6 +5325,10 @@ struct ProviderStartArgs {
     /// Disable a non-core catalog modality. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
     disable_modalities: Vec<String>,
+
+    /// Bound admin-defined model speciality levels, e.g. reasoning_effort=none,high. Repeat per speciality.
+    #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
+    speciality_levels: Vec<String>,
 
     /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
     #[arg(long, value_name = "GB|%")]
@@ -5584,6 +5610,7 @@ struct ConfigProviderLimits {
     vllm_memory_utilization_pct: Option<u32>,
     disk_reserve: Option<String>,
     modalities: Option<BTreeMap<String, ConfigProviderModalityLimits>>,
+    specialities: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -6458,6 +6485,7 @@ struct CatalogListModel {
     requirements: CatalogListRequirements,
     adapter: catalog::CatalogAdapter,
     modality_assessment: catalog::CatalogModalityAssessment,
+    speciality_assessment: catalog::CatalogSpecialityAssessment,
     sampling: catalog::CatalogSamplingProfile,
     canary_set: String,
     canary_match_min: f64,
@@ -6702,6 +6730,31 @@ fn filter_catalog_list_report_by_modality(
     report
 }
 
+fn filter_catalog_list_report_by_speciality(
+    mut report: CatalogListReport,
+    speciality: Option<&(String, String)>,
+) -> CatalogListReport {
+    let Some((name, level)) = speciality else {
+        return report;
+    };
+    report.models.retain(|model| {
+        model.adapter.specialities.iter().any(|descriptor| {
+            descriptor.name == *name
+                && descriptor
+                    .levels
+                    .iter()
+                    .any(|descriptor_level| descriptor_level.name == *level)
+        })
+    });
+    report.model_count = report.models.len();
+    report.artifact_count = report
+        .models
+        .iter()
+        .map(|model| model.artifacts.len())
+        .sum();
+    report
+}
+
 fn catalog_list_tier_matches(model_tier: &str, filter: CatalogListTier) -> bool {
     match filter {
         CatalogListTier::Launch => model_tier == "launch",
@@ -6785,6 +6838,7 @@ fn catalog_list_model(
         },
         adapter: model.adapter.clone(),
         modality_assessment: model.modality_assessment.clone(),
+        speciality_assessment: model.speciality_assessment.clone(),
         sampling: model.sampling.clone(),
         canary_set: model.canary.set_id.clone(),
         canary_match_min: model.canary.match_min,
@@ -7102,6 +7156,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         min_ask_au: 0,
         ctx: None,
         disable_modalities: Vec::new(),
+        speciality_levels: Vec::new(),
         memory_reserve: None,
         vllm_memory_utilization: None,
         disk_reserve: None,
@@ -7525,6 +7580,28 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.adapter.reasoning_passthrough,
             model.adapter.modality_set.join(",")
         );
+        if !model.adapter.specialities.is_empty() {
+            println!(
+                "  specialities: {}",
+                model
+                    .adapter
+                    .specialities
+                    .iter()
+                    .map(|descriptor| format!(
+                        "{}(default={}; levels={})",
+                        descriptor.name,
+                        descriptor.default_level,
+                        descriptor
+                            .levels
+                            .iter()
+                            .map(|level| level.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
         println!(
             "  canary: {} method={} match_min={} tolerance_bps={}",
             model.canary_set,
@@ -11436,6 +11513,14 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         aggregate_calibrated_modality_fingerprints(model, &prompts, &reports)?;
     let modality_resource_profiles =
         aggregate_calibrated_modality_resource_profiles(model, &reports, &calibration_memory)?;
+    let speciality_calibrations = calibrate_model_specialities(
+        backend.as_mut(),
+        model,
+        &prompts,
+        args.seed,
+        args.include_output,
+        &calibration_memory,
+    )?;
     let endpoint_calibration =
         catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
     let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
@@ -11457,6 +11542,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         catalog_fingerprint,
         modality_fingerprints,
         modality_resource_profiles,
+        speciality_calibrations,
         endpoint_calibration,
         existing_catalog_fingerprint: existing,
         matches_existing_catalog: matches_existing,
@@ -11482,6 +11568,18 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
                 "failed"
             }
         );
+        let speciality_level_count = report
+            .speciality_calibrations
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        if speciality_level_count > 0 {
+            println!(
+                "Speciality calibration: {} specialities / {} levels",
+                report.speciality_calibrations.len(),
+                speciality_level_count
+            );
+        }
         if let Some(existing) = &report.existing_catalog_fingerprint {
             println!("Existing catalog fingerprint: {existing}");
             println!(
@@ -11516,6 +11614,81 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         endpoint_errors.join("; ")
     );
     Ok(())
+}
+
+fn calibrate_model_specialities(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+    seed: u32,
+    include_output: bool,
+    memory: &CalibrationMemoryContext,
+) -> Result<BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>>> {
+    if model.adapter.specialities.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    ensure!(
+        model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+        "model {} declares specialities but canary method {} cannot produce per-level token fingerprints",
+        model.model_id,
+        model.canary.verification_method
+    );
+
+    let mut calibrated = BTreeMap::new();
+    for descriptor in &model.adapter.specialities {
+        let mut levels = BTreeMap::new();
+        for level in &descriptor.levels {
+            let mut level_reports = Vec::with_capacity(prompts.len());
+            for prompt in prompts {
+                let process_ids = backend.process_ids();
+                let (mut report, baseline, peak) =
+                    measure_calibration_memory(memory, &process_ids, || {
+                        calibrate_token_canary_prompt_with_speciality(
+                            backend,
+                            model,
+                            prompt,
+                            seed,
+                            include_output,
+                            Some((&descriptor.name, &level.name)),
+                        )
+                    })?;
+                report.calibration_baseline_memory_bytes = baseline;
+                report.calibration_peak_memory_bytes = peak;
+                level_reports.push(report);
+            }
+            let output_tokens = level_reports
+                .iter()
+                .map(|report| u64::from(report.completion_tokens))
+                .sum();
+            let reasoning_tokens = level_reports
+                .iter()
+                .map(|report| u64::from(report.reasoning_tokens))
+                .sum();
+            ensure!(
+                output_tokens > 0,
+                "speciality {}/{} produced no output tokens",
+                descriptor.name,
+                level.name
+            );
+            ensure!(
+                reasoning_tokens <= output_tokens,
+                "speciality {}/{} reported more reasoning tokens than output tokens",
+                descriptor.name,
+                level.name
+            );
+            levels.insert(
+                level.name.clone(),
+                CanarySpecialityCalibrationReport {
+                    fingerprint: aggregate_canary_fingerprint(&level_reports),
+                    output_tokens,
+                    reasoning_tokens,
+                    prompts: level_reports,
+                },
+            );
+        }
+        calibrated.insert(descriptor.name.clone(), levels);
+    }
+    Ok(calibrated)
 }
 
 #[derive(Default)]
@@ -13103,6 +13276,11 @@ fn catalog_canary_evidence_report(
                     .cloned()
                     .unwrap_or_default(),
             );
+            let expected_speciality_calibrations = model
+                .speciality_assessment
+                .calibrated
+                .get(artifact_name)
+                .cloned();
             if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
                 match expected_fingerprint.as_deref() {
                     Some(value) if is_hex_len(value, 64) => {}
@@ -13123,6 +13301,12 @@ fn catalog_canary_evidence_report(
                     model,
                     artifact_name,
                     expected_modality_resource_profiles.as_ref(),
+                    &mut entry_errors,
+                );
+                validate_speciality_calibration_evidence(
+                    model,
+                    artifact_name,
+                    expected_speciality_calibrations.as_ref(),
                     &mut entry_errors,
                 );
             }
@@ -13173,6 +13357,7 @@ fn catalog_canary_evidence_report(
                 expected_fingerprint,
                 expected_modality_fingerprints,
                 expected_modality_resource_profiles,
+                expected_speciality_calibrations,
                 expected_token_prefixes,
                 expected_perceptual_hashes,
                 expected_embedding_vectors,
@@ -13183,6 +13368,7 @@ fn catalog_canary_evidence_report(
                 report_fingerprint: None,
                 report_modality_fingerprints: None,
                 report_modality_resource_profiles: None,
+                report_speciality_calibrations: None,
                 report_token_prefixes: None,
                 report_perceptual_hashes: None,
                 report_embedding_vectors: None,
@@ -13193,6 +13379,7 @@ fn catalog_canary_evidence_report(
                 matches_catalog: None,
                 modality_fingerprints_match_catalog: None,
                 modality_resource_profiles_match_catalog: None,
+                speciality_calibrations_match_catalog: None,
                 token_prefixes_match_catalog: None,
                 method_values_match_catalog: None,
                 ok: entry_errors.is_empty(),
@@ -13255,6 +13442,9 @@ fn catalog_canary_evidence_report(
         entry.report_modality_fingerprints = Some(calibration.modality_fingerprints.clone());
         entry.report_modality_resource_profiles =
             Some(calibration.modality_resource_profiles.clone());
+        let report_speciality_calibrations =
+            compact_speciality_calibration_report(&calibration.speciality_calibrations);
+        entry.report_speciality_calibrations = Some(report_speciality_calibrations.clone());
         let report_token_prefixes = calibration
             .prompts
             .iter()
@@ -13332,6 +13522,15 @@ fn catalog_canary_evidence_report(
             .as_ref()
             .map(|expected| expected == &calibration.modality_resource_profiles);
         entry.modality_resource_profiles_match_catalog = modality_resource_profiles_match_catalog;
+        let speciality_calibrations_match_catalog = Some(
+            entry
+                .expected_speciality_calibrations
+                .as_ref()
+                .cloned()
+                .unwrap_or_default()
+                == report_speciality_calibrations,
+        );
+        entry.speciality_calibrations_match_catalog = speciality_calibrations_match_catalog;
         let token_prefixes_match_catalog = entry
             .expected_token_prefixes
             .as_ref()
@@ -13393,6 +13592,15 @@ fn catalog_canary_evidence_report(
             )
             .into_iter()
             .map(|error| format!("endpoint calibration: {error}")),
+        );
+        let speciality_prompt_ids = canary_set_matrix_check(&canaries_dir, calibration_model)
+            .map(|info| info.prompt_ids)
+            .unwrap_or_default();
+        validate_speciality_calibration_report(
+            calibration_model,
+            &speciality_prompt_ids,
+            &calibration.speciality_calibrations,
+            &mut entry.errors,
         );
         if calibration.prompt_count != calibration.prompts.len() {
             entry.errors.push(format!(
@@ -13482,6 +13690,14 @@ fn catalog_canary_evidence_report(
         {
             entry.errors.push(
                 "report modality resource profiles do not match catalog calibration evidence"
+                    .to_owned(),
+            );
+        }
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && speciality_calibrations_match_catalog != Some(true)
+        {
+            entry.errors.push(
+                "report speciality calibrations do not match catalog calibration evidence"
                     .to_owned(),
             );
         }
@@ -13612,6 +13828,195 @@ fn validate_expected_canary_method_values(
             )),
         },
         _ => {}
+    }
+}
+
+fn compact_speciality_calibration_report(
+    report: &BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>>,
+) -> CompactSpecialityCalibrations {
+    report
+        .iter()
+        .map(|(name, levels)| {
+            let levels = levels
+                .iter()
+                .map(|(level, calibration)| {
+                    (
+                        level.clone(),
+                        catalog::CatalogSpecialityCalibration {
+                            fingerprint: calibration.fingerprint.clone(),
+                            output_tokens: calibration.output_tokens,
+                            reasoning_tokens: calibration.reasoning_tokens,
+                        },
+                    )
+                })
+                .collect();
+            (name.clone(), levels)
+        })
+        .collect()
+}
+
+fn validate_speciality_calibration_evidence(
+    model: &catalog::CatalogModel,
+    artifact: &str,
+    calibrated: Option<&CompactSpecialityCalibrations>,
+    errors: &mut Vec<String>,
+) {
+    if model.adapter.specialities.is_empty() {
+        if calibrated.is_some_and(|values| !values.is_empty()) {
+            errors.push(format!(
+                "speciality calibration for {artifact} exists but the model declares no specialities"
+            ));
+        }
+        return;
+    }
+    let Some(calibrated) = calibrated else {
+        errors.push(format!(
+            "speciality calibration missing artifact {artifact}"
+        ));
+        return;
+    };
+    let descriptors = model
+        .adapter
+        .specialities
+        .iter()
+        .map(|descriptor| (descriptor.name.as_str(), descriptor))
+        .collect::<BTreeMap<_, _>>();
+    for descriptor in descriptors.values() {
+        let Some(levels) = calibrated.get(&descriptor.name) else {
+            errors.push(format!(
+                "speciality calibration for {artifact} missing {}",
+                descriptor.name
+            ));
+            continue;
+        };
+        for level in &descriptor.levels {
+            match levels.get(&level.name) {
+                Some(calibration)
+                    if is_hex_len(&calibration.fingerprint, 64)
+                        && calibration.output_tokens > 0
+                        && calibration.reasoning_tokens <= calibration.output_tokens => {}
+                Some(_) => errors.push(format!(
+                    "speciality calibration for {artifact}/{}/{} requires a 32-byte fingerprint, positive output tokens, and reasoning <= output",
+                    descriptor.name, level.name
+                )),
+                None => errors.push(format!(
+                    "speciality calibration for {artifact}/{} missing level {}",
+                    descriptor.name, level.name
+                )),
+            }
+        }
+        for level in levels.keys() {
+            if !descriptor
+                .levels
+                .iter()
+                .any(|declared| declared.name == *level)
+            {
+                errors.push(format!(
+                    "speciality calibration for {artifact}/{} references unknown level {level}",
+                    descriptor.name
+                ));
+            }
+        }
+    }
+    for name in calibrated.keys() {
+        if !descriptors.contains_key(name.as_str()) {
+            errors.push(format!(
+                "speciality calibration for {artifact} references unknown speciality {name}"
+            ));
+        }
+    }
+}
+
+fn validate_speciality_calibration_report(
+    model: &catalog::CatalogModel,
+    expected_prompt_ids: &[String],
+    report: &BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>>,
+    errors: &mut Vec<String>,
+) {
+    let compact = compact_speciality_calibration_report(report);
+    validate_speciality_calibration_evidence(model, "report", Some(&compact), errors);
+    if model.adapter.specialities.is_empty() {
+        return;
+    }
+    if model.canary.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+        errors.push(format!(
+            "speciality calibration requires token_fingerprint canaries, not {}",
+            model.canary.verification_method
+        ));
+        return;
+    }
+
+    for descriptor in &model.adapter.specialities {
+        let Some(levels) = report.get(&descriptor.name) else {
+            continue;
+        };
+        for level in &descriptor.levels {
+            let Some(calibration) = levels.get(&level.name) else {
+                continue;
+            };
+            let observed_prompt_ids = calibration
+                .prompts
+                .iter()
+                .map(|prompt| prompt.prompt_id.as_str())
+                .collect::<Vec<_>>();
+            let expected_prompt_ids_ref = expected_prompt_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if observed_prompt_ids != expected_prompt_ids_ref {
+                errors.push(format!(
+                    "speciality calibration {}/{} prompt order or coverage does not match the canary set",
+                    descriptor.name, level.name
+                ));
+            }
+            let aggregate = aggregate_canary_fingerprint(&calibration.prompts);
+            if calibration.fingerprint != aggregate {
+                errors.push(format!(
+                    "speciality calibration {}/{} aggregate fingerprint does not match its prompt reports",
+                    descriptor.name, level.name
+                ));
+            }
+            let output_tokens = calibration
+                .prompts
+                .iter()
+                .map(|prompt| u64::from(prompt.completion_tokens))
+                .sum::<u64>();
+            let reasoning_tokens = calibration
+                .prompts
+                .iter()
+                .map(|prompt| u64::from(prompt.reasoning_tokens))
+                .sum::<u64>();
+            if calibration.output_tokens != output_tokens
+                || calibration.reasoning_tokens != reasoning_tokens
+            {
+                errors.push(format!(
+                    "speciality calibration {}/{} token totals do not match its prompt reports",
+                    descriptor.name, level.name
+                ));
+            }
+            for prompt in &calibration.prompts {
+                if prompt.reasoning_tokens > prompt.completion_tokens {
+                    errors.push(format!(
+                        "speciality calibration {}/{} prompt {} reports reasoning tokens above output tokens",
+                        descriptor.name, level.name, prompt.prompt_id
+                    ));
+                }
+                if !calibration_prompt_fingerprint_valid(
+                    CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+                    &prompt.fingerprint,
+                ) {
+                    errors.push(format!(
+                        "speciality calibration {}/{} prompt {} has an invalid token fingerprint",
+                        descriptor.name, level.name, prompt.prompt_id
+                    ));
+                }
+                validate_calibration_prompt_method_value(
+                    CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+                    prompt,
+                    errors,
+                );
+            }
+        }
     }
 }
 
@@ -13948,6 +14353,44 @@ fn apply_canary_report_fingerprints(
             resources.remove(&entry.artifact);
         } else {
             resources.insert(entry.artifact.clone(), json!(modality_resource_profiles));
+        }
+        let speciality_calibrations =
+            entry
+                .report_speciality_calibrations
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "calibration report for {} / {} has no speciality calibrations",
+                        entry.model_id, entry.artifact
+                    )
+                })?;
+        let model_object = model
+            .as_object_mut()
+            .with_context(|| format!("model {} catalog entry is not an object", entry.model_id))?;
+        let speciality_assessment = model_object
+            .entry("speciality_assessment")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} speciality_assessment is not an object",
+                    entry.model_id
+                )
+            })?;
+        let calibrated = speciality_assessment
+            .entry("calibrated")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} speciality_assessment.calibrated is not an object",
+                    entry.model_id
+                )
+            })?;
+        if speciality_calibrations.is_empty() {
+            calibrated.remove(&entry.artifact);
+        } else {
+            calibrated.insert(entry.artifact.clone(), json!(speciality_calibrations));
         }
         applied += 1;
     }
@@ -14389,6 +14832,7 @@ fn catalog_canary_matrix_report(
                 .modality_assessment
                 .resource_profiles
                 .get(artifact_name);
+            let speciality_calibrations = model.speciality_assessment.calibrated.get(artifact_name);
             validate_modality_fingerprint_evidence(
                 model,
                 artifact_name,
@@ -14399,6 +14843,12 @@ fn catalog_canary_matrix_report(
                 model,
                 artifact_name,
                 modality_resource_profiles,
+                &mut entry_errors,
+            );
+            validate_speciality_calibration_evidence(
+                model,
+                artifact_name,
+                speciality_calibrations,
                 &mut entry_errors,
             );
             if let Some(required_method) = required_launch_output_canary_method(model) {
@@ -14583,6 +15033,8 @@ fn catalog_canary_matrix_report(
                 audio_fingerprint_count,
                 modality_fingerprint_count: modality_fingerprints.map(BTreeMap::len),
                 modality_resource_profile_count: modality_resource_profiles.map(BTreeMap::len),
+                speciality_calibration_level_count: speciality_calibrations
+                    .map(|specialities| specialities.values().map(BTreeMap::len).sum()),
                 calibration_status,
                 ok,
                 errors: entry_errors,
@@ -14945,7 +15397,30 @@ fn calibrate_token_canary_prompt(
     seed: u32,
     include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
-    let body = canary_probe_request(&model.model_id, prompt);
+    calibrate_token_canary_prompt_with_speciality(
+        backend,
+        model,
+        prompt,
+        seed,
+        include_output,
+        None,
+    )
+}
+
+fn calibrate_token_canary_prompt_with_speciality(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+    seed: u32,
+    include_output: bool,
+    speciality: Option<(&str, &str)>,
+) -> Result<CanaryCalibrationPromptReport> {
+    let mut body = canary_probe_request(&model.model_id, prompt);
+    if let Some((name, level)) = speciality {
+        body.as_object_mut()
+            .context("chat canary request must be an object")?
+            .insert(name.to_owned(), json!(level));
+    }
     let mut request = provider_engine_request_from_endpoint_body_with_sampling(
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
         &body,
@@ -14970,6 +15445,7 @@ fn calibrate_token_canary_prompt(
         max_tokens,
         prompt_tokens: output.usage.prompt_tokens,
         completion_tokens: output.usage.completion_tokens,
+        reasoning_tokens: output.usage.reasoning_tokens,
         token_count: token_ids.len(),
         token_ids,
         fingerprint,
@@ -15042,6 +15518,7 @@ fn calibrate_image_perceptual_hash_prompt(
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
         prompt_tokens: 0,
         completion_tokens: 0,
+        reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
         fingerprint: perceptual_hash.clone(),
@@ -15091,6 +15568,7 @@ fn calibrate_embedding_cosine_prompt(
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
         prompt_tokens: output.usage.prompt_tokens,
         completion_tokens: output.usage.completion_tokens,
+        reasoning_tokens: output.usage.reasoning_tokens,
         token_count: 0,
         token_ids: Vec::new(),
         fingerprint,
@@ -15138,6 +15616,7 @@ fn calibrate_transcript_match_prompt(
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
         prompt_tokens: 0,
         completion_tokens: 0,
+        reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
         fingerprint,
@@ -15195,6 +15674,7 @@ fn calibrate_audio_fingerprint_prompt(
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
         prompt_tokens: 0,
         completion_tokens: 0,
+        reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
         fingerprint: fingerprint.clone(),
@@ -17770,6 +18250,12 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "enclave caps",
     )?;
     enforce_backend_caps(&args.backend, &mut caps)?;
+    caps.as_object_mut()
+        .context("enclave caps must be a JSON object")?
+        .insert(
+            "speciality_levels".to_owned(),
+            json!(binding.speciality_levels),
+        );
     let launch_measurements = optional_json_arg_or_file(
         args.launch_measurements_json.as_deref(),
         args.launch_measurements_file.as_ref(),
@@ -18026,6 +18512,7 @@ fn backend_supports_tool_calls(backend: &str) -> bool {
 struct AdminEnclaveCatalogBinding {
     model_class: String,
     quant: String,
+    speciality_levels: BTreeMap<String, Vec<String>>,
     artifact_sidecars: BTreeMap<String, CatalogSidecarPayload>,
 }
 
@@ -18149,6 +18636,7 @@ fn validate_admin_enclave_catalog_binding(
     Ok(AdminEnclaveCatalogBinding {
         model_class: model.model_class.clone(),
         quant,
+        speciality_levels: catalog_provider_speciality_levels(model),
         artifact_sidecars: artifact
             .sidecars
             .iter()
@@ -22365,6 +22853,7 @@ struct UpPlan {
     provider_auto_fit: bool,
     provider_gpu_layers: Option<u32>,
     provider_disable_modalities: Vec<String>,
+    provider_speciality_levels: Vec<String>,
     provider_hardware_quote_kind: Option<String>,
     provider_hardware_quote_command: Option<PathBuf>,
     provider_hardware_quote_timeout_seconds: u64,
@@ -22774,6 +23263,7 @@ fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
         skip_disk_bench: false,
         ctx: None,
         disable_modalities: plan.provider_disable_modalities.clone(),
+        speciality_levels: plan.provider_speciality_levels.clone(),
         memory_reserve: None,
         json: true,
         dev_skip_catalog_verify: false,
@@ -22884,6 +23374,7 @@ async fn up_add_selected_provider_workers(
             plan.provider_gpu_layers,
             Some(candidate.served_ctx),
             &candidate.served_modalities,
+            &candidate.served_specialities,
             worker_name,
         )?;
         let response = post_gateway_json(
@@ -22966,6 +23457,9 @@ fn resolve_up_provider_workers(args: &UpArgs) -> Result<Vec<UpProviderWorker>> {
         }
         if !args.provider_disable_modalities.is_empty() {
             bail!("--provider-disable-modality requires --provider");
+        }
+        if !args.provider_speciality_levels.is_empty() {
+            bail!("--provider-speciality-levels requires --provider");
         }
         return Ok(Vec::new());
     }
@@ -23051,6 +23545,11 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let provider_disable_modalities =
         normalized_provider_disabled_modalities(&args.provider_disable_modalities)?
             .into_iter()
+            .collect::<Vec<_>>();
+    let provider_speciality_levels =
+        parse_provider_speciality_level_overrides(&args.provider_speciality_levels)?
+            .into_iter()
+            .map(|(name, levels)| format!("{name}={}", levels.join(",")))
             .collect::<Vec<_>>();
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -23261,6 +23760,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         provider_auto_fit: args.auto_fit,
         provider_gpu_layers: args.provider_gpu_layers,
         provider_disable_modalities,
+        provider_speciality_levels,
         provider_hardware_quote_kind: args.provider_hardware_quote_kind.clone(),
         provider_hardware_quote_command,
         provider_hardware_quote_timeout_seconds: args.provider_hardware_quote_timeout_seconds,
@@ -23751,6 +24251,9 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             }
             for modality in &plan.provider_disable_modalities {
                 provider_args.extend(["--disable-modality".to_owned(), modality.clone()]);
+            }
+            for speciality in &plan.provider_speciality_levels {
+                provider_args.extend(["--speciality-levels".to_owned(), speciality.clone()]);
             }
             if let (Some(kind), Some(command)) = (
                 plan.provider_hardware_quote_kind.as_ref(),
@@ -25587,6 +26090,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
         .as_deref()
         .map(normalize_provider_modality)
         .transpose()?;
+    let speciality_filter = parse_speciality_filter(args.speciality.as_deref())?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -25596,18 +26100,21 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.gateway {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
         let models = fetch_gateway_models_allow_empty(&client, &gateway_root).await?;
-        let summaries = filter_model_summaries_by_modality(
-            filter_model_summaries_by_require_kyb(
-                filter_model_summaries_by_quant(
-                    filter_model_summaries_by_min_att_tier(
-                        gateway_model_summaries(&models)?,
-                        args.min_att_tier,
+        let summaries = filter_model_summaries_by_speciality(
+            filter_model_summaries_by_modality(
+                filter_model_summaries_by_require_kyb(
+                    filter_model_summaries_by_quant(
+                        filter_model_summaries_by_min_att_tier(
+                            gateway_model_summaries(&models)?,
+                            args.min_att_tier,
+                        ),
+                        quant_filter.as_deref(),
                     ),
-                    quant_filter.as_deref(),
+                    args.require_kyb,
                 ),
-                args.require_kyb,
+                modality_filter.as_deref(),
             ),
-            modality_filter.as_deref(),
+            speciality_filter.as_ref(),
         );
         let report = json!({
             "ok": true,
@@ -25617,6 +26124,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
             "quant": quant_filter,
             "require_kyb": args.require_kyb,
             "modality": modality_filter,
+            "speciality": speciality_filter.as_ref().map(|(name, level)| format!("{name}={level}")),
             "models": summaries,
         });
 
@@ -25638,22 +26146,25 @@ async fn models(args: ModelsArgs) -> Result<()> {
             disk_bench_mib: 1,
             fixture: None,
         });
-        let catalog_report = filter_catalog_list_report_by_modality(
-            catalog_list_report(
-                &catalog_doc,
-                files.catalog_path,
-                files.signature_path,
-                release.catalog_hash.clone(),
-                release.key_id.clone(),
-                CatalogListTier::Launch,
-                Some(&hardware),
-                Some(CatalogListLocalRunContext {
-                    contract: &contract,
-                    hardware: &hardware,
-                    home: &home,
-                }),
+        let catalog_report = filter_catalog_list_report_by_speciality(
+            filter_catalog_list_report_by_modality(
+                catalog_list_report(
+                    &catalog_doc,
+                    files.catalog_path,
+                    files.signature_path,
+                    release.catalog_hash.clone(),
+                    release.key_id.clone(),
+                    CatalogListTier::Launch,
+                    Some(&hardware),
+                    Some(CatalogListLocalRunContext {
+                        contract: &contract,
+                        hardware: &hardware,
+                        home: &home,
+                    }),
+                ),
+                modality_filter.as_deref(),
             ),
-            modality_filter.as_deref(),
+            speciality_filter.as_ref(),
         );
 
         if args.json {
@@ -25663,6 +26174,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
                 "rpc_url": rpc_url,
                 "release": release,
                 "modality": modality_filter,
+                "speciality": speciality_filter.as_ref().map(|(name, level)| format!("{name}={level}")),
                 "catalog": catalog_report,
             });
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -27239,6 +27751,9 @@ struct ModelSummary {
     id: String,
     modalities: Vec<String>,
     served_modalities: BTreeMap<String, u64>,
+    specialities: BTreeMap<String, Vec<String>>,
+    served_specialities: BTreeMap<String, BTreeMap<String, u64>>,
+    speciality_availability: Value,
     providers_online: u64,
     rooms: u64,
     denom: String,
@@ -27392,6 +27907,7 @@ struct CanaryCalibrationPromptReport {
     max_tokens: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
+    reasoning_tokens: u32,
     token_count: usize,
     token_ids: Vec<i32>,
     fingerprint: String,
@@ -27409,6 +27925,17 @@ struct CanaryCalibrationPromptReport {
     calibration_peak_memory_bytes: u64,
     output_text: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CanarySpecialityCalibrationReport {
+    fingerprint: String,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    prompts: Vec<CanaryCalibrationPromptReport>,
+}
+
+type CompactSpecialityCalibrations =
+    BTreeMap<String, BTreeMap<String, catalog::CatalogSpecialityCalibration>>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CanaryCalibrationResourceItem {
@@ -27447,6 +27974,7 @@ struct CatalogCanaryCalibrationReport {
     catalog_fingerprint: String,
     modality_fingerprints: BTreeMap<String, String>,
     modality_resource_profiles: BTreeMap<String, catalog::CatalogModalityResourceProfile>,
+    speciality_calibrations: BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>>,
     endpoint_calibration: EndpointCalibrationReport,
     existing_catalog_fingerprint: Option<String>,
     matches_existing_catalog: Option<bool>,
@@ -27482,6 +28010,7 @@ struct CatalogCanaryMatrixEntry {
     audio_fingerprint_count: Option<usize>,
     modality_fingerprint_count: Option<usize>,
     modality_resource_profile_count: Option<usize>,
+    speciality_calibration_level_count: Option<usize>,
     calibration_status: String,
     ok: bool,
     errors: Vec<String>,
@@ -27558,6 +28087,7 @@ struct CatalogCanaryEvidenceEntry {
     expected_modality_fingerprints: Option<BTreeMap<String, String>>,
     expected_modality_resource_profiles:
         Option<BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
+    expected_speciality_calibrations: Option<CompactSpecialityCalibrations>,
     expected_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     expected_perceptual_hashes: Option<BTreeMap<String, String>>,
     expected_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
@@ -27569,6 +28099,7 @@ struct CatalogCanaryEvidenceEntry {
     report_modality_fingerprints: Option<BTreeMap<String, String>>,
     report_modality_resource_profiles:
         Option<BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
+    report_speciality_calibrations: Option<CompactSpecialityCalibrations>,
     report_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     report_perceptual_hashes: Option<BTreeMap<String, String>>,
     report_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
@@ -27579,6 +28110,7 @@ struct CatalogCanaryEvidenceEntry {
     matches_catalog: Option<bool>,
     modality_fingerprints_match_catalog: Option<bool>,
     modality_resource_profiles_match_catalog: Option<bool>,
+    speciality_calibrations_match_catalog: Option<bool>,
     token_prefixes_match_catalog: Option<bool>,
     method_values_match_catalog: Option<bool>,
     ok: bool,
@@ -28531,6 +29063,46 @@ fn filter_model_summaries_by_modality(
         .collect()
 }
 
+fn parse_speciality_filter(value: Option<&str>) -> Result<Option<(String, String)>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let (name, level) = value
+        .split_once('=')
+        .with_context(|| format!("invalid --speciality {value:?}; expected exactly NAME=LEVEL"))?;
+    let name = name.trim();
+    let level = level.trim();
+    if !valid_provider_speciality_component(name)
+        || !valid_provider_speciality_component(level)
+        || level.contains('=')
+    {
+        bail!("invalid --speciality {value:?}; expected exactly NAME=LEVEL");
+    }
+    Ok(Some((name.to_owned(), level.to_owned())))
+}
+
+fn filter_model_summaries_by_speciality(
+    summaries: Vec<ModelSummary>,
+    speciality: Option<&(String, String)>,
+) -> Vec<ModelSummary> {
+    let Some((name, level)) = speciality else {
+        return summaries;
+    };
+    summaries
+        .into_iter()
+        .filter(|summary| {
+            summary
+                .served_specialities
+                .get(name)
+                .and_then(|levels| levels.get(level))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+        .collect()
+}
+
 fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
     let id = model
         .get("id")
@@ -28581,6 +29153,12 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         id: id.to_owned(),
         modalities: gateway_catalog_modalities(mayhem),
         served_modalities: gateway_served_modality_counts(mayhem),
+        specialities: gateway_catalog_specialities(mayhem),
+        served_specialities: gateway_served_speciality_counts(mayhem),
+        speciality_availability: mayhem
+            .get("speciality_availability")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
         providers_online: mayhem
             .get("providers_online")
             .and_then(Value::as_u64)
@@ -28611,6 +29189,55 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         prompt_confidential,
         prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
     })
+}
+
+fn gateway_catalog_specialities(mayhem: &Value) -> BTreeMap<String, Vec<String>> {
+    mayhem
+        .pointer("/adapter/specialities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|descriptor| {
+            let name = descriptor.get("name")?.as_str()?;
+            if !valid_provider_speciality_component(name) {
+                return None;
+            }
+            let levels = descriptor
+                .get("levels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|level| level.get("name").and_then(Value::as_str))
+                .filter(|level| valid_provider_speciality_component(level))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            Some((name.to_owned(), levels))
+        })
+        .collect()
+}
+
+fn gateway_served_speciality_counts(mayhem: &Value) -> BTreeMap<String, BTreeMap<String, u64>> {
+    mayhem
+        .get("speciality_availability")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, speciality)| {
+            let levels = speciality
+                .get("levels")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(level, availability)| {
+                    availability
+                        .get("live_provider_count")
+                        .and_then(Value::as_u64)
+                        .map(|count| (level.clone(), count))
+                })
+                .collect();
+            (name.clone(), levels)
+        })
+        .collect()
 }
 
 fn gateway_catalog_modalities(mayhem: &Value) -> Vec<String> {
@@ -29480,6 +30107,9 @@ fn print_models_report(report: &Value) -> Result<()> {
     if let Some(modality) = report["modality"].as_str() {
         println!("Filter: live provider modality {modality}");
     }
+    if let Some(speciality) = report["speciality"].as_str() {
+        println!("Filter: live provider speciality {speciality}");
+    }
     println!(
         "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
     );
@@ -29537,8 +30167,71 @@ fn print_models_report(report: &Value) -> Result<()> {
             truncate_for_table(&modalities, 20),
             truncate_for_table(&attestation, 36)
         );
+        let speciality_summary = gateway_speciality_summary_for_model(model);
+        if !speciality_summary.is_empty() {
+            println!("  specialities: {speciality_summary}");
+        }
     }
     Ok(())
+}
+
+fn gateway_speciality_summary_for_model(model: &Value) -> String {
+    model
+        .get("speciality_availability")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, speciality)| {
+            let default_level = speciality
+                .get("default_level")
+                .and_then(Value::as_str)
+                .unwrap_or("unset");
+            let levels = speciality
+                .get("levels")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(level, availability)| {
+                    let live = availability
+                        .get("live_provider_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let expected = availability
+                        .get("expected_volume")
+                        .filter(|value| !value.is_null())
+                        .map(|volume| {
+                            let output_min = volume
+                                .get("output_tokens_min")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let output_max = volume
+                                .get("output_tokens_max")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let cost_min = volume
+                                .get("expected_output_cost_usd_min")
+                                .and_then(Value::as_str);
+                            let cost_max = volume
+                                .get("expected_output_cost_usd_max")
+                                .and_then(Value::as_str);
+                            match (cost_min, cost_max) {
+                                (Some(cost_min), Some(cost_max)) => format!(
+                                    "{output_min}-{output_max} measured output tokens; {cost_min}-{cost_max} output cost"
+                                ),
+                                _ => format!(
+                                    "{output_min}-{output_max} measured output tokens; output rate unavailable"
+                                ),
+                            }
+                        })
+                        .unwrap_or_else(|| "calibration pending".to_owned());
+                    format!("{level}:{live} live, {expected}")
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("{name}(default={default_level}; {levels})")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn print_price_show_report(report: &Value) -> Result<()> {
@@ -32942,6 +33635,8 @@ struct LedgerServe {
     served_ctx: Option<u64>,
     #[serde(default)]
     served_modalities: Vec<String>,
+    #[serde(default)]
+    served_specialities: BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hardware_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33267,6 +33962,7 @@ struct ProviderCandidate {
     price: Option<LedgerPriceSchedule>,
     served_ctx: u64,
     served_modalities: Vec<String>,
+    served_specialities: BTreeMap<String, Vec<String>>,
     modality_capacities: BTreeMap<String, HeartbeatModalityCapacity>,
     feasibility: ProviderCtxFeasibility,
     ctx_bracket_schedule: CtxBracketSchedule,
@@ -33276,6 +33972,7 @@ struct ProviderCandidate {
 struct ProviderJoinContextTerms {
     served_ctx: u64,
     served_modalities: Vec<String>,
+    served_specialities: BTreeMap<String, Vec<String>>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
 }
@@ -34435,6 +35132,7 @@ struct ActiveProviderSession {
     locked_min_session_au: MoneyAu,
     served_ctx: u32,
     required_modalities: Vec<String>,
+    required_specialities: BTreeMap<String, String>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
@@ -34471,6 +35169,7 @@ struct ProviderSessionTerms {
     adapter: catalog::CatalogAdapter,
     sampling: catalog::CatalogSamplingProfile,
     served_modalities: Vec<String>,
+    served_specialities: BTreeMap<String, Vec<String>>,
     modality_capacities: BTreeMap<String, HeartbeatModalityCapacity>,
     room_ids: Vec<String>,
     price_ver: u64,
@@ -34937,6 +35636,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         skip_disk_bench: false,
         ctx: args.ctx,
         disable_modalities: args.disable_modalities.clone(),
+        speciality_levels: args.speciality_levels.clone(),
         memory_reserve: None,
         json: true,
         dev_skip_catalog_verify: false,
@@ -34962,6 +35662,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         computed.gpu_layers,
         Some(selected.served_ctx),
         &selected.served_modalities,
+        &selected.served_specialities,
         None,
     )?;
     let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
@@ -35050,6 +35751,7 @@ fn provider_serve_child_config(
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
     served_modalities: &[String],
+    served_specialities: &BTreeMap<String, Vec<String>>,
     name: Option<String>,
 ) -> Result<Value> {
     let config_path = config_path_for_home(home);
@@ -35101,6 +35803,16 @@ fn provider_serve_child_config(
         if !catalog_modalities.contains(modality) {
             args.extend(["--disable-modality".to_owned(), modality.to_owned()]);
         }
+    }
+    for (speciality, levels) in served_specialities {
+        ensure!(
+            !levels.is_empty(),
+            "provider speciality {speciality} has no served levels"
+        );
+        args.extend([
+            "--speciality-levels".to_owned(),
+            format!("{speciality}={}", levels.join(",")),
+        ]);
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
     Ok(json!({
@@ -35175,6 +35887,7 @@ fn provider_start_args_for_serve_plan(
         min_ask_au: 0,
         ctx: args.ctx,
         disable_modalities: args.disable_modalities.clone(),
+        speciality_levels: args.speciality_levels.clone(),
         memory_reserve: args.memory_reserve.clone(),
         vllm_memory_utilization: None,
         disk_reserve: None,
@@ -36715,6 +37428,7 @@ fn apply_provider_config_defaults(
     let cli_budget_au = args.serve_budget_au != 0;
     let cli_budget_units = args.serve_budget_units != 0;
     let cli_budget_period = args.serve_budget_period_seconds != 86_400;
+    let cli_specialities = !args.speciality_levels.is_empty();
     if let Some(limits) = config
         .and_then(|config| config.provider.as_ref())
         .and_then(|provider| provider.limits.as_ref())
@@ -36727,6 +37441,7 @@ fn apply_provider_config_defaults(
             cli_budget_au,
             cli_budget_units,
             cli_budget_period,
+            cli_specialities,
         );
     }
     if let Some(limits) = provider_config_enclave_limits(config, selected) {
@@ -36738,6 +37453,7 @@ fn apply_provider_config_defaults(
             cli_budget_au,
             cli_budget_units,
             cli_budget_period,
+            cli_specialities,
         );
     }
 }
@@ -36750,6 +37466,7 @@ fn apply_provider_limit_defaults(
     cli_budget_au: bool,
     cli_budget_units: bool,
     cli_budget_period: bool,
+    cli_specialities: bool,
 ) {
     if !cli_max_sessions {
         if let Some(value) = limits.max_sessions {
@@ -36797,6 +37514,14 @@ fn apply_provider_limit_defaults(
             if configured.max_item_units.is_some() {
                 target.max_item_units = configured.max_item_units;
             }
+        }
+    }
+    if !cli_specialities {
+        if let Some(specialities) = &limits.specialities {
+            args.speciality_levels = specialities
+                .iter()
+                .map(|(name, levels)| format!("{name}={}", levels.join(",")))
+                .collect();
         }
     }
 }
@@ -37074,8 +37799,15 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         )
     })?;
     let served_modalities = ledger_enclave_served_modalities(&enclave, &args.disable_modalities)?;
-    let serve_terms =
-        provider_join_context_terms_from_price(&enclave, served_ctx, served_modalities, price)?;
+    let served_specialities =
+        ledger_enclave_served_specialities(&enclave, &args.speciality_levels)?;
+    let serve_terms = provider_join_context_terms_from_price(
+        &enclave,
+        served_ctx,
+        served_modalities,
+        served_specialities,
+        price,
+    )?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
     let hardware_fingerprint = current_provider_hardware_fingerprint();
     let provider_feature = ensure_provider_registered(
@@ -37119,6 +37851,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "price": price,
         "hardware_fingerprint": hardware_fingerprint,
         "served_modalities": serve_terms.served_modalities,
+        "served_specialities": serve_terms.served_specialities,
         "rooms": rooms,
         "features": {
             "provider": provider_feature,
@@ -37404,6 +38137,7 @@ fn provider_lifecycle_intent_with_anchors(
             join_terms.context("join_enclave lifecycle intent requires committed context terms")?;
         value["served_ctx"] = json!(join_terms.served_ctx);
         value["served_modalities"] = json!(&join_terms.served_modalities);
+        value["served_specialities"] = json!(&join_terms.served_specialities);
         value["ctx_bracket"] = match &join_terms.ctx_bracket {
             Some(ctx_bracket) => json!(ctx_bracket),
             None => Value::Null,
@@ -37534,6 +38268,7 @@ fn provider_join_context_terms_from_price(
     enclave: &LedgerEnclave,
     served_ctx: u64,
     served_modalities: Vec<String>,
+    served_specialities: BTreeMap<String, Vec<String>>,
     price: &LedgerPriceSchedule,
 ) -> Result<ProviderJoinContextTerms> {
     let current = current_au_usd_price(price).with_context(|| {
@@ -37553,6 +38288,7 @@ fn provider_join_context_terms_from_price(
         return Ok(ProviderJoinContextTerms {
             served_ctx,
             served_modalities,
+            served_specialities,
             ctx_bracket: Some(ctx_bracket),
             ctx_bracket_table_ver: Some(ctx_bracket_table_ver),
         });
@@ -37563,6 +38299,7 @@ fn provider_join_context_terms_from_price(
     Ok(ProviderJoinContextTerms {
         served_ctx,
         served_modalities,
+        served_specialities,
         ctx_bracket: None,
         ctx_bracket_table_ver: None,
     })
@@ -37579,6 +38316,7 @@ fn provider_join_context_terms_for_candidate(
         &selected.enclave,
         selected.served_ctx,
         selected.served_modalities.clone(),
+        selected.served_specialities.clone(),
         price,
     )
 }
@@ -39036,6 +39774,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         let served_modalities = active_serve
             .map(|serve| serve.served_modalities.clone())
             .unwrap_or_default();
+        let served_specialities = active_serve
+            .map(|serve| serve.served_specialities.clone())
+            .unwrap_or_default();
         if served_modalities.is_empty() {
             continue;
         }
@@ -39085,6 +39826,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                         .map(|provider| provider.accepted_rails.clone())
                         .unwrap_or_default(),
                     served_modalities,
+                    served_specialities,
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
@@ -39195,6 +39937,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
                 adapter: mayhem_gateway::openai::ShapeAdapterInfo::default(),
+                speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
                 source: "contract".to_owned(),
@@ -39338,6 +40081,7 @@ fn gateway_shape_adapter(adapter: &catalog::CatalogAdapter) -> ShapeAdapterInfo 
         tool_call_strategy: adapter.tool_call_strategy.clone(),
         reasoning_passthrough: adapter.reasoning_passthrough.clone(),
         modality_set: adapter.modality_set.clone(),
+        specialities: adapter.specialities.clone(),
     }
 }
 
@@ -41185,6 +41929,38 @@ fn build_provider_candidates(
                 continue;
             }
         };
+        let catalog_specialities = catalog_provider_speciality_levels(model);
+        let ledger_specialities = match ledger_enclave_speciality_levels(enclave) {
+            Ok(specialities) => specialities,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("reading admin enclave speciality levels: {err:#}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        if ledger_specialities != catalog_specialities {
+            rejections.push(provider_rejection(
+                enclave,
+                "admin enclave speciality levels do not match the signed catalog".to_owned(),
+                None,
+            ));
+            continue;
+        }
+        let served_specialities = match provider_served_specialities(model, &args.speciality_levels)
+        {
+            Ok(specialities) => specialities,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("resolving served specialities: {err:#}"),
+                    None,
+                ));
+                continue;
+            }
+        };
         let feasibility = match provider_context_feasibility(
             enclave,
             model,
@@ -41208,6 +41984,15 @@ fn build_provider_candidates(
             }
         };
         let served_ctx = feasibility.served_ctx;
+        if let Err(err) = validate_provider_speciality_fit(model, &served_specialities, served_ctx)
+        {
+            rejections.push(provider_rejection(
+                enclave,
+                format!("speciality fit is invalid: {err:#}"),
+                None,
+            ));
+            continue;
+        }
         let modality_capacities = match provider_modality_capacities(
             model,
             &artifact_name,
@@ -41257,6 +42042,7 @@ fn build_provider_candidates(
             price: Some(price),
             served_ctx,
             served_modalities,
+            served_specialities,
             modality_capacities,
             feasibility,
             ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
@@ -41413,6 +42199,171 @@ fn ledger_enclave_served_modalities(
         })
         .collect::<Result<Vec<_>>>()?;
     resolve_provider_served_modalities(&enclave.model_class, &enabled, disabled)
+}
+
+fn valid_provider_speciality_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn catalog_provider_speciality_levels(
+    model: &catalog::CatalogModel,
+) -> BTreeMap<String, Vec<String>> {
+    model
+        .adapter
+        .specialities
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.name.clone(),
+                descriptor
+                    .levels
+                    .iter()
+                    .map(|level| level.name.clone())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn ledger_enclave_speciality_levels(
+    enclave: &LedgerEnclave,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    enclave
+        .caps
+        .get("speciality_levels")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("admin enclave caps speciality_levels must map names to level arrays")
+        .map(Option::unwrap_or_default)
+}
+
+fn parse_provider_speciality_level_overrides(
+    values: &[String],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut overrides = BTreeMap::new();
+    for value in values {
+        let (name, levels) = value.split_once('=').with_context(|| {
+            format!(
+                "invalid --speciality-levels {value:?}; expected NAME=LEVEL or NAME=LEVEL,LEVEL"
+            )
+        })?;
+        let name = name.trim();
+        if !valid_provider_speciality_component(name) {
+            bail!("invalid provider speciality name {name:?}");
+        }
+        if overrides.contains_key(name) {
+            bail!("provider speciality {name} is configured more than once");
+        }
+        let mut seen = BTreeSet::new();
+        let levels = levels
+            .split(',')
+            .map(str::trim)
+            .map(|level| {
+                if !valid_provider_speciality_component(level) {
+                    bail!("invalid level {level:?} for provider speciality {name}");
+                }
+                if !seen.insert(level.to_owned()) {
+                    bail!("provider speciality {name} repeats level {level}");
+                }
+                Ok(level.to_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if levels.is_empty() || levels.len() > 16 {
+            bail!("provider speciality {name} must retain between 1 and 16 levels");
+        }
+        overrides.insert(name.to_owned(), levels);
+    }
+    Ok(overrides)
+}
+
+fn resolve_provider_served_specialities(
+    available: &BTreeMap<String, Vec<String>>,
+    configured: &[String],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut served = available.clone();
+    for (name, selected) in parse_provider_speciality_level_overrides(configured)? {
+        let available_levels = available
+            .get(&name)
+            .with_context(|| format!("admin catalog does not define provider speciality {name}"))?;
+        for level in &selected {
+            if !available_levels.contains(level) {
+                bail!(
+                    "admin catalog speciality {name} does not define level {level}; available: {}",
+                    available_levels.join(",")
+                );
+            }
+        }
+        let selected_set = selected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        served.insert(
+            name,
+            available_levels
+                .iter()
+                .filter(|level| selected_set.contains(level.as_str()))
+                .cloned()
+                .collect(),
+        );
+    }
+    Ok(served)
+}
+
+fn provider_served_specialities(
+    model: &catalog::CatalogModel,
+    configured: &[String],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    resolve_provider_served_specialities(&catalog_provider_speciality_levels(model), configured)
+}
+
+fn ledger_enclave_served_specialities(
+    enclave: &LedgerEnclave,
+    configured: &[String],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    resolve_provider_served_specialities(&ledger_enclave_speciality_levels(enclave)?, configured)
+}
+
+fn validate_provider_speciality_fit(
+    model: &catalog::CatalogModel,
+    served: &BTreeMap<String, Vec<String>>,
+    served_ctx: u64,
+) -> Result<()> {
+    for descriptor in &model.adapter.specialities {
+        let levels = served.get(&descriptor.name).with_context(|| {
+            format!("provider speciality selection omitted {}", descriptor.name)
+        })?;
+        if levels.is_empty() {
+            bail!(
+                "provider speciality {} has no served levels",
+                descriptor.name
+            );
+        }
+        for level_name in levels {
+            let level = descriptor
+                .levels
+                .iter()
+                .find(|level| &level.name == level_name)
+                .with_context(|| {
+                    format!(
+                        "provider speciality {} selected unknown level {level_name}",
+                        descriptor.name
+                    )
+                })?;
+            if let Some(max_output_tokens) = level.default_max_output_tokens {
+                ensure!(
+                    u64::from(max_output_tokens) <= served_ctx,
+                    "provider speciality {} level {} output cap {} exceeds served context {}",
+                    descriptor.name,
+                    level.name,
+                    max_output_tokens,
+                    served_ctx
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) -> bool {
@@ -42419,6 +43370,13 @@ fn serve_state_matches_context_terms(
     if existing_modalities.as_deref() != Some(expected_modalities.as_slice()) {
         return false;
     }
+    let existing_specialities = existing
+        .get("served_specialities")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    if existing_specialities.as_ref() != Some(&serve_terms.served_specialities) {
+        return false;
+    }
     let existing_ctx_bracket = existing.get("ctx_bracket").and_then(Value::as_str);
     if existing_ctx_bracket != serve_terms.ctx_bracket.as_deref() {
         return false;
@@ -42953,6 +43911,7 @@ async fn send_provider_heartbeat_round(
                 "ctx": caps.ctx,
                 "vision": caps.vision,
                 "served_modalities": &selected.served_modalities,
+                "served_specialities": &selected.served_specialities,
                 "modality_capacity": &modality_capacity,
             },
             "att": {
@@ -42983,6 +43942,7 @@ async fn send_provider_heartbeat_round(
             "accepting_new": load.accepting_new,
             "identity_anchor": identity_anchor,
             "served_modalities": &selected.served_modalities,
+            "served_specialities": &selected.served_specialities,
         }));
     }
     Ok(sent)
@@ -43997,6 +44957,63 @@ fn validate_provider_session_modalities(required: &[String], served: &[String]) 
     Ok(())
 }
 
+fn validate_provider_session_specialities(
+    required: &BTreeMap<String, String>,
+    served: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    ensure!(
+        required.len() == served.len() && required.keys().eq(served.keys()),
+        "spend voucher must bind every provider speciality exactly once"
+    );
+    for (name, level) in required {
+        ensure!(
+            valid_provider_speciality_component(name) && valid_provider_speciality_component(level),
+            "spend voucher contains an invalid speciality selection"
+        );
+        ensure!(
+            served
+                .get(name)
+                .is_some_and(|levels| levels.contains(level)),
+            "provider does not serve speciality {name} level {level}"
+        );
+    }
+    Ok(())
+}
+
+fn provider_request_speciality_selection(
+    endpoint_family: &str,
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<BTreeMap<String, String>> {
+    let contract = adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .with_context(|| format!("catalog adapter has no endpoint family {endpoint_family}"))?;
+    let mut selected = BTreeMap::new();
+    for descriptor in &adapter.specialities {
+        ensure!(
+            contract.speciality_mappings.contains_key(&descriptor.name),
+            "endpoint family {endpoint_family} has no native mapping for speciality {}",
+            descriptor.name
+        );
+        let level = body
+            .get(&descriptor.name)
+            .and_then(Value::as_str)
+            .unwrap_or(&descriptor.default_level);
+        ensure!(
+            descriptor
+                .levels
+                .iter()
+                .any(|candidate| candidate.name == level),
+            "model speciality {} does not support level {level}",
+            descriptor.name
+        );
+        selected.insert(descriptor.name.clone(), level.to_owned());
+    }
+    Ok(selected)
+}
+
 fn provider_session_request_modalities(family: &str, body: &Value) -> Result<Vec<String>> {
     let mut modalities = match provider_endpoint_transport_kind(family)? {
         "embedding" => vec!["embedding".to_owned()],
@@ -44249,6 +45266,18 @@ fn validate_provider_session_request_modalities(
 ) -> Result<BTreeMap<String, u32>> {
     let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
     validate_provider_session_modalities(&active.required_modalities, &terms.served_modalities)?;
+    validate_provider_session_specialities(
+        &active.required_specialities,
+        &terms.served_specialities,
+    )?;
+    let actual_specialities =
+        provider_request_speciality_selection(verified.family, verified.request, &terms.adapter)?;
+    ensure!(
+        actual_specialities == active.required_specialities,
+        "request specialities {:?} do not match signed voucher specialities {:?}",
+        actual_specialities,
+        active.required_specialities
+    );
     let actual = provider_session_request_modalities(verified.family, verified.request)?;
     if actual != active.required_modalities {
         bail!(
@@ -44682,6 +45711,7 @@ async fn handle_provider_session_frame(
                             locked_min_session_au: spend_voucher.body.locked_min_session_au,
                             served_ctx: spend_voucher.body.served_ctx,
                             required_modalities: spend_voucher.body.required_modalities.clone(),
+                            required_specialities: spend_voucher.body.required_specialities.clone(),
                             ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                             ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                             checkpoint_every,
@@ -45664,11 +46694,12 @@ async fn send_provider_session_output(
         .await?;
     }
 
-    let receipt = provider_session_receipt_for_usage(
+    let receipt = provider_session_receipt_for_usage_attribution(
         terms,
         active,
         body,
         output.usage.clone(),
+        output.usage_attribution.clone(),
         receipt_seq,
         true,
         runtime_keypair,
@@ -45828,6 +46859,7 @@ async fn send_provider_session_final_output_frames(
         "embeddings": null,
         "fin": output.finish_reason,
         "usage": output.usage,
+        "usage_attribution": output.usage_attribution,
         "quality": provider_quality,
         "token_ids": null,
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
@@ -46520,11 +47552,12 @@ fn provider_session_receipt(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    provider_session_receipt_for_usage(
+    provider_session_receipt_for_usage_attribution(
         terms,
         active,
         body,
         output.usage.clone(),
+        output.usage_attribution.clone(),
         1,
         true,
         runtime_keypair,
@@ -46536,6 +47569,28 @@ fn provider_session_receipt_for_usage(
     active: &ActiveProviderSession,
     body: &Value,
     usage: ReceiptUsage,
+    seq: u64,
+    final_receipt: bool,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    provider_session_receipt_for_usage_attribution(
+        terms,
+        active,
+        body,
+        usage,
+        BTreeMap::new(),
+        seq,
+        final_receipt,
+        runtime_keypair,
+    )
+}
+
+fn provider_session_receipt_for_usage_attribution(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
     seq: u64,
     final_receipt: bool,
     runtime_keypair: &RuntimeKeypair,
@@ -46559,6 +47614,7 @@ fn provider_session_receipt_for_usage(
         ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
+        usage_attribution,
         au_owed_cum: provider_session_au_owed(active, &usage),
         prompt_hash: provider_session_prompt_hash(body),
         ts: unix_epoch_millis()?,
@@ -47619,6 +48675,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         adapter: ctx.selected.model.adapter.clone(),
         sampling: ctx.selected.model.sampling.clone(),
         served_modalities: ctx.selected.served_modalities.clone(),
+        served_specialities: ctx.selected.served_specialities.clone(),
         modality_capacities: ctx.selected.modality_capacities.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
@@ -47712,6 +48769,13 @@ fn provider_session_contract_decision(
         return reject(
             "SERVE",
             "provider committed modalities changed; restart against current contract state"
+                .to_owned(),
+        );
+    }
+    if active_serve.map(|serve| &serve.served_specialities) != Some(&terms.served_specialities) {
+        return reject(
+            "SERVE",
+            "provider committed speciality levels changed; restart against current contract state"
                 .to_owned(),
         );
     }
@@ -47888,6 +48952,7 @@ fn provider_session_spend_reservation_value(
         "rules_ver": terms.rules_ver,
         "served_ctx": spend_voucher.body.served_ctx,
         "required_modalities": spend_voucher.body.required_modalities,
+        "required_specialities": spend_voucher.body.required_specialities,
         "ctx_bracket": spend_voucher.body.ctx_bracket,
         "ctx_bracket_table_ver": spend_voucher.body.ctx_bracket_table_ver,
         "max_spend_au": money_au_json(spend_voucher.body.max_spend_au),
@@ -47910,6 +48975,7 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
         "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
         "required_modalities": value.get("required_modalities").cloned().unwrap_or(Value::Null),
+        "required_specialities": value.get("required_specialities").cloned().unwrap_or(Value::Null),
         "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
         "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
         "max_spend_au": value.get("max_spend_au").cloned().unwrap_or(Value::Null),
@@ -48089,6 +49155,12 @@ fn provider_session_open_decision(
     ) {
         return reject("MODALITY", err.to_string());
     }
+    if let Err(err) = validate_provider_session_specialities(
+        &voucher.body.required_specialities,
+        &terms.served_specialities,
+    ) {
+        return reject("SPECIALITY", err.to_string());
+    }
     if frame.get("served_ctx").and_then(Value::as_u64) != Some(u64::from(voucher.body.served_ctx)) {
         return reject("VOUCHER", "frame served_ctx mismatch".to_owned());
     }
@@ -48159,12 +49231,17 @@ fn provider_session_open_decision(
             "voucher max_spend_au must be positive".to_owned(),
         );
     }
-    if voucher.body.max_spend_au < terms.min_ask_au {
+    let market_rate_au = rate_gate_basis_au(
+        &voucher.body.locked_rate_map,
+        voucher.body.locked_per_req_au,
+        voucher.body.locked_min_session_au,
+    );
+    if market_rate_au < terms.min_ask_au {
         return reject(
             "PRICE_FLOOR",
             format!(
-                "session quote {} is below provider minimum ask {}",
-                au_to_usd_amount(voucher.body.max_spend_au),
+                "market rate basis {} is below provider minimum ask {}",
+                au_to_usd_amount(market_rate_au),
                 au_to_usd_amount(terms.min_ask_au)
             ),
         );
@@ -48239,6 +49316,7 @@ struct ProviderSessionOutput {
     completion_tokens: u64,
     token_ids: Vec<i32>,
     usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
 }
 
 fn validate_provider_session_output(
@@ -48313,6 +49391,33 @@ fn validate_provider_session_output(
     ensure!(
         artifact_bytes <= max_artifact_bytes,
         "provider artifacts exceed the session byte budget"
+    );
+    for axis in output.usage_attribution.keys() {
+        ensure!(
+            matches!(
+                axis.as_str(),
+                "reasoning_output_tokens" | "vision_input_tokens"
+            ),
+            "provider output contains unsupported usage attribution {axis}"
+        );
+    }
+    ensure!(
+        output
+            .usage_attribution
+            .get("reasoning_output_tokens")
+            .copied()
+            .unwrap_or(0)
+            <= output.usage.output_tokens(),
+        "provider reasoning attribution exceeds billed output tokens"
+    );
+    ensure!(
+        output
+            .usage_attribution
+            .get("vision_input_tokens")
+            .copied()
+            .unwrap_or(0)
+            <= output.usage.input_tokens(),
+        "provider vision attribution exceeds billed input tokens"
     );
     Ok(())
 }
@@ -48595,6 +49700,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: provider_audio_transcription_usage(audio_seconds),
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48626,6 +49732,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: provider_audio_speech_usage(input_characters, output.audio_seconds),
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48668,6 +49775,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage,
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48721,6 +49829,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: provider_video_generation_usage(output.duration_seconds, output.frame_count),
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48788,6 +49897,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: provider_audio_generation_usage(input_characters, output.duration_seconds),
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48815,6 +49925,7 @@ fn provider_engine_session_response_with_sampling(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: ReceiptUsage::text(prompt_tokens, 0),
+            usage_attribution: BTreeMap::new(),
         });
     }
 
@@ -48878,8 +49989,18 @@ fn provider_engine_session_response_with_sampling(
         None
     };
     let completion_tokens = u64::from(output.usage.completion_tokens);
+    let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
+    let vision_tokens = u64::from(output.usage.vision_tokens);
+    let billed_prompt_tokens = prompt_tokens.saturating_add(vision_tokens);
+    let mut usage_attribution = BTreeMap::new();
+    if reasoning_tokens > 0 {
+        usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
+    }
+    if vision_tokens > 0 {
+        usage_attribution.insert("vision_input_tokens".to_owned(), vision_tokens);
+    }
     Ok(ProviderSessionOutput {
-        usage: provider_chat_receipt_usage(request_body, prompt_tokens, completion_tokens),
+        usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: if tool.is_some() {
             String::new()
         } else {
@@ -48893,9 +50014,10 @@ fn provider_engine_session_response_with_sampling(
         } else {
             output.finish_reason.to_string()
         },
-        prompt_tokens,
+        prompt_tokens: billed_prompt_tokens,
         completion_tokens,
         token_ids,
+        usage_attribution,
     })
 }
 
@@ -49328,6 +50450,9 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     let mut request = GenerateRequest::new(prompt);
     request.messages = messages.clone();
     request.media = provider_engine_media_inputs(&messages);
+    let (speciality_parameters, speciality_output_cap) =
+        provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
+    request.speciality_parameters = speciality_parameters;
     if let Some(max_tokens) = body
         .get("max_tokens")
         .filter(|value| !value.is_null())
@@ -49343,6 +50468,8 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     {
         request.max_new_tokens = u32::try_from(max_tokens)
             .context("max_tokens exceeds provider engine request range")?;
+    } else if let Some(default_cap) = speciality_output_cap {
+        request.max_new_tokens = default_cap;
     }
     request.temperature = provider_optional_f64(body, "temperature")?
         .or(sampling.temperature)
@@ -49381,6 +50508,69 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         });
     }
     Ok(request)
+}
+
+fn provider_engine_speciality_parameters(
+    endpoint_family: &str,
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<(Vec<GenerateSpecialityParameter>, Option<u32>)> {
+    let contract = adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .with_context(|| format!("catalog adapter has no endpoint family {endpoint_family}"))?;
+    let selected = body.get("specialities").and_then(Value::as_object);
+    let mut parameters = Vec::new();
+    let mut reasoning_output_cap = None;
+    for descriptor in &adapter.specialities {
+        let level_name = selected
+            .and_then(|values| values.get(&descriptor.name))
+            .or_else(|| body.get(&descriptor.name))
+            .and_then(Value::as_str)
+            .unwrap_or(&descriptor.default_level);
+        let level = descriptor
+            .levels
+            .iter()
+            .find(|level| level.name == level_name)
+            .with_context(|| {
+                format!(
+                    "model speciality {} does not support level {}",
+                    descriptor.name, level_name
+                )
+            })?;
+        let mapping = contract
+            .speciality_mappings
+            .get(&descriptor.name)
+            .with_context(|| {
+                format!(
+                    "endpoint family {endpoint_family} has no native mapping for speciality {}",
+                    descriptor.name
+                )
+            })?;
+        let target = match mapping.target {
+            mayhem_proto::EndpointSpecialityTarget::ChatTemplateKwarg => {
+                GenerateSpecialityTarget::ChatTemplateKwarg
+            }
+            mayhem_proto::EndpointSpecialityTarget::SamplingParameter => {
+                GenerateSpecialityTarget::SamplingParameter
+            }
+            mayhem_proto::EndpointSpecialityTarget::PromptSuffix => {
+                GenerateSpecialityTarget::PromptSuffix
+            }
+        };
+        parameters.push(GenerateSpecialityParameter {
+            name: descriptor.name.clone(),
+            level: level.name.clone(),
+            target,
+            native_path: mapping.native_path.clone(),
+            value: level.native_value.clone(),
+        });
+        if descriptor.name == "reasoning_effort" {
+            reasoning_output_cap = level.default_max_output_tokens;
+        }
+    }
+    Ok((parameters, reasoning_output_cap))
 }
 
 #[cfg(test)]
@@ -49908,6 +51098,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens,
+            usage_attribution: BTreeMap::new(),
         };
     }
     let prompt_lower = prompt.to_lowercase();
@@ -49926,6 +51117,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             prompt_tokens,
             completion_tokens: 1,
             token_ids: Vec::new(),
+            usage_attribution: BTreeMap::new(),
         };
     }
     if let Some(tool_name) = provider_requested_tool_name(body) {
@@ -49943,6 +51135,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             prompt_tokens,
             completion_tokens: 1,
             token_ids: Vec::new(),
+            usage_attribution: BTreeMap::new(),
         };
     }
     let content = if provider_wants_json(body) {
@@ -49970,6 +51163,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         artifacts: Vec::new(),
         finish_reason: "stop".to_owned(),
         prompt_tokens,
+        usage_attribution: BTreeMap::new(),
     }
 }
 
@@ -51495,6 +52689,75 @@ mod tests {
         last_music_request: Option<EngineMediaGenerationRequest>,
     }
 
+    #[derive(Default)]
+    struct SpecialityCalibrationBackend {
+        observed_levels: Vec<String>,
+    }
+
+    impl EngineBackend for SpecialityCalibrationBackend {
+        fn backend_id(&self) -> &'static str {
+            "speciality-calibration-test"
+        }
+
+        fn load(
+            &mut self,
+            config: LoadConfig,
+        ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+            Ok(mayhem_engine::LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: config.ctx_size,
+                n_vocab: 0,
+            })
+        }
+
+        fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+            Ok(mayhem_engine::Tokenization {
+                token_ids: text.bytes().map(i32::from).collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            sink: &mut dyn mayhem_engine::TokenSink,
+        ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+            let level = request
+                .speciality_parameters
+                .iter()
+                .find(|parameter| parameter.name == "reasoning_effort")
+                .map(|parameter| parameter.level.clone())
+                .ok_or_else(|| {
+                    mayhem_engine::EngineError::InvalidConfig(
+                        "missing reasoning_effort test parameter".to_owned(),
+                    )
+                })?;
+            let (token_id, reasoning_tokens) = match level.as_str() {
+                "low" => (11, 0),
+                "high" => (22, 1),
+                _ => {
+                    return Err(mayhem_engine::EngineError::InvalidConfig(format!(
+                        "unexpected test level {level}"
+                    )))
+                }
+            };
+            self.observed_levels.push(level);
+            sink.on_token(mayhem_engine::TokenChunk {
+                index: 0,
+                token_id,
+                text: token_id.to_string(),
+            })?;
+            let mut usage = mayhem_engine::UsageCounters::new(1, 1);
+            usage.reasoning_tokens = reasoning_tokens;
+            Ok(mayhem_engine::GenerateOutput {
+                text: token_id.to_string(),
+                usage,
+                finish_reason: mayhem_engine::FinishReason::Stop,
+            })
+        }
+    }
+
     impl FakeEngineBackend {
         fn new(text: &str) -> Self {
             Self {
@@ -52484,6 +53747,7 @@ mod tests {
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacities: BTreeMap::new(),
             feasibility: ProviderCtxFeasibility::not_applicable(
                 4096,
@@ -55308,6 +56572,7 @@ mod tests {
         let join_terms = ProviderJoinContextTerms {
             served_ctx: 8192,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
         };
@@ -55421,6 +56686,7 @@ mod tests {
             status: "active".to_owned(),
             served_ctx: None,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec!["room-a".to_owned()],
@@ -55469,6 +56735,7 @@ mod tests {
             status: "active".to_owned(),
             served_ctx: None,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![],
@@ -55967,6 +57234,7 @@ mod tests {
             }),
             served_ctx: 8192,
             served_modalities: vec![modality.to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacities: test_modality_capacities(modality),
             feasibility: ProviderCtxFeasibility {
                 requested_ctx: 8192,
@@ -57592,6 +58860,7 @@ mod tests {
             status: "active".to_owned(),
             served_ctx: Some(8192),
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec!["aa".repeat(16)],
@@ -57627,6 +58896,7 @@ mod tests {
             status: "active".to_owned(),
             served_ctx: Some(8192),
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![second_room_id],
@@ -57740,6 +59010,7 @@ mod tests {
             status: "active".to_owned(),
             served_ctx: Some(8192),
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             hardware_fingerprint: None,
             device_key: None,
             rooms: vec![tier3_room_id],
@@ -57913,6 +59184,15 @@ mod tests {
         priced_out_terms.min_ask_au = 1001;
         assert!(matches!(
             provider_session_open_decision(&frame, &priced_out_terms),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_FLOOR",
+                ..
+            }
+        ));
+        let mut high_volume_frame = frame.clone();
+        high_volume_frame["voucher"]["max_spend_au"] = money_au_json(MoneyAu::MAX);
+        assert!(matches!(
+            provider_session_open_decision(&high_volume_frame, &priced_out_terms),
             ProviderSessionDecision::Reject {
                 code: "PRICE_FLOOR",
                 ..
@@ -58532,6 +59812,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -58553,6 +59834,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             completion_tokens: 4,
             token_ids: vec![1, 2, 3, 4],
             usage: ReceiptUsage::text(3, 4),
+            usage_attribution: BTreeMap::new(),
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let receipt =
@@ -58608,6 +59890,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -58659,6 +59942,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -58718,6 +60002,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_min_session_au: 0,
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -58754,6 +60039,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -58772,6 +60058,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             completion_tokens: 3,
             token_ids: vec![1, 2, 3],
             usage: ReceiptUsage::text(2, 3),
+            usage_attribution: BTreeMap::new(),
         };
         let receipt = provider_session_receipt(
             &terms,
@@ -58895,6 +60182,77 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.min_p, Some(0.02));
         assert_eq!(request.repeat_penalty, Some(1.05));
         assert_eq!(request.seed, Some(77));
+    }
+
+    #[test]
+    fn provider_engine_request_maps_signed_body_speciality_to_native_parameter() {
+        let descriptor = mayhem_proto::ModelSpecialityDescriptor {
+            name: "reasoning_effort".to_owned(),
+            mechanism: "enum".to_owned(),
+            default_level: "low".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "low".to_owned(),
+                    rank: 0,
+                    native_value: json!("low"),
+                    default_max_output_tokens: Some(8),
+                    max_reasoning_tokens: Some(4),
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "high".to_owned(),
+                    rank: 1,
+                    native_value: json!("high"),
+                    default_max_output_tokens: Some(32),
+                    max_reasoning_tokens: Some(24),
+                },
+            ],
+            research_evidence: vec!["test family documentation".to_owned()],
+        };
+        let mut adapter = catalog::CatalogAdapter::default();
+        let contract = adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat endpoint contract");
+        contract
+            .request_attributes
+            .push("reasoning_effort".to_owned());
+        let mut spec =
+            mayhem_proto::EndpointAttributeSpec::new(mayhem_proto::EndpointValueType::String);
+        spec.default = Some(json!("low"));
+        spec.enum_values = vec![json!("low"), json!("high")];
+        spec.calibration_values = spec.enum_values.clone();
+        contract
+            .request_attribute_specs
+            .insert("reasoning_effort".to_owned(), spec);
+        contract.speciality_mappings.insert(
+            "reasoning_effort".to_owned(),
+            mayhem_proto::EndpointSpecialityMapping {
+                request_path: "reasoning_effort".to_owned(),
+                target: mayhem_proto::EndpointSpecialityTarget::ChatTemplateKwarg,
+                native_path: "reasoning_effort".to_owned(),
+            },
+        );
+        adapter.specialities.push(descriptor);
+        let body = json!({
+            "messages": [{ "role": "user", "content": "reason carefully" }],
+            "reasoning_effort": "high",
+            "specialities": { "reasoning_effort": "high" }
+        });
+
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert_eq!(request.max_new_tokens, 32);
+        assert_eq!(request.speciality_parameters.len(), 1);
+        let parameter = &request.speciality_parameters[0];
+        assert_eq!(parameter.name, "reasoning_effort");
+        assert_eq!(parameter.level, "high");
+        assert_eq!(
+            parameter.target,
+            GenerateSpecialityTarget::ChatTemplateKwarg
+        );
+        assert_eq!(parameter.native_path, "reasoning_effort");
+        assert_eq!(parameter.value, json!("high"));
     }
 
     #[test]
@@ -59627,6 +60985,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 completion_tokens: 0,
                 token_ids: Vec::new(),
                 usage,
+                usage_attribution: BTreeMap::new(),
             };
             let response = catalog_endpoint_calibration_response(family, &request, &output)
                 .unwrap_or_else(|err| panic!("{family} response mapping failed: {err:#}"));
@@ -60260,6 +61619,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             price: None,
             served_ctx: 1,
             served_modalities: vec!["audio".to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacities: test_modality_capacities("audio"),
             feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
@@ -60349,6 +61709,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacities: BTreeMap::new(),
             feasibility: ProviderCtxFeasibility::not_applicable(
                 4096,
@@ -60388,6 +61749,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_min_session_au: 0,
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
+                    required_specialities: BTreeMap::new(),
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -60436,6 +61798,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_min_session_au: 0,
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
+                    required_specialities: BTreeMap::new(),
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -60483,6 +61846,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     locked_min_session_au: 0,
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
+                    required_specialities: BTreeMap::new(),
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -60847,6 +62211,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             completion_tokens: 8192,
             token_ids: vec![1; 8192],
             usage: ReceiptUsage::text(0, 8192),
+            usage_attribution: BTreeMap::new(),
         };
         validate_provider_session_output(&terms, &body, &output).unwrap();
 
@@ -60889,6 +62254,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             completion_tokens: 4,
             token_ids: (0..5000).collect::<Vec<i32>>(),
             usage: ReceiptUsage::text(3, 4),
+            usage_attribution: BTreeMap::new(),
         };
         let max_frame_bytes = 12 * 1024;
 
@@ -62743,6 +64109,130 @@ State initialization...
     }
 
     #[test]
+    fn model_summaries_filter_by_fresh_speciality_level_availability() {
+        let summaries = gateway_model_summaries(&[
+            json!({
+                "id": "mayhem/high-live",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_au": { "denom": "au_usd", "rate_map": [] },
+                    "attestation_tiers": { "T1": 1 },
+                    "caps": { "tools": false, "json": false, "ctx": 4096 },
+                    "adapter": {
+                        "modality_set": ["text"],
+                        "specialities": [{
+                            "name": "reasoning_effort",
+                            "levels": [{ "name": "low" }, { "name": "high" }]
+                        }]
+                    },
+                    "speciality_availability": {
+                        "reasoning_effort": {
+                            "default_level": "low",
+                            "levels": {
+                                "low": { "live_provider_count": 2 },
+                                "high": { "live_provider_count": 1 }
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "id": "mayhem/high-unavailable",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_au": { "denom": "au_usd", "rate_map": [] },
+                    "attestation_tiers": { "T1": 1 },
+                    "caps": { "tools": false, "json": false, "ctx": 4096 },
+                    "adapter": {
+                        "modality_set": ["text"],
+                        "specialities": [{
+                            "name": "reasoning_effort",
+                            "levels": [{ "name": "high" }]
+                        }]
+                    },
+                    "speciality_availability": {
+                        "reasoning_effort": {
+                            "default_level": "high",
+                            "levels": { "high": { "live_provider_count": 0 } }
+                        }
+                    }
+                }
+            }),
+        ])
+        .unwrap();
+        let filter = parse_speciality_filter(Some("reasoning_effort=high"))
+            .unwrap()
+            .unwrap();
+
+        let filtered = filter_model_summaries_by_speciality(summaries, Some(&filter));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "mayhem/high-live");
+        assert_eq!(
+            filtered[0].specialities["reasoning_effort"],
+            ["low", "high"]
+        );
+        assert_eq!(
+            filtered[0].served_specialities["reasoning_effort"]["high"],
+            1
+        );
+        assert!(parse_speciality_filter(Some("reasoning_effort")).is_err());
+        assert!(parse_speciality_filter(Some("reasoning_effort=high=extra")).is_err());
+    }
+
+    #[test]
+    fn ledger_catalog_speciality_filter_uses_admin_signed_descriptor_levels() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].adapter.specialities = vec![mayhem_proto::ModelSpecialityDescriptor {
+            name: "reasoning_effort".to_owned(),
+            mechanism: "enum".to_owned(),
+            default_level: "low".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "low".to_owned(),
+                    rank: 1,
+                    native_value: json!("low"),
+                    default_max_output_tokens: Some(1_024),
+                    max_reasoning_tokens: Some(256),
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "high".to_owned(),
+                    rank: 2,
+                    native_value: json!("high"),
+                    default_max_output_tokens: Some(4_096),
+                    max_reasoning_tokens: Some(2_048),
+                },
+            ],
+            research_evidence: vec!["pinned fixture card".to_owned()],
+        }];
+        let report = catalog_list_report(
+            &catalog,
+            PathBuf::from("catalog/models.json"),
+            PathBuf::from("catalog/signatures/models.json.sig"),
+            "cc".repeat(32),
+            "test-key".to_owned(),
+            CatalogListTier::All,
+            None,
+            None,
+        );
+
+        let high = filter_catalog_list_report_by_speciality(
+            report,
+            Some(&("reasoning_effort".to_owned(), "high".to_owned())),
+        );
+        assert_eq!(high.model_count, 1);
+        assert_eq!(high.models[0].speciality_assessment.evidence.len(), 1);
+
+        let missing = filter_catalog_list_report_by_speciality(
+            high,
+            Some(&("reasoning_effort".to_owned(), "xhigh".to_owned())),
+        );
+        assert_eq!(missing.model_count, 0);
+    }
+
+    #[test]
     fn catalog_list_report_filters_launch_and_surfaces_download_sources() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0]
@@ -63285,6 +64775,142 @@ State initialization...
     }
 
     #[test]
+    fn speciality_calibrator_runs_every_signed_level_without_reloading() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        add_test_reasoning_speciality(&mut catalog.models[0]);
+        let prompts = vec![serde_json::from_value::<CanaryPrompt>(json!({
+            "id": "p1",
+            "messages": [{"role": "user", "content": "reason"}],
+            "max_tokens": 8,
+            "temperature": 0.0
+        }))
+        .unwrap()];
+        let memory = CalibrationMemoryContext {
+            f13_budget_bytes: u64::MAX,
+            source: "test-process-rss".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+        };
+        let mut backend = SpecialityCalibrationBackend::default();
+
+        let calibrated = calibrate_model_specialities(
+            &mut backend,
+            &catalog.models[0],
+            &prompts,
+            7,
+            false,
+            &memory,
+        )
+        .unwrap();
+
+        assert_eq!(backend.observed_levels, ["low", "high"]);
+        let levels = &calibrated["reasoning_effort"];
+        assert_ne!(levels["low"].fingerprint, levels["high"].fingerprint);
+        assert_eq!(levels["low"].output_tokens, 1);
+        assert_eq!(levels["low"].reasoning_tokens, 0);
+        assert_eq!(levels["high"].output_tokens, 1);
+        assert_eq!(levels["high"].reasoning_tokens, 1);
+        let mut errors = Vec::new();
+        validate_speciality_calibration_report(
+            &catalog.models[0],
+            &["p1".to_owned()],
+            &calibrated,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn speciality_calibration_apply_and_verify_require_every_signed_level() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-speciality-canary".to_owned();
+        add_test_reasoning_speciality(&mut catalog.models[0]);
+        let canaries_dir = test_canary_dir_with_prompts(
+            "test-speciality-canary",
+            json!([{
+                "id": "p1",
+                "messages": [{"role": "user", "content": "reason"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }]),
+        );
+        let base_prompt = test_calibration_prompt("p1", canary_token_fingerprint([1]));
+        let base_fingerprint = aggregate_canary_fingerprint(std::slice::from_ref(&base_prompt));
+        let mut calibration = test_calibration_report(base_fingerprint.clone(), None);
+        calibration.model_id = catalog.models[0].model_id.clone();
+        calibration.canary_set = "test-speciality-canary".to_owned();
+        calibration.prompts = vec![base_prompt];
+        calibration.speciality_calibrations = test_speciality_calibration_report_map();
+        calibration.endpoint_calibration =
+            test_endpoint_calibration_report_for_adapter(&catalog.models[0].adapter);
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let full_report_path = write_temp_calibration_report(&calibration);
+
+        let apply_report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir.clone(),
+            true,
+            std::slice::from_ref(&full_report_path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(apply_report.ok, "{:?}", apply_report.errors);
+        let mut catalog_value = json!({
+            "models": [{
+                "model_id": catalog.models[0].model_id.clone(),
+                "modality_assessment": {},
+                "speciality_assessment": {},
+                "canary": {
+                    "set_id": "test-speciality-canary",
+                    "verification_method": "token_fingerprint"
+                }
+            }]
+        });
+        assert_eq!(
+            apply_canary_report_fingerprints(&mut catalog_value, &apply_report).unwrap(),
+            1
+        );
+        assert_eq!(
+            catalog_value["models"][0]["speciality_assessment"]["calibrated"]["gguf-q4_k_m"]
+                ["reasoning_effort"]["high"]["reasoning_tokens"],
+            json!(1)
+        );
+
+        let compact = compact_speciality_calibration_report(&calibration.speciality_calibrations);
+        catalog.models[0]
+            .speciality_assessment
+            .calibrated
+            .insert("gguf-q4_k_m".to_owned(), compact);
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", base_fingerprint);
+        let mut incomplete = calibration;
+        incomplete
+            .speciality_calibrations
+            .get_mut("reasoning_effort")
+            .unwrap()
+            .remove("high");
+        let incomplete_report_path = write_temp_calibration_report(&incomplete);
+
+        for mode in [
+            CatalogCanaryReportMode::ApplyToCatalog,
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+        ] {
+            let report = catalog_canary_evidence_report(
+                &catalog,
+                PathBuf::from("catalog.json"),
+                canaries_dir.clone(),
+                true,
+                std::slice::from_ref(&incomplete_report_path),
+                mode,
+            );
+            assert!(!report.ok);
+            assert!(report
+                .errors
+                .iter()
+                .any(|error| error.contains("missing level high")));
+        }
+    }
+
+    #[test]
     fn canary_apply_writes_non_text_method_values() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -63309,6 +64935,7 @@ State initialization...
             max_tokens: 1,
             prompt_tokens: 3,
             completion_tokens: 0,
+            reasoning_tokens: 0,
             token_count: 0,
             token_ids: Vec::new(),
             fingerprint: embedding_vector_fingerprint(&vector),
@@ -65356,6 +66983,7 @@ State initialization...
             min_ask_au: 0,
             ctx: None,
             disable_modalities: Vec::new(),
+            speciality_levels: Vec::new(),
             memory_reserve: None,
             vllm_memory_utilization: None,
             disk_reserve: None,
@@ -65433,6 +67061,7 @@ State initialization...
             adapter: catalog::CatalogAdapter::default(),
             sampling: catalog::CatalogSamplingProfile::default(),
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             modality_capacities: BTreeMap::new(),
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
@@ -65463,6 +67092,7 @@ State initialization...
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities,
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -65483,6 +67113,7 @@ State initialization...
             locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             max_spend_au: 1000,
@@ -65567,6 +67198,7 @@ State initialization...
             max_tokens: 8,
             prompt_tokens: 1,
             completion_tokens: 1,
+            reasoning_tokens: 0,
             token_count: 1,
             token_ids: vec![1],
             fingerprint,
@@ -65644,19 +67276,21 @@ State initialization...
             catalog_fingerprint: fingerprint,
             modality_fingerprints: BTreeMap::from([("text".to_owned(), "cc".repeat(32))]),
             modality_resource_profiles: BTreeMap::new(),
+            speciality_calibrations: BTreeMap::new(),
             endpoint_calibration: test_endpoint_calibration_report(),
             prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
         }
     }
 
     fn test_endpoint_calibration_report() -> EndpointCalibrationReport {
-        let contract = catalog::CatalogAdapter::default()
-            .endpoint_families
-            .into_iter()
-            .next()
-            .unwrap();
+        test_endpoint_calibration_report_for_adapter(&catalog::CatalogAdapter::default())
+    }
+
+    fn test_endpoint_calibration_report_for_adapter(
+        adapter: &catalog::CatalogAdapter,
+    ) -> EndpointCalibrationReport {
         let report = run_endpoint_calibration_matrix(
-            std::slice::from_ref(&contract),
+            &adapter.endpoint_families,
             &BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]),
             |contract, _case, request| {
                 Ok(EndpointCalibrationExecution {
@@ -66034,6 +67668,7 @@ State initialization...
             provider_auto_fit: false,
             provider_gpu_layers: Some(0),
             provider_disable_modalities: Vec::new(),
+            provider_speciality_levels: Vec::new(),
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
@@ -66520,6 +68155,7 @@ State initialization...
             auto_fit: false,
             provider_gpu_layers: None,
             provider_disable_modalities: Vec::new(),
+            provider_speciality_levels: Vec::new(),
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
@@ -66619,7 +68255,7 @@ State initialization...
             .get_mut("models")
             .and_then(Value::as_array_mut)
             .expect("repo catalog models array");
-        let launch = models
+        let mut launch = models
             .iter()
             .find(|model| {
                 model.get("model_id").and_then(Value::as_str)
@@ -66627,6 +68263,12 @@ State initialization...
             })
             .cloned()
             .expect("signed test model must remain in the catalog");
+        launch["speciality_assessment"] = json!({
+            "detected": [],
+            "evidence": ["test fixture researched: no model specialities"],
+            "unsupported": {},
+            "calibrated": {}
+        });
         *models = vec![launch];
         catalog["catalog_id"] = json!("mayhem-test-signed-catalog");
         write_json_file(path, &catalog).unwrap();
@@ -66704,6 +68346,10 @@ State initialization...
                     calibrated_fingerprints: BTreeMap::new(),
                     resource_profiles: BTreeMap::new(),
                 },
+                speciality_assessment: catalog::CatalogSpecialityAssessment {
+                    evidence: vec!["test fixture researched: no model specialities".to_owned()],
+                    ..catalog::CatalogSpecialityAssessment::default()
+                },
                 sampling: catalog::CatalogSamplingProfile::default(),
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
@@ -66725,6 +68371,83 @@ State initialization...
                 },
             }],
         }
+    }
+
+    fn add_test_reasoning_speciality(model: &mut catalog::CatalogModel) {
+        let descriptor = mayhem_proto::ModelSpecialityDescriptor {
+            name: "reasoning_effort".to_owned(),
+            mechanism: "enum".to_owned(),
+            default_level: "low".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "low".to_owned(),
+                    rank: 0,
+                    native_value: json!("low"),
+                    default_max_output_tokens: Some(8),
+                    max_reasoning_tokens: Some(4),
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "high".to_owned(),
+                    rank: 1,
+                    native_value: json!("high"),
+                    default_max_output_tokens: Some(32),
+                    max_reasoning_tokens: Some(24),
+                },
+            ],
+            research_evidence: vec!["pinned test family documentation".to_owned()],
+        };
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat endpoint contract");
+        contract
+            .request_attributes
+            .push("reasoning_effort".to_owned());
+        let mut spec =
+            mayhem_proto::EndpointAttributeSpec::new(mayhem_proto::EndpointValueType::String);
+        spec.default = Some(json!("low"));
+        spec.enum_values = vec![json!("low"), json!("high")];
+        spec.calibration_values = spec.enum_values.clone();
+        contract
+            .request_attribute_specs
+            .insert("reasoning_effort".to_owned(), spec);
+        contract.speciality_mappings.insert(
+            "reasoning_effort".to_owned(),
+            mayhem_proto::EndpointSpecialityMapping {
+                request_path: "reasoning_effort".to_owned(),
+                target: mayhem_proto::EndpointSpecialityTarget::ChatTemplateKwarg,
+                native_path: "reasoning_effort".to_owned(),
+            },
+        );
+        model.adapter.specialities = vec![descriptor];
+        model.speciality_assessment.detected = vec!["reasoning_effort".to_owned()];
+        model.speciality_assessment.evidence = vec!["pinned test family documentation".to_owned()];
+    }
+
+    fn test_speciality_calibration_report_map(
+    ) -> BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>> {
+        let level_report = |token_id: i32, reasoning_tokens: u32| {
+            let fingerprint = canary_token_fingerprint([token_id]);
+            let mut prompt = test_calibration_prompt("p1", fingerprint);
+            prompt.token_ids = vec![token_id];
+            prompt.reasoning_tokens = reasoning_tokens;
+            let prompts = vec![prompt];
+            CanarySpecialityCalibrationReport {
+                fingerprint: aggregate_canary_fingerprint(&prompts),
+                output_tokens: 1,
+                reasoning_tokens: u64::from(reasoning_tokens),
+                prompts,
+            }
+        };
+        BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            BTreeMap::from([
+                ("low".to_owned(), level_report(11, 0)),
+                ("high".to_owned(), level_report(22, 1)),
+            ]),
+        )])
     }
 
     fn test_modality_resource_profile(modality: &str) -> catalog::CatalogModalityResourceProfile {
@@ -66919,6 +68642,7 @@ State initialization...
                 status: "active".to_owned(),
                 served_ctx: Some(4096),
                 served_modalities: vec!["text".to_owned()],
+                served_specialities: BTreeMap::new(),
                 hardware_fingerprint: Some("77".repeat(32)),
                 device_key: Some("88".repeat(32)),
                 rooms: vec![room_id],

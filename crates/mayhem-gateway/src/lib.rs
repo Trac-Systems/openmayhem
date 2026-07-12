@@ -237,6 +237,8 @@ pub struct HeartbeatCaps {
     pub vision: bool,
     pub served_modalities: Vec<String>,
     pub modality_capacity: BTreeMap<String, HeartbeatModalityCapacity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub served_specialities: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2378,6 +2380,30 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
             });
         }
     }
+    if heartbeat.caps.served_specialities.len() > 16 {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "caps.served_specialities",
+            reason: "must contain at most 16 specialities".to_owned(),
+        });
+    }
+    for (name, levels) in &heartbeat.caps.served_specialities {
+        if !valid_heartbeat_capability_name(name) || levels.is_empty() || levels.len() > 16 {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.served_specialities",
+                reason: format!("{name} must have a safe name and contain 1..=16 served levels"),
+            });
+        }
+        let mut unique = HashSet::new();
+        if levels
+            .iter()
+            .any(|level| !valid_heartbeat_capability_name(level) || !unique.insert(level))
+        {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "caps.served_specialities",
+                reason: format!("{name} contains an invalid or duplicate served level"),
+            });
+        }
+    }
     if heartbeat
         .perf
         .tok_s
@@ -2389,6 +2415,14 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn valid_heartbeat_capability_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn validate_heartbeat_time(

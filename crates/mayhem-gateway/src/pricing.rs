@@ -152,6 +152,21 @@ pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> MoneyAu {
     })
 }
 
+/// Scalar rate-band basis: one standardized 1,000-unit basket of every priced unit.
+/// Request volume never enters this value. Fixed-only schedules retain a deterministic fallback.
+pub fn rate_gate_basis_au(
+    rate_map: &[RateMapEntry],
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+) -> MoneyAu {
+    let rate_basis = rate_map_cost_basis_per_1k(rate_map);
+    if rate_basis == 0 {
+        per_req_au.max(min_session_au)
+    } else {
+        rate_basis
+    }
+}
+
 fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
     if value == 0 || divisor == 0 {
         0
@@ -174,6 +189,14 @@ mod tests {
         let usage = ReceiptUsage::text(100, 250);
 
         assert_eq!(usage_map_au(&rate_map, &usage), 17);
+    }
+
+    #[test]
+    fn rate_gate_basis_is_independent_of_request_volume() {
+        let rate_map = text_generation_rate_map(20, 60);
+
+        assert_eq!(rate_gate_basis_au(&rate_map, 7, 11), 85);
+        assert_eq!(rate_gate_basis_au(&[], 7, 11), 11);
     }
 
     #[test]

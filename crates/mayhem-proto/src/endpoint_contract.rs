@@ -410,6 +410,7 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
         request_attribute_specs,
         response_attribute_specs,
         interaction_groups,
+        speciality_mappings: BTreeMap::new(),
     })
 }
 

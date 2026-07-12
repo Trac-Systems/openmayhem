@@ -7,9 +7,10 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_proto::{
-    default_model_class, EndpointFamilyContract, MoneyAu, DEFAULT_MODEL_CLASS,
-    ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    default_model_class, EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType,
+    ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS, ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+    USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,6 +108,8 @@ pub(crate) struct CatalogModel {
     pub(crate) adapter: CatalogAdapter,
     pub(crate) modality_assessment: CatalogModalityAssessment,
     #[serde(default)]
+    pub(crate) speciality_assessment: CatalogSpecialityAssessment,
+    #[serde(default)]
     pub(crate) sampling: CatalogSamplingProfile,
     pub(crate) canary: CanaryRef,
     pub(crate) price_ref_au: PriceRef,
@@ -161,6 +164,27 @@ pub(crate) struct CatalogModalityResourceProfile {
     pub(crate) calibration_f13_budget_bytes: u64,
     pub(crate) default_max_inflight_items: u32,
     pub(crate) default_max_items_per_request: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogSpecialityAssessment {
+    #[serde(default)]
+    pub(crate) detected: Vec<String>,
+    #[serde(default)]
+    pub(crate) evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) unsupported: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) calibrated:
+        BTreeMap<String, BTreeMap<String, BTreeMap<String, CatalogSpecialityCalibration>>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogSpecialityCalibration {
+    pub(crate) fingerprint: String,
+    pub(crate) output_tokens: u64,
+    #[serde(default)]
+    pub(crate) reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +296,8 @@ pub(crate) struct CatalogAdapter {
     #[serde(default = "default_reasoning_passthrough")]
     pub(crate) reasoning_passthrough: String,
     pub(crate) modality_set: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) specialities: Vec<ModelSpecialityDescriptor>,
 }
 
 impl Default for CatalogAdapter {
@@ -282,6 +308,7 @@ impl Default for CatalogAdapter {
             tool_call_strategy: default_tool_call_strategy(),
             reasoning_passthrough: default_reasoning_passthrough(),
             modality_set: default_modality_set(),
+            specialities: Vec::new(),
         }
     }
 }
@@ -694,6 +721,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_model_caps_modalities(model, errors);
     validate_model_modality_assessment(model, errors);
     validate_model_adapter(model, errors);
+    validate_model_specialities(model, errors);
     validate_model_sampling(model, errors);
     let _ = (model.caps.tools, model.caps.json);
     if model.requirements.min_ram_gb == 0 {
@@ -1693,6 +1721,287 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_model_specialities(model: &CatalogModel, errors: &mut Vec<String>) {
+    let assessment = &model.speciality_assessment;
+    if assessment.evidence.is_empty()
+        || assessment
+            .evidence
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+    {
+        errors.push(format!(
+            "{} speciality_assessment.evidence must record the pinned card/config research even when no speciality is detected",
+            model.model_id
+        ));
+    }
+
+    let mut detected = BTreeSet::new();
+    for name in &assessment.detected {
+        if !valid_endpoint_attribute_name(name) || !detected.insert(name.as_str()) {
+            errors.push(format!(
+                "{} speciality_assessment.detected contains an invalid or duplicate speciality {}",
+                model.model_id, name
+            ));
+        }
+    }
+
+    let mut descriptors = BTreeMap::new();
+    for descriptor in &model.adapter.specialities {
+        validate_speciality_descriptor(model, descriptor, errors);
+        if descriptors
+            .insert(descriptor.name.as_str(), descriptor)
+            .is_some()
+        {
+            errors.push(format!(
+                "{} adapter.specialities duplicates {}",
+                model.model_id, descriptor.name
+            ));
+        }
+        if !detected.contains(descriptor.name.as_str()) {
+            errors.push(format!(
+                "{} adapter speciality {} has no detection evidence",
+                model.model_id, descriptor.name
+            ));
+        }
+        if assessment.unsupported.contains_key(&descriptor.name) {
+            errors.push(format!(
+                "{} speciality {} cannot be both adapterized and unsupported",
+                model.model_id, descriptor.name
+            ));
+        }
+    }
+
+    for (name, reason) in &assessment.unsupported {
+        if !detected.contains(name.as_str()) {
+            errors.push(format!(
+                "{} unsupported speciality {} was not detected",
+                model.model_id, name
+            ));
+        }
+        if reason.trim().is_empty() {
+            errors.push(format!(
+                "{} unsupported speciality {} requires an explicit artifact/backend reason",
+                model.model_id, name
+            ));
+        }
+    }
+    for name in &detected {
+        if !descriptors.contains_key(name) && !assessment.unsupported.contains_key(*name) {
+            errors.push(format!(
+                "{} detected speciality {} is neither adapterized nor explicitly unsupported",
+                model.model_id, name
+            ));
+        }
+    }
+
+    for contract in &model.adapter.endpoint_families {
+        for (name, mapping) in &contract.speciality_mappings {
+            let Some(descriptor) = descriptors.get(name.as_str()) else {
+                errors.push(format!(
+                    "{} endpoint family {} maps unknown speciality {}",
+                    model.model_id, contract.family, name
+                ));
+                continue;
+            };
+            if !contract.request_attributes.contains(&mapping.request_path) {
+                errors.push(format!(
+                    "{} endpoint family {} speciality {} maps undeclared request path {}",
+                    model.model_id, contract.family, name, mapping.request_path
+                ));
+                continue;
+            }
+            if !valid_endpoint_attribute_name(&mapping.native_path) {
+                errors.push(format!(
+                    "{} endpoint family {} speciality {} has invalid native path {}",
+                    model.model_id, contract.family, name, mapping.native_path
+                ));
+            }
+            let Some(spec) = contract.request_attribute_specs.get(&mapping.request_path) else {
+                continue;
+            };
+            let expected_levels = descriptor
+                .levels
+                .iter()
+                .map(|level| Value::String(level.name.clone()))
+                .collect::<Vec<_>>();
+            if spec.value_types != [EndpointValueType::String]
+                || spec.enum_values != expected_levels
+                || spec.default.as_ref() != Some(&Value::String(descriptor.default_level.clone()))
+                || expected_levels
+                    .iter()
+                    .any(|level| !spec.calibration_values.contains(level))
+            {
+                errors.push(format!(
+                    "{} endpoint family {} speciality {} request spec must expose exactly its signed levels, default, and calibration values",
+                    model.model_id, contract.family, name
+                ));
+            }
+            if mapping.target == EndpointSpecialityTarget::PromptSuffix
+                && descriptor
+                    .levels
+                    .iter()
+                    .any(|level| !level.native_value.is_string())
+            {
+                errors.push(format!(
+                    "{} endpoint family {} prompt-suffix speciality {} requires string native values",
+                    model.model_id, contract.family, name
+                ));
+            }
+        }
+        for descriptor in descriptors.values() {
+            if !contract.speciality_mappings.contains_key(&descriptor.name) {
+                errors.push(format!(
+                    "{} endpoint family {} is missing native mapping for speciality {}",
+                    model.model_id, contract.family, descriptor.name
+                ));
+            }
+        }
+    }
+
+    validate_speciality_calibrations(model, &descriptors, errors);
+}
+
+fn validate_speciality_descriptor(
+    model: &CatalogModel,
+    descriptor: &ModelSpecialityDescriptor,
+    errors: &mut Vec<String>,
+) {
+    let label = format!("{} speciality {}", model.model_id, descriptor.name);
+    if !valid_endpoint_attribute_name(&descriptor.name) {
+        errors.push(format!("{label} has an invalid normalized name"));
+    }
+    if !matches!(
+        descriptor.mechanism.as_str(),
+        "enum" | "token_budget" | "boolean" | "string_enum"
+    ) {
+        errors.push(format!(
+            "{label} mechanism must be enum, token_budget, boolean, or string_enum"
+        ));
+    }
+    if descriptor.levels.len() < 2 || descriptor.levels.len() > 16 {
+        errors.push(format!("{label} must declare 2..=16 researched levels"));
+    }
+    if descriptor.research_evidence.is_empty()
+        || descriptor
+            .research_evidence
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+    {
+        errors.push(format!("{label} requires non-empty live research evidence"));
+    }
+    let mut names = BTreeSet::new();
+    let mut ranks = BTreeSet::new();
+    for level in &descriptor.levels {
+        if !valid_endpoint_attribute_name(&level.name) || !names.insert(level.name.as_str()) {
+            errors.push(format!(
+                "{label} contains invalid or duplicate level {}",
+                level.name
+            ));
+        }
+        if !ranks.insert(level.rank) {
+            errors.push(format!("{label} duplicates level rank {}", level.rank));
+        }
+        let native_type_ok = match descriptor.mechanism.as_str() {
+            "boolean" => level.native_value.is_boolean(),
+            "token_budget" => level.native_value.as_u64().is_some(),
+            "enum" | "string_enum" => level.native_value.is_string(),
+            _ => false,
+        };
+        if !native_type_ok {
+            errors.push(format!(
+                "{label} level {} native value does not match mechanism {}",
+                level.name, descriptor.mechanism
+            ));
+        }
+        if descriptor.name == "reasoning_effort"
+            && level.default_max_output_tokens.unwrap_or_default() == 0
+        {
+            errors.push(format!(
+                "{label} level {} requires a positive default output-token cap",
+                level.name
+            ));
+        }
+        if level.max_reasoning_tokens.is_some_and(|reasoning| {
+            level
+                .default_max_output_tokens
+                .is_none_or(|output| reasoning > output)
+        }) {
+            errors.push(format!(
+                "{label} level {} max_reasoning_tokens must fit its default output cap",
+                level.name
+            ));
+        }
+    }
+    if !names.contains(descriptor.default_level.as_str()) {
+        errors.push(format!(
+            "{label} default level {} is not declared",
+            descriptor.default_level
+        ));
+    }
+}
+
+fn validate_speciality_calibrations(
+    model: &CatalogModel,
+    descriptors: &BTreeMap<&str, &ModelSpecialityDescriptor>,
+    errors: &mut Vec<String>,
+) {
+    for (artifact, specialities) in &model.speciality_assessment.calibrated {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} speciality calibration references unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        for (name, levels) in specialities {
+            let Some(descriptor) = descriptors.get(name.as_str()) else {
+                errors.push(format!(
+                    "{} speciality calibration for {} references unknown speciality {}",
+                    model.model_id, artifact, name
+                ));
+                continue;
+            };
+            for (level_name, calibration) in levels {
+                if !descriptor
+                    .levels
+                    .iter()
+                    .any(|level| level.name == *level_name)
+                {
+                    errors.push(format!(
+                        "{} speciality calibration for {}/{}/{} references an unknown level",
+                        model.model_id, artifact, name, level_name
+                    ));
+                }
+                if !is_hex_len(&calibration.fingerprint, 64)
+                    || calibration.output_tokens == 0
+                    || calibration.reasoning_tokens > calibration.output_tokens
+                {
+                    errors.push(format!(
+                        "{} speciality calibration for {}/{}/{} requires a 32-byte fingerprint, positive output tokens, and reasoning <= output",
+                        model.model_id, artifact, name, level_name
+                    ));
+                }
+            }
+        }
+    }
+    for artifact in model.artifacts.keys() {
+        for descriptor in descriptors.values() {
+            let calibrated = model
+                .speciality_assessment
+                .calibrated
+                .get(artifact)
+                .and_then(|specialities| specialities.get(&descriptor.name));
+            for level in &descriptor.levels {
+                if !calibrated.is_some_and(|levels| levels.contains_key(&level.name)) {
+                    errors.push(format!(
+                        "{} speciality calibration for {}/{} missing level {}",
+                        model.model_id, artifact, descriptor.name, level.name
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
     let contracts = &model.adapter.endpoint_families;
     if contracts.is_empty() || contracts.len() > 12 {
@@ -1714,8 +2023,15 @@ fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
                 model.model_id, contract.family, model.model_class, model.adapter.modality_set
             ));
         } else if let Some(template) = endpoint_contract_template(&contract.family) {
+            let speciality_paths = contract
+                .speciality_mappings
+                .values()
+                .map(|mapping| mapping.request_path.as_str())
+                .collect::<BTreeSet<_>>();
             for attribute in &contract.request_attributes {
-                if !template.request_attributes.contains(attribute) {
+                if !template.request_attributes.contains(attribute)
+                    && !speciality_paths.contains(attribute.as_str())
+                {
                     errors.push(format!(
                         "{} endpoint family {} declares unknown request attribute {}",
                         model.model_id, contract.family, attribute
@@ -1850,9 +2166,7 @@ fn validate_endpoint_attribute_specs(
         ));
     }
     for (path, spec) in &contract.request_attribute_specs {
-        let Some(standard) = template.request_attribute_specs.get(path) else {
-            continue;
-        };
+        let standard = template.request_attribute_specs.get(path).unwrap_or(spec);
         validate_endpoint_attribute_spec(
             &model.model_id,
             &contract.family,
@@ -3069,6 +3383,123 @@ mod tests {
     }
 
     #[test]
+    fn speciality_catalog_validation_requires_complete_per_artifact_levels() {
+        let mut model = verification_test_model(
+            "admin/model@4bit",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        let descriptor = ModelSpecialityDescriptor {
+            name: "reasoning_effort".to_owned(),
+            mechanism: "enum".to_owned(),
+            default_level: "low".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "low".to_owned(),
+                    rank: 0,
+                    native_value: Value::String("low".to_owned()),
+                    default_max_output_tokens: Some(8),
+                    max_reasoning_tokens: Some(4),
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "high".to_owned(),
+                    rank: 1,
+                    native_value: Value::String("high".to_owned()),
+                    default_max_output_tokens: Some(32),
+                    max_reasoning_tokens: Some(24),
+                },
+            ],
+            research_evidence: vec!["pinned family documentation".to_owned()],
+        };
+        for contract in &mut model.adapter.endpoint_families {
+            contract
+                .request_attributes
+                .push("reasoning_effort".to_owned());
+            let mut spec = mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::String);
+            spec.default = Some(Value::String("low".to_owned()));
+            spec.enum_values = vec![
+                Value::String("low".to_owned()),
+                Value::String("high".to_owned()),
+            ];
+            spec.calibration_values = spec.enum_values.clone();
+            contract
+                .request_attribute_specs
+                .insert("reasoning_effort".to_owned(), spec);
+            contract.speciality_mappings.insert(
+                "reasoning_effort".to_owned(),
+                mayhem_proto::EndpointSpecialityMapping {
+                    request_path: "reasoning_effort".to_owned(),
+                    target: EndpointSpecialityTarget::ChatTemplateKwarg,
+                    native_path: "reasoning_effort".to_owned(),
+                },
+            );
+        }
+        model.adapter.specialities = vec![descriptor];
+        model.speciality_assessment.detected = vec!["reasoning_effort".to_owned()];
+        model.speciality_assessment.evidence = vec!["pinned family documentation".to_owned()];
+        model.speciality_assessment.calibrated.insert(
+            "fixture".to_owned(),
+            BTreeMap::from([(
+                "reasoning_effort".to_owned(),
+                BTreeMap::from([
+                    (
+                        "low".to_owned(),
+                        CatalogSpecialityCalibration {
+                            fingerprint: "b".repeat(64),
+                            output_tokens: 8,
+                            reasoning_tokens: 2,
+                        },
+                    ),
+                    (
+                        "high".to_owned(),
+                        CatalogSpecialityCalibration {
+                            fingerprint: "c".repeat(64),
+                            output_tokens: 24,
+                            reasoning_tokens: 16,
+                        },
+                    ),
+                ]),
+            )]),
+        );
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(
+            !errors.iter().any(|error| error.contains("speciality")),
+            "{errors:?}"
+        );
+
+        model
+            .speciality_assessment
+            .calibrated
+            .get_mut("fixture")
+            .unwrap()
+            .get_mut("reasoning_effort")
+            .unwrap()
+            .remove("high");
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("speciality calibration") && error.contains("missing level high")
+        }));
+    }
+
+    #[test]
     fn launch_source_metadata_requires_merkle_root_and_source_sha() {
         let mut model = CatalogModel {
             model_id: "admin/model@4bit".to_owned(),
@@ -3112,6 +3543,10 @@ mod tests {
                 evidence: vec!["test fixture".to_owned()],
                 calibrated_fingerprints: BTreeMap::new(),
                 resource_profiles: BTreeMap::new(),
+            },
+            speciality_assessment: CatalogSpecialityAssessment {
+                evidence: vec!["test fixture researched: no model specialities".to_owned()],
+                ..CatalogSpecialityAssessment::default()
             },
             sampling: CatalogSamplingProfile::default(),
             canary: CanaryRef {
@@ -3822,6 +4257,10 @@ mod tests {
                         )]),
                     )])
                 },
+            },
+            speciality_assessment: CatalogSpecialityAssessment {
+                evidence: vec!["test fixture researched: no model specialities".to_owned()],
+                ..CatalogSpecialityAssessment::default()
             },
             sampling: CatalogSamplingProfile::default(),
             canary,

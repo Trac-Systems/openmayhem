@@ -89,7 +89,7 @@ async function setupProviderServing(ctx) {
       manifest_hash: 'b'.repeat(64),
       att_tier: 1,
       binary_hash: 'c'.repeat(64),
-      caps: { chat: true, tools: false, ctx: 32768, modality_set: ['text'] },
+      caps: { chat: true, tools: false, ctx: 32768, modality_set: ['text'], speciality_levels: {} },
     },
     ctx.admin.publicKey,
     5
@@ -137,6 +137,7 @@ async function setupProviderServing(ctx) {
       enclave_id: enclaveId,
       served_ctx: 32768,
       served_modalities: ['text'],
+      served_specialities: {},
       ctx_bracket: 'le32k',
       ctx_bracket_table_ver: 1,
     },

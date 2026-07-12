@@ -59,6 +59,7 @@ const epochEnclaveRegistration = {
     tools: false,
     ctx: 32768,
     modality_set: ['text'],
+    speciality_levels: {},
   },
 };
 

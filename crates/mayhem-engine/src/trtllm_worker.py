@@ -53,6 +53,130 @@ def required_sampling_kwargs(callable_obj, kwargs, requested):
     return accepted
 
 
+def speciality_maps(payload):
+    template_kwargs = {}
+    sampling_kwargs = {}
+    prompt_suffixes = []
+    seen_names = set()
+    for item in payload.get("speciality_parameters") or []:
+        if not isinstance(item, dict):
+            raise ValueError("TensorRT-LLM speciality parameter must be an object")
+        name = str(item.get("name") or "")
+        target = str(item.get("target") or "")
+        native_path = str(item.get("native_path") or "")
+        if not name or name in seen_names or not native_path:
+            raise ValueError(
+                "TensorRT-LLM speciality parameters require unique names and native paths"
+            )
+        seen_names.add(name)
+        value = item.get("value")
+        if target == "chat_template_kwarg":
+            key = native_kwarg_name(native_path, "chat_template_kwargs.")
+            if key in template_kwargs:
+                raise ValueError(
+                    f"duplicate TensorRT-LLM chat-template speciality mapping {key!r}"
+                )
+            template_kwargs[key] = value
+        elif target == "sampling_parameter":
+            key = native_kwarg_name(native_path, "sampling_params.")
+            if key in sampling_kwargs:
+                raise ValueError(
+                    f"duplicate TensorRT-LLM sampling speciality mapping {key!r}"
+                )
+            sampling_kwargs[key] = value
+        elif target == "prompt_suffix":
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"TensorRT-LLM prompt-suffix speciality {name!r} must map to a string"
+                )
+            prompt_suffixes.append(value)
+        else:
+            raise ValueError(f"unsupported TensorRT-LLM speciality target {target!r}")
+    return template_kwargs, sampling_kwargs, prompt_suffixes
+
+
+def native_kwarg_name(native_path, prefix):
+    key = str(native_path)
+    if key.startswith(prefix):
+        key = key[len(prefix) :]
+    if not key or not key.isidentifier():
+        raise ValueError(f"native speciality path {native_path!r} is not a callable keyword")
+    return key
+
+
+def required_call_kwargs(callable_obj, kwargs, required, label):
+    accepted = accepted_kwargs(callable_obj, kwargs)
+    missing = sorted(name for name in required if name not in accepted)
+    if missing:
+        raise ValueError(
+            f"TensorRT-LLM {label} does not support requested speciality parameter(s): "
+            + ", ".join(missing)
+        )
+    return accepted
+
+
+def reasoning_enabled(payload):
+    for item in payload.get("speciality_parameters") or []:
+        haystack = f"{item.get('name', '')} {item.get('native_path', '')}".lower()
+        if "reason" not in haystack and "think" not in haystack:
+            continue
+        value = item.get("value")
+        level = str(item.get("level") or "").lower()
+        if value is False or value == 0 or str(value).lower() in ("false", "off", "none", "disabled"):
+            return False
+        if level in ("none", "off", "disabled"):
+            return False
+        return True
+    return False
+
+
+def reasoning_token_count(payload, completion_tokens, text):
+    if not reasoning_enabled(payload):
+        return 0
+    if "</think>" not in text:
+        return len(completion_tokens)
+    rendered = ""
+    for index, token in enumerate(completion_tokens):
+        rendered += decode_tokens([token])
+        if "</think>" in rendered:
+            return index + 1
+    return min(len(completion_tokens), len(encode_text(text.split("</think>", 1)[0])))
+
+
+def request_prompt(payload, template_kwargs, prompt_suffixes):
+    prompt = str(payload.get("prompt", ""))
+    if template_kwargs:
+        messages = payload.get("messages") or []
+        if not messages:
+            raise ValueError(
+                "TensorRT-LLM chat-template speciality request is missing structured messages"
+            )
+        if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+            raise ValueError(
+                "TensorRT-LLM tokenizer does not expose the requested chat-template speciality"
+            )
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            **template_kwargs,
+        }
+        try:
+            prompt = str(
+                tokenizer.apply_chat_template(
+                    messages,
+                    **required_call_kwargs(
+                        tokenizer.apply_chat_template,
+                        kwargs,
+                        set(template_kwargs),
+                        "chat template",
+                    ),
+                )
+            )
+        except Exception as exc:
+            raise ValueError(f"TensorRT-LLM model chat template failed: {exc}") from exc
+    return prompt + "".join(prompt_suffixes)
+
+
 def has_engine_payload(path):
     if not path or not os.path.isdir(path):
         return False
@@ -228,7 +352,7 @@ def create_engine_runner(engine_dir, payload):
     return ModelRunnerCpp.from_dir(**accepted_kwargs(ModelRunnerCpp.from_dir, kwargs))
 
 
-def make_sampling_params(payload):
+def make_sampling_params(payload, speciality_sampling_kwargs=None):
     SamplingParams = import_attr(
         (
             ("tensorrt_llm", "SamplingParams"),
@@ -277,6 +401,13 @@ def make_sampling_params(payload):
     if payload.get("seed") is not None:
         kwargs["seed"] = int(payload.get("seed"))
         kwargs["random_seed"] = int(payload.get("seed"))
+    for name, value in (speciality_sampling_kwargs or {}).items():
+        if name in kwargs:
+            raise ValueError(
+                f"TensorRT-LLM speciality sampling parameter {name!r} conflicts with a standard request field"
+            )
+        kwargs[name] = value
+        requested.add(name)
 
     try:
         return SamplingParams(
@@ -379,11 +510,23 @@ def runner_generate_batch_tokens(prompt_batches, payload, max_tokens):
             kwargs["repetition_penalty"] = float(payload.get("repeat_penalty"))
     if payload.get("seed") is not None:
         kwargs["random_seed"] = int(payload.get("seed"))
+    _, speciality_sampling_kwargs, _ = speciality_maps(payload)
+    for name, value in speciality_sampling_kwargs.items():
+        if name in kwargs:
+            raise ValueError(
+                f"TensorRT-LLM speciality sampling parameter {name!r} conflicts with a standard request field"
+            )
+        kwargs[name] = value
 
     with torch.no_grad():
         requested = {
             name
-            for name in ("top_k", "min_p", "repetition_penalty")
+            for name in (
+                "top_k",
+                "min_p",
+                "repetition_penalty",
+                *speciality_sampling_kwargs.keys(),
+            )
             if name in kwargs
         }
         outputs = model.generate(
@@ -471,7 +614,8 @@ def handle_tokenize(payload):
 
 
 def prepare_prompt(payload):
-    prompt = str(payload.get("prompt", ""))
+    template_kwargs, _, prompt_suffixes = speciality_maps(payload)
+    prompt = request_prompt(payload, template_kwargs, prompt_suffixes)
     prompt_tokens = encode_text(prompt)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
         raise ValueError(
@@ -480,18 +624,21 @@ def prepare_prompt(payload):
     return prompt, prompt_tokens
 
 
-def runner_result(prompt_tokens, completion_tokens, max_tokens):
+def runner_result(prompt_tokens, completion_tokens, max_tokens, payload):
     if len(completion_tokens) > max_tokens:
         completion_tokens = completion_tokens[:max_tokens]
     text = decode_tokens(completion_tokens)
     prompt_count = len(prompt_tokens)
     completion_count = len(completion_tokens) if completion_tokens else (1 if text else 0)
+    reasoning_tokens = reasoning_token_count(payload, completion_tokens, text)
     return {
         "text": text,
         "usage": {
             "prompt_tokens": prompt_count,
             "completion_tokens": completion_count,
             "total_tokens": prompt_count + completion_count,
+            "reasoning_tokens": min(reasoning_tokens, completion_count),
+            "vision_tokens": 0,
         },
         "finish_reason": "length" if completion_count >= max_tokens else "stop",
     }
@@ -507,6 +654,7 @@ def batch_generation_settings(payload):
         payload.get("min_p"),
         payload.get("repeat_penalty"),
         payload.get("seed"),
+        json.dumps(payload.get("speciality_parameters") or [], sort_keys=True, separators=(",", ":")),
     )
 
 
@@ -546,7 +694,8 @@ def handle_generate(request_id, payload):
         completion_tokens = runner_generate_tokens(prompt_tokens, payload, max_tokens)
         text = decode_tokens(completion_tokens)
     else:
-        params = make_sampling_params(payload)
+        _, speciality_sampling_kwargs, _ = speciality_maps(payload)
+        params = make_sampling_params(payload, speciality_sampling_kwargs)
         try:
             response = model.generate([prompt], sampling_params=params)
         except TypeError:
@@ -582,12 +731,15 @@ def handle_generate(request_id, payload):
 
     prompt_count = len(prompt_tokens)
     completion_count = len(completion_tokens) if completion_tokens else (1 if text else 0)
+    reasoning_tokens = reasoning_token_count(payload, completion_tokens, text)
     return {
         "text": text,
         "usage": {
             "prompt_tokens": prompt_count,
             "completion_tokens": completion_count,
             "total_tokens": prompt_count + completion_count,
+            "reasoning_tokens": min(reasoning_tokens, completion_count),
+            "vision_tokens": 0,
         },
         "finish_reason": (
             "length"
@@ -623,7 +775,10 @@ def handle_generate_batch(request_id, payload):
     max_tokens = request_max_tokens(payloads[0])
     prepared = [prepare_prompt(item)[1] for item in payloads]
     if max_tokens <= 0:
-        return [runner_result(prompt_tokens, [], max_tokens) for prompt_tokens in prepared]
+        return [
+            runner_result(prompt_tokens, [], max_tokens, payload)
+            for prompt_tokens, payload in zip(prepared, payloads)
+        ]
 
     completion_batches = runner_generate_batch_tokens(prepared, payloads[0], max_tokens)
     if len(completion_batches) != len(prepared):
@@ -631,8 +786,10 @@ def handle_generate_batch(request_id, payload):
             f"TensorRT-LLM runner returned {len(completion_batches)} batch outputs for {len(prepared)} requests"
         )
     return [
-        runner_result(prompt_tokens, completion_tokens, max_tokens)
-        for prompt_tokens, completion_tokens in zip(prepared, completion_batches)
+        runner_result(prompt_tokens, completion_tokens, max_tokens, payload)
+        for prompt_tokens, completion_tokens, payload in zip(
+            prepared, completion_batches, payloads
+        )
     ]
 
 

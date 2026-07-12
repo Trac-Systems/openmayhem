@@ -391,6 +391,25 @@ pub struct GenerateRequest {
     pub seed: Option<u32>,
     #[serde(default)]
     pub ignore_eos: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speciality_parameters: Vec<GenerateSpecialityParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerateSpecialityTarget {
+    ChatTemplateKwarg,
+    SamplingParameter,
+    PromptSuffix,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenerateSpecialityParameter {
+    pub name: String,
+    pub level: String,
+    pub target: GenerateSpecialityTarget,
+    pub native_path: String,
+    pub value: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -535,6 +554,7 @@ impl GenerateRequest {
             stop: Vec::new(),
             seed: None,
             ignore_eos: false,
+            speciality_parameters: Vec::new(),
         }
     }
 
@@ -557,6 +577,24 @@ impl GenerateRequest {
     }
 
     pub fn validate_sampling(&self) -> Result<()> {
+        if self.speciality_parameters.len() > 16 {
+            return Err(EngineError::InvalidConfig(
+                "at most 16 speciality parameters may be supplied".to_owned(),
+            ));
+        }
+        let mut speciality_names = std::collections::BTreeSet::new();
+        for speciality in &self.speciality_parameters {
+            if !valid_speciality_name(&speciality.name)
+                || !valid_speciality_name(&speciality.level)
+                || !valid_speciality_name(&speciality.native_path)
+                || !speciality_names.insert(speciality.name.as_str())
+            {
+                return Err(EngineError::InvalidConfig(
+                    "speciality parameters require unique safe names, levels, and native paths"
+                        .to_owned(),
+                ));
+            }
+        }
         if self
             .temperature
             .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
@@ -783,6 +821,10 @@ pub struct UsageCounters {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+    #[serde(default)]
+    pub vision_tokens: u32,
 }
 
 impl UsageCounters {
@@ -792,8 +834,18 @@ impl UsageCounters {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            reasoning_tokens: 0,
+            vision_tokens: 0,
         }
     }
+}
+
+fn valid_speciality_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2710,9 +2762,9 @@ mod llama_cpp_backend {
     use super::{
         tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
         EmbeddingOutput, EmbeddingRequest, EngineBackend, EngineError, FinishReason,
-        GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig, LoadedModelInfo, MediaInput,
-        Result, TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
-        MTMD_MEDIA_MARKER,
+        GenerateOutput, GenerateRequest, GenerateSpecialityTarget, GrammarSpec, LoadConfig,
+        LoadedModelInfo, MediaInput, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        DEFAULT_SEED, MTMD_MEDIA_MARKER,
     };
     use std::collections::VecDeque;
     use std::ffi::CString;
@@ -2836,6 +2888,8 @@ mod llama_cpp_backend {
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
             request.validate_sampling()?;
+            let mut request = request;
+            apply_llama_speciality_parameters(&mut request)?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -2933,9 +2987,12 @@ mod llama_cpp_backend {
             }
             stop_stream.finish(sink)?;
 
+            let mut usage = UsageCounters::new(prompt_tokens.len() as u32, completion_tokens);
+            usage.reasoning_tokens =
+                llama_reasoning_tokens(model, &request, &stop_stream.output, completion_tokens);
             Ok(GenerateOutput {
                 text: stop_stream.output,
-                usage: UsageCounters::new(prompt_tokens.len() as u32, completion_tokens),
+                usage,
                 finish_reason,
             })
         }
@@ -3140,12 +3197,89 @@ mod llama_cpp_backend {
             }
             stop_stream.finish(sink)?;
 
+            let mut usage = UsageCounters::new(prompt_tokens as u32, completion_tokens);
+            usage.reasoning_tokens =
+                llama_reasoning_tokens(model, &request, &stop_stream.output, completion_tokens);
+            let text_prompt_tokens = model
+                .str_to_token(&request.prompt, AddBos::Always)
+                .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
+                .unwrap_or(usage.prompt_tokens);
+            usage.vision_tokens = usage.prompt_tokens.saturating_sub(text_prompt_tokens);
             Ok(GenerateOutput {
                 text: stop_stream.output,
-                usage: UsageCounters::new(prompt_tokens as u32, completion_tokens),
+                usage,
                 finish_reason,
             })
         }
+    }
+
+    fn apply_llama_speciality_parameters(request: &mut GenerateRequest) -> Result<()> {
+        for speciality in &request.speciality_parameters {
+            match speciality.target {
+                GenerateSpecialityTarget::PromptSuffix => {
+                    let suffix = speciality.value.as_str().ok_or_else(|| {
+                        EngineError::InvalidConfig(format!(
+                            "llama.cpp prompt-suffix speciality {} must map to a string",
+                            speciality.name
+                        ))
+                    })?;
+                    request.prompt.push_str(suffix);
+                }
+                GenerateSpecialityTarget::ChatTemplateKwarg => {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "llama.cpp artifact cannot apply chat-template speciality {} ({}) through this backend; publish a prompt-suffix/native mapping or do not advertise the level",
+                        speciality.name, speciality.native_path
+                    )));
+                }
+                GenerateSpecialityTarget::SamplingParameter => {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "llama.cpp artifact does not support dynamic sampling speciality {} ({})",
+                        speciality.name, speciality.native_path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn llama_reasoning_tokens(
+        model: &LlamaModel,
+        request: &GenerateRequest,
+        text: &str,
+        completion_tokens: u32,
+    ) -> u32 {
+        let enabled = request.speciality_parameters.iter().any(|speciality| {
+            let name = speciality.name.to_ascii_lowercase();
+            let native_path = speciality.native_path.to_ascii_lowercase();
+            let relevant = name.contains("reason")
+                || name.contains("think")
+                || native_path.contains("reason")
+                || native_path.contains("think");
+            let disabled_level = matches!(
+                speciality.level.to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled"
+            );
+            let disabled_value = speciality.value == serde_json::Value::Bool(false)
+                || speciality.value.as_u64() == Some(0)
+                || speciality.value.as_str().is_some_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "none" | "off" | "disabled" | "false"
+                    )
+                });
+            relevant && !disabled_level && !disabled_value
+        });
+        if !enabled {
+            return 0;
+        }
+        let Some((prefix, _)) = text.split_once("</think>") else {
+            return completion_tokens;
+        };
+        let attributed = model
+            .str_to_token(&format!("{prefix}</think>"), AddBos::Never)
+            .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
+            .unwrap_or(completion_tokens);
+        attributed.min(completion_tokens)
     }
 
     fn media_bitmaps(mtmd: &MtmdContext, media: &[MediaInput]) -> Result<Vec<MtmdBitmap>> {

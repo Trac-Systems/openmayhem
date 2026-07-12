@@ -347,6 +347,43 @@ pub struct EndpointFamilyContract {
     pub request_attribute_specs: BTreeMap<String, EndpointAttributeSpec>,
     pub response_attribute_specs: BTreeMap<String, EndpointAttributeSpec>,
     pub interaction_groups: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub speciality_mappings: BTreeMap<String, EndpointSpecialityMapping>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSpecialityTarget {
+    ChatTemplateKwarg,
+    SamplingParameter,
+    PromptSuffix,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointSpecialityMapping {
+    pub request_path: String,
+    pub target: EndpointSpecialityTarget,
+    pub native_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSpecialityDescriptor {
+    pub name: String,
+    pub mechanism: String,
+    pub default_level: String,
+    pub levels: Vec<ModelSpecialityLevel>,
+    pub research_evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSpecialityLevel {
+    pub name: String,
+    pub rank: u32,
+    pub native_value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reasoning_tokens: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +540,8 @@ pub struct SpendVoucherBody {
     pub served_ctx: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub required_specialities: BTreeMap<String, String>,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
     #[serde(default)]
@@ -682,6 +721,8 @@ pub struct ReceiptBody {
     pub ctx_bracket_table_ver: Option<u32>,
     pub rules_ver: u64,
     pub usage: ReceiptUsage,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_attribution: BTreeMap<String, u64>,
     #[serde(with = "decimal_u128")]
     pub au_owed_cum: MoneyAu,
     pub prompt_hash: String,
@@ -1690,6 +1731,7 @@ mod tests {
             locked_min_session_au: 11,
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -1730,6 +1772,7 @@ mod tests {
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
+            usage_attribution: BTreeMap::new(),
             au_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
@@ -1801,6 +1844,7 @@ mod tests {
             locked_min_session_au: 11,
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -1833,6 +1877,7 @@ mod tests {
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
+            usage_attribution: BTreeMap::new(),
             au_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
@@ -1867,6 +1912,7 @@ mod tests {
             locked_min_session_au: 2_000_000_000_000_000_000_000_000,
             served_ctx: 131_072,
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: Some("le128k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 2_000_000_000_000_000_000_000_001,
@@ -1911,6 +1957,7 @@ mod tests {
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 7,
             usage: ReceiptUsage::text(3, 5),
+            usage_attribution: BTreeMap::new(),
             au_owed_cum: voucher.max_spend_au,
             prompt_hash: "33".repeat(32),
             ts: 1_783_517_300,

@@ -162,6 +162,7 @@ async function seedReservationServing(ctx, provider = ctx.provider) {
       ctx: 8192,
       ctx_max: 8192,
       modality_set: ['text'],
+      speciality_levels: {},
     },
     status: 'active',
     created_by: ctx.admin.publicKey,
@@ -176,6 +177,7 @@ async function seedReservationServing(ctx, provider = ctx.provider) {
     status: 'active',
     served_ctx: 8192,
     served_modalities: ['text'],
+    served_specialities: {},
     ctx_bracket: 'le8k',
     ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
     joined_at: makeTxKey(11),
@@ -210,7 +212,7 @@ async function seedNonTextReservationServing(ctx, provider = ctx.provider) {
     manifest_hash: 'b2'.repeat(32),
     binary_hash: 'c2'.repeat(32),
     att_tier: 1,
-    caps: { embedding: true, ctx: 512, ctx_max: 512, modality_set: ['embedding'] },
+    caps: { embedding: true, ctx: 512, ctx_max: 512, modality_set: ['embedding'], speciality_levels: {} },
     status: 'active',
     created_by: ctx.admin.publicKey,
     created_by_role: 'admin',
@@ -224,6 +226,7 @@ async function seedNonTextReservationServing(ctx, provider = ctx.provider) {
     status: 'active',
     served_ctx: 512,
     served_modalities: ['embedding'],
+    served_specialities: {},
     ctx_bracket: null,
     ctx_bracket_table_ver: null,
     joined_at: makeTxKey(21),
@@ -258,6 +261,7 @@ function signedSpendReservation(
     lockedMinSessionAu = 100,
     servedCtx = 8192,
     requiredModalities = ['text'],
+    requiredSpecialities = {},
     ctxBracket = ctxBracketForTokens(servedCtx),
     ctxBracketTableVer = CTX_BRACKET_TABLE_VERSION,
     at = epoch * 3_600,
@@ -276,6 +280,9 @@ function signedSpendReservation(
     locked_min_session_au: lockedMinSessionAuString,
     served_ctx: servedCtx,
     required_modalities: requiredModalities,
+    ...(Object.keys(requiredSpecialities).length > 0
+      ? { required_specialities: requiredSpecialities }
+      : {}),
     ctx_bracket: ctxBracket,
     ctx_bracket_table_ver: ctxBracketTableVer,
     max_spend_au: maxSpendAuString,
@@ -295,6 +302,9 @@ function signedSpendReservation(
     rules_ver: 1,
     served_ctx: servedCtx,
     required_modalities: requiredModalities,
+    ...(Object.keys(requiredSpecialities).length > 0
+      ? { required_specialities: requiredSpecialities }
+      : {}),
     ctx_bracket: ctxBracket,
     ctx_bracket_table_ver: ctxBracketTableVer,
     max_spend_au: maxSpendAuString,
@@ -627,6 +637,57 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
   );
   assert.match(secondResult.message, /Insufficient unreserved credit balance/);
   assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_au, '700000');
+});
+
+test('MayhemContract spend reservation requires a provider-served speciality level', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+  const enclaveKey = `enclave/${enclaveId}`;
+  const serveKey = `serve/${ctx.provider.publicKey}/${enclaveId}`;
+  const enclave = (await ctx.storage.get(enclaveKey)).value;
+  const serve = (await ctx.storage.get(serveKey)).value;
+  await ctx.storage.put(enclaveKey, {
+    ...enclave,
+    caps: {
+      ...enclave.caps,
+      speciality_levels: { reasoning_effort: ['none', 'high'] },
+    },
+  });
+  await ctx.storage.put(serveKey, {
+    ...serve,
+    served_specialities: { reasoning_effort: ['none'] },
+  });
+
+  const unsupported = signedSpendReservation(ctx, {
+    enclaveId,
+    sessionId: 'a3'.repeat(32),
+    maxSpendAu: 100_000,
+    requiredSpecialities: { reasoning_effort: 'high' },
+  });
+  const rejected = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    unsupported,
+    ctx.provider.publicKey
+  );
+  assert.match(rejected.message, /committed specialities do not cover/i);
+  assert.equal(await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`), null);
+
+  const supported = signedSpendReservation(ctx, {
+    enclaveId,
+    sessionId: 'a4'.repeat(32),
+    maxSpendAu: 100_000,
+    requiredSpecialities: { reasoning_effort: 'none' },
+  });
+  const accepted = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    supported,
+    ctx.provider.publicKey
+  );
+  assert.equal(accepted.ok, true, accepted.message);
+  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
+  assert.deepEqual(hold.sessions[0].required_specialities, { reasoning_effort: 'none' });
 });
 
 test('MayhemContract spend reservation accepts unbracketed non-text markets only', async () => {

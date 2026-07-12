@@ -31,7 +31,10 @@ use crate::{
         RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
         DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
-    pricing::{normalize_rate_map, priced_usage_au, text_generation_rate_map, RateMapEntry},
+    pricing::{
+        normalize_rate_map, priced_usage_au, rate_gate_basis_au, text_generation_rate_map,
+        usage_units_au, RateMapEntry,
+    },
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
         ProviderCapacityMismatchEvent, ProviderObservationSample, ProviderTable,
@@ -72,14 +75,15 @@ use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
     payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
     session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, AttestationReport,
-    CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
-    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract, ModelSpecialityDescriptor,
+    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
+    USAGE_VIDEO_SECOND,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -183,6 +187,7 @@ const DASHBOARD_USER_CSS: &str = r#"
 .overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid>.card{overflow-x:auto}.wide-grid.network .card{overflow-x:auto}.table{width:100%;min-width:560px;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table{min-width:0;table-layout:fixed;font-size:12px}.table th,.table td{padding:10px 5px}.table th:nth-child(3),.table td:nth-child(3){display:none}.table td:last-child,.table th:last-child{text-align:left}.overview-grid{gap:12px}}
 "#;
 const DASHBOARD_CHART_CSS: &str = r#"
+.capability-controls{display:grid;gap:8px;margin:0 0 24px;padding:14px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.capability-controls .segment{text-decoration:none}.capability-band{margin:0 0 24px}.section-heading{margin:0 0 12px}.section-heading h2{margin:3px 0 0;font-size:22px}.capability-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.capability-card{display:grid;align-content:start;min-height:220px}.capability-card .card-header h2{font-size:18px}.capability-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0 8px}.capability-metrics p{margin:4px 0 0;overflow-wrap:anywhere}.wide-grid.network{grid-template-columns:1fr}.wide-grid.network .table{min-width:900px;table-layout:auto}.wide-grid.network .table th,.wide-grid.network .table td{overflow-wrap:normal;word-break:normal}.wide-grid.network .table td:nth-child(4){min-width:260px}@media(max-width:900px){.capability-grid{grid-template-columns:1fr}.capability-metrics{grid-template-columns:1fr}}@media(max-width:640px){.wide-grid.network .table{min-width:900px;font-size:12px}.wide-grid.network .table th:nth-child(3),.wide-grid.network .table td:nth-child(3){display:table-cell}}
 .price-chart-grid{display:grid;grid-template-columns:1fr;gap:24px;margin:0 0 24px}.price-chart-card .card-header{align-items:flex-start}.price-chart-title{min-width:0}.price-chart-title h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.price-chart-toolbar{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin:0 0 14px}.price-chart-control{display:grid;gap:6px}.price-chart-control .segmented{gap:6px}.price-chart-control .segment{text-decoration:none}.price-chart-shell{border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.3),rgba(16,16,19,.42));overflow:hidden}.price-chart-svg{display:block;width:100%;height:auto}.price-grid-line{stroke:rgba(136,138,140,.16);stroke-width:1}.price-axis{fill:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}.price-step{fill:none;stroke:var(--accent-primary);stroke-width:2.4;stroke-linejoin:round;stroke-linecap:round}.price-overlay{fill:none;stroke:var(--accent-secondary);stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round;opacity:.65}.price-volume{fill:rgba(136,138,140,.36)}.price-candle .wick{stroke:var(--text-primary);stroke-width:1.4}.price-candle .body{stroke:transparent}.price-candle.up .body{fill:rgba(66,187,147,.76)}.price-candle.down .body{fill:rgba(197,68,89,.76)}.price-marker{fill:var(--surface-card);stroke:var(--accent-primary-light);stroke-width:1.4}.price-marker.pinned{stroke:var(--accent-secondary)}.price-chart-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.price-chart-empty{min-height:300px}.price-chart-footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--text-muted);font-size:13px}@media(max-width:640px){.price-chart-toolbar{gap:10px}.price-chart-title h2{white-space:normal}.price-chart-footer{display:grid}.price-axis{font-size:10px}}
 "#;
 
@@ -530,6 +535,9 @@ pub struct MayhemModelInfo {
     pub min_app_version: Option<String>,
     pub caps: ModelCaps,
     pub adapter: ShapeAdapterInfo,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub speciality_calibrations:
+        BTreeMap<String, BTreeMap<String, BTreeMap<String, GatewaySpecialityCalibration>>>,
     #[serde(default, skip_serializing_if = "SamplingProfile::is_empty")]
     pub sampling: SamplingProfile,
     #[serde(default, skip_serializing_if = "GatewayFailoverPolicyConfig::is_empty")]
@@ -539,6 +547,48 @@ pub struct MayhemModelInfo {
     pub kyb_identities: Vec<ProviderKybInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_candidates: Vec<GatewayRouteCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewaySpecialityCalibration {
+    pub fingerprint: String,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GatewaySpecialityVolumeEstimate {
+    calibration_artifacts: usize,
+    output_tokens_min: u64,
+    output_tokens_max: u64,
+    reasoning_tokens_min: u64,
+    reasoning_tokens_max: u64,
+    expected_output_cost_au_min: Option<String>,
+    expected_output_cost_au_max: Option<String>,
+    expected_output_cost_usd_min: Option<String>,
+    expected_output_cost_usd_max: Option<String>,
+    rate_unit: String,
+    rate_granularity: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GatewaySpecialityLevelAvailability {
+    available: bool,
+    canonical_provider_count: usize,
+    live_provider_count: usize,
+    canonical_providers: Vec<String>,
+    live_providers: Vec<String>,
+    default_max_output_tokens: Option<u32>,
+    max_reasoning_tokens: Option<u32>,
+    expected_volume: Option<GatewaySpecialityVolumeEstimate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GatewaySpecialityAvailability {
+    mechanism: String,
+    default_level: String,
+    levels: BTreeMap<String, GatewaySpecialityLevelAvailability>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -610,6 +660,8 @@ pub struct GatewayRouteCandidate {
     pub accepted_rails: Vec<String>,
     #[serde(default)]
     pub served_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub served_specialities: BTreeMap<String, Vec<String>>,
     pub enclave_id: String,
     pub room_id: String,
     pub price_ver: u64,
@@ -729,6 +781,8 @@ pub struct ShapeAdapterInfo {
     pub tool_call_strategy: String,
     pub reasoning_passthrough: String,
     pub modality_set: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specialities: Vec<ModelSpecialityDescriptor>,
 }
 
 impl Default for ShapeAdapterInfo {
@@ -742,6 +796,7 @@ impl Default for ShapeAdapterInfo {
             tool_call_strategy: "mayhem_json".to_owned(),
             reasoning_passthrough: "strip".to_owned(),
             modality_set: vec!["text".to_owned()],
+            specialities: Vec::new(),
         }
     }
 }
@@ -1321,6 +1376,8 @@ pub struct GatewayCanaryModelConfig {
     pub embedding_vectors_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
     pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub audio_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
+    pub speciality_calibrations_by_artifact_root:
+        BTreeMap<String, BTreeMap<String, BTreeMap<String, GatewaySpecialityCalibration>>>,
     pub default_fingerprint: Option<String>,
     pub default_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     pub default_perceptual_hashes: Option<BTreeMap<String, String>>,
@@ -1400,7 +1457,6 @@ struct HardwareQuoteTrust {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     #[serde(default)]
@@ -1443,6 +1499,12 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub max_completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, flatten)]
+    pub speciality_values: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub effective_specialities: BTreeMap<String, String>,
     #[serde(skip)]
     pub endpoint_family: Option<String>,
     #[serde(skip)]
@@ -1468,7 +1530,6 @@ pub struct StreamOptions {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
     pub model: String,
     #[serde(default)]
@@ -1495,10 +1556,13 @@ pub struct CompletionRequest {
     pub stop: Option<Value>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, flatten)]
+    pub speciality_values: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesRequest {
     pub model: String,
     pub input: Value,
@@ -1528,6 +1592,10 @@ pub struct ResponsesRequest {
     pub metadata: BTreeMap<String, Value>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, flatten)]
+    pub speciality_values: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2270,6 +2338,7 @@ impl GatewayState {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "local-fixture".to_owned(),
@@ -2888,20 +2957,163 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
     if let Err(err) = state.authorize_gateway_request(&headers, None) {
         return err.into_response();
     }
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis_u64())
+    };
     let data = state
         .models
         .iter()
         .map(|model| {
+            let mut mayhem = serde_json::to_value(&model.mayhem).unwrap_or(Value::Null);
+            if let Some(object) = mayhem.as_object_mut() {
+                object.insert(
+                    "speciality_availability".to_owned(),
+                    serde_json::to_value(gateway_speciality_availability(model, &entries))
+                        .unwrap_or_else(|_| json!({})),
+                );
+            }
             json!({
                 "id": model.id,
                 "object": "model",
                 "created": model.created,
                 "owned_by": model.owned_by,
-                "mayhem": model.mayhem,
+                "mayhem": mayhem,
             })
         })
         .collect::<Vec<_>>();
     Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+fn gateway_speciality_availability(
+    model: &GatewayModel,
+    entries: &[ProviderTableEntry],
+) -> BTreeMap<String, GatewaySpecialityAvailability> {
+    model
+        .mayhem
+        .adapter
+        .specialities
+        .iter()
+        .map(|descriptor| {
+            let levels = descriptor
+                .levels
+                .iter()
+                .map(|level| {
+                    let canonical_providers = model
+                        .mayhem
+                        .route_candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate
+                                .served_specialities
+                                .get(&descriptor.name)
+                                .is_some_and(|levels| levels.contains(&level.name))
+                        })
+                        .map(|candidate| candidate.provider.clone())
+                        .collect::<BTreeSet<_>>();
+                    let live_providers = model
+                        .mayhem
+                        .route_candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate
+                                .served_specialities
+                                .get(&descriptor.name)
+                                .is_some_and(|levels| levels.contains(&level.name))
+                                && dashboard_entry_for_route(entries, candidate)
+                                    .and_then(|entry| entry.heartbeat.as_ref())
+                                    .is_some_and(|heartbeat| {
+                                        heartbeat
+                                            .caps
+                                            .served_specialities
+                                            .get(&descriptor.name)
+                                            .is_some_and(|levels| levels.contains(&level.name))
+                                    })
+                        })
+                        .map(|candidate| candidate.provider.clone())
+                        .collect::<BTreeSet<_>>();
+                    let expected_volume =
+                        gateway_speciality_volume_estimate(model, &descriptor.name, &level.name);
+                    let canonical_providers = canonical_providers.into_iter().collect::<Vec<_>>();
+                    let live_providers = live_providers.into_iter().collect::<Vec<_>>();
+                    (
+                        level.name.clone(),
+                        GatewaySpecialityLevelAvailability {
+                            available: !live_providers.is_empty(),
+                            canonical_provider_count: canonical_providers.len(),
+                            live_provider_count: live_providers.len(),
+                            canonical_providers,
+                            live_providers,
+                            default_max_output_tokens: level.default_max_output_tokens,
+                            max_reasoning_tokens: level.max_reasoning_tokens,
+                            expected_volume,
+                        },
+                    )
+                })
+                .collect();
+            (
+                descriptor.name.clone(),
+                GatewaySpecialityAvailability {
+                    mechanism: descriptor.mechanism.clone(),
+                    default_level: descriptor.default_level.clone(),
+                    levels,
+                },
+            )
+        })
+        .collect()
+}
+
+fn gateway_speciality_volume_estimate(
+    model: &GatewayModel,
+    speciality: &str,
+    level: &str,
+) -> Option<GatewaySpecialityVolumeEstimate> {
+    let calibrations = model
+        .mayhem
+        .speciality_calibrations
+        .values()
+        .filter_map(|specialities| specialities.get(speciality))
+        .filter_map(|levels| levels.get(level))
+        .collect::<Vec<_>>();
+    let output_tokens_min = calibrations.iter().map(|row| row.output_tokens).min()?;
+    let output_tokens_max = calibrations.iter().map(|row| row.output_tokens).max()?;
+    let reasoning_tokens_min = calibrations
+        .iter()
+        .map(|row| row.reasoning_tokens)
+        .min()
+        .unwrap_or(0);
+    let reasoning_tokens_max = calibrations
+        .iter()
+        .map(|row| row.reasoning_tokens)
+        .max()
+        .unwrap_or(0);
+    let output_rate = model.mayhem.price_ref_au.rate_map.iter().find(|rate| {
+        rate.unit == USAGE_OUTPUT_TOKEN && rate.per_unit_au > 0 && rate.granularity > 0
+    });
+    let output_cost = output_rate.map(|rate| {
+        let minimum = usage_units_au(
+            &model.mayhem.price_ref_au.rate_map,
+            &[(USAGE_OUTPUT_TOKEN, output_tokens_min)],
+        );
+        let maximum = usage_units_au(
+            &model.mayhem.price_ref_au.rate_map,
+            &[(USAGE_OUTPUT_TOKEN, output_tokens_max)],
+        );
+        (minimum, maximum, rate.granularity)
+    });
+    Some(GatewaySpecialityVolumeEstimate {
+        calibration_artifacts: calibrations.len(),
+        output_tokens_min,
+        output_tokens_max,
+        reasoning_tokens_min,
+        reasoning_tokens_max,
+        expected_output_cost_au_min: output_cost.map(|(minimum, _, _)| minimum.to_string()),
+        expected_output_cost_au_max: output_cost.map(|(_, maximum, _)| maximum.to_string()),
+        expected_output_cost_usd_min: output_cost.map(|(minimum, _, _)| format_au_usd(minimum)),
+        expected_output_cost_usd_max: output_cost.map(|(_, maximum, _)| format_au_usd(maximum)),
+        rate_unit: USAGE_OUTPUT_TOKEN.to_owned(),
+        rate_granularity: output_cost.map(|(_, _, granularity)| granularity),
+    })
 }
 
 fn parse_catalog_endpoint_request<T: DeserializeOwned>(
@@ -4204,6 +4416,7 @@ struct DashboardQuery {
     bucket: Option<String>,
     quant: Option<String>,
     unit: Option<String>,
+    speciality: Option<String>,
     pin: Option<String>,
 }
 
@@ -4286,6 +4499,7 @@ struct DashboardChartOptions {
     selected_bucket: Option<String>,
     selected_quant: Option<String>,
     selected_unit: Option<String>,
+    selected_speciality: Option<(String, String)>,
     pinned_models: Vec<String>,
     provider_filter: Option<String>,
 }
@@ -4548,6 +4762,7 @@ fn dashboard_chart_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
+            selected_speciality: dashboard_parse_speciality_filter(query.speciality.as_deref()),
             pinned_models: pins.models,
             provider_filter: query
                 .provider
@@ -4558,6 +4773,24 @@ fn dashboard_chart_options(
         },
         pins.set_cookie,
     )
+}
+
+fn dashboard_parse_speciality_filter(value: Option<&str>) -> Option<(String, String)> {
+    let value = value?.trim();
+    let (name, level) = value.split_once('=')?;
+    let name = name.trim();
+    let level = level.trim();
+    let valid = |component: &str| {
+        !component.is_empty()
+            && component.len() <= 128
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    if !valid(name) || !valid(level) || level.contains('=') {
+        return None;
+    }
+    Some((name.to_owned(), level.to_owned()))
 }
 
 fn dashboard_pin_state_from_request(
@@ -4926,6 +5159,15 @@ fn dashboard_user_html(
     origin: &str,
     chart_options: &DashboardChartOptions,
 ) -> String {
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis_u64())
+    };
+    let models = dashboard_filtered_models(
+        &state.models,
+        &entries,
+        chart_options.selected_speciality.as_ref(),
+    );
     let receipts = state.receipts();
     let latest_receipts = dashboard_latest_receipts(&receipts);
     let active_sessions = latest_receipts
@@ -4940,9 +5182,11 @@ fn dashboard_user_html(
     let gateway_root = origin.trim_end_matches('/');
     let openai_base_url = format!("{gateway_root}/v1");
     let session_rows = dashboard_session_rows(&latest_receipts);
-    let model_rows = dashboard_model_rows(&state.models);
+    let model_rows = dashboard_model_rows(&models, &entries);
     let spend_body = dashboard_spend_body(&latest_receipts);
-    let price_charts = dashboard_price_chart_cards(&state.models, chart_options, None);
+    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
+    let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
     let access_summary = state.access_summary();
     let token_rows = dashboard_access_token_rows(&access_summary);
     let token_count = access_summary
@@ -4968,7 +5212,7 @@ fn dashboard_user_html(
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">{payment_status}</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">{payment_status}</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Local gateway · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
@@ -5030,10 +5274,19 @@ fn dashboard_provider_html(
     provider_filter: Option<&str>,
     chart_options: &DashboardChartOptions,
 ) -> String {
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis_u64())
+    };
+    let models = dashboard_filtered_models(
+        &state.models,
+        &entries,
+        chart_options.selected_speciality.as_ref(),
+    );
     let receipts = state.receipts();
     let latest_receipts = dashboard_latest_receipts(&receipts);
     let probes = state.probes();
-    let candidates = dashboard_provider_candidates(&state.models, provider_filter);
+    let candidates = dashboard_provider_candidates(&models, provider_filter);
     let provider_scope = dashboard_provider_scope(
         provider_filter,
         &candidates,
@@ -5089,14 +5342,15 @@ fn dashboard_provider_html(
     let hardware_body = dashboard_provider_hwprobe_body(&candidates, &probes, &provider_scope);
     let claim_body =
         dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
-    let price_charts =
-        dashboard_price_chart_cards(&state.models, chart_options, Some(&provider_scope));
+    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
+    let price_charts = dashboard_price_chart_cards(&models, chart_options, Some(&provider_scope));
     let update_notice = state.update_notice();
     let update_banner = dashboard_update_banner(update_notice.as_ref());
     dashboard_html_document(
         "Provider Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
             earned = format_au_usd(earned_au),
             earned_source = if earning_totals.loaded {
                 "ledger earn/* rows"
@@ -5153,36 +5407,44 @@ fn dashboard_network_html(
         let table = state.provider_table.lock_recover("provider table");
         table.entries(now_millis_u64())
     };
-    let provider_count = state
-        .models
+    let models = dashboard_filtered_models(
+        &state.models,
+        &entries,
+        chart_options.selected_speciality.as_ref(),
+    );
+    let provider_count = models
         .iter()
         .flat_map(|model| model.mayhem.route_candidates.iter())
         .map(|candidate| candidate.provider.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let route_count = state
-        .models
+    let route_count = models
         .iter()
         .map(|model| model.mayhem.route_candidates.len())
         .sum::<usize>();
-    let live_count = entries
+    let live_count = models
         .iter()
-        .filter(|entry| dashboard_entry_has_live_heartbeat(entry))
+        .flat_map(|model| model.mayhem.route_candidates.iter())
+        .filter(|candidate| {
+            dashboard_entry_for_route(&entries, candidate)
+                .is_some_and(dashboard_entry_has_live_heartbeat)
+        })
         .count();
-    let unavailable_models = state
-        .models
+    let unavailable_models = models
         .iter()
         .filter(|model| !dashboard_model_has_live_provider(model, &entries))
         .count();
     let gateway_root = origin.trim_end_matches('/');
-    let model_rows = dashboard_network_model_rows(&state.models, &entries);
-    let provider_rows = dashboard_network_provider_rows(&state.models, &entries);
-    let price_charts = dashboard_price_chart_cards(&state.models, chart_options, None);
+    let model_rows = dashboard_network_model_rows(&models, &entries);
+    let provider_rows = dashboard_network_provider_rows(&models, &entries);
+    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
+    let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
     dashboard_html_document(
         "Network Explorer",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section>{price_charts}<section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
-            model_count = state.models.len(),
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
+            model_count = models.len(),
         ),
     )
 }
@@ -5296,6 +5558,206 @@ fn dashboard_model_has_live_provider(model: &GatewayModel, entries: &[ProviderTa
     })
 }
 
+fn dashboard_model_has_live_speciality(
+    model: &GatewayModel,
+    entries: &[ProviderTableEntry],
+    speciality: &(String, String),
+) -> bool {
+    gateway_speciality_availability(model, entries)
+        .get(&speciality.0)
+        .and_then(|entry| entry.levels.get(&speciality.1))
+        .is_some_and(|level| level.available)
+}
+
+fn dashboard_filtered_models(
+    models: &[GatewayModel],
+    entries: &[ProviderTableEntry],
+    speciality: Option<&(String, String)>,
+) -> Vec<GatewayModel> {
+    models
+        .iter()
+        .filter(|model| {
+            speciality
+                .is_none_or(|filter| dashboard_model_has_live_speciality(model, entries, filter))
+        })
+        .cloned()
+        .collect()
+}
+
+fn dashboard_speciality_controls(
+    models: &[GatewayModel],
+    entries: &[ProviderTableEntry],
+    options: &DashboardChartOptions,
+) -> String {
+    let mut live_providers = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    let mut defaults = BTreeSet::new();
+    for model in models {
+        for (name, speciality) in gateway_speciality_availability(model, entries) {
+            defaults.insert((name.clone(), speciality.default_level.clone()));
+            for (level, availability) in speciality.levels {
+                live_providers
+                    .entry((name.clone(), level))
+                    .or_default()
+                    .extend(availability.live_providers);
+            }
+        }
+    }
+    if live_providers.is_empty() {
+        return String::new();
+    }
+    let clear = {
+        let mut next = options.clone();
+        next.selected_speciality = None;
+        let selected_tier = next.selected_tier.clone();
+        let selected_bucket = next.selected_bucket.clone();
+        let selected_quant = next.selected_quant.clone();
+        let selected_unit = next.selected_unit.clone();
+        dashboard_chart_href(
+            &next,
+            selected_tier.as_deref(),
+            next.selected_timeframe,
+            selected_bucket.as_deref(),
+            selected_quant.as_deref(),
+            selected_unit.as_deref(),
+            None,
+        )
+    };
+    let mut links = dashboard_segment_link("All", &clear, options.selected_speciality.is_none());
+    for ((name, level), providers) in live_providers {
+        let mut next = options.clone();
+        next.selected_speciality = Some((name.clone(), level.clone()));
+        let selected_tier = next.selected_tier.clone();
+        let selected_bucket = next.selected_bucket.clone();
+        let selected_quant = next.selected_quant.clone();
+        let selected_unit = next.selected_unit.clone();
+        let href = dashboard_chart_href(
+            &next,
+            selected_tier.as_deref(),
+            next.selected_timeframe,
+            selected_bucket.as_deref(),
+            selected_quant.as_deref(),
+            selected_unit.as_deref(),
+            None,
+        );
+        let default = if defaults.contains(&(name.clone(), level.clone())) {
+            " · default"
+        } else {
+            ""
+        };
+        links.push_str(&dashboard_segment_link(
+            &format!("{name}={level} · {} live{default}", providers.len()),
+            &href,
+            options
+                .selected_speciality
+                .as_ref()
+                .is_some_and(|selected| selected.0 == name && selected.1 == level),
+        ));
+    }
+    format!(
+        r#"<section class="capability-controls"><span class="label">Capability filter</span><div class="segmented">{links}</div></section>"#
+    )
+}
+
+fn dashboard_speciality_volume_cards(
+    models: &[GatewayModel],
+    entries: &[ProviderTableEntry],
+    options: &DashboardChartOptions,
+) -> String {
+    let mut cards = String::new();
+    for model in models {
+        for (name, speciality) in gateway_speciality_availability(model, entries) {
+            for (level, availability) in speciality.levels {
+                if options
+                    .selected_speciality
+                    .as_ref()
+                    .is_some_and(|selected| selected.0 != name || selected.1 != level)
+                {
+                    continue;
+                }
+                let status = if availability.available {
+                    format!(
+                        r#"<span class="status-dot">{} live</span>"#,
+                        availability.live_provider_count
+                    )
+                } else {
+                    r#"<span class="status-dot muted">0 live</span>"#.to_owned()
+                };
+                let expected = availability
+                    .expected_volume
+                    .as_ref()
+                    .map(|volume| {
+                        let output = dashboard_u64_range(
+                            volume.output_tokens_min,
+                            volume.output_tokens_max,
+                        );
+                        let reasoning = dashboard_u64_range(
+                            volume.reasoning_tokens_min,
+                            volume.reasoning_tokens_max,
+                        );
+                        let cost = match (
+                            volume.expected_output_cost_usd_min.as_deref(),
+                            volume.expected_output_cost_usd_max.as_deref(),
+                        ) {
+                            (Some(minimum), Some(maximum)) if minimum == maximum => {
+                                minimum.to_owned()
+                            }
+                            (Some(minimum), Some(maximum)) => format!("{minimum} - {maximum}"),
+                            _ => "rate unavailable".to_owned(),
+                        };
+                        format!(
+                            r#"<div class="capability-metrics"><div><span class="label">Measured output</span><p class="mono">{} tokens</p></div><div><span class="label">Reasoning attribution</span><p class="mono">{} tokens</p></div><div><span class="label">Expected output cost</span><p class="mono">{}</p></div></div><p class="privacy-note">{} signed artifact calibration row(s)</p>"#,
+                            html_escape(&output),
+                            html_escape(&reasoning),
+                            html_escape(&cost),
+                            volume.calibration_artifacts,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        r#"<p class="privacy-note">Expected volume unavailable: signed calibration pending</p>"#
+                            .to_owned()
+                    });
+                let output_cap = availability
+                    .default_max_output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unset".to_owned());
+                let reasoning_cap = availability
+                    .max_reasoning_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unset".to_owned());
+                let default = if speciality.default_level == level {
+                    r#"<span class="badge good">default</span>"#
+                } else {
+                    ""
+                };
+                cards.push_str(&format!(
+                    r#"<article class="card capability-card"><div class="card-header"><div><span class="label">{}</span><h2 class="mono">{}</h2></div>{status}</div><div class="badge-row"><span class="badge">{}={}</span>{default}<span class="badge">{} canonical</span></div>{expected}<p class="privacy-note">caps: output {} · reasoning {}</p></article>"#,
+                    html_escape(short_text(&model.id, 42).as_ref()),
+                    html_escape(&level),
+                    html_escape(&name),
+                    html_escape(&level),
+                    availability.canonical_provider_count,
+                    html_escape(&output_cap),
+                    html_escape(&reasoning_cap),
+                ));
+            }
+        }
+    }
+    if cards.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<section class="capability-band"><div class="section-heading"><span class="label">Volume plane</span><h2>Capability cost</h2></div><div class="capability-grid">{cards}</div></section>"#
+    )
+}
+
+fn dashboard_u64_range(minimum: u64, maximum: u64) -> String {
+    if minimum == maximum {
+        minimum.to_string()
+    } else {
+        format!("{minimum}-{maximum}")
+    }
+}
+
 fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
     let mut abilities = BTreeSet::new();
     for modality in model
@@ -5336,6 +5798,18 @@ fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
             abilities.insert(format!("api:{}", contract.family.trim()));
         }
     }
+    for speciality in &model.mayhem.adapter.specialities {
+        abilities.insert(format!(
+            "{}:{}",
+            speciality.name,
+            speciality
+                .levels
+                .iter()
+                .map(|level| level.name.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        ));
+    }
     abilities.insert(format!("ctx {}", model.mayhem.caps.ctx));
     abilities.into_iter().collect()
 }
@@ -5367,6 +5841,9 @@ fn dashboard_route_abilities(
         if !modality.trim().is_empty() {
             abilities.insert(modality.trim().to_owned());
         }
+    }
+    for (name, levels) in &caps.served_specialities {
+        abilities.insert(format!("{name}:{}", levels.join("|")));
     }
     abilities.insert(format!("ctx {}", caps.ctx));
     abilities.into_iter().collect()
@@ -5558,6 +6035,7 @@ struct DashboardProviderCandidate {
     enclave_id: String,
     room_id: String,
     backend: String,
+    served_specialities: BTreeMap<String, Vec<String>>,
     att_tier: u8,
     kyb: Option<ProviderKybInfo>,
 }
@@ -5615,6 +6093,7 @@ fn dashboard_provider_candidates(
                 enclave_id: candidate.enclave_id.clone(),
                 room_id: candidate.room_id.clone(),
                 backend: primary_endpoint_family(&model.mayhem.adapter).to_owned(),
+                served_specialities: candidate.served_specialities.clone(),
                 att_tier: candidate.att_tier,
                 kyb: candidate.kyb.clone(),
             });
@@ -5848,8 +6327,16 @@ fn dashboard_provider_enclave_rows(
                 candidate.provider.clone(),
                 candidate.enclave_id.clone(),
             )));
+            let speciality_badges = dashboard_badges(
+                &candidate
+                    .served_specialities
+                    .iter()
+                    .map(|(name, levels)| format!("{name}:{}", levels.join("|")))
+                    .collect::<Vec<_>>(),
+                "badge",
+            );
             format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td>{}</td></tr>"#,
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span>{speciality_badges}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td>{}</td></tr>"#,
                 html_escape(short_text(&candidate.model_id, 30).as_ref()),
                 html_escape(short_text(&candidate.enclave_id, 22).as_ref()),
                 html_escape(&candidate.backend),
@@ -6218,8 +6705,23 @@ fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
             } else {
                 r#"<span class="status-dot">Running</span>"#
             };
+            let attribution = if body.usage_attribution.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<p class="privacy-note">{}</p>"#,
+                    html_escape(
+                        &body
+                            .usage_attribution
+                            .iter()
+                            .map(|(axis, units)| format!("{axis} {units}"))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    )
+                )
+            };
             format!(
-                r#"<tr><td class="mono">{}</td><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
+                r#"<tr><td class="mono">{}</td><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td><span class="mono">{}/{}</span>{attribution}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
                 html_escape(short_text(&body.model_id, 28).as_ref()),
                 html_escape(short_text(&body.provider, 18).as_ref()),
                 body.usage.prompt_tokens(),
@@ -6230,7 +6732,7 @@ fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
         .collect::<String>()
 }
 
-fn dashboard_model_rows(models: &[GatewayModel]) -> String {
+fn dashboard_model_rows(models: &[GatewayModel], entries: &[ProviderTableEntry]) -> String {
     if models.is_empty() {
         return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No models loaded</p></div></div>"#
             .to_owned();
@@ -6246,7 +6748,7 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
                 1 => "1 worker route".to_owned(),
                 count => format!("{count} worker routes"),
             };
-            let availability = if model.mayhem.providers_online > 0 {
+            let availability = if dashboard_model_has_live_provider(model, entries) {
                 r#"<span class="status-dot">Online</span>"#
             } else {
                 r#"<span class="status-dot muted">Offline</span>"#
@@ -6269,10 +6771,11 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
                         html_escape(&identity.legal_name),
                         html_escape(&identity.jurisdiction)
                     )
-            })
+                })
                 .unwrap_or_default();
+            let abilities = dashboard_badges(&dashboard_model_abilities(model), "badge");
             format!(
-                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
+                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {} · {}</div>{abilities}</div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
                 html_escape(&model.id),
                 tier_tooltip,
                 tier_tooltip,
@@ -6681,6 +7184,12 @@ fn dashboard_chart_href(
     }
     if let Some(unit) = unit.filter(|value| !value.is_empty()) {
         query.push(format!("unit={}", dashboard_url_encode(unit)));
+    }
+    if let Some((name, level)) = options.selected_speciality.as_ref() {
+        query.push(format!(
+            "speciality={}",
+            dashboard_url_encode(&format!("{name}={level}"))
+        ));
     }
     let pins = pin_override.unwrap_or(&options.pinned_models);
     if pin_override.is_some() {
@@ -8017,9 +8526,15 @@ fn canary_registry_from_catalog_root(
         let mut embedding_vectors_by_artifact_root = BTreeMap::new();
         let mut transcripts_by_artifact_root = BTreeMap::new();
         let mut audio_fingerprints_by_artifact_root = BTreeMap::new();
+        let speciality_calibrations = speciality_calibrations_from_catalog_value(model);
+        let mut speciality_calibrations_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
+                    if let Some(calibrations) = speciality_calibrations.get(artifact_name) {
+                        speciality_calibrations_by_artifact_root
+                            .insert(artifact_root.to_owned(), calibrations.clone());
+                    }
                     if verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
                         let Some(fingerprint) = fingerprints.get(artifact_name.as_str()) else {
                             continue;
@@ -8072,6 +8587,7 @@ fn canary_registry_from_catalog_root(
                 embedding_vectors_by_artifact_root,
                 transcripts_by_artifact_root,
                 audio_fingerprints_by_artifact_root,
+                speciality_calibrations_by_artifact_root,
                 default_fingerprint,
                 default_token_prefixes,
                 default_perceptual_hashes,
@@ -8386,7 +8902,11 @@ fn route_identity_anchor(candidate: &GatewayRouteCandidate) -> Option<String> {
         })
 }
 
-fn heartbeat_caps_from_model(caps: &ModelCaps, modalities: &[String]) -> HeartbeatCaps {
+fn heartbeat_caps_from_model(
+    caps: &ModelCaps,
+    modalities: &[String],
+    specialities: &[ModelSpecialityDescriptor],
+) -> HeartbeatCaps {
     HeartbeatCaps {
         tools: caps.tools,
         json: caps.json,
@@ -8394,6 +8914,19 @@ fn heartbeat_caps_from_model(caps: &ModelCaps, modalities: &[String]) -> Heartbe
         vision: caps.vision,
         served_modalities: modalities.to_vec(),
         modality_capacity: BTreeMap::new(),
+        served_specialities: specialities
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.name.clone(),
+                    descriptor
+                        .levels
+                        .iter()
+                        .map(|level| level.name.clone())
+                        .collect(),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -8401,8 +8934,11 @@ fn heartbeat_caps_for_route(
     model: &GatewayModel,
     candidate: &GatewayRouteCandidate,
 ) -> HeartbeatCaps {
-    let fallback =
-        heartbeat_caps_from_model(&model.mayhem.caps, &model.mayhem.adapter.modality_set);
+    let fallback = heartbeat_caps_from_model(
+        &model.mayhem.caps,
+        &model.mayhem.adapter.modality_set,
+        &model.mayhem.adapter.specialities,
+    );
     HeartbeatCaps {
         tools: candidate
             .caps
@@ -8438,6 +8974,7 @@ fn heartbeat_caps_for_route(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
+        served_specialities: candidate.served_specialities.clone(),
     }
 }
 
@@ -10497,6 +11034,15 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
     );
     set_optional_json(
         &mut body,
+        "reasoning_effort",
+        request.reasoning_effort.as_ref().map(|value| json!(value)),
+    );
+    for (name, value) in &request.speciality_values {
+        body[name] = value.clone();
+    }
+    body["specialities"] = json!(&request.effective_specialities);
+    set_optional_json(
+        &mut body,
         "user",
         request.user.as_ref().map(|value| json!(value)),
     );
@@ -10525,6 +11071,7 @@ fn direct_session_contract_request(transport_body: &Value) -> Value {
         object.remove("endpoint_family");
         object.remove("mayhem_contract");
         object.remove("contract_request");
+        object.remove("specialities");
     }
     request
 }
@@ -11467,6 +12014,7 @@ async fn collect_direct_session_output(
     let mut tool_call = None;
     let mut finish_reason = None;
     let mut claimed_usage = None;
+    let mut claimed_usage_attribution = None;
     let mut final_provider_receipt = None;
     let mut latest_checkpoint_receipt = None;
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
@@ -11597,6 +12145,7 @@ async fn collect_direct_session_output(
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
+                    claimed_usage_attribution = usage_attribution_from_session_delta(&frame)?;
                     provider_quality =
                         provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
@@ -11718,7 +12267,38 @@ async fn collect_direct_session_output(
         }
     }
 
-    let usage = observed_chat_usage(request, &content, &token_ids);
+    let mut usage = observed_chat_usage(request, &content, &token_ids);
+    let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {session_id} ended without a final receipt"
+        ))
+    })?;
+    validate_usage_attribution(
+        &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    if claimed_usage_attribution
+        .as_ref()
+        .is_some_and(|claimed| claimed != &final_receipt.body.usage_attribution)
+    {
+        return Err(GatewaySessionError::new(
+            "provider final delta usage attribution did not match its signed receipt",
+        ));
+    }
+    let vision_tokens = final_receipt
+        .body
+        .usage_attribution
+        .get("vision_input_tokens")
+        .copied()
+        .unwrap_or(0);
+    let input_modalities = chat_input_modalities(&request.messages);
+    if vision_tokens > 0 && !input_modalities.image && !input_modalities.video {
+        return Err(GatewaySessionError::new(
+            "provider claimed vision tokens for a request without visual input",
+        ));
+    }
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(vision_tokens);
+    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
             return Err(GatewaySessionError::new(format!(
@@ -13386,6 +13966,7 @@ fn validate_provider_receipt(
         )));
     }
     let body = provider_receipt.body.clone();
+    validate_usage_attribution(&body.usage, &body.usage_attribution)?;
     let checks = [
         (
             body.session_id == invocation.session_id,
@@ -13542,6 +14123,51 @@ fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
     })
+}
+
+fn usage_attribution_from_session_delta(
+    frame: &Value,
+) -> Result<Option<BTreeMap<String, u64>>, GatewaySessionError> {
+    let Some(value) = frame.get("usage_attribution") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|err| {
+            GatewaySessionError::new(format!("invalid provider usage attribution: {err}"))
+        })
+}
+
+fn validate_usage_attribution(
+    usage: &ReceiptUsage,
+    attribution: &BTreeMap<String, u64>,
+) -> Result<(), GatewaySessionError> {
+    for axis in attribution.keys() {
+        if !matches!(
+            axis.as_str(),
+            "reasoning_output_tokens" | "vision_input_tokens"
+        ) {
+            return Err(GatewaySessionError::new(format!(
+                "unsupported provider usage attribution {axis}"
+            )));
+        }
+    }
+    if attribution
+        .get("reasoning_output_tokens")
+        .copied()
+        .unwrap_or(0)
+        > usage.output_tokens()
+    {
+        return Err(GatewaySessionError::new(
+            "provider reasoning attribution exceeds billed output tokens",
+        ));
+    }
+    if attribution.get("vision_input_tokens").copied().unwrap_or(0) > usage.input_tokens() {
+        return Err(GatewaySessionError::new(
+            "provider vision attribution exceeds billed input tokens",
+        ));
+    }
+    Ok(())
 }
 
 fn receipt_usage_from_session_delta(frame: &Value) -> Option<ReceiptUsage> {
@@ -14479,13 +15105,17 @@ fn no_price_band_route_error() -> ApiError {
 }
 
 fn ensure_max_price_allows(
-    quote_au: MoneyAu,
+    market_rate_au: MoneyAu,
     max_price_au: Option<MoneyAu>,
 ) -> Result<(), ApiError> {
-    if max_price_au.is_some_and(|max_price_au| quote_au > max_price_au) {
+    if max_price_au.is_some_and(|max_price_au| market_rate_au > max_price_au) {
         return Err(no_price_band_route_error());
     }
     Ok(())
+}
+
+fn price_rate_gate_basis_au(price: &PriceRefAu) -> MoneyAu {
+    rate_gate_basis_au(&price.rate_map, price.per_req_au, price.min_session_au)
 }
 
 fn validate_sampling_values(
@@ -14559,6 +15189,58 @@ fn apply_model_sampling_defaults(
     Ok(())
 }
 
+fn apply_model_speciality_defaults(
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    let mut effective = BTreeMap::new();
+    for descriptor in &model.mayhem.adapter.specialities {
+        let submitted = if descriptor.name == "reasoning_effort" {
+            request.reasoning_effort.as_deref()
+        } else {
+            request
+                .speciality_values
+                .get(&descriptor.name)
+                .and_then(Value::as_str)
+        };
+        let level_name = submitted.unwrap_or(&descriptor.default_level);
+        let level = descriptor
+            .levels
+            .iter()
+            .find(|level| level.name == level_name)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!(
+                        "model {} does not support speciality {} level {}; available levels: {}",
+                        model.id,
+                        descriptor.name,
+                        level_name,
+                        descriptor
+                            .levels
+                            .iter()
+                            .map(|level| level.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Some("speciality"),
+                )
+            })?;
+        if descriptor.name == "reasoning_effort" {
+            request.reasoning_effort = Some(level.name.clone());
+            if request.max_tokens.is_none() && request.max_completion_tokens.is_none() {
+                request.max_completion_tokens = level.default_max_output_tokens;
+            }
+        } else {
+            request
+                .speciality_values
+                .insert(descriptor.name.clone(), Value::String(level.name.clone()));
+        }
+        effective.insert(descriptor.name.clone(), level.name.clone());
+    }
+    request.effective_specialities = effective;
+    Ok(())
+}
+
 async fn build_chat_completion(
     state: SharedState,
     request: ChatCompletionRequest,
@@ -14567,6 +15249,7 @@ async fn build_chat_completion(
     let model = require_model(&state, &request.model)?;
     let mut request = request;
     apply_model_sampling_defaults(&model, &mut request)?;
+    apply_model_speciality_defaults(&model, &mut request)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
             "messages must contain at least one item",
@@ -15280,6 +15963,7 @@ async fn run_live_direct_chat_sse_inner(
     let mut tool_call = None;
     let mut finish_reason = None;
     let mut claimed_usage = None;
+    let mut claimed_usage_attribution = None;
     let mut final_provider_receipt = None;
     let mut latest_checkpoint_receipt = None;
     let mut latest_checkpoint_ack_frame: Option<Value> = None;
@@ -15509,6 +16193,7 @@ async fn run_live_direct_chat_sse_inner(
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
+                    claimed_usage_attribution = usage_attribution_from_session_delta(&frame)?;
                 }
                 if finish_reason.is_none() {
                     let output_tokens = streamed_output_token_count(&content, &token_ids);
@@ -15639,7 +16324,39 @@ async fn run_live_direct_chat_sse_inner(
         }
     }
 
-    let usage = observed_chat_usage(&session.request, &content, &token_ids);
+    let mut usage = observed_chat_usage(&session.request, &content, &token_ids);
+    let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider session {} ended without a final receipt",
+            session.invocation.session_id
+        ))
+    })?;
+    validate_usage_attribution(
+        &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    if claimed_usage_attribution
+        .as_ref()
+        .is_some_and(|claimed| claimed != &final_receipt.body.usage_attribution)
+    {
+        return Err(GatewaySessionError::new(
+            "provider final delta usage attribution did not match its signed receipt",
+        ));
+    }
+    let vision_tokens = final_receipt
+        .body
+        .usage_attribution
+        .get("vision_input_tokens")
+        .copied()
+        .unwrap_or(0);
+    let input_modalities = chat_input_modalities(&session.request.messages);
+    if vision_tokens > 0 && !input_modalities.image && !input_modalities.video {
+        return Err(GatewaySessionError::new(
+            "provider claimed vision tokens for a request without visual input",
+        ));
+    }
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(vision_tokens);
+    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
             return Err(GatewaySessionError::new(format!(
@@ -15774,7 +16491,7 @@ async fn run_live_direct_chat_sse_inner(
             "created": session.created,
             "model": session.model.id,
             "choices": [],
-            "usage": output.usage,
+            "usage": chat_usage_value(&output.usage, Some(&receipt)),
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
@@ -15865,7 +16582,7 @@ async fn send_live_chat_tail(
             "created": created,
             "model": model_id,
             "choices": [],
-            "usage": output.usage,
+            "usage": chat_usage_value(&output.usage, receipt),
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
@@ -17102,6 +17819,7 @@ fn request_requirements_for_chat(
         requires_json: request.response_format.is_some(),
         requires_vision: chat_modalities.image || chat_modalities.video,
         required_modalities: chat_required_modalities(&request.messages),
+        required_specialities: request.effective_specialities.clone(),
         modality_load,
         min_ctx: effective_context_floor(explicit_min_ctx, input_tokens, output_tokens),
         input_tokens,
@@ -18030,6 +18748,9 @@ fn completion_chat_request(
         stop: request.stop,
         max_tokens: request.max_tokens,
         max_completion_tokens: None,
+        reasoning_effort: request.reasoning_effort,
+        speciality_values: request.speciality_values,
+        effective_specialities: BTreeMap::new(),
         endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS.to_owned()),
         endpoint_request: Some(raw_request),
     })
@@ -18100,6 +18821,22 @@ fn responses_chat_request(
     raw_request: Value,
 ) -> Result<ChatCompletionRequest, ApiError> {
     let messages = responses_input_messages(&request.input)?;
+    let nested_reasoning_effort = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if request.reasoning_effort.is_some()
+        && nested_reasoning_effort.is_some()
+        && request.reasoning_effort != nested_reasoning_effort
+    {
+        return Err(ApiError::bad_request(
+            "reasoning_effort conflicts with reasoning.effort",
+            Some("reasoning_effort"),
+        ));
+    }
+    let reasoning_effort = request.reasoning_effort.or(nested_reasoning_effort);
     let response_format = request
         .text
         .as_ref()
@@ -18127,6 +18864,9 @@ fn responses_chat_request(
         stop: None,
         max_tokens: request.max_output_tokens,
         max_completion_tokens: None,
+        reasoning_effort,
+        speciality_values: request.speciality_values,
+        effective_specialities: BTreeMap::new(),
         endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_RESPONSES.to_owned()),
         endpoint_request: Some(raw_request),
     })
@@ -19611,6 +20351,17 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        if !model.mayhem.adapter.specialities.is_empty() {
+            return self
+                .run_speciality_canary_probe_for_route(
+                    model,
+                    served_invocation,
+                    config,
+                    route.as_ref(),
+                    &prompts,
+                )
+                .await;
+        }
         let expected_prompt_fingerprints = expected_token_prefixes
             .iter()
             .map(|(prompt_id, tokens)| {
@@ -19772,6 +20523,305 @@ impl GatewayState {
             probe_command,
         };
         Ok(event)
+    }
+
+    async fn run_speciality_canary_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+        route: Option<&GatewayRouteCandidate>,
+        prompts: &[&GatewayCanaryPrompt],
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let route = route.ok_or_else(|| {
+            ApiError::bad_gateway(
+                "model specialities require an exact served route for canary verification",
+                Some("model"),
+            )
+        })?;
+        let calibrations = config
+            .speciality_calibrations_by_artifact_root
+            .get(&route.artifact_root)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "served artifact has no signed per-level speciality calibrations",
+                    Some("model"),
+                )
+            })?;
+        let mut reports = Vec::new();
+        let mut receipts = Vec::new();
+        let mut receipt_hashes = Vec::new();
+        let mut expected_fingerprints = BTreeMap::<String, BTreeMap<String, String>>::new();
+        let mut observed_fingerprints = BTreeMap::<String, BTreeMap<String, String>>::new();
+        let mut passed_levels = 0u64;
+        let mut total_levels = 0u64;
+
+        for descriptor in &model.mayhem.adapter.specialities {
+            let served_levels = route
+                .served_specialities
+                .get(&descriptor.name)
+                .filter(|levels| !levels.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        format!(
+                            "served route does not advertise any level for speciality {}",
+                            descriptor.name
+                        ),
+                        Some("model"),
+                    )
+                })?;
+            let expected_levels = calibrations.get(&descriptor.name).ok_or_else(|| {
+                ApiError::bad_gateway(
+                    format!(
+                        "served artifact has no calibration for speciality {}",
+                        descriptor.name
+                    ),
+                    Some("model"),
+                )
+            })?;
+            for level_name in served_levels {
+                let expected = expected_levels.get(level_name).ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        format!(
+                            "served artifact has no calibration for speciality {} level {}",
+                            descriptor.name, level_name
+                        ),
+                        Some("model"),
+                    )
+                })?;
+                if !is_hex_len(&expected.fingerprint, 64) || expected.output_tokens == 0 {
+                    return Err(ApiError::bad_gateway(
+                        format!(
+                            "invalid signed calibration for speciality {} level {}",
+                            descriptor.name, level_name
+                        ),
+                        Some("model"),
+                    ));
+                }
+                if !descriptor
+                    .levels
+                    .iter()
+                    .any(|level| level.name == *level_name)
+                {
+                    return Err(ApiError::bad_gateway(
+                        format!(
+                            "route advertises unknown speciality {} level {}",
+                            descriptor.name, level_name
+                        ),
+                        Some("model"),
+                    ));
+                }
+                let mut prompt_reports = Vec::with_capacity(prompts.len());
+                let mut prompt_fingerprints = BTreeMap::new();
+                let mut observed_output_tokens = 0u64;
+                let mut observed_reasoning_tokens = 0u64;
+
+                for prompt in prompts {
+                    let mut request = canary_chat_request(model, prompt, self.canary_policy.seed)?;
+                    if descriptor.name == "reasoning_effort" {
+                        request.reasoning_effort = Some(level_name.clone());
+                    } else {
+                        request
+                            .speciality_values
+                            .insert(descriptor.name.clone(), json!(level_name));
+                    }
+                    apply_model_speciality_defaults(model, &mut request)?;
+                    let invocation = self.prepare_chat_invocation_for_route(
+                        model,
+                        &request,
+                        Some(route),
+                        &GatewayRequestOptions::default(),
+                    )?;
+                    let result = self
+                        .session_backend
+                        .run_chat(model, &request, &invocation)
+                        .await
+                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    let observed_prompt_fingerprint =
+                        token_fingerprint(result.token_ids.iter().copied()).digest;
+                    prompt_fingerprints
+                        .insert(prompt.id.clone(), observed_prompt_fingerprint.clone());
+                    let receipt = self.meter_chat_session(
+                        model,
+                        &request,
+                        &result.output,
+                        &invocation,
+                        result.provider_receipt.as_ref(),
+                    )?;
+                    observed_output_tokens = observed_output_tokens
+                        .saturating_add(receipt.receipt.body.usage.output_tokens());
+                    observed_reasoning_tokens = observed_reasoning_tokens.saturating_add(
+                        receipt
+                            .receipt
+                            .body
+                            .usage_attribution
+                            .get("reasoning_output_tokens")
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    let receipt_hash = stable_value_hash(&json!(receipt));
+                    receipt_hashes.push(receipt_hash.clone());
+                    prompt_reports.push(json!({
+                        "prompt_id": prompt.id,
+                        "request": request,
+                        "selected_specialities": invocation.spend_voucher.body.required_specialities,
+                        "token_count": result.token_ids.len(),
+                        "token_ids": result.token_ids,
+                        "token_fingerprint": observed_prompt_fingerprint,
+                        "session_id": invocation.session_id,
+                        "receipt_hash": receipt_hash,
+                    }));
+                    receipts.push(receipt);
+                }
+
+                let observed_fingerprint =
+                    aggregate_canary_fingerprints(prompt_fingerprints.iter().map(
+                        |(prompt_id, fingerprint)| (prompt_id.as_str(), fingerprint.as_str()),
+                    ));
+                let fingerprint_match = observed_fingerprint == expected.fingerprint;
+                let output_tokens_match = observed_output_tokens == expected.output_tokens;
+                let reasoning_tokens_match = observed_reasoning_tokens == expected.reasoning_tokens;
+                let pass = fingerprint_match && output_tokens_match && reasoning_tokens_match;
+                total_levels = total_levels.saturating_add(1);
+                if pass {
+                    passed_levels = passed_levels.saturating_add(1);
+                }
+                expected_fingerprints
+                    .entry(descriptor.name.clone())
+                    .or_default()
+                    .insert(level_name.clone(), expected.fingerprint.clone());
+                observed_fingerprints
+                    .entry(descriptor.name.clone())
+                    .or_default()
+                    .insert(level_name.clone(), observed_fingerprint.clone());
+                reports.push(json!({
+                    "speciality": descriptor.name,
+                    "level": level_name,
+                    "expected_fingerprint": expected.fingerprint,
+                    "observed_fingerprint": observed_fingerprint,
+                    "expected_output_tokens": expected.output_tokens,
+                    "observed_output_tokens": observed_output_tokens,
+                    "expected_reasoning_tokens": expected.reasoning_tokens,
+                    "observed_reasoning_tokens": observed_reasoning_tokens,
+                    "fingerprint_match": fingerprint_match,
+                    "output_tokens_match": output_tokens_match,
+                    "reasoning_tokens_match": reasoning_tokens_match,
+                    "pass": pass,
+                    "prompts": prompt_reports,
+                }));
+            }
+        }
+
+        if total_levels == 0 {
+            return Err(ApiError::bad_gateway(
+                "served route exposes no speciality level to canary",
+                Some("model"),
+            ));
+        }
+        let match_bps = u32::try_from(
+            passed_levels
+                .saturating_mul(10_000)
+                .checked_div(total_levels)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let pass = passed_levels == total_levels;
+        let expected_fingerprint = stable_value_hash(&json!({
+            "domain": "mayhem-speciality-canary-expected-v1",
+            "fingerprints": expected_fingerprints,
+        }));
+        let observed_fingerprint = stable_value_hash(&json!({
+            "domain": "mayhem-speciality-canary-observed-v1",
+            "fingerprints": observed_fingerprints,
+        }));
+        let provider = served_invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let binary_hash = served_invocation
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.contract.binary_hash.clone())
+            .unwrap_or_default();
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-speciality-canary-probe-evidence",
+            "model": model.id,
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "canary_set": config.canary_set,
+            "verification_method": CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+            "artifact_root": route.artifact_root,
+            "expected_fingerprints": expected_fingerprints,
+            "observed_fingerprints": observed_fingerprints,
+            "match_bps": match_bps,
+            "pass": pass,
+            "levels": reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        let evidence_hash = stable_value_hash(&evidence);
+        let session_receipt_hash = stable_value_hash(&json!({
+            "domain": "mayhem-canary-receipt-bundle-v1",
+            "receipt_hashes": receipt_hashes,
+        }));
+        let at = now_secs();
+        let probe_id = stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "epoch": self.canary_policy.epoch,
+            "evidence_hash": evidence_hash,
+        }));
+        let mut probe_command = json!({
+            "op": "probe_result",
+            "probe_id": probe_id,
+            "probe_kind": "canary",
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "epoch": self.canary_policy.epoch,
+            "at": at,
+            "canary_set": config.canary_set,
+            "verification_method": CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+            "match_bps": match_bps,
+            "pass": pass,
+            "session_receipt_hash": session_receipt_hash,
+            "evidence_hash": evidence_hash,
+        });
+        probe_command["auditor_sig"] = json!(probe_result_signature(
+            &self.receipt_config.user_seed,
+            &probe_command,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        ));
+        Ok(StoredProbeEvent {
+            probe_id: probe_command["probe_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            model_id: model.id.clone(),
+            provider,
+            enclave_id: served_invocation.enclave_id.clone(),
+            binary_hash,
+            canary_set: config.canary_set.clone(),
+            verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+            expected_fingerprint,
+            observed_fingerprint,
+            match_bps,
+            pass,
+            reputation_event_kind: if pass {
+                ReputationEventKind::ProbeOk
+            } else {
+                ReputationEventKind::ProbeFail
+            },
+            session_receipt_hash,
+            evidence_hash,
+            evidence: json!({
+                "evidence": evidence,
+                "receipts": receipts,
+            }),
+            probe_command,
+        })
     }
 
     async fn run_seed_perceptual_hash_probe_for_route(
@@ -20420,7 +21470,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_max_spend_au(price, request, &prompt_text);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20444,6 +21494,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: chat_required_modalities(&request.messages),
+            required_specialities: request.effective_specialities.clone(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -20523,7 +21574,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20546,6 +21597,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: vec!["embedding".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -20625,7 +21677,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20648,6 +21700,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: vec!["image".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -20727,7 +21780,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20750,6 +21803,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: vec!["audio".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -20829,7 +21883,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20852,6 +21906,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: vec!["audio".to_owned(), "text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -20934,7 +21989,7 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
-        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -20957,6 +22012,7 @@ impl GatewayState {
             locked_min_session_au: price.min_session_au,
             served_ctx,
             required_modalities: vec![request.output_modality.clone()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -21120,6 +22176,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash: blake3_hex(prompt_text.as_bytes()),
                 ts: now_millis_u64(),
@@ -21216,6 +22273,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
                 ts: now_millis_u64(),
@@ -21312,6 +22370,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash: image_generation_prompt_hash(request),
                 ts: now_millis_u64(),
@@ -21407,6 +22466,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash,
                 ts: now_millis_u64(),
@@ -21564,6 +22624,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash: audio_speech_prompt_hash(request),
                 ts: now_millis_u64(),
@@ -21660,6 +22721,7 @@ impl GatewayState {
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
+                usage_attribution: BTreeMap::new(),
                 au_owed_cum,
                 prompt_hash: audio_transcription_prompt_hash(request),
                 ts: now_millis_u64(),
@@ -21949,6 +23011,9 @@ fn context_needle_chat_request(model_id: &str, spec: &ContextNeedleSpec) -> Chat
         stop: None,
         max_tokens: Some(CONTEXT_NEEDLE_MAX_TOKENS),
         max_completion_tokens: None,
+        reasoning_effort: None,
+        speciality_values: BTreeMap::new(),
+        effective_specialities: BTreeMap::new(),
         endpoint_family: None,
         endpoint_request: None,
     }
@@ -21989,10 +23054,14 @@ fn canary_chat_request(
         stop: None,
         max_tokens: Some(prompt.max_tokens.max(1)),
         max_completion_tokens: None,
+        reasoning_effort: None,
+        speciality_values: BTreeMap::new(),
+        effective_specialities: BTreeMap::new(),
         endpoint_family: None,
         endpoint_request: None,
     };
     apply_model_sampling_defaults(model, &mut request)?;
+    apply_model_speciality_defaults(model, &mut request)?;
     Ok(request)
 }
 
@@ -22487,7 +23556,7 @@ fn chat_response_value(
             "logprobs": null,
             "finish_reason": output.finish_reason,
         }],
-        "usage": output.usage,
+        "usage": chat_usage_value(&output.usage, receipt),
         "mayhem": {
             "backend": mayhem_meta.backend,
             "direct_session": mayhem_meta.direct_session,
@@ -22566,7 +23635,7 @@ fn chat_stream_chunks(
             "created": created,
             "model": model,
             "choices": [],
-            "usage": output.usage,
+            "usage": chat_usage_value(&output.usage, receipt),
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
@@ -22683,10 +23752,40 @@ fn receipt_summary(receipt: &StoredReceipt) -> Value {
         "seq": receipt.receipt.body.seq,
         "final": receipt.receipt.body.final_receipt,
         "au_owed_cum": receipt.receipt.body.au_owed_cum,
+        "usage": receipt.receipt.body.usage,
+        "usage_attribution": receipt.receipt.body.usage_attribution,
         "prompt_hash": receipt.receipt.body.prompt_hash,
         "receipt_ack": receipt.receipt_ack,
         "access_token": receipt.access_token,
     })
+}
+
+fn chat_usage_value(usage: &Usage, receipt: Option<&StoredReceipt>) -> Value {
+    let mut value = serde_json::to_value(usage).unwrap_or_else(|_| {
+        json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        })
+    });
+    let Some(receipt) = receipt else {
+        return value;
+    };
+    let attribution = &receipt.receipt.body.usage_attribution;
+    if let Some(reasoning_tokens) = attribution.get("reasoning_output_tokens") {
+        value["completion_tokens_details"] = json!({
+            "reasoning_tokens": reasoning_tokens,
+        });
+    }
+    if let Some(vision_tokens) = attribution.get("vision_input_tokens") {
+        value["prompt_tokens_details"] = json!({
+            "vision_tokens": vision_tokens,
+        });
+    }
+    if !attribution.is_empty() {
+        value["mayhem_attribution"] = json!(attribution);
+    }
+    value
 }
 
 fn sse_response(chunks: Vec<Value>) -> Response {
@@ -22799,6 +23898,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 output_modalities: caps_output_modalities(caps),
             },
             adapter: shape_adapter_from_catalog_value(model)?,
+            speciality_calibrations: speciality_calibrations_from_catalog_value(model),
             sampling: sampling_profile_from_catalog_value(model),
             failover: failover_policy_from_catalog_value(model),
             source: "catalog".to_owned(),
@@ -22820,6 +23920,16 @@ fn sampling_profile_from_catalog_value(model: &Value) -> SamplingProfile {
         min_p: sampling.get("min_p").and_then(Value::as_f64),
         repeat_penalty: sampling.get("repeat_penalty").and_then(Value::as_f64),
     }
+}
+
+fn speciality_calibrations_from_catalog_value(
+    model: &Value,
+) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, GatewaySpecialityCalibration>>> {
+    model
+        .pointer("/speciality_assessment/calibrated")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 fn failover_policy_from_catalog_value(model: &Value) -> GatewayFailoverPolicyConfig {
@@ -22945,6 +24055,13 @@ fn shape_adapter_from_catalog_value(model: &Value) -> Option<ShapeAdapterInfo> {
         tool_call_strategy: adapter.get("tool_call_strategy")?.as_str()?.to_owned(),
         reasoning_passthrough: adapter.get("reasoning_passthrough")?.as_str()?.to_owned(),
         modality_set,
+        specialities: adapter
+            .get("specialities")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .ok()?
+            .unwrap_or_default(),
     })
 }
 
@@ -24362,7 +25479,7 @@ mod tests {
         assert!(err.message.contains("insufficient local balance"));
 
         let max_bid = GatewayRequestOptions {
-            max_price_au: Some(999),
+            max_price_au: Some(84),
             ..GatewayRequestOptions::default()
         };
         let err = state
@@ -25429,6 +26546,7 @@ mod tests {
             locked_min_session_au: 0,
             served_ctx: 4096,
             required_modalities: vec!["text".to_owned()],
+            required_specialities: BTreeMap::new(),
             ctx_bracket: Some(ctx_bracket_for_tokens(4096).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 1000,
@@ -25513,6 +26631,7 @@ mod tests {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "test".to_owned(),
@@ -25766,6 +26885,7 @@ mod tests {
             selected_bucket: None,
             selected_quant: None,
             selected_unit: None,
+            selected_speciality: None,
             pinned_models: Vec::new(),
             provider_filter: None,
         };
@@ -25884,6 +27004,9 @@ mod tests {
             stop: None,
             max_tokens: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
+            speciality_values: BTreeMap::new(),
+            effective_specialities: BTreeMap::new(),
             endpoint_family: None,
             endpoint_request: None,
         }
@@ -26004,6 +27127,7 @@ mod tests {
             provider: format!("{:02x}", idx.wrapping_add(1)).repeat(32),
             accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
             served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
@@ -28726,6 +29850,7 @@ mod tests {
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
+            usage_attribution: BTreeMap::new(),
             au_owed_cum: calculate_locked_au_owed(invocation, &usage),
             prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
             ts: 123,
@@ -28765,6 +29890,7 @@ mod tests {
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
+            usage_attribution: BTreeMap::new(),
             au_owed_cum: calculate_locked_au_owed(invocation, &usage),
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             ts: 123,
