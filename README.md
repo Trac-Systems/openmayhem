@@ -35,6 +35,8 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 No terminal knowledge needed. Hand this repository to a coding agent — Claude Code, Codex, Cursor, or opencode — and paste one of the prompts below. The agent reads this README, checks your operating system and hardware, runs the real install, and verifies the gateway is answering before it hands back. You watch and approve each step; you never have to know a single command. For most people this is the whole install.
 
+> **Agents:** read **[`SKILL.md`](SKILL.md)** first — it is the authoritative, structured guide for installing and operating OpenMayhem (per-OS install + pitfalls, the ask-first flows for users and providers, funding, and the hard rule to never modify the pinned core). It exists so you don't have to figure the app out yourself.
+
 **Agent prompt — user setup (buy inference):**
 
 ```text
