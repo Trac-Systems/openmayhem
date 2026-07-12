@@ -90,8 +90,12 @@ def required_call_kwargs(callable_obj, kwargs, required, label):
 
 def reasoning_enabled(payload):
     for item in payload.get("speciality_parameters") or []:
-        haystack = f"{item.get('name', '')} {item.get('native_path', '')}".lower()
+        name = str(item.get("name") or "").lower()
+        native_path = str(item.get("native_path") or "").lower()
+        haystack = f"{name} {native_path}"
         if "reason" not in haystack and "think" not in haystack:
+            continue
+        if any(marker in haystack for marker in ("preserve", "history", "retain")):
             continue
         value = item.get("value")
         level = str(item.get("level") or "").lower()
@@ -105,10 +109,13 @@ def reasoning_enabled(payload):
 
 def request_prompt(payload, template_kwargs, prompt_suffixes):
     prompt = str(payload.get("prompt", ""))
-    if template_kwargs:
+    template_tools = payload.get("tools") or []
+    if not isinstance(template_tools, list):
+        raise ValueError("MLX chat-template tools must be an array")
+    if template_kwargs or template_tools:
         messages = payload.get("messages") or []
         if not messages:
-            raise ValueError("MLX chat-template speciality request is missing structured messages")
+            raise ValueError("MLX chat-template request is missing structured messages")
         if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
             raise ValueError("MLX tokenizer does not expose the requested chat-template speciality")
         kwargs = {
@@ -116,6 +123,8 @@ def request_prompt(payload, template_kwargs, prompt_suffixes):
             "add_generation_prompt": True,
             **template_kwargs,
         }
+        if template_tools:
+            kwargs["tools"] = template_tools
         try:
             prompt = str(
                 tokenizer.apply_chat_template(
@@ -123,7 +132,7 @@ def request_prompt(payload, template_kwargs, prompt_suffixes):
                     **required_call_kwargs(
                         tokenizer.apply_chat_template,
                         kwargs,
-                        set(template_kwargs),
+                        set(template_kwargs) | ({"tools"} if template_tools else set()),
                         "chat template",
                     ),
                 )

@@ -26,7 +26,7 @@ struct PythonRuntimeSpec {
     backend: &'static str,
     override_env: &'static str,
     distribution: &'static str,
-    import_name: &'static str,
+    required_imports: &'static [&'static str],
     version: &'static str,
     requirements: &'static [u8],
     requirements_sha256: &'static str,
@@ -191,10 +191,19 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             backend: "vllm",
             override_env: "MAYHEM_VLLM_PYTHON",
             distribution: "vllm",
-            import_name: "vllm",
+            required_imports: &[
+                "vllm",
+                "torch",
+                "transformers",
+                "tokenizers",
+                "safetensors",
+                "compressed_tensors",
+                "triton",
+                "av",
+            ],
             version: "0.24.0",
             requirements: VLLM_REQUIREMENTS,
-            requirements_sha256: "51826622021f8d2fb22495b12bb9d2724b7ed1245c149754af9def3f41fad4b2",
+            requirements_sha256: "34176fbb8bce38f1b9cb1e8be9754ad44aedebb7a7c3152b8050f6d6c99bbb5b",
             extra_index_urls: &[],
             min_free_bytes: 8 * GIB,
         }),
@@ -202,7 +211,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             backend: "trt-llm",
             override_env: "MAYHEM_TRTLLM_PYTHON",
             distribution: "tensorrt_llm",
-            import_name: "tensorrt_llm",
+            required_imports: &["tensorrt_llm", "torch", "torchvision"],
             version: "1.3.0rc20",
             requirements: TRT_LLM_REQUIREMENTS,
             requirements_sha256: "af04f36cac8fa64b2694ab8d7709e837a69f49c7f5f3fe856594a628c8d5a8ff",
@@ -216,7 +225,7 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             backend: "mlx",
             override_env: "MAYHEM_MLX_PYTHON",
             distribution: "mlx-lm",
-            import_name: "mlx_lm",
+            required_imports: &["mlx_lm", "mlx", "transformers", "tokenizers", "safetensors"],
             version: "0.31.3",
             requirements: MLX_REQUIREMENTS,
             requirements_sha256: "d3167fca548be3265d62c6397f6ded6a688017b3d37de1ed4eed5eabf16b9747",
@@ -290,10 +299,11 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
     let text = std::str::from_utf8(spec.requirements)
         .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
     let expected_versions = serde_json::to_string(&exact_requirement_pairs(text)?)?;
+    let required_imports = serde_json::to_string(spec.required_imports)?;
     const VERSION_MARKER: &str = "__MAYHEM_RUNTIME_VERSION__=";
     let script = format!(
-        "import importlib.metadata as m; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); import {}; print({:?} + m.version({:?}))",
-        spec.import_name, VERSION_MARKER, spec.distribution
+        "import importlib, importlib.metadata as m; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); [importlib.import_module(name) for name in {required_imports}]; print({:?} + m.version({:?}))",
+        VERSION_MARKER, spec.distribution
     );
     let mut command = Command::new(python);
     configure_validation_cache(&mut command, cache_root)?;
@@ -409,6 +419,13 @@ mod tests {
                 .expect("all requirements are exact");
             assert!(!pairs.is_empty());
         }
+        let vllm = python_runtime_spec("vllm").expect("vLLM runtime");
+        assert!(vllm.required_imports.contains(&"av"));
+        assert!(
+            exact_requirement_pairs(std::str::from_utf8(vllm.requirements).unwrap())
+                .unwrap()
+                .contains(&("av".to_owned(), "18.0.0".to_owned()))
+        );
     }
 
     #[test]

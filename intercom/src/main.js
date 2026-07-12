@@ -664,6 +664,25 @@ const msbDhtBootstrap = parseCsvList(
     env.MSB_DHT_BOOTSTRAP ||
     ''
 );
+const msbWalletEnabled = parseBool(
+  flagValue('msb-wallet', env.MSB_WALLET || ''),
+  true
+);
+const msbDirectPeers = [...new Set(parseCsvList(
+  (flags['msb-direct-peer'] && String(flags['msb-direct-peer'])) ||
+    env.MSB_DIRECT_PEERS ||
+    ''
+) ?? [])];
+if (msbDirectPeers.length > 16 || msbDirectPeers.some((peer) => !/^[0-9a-fA-F]{64}$/.test(peer))) {
+  throw new Error('Invalid --msb-direct-peer. Expected at most 16 comma-separated 32-byte public keys.');
+}
+const msbDirectPeerRetryMs = parseInteger(
+  flagValue('msb-direct-peer-retry-ms', env.MSB_DIRECT_PEER_RETRY_MS || ''),
+  5_000
+);
+if (msbDirectPeerRetryMs < 1_000 || msbDirectPeerRetryMs > 300_000) {
+  throw new Error('Invalid --msb-direct-peer-retry-ms. Expected 1000-300000.');
+}
 const msbBootstrapOverride =
   (flags['msb-bootstrap'] && String(flags['msb-bootstrap'])) ||
   env.MSB_BOOTSTRAP ||
@@ -715,6 +734,7 @@ const msbConfig = createMsbConfig(msbEnvironment, {
   storeName: msbStoreName,
   storesDirectory: msbStoresDirectory,
   enableInteractiveMode: false,
+  enableWallet: msbWalletEnabled,
   ...(msbBootstrapOverride ? { bootstrap: String(msbBootstrapOverride).trim().toLowerCase() } : {}),
   ...(msbChannelOverride ? { channel: String(msbChannelOverride) } : {}),
   ...(msbDhtBootstrap ? { dhtBootstrap: msbDhtBootstrap } : {}),
@@ -740,12 +760,45 @@ const peerConfig = createPeerConfig(peerEnvironment, {
   ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
 });
 
-await ensureKeypairFile(msbConfig.keyPairPath);
+if (msbWalletEnabled) {
+  await ensureKeypairFile(msbConfig.keyPairPath);
+}
 await ensureKeypairFile(peerConfig.keyPairPath);
 
 console.log('=============== STARTING MSB ===============');
 const msb = new MainSettlementBus(msbConfig);
 await msb.ready();
+
+const localMsbPeer = msb.wallet?.publicKey;
+const localMsbPeerHex = b4a.isBuffer(localMsbPeer)
+  ? b4a.toString(localMsbPeer, 'hex')
+  : String(localMsbPeer ?? '').toLowerCase();
+const effectiveMsbDirectPeers = msbDirectPeers
+  .map((peer) => peer.toLowerCase())
+  .filter((peer) => peer !== localMsbPeerHex);
+let msbDirectPeerConnectInFlight = false;
+const connectMsbDirectPeers = async () => {
+  if (msbDirectPeerConnectInFlight) return;
+  msbDirectPeerConnectInFlight = true;
+  try {
+    for (const peerPublicKey of effectiveMsbDirectPeers) {
+      if (msb.network.validatorConnectionManager.connected(peerPublicKey)) continue;
+      await msb.network.tryConnect(peerPublicKey, 'validator');
+    }
+  } finally {
+    msbDirectPeerConnectInFlight = false;
+  }
+};
+if (effectiveMsbDirectPeers.length > 0) {
+  await connectMsbDirectPeers();
+}
+const msbDirectPeerTimer = effectiveMsbDirectPeers.length > 0
+  ? setInterval(() => {
+      connectMsbDirectPeers().catch((error) => {
+        console.error('MSB direct-peer reconnect failed:', error?.message ?? error);
+      });
+    }, msbDirectPeerRetryMs)
+  : null;
 
 console.log('=============== STARTING MAYHEM PEER ===============');
 const peer = new Peer({
@@ -808,6 +861,9 @@ console.log('MSB store:', msbStorePath);
 console.log('Peer store:', peerStorePath);
 if (Array.isArray(msbConfig?.dhtBootstrap) && msbConfig.dhtBootstrap.length > 0) {
   console.log('MSB DHT bootstrap nodes:', msbConfig.dhtBootstrap.join(', '));
+}
+if (msbDirectPeers.length > 0) {
+  console.log('MSB direct replication peers:', msbDirectPeers.join(', '));
 }
 if (Array.isArray(peerConfig?.dhtBootstrap) && peerConfig.dhtBootstrap.length > 0) {
   console.log('Peer DHT bootstrap nodes:', peerConfig.dhtBootstrap.join(', '));
@@ -987,6 +1043,7 @@ if (headless) {
 
 if (keepAlive) {
   const close = async () => {
+    if (msbDirectPeerTimer) clearInterval(msbDirectPeerTimer);
     try {
       rpcServer?.close?.();
     } catch (_e) {}

@@ -38,8 +38,17 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "parallel_tool_calls",
                 "response_format",
                 "user",
+                "messages.role",
+                "messages.name",
+                "messages.tool_calls",
+                "messages.tool_call_id",
+                "messages.content.type",
+                "messages.content.text",
+                "messages.content.image_url.url",
+                "messages.content.input_audio.data",
+                "messages.content.input_audio.format",
             ],
-            &["model", "messages"],
+            &["model", "messages", "messages.role"],
             &[
                 "id", "object", "created", "model", "choices", "usage", "mayhem",
             ],
@@ -123,7 +132,7 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "tool_choice",
                 "response_format",
             ],
-            &["model", "messages"],
+            &["model", "messages", "messages.role"],
             &[
                 "id", "object", "created", "model", "choices", "usage", "mayhem",
             ],
@@ -511,11 +520,14 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
 fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeSpec> {
     let leaf = path.rsplit('.').next().unwrap_or(path);
     let spec = match path {
-        "model" => string_spec(1, 512, json!("$MODEL")),
+        "model" => marker_string_spec(json!("$MODEL")),
         "messages" => array_spec(
             1,
             4096,
-            json!([{"role":"user","content":"Mayhem calibration"}]),
+            json!([
+                {"role":"user","content":"Mayhem calibration context"},
+                {"role":"user","content":"Mayhem calibration"}
+            ]),
         ),
         "metadata" => object_spec_with_default(json!({})),
         "text" | "reasoning" | "response_format"
@@ -603,15 +615,19 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "parameters.voice" | "parameters.speaker_id" | "scheduler" | "parameters.scheduler" => {
             string_spec(1, 256, json!("$MODEL_VALUE"))
         }
-        "messages.content.type" => enum_spec(
-            None,
-            &[
-                json!("text"),
-                json!("image_url"),
-                json!("input_audio"),
-                json!("video"),
-            ],
-        ),
+        "messages.content.type" => {
+            let values = if family == ENDPOINT_OPENAI_CHAT_COMPLETIONS {
+                vec![json!("text"), json!("image_url"), json!("input_audio")]
+            } else {
+                vec![
+                    json!("text"),
+                    json!("image_url"),
+                    json!("input_audio"),
+                    json!("video"),
+                ]
+            };
+            enum_spec(None, &values)
+        }
         "messages.role" => enum_spec(
             None,
             &[
@@ -629,18 +645,16 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             json!([{"id":"call-calibration","type":"function","function":{"name":"calibration_tool","arguments":"{}"}}]),
         ),
         "messages.content.text" => string_spec(1, 32_000, json!("Mayhem calibration")),
-        "messages.content.image_url.url" => {
-            string_spec(1, 64 * 1024 * 1024, json!("$IMAGE_DATA_URL"))
-        }
-        "messages.content.input_audio.data" => {
-            string_spec(1, 256 * 1024 * 1024, json!("$AUDIO_BASE64"))
-        }
+        "messages.content.image_url.url" => marker_string_spec(json!("$IMAGE_DATA_URL")),
+        "messages.content.input_audio.data" => marker_string_spec(json!("$AUDIO_BASE64")),
         "messages.content.input_audio.format" => enum_spec(
             None,
             &[json!("wav"), json!("mp3"), json!("flac"), json!("ogg")],
         ),
-        "messages.content.video.data" => string_spec(1, 512 * 1024 * 1024, json!("$VIDEO_BASE64")),
-        "messages.content.video.content_type" => string_spec(1, 128, json!("video/mp4")),
+        "messages.content.video.data" => marker_string_spec(json!("$VIDEO_BASE64")),
+        "messages.content.video.content_type" => {
+            enum_spec(None, &[json!("video/mp4"), json!("video/webm")])
+        }
         "messages.content.video.num_frames" | "parameters.num_frames" => {
             integer_spec(1.0, 4096.0, 16)
         }
@@ -851,6 +865,7 @@ fn number_minimum(leaf: &str) -> f64 {
     match leaf {
         "frequency_penalty" | "presence_penalty" => -2.0,
         "repeat_penalty" | "speed" => 0.01,
+        "top_p" => 0.000_001,
         _ => 0.0,
     }
 }
@@ -886,6 +901,12 @@ fn string_spec(min_length: u64, max_length: u64, calibration: Value) -> Endpoint
     let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
     spec.min_length = Some(min_length);
     spec.max_length = Some(max_length);
+    spec.calibration_values.push(calibration);
+    spec
+}
+
+fn marker_string_spec(calibration: Value) -> EndpointAttributeSpec {
+    let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
     spec.calibration_values.push(calibration);
     spec
 }
@@ -1185,7 +1206,7 @@ pub fn generate_endpoint_calibration_cases(
                 &contract_fingerprint,
                 &base_request,
                 &format!("accepted_value_{index}"),
-                vec![literal_mutation(path, value)],
+                calibration_mutations_for_literal(contract, path, value),
                 true,
                 Vec::new(),
             );
@@ -1266,10 +1287,25 @@ pub fn generate_endpoint_calibration_cases(
                     &contract_fingerprint,
                     &base_request,
                     "pairwise_interaction",
-                    vec![
-                        literal_mutation(left_path, left_value),
-                        literal_mutation(right_path, right_value),
-                    ],
+                    {
+                        let mut mutations = vec![
+                            literal_mutation(left_path, left_value.clone()),
+                            literal_mutation(right_path, right_value.clone()),
+                        ];
+                        add_calibration_companion_mutations(
+                            contract,
+                            left_path,
+                            Some(&left_value),
+                            &mut mutations,
+                        );
+                        add_calibration_companion_mutations(
+                            contract,
+                            right_path,
+                            Some(&right_value),
+                            &mut mutations,
+                        );
+                        mutations
+                    },
                     true,
                     Vec::new(),
                 );
@@ -1343,6 +1379,85 @@ fn literal_mutation(path: &str, value: Value) -> EndpointCalibrationMutation {
     }
 }
 
+fn calibration_mutations_for_literal(
+    contract: &EndpointFamilyContract,
+    path: &str,
+    value: Value,
+) -> Vec<EndpointCalibrationMutation> {
+    let mut mutations = vec![literal_mutation(path, value.clone())];
+    add_calibration_companion_mutations(contract, path, Some(&value), &mut mutations);
+    mutations
+}
+
+fn add_calibration_companion_mutations(
+    contract: &EndpointFamilyContract,
+    path: &str,
+    value: Option<&Value>,
+    mutations: &mut Vec<EndpointCalibrationMutation>,
+) {
+    let mut add = |companion_path: &str, companion_value: Value| {
+        if contract
+            .request_attributes
+            .iter()
+            .any(|declared| declared == companion_path)
+            && !mutations
+                .iter()
+                .any(|mutation| mutation.path == companion_path)
+        {
+            mutations.push(literal_mutation(companion_path, companion_value));
+        }
+    };
+
+    if path.starts_with("messages.content.") {
+        add("messages.role", json!("user"));
+    }
+
+    match path {
+        "messages.role" if value.and_then(Value::as_str) == Some("tool") => {
+            add("messages.tool_call_id", json!("call-calibration"));
+        }
+        "messages.tool_calls" => add("messages.role", json!("assistant")),
+        "messages.tool_call_id" => add("messages.role", json!("tool")),
+        "messages.content.type" => match value.and_then(Value::as_str) {
+            Some("text") => add("messages.content.text", json!("Mayhem calibration")),
+            Some("image_url") => {
+                add("messages.content.image_url.url", json!("$IMAGE_DATA_URL"));
+            }
+            Some("input_audio") => {
+                add("messages.content.input_audio.data", json!("$AUDIO_BASE64"));
+                add("messages.content.input_audio.format", json!("wav"));
+            }
+            Some("video") => {
+                add("messages.content.video.data", json!("$VIDEO_BASE64"));
+                add("messages.content.video.content_type", json!("video/mp4"));
+                add("messages.content.video.num_frames", json!(16));
+                add("messages.content.video.fps", json!(8.0));
+            }
+            _ => {}
+        },
+        "messages.content.text" => add("messages.content.type", json!("text")),
+        "messages.content.image_url.url" => {
+            add("messages.content.type", json!("image_url"));
+        }
+        "messages.content.input_audio.data" | "messages.content.input_audio.format" => {
+            add("messages.content.type", json!("input_audio"));
+            add("messages.content.input_audio.data", json!("$AUDIO_BASE64"));
+            add("messages.content.input_audio.format", json!("wav"));
+        }
+        "messages.content.video.data"
+        | "messages.content.video.content_type"
+        | "messages.content.video.num_frames"
+        | "messages.content.video.fps" => {
+            add("messages.content.type", json!("video"));
+            add("messages.content.video.data", json!("$VIDEO_BASE64"));
+            add("messages.content.video.content_type", json!("video/mp4"));
+            add("messages.content.video.num_frames", json!(16));
+            add("messages.content.video.fps", json!(8.0));
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_calibration_case(
     cases: &mut Vec<EndpointCalibrationCase>,
@@ -1403,22 +1518,24 @@ fn add_boundary_calibration_cases(
             contract_fingerprint,
             base_request,
             kind,
-            vec![literal_mutation(path, value)],
+            calibration_mutations_for_literal(contract, path, value),
             accept,
             Vec::new(),
         );
     }
     for (kind, length, accept) in length_boundary_values(spec.min_length, spec.max_length) {
+        let mut mutations = vec![EndpointCalibrationMutation {
+            path: path.to_owned(),
+            value: EndpointCalibrationValue::StringLength { length },
+        }];
+        add_calibration_companion_mutations(contract, path, None, &mut mutations);
         push_calibration_case(
             cases,
             contract,
             contract_fingerprint,
             base_request,
             kind,
-            vec![EndpointCalibrationMutation {
-                path: path.to_owned(),
-                value: EndpointCalibrationValue::StringLength { length },
-            }],
+            mutations,
             accept,
             Vec::new(),
         );
@@ -2073,5 +2190,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chat_matrix_requires_roles_and_materializes_media_companions() {
+        let contract = endpoint_family_contract_template(ENDPOINT_HF_MULTIMODAL_CHAT)
+            .expect("HF multimodal chat contract");
+        assert!(contract
+            .required_request_attributes
+            .contains(&"messages.role".to_owned()));
+        let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
+        let substitutions = BTreeMap::from([
+            ("$MODEL".to_owned(), json!("test/model")),
+            (
+                "$IMAGE_DATA_URL".to_owned(),
+                json!("data:image/png;base64,aGVsbG8="),
+            ),
+            ("$AUDIO_BASE64".to_owned(), json!("aGVsbG8=")),
+            ("$VIDEO_BASE64".to_owned(), json!("aGVsbG8=")),
+        ]);
+
+        let missing_role = cases
+            .iter()
+            .find(|case| {
+                case.case_kind == "required_missing"
+                    && case.attributes == vec!["messages.role".to_owned()]
+            })
+            .expect("missing-role rejection row");
+        let request = materialize_endpoint_calibration_request(missing_role, &substitutions)
+            .expect("missing-role request");
+        assert!(validate_endpoint_request(&contract, &request).is_err());
+
+        let video = cases
+            .iter()
+            .find(|case| {
+                case.case_kind.starts_with("accepted_value_")
+                    && case.mutations.iter().any(|mutation| {
+                        mutation.path == "messages.content.type"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal {
+                                    value: json!("video"),
+                                })
+                    })
+            })
+            .expect("video type row");
+        let request =
+            materialize_endpoint_calibration_request(video, &substitutions).expect("video request");
+        assert_eq!(
+            request["messages"][0]["content"][0]["video"]["content_type"],
+            "video/mp4"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["video"]["num_frames"],
+            16
+        );
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert!(validate_endpoint_request(&contract, &request).is_ok());
     }
 }

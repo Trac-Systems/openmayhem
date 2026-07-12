@@ -76,7 +76,7 @@ use mayhem_gateway::{
     RateMapEntry, ReputationEvent, ReputationEventKind,
     DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
     DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
-    OUTPUT_TOKEN_UNIT,
+    MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
@@ -108,6 +108,11 @@ const MAINNET_MSB_NETWORK_ID: u64 = 918;
 const MAINNET_MSB_BOOTSTRAP: &str =
     "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685";
 const MAINNET_MSB_CHANNEL: &str = "0000trac0network0msb0mainnet0000";
+const MAINNET_MSB_DIRECT_PEERS: [&str; 3] = [
+    "2a8ccdeb077a84cf555ff0c1a068f40fa025e0229f9085b19bebbc8f5a65b00c",
+    "08019b10edc930eb5feab8b921ed3402de801a1f15937455c1a6fb46b5fca2e9",
+    "29de5dbddce25b036aa07350c5d11be48d6b238f7ab169bc97cde815c75685b5",
+];
 const MAINNET_TAP_CHAIN_ID: u64 = 1;
 const MAINNET_TAP_TOKEN_ADDRESS: &str = "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454";
 const MAINNET_TAP_POOL_ADDRESS: &str = "0x9B254d37C28Fb5893F46513a61925eDC2F300615";
@@ -162,6 +167,7 @@ struct MainnetManifestMsb {
     network_id: u64,
     bootstrap: String,
     channel: String,
+    direct_peers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2964,6 +2970,10 @@ struct CatalogArtifactPublishPlanArgs {
 
 #[derive(Debug, Parser)]
 struct CatalogCalibrateCanaryArgs {
+    /// Mayhem home used for the same managed backend runtime as provider serving.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
     /// Path to catalog/models.json. Defaults to the repo catalog.
     #[arg(long, value_name = "PATH")]
     catalog_path: Option<PathBuf>,
@@ -3016,6 +3026,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     include_output: bool,
 
+    /// Reuse fully validated core evidence from this report and rerun the endpoint matrix.
+    #[arg(long, value_name = "PATH")]
+    resume_core_report: Option<PathBuf>,
+
     /// Write the calibration report JSON to this path.
     #[arg(long, value_name = "PATH")]
     report_output: Option<PathBuf>,
@@ -3048,6 +3062,14 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     trt_max_num_tokens: Option<u32>,
 
+    /// Provider-local vLLM memory target used by calibration, as a percentage.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization: Option<u32>,
+
+    /// Lowest vLLM memory percentage attempted after an OOM during calibration.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization_floor: Option<u32>,
+
     /// Print a machine-readable calibration report.
     #[arg(long)]
     json: bool,
@@ -3074,6 +3096,10 @@ struct CatalogCanaryMatrixArgs {
 
 #[derive(Debug, Parser)]
 struct CatalogCanaryPlanArgs {
+    /// Mayhem home used by printed calibration commands for managed backend runtimes.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
     /// Path to catalog/models.json. Defaults to the repo catalog.
     #[arg(long, value_name = "PATH")]
     catalog_path: Option<PathBuf>,
@@ -3157,6 +3183,14 @@ struct CatalogCanaryPlanArgs {
     /// TensorRT-LLM runtime max token capacity for calibration commands.
     #[arg(long)]
     trt_max_num_tokens: Option<u32>,
+
+    /// Provider-local vLLM memory target for printed calibration commands.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization: Option<u32>,
+
+    /// Lowest vLLM memory percentage attempted by printed calibration commands.
+    #[arg(long, value_name = "PCT")]
+    vllm_memory_utilization_floor: Option<u32>,
 
     /// Include dev-tier models in addition to launch-tier models.
     #[arg(long)]
@@ -11445,6 +11479,11 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .as_ref()
         .map(|path| absolutize(path.clone()))
         .transpose()?;
+    let resume_core_report_path = args
+        .resume_core_report
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
     let catalog_doc = catalog::load_document(&catalog_path)?;
     let model = catalog_doc
         .models
@@ -11484,69 +11523,122 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     )?;
     let canary_set_sha256 =
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
+    catalog_endpoint_calibration_preflight(model, &prompts)?;
     let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
+    let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
+    let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
+    let resume_core_report = resume_core_report_path
+        .as_ref()
+        .map(|path| {
+            ensure!(
+                args.prompt_id.is_none(),
+                "--resume-core-report cannot be combined with --prompt-id"
+            );
+            let report: CatalogCanaryCalibrationReport = serde_json::from_value(
+                read_json_file(path)
+                    .with_context(|| format!("loading resume core report {}", path.display()))?,
+            )
+            .with_context(|| format!("parsing resume core report {}", path.display()))?;
+            validate_resumed_canary_core(
+                &report,
+                model,
+                &args.artifact,
+                artifact,
+                &artifact_path,
+                &prompts,
+                &canary_set_sha256,
+                &runtime_config,
+                &calibration_memory,
+                existing.as_ref(),
+            )?;
+            Ok::<_, anyhow::Error>(report)
+        })
+        .transpose()?;
     let mut backend = catalog_calibration_backend(
         artifact,
         &artifact_path,
         vision_projector_path.as_deref(),
         &args,
     )?;
-    let mut reports = Vec::with_capacity(prompts.len());
-    for prompt in &prompts {
-        let process_ids = backend.process_ids();
-        let (mut report, baseline, peak) =
-            measure_calibration_memory(&calibration_memory, &process_ids, || {
-                calibrate_canary_prompt(
-                    backend.as_mut(),
-                    model,
-                    prompt,
-                    args.seed,
-                    args.include_output,
-                )
-            })?;
-        report.calibration_baseline_memory_bytes = baseline;
-        report.calibration_peak_memory_bytes = peak;
-        reports.push(report);
-    }
-    let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
-    let modality_fingerprints =
-        aggregate_calibrated_modality_fingerprints(model, &prompts, &reports)?;
-    let modality_resource_profiles =
-        aggregate_calibrated_modality_resource_profiles(model, &reports, &calibration_memory)?;
-    let speciality_calibrations = calibrate_model_specialities(
-        backend.as_mut(),
-        model,
-        &prompts,
-        args.seed,
-        args.include_output,
-        &calibration_memory,
-    )?;
-    let endpoint_calibration =
-        catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
-    let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
-    let matches_existing = existing
-        .as_ref()
-        .map(|existing| existing == &catalog_fingerprint);
-    let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
-    let report = CatalogCanaryCalibrationReport {
-        model_id: model.model_id.clone(),
-        artifact: args.artifact.clone(),
-        engine: artifact.engine.clone(),
-        verification_method: model.canary.verification_method.clone(),
-        artifact_path,
-        artifact_binding: catalog_canary_artifact_binding(artifact),
-        runtime_config,
-        canary_set: model.canary.set_id.clone(),
-        canary_set_sha256,
-        prompt_count: reports.len(),
-        catalog_fingerprint,
-        modality_fingerprints,
-        modality_resource_profiles,
-        speciality_calibrations,
-        endpoint_calibration,
-        existing_catalog_fingerprint: existing,
-        matches_existing_catalog: matches_existing,
-        prompts: reports,
+    let report = if let Some(mut report) = resume_core_report {
+        report.endpoint_calibration =
+            catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
+        report.artifact_path = artifact_path.clone();
+        report.existing_catalog_fingerprint = existing.clone();
+        report.matches_existing_catalog = existing
+            .as_ref()
+            .map(|expected| expected == &report.catalog_fingerprint);
+        report
+    } else {
+        if model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+            warm_token_canary_probes(backend.as_mut(), model, &prompts, args.seed, None)?;
+        }
+        let mut reports = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            let process_ids = backend.process_ids();
+            let (mut report, baseline, peak) =
+                measure_calibration_memory(&calibration_memory, &process_ids, || {
+                    calibrate_canary_prompt(
+                        backend.as_mut(),
+                        model,
+                        prompt,
+                        args.seed,
+                        args.include_output,
+                    )
+                })?;
+            report.calibration_baseline_memory_bytes = baseline;
+            report.calibration_peak_memory_bytes = peak;
+            reports.push(report);
+        }
+        if model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+            stabilize_token_canary_reports(
+                backend.as_mut(),
+                model,
+                &prompts,
+                args.seed,
+                &mut reports,
+                None,
+            )?;
+            ensure_launch_stable_token_count(model, "base canary", &reports)?;
+        }
+        let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
+        let modality_fingerprints =
+            aggregate_calibrated_modality_fingerprints(model, &prompts, &reports)?;
+        let modality_resource_profiles =
+            aggregate_calibrated_modality_resource_profiles(model, &reports, &calibration_memory)?;
+        let speciality_calibrations = calibrate_model_specialities(
+            backend.as_mut(),
+            model,
+            &prompts,
+            args.seed,
+            args.include_output,
+            &calibration_memory,
+        )?;
+        let endpoint_calibration =
+            catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
+        let matches_existing = existing
+            .as_ref()
+            .map(|expected| expected == &catalog_fingerprint);
+        CatalogCanaryCalibrationReport {
+            model_id: model.model_id.clone(),
+            artifact: args.artifact.clone(),
+            engine: artifact.engine.clone(),
+            verification_method: model.canary.verification_method.clone(),
+            artifact_path,
+            artifact_binding: catalog_canary_artifact_binding(artifact),
+            runtime_config,
+            canary_set: model.canary.set_id.clone(),
+            canary_set_sha256,
+            prompt_count: reports.len(),
+            catalog_fingerprint,
+            modality_fingerprints,
+            modality_resource_profiles,
+            speciality_calibrations,
+            endpoint_calibration,
+            existing_catalog_fingerprint: existing,
+            matches_existing_catalog: matches_existing,
+            prompts: reports,
+        }
     };
 
     if args.json {
@@ -11616,6 +11708,204 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_resumed_canary_core(
+    report: &CatalogCanaryCalibrationReport,
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+    prompts: &[CanaryPrompt],
+    canary_set_sha256: &str,
+    runtime_config: &CatalogCanaryRuntimeConfig,
+    calibration_memory: &CalibrationMemoryContext,
+    existing_catalog_fingerprint: Option<&String>,
+) -> Result<()> {
+    ensure!(
+        report.model_id == model.model_id,
+        "resume core report model {} does not match {}",
+        report.model_id,
+        model.model_id
+    );
+    ensure!(
+        report.artifact == artifact_name,
+        "resume core report artifact {} does not match {artifact_name}",
+        report.artifact
+    );
+    ensure!(
+        report.engine == artifact.engine,
+        "resume core report engine {} does not match {}",
+        report.engine,
+        artifact.engine
+    );
+    ensure!(
+        report.verification_method == model.canary.verification_method,
+        "resume core report verification method {} does not match {}",
+        report.verification_method,
+        model.canary.verification_method
+    );
+    ensure!(
+        report.artifact_path == artifact_path,
+        "resume core report artifact path {} does not match {}",
+        report.artifact_path.display(),
+        artifact_path.display()
+    );
+    ensure!(
+        report.artifact_binding == catalog_canary_artifact_binding(artifact),
+        "resume core report artifact binding does not match the current catalog artifact"
+    );
+    ensure!(
+        &report.runtime_config == runtime_config,
+        "resume core report runtime configuration does not match this calibration invocation"
+    );
+    ensure!(
+        report.canary_set == model.canary.set_id,
+        "resume core report canary set {} does not match {}",
+        report.canary_set,
+        model.canary.set_id
+    );
+    ensure!(
+        report.canary_set_sha256 == canary_set_sha256,
+        "resume core report canary SHA {} does not match {}",
+        report.canary_set_sha256,
+        canary_set_sha256
+    );
+    ensure!(
+        report.prompt_count == prompts.len() && report.prompts.len() == prompts.len(),
+        "resume core report prompt coverage is {} / {}, expected {}",
+        report.prompt_count,
+        report.prompts.len(),
+        prompts.len()
+    );
+    for (prompt, calibrated) in prompts.iter().zip(&report.prompts) {
+        ensure!(
+            calibrated.prompt_id == prompt.id,
+            "resume core report prompt order differs at {} / {}",
+            calibrated.prompt_id,
+            prompt.id
+        );
+        if let Some(max_tokens) = prompt.max_tokens {
+            ensure!(
+                calibrated.max_tokens == max_tokens.max(1),
+                "resume core report prompt {} max_tokens {} does not match canary {}",
+                prompt.id,
+                calibrated.max_tokens,
+                max_tokens.max(1)
+            );
+        }
+    }
+    ensure!(
+        report.catalog_fingerprint == aggregate_canary_fingerprint(&report.prompts),
+        "resume core report aggregate fingerprint does not bind its prompt reports"
+    );
+    let mut core_errors = Vec::new();
+    for prompt in &report.prompts {
+        if !calibration_prompt_fingerprint_valid(&report.verification_method, &prompt.fingerprint) {
+            core_errors.push(format!(
+                "prompt {} fingerprint has invalid shape for {}",
+                prompt.prompt_id, report.verification_method
+            ));
+        }
+        validate_calibration_prompt_method_value(
+            &report.verification_method,
+            prompt,
+            &mut core_errors,
+        );
+    }
+    ensure!(
+        core_errors.is_empty(),
+        "resume core report prompt evidence is invalid: {}",
+        core_errors.join("; ")
+    );
+    if report.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+        ensure_launch_stable_token_count(model, "resumed base canary", &report.prompts)?;
+    }
+    let modality_fingerprints =
+        aggregate_calibrated_modality_fingerprints(model, prompts, &report.prompts)?;
+    ensure!(
+        report.modality_fingerprints == modality_fingerprints,
+        "resume core report modality fingerprints do not bind its prompt reports"
+    );
+    let modality_resource_profiles = if let Some(recorded) =
+        report.modality_resource_profiles.values().next()
+    {
+        ensure!(
+            report.modality_resource_profiles.values().all(|profile| {
+                profile.measurement_source == recorded.measurement_source
+                    && profile.calibration_f13_budget_bytes == recorded.calibration_f13_budget_bytes
+            }),
+            "resume core report modality profiles disagree on their calibration memory context"
+        );
+        ensure!(
+            calibration_memory.source.split(';').next().map(str::trim)
+                == recorded.measurement_source.split(';').next().map(str::trim),
+            "resume core report memory probe does not match the current host probe"
+        );
+        let required_peak = report
+            .modality_resource_profiles
+            .values()
+            .map(|profile| profile.calibration_peak_memory_bytes)
+            .max()
+            .unwrap_or_default();
+        ensure!(
+            calibration_memory.f13_budget_bytes >= required_peak,
+            "current F13 budget {} is below the resumed calibration peak {}",
+            calibration_memory.f13_budget_bytes,
+            required_peak
+        );
+        let recorded_memory = CalibrationMemoryContext {
+            f13_budget_bytes: recorded.calibration_f13_budget_bytes,
+            source: recorded.measurement_source.clone(),
+            probe: calibration_memory.probe.clone(),
+        };
+        aggregate_calibrated_modality_resource_profiles(model, &report.prompts, &recorded_memory)?
+    } else {
+        aggregate_calibrated_modality_resource_profiles(model, &report.prompts, calibration_memory)?
+    };
+    ensure!(
+        report.modality_resource_profiles == modality_resource_profiles,
+        "resume core report modality resource profiles do not bind its prompt measurements"
+    );
+    let speciality_prompt_ids = speciality_canary_prompts(model, prompts)
+        .into_iter()
+        .map(|prompt| prompt.id.clone())
+        .collect::<Vec<_>>();
+    let mut speciality_errors = Vec::new();
+    validate_speciality_calibration_report(
+        model,
+        &speciality_prompt_ids,
+        &report.speciality_calibrations,
+        &mut speciality_errors,
+    );
+    for (name, levels) in &report.speciality_calibrations {
+        let fingerprints = levels
+            .values()
+            .map(|calibration| calibration.fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        if fingerprints.len() != levels.len() {
+            speciality_errors.push(format!(
+                "speciality {name} levels are not behaviorally distinguishable"
+            ));
+        }
+    }
+    ensure!(
+        speciality_errors.is_empty(),
+        "resume core report speciality evidence is invalid: {}",
+        speciality_errors.join("; ")
+    );
+    ensure!(
+        report.existing_catalog_fingerprint.as_ref() == existing_catalog_fingerprint,
+        "resume core report was produced against a different catalog fingerprint"
+    );
+    let expected_match =
+        existing_catalog_fingerprint.map(|expected| expected == &report.catalog_fingerprint);
+    ensure!(
+        report.matches_existing_catalog == expected_match,
+        "resume core report catalog-match state is inconsistent"
+    );
+    Ok(())
+}
+
 fn calibrate_model_specialities(
     backend: &mut dyn EngineBackend,
     model: &catalog::CatalogModel,
@@ -11633,13 +11923,30 @@ fn calibrate_model_specialities(
         model.model_id,
         model.canary.verification_method
     );
+    let speciality_prompts = speciality_canary_prompts(model, prompts)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        !speciality_prompts.is_empty(),
+        "model {} has no canary prompts for speciality calibration",
+        model.model_id
+    );
 
     let mut calibrated = BTreeMap::new();
+    let mut short_levels = Vec::new();
     for descriptor in &model.adapter.specialities {
         let mut levels = BTreeMap::new();
         for level in &descriptor.levels {
-            let mut level_reports = Vec::with_capacity(prompts.len());
-            for prompt in prompts {
+            warm_token_canary_probes(
+                backend,
+                model,
+                &speciality_prompts,
+                seed,
+                Some((&descriptor.name, &level.name)),
+            )?;
+            let mut level_reports = Vec::with_capacity(speciality_prompts.len());
+            for prompt in &speciality_prompts {
                 let process_ids = backend.process_ids();
                 let (mut report, baseline, peak) =
                     measure_calibration_memory(memory, &process_ids, || {
@@ -11656,22 +11963,31 @@ fn calibrate_model_specialities(
                 report.calibration_peak_memory_bytes = peak;
                 level_reports.push(report);
             }
-            let output_tokens = level_reports
-                .iter()
-                .map(|report| u64::from(report.completion_tokens))
-                .sum();
-            let reasoning_tokens = level_reports
-                .iter()
-                .map(|report| u64::from(report.reasoning_tokens))
-                .sum();
+            let usage_range = stabilize_token_canary_reports(
+                backend,
+                model,
+                &speciality_prompts,
+                seed,
+                &mut level_reports,
+                Some((&descriptor.name, &level.name)),
+            )?;
+            if model.tier == "launch" {
+                let (stable_tokens, per_prompt) = stable_token_count(&level_reports);
+                if stable_tokens < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS {
+                    short_levels.push(format!(
+                        "{}/{} retained {stable_tokens} stable tokens ({per_prompt})",
+                        descriptor.name, level.name
+                    ));
+                }
+            }
             ensure!(
-                output_tokens > 0,
+                usage_range.output_tokens_min > 0,
                 "speciality {}/{} produced no output tokens",
                 descriptor.name,
                 level.name
             );
             ensure!(
-                reasoning_tokens <= output_tokens,
+                usage_range.reasoning_tokens_max <= usage_range.output_tokens_max,
                 "speciality {}/{} reported more reasoning tokens than output tokens",
                 descriptor.name,
                 level.name
@@ -11680,15 +11996,215 @@ fn calibrate_model_specialities(
                 level.name.clone(),
                 CanarySpecialityCalibrationReport {
                     fingerprint: aggregate_canary_fingerprint(&level_reports),
-                    output_tokens,
-                    reasoning_tokens,
+                    token_prefixes: calibration_token_prefixes(&level_reports),
+                    output_tokens_min: usage_range.output_tokens_min,
+                    output_tokens_max: usage_range.output_tokens_max,
+                    reasoning_tokens_min: usage_range.reasoning_tokens_min,
+                    reasoning_tokens_max: usage_range.reasoning_tokens_max,
                     prompts: level_reports,
                 },
             );
         }
+        let distinct_fingerprints = levels
+            .values()
+            .map(|calibration| calibration.fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            distinct_fingerprints.len() == levels.len(),
+            "speciality {} levels are not behaviorally distinguishable by the calibrated canary prompts",
+            descriptor.name
+        );
         calibrated.insert(descriptor.name.clone(), levels);
     }
+    ensure!(
+        short_levels.is_empty(),
+        "speciality launch evidence requires at least {MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS} stable token positions per level across {CANARY_RECORDED_RUNS} runs: {}",
+        short_levels.join("; ")
+    );
     Ok(calibrated)
+}
+
+fn speciality_canary_prompts<'a>(
+    model: &catalog::CatalogModel,
+    prompts: &'a [CanaryPrompt],
+) -> Vec<&'a CanaryPrompt> {
+    let text_prompts = prompts
+        .iter()
+        .filter(|prompt| {
+            provider_canary_prompt_modalities(model, prompt)
+                .iter()
+                .all(|modality| modality == "text")
+        })
+        .collect::<Vec<_>>();
+    let sampled = text_prompts
+        .iter()
+        .copied()
+        .filter(|prompt| {
+            prompt
+                .temperature
+                .or(model.sampling.temperature)
+                .is_some_and(|temperature| temperature > 0.0)
+        })
+        .collect::<Vec<_>>();
+    if sampled.is_empty() {
+        text_prompts
+    } else {
+        sampled
+    }
+}
+
+fn warm_token_canary_probes(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+    seed: u32,
+    speciality: Option<(&str, &str)>,
+) -> Result<()> {
+    for prompt in prompts {
+        calibrate_token_canary_prompt_with_speciality(
+            backend, model, prompt, seed, false, speciality,
+        )?;
+    }
+    Ok(())
+}
+
+const CANARY_RECORDED_RUNS: u32 = 3;
+
+#[derive(Clone, Copy, Debug)]
+struct CanaryUsageRange {
+    output_tokens_min: u64,
+    output_tokens_max: u64,
+    reasoning_tokens_min: u64,
+    reasoning_tokens_max: u64,
+}
+
+fn stabilize_token_canary_reports(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+    seed: u32,
+    expected: &mut [CanaryCalibrationPromptReport],
+    speciality: Option<(&str, &str)>,
+) -> Result<CanaryUsageRange> {
+    ensure!(
+        prompts.len() == expected.len(),
+        "canary reproducibility prompt/report cardinality mismatch"
+    );
+    let label = speciality
+        .map(|(name, level)| format!("speciality {name}/{level}"))
+        .unwrap_or_else(|| "base canary".to_owned());
+    let (output_tokens, reasoning_tokens) = calibration_usage_totals(expected);
+    let mut range = CanaryUsageRange {
+        output_tokens_min: output_tokens,
+        output_tokens_max: output_tokens,
+        reasoning_tokens_min: reasoning_tokens,
+        reasoning_tokens_max: reasoning_tokens,
+    };
+    for _ in 1..CANARY_RECORDED_RUNS {
+        let mut replay = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            replay.push(calibrate_token_canary_prompt_with_speciality(
+                backend, model, prompt, seed, false, speciality,
+            )?);
+        }
+        let (output_tokens, reasoning_tokens) = calibration_usage_totals(&replay);
+        range.output_tokens_min = range.output_tokens_min.min(output_tokens);
+        range.output_tokens_max = range.output_tokens_max.max(output_tokens);
+        range.reasoning_tokens_min = range.reasoning_tokens_min.min(reasoning_tokens);
+        range.reasoning_tokens_max = range.reasoning_tokens_max.max(reasoning_tokens);
+        for (expected, observed) in expected.iter_mut().zip(&replay) {
+            merge_token_canary_prefix(&label, expected, observed)?;
+        }
+    }
+    for report in expected {
+        report.reproducibility_runs = CANARY_RECORDED_RUNS;
+        report.fingerprint = canary_token_fingerprint(report.token_prefix.iter().copied());
+    }
+    Ok(range)
+}
+
+fn stable_token_count(reports: &[CanaryCalibrationPromptReport]) -> (usize, String) {
+    let stable_tokens = reports.iter().map(|report| report.token_prefix.len()).sum();
+    let per_prompt = reports
+        .iter()
+        .map(|report| format!("{}={}", report.prompt_id, report.token_prefix.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (stable_tokens, per_prompt)
+}
+
+fn ensure_launch_stable_token_count(
+    model: &catalog::CatalogModel,
+    label: &str,
+    reports: &[CanaryCalibrationPromptReport],
+) -> Result<()> {
+    if model.tier != "launch" {
+        return Ok(());
+    }
+    let (stable_tokens, per_prompt) = stable_token_count(reports);
+    ensure!(
+        stable_tokens >= MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
+        "{label} retained only {stable_tokens} stable token positions across {CANARY_RECORDED_RUNS} runs ({per_prompt}); launch evidence requires at least {MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS}"
+    );
+    Ok(())
+}
+
+fn merge_token_canary_prefix(
+    label: &str,
+    expected: &mut CanaryCalibrationPromptReport,
+    observed: &CanaryCalibrationPromptReport,
+) -> Result<()> {
+    ensure!(
+        expected.prompt_id == observed.prompt_id,
+        "{label} reproducibility compared prompt {} with {}",
+        expected.prompt_id,
+        observed.prompt_id
+    );
+    let expected_head = expected
+        .token_prefix
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>();
+    let observed_head = observed
+        .token_ids
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>();
+    let stable_len = expected
+        .token_prefix
+        .iter()
+        .zip(&observed.token_ids)
+        .take_while(|(expected, observed)| expected == observed)
+        .count();
+    expected.token_prefix.truncate(stable_len);
+    ensure!(
+        !expected.token_prefix.is_empty(),
+        "{label} prompt {} has no stable first token across recorded runs; expected token head {:?}, observed token head {:?}",
+        expected.prompt_id,
+        expected_head,
+        observed_head
+    );
+    Ok(())
+}
+
+fn calibration_usage_totals(reports: &[CanaryCalibrationPromptReport]) -> (u64, u64) {
+    reports.iter().fold((0_u64, 0_u64), |totals, report| {
+        (
+            totals.0.saturating_add(u64::from(report.completion_tokens)),
+            totals.1.saturating_add(u64::from(report.reasoning_tokens)),
+        )
+    })
+}
+
+fn calibration_token_prefixes(
+    reports: &[CanaryCalibrationPromptReport],
+) -> BTreeMap<String, Vec<i32>> {
+    reports
+        .iter()
+        .map(|report| (report.prompt_id.clone(), report.token_prefix.clone()))
+        .collect()
 }
 
 #[derive(Default)]
@@ -11709,6 +12225,115 @@ fn catalog_endpoint_calibration_report(
             catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)
         },
     )
+}
+
+fn catalog_endpoint_calibration_preflight(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> Result<()> {
+    let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    let mut failures = Vec::new();
+    for contract in &model.adapter.endpoint_families {
+        let cases = mayhem_proto::generate_endpoint_calibration_cases(contract)
+            .map_err(anyhow::Error::msg)?;
+        for case in cases {
+            let request =
+                mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
+                    .map_err(anyhow::Error::msg)?;
+            let contract_result = mayhem_proto::validate_endpoint_request(contract, &request);
+            let gateway_result =
+                mayhem_gateway::openai::normalize_endpoint_request_for_provider(contract, &request);
+            if !case.expect_accept {
+                if contract_result.is_ok() || gateway_result.is_ok() {
+                    failures.push(format!(
+                        "{} expected rejection but contract={} gateway={}",
+                        case.case_id,
+                        contract_result.is_err(),
+                        gateway_result.is_err()
+                    ));
+                }
+                continue;
+            }
+            if let Err(violations) = contract_result {
+                failures.push(format!(
+                    "{} contract rejected: {}",
+                    case.case_id,
+                    violations
+                        .iter()
+                        .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+                continue;
+            }
+            let normalized = match gateway_result {
+                Ok(normalized) => normalized.normalized_request,
+                Err(error) => {
+                    failures.push(format!("{} gateway rejected: {error}", case.case_id));
+                    continue;
+                }
+            };
+            let transport =
+                match catalog_endpoint_calibration_transport(contract, &normalized, &fixtures) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        failures.push(format!("{} transport failed: {error:#}", case.case_id));
+                        continue;
+                    }
+                };
+            let (_, handled) = match catalog_endpoint_calibration_translation(
+                model,
+                contract,
+                &normalized,
+                &transport,
+            ) {
+                Ok(translation) => translation,
+                Err(error) => {
+                    failures.push(format!("{} translation failed: {error:#}", case.case_id));
+                    continue;
+                }
+            };
+            let present = contract
+                .request_attributes
+                .iter()
+                .filter(|path| calibration_value_has_path(&normalized, path))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let missing = present.difference(&handled).cloned().collect::<Vec<_>>();
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "{} translation dropped {}",
+                    case.case_id,
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            let sealed = match catalog_endpoint_calibration_seal(contract, &normalized, transport) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    failures.push(format!("{} sealing failed: {error:#}", case.case_id));
+                    continue;
+                }
+            };
+            if let Err(error) =
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+            {
+                failures.push(format!("{} provider rejected: {error:#}", case.case_id));
+            }
+        }
+    }
+    ensure!(
+        failures.is_empty(),
+        "endpoint calibration preflight failed before model load ({} row(s)): {}",
+        failures.len(),
+        failures
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    Ok(())
 }
 
 fn catalog_endpoint_calibration_fixtures(
@@ -11934,18 +12559,40 @@ fn catalog_endpoint_calibration_translation(
         .iter()
         .filter(|path| {
             calibration_value_has_path(request, path)
-                && calibration_endpoint_attribute_is_handled(&contract.family, path, request)
+                && calibration_endpoint_attribute_is_handled(contract, path, request)
         })
         .cloned()
         .collect();
     Ok((translation, handled))
 }
 
-fn calibration_endpoint_attribute_is_handled(family: &str, path: &str, request: &Value) -> bool {
-    match family {
+fn calibration_endpoint_attribute_is_handled(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    path: &str,
+    request: &Value,
+) -> bool {
+    if contract
+        .speciality_mappings
+        .values()
+        .any(|mapping| mapping.request_path == path)
+    {
+        return true;
+    }
+    match contract.family.as_str() {
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS => match path {
             "model"
             | "messages"
+            | "messages.role"
+            | "messages.name"
+            | "messages.tool_calls"
+            | "messages.tool_call_id"
+            | "messages.content.type"
+            | "messages.content.text"
+            | "messages.content.image_url.url"
+            | "messages.content.input_audio.data"
+            | "messages.content.input_audio.format"
+            | "metadata"
+            | "user"
             | "max_tokens"
             | "max_completion_tokens"
             | "temperature"
@@ -11981,11 +12628,13 @@ fn calibration_endpoint_attribute_is_handled(family: &str, path: &str, request: 
                 | "presence_penalty"
                 | "seed"
                 | "stop"
+                | "user"
                 | "stream"
         ),
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES => match path {
             "model" | "input" | "stream" | "max_output_tokens" | "temperature" | "top_p"
-            | "top_k" | "min_p" | "tools" | "tool_choice" | "text" => true,
+            | "top_k" | "min_p" | "tools" | "tool_choice" | "text" | "reasoning" | "metadata"
+            | "user" => true,
             "parallel_tool_calls" => request
                 .get(path)
                 .and_then(Value::as_bool)
@@ -12441,7 +13090,33 @@ fn validate_calibration_args_for_artifact(
     artifact: &catalog::CatalogArtifact,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<()> {
+    let vllm_target = args
+        .vllm_memory_utilization
+        .map(validate_provider_vllm_memory_utilization_pct)
+        .transpose()?;
+    let vllm_floor = args
+        .vllm_memory_utilization_floor
+        .map(validate_provider_vllm_memory_utilization_pct)
+        .transpose()?;
+    let has_trt_options = args.trt_engine_dir.is_some()
+        || args.trt_require_engine_dir
+        || args.trt_tensor_parallel.is_some()
+        || args.trt_kv_cache_dtype.is_some()
+        || args.trt_max_batch_size.is_some()
+        || args.trt_max_num_tokens.is_some();
+    if let Some(floor) = vllm_floor {
+        let target = vllm_target
+            .context("--vllm-memory-utilization-floor requires --vllm-memory-utilization")?;
+        ensure!(
+            floor <= target,
+            "vLLM calibration memory floor {floor}% exceeds target {target}%"
+        );
+    }
     if artifact.engine == "trt-llm" {
+        ensure!(
+            vllm_target.is_none() && vllm_floor.is_none(),
+            "vLLM memory calibration options require a vllm artifact"
+        );
         return Ok(());
     }
     if artifact.engine == "vllm" {
@@ -12455,15 +13130,15 @@ fn validate_calibration_args_for_artifact(
         }
         return Ok(());
     }
-    if args.trt_engine_dir.is_some()
-        || args.trt_require_engine_dir
-        || args.trt_tensor_parallel.is_some()
-        || args.trt_kv_cache_dtype.is_some()
-        || args.trt_max_batch_size.is_some()
-        || args.trt_max_num_tokens.is_some()
-    {
+    if has_trt_options {
         bail!(
             "TensorRT calibration options require a trt-llm artifact, got {}",
+            artifact.engine
+        );
+    }
+    if vllm_target.is_some() || vllm_floor.is_some() {
+        bail!(
+            "vLLM memory calibration options require a vllm artifact, got {}",
             artifact.engine
         );
     }
@@ -12798,6 +13473,12 @@ fn catalog_canary_runtime_config(
             .flatten(),
         trt_max_num_tokens: (artifact.engine == "trt-llm")
             .then_some(trt_max_num_tokens)
+            .flatten(),
+        vllm_memory_utilization_pct: (artifact.engine == "vllm")
+            .then_some(args.vllm_memory_utilization)
+            .flatten(),
+        vllm_memory_utilization_floor_pct: (artifact.engine == "vllm")
+            .then_some(args.vllm_memory_utilization_floor)
             .flatten(),
     })
 }
@@ -13448,7 +14129,7 @@ fn catalog_canary_evidence_report(
         let report_token_prefixes = calibration
             .prompts
             .iter()
-            .map(|prompt| (prompt.prompt_id.clone(), prompt.token_ids.clone()))
+            .map(|prompt| (prompt.prompt_id.clone(), prompt.token_prefix.clone()))
             .collect::<BTreeMap<_, _>>();
         let report_perceptual_hashes = calibration
             .prompts
@@ -13594,7 +14275,7 @@ fn catalog_canary_evidence_report(
             .map(|error| format!("endpoint calibration: {error}")),
         );
         let speciality_prompt_ids = canary_set_matrix_check(&canaries_dir, calibration_model)
-            .map(|info| info.prompt_ids)
+            .map(|info| info.speciality_prompt_ids)
             .unwrap_or_default();
         validate_speciality_calibration_report(
             calibration_model,
@@ -13844,8 +14525,11 @@ fn compact_speciality_calibration_report(
                         level.clone(),
                         catalog::CatalogSpecialityCalibration {
                             fingerprint: calibration.fingerprint.clone(),
-                            output_tokens: calibration.output_tokens,
-                            reasoning_tokens: calibration.reasoning_tokens,
+                            token_prefixes: calibration.token_prefixes.clone(),
+                            output_tokens_min: calibration.output_tokens_min,
+                            output_tokens_max: calibration.output_tokens_max,
+                            reasoning_tokens_min: calibration.reasoning_tokens_min,
+                            reasoning_tokens_max: calibration.reasoning_tokens_max,
                         },
                     )
                 })
@@ -13893,10 +14577,21 @@ fn validate_speciality_calibration_evidence(
             match levels.get(&level.name) {
                 Some(calibration)
                     if is_hex_len(&calibration.fingerprint, 64)
-                        && calibration.output_tokens > 0
-                        && calibration.reasoning_tokens <= calibration.output_tokens => {}
+                        && !calibration.token_prefixes.is_empty()
+                        && calibration.token_prefixes.values().all(|tokens| !tokens.is_empty())
+                        && calibration.output_tokens_min > 0
+                        && calibration.output_tokens_max >= calibration.output_tokens_min
+                        && calibration.reasoning_tokens_max >= calibration.reasoning_tokens_min
+                        && calibration.reasoning_tokens_max <= calibration.output_tokens_max
+                        && (model.tier != "launch"
+                            || calibration
+                                .token_prefixes
+                                .values()
+                                .map(Vec::len)
+                                .sum::<usize>()
+                                >= MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS) => {}
                 Some(_) => errors.push(format!(
-                    "speciality calibration for {artifact}/{}/{} requires a 32-byte fingerprint, positive output tokens, and reasoning <= output",
+                    "speciality calibration for {artifact}/{}/{} requires stable token prefixes and valid output/reasoning ranges",
                     descriptor.name, level.name
                 )),
                 None => errors.push(format!(
@@ -13976,6 +14671,12 @@ fn validate_speciality_calibration_report(
                     descriptor.name, level.name
                 ));
             }
+            if calibration.token_prefixes != calibration_token_prefixes(&calibration.prompts) {
+                errors.push(format!(
+                    "speciality calibration {}/{} token prefixes do not match its prompt reports",
+                    descriptor.name, level.name
+                ));
+            }
             let output_tokens = calibration
                 .prompts
                 .iter()
@@ -13986,11 +14687,13 @@ fn validate_speciality_calibration_report(
                 .iter()
                 .map(|prompt| u64::from(prompt.reasoning_tokens))
                 .sum::<u64>();
-            if calibration.output_tokens != output_tokens
-                || calibration.reasoning_tokens != reasoning_tokens
+            if !(calibration.output_tokens_min..=calibration.output_tokens_max)
+                .contains(&output_tokens)
+                || !(calibration.reasoning_tokens_min..=calibration.reasoning_tokens_max)
+                    .contains(&reasoning_tokens)
             {
                 errors.push(format!(
-                    "speciality calibration {}/{} token totals do not match its prompt reports",
+                    "speciality calibration {}/{} token totals fall outside its measured ranges",
                     descriptor.name, level.name
                 ));
             }
@@ -14176,6 +14879,25 @@ fn validate_calibration_prompt_method_value(
                 errors.push(format!(
                     "prompt {} token_ids must not be empty",
                     prompt.prompt_id
+                ));
+            }
+            if prompt.token_prefix.is_empty() || !prompt.token_ids.starts_with(&prompt.token_prefix)
+            {
+                errors.push(format!(
+                    "prompt {} token_prefix must be a non-empty prefix of token_ids",
+                    prompt.prompt_id
+                ));
+            }
+            if prompt.fingerprint != canary_token_fingerprint(prompt.token_prefix.iter().copied()) {
+                errors.push(format!(
+                    "prompt {} fingerprint does not bind its stable token_prefix",
+                    prompt.prompt_id
+                ));
+            }
+            if prompt.reproducibility_runs < CANARY_RECORDED_RUNS {
+                errors.push(format!(
+                    "prompt {} has only {} reproducibility runs; at least {} are required",
+                    prompt.prompt_id, prompt.reproducibility_runs, CANARY_RECORDED_RUNS
                 ));
             }
         }
@@ -14634,6 +15356,9 @@ fn catalog_canary_calibration_plan_command(
         "catalog".to_owned(),
         "calibrate-canary".to_owned(),
     ];
+    if let Some(home) = &args.home {
+        push_plan_path_arg(&mut argv, "--home", home);
+    }
     push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
     push_plan_path_arg(&mut argv, "--canaries-dir", canaries_dir);
     push_plan_value_arg(&mut argv, "--model", &model.model_id);
@@ -14679,6 +15404,18 @@ fn catalog_canary_calibration_plan_command(
                 &mut argv,
                 "--trt-max-num-tokens",
                 max_num_tokens.max(args.ctx_size.max(1)).max(1).to_string(),
+            );
+        }
+    }
+    if artifact.engine == "vllm" {
+        if let Some(target) = args.vllm_memory_utilization {
+            push_plan_value_arg(&mut argv, "--vllm-memory-utilization", target.to_string());
+        }
+        if let Some(floor) = args.vllm_memory_utilization_floor {
+            push_plan_value_arg(
+                &mut argv,
+                "--vllm-memory-utilization-floor",
+                floor.to_string(),
             );
         }
     }
@@ -14809,10 +15546,22 @@ fn catalog_canary_matrix_report(
             continue;
         }
         let canary_check = canary_set_matrix_check(&canaries_dir, model);
+        let endpoint_preflight_error = load_canary_prompts_checked(
+            Some(&canaries_dir),
+            &model.canary.set_id,
+            None,
+            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+        )
+        .and_then(|prompts| catalog_endpoint_calibration_preflight(model, &prompts))
+        .err()
+        .map(|error| format!("endpoint calibration preflight: {error:#}"));
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
                 entry_errors.push(err.clone());
+            }
+            if let Some(error) = &endpoint_preflight_error {
+                entry_errors.push(error.clone());
             }
             let prompt_ids = canary_check
                 .as_ref()
@@ -15078,6 +15827,7 @@ fn catalog_canary_matrix_report(
 struct CanarySetMatrixInfo {
     prompt_count: usize,
     prompt_ids: Vec<String>,
+    speciality_prompt_ids: Vec<String>,
 }
 
 fn canary_set_matrix_check(
@@ -15111,6 +15861,29 @@ fn canary_set_matrix_check(
         if require_messages && prompt.messages.is_empty() {
             return Err(format!("canary prompt {} has no messages", prompt.id));
         }
+        for (name, level) in &prompt.specialities {
+            let descriptor = model
+                .adapter
+                .specialities
+                .iter()
+                .find(|descriptor| descriptor.name == *name)
+                .ok_or_else(|| {
+                    format!(
+                        "canary prompt {} in {set_id} selects unknown speciality {name}",
+                        prompt.id
+                    )
+                })?;
+            if !descriptor
+                .levels
+                .iter()
+                .any(|candidate| candidate.name == *level)
+            {
+                return Err(format!(
+                    "canary prompt {} in {set_id} selects unknown level {level} for speciality {name}",
+                    prompt.id
+                ));
+            }
+        }
         if prompt
             .temperature
             .is_some_and(|temperature| temperature > 0.0)
@@ -15143,9 +15916,14 @@ fn canary_set_matrix_check(
     if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
         validate_canary_sampling_range(model, &doc.prompts)?;
     }
+    let speciality_prompt_ids = speciality_canary_prompts(model, &doc.prompts)
+        .into_iter()
+        .map(|prompt| prompt.id.clone())
+        .collect();
     Ok(CanarySetMatrixInfo {
         prompt_count: prompt_ids.len(),
         prompt_ids,
+        speciality_prompt_ids,
     })
 }
 
@@ -15256,6 +16034,22 @@ fn catalog_calibration_backend(
     vision_projector_path: Option<&Path>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
+    let managed_runtime = if matches!(artifact.engine.as_str(), "mlx" | "trt-llm" | "vllm") {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        let runtime =
+            python_runtime::ensure_backend_python(&home, &artifact.engine).with_context(|| {
+                format!(
+                    "preparing the managed {} calibration runtime under {}",
+                    artifact.engine,
+                    home.display()
+                )
+            })?;
+        Some((runtime, home.join("cache").join(&artifact.engine)))
+    } else {
+        None
+    };
     let mut config = match artifact.engine.as_str() {
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
@@ -15266,6 +16060,11 @@ fn catalog_calibration_backend(
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
     };
+    if let Some((_, cache_dir)) = &managed_runtime {
+        fs::create_dir_all(cache_dir)
+            .with_context(|| format!("creating calibration cache {}", cache_dir.display()))?;
+        config.backend_cache_dir = Some(cache_dir.clone());
+    }
     config.ctx_size = args.ctx_size.max(1);
     config.threads = args.threads;
     config.gpu_layers = args.gpu_layers;
@@ -15278,6 +16077,10 @@ fn catalog_calibration_backend(
         } else {
             max_num_tokens.max(config.ctx_size).max(1)
         };
+    }
+    if artifact.engine == "vllm" {
+        config.vllm_gpu_memory_utilization_pct = args.vllm_memory_utilization;
+        config.vllm_gpu_memory_utilization_floor_pct = args.vllm_memory_utilization_floor;
     }
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
@@ -15301,8 +16104,13 @@ fn catalog_calibration_backend(
             Ok(Box::new(backend))
         }
         "mlx" => {
-            let mut backend =
-                mayhem_engine::MlxBackend::new().context("initializing MLX backend")?;
+            let python = &managed_runtime
+                .as_ref()
+                .context("MLX calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::MlxBackend::with_python(python)
+                .context("initializing MLX backend")?;
             backend
                 .load(config)
                 .context("loading MLX canary calibration artifact")?;
@@ -15323,8 +16131,13 @@ fn catalog_calibration_backend(
                 .or_else(|| trt_kv_cache_dtype_for_artifact("calibration", artifact));
             config.trt_require_engine_dir =
                 args.trt_require_engine_dir || args.trt_engine_dir.is_some();
-            let mut backend =
-                mayhem_engine::TrtLlmBackend::new().context("initializing TensorRT-LLM backend")?;
+            let python = &managed_runtime
+                .as_ref()
+                .context("TensorRT-LLM calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::TrtLlmBackend::with_python(python)
+                .context("initializing TensorRT-LLM backend")?;
             backend
                 .load(config)
                 .context("loading TensorRT-LLM canary calibration artifact")?;
@@ -15332,8 +16145,13 @@ fn catalog_calibration_backend(
         }
         "vllm" => {
             config.vllm_tensor_parallel = Some(args.trt_tensor_parallel.unwrap_or(1));
-            let mut backend =
-                mayhem_engine::VllmBackend::new().context("initializing vLLM backend")?;
+            let python = &managed_runtime
+                .as_ref()
+                .context("vLLM calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::VllmBackend::with_python(python)
+                .context("initializing vLLM backend")?;
             backend
                 .load(config)
                 .context("loading vLLM canary calibration artifact")?;
@@ -15417,9 +16235,16 @@ fn calibrate_token_canary_prompt_with_speciality(
 ) -> Result<CanaryCalibrationPromptReport> {
     let mut body = canary_probe_request(&model.model_id, prompt);
     if let Some((name, level)) = speciality {
+        let mut selected = model
+            .adapter
+            .specialities
+            .iter()
+            .map(|descriptor| (descriptor.name.clone(), descriptor.default_level.clone()))
+            .collect::<BTreeMap<_, _>>();
+        selected.insert(name.to_owned(), level.to_owned());
         body.as_object_mut()
             .context("chat canary request must be an object")?
-            .insert(name.to_owned(), json!(level));
+            .insert("specialities".to_owned(), json!(selected));
     }
     let mut request = provider_engine_request_from_endpoint_body_with_sampling(
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
@@ -15440,6 +16265,7 @@ fn calibrate_token_canary_prompt_with_speciality(
         bail!("canary prompt {} produced no tokens", prompt.id);
     }
     let fingerprint = canary_token_fingerprint(token_ids.iter().copied());
+    let token_prefix = token_ids.clone();
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens,
@@ -15448,6 +16274,8 @@ fn calibrate_token_canary_prompt_with_speciality(
         reasoning_tokens: output.usage.reasoning_tokens,
         token_count: token_ids.len(),
         token_ids,
+        token_prefix,
+        reproducibility_runs: 1,
         fingerprint,
         perceptual_hash: None,
         embedding_vector: None,
@@ -15521,6 +16349,8 @@ fn calibrate_image_perceptual_hash_prompt(
         reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
         fingerprint: perceptual_hash.clone(),
         perceptual_hash: Some(perceptual_hash),
         embedding_vector: None,
@@ -15571,6 +16401,8 @@ fn calibrate_embedding_cosine_prompt(
         reasoning_tokens: output.usage.reasoning_tokens,
         token_count: 0,
         token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
         fingerprint,
         perceptual_hash: None,
         embedding_vector: Some(vector),
@@ -15619,6 +16451,8 @@ fn calibrate_transcript_match_prompt(
         reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
         fingerprint,
         perceptual_hash: None,
         embedding_vector: None,
@@ -15677,6 +16511,8 @@ fn calibrate_audio_fingerprint_prompt(
         reasoning_tokens: 0,
         token_count: 0,
         token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
         fingerprint: fingerprint.clone(),
         perceptual_hash: None,
         embedding_vector: None,
@@ -23371,6 +24207,8 @@ async fn up_add_selected_provider_workers(
         let child = provider_serve_child_config(
             &plan.home,
             &candidate.enclave.enclave_id,
+            &candidate.artifact.engine,
+            runtime,
             plan.provider_gpu_layers,
             Some(candidate.served_ctx),
             &candidate.served_modalities,
@@ -23956,6 +24794,22 @@ fn validate_mainnet_manifest(manifest: &MainnetManifest) -> Result<()> {
         "mainnet manifest does not pin the official Trac MSB"
     );
     ensure!(
+        manifest
+            .network
+            .msb
+            .direct_peers
+            .iter()
+            .map(String::as_str)
+            .eq(MAINNET_MSB_DIRECT_PEERS)
+            && manifest
+                .network
+                .msb
+                .direct_peers
+                .iter()
+                .all(|peer| is_hex_len(peer, 64)),
+        "mainnet manifest must pin the canonical Mayhem MSB replication seed"
+    );
+    ensure!(
         !manifest.network.subnet.channel.trim().is_empty()
             && is_hex_len(&manifest.network.subnet.bootstrap, 64)
             && !manifest
@@ -24097,6 +24951,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         stores_directory,
         "--msb-store-name".to_owned(),
         plan.msb_store_name.clone(),
+        "--msb-wallet".to_owned(),
+        "0".to_owned(),
     ];
     if let Some(channel) = plan
         .subnet_channel
@@ -24132,6 +24988,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             manifest.network.dht.peer_bootstrap.join(","),
             "--msb-dht-bootstrap".to_owned(),
             manifest.network.dht.msb_bootstrap.join(","),
+            "--msb-direct-peer".to_owned(),
+            manifest.network.msb.direct_peers.join(","),
         ]);
     }
     peer_args.extend([
@@ -27812,6 +28670,8 @@ struct CanaryPrompt {
     #[serde(default)]
     tools: Option<Vec<Value>>,
     #[serde(default)]
+    specialities: BTreeMap<String, String>,
+    #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
     top_p: Option<f64>,
@@ -27887,7 +28747,7 @@ struct CatalogCanarySidecarBinding {
     weights_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct CatalogCanaryRuntimeConfig {
     ctx_size: u32,
     seed: u32,
@@ -27899,6 +28759,8 @@ struct CatalogCanaryRuntimeConfig {
     trt_kv_cache_dtype: Option<String>,
     trt_max_batch_size: Option<u32>,
     trt_max_num_tokens: Option<u32>,
+    vllm_memory_utilization_pct: Option<u32>,
+    vllm_memory_utilization_floor_pct: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27910,6 +28772,8 @@ struct CanaryCalibrationPromptReport {
     reasoning_tokens: u32,
     token_count: usize,
     token_ids: Vec<i32>,
+    token_prefix: Vec<i32>,
+    reproducibility_runs: u32,
     fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     perceptual_hash: Option<String>,
@@ -27929,8 +28793,11 @@ struct CanaryCalibrationPromptReport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CanarySpecialityCalibrationReport {
     fingerprint: String,
-    output_tokens: u64,
-    reasoning_tokens: u64,
+    token_prefixes: BTreeMap<String, Vec<i32>>,
+    output_tokens_min: u64,
+    output_tokens_max: u64,
+    reasoning_tokens_min: u64,
+    reasoning_tokens_max: u64,
     prompts: Vec<CanaryCalibrationPromptReport>,
 }
 
@@ -28396,6 +29263,9 @@ fn canary_probe_request(model_id: &str, prompt: &CanaryPrompt) -> Value {
     });
     if let Some(tools) = &prompt.tools {
         request["tools"] = json!(tools);
+    }
+    if !prompt.specialities.is_empty() {
+        request["specialities"] = json!(&prompt.specialities);
     }
     if let Some(temperature) = prompt.temperature {
         request["temperature"] = json!(temperature);
@@ -35649,6 +36519,9 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         .candidates
         .first()
         .context("explicit provider add did not select a candidate")?;
+    if let Some(path) = provider_serve_active_drain_flag(&home, &selected.enclave.enclave_id)? {
+        bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?;
+    }
     let runtime = provider_backend_runtime_preflight(&home, selected, &computed.hardware)
         .with_context(|| {
             format!(
@@ -35659,6 +36532,8 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
     let child = provider_serve_child_config(
         &home,
         &selected.enclave.enclave_id,
+        &selected.artifact.engine,
+        &runtime,
         computed.gpu_layers,
         Some(selected.served_ctx),
         &selected.served_modalities,
@@ -35677,7 +36552,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         "model_id": selected.enclave.model_id,
         "served_ctx": selected.served_ctx,
         "runtime": runtime,
-        "child": child,
+        "child": provider_serve_public_child_report(&child),
         "response": response,
     });
     if args.json {
@@ -35748,6 +36623,8 @@ fn mayhemd_control_url(home: &Path) -> Result<String> {
 fn provider_serve_child_config(
     home: &Path,
     enclave: &str,
+    backend: &str,
+    runtime: &ProviderBackendRuntime,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
     served_modalities: &[String],
@@ -35815,15 +36692,68 @@ fn provider_serve_child_config(
         ]);
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
+    let runtime_env = provider_backend_runtime_child_env(backend, runtime);
     Ok(json!({
         "name": name.unwrap_or_else(|| format!("provider-live-{}", up_provider_worker_slug(enclave))),
         "command": mayhem_path.display().to_string(),
         "args": args,
+        "env": runtime_env,
         "restart": true,
         "restart_backoff_ms": 1000,
         "restart_stable_after_ms": MAYHEMD_RESTART_STABLE_AFTER_MILLIS,
         "crash_loop_threshold": MAYHEMD_CRASH_LOOP_THRESHOLD,
     }))
+}
+
+fn provider_backend_runtime_child_env(
+    backend: &str,
+    runtime: &ProviderBackendRuntime,
+) -> BTreeMap<String, String> {
+    let mut child_env = BTreeMap::new();
+    let mut insert_path = |name: &str, path: Option<&Path>| {
+        if let Some(path) = path {
+            child_env.insert(name.to_owned(), path.display().to_string());
+        }
+    };
+    match backend {
+        "vllm" => {
+            insert_path("MAYHEM_VLLM_PYTHON", runtime.python.as_deref());
+            insert_path("MAYHEM_VLLM_CACHE_DIR", runtime.cache_dir.as_deref());
+            insert_path("MAYHEM_VLLM_CUDA_HOME", runtime.cuda_home.as_deref());
+        }
+        "trt-llm" => {
+            insert_path("MAYHEM_TRTLLM_PYTHON", runtime.python.as_deref());
+            insert_path("MAYHEM_TRTLLM_CACHE_DIR", runtime.cache_dir.as_deref());
+            insert_path("MAYHEM_TRTLLM_CUDA_HOME", runtime.cuda_home.as_deref());
+        }
+        "mlx" => insert_path("MAYHEM_MLX_PYTHON", runtime.python.as_deref()),
+        "stable-diffusion.cpp" => {
+            insert_path(
+                "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
+                runtime.external_binary.as_deref(),
+            );
+            if let Some(accelerator) = runtime.stable_diffusion_backend.as_ref() {
+                child_env.insert(
+                    "MAYHEM_STABLE_DIFFUSION_CPP_BACKEND".to_owned(),
+                    accelerator.clone(),
+                );
+            }
+        }
+        "whisper.cpp" => insert_path("MAYHEM_WHISPER_CPP_BIN", runtime.external_binary.as_deref()),
+        "piper" => insert_path("MAYHEM_PIPER_BIN", runtime.external_binary.as_deref()),
+        _ => {}
+    }
+    child_env
+}
+
+fn provider_serve_public_child_report(child: &Value) -> Value {
+    json!({
+        "name": child.get("name"),
+        "restart": child.get("restart"),
+        "restart_backoff_ms": child.get("restart_backoff_ms"),
+        "restart_stable_after_ms": child.get("restart_stable_after_ms"),
+        "crash_loop_threshold": child.get("crash_loop_threshold"),
+    })
 }
 
 fn provider_serve_child_name_for_target(status: &Value, target: &str) -> Result<String> {
@@ -36270,6 +37200,13 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "no open admin-created canonical rooms found for {}; ask the admin to open one",
             selected.enclave.model_id
         );
+    }
+    if args.serve_sessions {
+        let drain_paths =
+            provider_drain_flag_paths(&home, &wallet.public_key, &selected.enclave.enclave_id);
+        if let Some(path) = provider_drain_requested(&drain_paths)? {
+            bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?;
+        }
     }
     args.load_progress = Some(ProviderLoadProgressContext::new(
         &home,
@@ -37709,6 +38646,48 @@ fn provider_drain_flag_paths(home: &Path, provider: &str, enclave: &str) -> Vec<
         provider_drain_flag_path(home, provider, Some(enclave)),
         provider_drain_flag_path(home, provider, None),
     ]
+}
+
+fn provider_serve_active_drain_flag(home: &Path, enclave: &str) -> Result<Option<PathBuf>> {
+    let control_root = home.join("provider-control");
+    let entries = match fs::read_dir(&control_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", control_root.display())),
+    };
+    let mut provider_dirs = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    provider_dirs.sort();
+    for provider_dir in provider_dirs {
+        let paths = [
+            provider_dir.join(format!("{}.drain.json", safe_path_component(enclave))),
+            provider_dir.join("all.drain.json"),
+        ];
+        if let Some(path) = provider_drain_requested(&paths)? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn bail_provider_start_drained(home: &Path, enclave: &str, path: &Path) -> Result<()> {
+    let enclave_arg = (path.file_name().and_then(|name| name.to_str()) != Some("all.drain.json"))
+        .then(|| format!(" --enclave {enclave}"))
+        .unwrap_or_default();
+    bail!(
+        "provider serving is locally drained by {}; clear it before loading a model: mayhem provider drain --home {}{} --clear",
+        path.display(),
+        home.display(),
+        enclave_arg,
+    )
 }
 
 fn provider_drain_requested(paths: &[PathBuf]) -> Result<Option<PathBuf>> {
@@ -47947,12 +48926,17 @@ struct ProviderModalityHealthReport {
     ok: bool,
 }
 
-fn provider_modality_self_test(
+#[derive(Clone, Debug)]
+struct ProviderModalitySelfTestCase {
+    prompt_id: String,
+    modalities: Vec<String>,
+    body: Value,
+}
+
+fn provider_modality_self_test_plan(
     ctx: &ProviderSessionContext<'_>,
-    responder: &mut dyn ProviderSessionResponder,
     canaries_dir: &Path,
-) -> Result<Vec<ProviderModalityHealthReport>> {
-    let terms = provider_session_terms(ctx)?;
+) -> Result<Vec<ProviderModalitySelfTestCase>> {
     let prompts = load_canary_prompts_checked(
         Some(canaries_dir),
         &ctx.selected.model.canary.set_id,
@@ -48002,28 +48986,52 @@ fn provider_modality_self_test(
         selected.push((prompt, modalities));
     }
 
+    selected
+        .into_iter()
+        .map(|(prompt, modalities)| {
+            let body = provider_canary_self_test_body(&ctx.selected.model, prompt)?;
+            let body = provider_seal_local_contract_request(
+                &body,
+                &ctx.selected.model.adapter,
+                &ctx.selected.model.model_id,
+            )
+            .with_context(|| {
+                format!(
+                    "functional modality canary {} violates its signed endpoint contract",
+                    prompt.id
+                )
+            })?;
+            Ok(ProviderModalitySelfTestCase {
+                prompt_id: prompt.id.clone(),
+                modalities: modalities.into_iter().collect(),
+                body,
+            })
+        })
+        .collect()
+}
+
+fn provider_modality_self_test(
+    ctx: &ProviderSessionContext<'_>,
+    terms: &ProviderSessionTerms,
+    responder: &mut dyn ProviderSessionResponder,
+    cases: Vec<ProviderModalitySelfTestCase>,
+) -> Result<Vec<ProviderModalityHealthReport>> {
     let mut reports = Vec::new();
-    for (prompt, modalities) in selected {
-        let body = provider_canary_self_test_body(&ctx.selected.model, prompt)?;
-        let body = provider_seal_local_contract_request(
-            &body,
-            &ctx.selected.model.adapter,
-            &ctx.selected.model.model_id,
-        )?;
+    for case in cases {
         let output = responder
-            .respond(&terms, &body)
-            .with_context(|| format!("functional modality canary {} failed", prompt.id))?;
+            .respond(terms, &case.body)
+            .with_context(|| format!("functional modality canary {} failed", case.prompt_id))?;
         validate_provider_canary_self_test_output(&ctx.selected.model, &output).with_context(
             || {
                 format!(
                     "functional modality canary {} returned invalid output",
-                    prompt.id
+                    case.prompt_id
                 )
             },
         )?;
         reports.push(ProviderModalityHealthReport {
-            prompt_id: prompt.id.clone(),
-            modalities: modalities.into_iter().collect(),
+            prompt_id: case.prompt_id,
+            modalities: case.modalities,
             engine: ctx.selected.artifact.engine.clone(),
             ok: true,
         });
@@ -48041,8 +49049,10 @@ fn provider_session_responder_with_modality_health(
     Box<dyn ProviderSessionResponder>,
     Vec<ProviderModalityHealthReport>,
 )> {
+    let terms = provider_session_terms(ctx)?;
+    let cases = provider_modality_self_test_plan(ctx, ctx.canaries_dir)?;
     let mut responder = provider_session_responder(ctx)?;
-    let health = provider_modality_self_test(ctx, responder.as_mut(), ctx.canaries_dir)?;
+    let health = provider_modality_self_test(ctx, &terms, responder.as_mut(), cases)?;
     Ok((responder, health))
 }
 
@@ -48093,17 +49103,34 @@ fn provider_canary_self_test_body(
     prompt: &CanaryPrompt,
 ) -> Result<Value> {
     match model.model_class.as_str() {
-        DEFAULT_MODEL_CLASS => Ok(json!({
-            "messages": &prompt.messages,
-            "tools": &prompt.tools,
-            "temperature": prompt.temperature,
-            "top_p": prompt.top_p,
-            "top_k": prompt.top_k,
-            "min_p": prompt.min_p,
-            "seed": prompt.seed,
-            "max_tokens": prompt.max_tokens.unwrap_or(4).clamp(1, 4),
-            "stream": false,
-        })),
+        DEFAULT_MODEL_CLASS => {
+            let mut body = json!({
+                "messages": &prompt.messages,
+                "max_tokens": prompt.max_tokens.unwrap_or(4).clamp(1, 4),
+                "stream": false,
+            });
+            let object = body.as_object_mut().expect("text canary body is an object");
+            if let Some(tools) = prompt.tools.as_ref().filter(|tools| !tools.is_empty()) {
+                object.insert("tools".to_owned(), json!(tools));
+            }
+            for (name, level) in &prompt.specialities {
+                object.insert(name.clone(), json!(level));
+            }
+            for (name, value) in [
+                ("temperature", prompt.temperature.map(Value::from)),
+                ("top_p", prompt.top_p.map(Value::from)),
+                ("top_k", prompt.top_k.map(Value::from)),
+                ("min_p", prompt.min_p.map(Value::from)),
+                ("seed", prompt.seed.map(Value::from)),
+            ] {
+                if let Some(value) = value {
+                    object.insert(name.to_owned(), value);
+                }
+            }
+            let family = provider_canary_self_test_endpoint_family(model, &body)?;
+            body["endpoint_family"] = json!(family);
+            Ok(body)
+        }
         "embedding" => Ok(json!({
             "kind": "embedding",
             "input": canary_prompt_text(prompt)?,
@@ -48165,6 +49192,37 @@ fn provider_canary_self_test_body(
         })),
         other => bail!("functional modality self-test is not wired for model_class {other}"),
     }
+}
+
+fn provider_canary_self_test_endpoint_family(
+    model: &catalog::CatalogModel,
+    body: &Value,
+) -> Result<String> {
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("chat");
+    let transport_kind = provider_endpoint_transport_kind(provider_local_endpoint_family(kind))?;
+    let mut request = body.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.remove("kind");
+        object.remove("endpoint_family");
+        object
+            .entry("model")
+            .or_insert_with(|| json!(&model.model_id));
+    }
+    model
+        .adapter
+        .endpoint_families
+        .iter()
+        .filter(|contract| {
+            provider_endpoint_transport_kind(&contract.family).ok() == Some(transport_kind)
+        })
+        .find(|contract| mayhem_proto::validate_endpoint_request(contract, &request).is_ok())
+        .map(|contract| contract.family.clone())
+        .with_context(|| {
+            format!(
+                "canary request has no compatible signed {transport_kind} endpoint family for {}",
+                model.model_id
+            )
+        })
 }
 
 fn validate_provider_canary_self_test_output(
@@ -49547,7 +50605,11 @@ fn provider_seal_local_contract_request(
     model_id: &str,
 ) -> Result<Value> {
     let kind = body.get("kind").and_then(Value::as_str).unwrap_or("chat");
-    let family = provider_local_endpoint_family(kind);
+    let family = body
+        .get("endpoint_family")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider_local_endpoint_family(kind));
     let contract = adapter
         .endpoint_families
         .iter()
@@ -49950,7 +51012,9 @@ fn provider_engine_session_response_with_sampling(
     )?;
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
-    let prompt_tokens = rough_text_tokens(&request.prompt);
+    // Bill the canonical request content shared with the gateway, not backend-specific
+    // chat-template wrappers that are added only for inference.
+    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
     let output = backend
         .generate_with_artifacts(
             request,
@@ -50445,7 +51509,10 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     adapter: &catalog::CatalogAdapter,
     sampling: &catalog::CatalogSamplingProfile,
 ) -> Result<GenerateRequest> {
-    let messages = provider_endpoint_messages(endpoint_family, body)?;
+    let messages = provider_engine_template_messages(
+        provider_endpoint_messages(endpoint_family, body)?,
+        adapter,
+    )?;
     let prompt = provider_engine_prompt(&messages, adapter)?;
     let mut request = GenerateRequest::new(prompt);
     request.messages = messages.clone();
@@ -50490,6 +51557,7 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.seed = provider_optional_u32(body, "seed")?;
     request.validate_sampling()?;
     if let Some((strategy, tools)) = provider_engine_tool_request(body, adapter)? {
+        request.tools = provider_engine_template_tools(&tools);
         match strategy {
             ProviderEngineToolStrategy::MayhemJson => {
                 request.grammar = Some(GrammarSpec::ToolCall { tools });
@@ -50508,6 +51576,69 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         });
     }
     Ok(request)
+}
+
+fn provider_engine_template_messages(
+    mut messages: Vec<Value>,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<Vec<Value>> {
+    if adapter.chat_template_id != "qwen3.5-instruct" {
+        return Ok(messages);
+    }
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for (call_index, tool_call) in tool_calls.iter_mut().enumerate() {
+            let Some(call) = tool_call.as_object_mut() else {
+                continue;
+            };
+            let arguments = if call.get("function").is_some_and(Value::is_object) {
+                call.get_mut("function")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|function| function.get_mut("arguments"))
+            } else {
+                call.get_mut("arguments")
+            };
+            let Some(arguments) = arguments else {
+                continue;
+            };
+            if let Some(encoded) = arguments.as_str() {
+                let parsed = serde_json::from_str::<Value>(encoded).with_context(|| {
+                    format!(
+                        "qwen3.5 tool call arguments at message {message_index}, call {call_index} are not valid JSON"
+                    )
+                })?;
+                ensure!(
+                    parsed.is_object(),
+                    "qwen3.5 tool call arguments at message {message_index}, call {call_index} must encode a JSON object"
+                );
+                *arguments = parsed;
+            } else {
+                ensure!(
+                    arguments.is_object(),
+                    "qwen3.5 tool call arguments at message {message_index}, call {call_index} must be a JSON object or an encoded JSON object"
+                );
+            }
+        }
+    }
+    Ok(messages)
+}
+
+fn provider_engine_template_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let mut function = serde_json::Map::from_iter([
+                ("name".to_owned(), json!(&tool.name)),
+                ("parameters".to_owned(), tool.parameters.clone()),
+            ]);
+            if let Some(description) = &tool.description {
+                function.insert("description".to_owned(), json!(description));
+            }
+            json!({"type": "function", "function": function})
+        })
+        .collect()
 }
 
 fn provider_engine_speciality_parameters(
@@ -50802,7 +51933,7 @@ fn audio_content_type(format: &str) -> &'static str {
 
 fn provider_engine_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter) -> Result<String> {
     match adapter.chat_template_id.as_str() {
-        "generic_chatml" | "qwen2.5-instruct" => {
+        "generic_chatml" | "qwen2.5-instruct" | "qwen3.5-instruct" => {
             Ok(provider_engine_generic_chatml_prompt(messages, adapter))
         }
         "llama3-instruct" => Ok(provider_engine_llama3_prompt(messages, adapter)),
@@ -57119,6 +58250,91 @@ mod tests {
         assert!(matches!(*command, ProviderCommands::Start(_)));
     }
 
+    #[test]
+    fn provider_serve_public_report_never_exposes_child_credentials() {
+        let child = json!({
+            "name": "provider-live-test",
+            "command": "mayhem",
+            "args": [
+                "provider",
+                "start",
+                "--sc-bridge-token",
+                "local-secret-value"
+            ],
+            "env": {
+                "MAYHEM_VLLM_PYTHON": "provider-python"
+            },
+            "restart": true,
+            "restart_backoff_ms": 1000,
+            "restart_stable_after_ms": 300000,
+            "crash_loop_threshold": 5,
+        });
+
+        let report = provider_serve_public_child_report(&child);
+        let encoded = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(report["name"], "provider-live-test");
+        assert!(report.get("args").is_none());
+        assert!(report.get("command").is_none());
+        assert!(report.get("env").is_none());
+        assert!(!encoded.contains("local-secret-value"));
+        assert!(!encoded.contains("provider-python"));
+    }
+
+    #[test]
+    fn provider_serve_detects_persistent_drain_before_starting_a_worker() {
+        let home = test_temp_dir("mayhem-provider-serve-drain-preflight");
+        let provider = "11".repeat(32);
+        let enclave = "22".repeat(32);
+        let global = provider_drain_flag_path(&home, &provider, None);
+        write_json_file(&global, &json!({ "active": true })).unwrap();
+
+        assert_eq!(
+            provider_serve_active_drain_flag(&home, &enclave).unwrap(),
+            Some(global.clone())
+        );
+
+        fs::remove_file(&global).unwrap();
+        let scoped = provider_drain_flag_path(&home, &provider, Some(&enclave));
+        write_json_file(&scoped, &json!({ "active": true })).unwrap();
+        assert_eq!(
+            provider_serve_active_drain_flag(&home, &enclave).unwrap(),
+            Some(scoped.clone())
+        );
+
+        write_json_file(&scoped, &json!({ "active": false })).unwrap();
+        assert_eq!(
+            provider_serve_active_drain_flag(&home, &enclave).unwrap(),
+            None
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_child_uses_the_exact_preflighted_backend_runtime() {
+        let runtime = ProviderBackendRuntime {
+            python: Some(PathBuf::from("/managed/vllm/bin/python")),
+            cuda_home: Some(PathBuf::from("/managed/cuda")),
+            cache_dir: Some(PathBuf::from("/managed/cache")),
+            ..ProviderBackendRuntime::default()
+        };
+        let child_env = provider_backend_runtime_child_env("vllm", &runtime);
+
+        assert_eq!(
+            child_env.get("MAYHEM_VLLM_PYTHON").map(String::as_str),
+            Some("/managed/vllm/bin/python")
+        );
+        assert_eq!(
+            child_env.get("MAYHEM_VLLM_CUDA_HOME").map(String::as_str),
+            Some("/managed/cuda")
+        );
+        assert_eq!(
+            child_env.get("MAYHEM_VLLM_CACHE_DIR").map(String::as_str),
+            Some("/managed/cache")
+        );
+        assert!(!child_env.contains_key("MAYHEM_TRTLLM_PYTHON"));
+    }
+
     fn test_modality_capacities(modality: &str) -> BTreeMap<String, HeartbeatModalityCapacity> {
         if modality == "text" {
             return BTreeMap::new();
@@ -60144,6 +61360,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(request.prompt.contains("user: write a file"));
         assert_eq!(request.max_new_tokens, 12);
         assert_eq!(request.seed, Some(42));
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0]["type"], "function");
+        assert_eq!(request.tools[0]["function"]["name"], "write");
+        assert_eq!(request.tools[0]["function"]["description"], "write a file");
         let Some(GrammarSpec::ToolCall { tools }) = request.grammar else {
             panic!("expected tool-call grammar");
         };
@@ -60325,6 +61545,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let request = provider_engine_request_from_body(&body, &adapter).unwrap();
 
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0]["function"]["name"], "write");
         let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
             panic!("expected OpenAI tool_calls JSON schema grammar");
         };
@@ -60353,6 +61575,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let request = provider_engine_request_from_body(&body, &adapter).unwrap();
 
         assert!(request.grammar.is_none());
+        assert!(request.tools.is_empty());
     }
 
     #[test]
@@ -60386,6 +61609,40 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .prompt
             .contains("scratchpad stays only for preserve adapters"));
         assert!(stripped_request.prompt.contains("user: final user content"));
+    }
+
+    #[test]
+    fn provider_engine_request_maps_openai_tool_history_for_qwen_template() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-calibration",
+                    "type": "function",
+                    "function": {
+                        "name": "calibration_tool",
+                        "arguments": "{\"value\":7}"
+                    }
+                }]
+            }]
+        });
+
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert_eq!(
+            request.messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"value": 7})
+        );
+
+        let mut malformed = body;
+        malformed["messages"][0]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
+        let error = provider_engine_request_from_body(&malformed, &adapter).unwrap_err();
+        assert!(error.to_string().contains("are not valid JSON"));
     }
 
     #[test]
@@ -60427,6 +61684,53 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(request.prompt.contains("describe this"));
         assert!(request.prompt.contains("[image:"));
         assert!(request.prompt.contains("[audio:wav:"));
+    }
+
+    #[test]
+    fn live_catalog_modality_canaries_preflight_before_engine_load() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "hauhaucs/qwen3.6-35b-a3b-uncensored")
+            .expect("live launch model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let served = model
+            .adapter
+            .modality_set
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut covered = BTreeSet::new();
+
+        for prompt in &prompts {
+            let modalities = provider_canary_prompt_modalities(model, prompt);
+            if modalities.is_empty() || !modalities.iter().all(|value| served.contains(value)) {
+                continue;
+            }
+            let body = provider_canary_self_test_body(model, prompt)
+                .unwrap_or_else(|error| panic!("{} body: {error:#}", prompt.id));
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap_or_else(|error| panic!("{} seal: {error:#}", prompt.id));
+            let mut backend = FakeEngineBackend::new("modality preflight ready");
+            provider_engine_session_response_with_sampling(
+                &mut backend,
+                Some(&model.model_id),
+                &model.adapter,
+                &model.sampling,
+                &sealed,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{} translate: {error:#}", prompt.id));
+            covered.extend(modalities);
+        }
+
+        assert_eq!(covered, served);
     }
 
     #[test]
@@ -60629,7 +61933,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_engine_session_response_uses_backend_output() {
         let mut backend = FakeEngineBackend::new("engine says hi");
         let body = json!({
-            "messages": [{ "role": "user", "content": "hello" }],
+            "messages": [{
+                "role": "user",
+                "content": "Reply only: transport observer passed"
+            }],
             "max_tokens": 8
         });
         let output = provider_engine_session_response(
@@ -60644,11 +61951,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(output.tool.is_none());
         assert_eq!(output.finish_reason, "stop");
         let request = backend.last_request.expect("engine request");
-        assert_eq!(output.prompt_tokens, rough_text_tokens(&request.prompt));
+        let canonical_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(&body));
+        let rendered_prompt_tokens = rough_text_tokens(&request.prompt);
+        assert_eq!(canonical_prompt_tokens, 5);
+        assert_eq!(rendered_prompt_tokens, 7);
+        assert_eq!(output.prompt_tokens, canonical_prompt_tokens);
         assert_eq!(output.completion_tokens, 2);
         assert_eq!(output.usage.input_tokens(), output.prompt_tokens);
         assert_eq!(output.usage.output_tokens(), 2);
-        assert!(request.prompt.contains("user: hello"));
+        assert!(request
+            .prompt
+            .contains("user: Reply only: transport observer passed"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
     }
@@ -64290,6 +65603,7 @@ State initialization...
                     "parameters": { "type": "object" }
                 }
             })]),
+            specialities: BTreeMap::from([("thinking_mode".to_owned(), "disabled".to_owned())]),
             temperature: Some(0.2),
             top_p: Some(0.9),
             top_k: Some(20),
@@ -64314,6 +65628,7 @@ State initialization...
         assert_eq!(request["top_p"], 0.9);
         assert_eq!(request["top_k"], 20);
         assert_eq!(request["min_p"], 0.05);
+        assert_eq!(request["specialities"]["thinking_mode"], "disabled");
         assert_eq!(request["repeat_penalty"], 1.05);
 
         assert_eq!(request["model"], "admin/model");
@@ -64378,6 +65693,24 @@ State initialization...
     }
 
     #[test]
+    fn token_canary_reproducibility_derives_exact_common_prefix() {
+        let mut expected = test_calibration_prompt("p1", canary_token_fingerprint([1, 2, 3]));
+        expected.token_ids = vec![1, 2, 3];
+        expected.token_prefix = expected.token_ids.clone();
+        let mut drifted = expected.clone();
+        drifted.token_ids = vec![1, 2, 9];
+
+        merge_token_canary_prefix("base canary", &mut expected, &drifted).unwrap();
+        assert_eq!(expected.token_prefix, vec![1, 2]);
+
+        let mut first_token_drift = drifted;
+        first_token_drift.token_ids = vec![9, 2, 3];
+        let err = merge_token_canary_prefix("base canary", &mut expected, &first_token_drift)
+            .expect_err("a prompt without a stable first token must fail");
+        assert!(err.to_string().contains("no stable first token"));
+    }
+
+    #[test]
     fn calibration_match_guard_accepts_matching_catalog_fingerprint() {
         let report = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
 
@@ -64400,6 +65733,72 @@ State initialization...
         let err = ensure_calibration_matches_catalog(&report).unwrap_err();
 
         assert!(err.to_string().contains("catalog has no fingerprint"));
+    }
+
+    #[test]
+    fn resumed_canary_core_is_strictly_bound_but_allows_endpoint_repair() {
+        let catalog = test_catalog(&"aa".repeat(32));
+        let model = &catalog.models[0];
+        let artifact = &model.artifacts["gguf-q4_k_m"];
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, true)
+                .unwrap();
+        let canary_sha = canary_set_file_sha256(&canaries_dir, &model.canary.set_id).unwrap();
+        let artifact_path = PathBuf::from("/tmp/model.gguf");
+        let mut report = test_calibration_report("resume".to_owned(), None);
+        let tokens = vec![17; 8];
+        report.model_id = model.model_id.clone();
+        report.artifact_path = artifact_path.clone();
+        report.artifact_binding = catalog_canary_artifact_binding(artifact);
+        report.canary_set_sha256 = canary_sha.clone();
+        report.prompts[0].max_tokens = 8;
+        report.prompts[0].completion_tokens = 8;
+        report.prompts[0].token_count = tokens.len();
+        report.prompts[0].token_ids = tokens.clone();
+        report.prompts[0].token_prefix = tokens.clone();
+        report.prompts[0].fingerprint = canary_token_fingerprint(tokens);
+        report.catalog_fingerprint = aggregate_canary_fingerprint(&report.prompts);
+        report.modality_fingerprints =
+            BTreeMap::from([("text".to_owned(), report.catalog_fingerprint.clone())]);
+        report.endpoint_calibration.ok = false;
+        let runtime_config = report.runtime_config.clone();
+        let calibration_memory = CalibrationMemoryContext {
+            f13_budget_bytes: 200,
+            source: "test resume memory".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+        };
+
+        validate_resumed_canary_core(
+            &report,
+            model,
+            "gguf-q4_k_m",
+            artifact,
+            &artifact_path,
+            &prompts,
+            &canary_sha,
+            &runtime_config,
+            &calibration_memory,
+            None,
+        )
+        .unwrap();
+
+        let mut mismatched = report;
+        mismatched.runtime_config.ctx_size += 1;
+        let error = validate_resumed_canary_core(
+            &mismatched,
+            model,
+            "gguf-q4_k_m",
+            artifact,
+            &artifact_path,
+            &prompts,
+            &canary_sha,
+            &runtime_config,
+            &calibration_memory,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime configuration"));
     }
 
     #[test]
@@ -64450,9 +65849,67 @@ State initialization...
     }
 
     #[test]
+    fn calibration_vllm_memory_controls_validate_and_propagate() {
+        let catalog = test_catalog(&"aa".repeat(32));
+        let model = &catalog.models[0];
+        let mut artifact = model.artifacts["gguf-q4_k_m"].clone();
+        artifact.engine = "vllm".to_owned();
+        let mut args = test_calibrate_canary_args();
+        args.vllm_memory_utilization = Some(40);
+        args.vllm_memory_utilization_floor = Some(40);
+
+        validate_calibration_args_for_artifact(&artifact, &args).unwrap();
+        let runtime =
+            catalog_canary_runtime_config(&artifact, Path::new("/tmp/model.safetensors"), &args)
+                .unwrap();
+        assert_eq!(runtime.vllm_memory_utilization_pct, Some(40));
+        assert_eq!(runtime.vllm_memory_utilization_floor_pct, Some(40));
+
+        let mut plan_args = test_canary_plan_args();
+        plan_args.home = Some(PathBuf::from("/tmp/provider-home"));
+        plan_args.vllm_memory_utilization = Some(40);
+        plan_args.vllm_memory_utilization_floor = Some(40);
+        let command = catalog_canary_calibration_plan_command(CatalogCanaryCalibrationPlanInput {
+            catalog_path: Path::new("/tmp/catalog.json"),
+            canaries_dir: Path::new("/tmp/canaries"),
+            model,
+            artifact_name: "nvfp4",
+            artifact: &artifact,
+            artifact_base: Path::new("/tmp/artifacts"),
+            artifact_path: Path::new("/tmp/model.safetensors"),
+            report_path: Path::new("/tmp/report.json"),
+            trt_engine_dir: None,
+            args: &plan_args,
+        });
+        assert!(command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--home" && pair[1] == "/tmp/provider-home"));
+        assert!(command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--vllm-memory-utilization" && pair[1] == "40"));
+        assert!(command
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--vllm-memory-utilization-floor" && pair[1] == "40" }));
+
+        args.vllm_memory_utilization_floor = Some(41);
+        let err = validate_calibration_args_for_artifact(&artifact, &args).unwrap_err();
+        assert!(err.to_string().contains("floor 41% exceeds target 40%"));
+
+        args.vllm_memory_utilization = None;
+        let err = validate_calibration_args_for_artifact(&artifact, &args).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires --vllm-memory-utilization"));
+    }
+
+    #[test]
     fn canary_matrix_covers_launch_artifacts_and_marks_hardware_gated_backends() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
+        make_test_catalog_endpoint_calibration_compatible(&mut catalog.models[0]);
         catalog.models[0].canary.set_id = "test-canary-zero".to_owned();
         let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
         trt_artifact.engine = "trt-llm".to_owned();
@@ -64656,6 +66113,7 @@ State initialization...
     fn canary_matrix_accepts_seed_phash_and_attestation_descriptors() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
+        make_test_catalog_endpoint_calibration_compatible(&mut catalog.models[0]);
         catalog.models[0].model_class = "image-generation".to_owned();
         catalog.models[0].canary.set_id = "test-image-canary".to_owned();
         catalog.models[0].canary.verification_method = "seed_perceptual_hash".to_owned();
@@ -64778,13 +66236,29 @@ State initialization...
     fn speciality_calibrator_runs_every_signed_level_without_reloading() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         add_test_reasoning_speciality(&mut catalog.models[0]);
-        let prompts = vec![serde_json::from_value::<CanaryPrompt>(json!({
-            "id": "p1",
-            "messages": [{"role": "user", "content": "reason"}],
-            "max_tokens": 8,
-            "temperature": 0.0
-        }))
-        .unwrap()];
+        let prompts = vec![
+            serde_json::from_value::<CanaryPrompt>(json!({
+                "id": "p1",
+                "messages": [{"role": "user", "content": "reason"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }))
+            .unwrap(),
+            serde_json::from_value::<CanaryPrompt>(json!({
+                "id": "media-p1",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+                    ]
+                }],
+                "max_tokens": 8,
+                "temperature": 0.6,
+                "seed": 9
+            }))
+            .unwrap(),
+        ];
         let memory = CalibrationMemoryContext {
             f13_budget_bytes: u64::MAX,
             source: "test-process-rss".to_owned(),
@@ -64802,13 +66276,28 @@ State initialization...
         )
         .unwrap();
 
-        assert_eq!(backend.observed_levels, ["low", "high"]);
+        assert_eq!(
+            backend.observed_levels,
+            ["low", "low", "low", "low", "high", "high", "high", "high"]
+        );
         let levels = &calibrated["reasoning_effort"];
+        assert_eq!(
+            levels["low"]
+                .token_prefixes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["p1"]
+        );
         assert_ne!(levels["low"].fingerprint, levels["high"].fingerprint);
-        assert_eq!(levels["low"].output_tokens, 1);
-        assert_eq!(levels["low"].reasoning_tokens, 0);
-        assert_eq!(levels["high"].output_tokens, 1);
-        assert_eq!(levels["high"].reasoning_tokens, 1);
+        assert_eq!(levels["low"].output_tokens_min, 1);
+        assert_eq!(levels["low"].output_tokens_max, 1);
+        assert_eq!(levels["low"].reasoning_tokens_min, 0);
+        assert_eq!(levels["low"].reasoning_tokens_max, 0);
+        assert_eq!(levels["high"].output_tokens_min, 1);
+        assert_eq!(levels["high"].output_tokens_max, 1);
+        assert_eq!(levels["high"].reasoning_tokens_min, 1);
+        assert_eq!(levels["high"].reasoning_tokens_max, 1);
         let mut errors = Vec::new();
         validate_speciality_calibration_report(
             &catalog.models[0],
@@ -64834,9 +66323,17 @@ State initialization...
                 "temperature": 0.0
             }]),
         );
-        let base_prompt = test_calibration_prompt("p1", canary_token_fingerprint([1]));
+        let base_tokens = vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS];
+        let mut base_prompt =
+            test_calibration_prompt("p1", canary_token_fingerprint(base_tokens.iter().copied()));
+        base_prompt.max_tokens = u32::try_from(base_tokens.len()).unwrap();
+        base_prompt.completion_tokens = u32::try_from(base_tokens.len()).unwrap();
+        base_prompt.token_count = base_tokens.len();
+        base_prompt.token_ids = base_tokens.clone();
+        base_prompt.token_prefix = base_tokens.clone();
         let base_fingerprint = aggregate_canary_fingerprint(std::slice::from_ref(&base_prompt));
         let mut calibration = test_calibration_report(base_fingerprint.clone(), None);
+        calibration.catalog_fingerprint = base_fingerprint.clone();
         calibration.model_id = catalog.models[0].model_id.clone();
         calibration.canary_set = "test-speciality-canary".to_owned();
         calibration.prompts = vec![base_prompt];
@@ -64872,7 +66369,7 @@ State initialization...
         );
         assert_eq!(
             catalog_value["models"][0]["speciality_assessment"]["calibrated"]["gguf-q4_k_m"]
-                ["reasoning_effort"]["high"]["reasoning_tokens"],
+                ["reasoning_effort"]["high"]["reasoning_tokens_max"],
             json!(1)
         );
 
@@ -64881,7 +66378,21 @@ State initialization...
             .speciality_assessment
             .calibrated
             .insert("gguf-q4_k_m".to_owned(), compact);
-        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", base_fingerprint);
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), base_fingerprint);
+        catalog.models[0].canary.token_prefixes.insert(
+            "gguf-q4_k_m".to_owned(),
+            BTreeMap::from([("p1".to_owned(), base_tokens)]),
+        );
+        catalog.models[0]
+            .modality_assessment
+            .calibrated_fingerprints
+            .insert(
+                "gguf-q4_k_m".to_owned(),
+                BTreeMap::from([("text".to_owned(), "cc".repeat(32))]),
+            );
         let mut incomplete = calibration;
         incomplete
             .speciality_calibrations
@@ -64930,6 +66441,8 @@ State initialization...
         calibration.canary_set = "test-embedding-canary".to_owned();
         calibration.verification_method = "embedding_cosine".to_owned();
         calibration.matches_existing_catalog = None;
+        calibration.catalog_fingerprint =
+            aggregate_prompt_fingerprint_map([("p1", embedding_vector_fingerprint(&vector))]);
         calibration.prompts = vec![CanaryCalibrationPromptReport {
             prompt_id: "p1".to_owned(),
             max_tokens: 1,
@@ -64938,6 +66451,8 @@ State initialization...
             reasoning_tokens: 0,
             token_count: 0,
             token_ids: Vec::new(),
+            token_prefix: Vec::new(),
+            reproducibility_runs: 1,
             fingerprint: embedding_vector_fingerprint(&vector),
             perceptual_hash: None,
             embedding_vector: Some(vector.clone()),
@@ -65416,10 +66931,9 @@ State initialization...
         catalog.models[0].tier = "launch".to_owned();
         insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
-        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        let mut calibration = test_calibration_report("bb".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
         stamp_test_calibration_report(&mut calibration, &canaries_dir);
-        calibration.prompts[0].token_ids = vec![2];
         let report_path = write_temp_calibration_report(&calibration);
 
         let report = catalog_canary_evidence_report(
@@ -65486,10 +67000,7 @@ State initialization...
     fn canary_apply_updates_catalog_fingerprint_from_bound_report() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "00".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "00".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("00".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -65527,11 +67038,11 @@ State initialization...
         );
         assert_eq!(
             catalog_value["models"][0]["canary"]["fingerprints"]["gguf-q4_k_m"],
-            json!("aa".repeat(32))
+            json!(test_canary_aggregate_for_label(&"aa".repeat(32)))
         );
         assert_eq!(
             catalog_value["models"][0]["canary"]["token_prefixes"]["gguf-q4_k_m"]["p1"],
-            json!([1])
+            json!(test_canary_tokens_for_label(&"aa".repeat(32)))
         );
     }
 
@@ -67201,6 +68712,8 @@ State initialization...
             reasoning_tokens: 0,
             token_count: 1,
             token_ids: vec![1],
+            token_prefix: vec![1],
+            reproducibility_runs: CANARY_RECORDED_RUNS,
             fingerprint,
             perceptual_hash: None,
             embedding_vector: None,
@@ -67213,18 +68726,45 @@ State initialization...
         }
     }
 
+    fn test_canary_tokens_for_label(label: &str) -> Vec<i32> {
+        let token = label
+            .as_bytes()
+            .first()
+            .copied()
+            .map(i32::from)
+            .unwrap_or(1);
+        vec![token; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS]
+    }
+
+    fn test_canary_prompt_for_label(label: &str) -> CanaryCalibrationPromptReport {
+        let tokens = test_canary_tokens_for_label(label);
+        let mut prompt =
+            test_calibration_prompt("p1", canary_token_fingerprint(tokens.iter().copied()));
+        prompt.max_tokens = u32::try_from(tokens.len()).unwrap();
+        prompt.completion_tokens = u32::try_from(tokens.len()).unwrap();
+        prompt.token_count = tokens.len();
+        prompt.token_ids = tokens.clone();
+        prompt.token_prefix = tokens;
+        prompt
+    }
+
+    fn test_canary_aggregate_for_label(label: &str) -> String {
+        aggregate_canary_fingerprint(&[test_canary_prompt_for_label(label)])
+    }
+
     fn insert_test_canary_expectation(
         model: &mut catalog::CatalogModel,
         artifact: &str,
-        fingerprint: String,
+        label: String,
     ) {
-        model
-            .canary
-            .fingerprints
-            .insert(artifact.to_owned(), fingerprint);
+        let prompt = test_canary_prompt_for_label(&label);
+        model.canary.fingerprints.insert(
+            artifact.to_owned(),
+            aggregate_canary_fingerprint(std::slice::from_ref(&prompt)),
+        );
         model.canary.token_prefixes.insert(
             artifact.to_owned(),
-            BTreeMap::from([("p1".to_owned(), vec![1])]),
+            BTreeMap::from([("p1".to_owned(), prompt.token_prefix)]),
         );
         model.modality_assessment.calibrated_fingerprints.insert(
             artifact.to_owned(),
@@ -67233,9 +68773,14 @@ State initialization...
     }
 
     fn test_calibration_report(
-        fingerprint: String,
-        existing: Option<String>,
+        label: String,
+        existing_label: Option<String>,
     ) -> CatalogCanaryCalibrationReport {
+        let prompt = test_canary_prompt_for_label(&label);
+        let fingerprint = aggregate_canary_fingerprint(std::slice::from_ref(&prompt));
+        let existing = existing_label
+            .as_deref()
+            .map(test_canary_aggregate_for_label);
         CatalogCanaryCalibrationReport {
             model_id: "test/model".to_owned(),
             artifact: "gguf-q4_k_m".to_owned(),
@@ -67267,6 +68812,8 @@ State initialization...
                 trt_kv_cache_dtype: None,
                 trt_max_batch_size: None,
                 trt_max_num_tokens: None,
+                vllm_memory_utilization_pct: None,
+                vllm_memory_utilization_floor_pct: None,
             },
             canary_set: "test-canary".to_owned(),
             canary_set_sha256: String::new(),
@@ -67278,8 +68825,35 @@ State initialization...
             modality_resource_profiles: BTreeMap::new(),
             speciality_calibrations: BTreeMap::new(),
             endpoint_calibration: test_endpoint_calibration_report(),
-            prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
+            prompts: vec![prompt],
         }
+    }
+
+    fn make_test_catalog_endpoint_calibration_compatible(model: &mut catalog::CatalogModel) {
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("test chat endpoint contract");
+        contract
+            .request_attributes
+            .retain(|attribute| attribute != "repeat_penalty");
+        contract
+            .required_request_attributes
+            .retain(|attribute| attribute != "repeat_penalty");
+        contract.request_attribute_specs.remove("repeat_penalty");
+        for group in &mut contract.interaction_groups {
+            group.retain(|attribute| attribute != "repeat_penalty");
+        }
+        contract.interaction_groups.retain(|group| group.len() > 1);
+        let parallel = contract
+            .request_attribute_specs
+            .get_mut("parallel_tool_calls")
+            .expect("parallel_tool_calls test contract");
+        parallel.default = Some(json!(false));
+        parallel.enum_values = vec![json!(false)];
+        parallel.calibration_values = vec![json!(false)];
     }
 
     fn test_endpoint_calibration_report() -> EndpointCalibrationReport {
@@ -67289,9 +68863,26 @@ State initialization...
     fn test_endpoint_calibration_report_for_adapter(
         adapter: &catalog::CatalogAdapter,
     ) -> EndpointCalibrationReport {
+        let fixture_bytes = b"mayhem-endpoint-calibration-fixture";
         let report = run_endpoint_calibration_matrix(
             &adapter.endpoint_families,
-            &BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]),
+            &BTreeMap::from([
+                ("$MODEL".to_owned(), json!("test/model")),
+                ("$MODEL_VALUE".to_owned(), json!("test/model")),
+                ("$RESPONSE_VALUE".to_owned(), json!("json")),
+                (
+                    "$IMAGE_DATA_URL".to_owned(),
+                    json!("data:image/png;base64,aGVsbG8="),
+                ),
+                ("$IMAGE_FILE".to_owned(), json!("fixture.png")),
+                ("$AUDIO_BASE64".to_owned(), json!("aGVsbG8=")),
+                (
+                    "$AUDIO_BLAKE3".to_owned(),
+                    json!(blake3::hash(fixture_bytes).to_hex().to_string()),
+                ),
+                ("$VIDEO_BASE64".to_owned(), json!("aGVsbG8=")),
+                ("$VOICE".to_owned(), json!("launch")),
+            ]),
             |contract, _case, request| {
                 Ok(EndpointCalibrationExecution {
                     provider_translation_fingerprint: "11".repeat(32),
@@ -67341,6 +68932,7 @@ State initialization...
 
     fn test_calibrate_canary_args() -> CatalogCalibrateCanaryArgs {
         CatalogCalibrateCanaryArgs {
+            home: None,
             catalog_path: None,
             canaries_dir: None,
             model: "test/model".to_owned(),
@@ -67354,6 +68946,7 @@ State initialization...
             memory_reserve: None,
             seed: 0,
             include_output: false,
+            resume_core_report: None,
             report_output: None,
             require_match: false,
             trt_engine_dir: None,
@@ -67362,12 +68955,15 @@ State initialization...
             trt_kv_cache_dtype: None,
             trt_max_batch_size: None,
             trt_max_num_tokens: None,
+            vllm_memory_utilization: None,
+            vllm_memory_utilization_floor: None,
             json: false,
         }
     }
 
     fn test_canary_plan_args() -> CatalogCanaryPlanArgs {
         CatalogCanaryPlanArgs {
+            home: None,
             catalog_path: None,
             canaries_dir: None,
             artifact_base: PathBuf::from("/tmp/artifacts"),
@@ -67389,6 +68985,8 @@ State initialization...
             trt_kv_cache_dtype: None,
             trt_max_batch_size: None,
             trt_max_num_tokens: None,
+            vllm_memory_utilization: None,
+            vllm_memory_utilization_floor: None,
             include_dev: false,
             json: false,
         }
@@ -67720,6 +69318,7 @@ State initialization...
         assert!(text.contains("tap"));
         assert!(text.contains("--peer-stores-directory"));
         assert!(text.contains("--msb-stores-directory"));
+        assert!(text.contains("\"--msb-wallet\", \"0\""));
         assert!(text.contains(&home.join("stores").display().to_string()));
         assert!(text.contains("--bind"));
         assert!(text.contains("0.0.0.0:11435"));
@@ -67771,6 +69370,13 @@ State initialization...
         assert_eq!(manifest.network.msb.network_id, MAINNET_MSB_NETWORK_ID);
         assert_eq!(manifest.network.msb.bootstrap, MAINNET_MSB_BOOTSTRAP);
         assert_eq!(manifest.network.msb.channel, MAINNET_MSB_CHANNEL);
+        assert!(manifest
+            .network
+            .msb
+            .direct_peers
+            .iter()
+            .map(String::as_str)
+            .eq(MAINNET_MSB_DIRECT_PEERS));
         assert_eq!(manifest.network.dht.peer_bootstrap.len(), 5);
         assert_eq!(manifest.network.dht.msb_bootstrap.len(), 5);
         assert_eq!(manifest.payments.directory_min_version, 3);
@@ -67818,6 +69424,10 @@ State initialization...
 
         assert!(text.contains("--peer-dht-bootstrap"));
         assert!(text.contains("--msb-dht-bootstrap"));
+        assert!(text.contains("--msb-direct-peer"));
+        assert!(MAINNET_MSB_DIRECT_PEERS
+            .iter()
+            .all(|peer| text.contains(peer)));
         assert!(text.contains("node3.hyperdht.org:49737"));
         assert!(text.contains(&manifest.network.subnet.bootstrap));
         assert!(text.contains(MAINNET_MSB_BOOTSTRAP));
@@ -68255,20 +69865,11 @@ State initialization...
             .get_mut("models")
             .and_then(Value::as_array_mut)
             .expect("repo catalog models array");
-        let mut launch = models
+        let launch = models
             .iter()
-            .find(|model| {
-                model.get("model_id").and_then(Value::as_str)
-                    == Some("qwen/qwen2.5-1.5b-instruct@small")
-            })
+            .find(|model| model.get("tier").and_then(Value::as_str) == Some("launch"))
             .cloned()
-            .expect("signed test model must remain in the catalog");
-        launch["speciality_assessment"] = json!({
-            "detected": [],
-            "evidence": ["test fixture researched: no model specialities"],
-            "unsupported": {},
-            "calibrated": {}
-        });
+            .expect("repo catalog must retain at least one signed launch model");
         *models = vec![launch];
         catalog["catalog_id"] = json!("mayhem-test-signed-catalog");
         write_json_file(path, &catalog).unwrap();
@@ -68429,15 +70030,23 @@ State initialization...
     fn test_speciality_calibration_report_map(
     ) -> BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>> {
         let level_report = |token_id: i32, reasoning_tokens: u32| {
-            let fingerprint = canary_token_fingerprint([token_id]);
+            let tokens = vec![token_id; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS];
+            let fingerprint = canary_token_fingerprint(tokens.iter().copied());
             let mut prompt = test_calibration_prompt("p1", fingerprint);
-            prompt.token_ids = vec![token_id];
+            prompt.max_tokens = u32::try_from(tokens.len()).unwrap();
+            prompt.completion_tokens = u32::try_from(tokens.len()).unwrap();
+            prompt.token_count = tokens.len();
+            prompt.token_ids = tokens;
+            prompt.token_prefix = prompt.token_ids.clone();
             prompt.reasoning_tokens = reasoning_tokens;
             let prompts = vec![prompt];
             CanarySpecialityCalibrationReport {
                 fingerprint: aggregate_canary_fingerprint(&prompts),
-                output_tokens: 1,
-                reasoning_tokens: u64::from(reasoning_tokens),
+                token_prefixes: calibration_token_prefixes(&prompts),
+                output_tokens_min: MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS as u64,
+                output_tokens_max: MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS as u64,
+                reasoning_tokens_min: u64::from(reasoning_tokens),
+                reasoning_tokens_max: u64::from(reasoning_tokens),
                 prompts,
             }
         };

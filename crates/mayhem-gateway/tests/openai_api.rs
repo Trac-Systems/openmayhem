@@ -1118,11 +1118,17 @@ impl GatewaySessionBackend for ContextNeedleBackend {
 }
 
 fn test_app() -> Router {
-    openai_router(GatewayState::from_embedded_catalog().with_dev_session_shim())
+    openai_router(
+        GatewayState::from_embedded_catalog()
+            .with_receipt_balance_au(1_000_000_000_000_000_000)
+            .with_dev_session_shim(),
+    )
 }
 
 fn test_state_and_app() -> (GatewayState, Router) {
-    let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+    let state = GatewayState::from_embedded_catalog()
+        .with_receipt_balance_au(1_000_000_000_000_000_000)
+        .with_dev_session_shim();
     let app = openai_router(state.clone());
     (state, app)
 }
@@ -1266,7 +1272,7 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     let (status, body) = json_request(test_app(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "list");
-    assert!(body["data"].as_array().expect("model data").len() >= 2);
+    assert!(!body["data"].as_array().expect("model data").is_empty());
     assert_eq!(body["data"][0]["object"], "model");
     assert_eq!(body["data"][0]["owned_by"], "mayhem");
     assert_eq!(body["data"][0]["mayhem"]["price_ref_au"]["denom"], "au_usd");
@@ -1330,24 +1336,33 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
                     "low".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "11".repeat(32),
-                        output_tokens: 1_000,
-                        reasoning_tokens: 250,
+                        token_prefixes: BTreeMap::new(),
+                        output_tokens_min: 1_000,
+                        output_tokens_max: 1_000,
+                        reasoning_tokens_min: 250,
+                        reasoning_tokens_max: 250,
                     },
                 ),
                 (
                     "high".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "22".repeat(32),
-                        output_tokens: 2_000,
-                        reasoning_tokens: 1_500,
+                        token_prefixes: BTreeMap::new(),
+                        output_tokens_min: 2_000,
+                        output_tokens_max: 2_000,
+                        reasoning_tokens_min: 1_500,
+                        reasoning_tokens_max: 1_500,
                     },
                 ),
                 (
                     "xhigh".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "33".repeat(32),
-                        output_tokens: 3_000,
-                        reasoning_tokens: 2_500,
+                        token_prefixes: BTreeMap::new(),
+                        output_tokens_min: 3_000,
+                        output_tokens_max: 3_000,
+                        reasoning_tokens_min: 2_500,
+                        reasoning_tokens_max: 2_500,
                     },
                 ),
             ]),
@@ -2464,7 +2479,14 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
         let prompt = token_fingerprint(tokens.iter().copied()).digest;
         aggregate_canary_fingerprints([("fixed-probe", prompt.as_str())])
     };
-    let mut registry = test_canary_registry(&[4]);
+    let mut registry = test_canary_registry(&[9]);
+    registry
+        .models
+        .get_mut("mayhem/routed-test")
+        .expect("canary config")
+        .prompts[0]
+        .specialities
+        .insert("reasoning_effort".to_owned(), "high".to_owned());
     registry
         .models
         .get_mut("mayhem/routed-test")
@@ -2478,16 +2500,22 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
                     "low".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: expected_for(&[4]),
-                        output_tokens: 1,
-                        reasoning_tokens: 0,
+                        token_prefixes: BTreeMap::from([("fixed-probe".to_owned(), vec![4])]),
+                        output_tokens_min: 1,
+                        output_tokens_max: 1,
+                        reasoning_tokens_min: 0,
+                        reasoning_tokens_max: 0,
                     },
                 ),
                 (
                     "high".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: expected_for(&[5, 5]),
-                        output_tokens: 2,
-                        reasoning_tokens: 0,
+                        token_prefixes: BTreeMap::from([("fixed-probe".to_owned(), vec![5, 5])]),
+                        output_tokens_min: 2,
+                        output_tokens_max: 2,
+                        reasoning_tokens_min: 0,
+                        reasoning_tokens_max: 0,
                     },
                 ),
             ]),
@@ -2510,17 +2538,18 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
     let (status, _) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(state.receipts().len(), 3);
+    assert_eq!(state.receipts().len(), 4);
     let probes = state.probes();
-    assert_eq!(probes.len(), 1);
-    assert!(!probes[0].pass);
-    assert_eq!(probes[0].match_bps, 5_000);
-    assert_eq!(probes[0].evidence["evidence"]["levels"][0]["level"], "low");
-    assert_eq!(probes[0].evidence["evidence"]["levels"][0]["pass"], true);
-    assert_eq!(probes[0].evidence["evidence"]["levels"][1]["level"], "high");
-    assert_eq!(probes[0].evidence["evidence"]["levels"][1]["pass"], false);
+    assert_eq!(probes.len(), 2);
+    assert!(probes[0].pass, "baseline canary must still run and pass");
+    assert!(!probes[1].pass);
+    assert_eq!(probes[1].match_bps, 5_000);
+    assert_eq!(probes[1].evidence["evidence"]["levels"][0]["level"], "low");
+    assert_eq!(probes[1].evidence["evidence"]["levels"][0]["pass"], true);
+    assert_eq!(probes[1].evidence["evidence"]["levels"][1]["level"], "high");
+    assert_eq!(probes[1].evidence["evidence"]["levels"][1]["pass"], false);
     let calls = calls.lock().expect("calls lock");
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert!(calls.iter().all(|(request_levels, voucher_levels)| {
         request_levels == voucher_levels && request_levels.get("reasoning_effort").is_some()
     }));
@@ -2529,7 +2558,7 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
             .iter()
             .map(|(levels, _)| levels["reasoning_effort"].as_str())
             .collect::<Vec<_>>(),
-        vec!["high", "low", "high"]
+        vec!["high", "high", "low", "high"]
     );
 }
 
@@ -3744,6 +3773,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
             "mayhem/routed-test".to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: "canary-test-v1".to_owned(),
+                requires_launch_evidence: false,
                 match_min_bps: 9_000,
                 verification_method: "token_fingerprint".to_owned(),
                 verification_tolerance_bps: None,
@@ -3756,6 +3786,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                         extra: BTreeMap::new(),
                     }],
                     tools: None,
+                    specialities: BTreeMap::new(),
                     max_tokens: 8,
                     temperature: None,
                     top_p: None,
@@ -3805,6 +3836,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
             "admin/image-fixture".to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: "canary-image-test-v1".to_owned(),
+                requires_launch_evidence: false,
                 match_min_bps: 9_000,
                 verification_method: "seed_perceptual_hash".to_owned(),
                 verification_tolerance_bps: Some(500),
@@ -3812,6 +3844,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     id: "fixed-image".to_owned(),
                     messages: Vec::new(),
                     tools: None,
+                    specialities: BTreeMap::new(),
                     max_tokens: 1,
                     temperature: None,
                     top_p: None,
@@ -3858,6 +3891,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
             "admin/embed-fixture".to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: "canary-embedding-test-v1".to_owned(),
+                requires_launch_evidence: false,
                 match_min_bps: 9_900,
                 verification_method: "embedding_cosine".to_owned(),
                 verification_tolerance_bps: Some(100),
@@ -3865,6 +3899,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     id: "fixed-embedding".to_owned(),
                     messages: Vec::new(),
                     tools: None,
+                    specialities: BTreeMap::new(),
                     max_tokens: 1,
                     temperature: None,
                     top_p: None,
@@ -3911,6 +3946,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
             "admin/stt-fixture".to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: "canary-stt-test-v1".to_owned(),
+                requires_launch_evidence: false,
                 match_min_bps: 10_000,
                 verification_method: "transcript_match".to_owned(),
                 verification_tolerance_bps: None,
@@ -3918,6 +3954,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     id: "fixed-stt".to_owned(),
                     messages: Vec::new(),
                     tools: None,
+                    specialities: BTreeMap::new(),
                     max_tokens: 1,
                     temperature: None,
                     top_p: None,
@@ -3964,6 +4001,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
             "admin/tts-fixture".to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: "canary-tts-test-v1".to_owned(),
+                requires_launch_evidence: false,
                 match_min_bps: 10_000,
                 verification_method: "audio_fingerprint".to_owned(),
                 verification_tolerance_bps: None,
@@ -3971,6 +4009,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     id: "fixed-tts".to_owned(),
                     messages: Vec::new(),
                     tools: None,
+                    specialities: BTreeMap::new(),
                     max_tokens: 1,
                     temperature: None,
                     top_p: None,

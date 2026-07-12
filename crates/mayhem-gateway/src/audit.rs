@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::ReputationEventKind;
 
 pub const DEFAULT_CANARY_MATCH_MIN_BPS: u32 = 9_000;
+pub const MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS: usize = 64;
 pub const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 pub const CANARY_VERIFICATION_CONTEXT_NEEDLE: &str = "context_needle";
 pub const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";

@@ -366,6 +366,8 @@ pub struct GenerateRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default = "default_max_new_tokens")]
     pub max_new_tokens: u32,
@@ -541,6 +543,7 @@ impl GenerateRequest {
         Self {
             prompt: prompt.into(),
             messages: Vec::new(),
+            tools: Vec::new(),
             media: Vec::new(),
             max_new_tokens: default_max_new_tokens(),
             grammar: None,
@@ -4367,6 +4370,9 @@ mod vllm_backend {
             })?;
             command.env(name, path);
         }
+        command.env("VLLM_ENABLE_V1_MULTIPROCESSING", "0");
+        command.env("PYTHONHASHSEED", "0");
+        command.env("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
         command.env("MAX_JOBS", vllm_build_jobs().to_string());
 
         let cuda_home = resolve_vllm_cuda_home(python);
@@ -4627,6 +4633,7 @@ mod vllm_backend {
     #[cfg(unix)]
     mod tests {
         use super::*;
+        use std::collections::BTreeMap;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
@@ -4730,12 +4737,49 @@ mod vllm_backend {
         #[test]
         fn vllm_worker_multimodal_path_is_local_only_and_processor_backed() {
             assert!(WORKER.contains("AutoProcessor.from_pretrained"));
-            assert!(WORKER.contains("processor.apply_chat_template"));
+            assert!(WORKER.contains("renderer.apply_chat_template"));
             assert!(WORKER.contains("multi_modal_data"));
             assert!(WORKER.contains("limit_mm_per_prompt"));
             assert!(WORKER.contains("remote media URLs are forbidden"));
             assert!(WORKER.contains("base64.b64decode"));
             assert!(WORKER.contains("num_frames must be between 1 and 1024"));
+            assert!(WORKER.contains("\"frames_indices\": frame_indices"));
+            assert!(WORKER.contains("\"video_backend\": \"pyav\""));
+        }
+
+        #[test]
+        fn vllm_worker_enforces_seeded_batch_invariant_execution_when_supported() {
+            assert!(WORKER.contains("VLLM_BATCH_INVARIANT"));
+            assert!(WORKER.contains("capability >= (9, 0)"));
+            assert!(WORKER.contains("model_uses_hybrid_attention"));
+            assert!(WORKER.contains("linear\", \"mamba\", \"ssm\", \"gdn"));
+            assert!(WORKER.contains("\"async_scheduling\": False"));
+            assert!(WORKER.contains("\"use_fp64_gumbel\": True"));
+            assert!(WORKER.contains("required deterministic engine option(s)"));
+            assert!(WORKER.contains("model_uses_nvfp4"));
+            assert!(WORKER.contains("kwargs[\"linear_backend\"] = \"cutlass\""));
+            assert!(WORKER.contains("kwargs[\"moe_backend\"] = \"cutlass\""));
+            assert!(WORKER.contains("\"kernel_policy\": kernel_policy"));
+        }
+
+        #[test]
+        fn vllm_worker_environment_disables_nondeterministic_v1_scheduling() {
+            let cache = env::temp_dir().join(format!(
+                "mayhem-vllm-determinism-env-{}",
+                std::process::id()
+            ));
+            let mut command = std::process::Command::new("python3");
+            configure_vllm_worker_environment(&mut command, Path::new("python3"), Some(&cache))
+                .unwrap();
+            let environment = command
+                .get_envs()
+                .filter_map(|(name, value)| Some((name.to_str()?, value?.to_str()?)))
+                .collect::<BTreeMap<_, _>>();
+
+            assert_eq!(environment["VLLM_ENABLE_V1_MULTIPROCESSING"], "0");
+            assert_eq!(environment["PYTHONHASHSEED"], "0");
+            assert_eq!(environment["CUBLAS_WORKSPACE_CONFIG"], ":4096:8");
+            let _ = fs::remove_dir_all(cache);
         }
 
         #[test]
@@ -5717,6 +5761,45 @@ mod trt_llm_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speciality_reasoning_detection_ignores_history_preservation_controls() {
+        for (name, worker) in [
+            ("mlx", include_str!("mlx_worker.py")),
+            ("vllm", include_str!("vllm_worker.py")),
+            ("trt-llm", include_str!("trtllm_worker.py")),
+        ] {
+            let history_guard = worker
+                .find("(\"preserve\", \"history\", \"retain\")")
+                .unwrap_or_else(|| panic!("{name} worker lacks the reasoning-history guard"));
+            let value_check = worker[history_guard..]
+                .find("value = item.get(\"value\")")
+                .map(|offset| history_guard + offset)
+                .unwrap_or_else(|| panic!("{name} worker lacks reasoning value handling"));
+            assert!(
+                history_guard < value_check,
+                "{name} must ignore history controls before evaluating reasoning values"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_workers_forward_tool_definitions_into_chat_templates() {
+        for (name, worker) in [
+            ("mlx", include_str!("mlx_worker.py")),
+            ("vllm", include_str!("vllm_worker.py")),
+            ("trt-llm", include_str!("trtllm_worker.py")),
+        ] {
+            assert!(
+                worker.contains("payload.get(\"tools\")"),
+                "{name} worker does not read template tools"
+            );
+            assert!(
+                worker.contains("[\"tools\"] = template_tools"),
+                "{name} worker does not pass tools to its chat template"
+            );
+        }
+    }
     use std::io::Write;
 
     #[cfg(any(feature = "trt-llm", feature = "vllm"))]

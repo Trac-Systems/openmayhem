@@ -18,6 +18,8 @@ engine = None
 tokenizer = None
 processor = None
 ctx_size = 2048
+batch_invariant = False
+kernel_policy = "auto"
 event_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(event_loop)
 
@@ -47,6 +49,73 @@ def required_sampling_kwargs(callable_obj, kwargs, requested):
             + ", ".join(missing)
         )
     return accepted
+
+
+def required_engine_kwargs(callable_obj, kwargs, required):
+    accepted = accepted_kwargs(callable_obj, kwargs)
+    missing = sorted(name for name in required if name not in accepted)
+    if missing:
+        raise ValueError(
+            "vLLM backend lacks required deterministic engine option(s): "
+            + ", ".join(missing)
+        )
+    return accepted
+
+
+def model_uses_hybrid_attention(path):
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(path, trust_remote_code=False)
+    configs = [config, getattr(config, "text_config", None)]
+    hybrid_markers = ("linear", "mamba", "ssm", "gdn", "recurrent", "rwkv")
+    for candidate in configs:
+        if candidate is None:
+            continue
+        layer_types = getattr(candidate, "layer_types", None) or []
+        if any(
+            any(marker in str(layer_type).lower() for marker in hybrid_markers)
+            for layer_type in layer_types
+        ):
+            return True
+        model_type = str(getattr(candidate, "model_type", "")).lower()
+        if any(marker in model_type for marker in ("mamba", "jamba", "rwkv")):
+            return True
+    return False
+
+
+def model_uses_nvfp4(path):
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(path, trust_remote_code=False)
+    quantization = getattr(config, "quantization_config", None) or {}
+    return "nvfp4" in json.dumps(quantization, sort_keys=True).lower()
+
+
+def configure_deterministic_runtime(path):
+    global batch_invariant
+
+    # Seeded canaries must survive batching and scheduler changes. vLLM's
+    # batch-invariant kernels require NVIDIA compute capability 9.0 or newer,
+    # and vLLM currently refuses them for hybrid GDN/Mamba attention stacks.
+    required_environment = {
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "PYTHONHASHSEED": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    }
+    for name, expected in required_environment.items():
+        if os.environ.get(name) != expected:
+            raise RuntimeError(
+                f"deterministic vLLM worker requires {name}={expected} before Python starts"
+            )
+    import torch
+
+    cuda_supported = bool(torch.version.cuda) and torch.cuda.is_available()
+    capability = torch.cuda.get_device_capability() if cuda_supported else (0, 0)
+    batch_invariant = (
+        cuda_supported and capability >= (9, 0) and not model_uses_hybrid_attention(path)
+    )
+    os.environ["VLLM_BATCH_INVARIANT"] = "1" if batch_invariant else "0"
+    return batch_invariant
 
 
 def speciality_maps(payload):
@@ -105,8 +174,12 @@ def required_call_kwargs(callable_obj, kwargs, required, label):
 
 def reasoning_enabled(payload):
     for item in payload.get("speciality_parameters") or []:
-        haystack = f"{item.get('name', '')} {item.get('native_path', '')}".lower()
+        name = str(item.get("name") or "").lower()
+        native_path = str(item.get("native_path") or "").lower()
+        haystack = f"{name} {native_path}"
         if "reason" not in haystack and "think" not in haystack:
+            continue
+        if any(marker in haystack for marker in ("preserve", "history", "retain")):
             continue
         value = item.get("value")
         level = str(item.get("level") or "").lower()
@@ -293,6 +366,10 @@ def make_sampling_params(payload, speciality_sampling_kwargs=None):
 
 
 def create_engine(payload):
+    global kernel_policy
+
+    path = str(payload["path"])
+    configure_deterministic_runtime(path)
     AsyncEngineArgs = import_attr(
         (
             ("vllm.engine.arg_utils", "AsyncEngineArgs"),
@@ -305,7 +382,6 @@ def create_engine(payload):
             ("vllm", "AsyncLLM"),
         )
     )
-    path = str(payload["path"])
     tensor_parallel = positive_int(payload.get("tensor_parallel"), 1)
     kwargs = {
         "model": path,
@@ -318,16 +394,37 @@ def create_engine(payload):
         ),
         "tensor_parallel_size": tensor_parallel,
         "enforce_eager": bool(payload.get("enforce_eager", True)),
+        "seed": 0,
+        "use_fp64_gumbel": True,
+        "async_scheduling": False,
         "limit_mm_per_prompt": {"image": 1, "audio": 1, "video": 1},
         "mm_processor_cache_gb": 0,
     }
+    required_options = {"seed", "use_fp64_gumbel", "async_scheduling"}
+    if model_uses_nvfp4(path):
+        # vLLM's batch-invariant path selects CUTLASS for deterministic NVFP4
+        # execution. Hybrid GDN models cannot enable that global mode, so pin
+        # the same kernel family explicitly instead of using auto-selected
+        # FlashInfer linear/MoE kernels.
+        kwargs["linear_backend"] = "cutlass"
+        kwargs["moe_backend"] = "cutlass"
+        required_options.update(("linear_backend", "moe_backend"))
+        kernel_policy = "nvfp4-cutlass"
+    else:
+        kernel_policy = "auto"
     dtype = payload.get("dtype")
     if dtype:
         kwargs["dtype"] = str(dtype)
     gpu_memory_utilization = utilization_float(payload.get("gpu_memory_utilization"))
     if gpu_memory_utilization is not None:
         kwargs["gpu_memory_utilization"] = gpu_memory_utilization
-    args = AsyncEngineArgs(**accepted_kwargs(AsyncEngineArgs, kwargs))
+    args = AsyncEngineArgs(
+        **required_engine_kwargs(
+            AsyncEngineArgs,
+            kwargs,
+            required_options,
+        )
+    )
     if hasattr(AsyncLLM, "from_engine_args"):
         return AsyncLLM.from_engine_args(args)
     return AsyncLLM(args)
@@ -425,26 +522,50 @@ def decode_video(item):
     except Exception as exc:
         raise ValueError("multimodal video container cannot be decoded") from exc
     total = int(getattr(stream, "frames", 0) or 0)
+    average_rate = getattr(stream, "average_rate", None)
+    source_fps = float(average_rate) if average_rate is not None else 0.0
+    if source_fps <= 0:
+        source_fps = float(item.get("fps") or 1.0)
+    stream_duration = getattr(stream, "duration", None)
+    time_base = getattr(stream, "time_base", None)
+    duration = (
+        float(stream_duration * time_base)
+        if stream_duration is not None and time_base is not None
+        else 0.0
+    )
     wanted = None
     if total > 0:
         wanted = set(np.linspace(0, total - 1, min(requested, total), dtype=int).tolist())
     frames = []
+    frame_indices = []
     try:
         for index, frame in enumerate(container.decode(stream)):
             if wanted is None:
                 if len(frames) < requested:
                     frames.append(frame.to_ndarray(format="rgb24"))
+                    frame_indices.append(index)
                 else:
                     break
             elif index in wanted:
                 frames.append(frame.to_ndarray(format="rgb24"))
+                frame_indices.append(index)
                 if len(frames) == len(wanted):
                     break
     finally:
         container.close()
     if not frames:
         raise ValueError("multimodal video contains no decodable frames")
-    return np.stack(frames)
+    total_num_frames = max(total, frame_indices[-1] + 1, len(frames))
+    duration = max(duration, total_num_frames / source_fps)
+    metadata = {
+        "fps": source_fps,
+        "duration": duration,
+        "total_num_frames": total_num_frames,
+        "frames_indices": frame_indices,
+        "video_backend": "pyav",
+        "do_sample_frames": False,
+    }
+    return np.stack(frames), metadata
 
 
 def decode_multimodal_data(payload):
@@ -527,7 +648,7 @@ def multimodal_engine_prompt(payload, mm_data, template_kwargs, prompt_suffixes)
         return rendered, {"prompt": rendered, "multi_modal_data": mm_data}
     if template_kwargs:
         if not messages:
-            raise ValueError("chat-template speciality request is missing structured chat messages")
+            raise ValueError("chat-template request is missing structured chat messages")
         prompt = render_chat_template(tokenizer, messages, template_kwargs, "tokenizer")
     prompt += "".join(prompt_suffixes)
     return prompt, prompt
@@ -539,6 +660,13 @@ async def async_handle_generate(request_id, payload):
 
     max_tokens = request_max_tokens(payload)
     template_kwargs, sampling_kwargs, prompt_suffixes = speciality_maps(payload)
+    template_tools = payload.get("tools") or []
+    if not isinstance(template_tools, list):
+        raise ValueError("vLLM chat-template tools must be an array")
+    if template_tools:
+        if "tools" in template_kwargs:
+            raise ValueError("vLLM chat-template tools conflict with a speciality mapping")
+        template_kwargs["tools"] = template_tools
     mm_data = decode_multimodal_data(payload)
     prompt, engine_prompt = multimodal_engine_prompt(
         payload, mm_data, template_kwargs, prompt_suffixes
@@ -636,6 +764,15 @@ def handle_load(payload):
     return {
         "n_ctx_train": model_ctx(ctx_size),
         "n_vocab": int(vocab_size()),
+        "determinism": {
+            "async_scheduling": False,
+            "batch_invariant": batch_invariant,
+            "v1_multiprocessing": False,
+            "python_hash_seed": 0,
+            "fp64_gumbel": True,
+            "kernel_policy": kernel_policy,
+            "seed": 0,
+        },
     }
 
 

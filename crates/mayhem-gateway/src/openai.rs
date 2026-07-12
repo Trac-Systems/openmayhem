@@ -24,7 +24,7 @@ use crate::{
         CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT, CANARY_VERIFICATION_CONTEXT_NEEDLE,
         CANARY_VERIFICATION_EMBEDDING_COSINE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
         CANARY_VERIFICATION_TOKEN_FINGERPRINT, CANARY_VERIFICATION_TRANSCRIPT_MATCH,
-        DEFAULT_CANARY_MATCH_MIN_BPS,
+        DEFAULT_CANARY_MATCH_MIN_BPS, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
     },
     failover::{
         effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
@@ -552,9 +552,11 @@ pub struct MayhemModelInfo {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct GatewaySpecialityCalibration {
     pub fingerprint: String,
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub reasoning_tokens: u64,
+    pub token_prefixes: BTreeMap<String, Vec<i32>>,
+    pub output_tokens_min: u64,
+    pub output_tokens_max: u64,
+    pub reasoning_tokens_min: u64,
+    pub reasoning_tokens_max: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -847,6 +849,7 @@ impl GatewayFailoverPolicyConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GatewayFailoverInvocation {
     pub open_timeout_ms: u64,
+    pub session_accept_timeout_ms: Option<u64>,
     pub ttft_timeout_ms: Option<u64>,
     pub stall_timeout_ms: Option<u64>,
     pub min_tok_s: Option<f64>,
@@ -856,6 +859,7 @@ impl Default for GatewayFailoverInvocation {
     fn default() -> Self {
         Self {
             open_timeout_ms: DEFAULT_OPEN_TIMEOUT_MILLIS,
+            session_accept_timeout_ms: None,
             ttft_timeout_ms: None,
             stall_timeout_ms: None,
             min_tok_s: None,
@@ -870,6 +874,7 @@ impl GatewayFailoverInvocation {
             open_timeout_ms: config
                 .open_timeout_ms
                 .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS),
+            session_accept_timeout_ms: None,
             ttft_timeout_ms: config.ttft_timeout_ms,
             stall_timeout_ms: config.stall_timeout_ms,
             min_tok_s: config.min_tok_s,
@@ -878,6 +883,10 @@ impl GatewayFailoverInvocation {
 
     fn open_timeout(self) -> Duration {
         Duration::from_millis(self.open_timeout_ms)
+    }
+
+    fn session_accept_timeout(self) -> Option<Duration> {
+        self.session_accept_timeout_ms.map(Duration::from_millis)
     }
 
     fn ttft_timeout(self) -> Option<Duration> {
@@ -1094,11 +1103,19 @@ impl GatewayAccessControl {
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
         self.reload_store(&mut store)?;
-        let token = store
+        let Some(token) = store
             .tokens
             .iter_mut()
             .find(|token| token.token_hash == token_hash)
-            .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
+        else {
+            if self.require_auth {
+                return Err(ApiError::unauthorized(
+                    "invalid bearer token",
+                    Some("Authorization"),
+                ));
+            }
+            return Ok(None);
+        };
         if token.revoked_at.is_some() {
             return Err(ApiError::unauthorized(
                 "revoked bearer token",
@@ -1366,6 +1383,7 @@ pub struct GatewayCanaryRegistry {
 #[derive(Clone, Debug)]
 pub struct GatewayCanaryModelConfig {
     pub canary_set: String,
+    pub requires_launch_evidence: bool,
     pub match_min_bps: u32,
     pub verification_method: String,
     pub verification_tolerance_bps: Option<u32>,
@@ -1391,6 +1409,7 @@ pub struct GatewayCanaryPrompt {
     pub id: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Value>>,
+    pub specialities: BTreeMap<String, String>,
     pub max_tokens: u32,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -1747,7 +1766,15 @@ pub fn normalize_endpoint_request_for_provider(
         | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
             let request = serde_json::from_value::<ChatCompletionRequest>(raw_request.clone())
                 .map_err(|err| format!("invalid chat request: {err}"))?;
-            direct_session_contract_request(&direct_session_request_body(&request))
+            let mut normalized =
+                direct_session_contract_request(&direct_session_request_body(&request));
+            if contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT {
+                normalized
+                    .as_object_mut()
+                    .expect("chat normalization always produces an object")
+                    .remove("metadata");
+            }
+            normalized
         }
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => {
             let request = serde_json::from_value::<CompletionRequest>(raw_request.clone())
@@ -3075,16 +3102,16 @@ fn gateway_speciality_volume_estimate(
         .filter_map(|specialities| specialities.get(speciality))
         .filter_map(|levels| levels.get(level))
         .collect::<Vec<_>>();
-    let output_tokens_min = calibrations.iter().map(|row| row.output_tokens).min()?;
-    let output_tokens_max = calibrations.iter().map(|row| row.output_tokens).max()?;
+    let output_tokens_min = calibrations.iter().map(|row| row.output_tokens_min).min()?;
+    let output_tokens_max = calibrations.iter().map(|row| row.output_tokens_max).max()?;
     let reasoning_tokens_min = calibrations
         .iter()
-        .map(|row| row.reasoning_tokens)
+        .map(|row| row.reasoning_tokens_min)
         .min()
         .unwrap_or(0);
     let reasoning_tokens_max = calibrations
         .iter()
-        .map(|row| row.reasoning_tokens)
+        .map(|row| row.reasoning_tokens_max)
         .max()
         .unwrap_or(0);
     let output_rate = model.mayhem.price_ref_au.rate_map.iter().find(|rate| {
@@ -8397,6 +8424,8 @@ struct CanaryPromptDocument {
     #[serde(default)]
     tools: Option<Vec<Value>>,
     #[serde(default)]
+    specialities: BTreeMap<String, String>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f64>,
@@ -8461,6 +8490,7 @@ fn canary_registry_from_catalog_root(
         let Some(canary_set) = canary.get("set_id").and_then(Value::as_str) else {
             continue;
         };
+        let requires_launch_evidence = model.get("tier").and_then(Value::as_str) == Some("launch");
         let Some(prompts) = canary_sets.get(canary_set).cloned() else {
             continue;
         };
@@ -8577,6 +8607,7 @@ fn canary_registry_from_catalog_root(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: canary_set.to_owned(),
+                requires_launch_evidence,
                 match_min_bps,
                 verification_method,
                 verification_tolerance_bps,
@@ -8732,7 +8763,14 @@ fn aggregate_token_prefixes_for_prompts(
     prompts: &[GatewayCanaryPrompt],
     prefixes: &BTreeMap<String, Vec<i32>>,
 ) -> Option<String> {
-    let mut prompt_fingerprints = Vec::with_capacity(prompts.len());
+    aggregate_token_prefixes_for_prompt_refs(prompts.iter(), prefixes)
+}
+
+fn aggregate_token_prefixes_for_prompt_refs<'a>(
+    prompts: impl IntoIterator<Item = &'a GatewayCanaryPrompt>,
+    prefixes: &BTreeMap<String, Vec<i32>>,
+) -> Option<String> {
+    let mut prompt_fingerprints = Vec::new();
     for prompt in prompts {
         let tokens = prefixes.get(&prompt.id)?;
         let fingerprint = token_fingerprint(tokens.iter().copied()).digest;
@@ -8766,6 +8804,7 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             id: prompt.id,
             messages: prompt.messages,
             tools: prompt.tools,
+            specialities: prompt.specialities,
             max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
             temperature: prompt.temperature,
             top_p: prompt.top_p,
@@ -9723,11 +9762,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -9936,11 +9975,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -10110,11 +10149,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -10284,11 +10323,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -10448,11 +10487,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -10612,11 +10651,11 @@ impl ScBridgeGatewaySessionBackend {
                 ))
             })?;
 
-        let accept = next_session_frame(
+        let accept = next_session_frame_with_optional_wait(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
-            invocation.failover.open_timeout(),
+            invocation.failover.session_accept_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -15593,11 +15632,11 @@ async fn open_live_direct_chat_session(
             ))
         })?;
 
-    let accept = next_session_frame(
+    let accept = next_session_frame_with_optional_wait(
         &mut bridge,
         &invocation.session_id,
         direct_peer,
-        invocation.failover.open_timeout(),
+        invocation.failover.session_accept_timeout(),
         &["s.accept", "s.reject"],
     )
     .await
@@ -19628,19 +19667,27 @@ fn validate_chat_modalities(
     limits: &GatewayMediaLimits,
 ) -> Result<(), ApiError> {
     let modalities = chat_input_modalities(&request.messages);
-    if modalities.image && !model.mayhem.caps.vision {
+    let supports = |modality: &str| {
+        model
+            .mayhem
+            .adapter
+            .modality_set
+            .iter()
+            .any(|served| served == modality)
+    };
+    if modalities.image && !supports("image") {
         return Err(ApiError::bad_request(
             "model does not support image_url chat content",
             Some("messages"),
         ));
     }
-    if modalities.audio && !model.mayhem.caps.audio {
+    if modalities.audio && !supports("audio") {
         return Err(ApiError::bad_request(
             "model does not support input_audio chat content",
             Some("messages"),
         ));
     }
-    if modalities.video && !model.mayhem.caps.video {
+    if modalities.video && !supports("video") {
         return Err(ApiError::bad_request(
             "model does not support video chat content",
             Some("messages"),
@@ -20092,32 +20139,34 @@ impl GatewayState {
         if !should_probe {
             return;
         }
-        let probe = match config.verification_method.as_str() {
+        let probes = match config.verification_method.as_str() {
             CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
                 self.run_canary_probe_for_route(model, invocation, &config)
                     .await
             }
-            CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => {
-                self.run_seed_perceptual_hash_probe_for_route(model, invocation, &config)
-                    .await
-            }
-            CANARY_VERIFICATION_EMBEDDING_COSINE => {
-                self.run_embedding_cosine_probe_for_route(model, invocation, &config)
-                    .await
-            }
-            CANARY_VERIFICATION_TRANSCRIPT_MATCH => {
-                self.run_transcript_match_probe_for_route(model, invocation, &config)
-                    .await
-            }
-            CANARY_VERIFICATION_AUDIO_FINGERPRINT => {
-                self.run_audio_fingerprint_probe_for_route(model, invocation, &config)
-                    .await
-            }
+            CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => self
+                .run_seed_perceptual_hash_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
+            CANARY_VERIFICATION_EMBEDDING_COSINE => self
+                .run_embedding_cosine_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
+            CANARY_VERIFICATION_TRANSCRIPT_MATCH => self
+                .run_transcript_match_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
+            CANARY_VERIFICATION_AUDIO_FINGERPRINT => self
+                .run_audio_fingerprint_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
             _ => return,
         };
-        match probe {
-            Ok(probe) => {
-                self.record_probe(probe);
+        match probes {
+            Ok(probes) => {
+                for probe in probes {
+                    self.record_probe(probe);
+                }
                 if config.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
                     if let Ok(Some(context_probe)) = self
                         .run_context_needle_probe_for_route(model, invocation, &config)
@@ -20300,7 +20349,7 @@ impl GatewayState {
         model: &GatewayModel,
         served_invocation: &GatewaySessionInvocation,
         config: &GatewayCanaryModelConfig,
-    ) -> Result<StoredProbeEvent, ApiError> {
+    ) -> Result<Vec<StoredProbeEvent>, ApiError> {
         let all_expected_token_prefixes = canary_expected_token_prefixes(config, served_invocation)
             .ok_or_else(|| {
                 ApiError::bad_gateway(
@@ -20350,17 +20399,6 @@ impl GatewayState {
                 "catalog canary token prefixes do not cover every served-modality prompt",
                 Some("model"),
             ));
-        }
-        if !model.mayhem.adapter.specialities.is_empty() {
-            return self
-                .run_speciality_canary_probe_for_route(
-                    model,
-                    served_invocation,
-                    config,
-                    route.as_ref(),
-                    &prompts,
-                )
-                .await;
         }
         let expected_prompt_fingerprints = expected_token_prefixes
             .iter()
@@ -20522,7 +20560,20 @@ impl GatewayState {
             }),
             probe_command,
         };
-        Ok(event)
+        let mut events = vec![event];
+        if !model.mayhem.adapter.specialities.is_empty() {
+            events.push(
+                self.run_speciality_canary_probe_for_route(
+                    model,
+                    served_invocation,
+                    config,
+                    route.as_ref(),
+                    &prompts,
+                )
+                .await?,
+            );
+        }
+        Ok(events)
     }
 
     async fn run_speciality_canary_probe_for_route(
@@ -20589,7 +20640,33 @@ impl GatewayState {
                         Some("model"),
                     )
                 })?;
-                if !is_hex_len(&expected.fingerprint, 64) || expected.output_tokens == 0 {
+                let level_prompts = prompts
+                    .iter()
+                    .copied()
+                    .filter(|prompt| expected.token_prefixes.contains_key(&prompt.id))
+                    .collect::<Vec<_>>();
+                let expected_fingerprint = aggregate_token_prefixes_for_prompt_refs(
+                    level_prompts.iter().copied(),
+                    &expected.token_prefixes,
+                );
+                let stable_tokens = expected
+                    .token_prefixes
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>();
+                if !is_hex_len(&expected.fingerprint, 64)
+                    || level_prompts.is_empty()
+                    || level_prompts.len() != expected.token_prefixes.len()
+                    || expected_fingerprint.as_deref() != Some(expected.fingerprint.as_str())
+                    || expected.token_prefixes.is_empty()
+                    || expected.token_prefixes.values().any(Vec::is_empty)
+                    || (config.requires_launch_evidence
+                        && stable_tokens < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS)
+                    || expected.output_tokens_min == 0
+                    || expected.output_tokens_max < expected.output_tokens_min
+                    || expected.reasoning_tokens_max < expected.reasoning_tokens_min
+                    || expected.reasoning_tokens_max > expected.output_tokens_max
+                {
                     return Err(ApiError::bad_gateway(
                         format!(
                             "invalid signed calibration for speciality {} level {}",
@@ -20611,13 +20688,16 @@ impl GatewayState {
                         Some("model"),
                     ));
                 }
-                let mut prompt_reports = Vec::with_capacity(prompts.len());
-                let mut prompt_fingerprints = BTreeMap::new();
+                let mut prompt_reports = Vec::with_capacity(level_prompts.len());
+                let mut observed_prefixes = BTreeMap::new();
                 let mut observed_output_tokens = 0u64;
                 let mut observed_reasoning_tokens = 0u64;
 
-                for prompt in prompts {
+                for prompt in &level_prompts {
                     let mut request = canary_chat_request(model, prompt, self.canary_policy.seed)?;
+                    request.reasoning_effort = None;
+                    request.speciality_values.clear();
+                    request.effective_specialities.clear();
                     if descriptor.name == "reasoning_effort" {
                         request.reasoning_effort = Some(level_name.clone());
                     } else {
@@ -20637,10 +20717,26 @@ impl GatewayState {
                         .run_chat(model, &request, &invocation)
                         .await
                         .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    let expected_prefix = expected.token_prefixes.get(&prompt.id).ok_or_else(|| {
+                        ApiError::bad_gateway(
+                            format!(
+                                "signed calibration for speciality {} level {} is missing prompt {}",
+                                descriptor.name, level_name, prompt.id
+                            ),
+                            Some("model"),
+                        )
+                    })?;
+                    let observed_prefix = result
+                        .token_ids
+                        .iter()
+                        .copied()
+                        .take(expected_prefix.len())
+                        .collect::<Vec<_>>();
                     let observed_prompt_fingerprint =
+                        token_fingerprint(observed_prefix.iter().copied()).digest;
+                    let full_output_fingerprint =
                         token_fingerprint(result.token_ids.iter().copied()).digest;
-                    prompt_fingerprints
-                        .insert(prompt.id.clone(), observed_prompt_fingerprint.clone());
+                    observed_prefixes.insert(prompt.id.clone(), observed_prefix);
                     let receipt = self.meter_chat_session(
                         model,
                         &request,
@@ -20667,20 +20763,25 @@ impl GatewayState {
                         "selected_specialities": invocation.spend_voucher.body.required_specialities,
                         "token_count": result.token_ids.len(),
                         "token_ids": result.token_ids,
-                        "token_fingerprint": observed_prompt_fingerprint,
+                        "stable_prefix_fingerprint": observed_prompt_fingerprint,
+                        "full_output_fingerprint": full_output_fingerprint,
                         "session_id": invocation.session_id,
                         "receipt_hash": receipt_hash,
                     }));
                     receipts.push(receipt);
                 }
 
-                let observed_fingerprint =
-                    aggregate_canary_fingerprints(prompt_fingerprints.iter().map(
-                        |(prompt_id, fingerprint)| (prompt_id.as_str(), fingerprint.as_str()),
-                    ));
+                let observed_fingerprint = aggregate_token_prefixes_for_prompt_refs(
+                    level_prompts.iter().copied(),
+                    &observed_prefixes,
+                )
+                .unwrap_or_default();
                 let fingerprint_match = observed_fingerprint == expected.fingerprint;
-                let output_tokens_match = observed_output_tokens == expected.output_tokens;
-                let reasoning_tokens_match = observed_reasoning_tokens == expected.reasoning_tokens;
+                let output_tokens_match = (expected.output_tokens_min..=expected.output_tokens_max)
+                    .contains(&observed_output_tokens);
+                let reasoning_tokens_match = (expected.reasoning_tokens_min
+                    ..=expected.reasoning_tokens_max)
+                    .contains(&observed_reasoning_tokens);
                 let pass = fingerprint_match && output_tokens_match && reasoning_tokens_match;
                 total_levels = total_levels.saturating_add(1);
                 if pass {
@@ -20699,9 +20800,11 @@ impl GatewayState {
                     "level": level_name,
                     "expected_fingerprint": expected.fingerprint,
                     "observed_fingerprint": observed_fingerprint,
-                    "expected_output_tokens": expected.output_tokens,
+                    "expected_output_tokens_min": expected.output_tokens_min,
+                    "expected_output_tokens_max": expected.output_tokens_max,
                     "observed_output_tokens": observed_output_tokens,
-                    "expected_reasoning_tokens": expected.reasoning_tokens,
+                    "expected_reasoning_tokens_min": expected.reasoning_tokens_min,
+                    "expected_reasoning_tokens_max": expected.reasoning_tokens_max,
                     "observed_reasoning_tokens": observed_reasoning_tokens,
                     "fingerprint_match": fingerprint_match,
                     "output_tokens_match": output_tokens_match,
@@ -23054,8 +23157,13 @@ fn canary_chat_request(
         stop: None,
         max_tokens: Some(prompt.max_tokens.max(1)),
         max_completion_tokens: None,
-        reasoning_effort: None,
-        speciality_values: BTreeMap::new(),
+        reasoning_effort: prompt.specialities.get("reasoning_effort").cloned(),
+        speciality_values: prompt
+            .specialities
+            .iter()
+            .filter(|(name, _)| name.as_str() != "reasoning_effort")
+            .map(|(name, level)| (name.clone(), json!(level)))
+            .collect(),
         effective_specialities: BTreeMap::new(),
         endpoint_family: None,
         endpoint_request: None,
@@ -25087,6 +25195,24 @@ mod tests {
     };
 
     #[test]
+    fn hf_chat_normalization_does_not_invent_openai_metadata() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
+        )
+        .expect("HF multimodal chat contract");
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model": "test/model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .expect("HF request normalization");
+        assert!(normalized.normalized_request.get("metadata").is_none());
+        assert_eq!(normalized.normalized_request["stream"], false);
+    }
+
+    #[test]
     fn poisoned_gateway_mutex_does_not_cascade_into_later_requests() {
         let shared = Arc::new(Mutex::new(vec!["before"]));
         let poisoned = shared.clone();
@@ -25266,6 +25392,7 @@ mod tests {
             .expect("invocation");
 
         assert_eq!(invocation.failover.open_timeout_ms, 4_000);
+        assert_eq!(invocation.failover.session_accept_timeout_ms, None);
         assert_eq!(invocation.failover.ttft_timeout_ms, Some(7_000));
         assert_eq!(invocation.failover.stall_timeout_ms, Some(6_000));
         assert_eq!(invocation.failover.min_tok_s, Some(30.0));
@@ -25294,6 +25421,7 @@ mod tests {
             invocation.failover.open_timeout_ms,
             DEFAULT_OPEN_TIMEOUT_MILLIS
         );
+        assert_eq!(invocation.failover.session_accept_timeout_ms, None);
         assert_eq!(invocation.failover.stall_timeout_ms, None);
         assert_eq!(invocation.failover.ttft_timeout_ms, None);
     }
@@ -25690,6 +25818,21 @@ mod tests {
         assert!(validate_gateway_bind_access(shared, true, false).is_err());
         assert!(validate_gateway_bind_access(shared, false, true).is_err());
         assert!(validate_gateway_bind_access(shared, true, true).is_ok());
+    }
+
+    #[test]
+    fn disabled_gateway_auth_accepts_openai_client_placeholder_tokens() {
+        let access = GatewayAccessControl::disabled();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer mayhem-local"),
+        );
+
+        assert!(access
+            .authorize(&headers, Some("mayhem/dev-chat-tools"))
+            .expect("optional auth accepts an unrecognized client placeholder")
+            .is_none());
     }
 
     #[test]
@@ -26696,6 +26839,7 @@ mod tests {
                 extra: BTreeMap::new(),
             }],
             tools: None,
+            specialities: BTreeMap::new(),
             max_tokens: 8,
             temperature: Some(1.0),
             top_p: None,
@@ -26939,6 +27083,7 @@ mod tests {
                 id: "fixed-image".to_owned(),
                 messages: Vec::new(),
                 tools: None,
+                specialities: BTreeMap::new(),
                 max_tokens: 1,
                 temperature: None,
                 top_p: None,
@@ -29315,6 +29460,8 @@ mod tests {
         let mut model = test_model();
         model.mayhem.caps.vision = true;
         model.mayhem.caps.audio = true;
+        model.mayhem.adapter.modality_set =
+            vec!["text".to_owned(), "image".to_owned(), "audio".to_owned()];
         let mut request = test_chat_request(&model.id);
         request.messages[0].content = json!([{
             "type": "image_url",
@@ -29342,7 +29489,6 @@ mod tests {
     #[test]
     fn video_chat_uses_hf_contract_and_routes_by_bounded_frame_load() {
         let mut model = test_model();
-        model.mayhem.caps.video = true;
         model.mayhem.adapter.modality_set = vec!["text".to_owned(), "video".to_owned()];
         model.mayhem.adapter.endpoint_families.push(
             mayhem_proto::endpoint_family_contract_template(

@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use mayhem_gateway::MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS;
 use mayhem_proto::{
     default_model_class, EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType,
     ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS, ENDPOINT_OPENAI_CHAT_COMPLETIONS,
@@ -182,9 +183,11 @@ pub(crate) struct CatalogSpecialityAssessment {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct CatalogSpecialityCalibration {
     pub(crate) fingerprint: String,
-    pub(crate) output_tokens: u64,
-    #[serde(default)]
-    pub(crate) reasoning_tokens: u64,
+    pub(crate) token_prefixes: BTreeMap<String, Vec<i32>>,
+    pub(crate) output_tokens_min: u64,
+    pub(crate) output_tokens_max: u64,
+    pub(crate) reasoning_tokens_min: u64,
+    pub(crate) reasoning_tokens_max: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1325,6 +1328,16 @@ fn validate_token_prefixes(model: &CatalogModel, errors: &mut Vec<String>) {
                 ));
             }
         }
+        let stable_tokens = prefixes.values().map(Vec::len).sum::<usize>();
+        if model.tier == "launch" && stable_tokens < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS {
+            errors.push(format!(
+                "{} canary token_prefixes for {} contain only {} stable tokens; launch requires at least {}",
+                model.model_id,
+                artifact,
+                stable_tokens,
+                MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS
+            ));
+        }
     }
 }
 
@@ -1671,7 +1684,11 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_endpoint_families(model, errors);
     if !matches!(
         adapter.chat_template_id.as_str(),
-        "generic_chatml" | "llama3-instruct" | "qwen2.5-instruct" | "smolvlm2-instruct"
+        "generic_chatml"
+            | "llama3-instruct"
+            | "qwen2.5-instruct"
+            | "qwen3.5-instruct"
+            | "smolvlm2-instruct"
     ) {
         errors.push(format!(
             "{} adapter.chat_template_id is unsupported: {}",
@@ -1971,13 +1988,25 @@ fn validate_speciality_calibrations(
                         model.model_id, artifact, name, level_name
                     ));
                 }
+                let stable_tokens = calibration
+                    .token_prefixes
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>();
                 if !is_hex_len(&calibration.fingerprint, 64)
-                    || calibration.output_tokens == 0
-                    || calibration.reasoning_tokens > calibration.output_tokens
+                    || calibration.token_prefixes.is_empty()
+                    || calibration.token_prefixes.values().any(Vec::is_empty)
+                    || calibration.output_tokens_min == 0
+                    || calibration.output_tokens_max < calibration.output_tokens_min
+                    || calibration.reasoning_tokens_max < calibration.reasoning_tokens_min
+                    || calibration.reasoning_tokens_max > calibration.output_tokens_max
+                    || (model.tier == "launch"
+                        && stable_tokens < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS)
                 {
                     errors.push(format!(
-                        "{} speciality calibration for {}/{}/{} requires a 32-byte fingerprint, positive output tokens, and reasoning <= output",
+                        "{} speciality calibration for {}/{}/{} requires exact stable prefixes, valid output/reasoning ranges, and at least {} launch token positions",
                         model.model_id, artifact, name, level_name
+                        , MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS
                     ));
                 }
             }
@@ -2933,7 +2962,7 @@ fn canary_prompt_modalities<'a>(
                         Some("input_audio") => {
                             modalities.insert("audio");
                         }
-                        Some("video_url") | Some("input_video") => {
+                        Some("video") | Some("video_url") | Some("input_video") => {
                             modalities.insert("video");
                         }
                         _ => {}
@@ -3358,7 +3387,10 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::from([(
                     "fixture".to_owned(),
-                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
                 embedding_vectors: BTreeMap::new(),
@@ -3396,7 +3428,10 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::from([(
                     "fixture".to_owned(),
-                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
                 embedding_vectors: BTreeMap::new(),
@@ -3461,16 +3496,28 @@ mod tests {
                         "low".to_owned(),
                         CatalogSpecialityCalibration {
                             fingerprint: "b".repeat(64),
-                            output_tokens: 8,
-                            reasoning_tokens: 2,
+                            token_prefixes: BTreeMap::from([(
+                                "fixed-text".to_owned(),
+                                vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                            )]),
+                            output_tokens_min: 8,
+                            output_tokens_max: 8,
+                            reasoning_tokens_min: 2,
+                            reasoning_tokens_max: 2,
                         },
                     ),
                     (
                         "high".to_owned(),
                         CatalogSpecialityCalibration {
                             fingerprint: "c".repeat(64),
-                            output_tokens: 24,
-                            reasoning_tokens: 16,
+                            token_prefixes: BTreeMap::from([(
+                                "fixed-text".to_owned(),
+                                vec![2; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                            )]),
+                            output_tokens_min: 24,
+                            output_tokens_max: 24,
+                            reasoning_tokens_min: 16,
+                            reasoning_tokens_max: 16,
                         },
                     ),
                 ]),
@@ -3620,7 +3667,10 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::from([(
                     "fixture".to_owned(),
-                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
                 embedding_vectors: BTreeMap::new(),
@@ -3791,7 +3841,10 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::from([(
                     "fixture".to_owned(),
-                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
                 embedding_vectors: BTreeMap::new(),
@@ -3800,7 +3853,7 @@ mod tests {
             },
         );
         model.adapter.tool_call_strategy = "openai_tool_calls".to_owned();
-        model.adapter.chat_template_id = "qwen2.5-instruct".to_owned();
+        model.adapter.chat_template_id = "qwen3.5-instruct".to_owned();
         model.adapter.reasoning_passthrough = "preserve".to_owned();
         let mut errors = Vec::new();
         validate_model(&model, &mut errors);
@@ -3897,6 +3950,52 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("adapter.modality_set entry is unsupported: smell")));
+    }
+
+    #[test]
+    fn token_canary_video_shape_counts_as_video_input() {
+        let model = verification_test_model(
+            "admin/video-chat@fixture",
+            DEFAULT_MODEL_CLASS,
+            "vllm",
+            CanaryRef {
+                set_id: "canary-video-chat-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        let prompt = CanarySetPrompt {
+            id: "video".to_owned(),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "video", "video": {"data": "AAAA", "num_frames": 1}}
+                ]
+            })],
+            prompt: None,
+            input: None,
+            audio_b64: None,
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            seed: None,
+            max_tokens: Some(8),
+        };
+
+        assert_eq!(
+            canary_prompt_modalities(&model, &prompt),
+            BTreeSet::from(["text", "video"])
+        );
     }
 
     #[test]
