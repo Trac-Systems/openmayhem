@@ -54539,7 +54539,7 @@ fn mayhem_asset_root() -> Result<PathBuf> {
     if let Some(value) = env::var_os("MAYHEM_ASSET_DIR") {
         let root = absolutize(PathBuf::from(value))?;
         if mayhem_asset_root_marker(&root) {
-            return Ok(fs::canonicalize(&root).unwrap_or(root));
+            return Ok(asset_root_for_child_process(root));
         }
         bail!(
             "MAYHEM_ASSET_DIR={} does not look like a Mayhem asset directory",
@@ -54559,13 +54559,27 @@ fn mayhem_asset_root() -> Result<PathBuf> {
 
     for candidate in candidates {
         if mayhem_asset_root_marker(&candidate) {
-            return Ok(fs::canonicalize(&candidate).unwrap_or(candidate));
+            return Ok(asset_root_for_child_process(candidate));
         }
     }
 
     bail!(
         "Mayhem assets were not found; set MAYHEM_ASSET_DIR to the release/share directory or run from a Mayhem checkout"
     )
+}
+
+fn asset_root_for_child_process(root: PathBuf) -> PathBuf {
+    let canonical = fs::canonicalize(&root).unwrap_or(root);
+    let Some(text) = canonical.to_str() else {
+        return canonical;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    canonical
 }
 
 fn push_asset_root_candidates(out: &mut Vec<PathBuf>, start: &Path) {
@@ -55568,6 +55582,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn child_process_asset_root_strips_windows_verbatim_disk_prefix() {
+        assert_eq!(
+            asset_root_for_child_process(PathBuf::from(r"\\?\C:\mayhem\openmayhem")),
+            PathBuf::from(r"C:\mayhem\openmayhem")
+        );
+    }
+
+    #[test]
+    fn child_process_asset_root_preserves_windows_unc_path() {
+        assert_eq!(
+            asset_root_for_child_process(PathBuf::from(r"\\?\UNC\server\share\openmayhem")),
+            PathBuf::from(r"\\server\share\openmayhem")
+        );
+    }
 
     struct TestRelease {
         home: PathBuf,
