@@ -47554,6 +47554,7 @@ enum ProviderReasoningStreamState {
     Preserve,
     Probe,
     Suppress,
+    Boundary,
     Passthrough,
 }
 
@@ -47588,6 +47589,7 @@ impl ProviderReasoningOutputFilter {
                 self.pending.push_str(text);
                 self.resolve_suppressed()
             }
+            ProviderReasoningStreamState::Boundary => self.resolve_boundary(text),
         }
     }
 
@@ -47609,9 +47611,9 @@ impl ProviderReasoningOutputFilter {
                 self.pending.clear();
                 String::new()
             }
-            ProviderReasoningStreamState::Preserve | ProviderReasoningStreamState::Passthrough => {
-                String::new()
-            }
+            ProviderReasoningStreamState::Preserve
+            | ProviderReasoningStreamState::Boundary
+            | ProviderReasoningStreamState::Passthrough => String::new(),
         }
     }
 
@@ -47629,10 +47631,9 @@ impl ProviderReasoningOutputFilter {
             return self.resolve_suppressed();
         }
         if let Some(rest) = trimmed.strip_prefix(PROVIDER_REASONING_CLOSE_TAG) {
-            let visible = trim_provider_reasoning_boundary(rest).to_owned();
+            let rest = rest.to_owned();
             self.pending.clear();
-            self.state = ProviderReasoningStreamState::Passthrough;
-            return visible;
+            return self.resolve_boundary(&rest);
         }
         self.state = ProviderReasoningStreamState::Passthrough;
         std::mem::take(&mut self.pending)
@@ -47640,13 +47641,9 @@ impl ProviderReasoningOutputFilter {
 
     fn resolve_suppressed(&mut self) -> String {
         if let Some(index) = self.pending.find(PROVIDER_REASONING_CLOSE_TAG) {
-            let visible = trim_provider_reasoning_boundary(
-                &self.pending[index + PROVIDER_REASONING_CLOSE_TAG.len()..],
-            )
-            .to_owned();
+            let rest = self.pending[index + PROVIDER_REASONING_CLOSE_TAG.len()..].to_owned();
             self.pending.clear();
-            self.state = ProviderReasoningStreamState::Passthrough;
-            return visible;
+            return self.resolve_boundary(&rest);
         }
 
         let retained = (1..PROVIDER_REASONING_CLOSE_TAG.len())
@@ -47663,6 +47660,17 @@ impl ProviderReasoningOutputFilter {
             self.pending = tail;
         }
         String::new()
+    }
+
+    fn resolve_boundary(&mut self, text: &str) -> String {
+        let visible = trim_provider_reasoning_boundary(text);
+        if visible.is_empty() {
+            self.state = ProviderReasoningStreamState::Boundary;
+            String::new()
+        } else {
+            self.state = ProviderReasoningStreamState::Passthrough;
+            visible.to_owned()
+        }
     }
 }
 
@@ -62509,7 +62517,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let chunks = [
             "private chain ",
             "of thought</thi",
-            "nk>\n\npublic ",
+            "nk>",
+            "\n",
+            "\npublic ",
             "answer",
         ];
         let visible = chunks
