@@ -1391,6 +1391,18 @@ fn calibration_mutations_for_literal(
     mutations
 }
 
+fn endpoint_calibration_companion_baseline(
+    contract: &EndpointFamilyContract,
+    path: &str,
+    fallback: Value,
+) -> Value {
+    contract
+        .request_attribute_specs
+        .get(path)
+        .and_then(endpoint_calibration_baseline)
+        .unwrap_or(fallback)
+}
+
 fn add_calibration_companion_mutations(
     contract: &EndpointFamilyContract,
     path: &str,
@@ -1435,7 +1447,14 @@ fn add_calibration_companion_mutations(
                     json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
                 );
                 add("messages.content.video.num_frames", json!(2));
-                add("messages.content.video.fps", json!(8.0));
+                add(
+                    "messages.content.video.fps",
+                    endpoint_calibration_companion_baseline(
+                        contract,
+                        "messages.content.video.fps",
+                        json!(8.0),
+                    ),
+                );
             }
             _ => {}
         },
@@ -1453,7 +1472,14 @@ fn add_calibration_companion_mutations(
             add("messages.content.video.data", json!("$VIDEO_BASE64"));
             add("messages.content.video.content_type", json!("video/mp4"));
             add("messages.content.video.num_frames", json!(16));
-            add("messages.content.video.fps", json!(8.0));
+            add(
+                "messages.content.video.fps",
+                endpoint_calibration_companion_baseline(
+                    contract,
+                    "messages.content.video.fps",
+                    json!(8.0),
+                ),
+            );
         }
         "messages.content.video.frames" => {
             let frame_count = value.and_then(Value::as_array).map(Vec::len).unwrap_or(2);
@@ -1463,7 +1489,14 @@ fn add_calibration_companion_mutations(
                 Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
             );
             add("messages.content.video.num_frames", json!(frame_count));
-            add("messages.content.video.fps", json!(8.0));
+            add(
+                "messages.content.video.fps",
+                endpoint_calibration_companion_baseline(
+                    contract,
+                    "messages.content.video.fps",
+                    json!(8.0),
+                ),
+            );
         }
         "messages.content.video.num_frames" => {
             let frame_count = value.and_then(Value::as_u64).unwrap_or(2).min(64) as usize;
@@ -1473,7 +1506,14 @@ fn add_calibration_companion_mutations(
                 Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
             );
             add("messages.content.video.num_frames", json!(frame_count));
-            add("messages.content.video.fps", json!(8.0));
+            add(
+                "messages.content.video.fps",
+                endpoint_calibration_companion_baseline(
+                    contract,
+                    "messages.content.video.fps",
+                    json!(8.0),
+                ),
+            );
         }
         "messages.content.video.fps" => {
             add("messages.content.type", json!("video"));
@@ -1482,7 +1522,14 @@ fn add_calibration_companion_mutations(
                 json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
             );
             add("messages.content.video.num_frames", json!(2));
-            add("messages.content.video.fps", json!(8.0));
+            add(
+                "messages.content.video.fps",
+                endpoint_calibration_companion_baseline(
+                    contract,
+                    "messages.content.video.fps",
+                    json!(8.0),
+                ),
+            );
         }
         _ => {}
     }
@@ -1580,19 +1627,29 @@ fn add_boundary_calibration_cases(
         .or_else(|| spec.enum_values.first().cloned())
         .unwrap_or_else(|| json!("item"));
     for (kind, length, accept) in length_boundary_values(spec.min_items, spec.max_items) {
+        let mut mutations = vec![EndpointCalibrationMutation {
+            path: path.to_owned(),
+            value: EndpointCalibrationValue::ArrayLength {
+                length,
+                item: array_item.clone(),
+            },
+        }];
+        let companion_value = usize::try_from(length)
+            .ok()
+            .map(|length| Value::Array(vec![array_item.clone(); length]));
+        add_calibration_companion_mutations(
+            contract,
+            path,
+            companion_value.as_ref(),
+            &mut mutations,
+        );
         push_calibration_case(
             cases,
             contract,
             contract_fingerprint,
             base_request,
             kind,
-            vec![EndpointCalibrationMutation {
-                path: path.to_owned(),
-                value: EndpointCalibrationValue::ArrayLength {
-                    length,
-                    item: array_item.clone(),
-                },
-            }],
+            mutations,
             accept,
             Vec::new(),
         );
@@ -2279,5 +2336,74 @@ mod tests {
         );
         assert_eq!(request["messages"][0]["role"], "user");
         assert!(validate_endpoint_request(&contract, &request).is_ok());
+    }
+
+    #[test]
+    fn chat_matrix_uses_model_contract_video_fps_for_companions() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_HF_MULTIMODAL_CHAT)
+            .expect("HF multimodal chat contract");
+        let fps = contract
+            .request_attribute_specs
+            .get_mut("messages.content.video.fps")
+            .expect("video fps spec");
+        fps.minimum = Some(1.0);
+        fps.maximum = Some(1.0);
+        fps.calibration_values = vec![json!(1.0)];
+
+        let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
+        let substitutions = BTreeMap::from([
+            ("$MODEL".to_owned(), json!("test/model")),
+            (
+                "$IMAGE_DATA_URL".to_owned(),
+                json!("data:image/png;base64,aGVsbG8="),
+            ),
+            ("$AUDIO_BASE64".to_owned(), json!("aGVsbG8=")),
+            ("$VIDEO_BASE64".to_owned(), json!("aGVsbG8=")),
+        ]);
+        let video = cases
+            .iter()
+            .find(|case| {
+                case.case_kind.starts_with("accepted_value_")
+                    && case.mutations.iter().any(|mutation| {
+                        mutation.path == "messages.content.type"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal {
+                                    value: json!("video"),
+                                })
+                    })
+            })
+            .expect("video type row");
+        let request =
+            materialize_endpoint_calibration_request(video, &substitutions).expect("video request");
+
+        assert_eq!(
+            request["messages"][0]["content"][0]["video"]["fps"],
+            json!(1.0)
+        );
+        assert!(validate_endpoint_request(&contract, &request).is_ok());
+
+        let frame_boundaries = cases
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case.case_kind.as_str(),
+                    "minimum_length_valid" | "maximum_length_valid"
+                ) && case
+                    .mutations
+                    .iter()
+                    .any(|mutation| mutation.path == "messages.content.video.frames")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(frame_boundaries.len(), 2);
+        for case in frame_boundaries {
+            let request = materialize_endpoint_calibration_request(case, &substitutions)
+                .expect("video frame boundary request");
+            let video = &request["messages"][0]["content"][0]["video"];
+            let frame_count = video["frames"].as_array().expect("video frames").len();
+            assert_eq!(request["messages"][0]["content"][0]["type"], "video");
+            assert_eq!(video["num_frames"], json!(frame_count));
+            assert_eq!(video["fps"], json!(1.0));
+            assert!(validate_endpoint_request(&contract, &request).is_ok());
+        }
     }
 }

@@ -2743,6 +2743,18 @@ struct CatalogSignArgs {
     #[arg(long, value_name = "PATH")]
     catalog_path: Option<PathBuf>,
 
+    /// Currently active catalog whose existing models must be preserved.
+    #[arg(long, value_name = "PATH")]
+    base_catalog_path: Option<PathBuf>,
+
+    /// Permit an intentional change to this existing model. Repeat per model.
+    #[arg(long, value_name = "MODEL_ID")]
+    allow_model_change: Vec<String>,
+
+    /// Sign the first catalog for a new network, where no base catalog exists.
+    #[arg(long, conflicts_with = "base_catalog_path")]
+    initial_catalog: bool,
+
     /// Write the detached catalog signature JSON here.
     #[arg(long, value_name = "PATH")]
     signature_output: PathBuf,
@@ -7868,6 +7880,27 @@ fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
         .unwrap_or_else(|| repo_path("catalog/keys"))?;
     let keys_dir = absolutize(keys_dir)?;
     let seed_file = absolutize(args.seed_file.clone())?;
+    if args.initial_catalog {
+        ensure!(
+            args.allow_model_change.is_empty(),
+            "--allow-model-change cannot be used with --initial-catalog"
+        );
+    } else {
+        let base_catalog_path = args
+            .base_catalog_path
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+        let base_catalog_path = absolutize(base_catalog_path)?;
+        ensure!(
+            base_catalog_path != catalog_path,
+            "refusing to sign a catalog in place; pass a separate draft with --catalog-path so the active base can be compared"
+        );
+        validate_additive_catalog_update(
+            &base_catalog_path,
+            &catalog_path,
+            &args.allow_model_change.into_iter().collect(),
+        )?;
+    }
 
     let report = catalog_sign_report(CatalogSignRequest {
         catalog_path,
@@ -7909,6 +7942,74 @@ fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
             shell_single_quote(&report.keys_dir.display().to_string())
         );
     }
+    Ok(())
+}
+
+fn catalog_models_by_id(path: &Path) -> Result<BTreeMap<String, Value>> {
+    let document = read_json_file(path)?;
+    let models = document
+        .get("models")
+        .and_then(Value::as_array)
+        .with_context(|| format!("catalog {} must contain a models array", path.display()))?;
+    let mut by_id = BTreeMap::new();
+    for model in models {
+        let model_id = model
+            .get("model_id")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!(
+                    "catalog {} contains a model without model_id",
+                    path.display()
+                )
+            })?;
+        ensure!(
+            by_id.insert(model_id.to_owned(), model.clone()).is_none(),
+            "catalog {} duplicates model {model_id}",
+            path.display()
+        );
+    }
+    Ok(by_id)
+}
+
+fn validate_additive_catalog_update(
+    base_path: &Path,
+    candidate_path: &Path,
+    allowed_model_changes: &BTreeSet<String>,
+) -> Result<()> {
+    let base = catalog_models_by_id(base_path)?;
+    let candidate = catalog_models_by_id(candidate_path)?;
+    let unknown_allowances = allowed_model_changes
+        .iter()
+        .filter(|model_id| !base.contains_key(*model_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        unknown_allowances.is_empty(),
+        "--allow-model-change names model(s) absent from the base catalog: {}",
+        unknown_allowances.join(", ")
+    );
+
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (model_id, base_model) in &base {
+        let Some(candidate_model) = candidate.get(model_id) else {
+            removed.push(model_id.clone());
+            continue;
+        };
+        if candidate_model != base_model && !allowed_model_changes.contains(model_id) {
+            changed.push(model_id.clone());
+        }
+    }
+    ensure!(
+        removed.is_empty(),
+        "catalog signing refuses to remove existing model(s): {}; retire markets explicitly on the ledger instead",
+        removed.join(", ")
+    );
+    ensure!(
+        changed.is_empty(),
+        "catalog signing refuses unapproved changes to existing model(s): {}; review and repeat --allow-model-change for each intentional update",
+        changed.join(", ")
+    );
     Ok(())
 }
 
@@ -13146,7 +13247,7 @@ fn catalog_endpoint_calibration_translation(
 fn calibration_endpoint_attribute_is_handled(
     contract: &mayhem_proto::EndpointFamilyContract,
     path: &str,
-    request: &Value,
+    _request: &Value,
 ) -> bool {
     if contract
         .speciality_mappings
@@ -13185,11 +13286,8 @@ fn calibration_endpoint_attribute_is_handled(
             | "tool_choice"
             | "response_format"
             | "stream"
-            | "stream_options.include_usage" => true,
-            "parallel_tool_calls" => request
-                .get(path)
-                .and_then(Value::as_bool)
-                .is_some_and(|enabled| !enabled),
+            | "stream_options.include_usage"
+            | "parallel_tool_calls" => true,
             _ => false,
         },
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => matches!(
@@ -13209,13 +13307,21 @@ fn calibration_endpoint_attribute_is_handled(
                 | "stream"
         ),
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES => match path {
-            "model" | "input" | "stream" | "max_output_tokens" | "temperature" | "top_p"
-            | "top_k" | "min_p" | "tools" | "tool_choice" | "text" | "reasoning" | "metadata"
-            | "user" => true,
-            "parallel_tool_calls" => request
-                .get(path)
-                .and_then(Value::as_bool)
-                .is_some_and(|enabled| !enabled),
+            "model"
+            | "input"
+            | "stream"
+            | "max_output_tokens"
+            | "temperature"
+            | "top_p"
+            | "top_k"
+            | "min_p"
+            | "tools"
+            | "tool_choice"
+            | "text"
+            | "reasoning"
+            | "metadata"
+            | "user"
+            | "parallel_tool_calls" => true,
             _ => false,
         },
         mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => matches!(
@@ -13233,6 +13339,7 @@ fn calibration_endpoint_attribute_is_handled(
                 | "messages.content.input_audio.format"
                 | "messages.content.video.data"
                 | "messages.content.video.content_type"
+                | "messages.content.video.frames"
                 | "messages.content.video.num_frames"
                 | "messages.content.video.fps"
                 | "stream"
@@ -52327,6 +52434,15 @@ fn provider_engine_session_response_with_sampling_bounded(
             provider_engine_tool_call_outputs(&output.text, mode.strategy, &mode.tools)
         })
         .unwrap_or_default();
+    if tool_mode
+        .as_ref()
+        .is_some_and(|mode| !mode.parallel && tools.len() > 1)
+    {
+        bail!(
+            "provider engine returned {} tool calls while parallel_tool_calls=false",
+            tools.len()
+        );
+    }
     if tool_mode.as_ref().is_some_and(|mode| mode.required) && tools.is_empty() {
         bail!(
             "provider engine did not return a valid required tool call: {}",
@@ -52862,17 +52978,20 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         if tool_request.required {
             match tool_request.strategy {
                 ProviderEngineToolStrategy::MayhemJson
-                | ProviderEngineToolStrategy::QwenFunctionXml => {
+                | ProviderEngineToolStrategy::QwenFunctionXml
+                | ProviderEngineToolStrategy::GemmaFunctionCall => {
                     request.grammar = Some(GrammarSpec::ToolCall {
                         tools: tool_request.tools,
                     });
                 }
                 ProviderEngineToolStrategy::OpenAiToolCalls => {
                     request.grammar = Some(GrammarSpec::JsonSchema {
-                        schema: provider_openai_tool_calls_json_schema(&tool_request.tools),
+                        schema: provider_openai_tool_calls_json_schema(
+                            &tool_request.tools,
+                            tool_request.parallel,
+                        ),
                     });
                 }
-                ProviderEngineToolStrategy::GemmaFunctionCall => {}
             }
         }
     } else if provider_wants_json(body) {
@@ -53390,6 +53509,7 @@ struct ProviderEngineToolRequest {
     strategy: ProviderEngineToolStrategy,
     tools: Vec<ToolSpec>,
     required: bool,
+    parallel: bool,
 }
 
 fn provider_engine_tool_request(
@@ -53406,6 +53526,11 @@ fn provider_engine_tool_request(
         Some(Value::String(choice)) if matches!(choice.as_str(), "required" | "any") => true,
         Some(Value::Object(choice)) if provider_engine_named_tool_choice(choice).is_some() => true,
         Some(other) => bail!("unsupported tool_choice value: {other}"),
+    };
+    let parallel = match body.get("parallel_tool_calls") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(parallel)) => *parallel,
+        Some(_) => bail!("parallel_tool_calls must be a boolean"),
     };
     let advertised_tools = body
         .get("tools")
@@ -53441,6 +53566,7 @@ fn provider_engine_tool_request(
         strategy,
         tools,
         required,
+        parallel,
     }))
 }
 
@@ -53487,12 +53613,12 @@ fn provider_engine_named_tool_choice(choice: &serde_json::Map<String, Value>) ->
         .or_else(|| choice.get("name").and_then(Value::as_str))
 }
 
-fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec]) -> Value {
+fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) -> Value {
     let names = tools
         .iter()
         .map(|tool| Value::String(tool.name.clone()))
         .collect::<Vec<_>>();
-    json!({
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "OpenAIToolCalls",
         "type": "object",
@@ -53522,7 +53648,11 @@ fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec]) -> Value {
                 },
             },
         },
-    })
+    });
+    if !parallel {
+        schema["properties"]["tool_calls"]["maxItems"] = json!(1);
+    }
+    schema
 }
 
 fn provider_response_json_schema(body: &Value) -> Value {
@@ -53550,14 +53680,16 @@ fn provider_engine_tool_call_outputs(
             provider_qwen_function_xml_tool_call_outputs(text)
                 .or_else(|| provider_mayhem_json_tool_call_outputs(text))
         }
-        ProviderEngineToolStrategy::GemmaFunctionCall => Some(
-            gemma4::parse_tool_calls(text)?
-                .into_iter()
-                .map(|(name, arguments)| {
-                    provider_normalized_tool_call(None, name, arguments.to_string())
-                })
-                .collect(),
-        ),
+        ProviderEngineToolStrategy::GemmaFunctionCall => gemma4::parse_tool_calls(text)
+            .map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|(name, arguments)| {
+                        provider_normalized_tool_call(None, name, arguments.to_string())
+                    })
+                    .collect()
+            })
+            .or_else(|| provider_mayhem_json_tool_call_outputs(text)),
     }?;
     if calls.is_empty()
         || calls.iter().any(|call| {
@@ -63428,6 +63560,109 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 ["name"]["enum"][0],
             "write"
         );
+        assert!(schema["properties"]["tool_calls"].get("maxItems").is_none());
+    }
+
+    #[test]
+    fn provider_engine_request_constrains_required_gemma_responses_tool_choice() {
+        let mut adapter = catalog::CatalogAdapter {
+            chat_template_id: "gemma4-instruct".to_owned(),
+            tool_call_strategy: "gemma_function_call".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        adapter.endpoint_families.push(
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_RESPONSES).unwrap(),
+        );
+        let body = json!({
+            "input": "write a file",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "parameters": { "type": "object" }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": { "type": "object" }
+                    }
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "write" }
+            }
+        });
+
+        let request = provider_engine_request_from_endpoint_body_with_sampling(
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+            &body,
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+        )
+        .unwrap();
+
+        let Some(GrammarSpec::ToolCall { tools }) = request.grammar else {
+            panic!("expected constrained tool-call grammar");
+        };
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "write");
+        assert!(request.prompt.contains("declaration:write"));
+        assert!(!request.prompt.contains("declaration:read"));
+    }
+
+    #[test]
+    fn gemma_required_tool_parser_accepts_constrained_canonical_output() {
+        let tools = vec![ToolSpec::new(
+            "write",
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        )];
+
+        let calls = provider_engine_tool_call_outputs(
+            r#"{"tool":"write","arguments":{"path":"README.md"}}"#,
+            ProviderEngineToolStrategy::GemmaFunctionCall,
+            &tools,
+        )
+        .expect("canonical constrained Gemma tool output");
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn provider_engine_request_limits_required_non_parallel_tool_choice() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write one file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
+            panic!("expected OpenAI tool_calls JSON schema grammar");
+        };
+        assert_eq!(schema["properties"]["tool_calls"]["maxItems"], 1);
+        assert!(
+            !provider_engine_tool_request(&body, &adapter)
+                .unwrap()
+                .expect("tool mode")
+                .parallel
+        );
     }
 
     #[test]
@@ -70479,6 +70714,76 @@ State initialization...
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn catalog_signing_guard_requires_additive_or_explicit_model_updates() {
+        let temp = test_temp_dir("mayhem-catalog-additive-signing");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        write_json_file(
+            &base_path,
+            &json!({
+                "models": [
+                    {"model_id": "test/keep", "value": 1},
+                    {"model_id": "test/change", "value": 1}
+                ]
+            }),
+        )
+        .unwrap();
+        write_json_file(
+            &candidate_path,
+            &json!({
+                "models": [
+                    {"model_id": "test/keep", "value": 1},
+                    {"model_id": "test/change", "value": 1},
+                    {"model_id": "test/new", "value": 1}
+                ]
+            }),
+        )
+        .unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new()).unwrap();
+
+        write_json_file(
+            &candidate_path,
+            &json!({"models": [{"model_id": "test/change", "value": 1}]}),
+        )
+        .unwrap();
+        let removed =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+                .unwrap_err();
+        assert!(removed.to_string().contains("remove existing model"));
+
+        write_json_file(
+            &candidate_path,
+            &json!({
+                "models": [
+                    {"model_id": "test/keep", "value": 1},
+                    {"model_id": "test/change", "value": 2}
+                ]
+            }),
+        )
+        .unwrap();
+        let changed =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+                .unwrap_err();
+        assert!(changed.to_string().contains("unapproved changes"));
+        validate_additive_catalog_update(
+            &base_path,
+            &candidate_path,
+            &BTreeSet::from(["test/change".to_owned()]),
+        )
+        .unwrap();
+
+        let unknown = validate_additive_catalog_update(
+            &base_path,
+            &candidate_path,
+            &BTreeSet::from(["test/missing".to_owned()]),
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("absent from the base catalog"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
     #[tokio::test]
     async fn update_report_accepts_signed_test_release_and_stages_binary() {
         let temp = test_temp_dir("mayhem-release-update-ok");
@@ -70641,6 +70946,9 @@ State initialization...
 
         let err = catalog_sign(CatalogSignArgs {
             catalog_path: Some(catalog_path),
+            base_catalog_path: None,
+            allow_model_change: Vec::new(),
+            initial_catalog: false,
             signature_output,
             keys_dir: Some(temp.join("keys")),
             key_id: "test-catalog-key".to_owned(),

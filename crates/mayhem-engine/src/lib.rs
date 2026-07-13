@@ -2779,6 +2779,7 @@ mod llama_cpp_backend {
     use std::collections::VecDeque;
     use std::ffi::CString;
     use std::num::NonZeroU32;
+    use std::ops::Range;
 
     #[derive(Debug)]
     pub struct LlamaCppBackend {
@@ -2793,7 +2794,9 @@ mod llama_cpp_backend {
     impl LlamaCppBackend {
         pub fn new() -> Result<Self> {
             let mut backend = LlamaBackend::init()?;
-            backend.void_logs();
+            if std::env::var_os("MAYHEM_LLAMA_LOGS").is_none() {
+                backend.void_logs();
+            }
             Ok(Self {
                 backend,
                 model: None,
@@ -2811,6 +2814,41 @@ mod llama_cpp_backend {
         fn config(&self) -> Result<&LoadConfig> {
             self.config.as_ref().ok_or(EngineError::NotLoaded)
         }
+    }
+
+    fn llama_context_params(config: &LoadConfig, ctx_size: NonZeroU32) -> LlamaContextParams {
+        // llama.cpp's CLI defaults to the compact SWA cache; its low-level API default does not.
+        let mut params = LlamaContextParams::default()
+            .with_n_ctx(Some(ctx_size))
+            .with_n_batch(config.batch_size)
+            .with_n_ubatch(config.ubatch_size)
+            .with_n_seq_max(1)
+            .with_swa_full(false)
+            .with_no_perf(true);
+        if let Some(threads) = config.threads {
+            params = params.with_n_threads(threads).with_n_threads_batch(threads);
+        }
+        params
+    }
+
+    fn llama_prompt_batch_ranges(token_count: usize, n_batch: u32) -> Result<Vec<Range<usize>>> {
+        let batch_size = usize::try_from(n_batch).map_err(|error| {
+            EngineError::InvalidConfig(format!("llama.cpp batch size overflow: {error}"))
+        })?;
+        if batch_size == 0 {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp batch size must be greater than zero".to_owned(),
+            ));
+        }
+        if token_count == 0 {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp prompt tokenization produced no tokens".to_owned(),
+            ));
+        }
+        Ok((0..token_count)
+            .step_by(batch_size)
+            .map(|start| start..start.saturating_add(batch_size).min(token_count))
+            .collect())
     }
 
     impl EngineBackend for LlamaCppBackend {
@@ -2919,18 +2957,7 @@ mod llama_cpp_backend {
             let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
                 EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
             })?;
-            let mut ctx_params = LlamaContextParams::default()
-                .with_n_ctx(Some(ctx_size))
-                .with_n_batch(config.batch_size)
-                .with_n_ubatch(config.ubatch_size)
-                .with_n_seq_max(1)
-                .with_no_perf(true);
-            if let Some(threads) = config.threads {
-                ctx_params = ctx_params
-                    .with_n_threads(threads)
-                    .with_n_threads_batch(threads);
-            }
-
+            let ctx_params = llama_context_params(&config, ctx_size);
             let mut ctx = model.new_context(&self.backend, ctx_params)?;
             let prompt_tokens = model.str_to_token(&request.prompt, AddBos::Always)?;
             if prompt_tokens.len() >= ctx.n_ctx() as usize {
@@ -2940,19 +2967,28 @@ mod llama_cpp_backend {
                 });
             }
 
-            let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
+            let batch_ranges = llama_prompt_batch_ranges(prompt_tokens.len(), ctx.n_batch())?;
+            let batch_capacity = batch_ranges
+                .iter()
+                .map(|range| range.len())
+                .max()
+                .unwrap_or(1);
+            let mut batch = LlamaBatch::new(batch_capacity, 1);
             let last_prompt_index = prompt_tokens.len().saturating_sub(1);
-            for (index, token) in prompt_tokens.iter().enumerate() {
-                batch.add(
-                    *token,
-                    i32::try_from(index).map_err(|err| {
-                        EngineError::InvalidConfig(format!("prompt position overflow: {err}"))
-                    })?,
-                    &[0],
-                    index == last_prompt_index,
-                )?;
+            for range in batch_ranges {
+                batch.clear();
+                for index in range {
+                    batch.add(
+                        prompt_tokens[index],
+                        i32::try_from(index).map_err(|err| {
+                            EngineError::InvalidConfig(format!("prompt position overflow: {err}"))
+                        })?,
+                        &[0],
+                        index == last_prompt_index,
+                    )?;
+                }
+                ctx.decode(&mut batch)?;
             }
-            ctx.decode(&mut batch)?;
 
             let mut sampler = make_sampler(model, &request)?;
             let mut decoder = UTF_8.new_decoder();
@@ -3041,19 +3077,9 @@ mod llama_cpp_backend {
                 prompt_tokens = prompt_tokens
                     .saturating_add(u32::try_from(input_tokens.len()).unwrap_or(u32::MAX));
 
-                let mut ctx_params = LlamaContextParams::default()
-                    .with_n_ctx(Some(ctx_size))
-                    .with_n_batch(config.batch_size)
-                    .with_n_ubatch(config.ubatch_size)
-                    .with_n_seq_max(1)
+                let ctx_params = llama_context_params(&config, ctx_size)
                     .with_pooling_type(LlamaPoolingType::Mean)
-                    .with_embeddings(true)
-                    .with_no_perf(true);
-                if let Some(threads) = config.threads {
-                    ctx_params = ctx_params
-                        .with_n_threads(threads)
-                        .with_n_threads_batch(threads);
-                }
+                    .with_embeddings(true);
 
                 let mut ctx = model.new_context(&self.backend, ctx_params)?;
                 let mut batch = LlamaBatch::new(input_tokens.len().max(1), 1);
@@ -3111,18 +3137,7 @@ mod llama_cpp_backend {
             let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
                 EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
             })?;
-            let mut ctx_params = LlamaContextParams::default()
-                .with_n_ctx(Some(ctx_size))
-                .with_n_batch(config.batch_size)
-                .with_n_ubatch(config.ubatch_size)
-                .with_n_seq_max(1)
-                .with_no_perf(true);
-            if let Some(threads) = config.threads {
-                ctx_params = ctx_params
-                    .with_n_threads(threads)
-                    .with_n_threads_batch(threads);
-            }
-
+            let ctx_params = llama_context_params(&config, ctx_size);
             let mut ctx = model.new_context(&self.backend, ctx_params)?;
             let bitmaps = media_bitmaps(mtmd, &request.media)?;
             let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
@@ -3717,6 +3732,34 @@ mod llama_cpp_backend {
     #[allow(dead_code)]
     fn token_ids(tokens: &[LlamaToken]) -> Vec<i32> {
         tokens.iter().map(|token| token.0).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn context_params_use_standard_compact_swa_cache() {
+            let config = LoadConfig::gguf("model.gguf");
+            let ctx_size = NonZeroU32::new(131_072).expect("context is nonzero");
+
+            let params = llama_context_params(&config, ctx_size);
+
+            assert!(!params.swa_full());
+        }
+
+        #[test]
+        fn prompt_prefill_splits_at_the_context_batch_boundary() {
+            let ranges = llama_prompt_batch_ranges(1_201, 512).expect("batch ranges");
+
+            assert_eq!(ranges, vec![0..512, 512..1_024, 1_024..1_201]);
+            assert_eq!(
+                llama_prompt_batch_ranges(512, 512).expect("one batch"),
+                vec![0..512]
+            );
+            assert!(llama_prompt_batch_ranges(1, 0).is_err());
+            assert!(llama_prompt_batch_ranges(0, 512).is_err());
+        }
     }
 }
 
