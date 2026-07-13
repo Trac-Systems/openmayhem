@@ -56891,12 +56891,14 @@ mod tests {
             .sum::<usize>();
         assert_eq!(payload["model_count"], catalog_doc.models.len());
         assert_eq!(payload["artifact_count"], expected_artifact_count);
+        let expected_canary_set = &catalog_doc.models[0].canary.set_id;
+        let expected_canary_suffix = format!("/canaries/{expected_canary_set}.json");
         assert!(payload["canaries"].as_array().unwrap().iter().any(|entry| {
-            entry["set_id"] == "canary-launch-v1"
+            entry["set_id"] == expected_canary_set.as_str()
                 && entry["url"]
                     .as_str()
                     .unwrap()
-                    .ends_with("/canaries/canary-launch-v1.json")
+                    .ends_with(&expected_canary_suffix)
         }));
         let _ = fs::remove_dir_all(temp);
     }
