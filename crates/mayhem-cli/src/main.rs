@@ -19785,11 +19785,22 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
     let key_id = required_json_string_for(&signature, "key_id", "catalog signature")?;
     let public_key = required_json_string_for(&signature, "public_key", "catalog signature")?;
     let signature_hash = blake3_file_hex(&signature_path)?;
+    let canary_max_bytes = configured_catalog_canary_max_bytes()?;
     let canaries = report
         .canary_sets
         .iter()
         .map(|set_id| {
             let path = canaries_dir.join(format!("{set_id}.json"));
+            let bytes = fs::metadata(&path)
+                .with_context(|| format!("reading catalog canary metadata {}", path.display()))?
+                .len();
+            ensure!(
+                bytes <= canary_max_bytes as u64,
+                "catalog canary set {} is {} bytes, above the configured runtime limit of {} bytes",
+                path.display(),
+                bytes,
+                canary_max_bytes
+            );
             Ok(json!({
                 "set_id": set_id,
                 "url": catalog_release_url_join(&args.canaries_base_url, &format!("{set_id}.json"))?,
@@ -30412,6 +30423,7 @@ async fn fetch_catalog_release_files(
     home: &Path,
     release: &CatalogReleaseAnchor,
 ) -> Result<CatalogReleaseFiles> {
+    let canary_max_bytes = configured_catalog_canary_max_bytes()?;
     let cache_dir = home.join("catalog-cache").join(&release.catalog_hash);
     let catalog_path = cache_dir.join("models.json");
     let signature_path = cache_dir.join("models.json.sig");
@@ -30453,7 +30465,7 @@ async fn fetch_catalog_release_files(
             &canary.url,
             &canaries_dir.join(format!("{}.json", canary.set_id)),
             &canary.hash,
-            1024 * 1024,
+            canary_max_bytes,
             "catalog canary set",
         )
         .await?;
@@ -30555,7 +30567,7 @@ async fn fetch_release_bytes(
     label: &str,
 ) -> Result<Vec<u8>> {
     validate_https_url(url, label)?;
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -30565,14 +30577,52 @@ async fn fetch_release_bytes(
         let body = response.text().await.unwrap_or_default();
         bail!("{label} fetch returned {status} for {url}: {body}");
     }
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("reading {label} body from {url}"))?;
-    if bytes.len() > max_bytes {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
         bail!("{label} from {url} exceeded {max_bytes} bytes");
     }
-    Ok(bytes.to_vec())
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(max_bytes),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {label} body from {url}"))?
+    {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= max_bytes,
+            "{label} from {url} exceeded {max_bytes} bytes"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+const DEFAULT_CATALOG_CANARY_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CATALOG_CANARY_HARD_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+fn configured_catalog_canary_max_bytes() -> Result<usize> {
+    let value = match std::env::var("MAYHEM_CATALOG_CANARY_MAX_BYTES") {
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .context("MAYHEM_CATALOG_CANARY_MAX_BYTES must be a positive integer")?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_CATALOG_CANARY_MAX_BYTES,
+        Err(error) => {
+            return Err(error).context("reading MAYHEM_CATALOG_CANARY_MAX_BYTES");
+        }
+    };
+    ensure!(
+        value > 0 && value <= CATALOG_CANARY_HARD_MAX_BYTES,
+        "MAYHEM_CATALOG_CANARY_MAX_BYTES must be between 1 and {CATALOG_CANARY_HARD_MAX_BYTES}"
+    );
+    Ok(value)
 }
 
 fn select_test_model(models: &[Value], requested: Option<&str>) -> Result<TestModel> {
