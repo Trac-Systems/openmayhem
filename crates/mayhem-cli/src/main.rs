@@ -33,6 +33,11 @@ use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
+use hf_hub::progress::{
+    DownloadEvent as HfDownloadEvent, ProgressEvent as HfProgressEvent,
+    ProgressHandler as HfProgressHandler,
+};
+use hf_hub::{HFClient, HFClientSync};
 use image::ImageReader;
 use indicatif::{ProgressBar, ProgressStyle};
 use mayhem_bridge::{
@@ -41,15 +46,14 @@ use mayhem_bridge::{
 };
 use mayhem_enclave::{
     build_hardware_attestation_report, build_hardware_attestation_report_for_measured_binary,
-    build_merkle_manifest, build_merkle_manifest_with_progress, download_resumable_with_progress,
-    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
-    prepare_hardware_quote_binding, prepare_hardware_quote_binding_for_measured_binary,
-    prepare_tier1_attestation_report, prepare_tier1_attestation_report_for_measured_binary,
-    read_sealed_manifest, seal_artifact, DownloadReport, DownloadRequest, DownloadSource,
-    HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext, ProgressEvent,
-    ProgressPhase, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions,
-    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
-    SEALED_STORE_MANIFEST,
+    build_merkle_manifest, build_merkle_manifest_with_progress, finalize_tier1_attestation_report,
+    load_or_create_runtime_keypair_store, measure_binary, prepare_hardware_quote_binding,
+    prepare_hardware_quote_binding_for_measured_binary, prepare_tier1_attestation_report,
+    prepare_tier1_attestation_report_for_measured_binary, read_sealed_manifest, seal_artifact,
+    DownloadReport, HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext,
+    ProgressEvent, ProgressPhase, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions,
+    SealOptions, Tier1AttestationReport, Tier1ExternalProviderAttestationOptions,
+    DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
@@ -40987,6 +40991,99 @@ impl ProviderProgressBars {
     }
 }
 
+struct HuggingFaceProviderProgress {
+    label: String,
+    load_progress: Option<ProviderLoadProgressContext>,
+    bar: Option<ProgressBar>,
+    position: AtomicU64,
+    total: AtomicU64,
+}
+
+impl HuggingFaceProviderProgress {
+    fn new(args: &ProviderStartArgs, label: impl Into<String>, expected_total: u64) -> Self {
+        let label = label.into();
+        let progress = Self {
+            bar: provider_progress_enabled(args)
+                .then(|| provider_progress_bar(Some(expected_total), format!("{label} download"))),
+            label,
+            load_progress: args.load_progress.clone(),
+            position: AtomicU64::new(0),
+            total: AtomicU64::new(expected_total),
+        };
+        progress.record(0, expected_total, "running");
+        progress
+    }
+
+    fn record(&self, position: u64, total: u64, status: &str) {
+        let total = total.max(self.total.load(Ordering::Relaxed));
+        self.total.store(total, Ordering::Relaxed);
+        let previous = self.position.fetch_max(position, Ordering::Relaxed);
+        let position = position.max(previous);
+        if let Some(bar) = &self.bar {
+            if total > 0 {
+                bar.set_length(total);
+            }
+            bar.set_position(position);
+        }
+        if let Some(load_progress) = &self.load_progress {
+            let _ = write_provider_load_progress(
+                load_progress,
+                &self.label,
+                "download",
+                status,
+                Some(position),
+                (total > 0).then_some(total),
+            );
+        }
+    }
+
+    fn finish(&self, succeeded: bool) {
+        let total = self.total.load(Ordering::Relaxed);
+        let position = if succeeded {
+            total
+        } else {
+            self.position.load(Ordering::Relaxed)
+        };
+        self.record(
+            position,
+            total,
+            if succeeded { "complete" } else { "failed" },
+        );
+        if let Some(bar) = &self.bar {
+            if succeeded {
+                bar.finish_and_clear();
+            } else {
+                bar.abandon_with_message(format!("{} download failed", self.label));
+            }
+        }
+    }
+}
+
+impl HfProgressHandler for HuggingFaceProviderProgress {
+    fn on_progress(&self, event: &HfProgressEvent) {
+        let HfProgressEvent::Download(event) = event else {
+            return;
+        };
+        match event {
+            HfDownloadEvent::Start { total_bytes, .. } => self.record(0, *total_bytes, "running"),
+            HfDownloadEvent::Progress { files } => {
+                if let Some(file) = files.iter().max_by_key(|file| file.bytes_completed) {
+                    self.record(file.bytes_completed, file.total_bytes, "running");
+                }
+            }
+            HfDownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => self.record(*bytes_completed, *total_bytes, "running"),
+            HfDownloadEvent::Complete => {
+                let total = self.total.load(Ordering::Relaxed);
+                self.record(total, total, "complete");
+            }
+        }
+    }
+}
+
 fn progress_phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
         ProgressPhase::Download => "download",
@@ -44916,48 +45013,28 @@ fn download_provider_primary_artifact(
     selected: &ProviderCandidate,
     destination: PathBuf,
 ) -> Result<PathBuf> {
-    let source = if selected.artifact.source.kind == "huggingface" {
-        DownloadSource::Http {
-            url: catalog::huggingface_resolve_url(
-                &selected.artifact.source,
-                &selected.artifact.path,
-            )?,
-            bearer_token: read_optional_token(args.hf_token_file.as_deref())?,
-        }
-    } else {
+    if selected.artifact.source.kind != "huggingface" {
         bail!(
             "unsupported artifact source kind {}; pass --artifact with a local copy that matches the admin enclave artifact_root",
             selected.artifact.source.kind
         );
-    };
+    }
     provider_download_disk_preflight(
         args,
         &destination,
         selected.artifact.weights_bytes,
         &format!("{} artifact", selected.artifact_name),
     )?;
-
-    let mut request = DownloadRequest::new(source, destination.clone());
-    request.chunk_size = args.chunk_size;
-    request.expected_merkle_root = Some(selected.enclave.artifact_root.clone());
-    let mut progress =
-        ProviderProgressBars::new(args, format!("{} artifact", selected.artifact_name));
-    if let Err(err) = download_resumable_with_progress(&request, |event| {
-        progress.update(event);
-    })
-    .with_context(|| {
-        format!(
-            "downloading and verifying artifact root {}",
-            selected.enclave.artifact_root
-        )
-    }) {
-        cleanup_provider_partial_download(&destination);
-        progress.finish();
-        return Err(err);
-    }
-    progress.finish();
-    verify_artifact_sha256(&destination, &selected.artifact)?;
-    Ok(destination)
+    download_provider_huggingface_file(
+        args,
+        &selected.artifact.source,
+        &selected.artifact.path,
+        destination,
+        selected.artifact.weights_bytes,
+        &selected.enclave.artifact_root,
+        selected.artifact.source_sha256.as_deref(),
+        &format!("{} artifact", selected.artifact_name),
+    )
 }
 
 fn download_provider_sidecar_artifact(
@@ -45005,53 +45082,156 @@ fn download_provider_sidecar_artifact(
     )? {
         return Ok(cached);
     }
-    let source = if sidecar.source.kind == "huggingface" {
-        DownloadSource::Http {
-            url: catalog::huggingface_resolve_url(&sidecar.source, &sidecar.path)?,
-            bearer_token: read_optional_token(args.hf_token_file.as_deref())?,
-        }
-    } else {
+    if sidecar.source.kind != "huggingface" {
         bail!(
             "unsupported sidecar source kind {}; sidecar {name} must be an admin-pinned Hugging Face artifact",
             sidecar.source.kind
         );
-    };
+    }
     provider_download_disk_preflight(
         args,
         &destination,
         ledger_sidecar.weights_bytes,
         &format!("{}/{} sidecar", selected.artifact_name, name),
     )?;
+    download_provider_huggingface_file(
+        args,
+        &sidecar.source,
+        &sidecar.path,
+        destination,
+        ledger_sidecar.weights_bytes,
+        &ledger_sidecar.artifact_root,
+        Some(&sidecar.source_sha256),
+        &format!("{}/{} sidecar", selected.artifact_name, name),
+    )
+}
 
-    let mut request = DownloadRequest::new(source, destination.clone());
-    request.chunk_size = args.chunk_size;
-    request.expected_merkle_root = Some(ledger_sidecar.artifact_root.clone());
-    let mut progress =
-        ProviderProgressBars::new(args, format!("{}/{} sidecar", selected.artifact_name, name));
-    if let Err(err) = download_resumable_with_progress(&request, |event| {
-        progress.update(event);
-    })
-    .with_context(|| {
+#[allow(clippy::too_many_arguments)]
+fn download_provider_huggingface_file(
+    args: &ProviderStartArgs,
+    source: &catalog::SourceRef,
+    remote_path: &str,
+    destination: PathBuf,
+    expected_bytes: u64,
+    expected_root: &str,
+    expected_sha256: Option<&str>,
+    label: &str,
+) -> Result<PathBuf> {
+    let (owner, repo_name) = source
+        .repo
+        .split_once('/')
+        .with_context(|| format!("invalid admin-pinned Hugging Face repo {}", source.repo))?;
+    let parent = destination
+        .parent()
+        .context("provider artifact destination has no parent directory")?;
+    let staging_hash = blake3::hash(destination.to_string_lossy().as_bytes()).to_hex();
+    let staging_dir = parent.join(format!(".hf-download-{}", &staging_hash[..16]));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).with_context(|| {
+            format!(
+                "removing stale Hugging Face staging directory {}",
+                staging_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&staging_dir).with_context(|| {
         format!(
-            "downloading and verifying sidecar {name} root {}",
-            ledger_sidecar.artifact_root
+            "creating Hugging Face staging directory {}",
+            staging_dir.display()
         )
-    }) {
-        cleanup_provider_partial_download(&destination);
-        progress.finish();
-        return Err(err);
+    })?;
+
+    let result = (|| -> Result<PathBuf> {
+        let mut client_builder = HFClient::builder()
+            .cache_enabled(false)
+            .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(token) = read_optional_token(args.hf_token_file.as_deref())? {
+            client_builder = client_builder.token(token);
+        }
+        let client = HFClientSync::from_inner(client_builder.build()?)
+            .context("starting the Hugging Face Xet client")?;
+        let progress = Arc::new(HuggingFaceProviderProgress::new(
+            args,
+            label,
+            expected_bytes,
+        ));
+        let download = client
+            .model(owner, repo_name)
+            .download_file()
+            .filename(remote_path.to_owned())
+            .revision(source.revision.clone())
+            .local_dir(staging_dir.clone())
+            .progress(Arc::clone(&progress))
+            .send()
+            .with_context(|| {
+                format!(
+                    "downloading admin-pinned Hugging Face artifact {}/{}@{}:{}",
+                    owner, repo_name, source.revision, remote_path
+                )
+            });
+        progress.finish(download.is_ok());
+        let downloaded = download?;
+
+        let actual_bytes = fs::metadata(&downloaded)
+            .with_context(|| format!("reading downloaded artifact {}", downloaded.display()))?
+            .len();
+        if actual_bytes != expected_bytes {
+            bail!(
+                "downloaded {label} has {actual_bytes} bytes; admin catalog requires {expected_bytes}"
+            );
+        }
+
+        let mut verify_progress = ProviderProgressBars::new(args, label);
+        let manifest = build_merkle_manifest_with_progress(&downloaded, args.chunk_size, |event| {
+            verify_progress.update(event);
+        });
+        verify_progress.finish();
+        let manifest = manifest.with_context(|| {
+            format!(
+                "verifying downloaded Hugging Face artifact {}",
+                downloaded.display()
+            )
+        })?;
+        if manifest.root != expected_root {
+            bail!(
+                "downloaded {label} root mismatch; expected admin artifact root {expected_root}, got {}",
+                manifest.root
+            );
+        }
+        if let Some(expected_sha256) = expected_sha256 {
+            let actual_sha256 = file_sha256_hex(&downloaded)?;
+            if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+                bail!(
+                    "downloaded {label} sha256 mismatch; expected admin catalog source_sha256 {expected_sha256}, got {actual_sha256}"
+                );
+            }
+        }
+
+        if destination.exists() {
+            fs::remove_file(&destination).with_context(|| {
+                format!("removing invalid cached artifact {}", destination.display())
+            })?;
+        }
+        fs::rename(&downloaded, &destination).with_context(|| {
+            format!(
+                "installing verified artifact {} at {}",
+                downloaded.display(),
+                destination.display()
+            )
+        })?;
+        Ok(destination.clone())
+    })();
+
+    let cleanup = fs::remove_dir_all(&staging_dir);
+    if result.is_ok() {
+        cleanup.with_context(|| {
+            format!(
+                "removing Hugging Face staging directory {}",
+                staging_dir.display()
+            )
+        })?;
     }
-    progress.finish();
-    let actual = file_sha256_hex(&destination)?;
-    if !actual.eq_ignore_ascii_case(&sidecar.source_sha256) {
-        bail!(
-            "sidecar {name} sha256 mismatch for {}; expected admin catalog source_sha256 {}, got {}",
-            destination.display(),
-            sidecar.source_sha256,
-            actual
-        );
-    }
-    Ok(destination)
+    result
 }
 
 fn provider_download_partial_path(destination: &Path) -> PathBuf {
@@ -45062,11 +45242,6 @@ fn provider_download_partial_path(destination: &Path) -> PathBuf {
         .unwrap_or("artifact");
     path.set_file_name(format!("{file_name}.part"));
     path
-}
-
-fn cleanup_provider_partial_download(destination: &Path) {
-    let part = provider_download_partial_path(destination);
-    let _ = fs::remove_file(part);
 }
 
 fn provider_download_disk_preflight(

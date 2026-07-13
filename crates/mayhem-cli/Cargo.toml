@@ -25,6 +25,10 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"
 getrandom = "0.3"
+hf-hub = { version = "=1.0.0", features = ["blocking"] }
+# hf-hub uses this crate transitively. Enabling this feature prevents a second
+# model-sized chunk cache beside Mayhem's verified artifact cache.
+hf-xet = { version = "=1.5.3", features = ["no-default-cache"] }
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-enclave = { path = "../mayhem-enclave" }
 mayhem-engine = { path = "../mayhem-engine", features = ["mlx", "trt-llm", "vllm"] }
