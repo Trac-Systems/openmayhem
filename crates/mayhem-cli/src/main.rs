@@ -47539,6 +47539,137 @@ struct ProviderSessionLiveStream<'a> {
     pending_token_ids: Vec<i32>,
 }
 
+const PROVIDER_REASONING_OPEN_TAG: &str = "<think>";
+const PROVIDER_REASONING_CLOSE_TAG: &str = "</think>";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderReasoningOutputMode {
+    Preserve,
+    StripPrefilled,
+    StripTagged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderReasoningStreamState {
+    Preserve,
+    Probe,
+    Suppress,
+    Passthrough,
+}
+
+struct ProviderReasoningOutputFilter {
+    state: ProviderReasoningStreamState,
+    pending: String,
+}
+
+impl ProviderReasoningOutputFilter {
+    fn new(mode: ProviderReasoningOutputMode) -> Self {
+        let state = match mode {
+            ProviderReasoningOutputMode::Preserve => ProviderReasoningStreamState::Preserve,
+            ProviderReasoningOutputMode::StripPrefilled => ProviderReasoningStreamState::Suppress,
+            ProviderReasoningOutputMode::StripTagged => ProviderReasoningStreamState::Probe,
+        };
+        Self {
+            state,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        match self.state {
+            ProviderReasoningStreamState::Preserve | ProviderReasoningStreamState::Passthrough => {
+                text.to_owned()
+            }
+            ProviderReasoningStreamState::Probe => {
+                self.pending.push_str(text);
+                self.resolve_probe()
+            }
+            ProviderReasoningStreamState::Suppress => {
+                self.pending.push_str(text);
+                self.resolve_suppressed()
+            }
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        match self.state {
+            ProviderReasoningStreamState::Probe => {
+                let trimmed = self.pending.trim_start();
+                if !trimmed.is_empty()
+                    && (PROVIDER_REASONING_OPEN_TAG.starts_with(trimmed)
+                        || PROVIDER_REASONING_CLOSE_TAG.starts_with(trimmed))
+                {
+                    self.pending.clear();
+                    return String::new();
+                }
+                self.state = ProviderReasoningStreamState::Passthrough;
+                std::mem::take(&mut self.pending)
+            }
+            ProviderReasoningStreamState::Suppress => {
+                self.pending.clear();
+                String::new()
+            }
+            ProviderReasoningStreamState::Preserve | ProviderReasoningStreamState::Passthrough => {
+                String::new()
+            }
+        }
+    }
+
+    fn resolve_probe(&mut self) -> String {
+        let trimmed = self.pending.trim_start();
+        if trimmed.is_empty()
+            || PROVIDER_REASONING_OPEN_TAG.starts_with(trimmed)
+            || PROVIDER_REASONING_CLOSE_TAG.starts_with(trimmed)
+        {
+            return String::new();
+        }
+        if let Some(rest) = trimmed.strip_prefix(PROVIDER_REASONING_OPEN_TAG) {
+            self.pending = rest.to_owned();
+            self.state = ProviderReasoningStreamState::Suppress;
+            return self.resolve_suppressed();
+        }
+        if let Some(rest) = trimmed.strip_prefix(PROVIDER_REASONING_CLOSE_TAG) {
+            let visible = trim_provider_reasoning_boundary(rest).to_owned();
+            self.pending.clear();
+            self.state = ProviderReasoningStreamState::Passthrough;
+            return visible;
+        }
+        self.state = ProviderReasoningStreamState::Passthrough;
+        std::mem::take(&mut self.pending)
+    }
+
+    fn resolve_suppressed(&mut self) -> String {
+        if let Some(index) = self.pending.find(PROVIDER_REASONING_CLOSE_TAG) {
+            let visible = trim_provider_reasoning_boundary(
+                &self.pending[index + PROVIDER_REASONING_CLOSE_TAG.len()..],
+            )
+            .to_owned();
+            self.pending.clear();
+            self.state = ProviderReasoningStreamState::Passthrough;
+            return visible;
+        }
+
+        let retained = (1..PROVIDER_REASONING_CLOSE_TAG.len())
+            .rev()
+            .find(|length| {
+                self.pending
+                    .ends_with(&PROVIDER_REASONING_CLOSE_TAG[..*length])
+            })
+            .unwrap_or(0);
+        if retained == 0 {
+            self.pending.clear();
+        } else {
+            let tail = self.pending.split_off(self.pending.len() - retained);
+            self.pending = tail;
+        }
+        String::new()
+    }
+}
+
+fn trim_provider_reasoning_boundary(text: &str) -> &str {
+    text.trim_start_matches(|character| matches!(character, '\r' | '\n'))
+}
+
 const PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT: &str =
     "provider live stream cancelled after client disconnect";
 
@@ -47641,6 +47772,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
         }
         self.poll_client_disconnect()?;
         Ok(())
+    }
+
+    fn append_visible_text(&mut self, text: &str) {
+        self.pending_text.push_str(text);
     }
 
     fn first_ttft_ms(&self) -> Option<u64> {
@@ -50977,6 +51112,53 @@ fn provider_local_endpoint_family(kind: &str) -> &'static str {
     }
 }
 
+fn provider_reasoning_output_mode(
+    adapter: &catalog::CatalogAdapter,
+    request: &GenerateRequest,
+) -> ProviderReasoningOutputMode {
+    if adapter.reasoning_passthrough == "preserve" {
+        return ProviderReasoningOutputMode::Preserve;
+    }
+    if provider_reasoning_speciality_enabled(request) == Some(true) {
+        ProviderReasoningOutputMode::StripPrefilled
+    } else {
+        ProviderReasoningOutputMode::StripTagged
+    }
+}
+
+fn provider_reasoning_speciality_enabled(request: &GenerateRequest) -> Option<bool> {
+    request.speciality_parameters.iter().find_map(|speciality| {
+        let name = speciality.name.to_ascii_lowercase();
+        let native_path = speciality.native_path.to_ascii_lowercase();
+        let haystack = format!("{name} {native_path}");
+        if (!haystack.contains("reason") && !haystack.contains("think"))
+            || ["preserve", "history", "retain"]
+                .iter()
+                .any(|marker| haystack.contains(marker))
+        {
+            return None;
+        }
+        let level = speciality.level.to_ascii_lowercase();
+        let disabled_level = matches!(level.as_str(), "none" | "off" | "disabled");
+        let disabled_value = speciality.value == Value::Bool(false)
+            || speciality.value.as_u64() == Some(0)
+            || speciality.value.as_str().is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "none" | "off" | "disabled" | "false"
+                )
+            });
+        Some(!disabled_level && !disabled_value)
+    })
+}
+
+fn provider_reasoning_visible_output(text: &str, mode: ProviderReasoningOutputMode) -> String {
+    let mut filter = ProviderReasoningOutputFilter::new(mode);
+    let mut visible = filter.push(text);
+    visible.push_str(&filter.finish());
+    visible
+}
+
 #[cfg(test)]
 fn provider_test_seal_contract_request(
     body: &Value,
@@ -51324,6 +51506,8 @@ fn provider_engine_session_response_with_sampling_bounded(
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
+    let reasoning_output_mode = provider_reasoning_output_mode(adapter, &request);
+    let mut reasoning_stream_filter = ProviderReasoningOutputFilter::new(reasoning_output_mode);
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
     // Bill the canonical request content shared with the gateway, not backend-specific
@@ -51335,8 +51519,10 @@ fn provider_engine_session_response_with_sampling_bounded(
             &mut |chunk: mayhem_engine::TokenChunk| {
                 if tool_mode.is_none() {
                     if let Some(stream) = live_stream.as_deref_mut() {
+                        let mut visible_chunk = chunk.clone();
+                        visible_chunk.text = reasoning_stream_filter.push(&chunk.text);
                         stream
-                            .on_token(chunk.clone(), prompt_tokens)
+                            .on_token(visible_chunk, prompt_tokens)
                             .map_err(|err| {
                                 mayhem_engine::EngineError::InvalidConfig(format!(
                                     "provider live stream failed: {err:#}"
@@ -51353,6 +51539,14 @@ fn provider_engine_session_response_with_sampling_bounded(
             },
         )
         .context("generating provider session response with mayhem-engine")?;
+    if tool_mode.is_none() {
+        let trailing_visible_text = reasoning_stream_filter.finish();
+        if !trailing_visible_text.is_empty() {
+            if let Some(stream) = live_stream.as_deref_mut() {
+                stream.append_visible_text(&trailing_visible_text);
+            }
+        }
+    }
     let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
     let tool = tool_mode.as_ref().and_then(|mode| {
         provider_engine_tool_call_output(&output.text, mode.strategy, &mode.tools)
@@ -51379,12 +51573,13 @@ fn provider_engine_session_response_with_sampling_bounded(
     } else {
         output.finish_reason.to_string()
     };
+    let visible_output = provider_reasoning_visible_output(&output.text, reasoning_output_mode);
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: if tool.is_some() {
             String::new()
         } else {
-            output.text
+            visible_output
         },
         tool,
         embeddings: None,
@@ -62262,6 +62457,68 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_reasoning_filter_strips_prefilled_output_across_stream_chunks() {
+        let mut filter =
+            ProviderReasoningOutputFilter::new(ProviderReasoningOutputMode::StripPrefilled);
+        let chunks = [
+            "private chain ",
+            "of thought</thi",
+            "nk>\n\npublic ",
+            "answer",
+        ];
+        let visible = chunks
+            .iter()
+            .map(|chunk| filter.push(chunk))
+            .collect::<String>();
+
+        assert_eq!(visible, "public answer");
+        assert_eq!(filter.finish(), "");
+    }
+
+    #[test]
+    fn provider_reasoning_filter_preserves_plain_and_explicit_preserve_output() {
+        assert_eq!(
+            provider_reasoning_visible_output(
+                "ordinary answer",
+                ProviderReasoningOutputMode::StripTagged,
+            ),
+            "ordinary answer"
+        );
+        assert_eq!(
+            provider_reasoning_visible_output(
+                "<think>private</think>\nvisible",
+                ProviderReasoningOutputMode::StripTagged,
+            ),
+            "visible"
+        );
+        assert_eq!(
+            provider_reasoning_visible_output(
+                "<think>published reasoning</think>\nanswer",
+                ProviderReasoningOutputMode::Preserve,
+            ),
+            "<think>published reasoning</think>\nanswer"
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_filter_never_leaks_unclosed_reasoning() {
+        assert_eq!(
+            provider_reasoning_visible_output(
+                "private reasoning without a closing marker",
+                ProviderReasoningOutputMode::StripPrefilled,
+            ),
+            ""
+        );
+        assert_eq!(
+            provider_reasoning_visible_output(
+                "<think>private reasoning without a closing marker",
+                ProviderReasoningOutputMode::StripTagged,
+            ),
+            ""
+        );
+    }
+
+    #[test]
     fn provider_engine_request_maps_openai_tool_history_for_qwen_template() {
         let adapter = catalog::CatalogAdapter {
             chat_template_id: "qwen3.5-instruct".to_owned(),
@@ -62657,6 +62914,51 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .contains("user: Reply only: transport observer passed"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_applies_signed_reasoning_output_policy() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "hauhaucs/qwen3.6-35b-a3b-uncensored")
+            .expect("live Qwen model");
+        let adapter = &model.adapter;
+        let mut backend = FakeEngineBackend::new(
+            "private reasoning that must stay internal</think>\n\npublic answer",
+        );
+        backend.output.usage.reasoning_tokens = 1;
+        let body = json!({
+            "model": model.model_id,
+            "messages": [{"role": "user", "content": "answer the question"}]
+        });
+        let sealed = provider_seal_local_contract_request(&body, adapter, &model.model_id).unwrap();
+
+        let output = provider_engine_session_response_with_sampling(
+            &mut backend,
+            Some(&model.model_id),
+            adapter,
+            &model.sampling,
+            &sealed,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "public answer");
+        assert_eq!(output.completion_tokens, 2);
+        assert_eq!(
+            output.usage_attribution.get("reasoning_output_tokens"),
+            Some(&1)
+        );
+        assert_eq!(
+            provider_reasoning_output_mode(
+                adapter,
+                backend.last_request.as_ref().expect("engine request")
+            ),
+            ProviderReasoningOutputMode::StripPrefilled
+        );
     }
 
     #[test]
