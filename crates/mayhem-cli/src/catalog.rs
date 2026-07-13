@@ -237,6 +237,8 @@ pub(crate) struct ConversionRef {
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
     pub(crate) source: SourceRef,
+    #[serde(default)]
+    pub(crate) upstream_source: Option<SourceRef>,
     pub(crate) path: String,
     pub(crate) artifact_root: String,
     pub(crate) artifact_root_kind: String,
@@ -1950,6 +1952,25 @@ fn validate_speciality_descriptor(
     {
         errors.push(format!("{label} requires non-empty live research evidence"));
     }
+    let mut calibration_modalities = BTreeSet::new();
+    for modality in &descriptor.calibration_modalities {
+        if modality == "text" {
+            errors.push(format!(
+                "{label} calibration_modalities uses an empty list for text-only calibration"
+            ));
+        } else if !valid_adapter_modality(modality)
+            || !model.adapter.modality_set.contains(modality)
+        {
+            errors.push(format!(
+                "{label} calibration modality {modality} is not served by the model adapter"
+            ));
+        }
+        if !calibration_modalities.insert(modality.as_str()) {
+            errors.push(format!(
+                "{label} duplicates calibration modality {modality}"
+            ));
+        }
+    }
     let mut names = BTreeSet::new();
     let mut ranks = BTreeSet::new();
     for level in &descriptor.levels {
@@ -2622,6 +2643,14 @@ fn validate_artifact(
         &artifact.source,
         errors,
     );
+    if let Some(source) = &artifact.upstream_source {
+        validate_source(
+            model_id,
+            &format!("artifacts.{name}.upstream_source"),
+            source,
+            errors,
+        );
+    }
     if artifact.path.trim().is_empty() {
         errors.push(format!("{model_id}/{name} path is required"));
     } else {
@@ -3521,6 +3550,7 @@ mod tests {
                     max_reasoning_tokens: Some(24),
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["pinned family documentation".to_owned()],
         };
         for contract in &mut model.adapter.endpoint_families {
@@ -3685,6 +3715,7 @@ mod tests {
                 revision: "2".repeat(40),
                 publisher_key: None,
             },
+            upstream_source: None,
             path: "model.gguf".to_owned(),
             artifact_root: "b".repeat(64),
             artifact_root_kind: "blake3_descriptor_until_p2_4".to_owned(),
@@ -4359,6 +4390,7 @@ mod tests {
                         revision: "5".repeat(40),
                         publisher_key: None,
                     },
+                    upstream_source: None,
                     path: "model.safetensors".to_owned(),
                     artifact_root: "6".repeat(64),
                     artifact_root_kind: "blake3_merkle_v1".to_owned(),

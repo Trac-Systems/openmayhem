@@ -1332,6 +1332,7 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
                 max_reasoning_tokens: Some(8_192),
             },
         ],
+        calibration_modalities: Vec::new(),
         research_evidence: vec!["pinned model-card fixture".to_owned()],
     }];
     model.mayhem.speciality_calibrations = BTreeMap::from([(
@@ -4147,6 +4148,7 @@ fn routed_test_model_with_specialities(providers: &[String]) -> GatewayModel {
                     max_reasoning_tokens: Some(24),
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["test family documentation".to_owned()],
         },
         ModelSpecialityDescriptor {
@@ -4169,6 +4171,7 @@ fn routed_test_model_with_specialities(providers: &[String]) -> GatewayModel {
                     max_reasoning_tokens: None,
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["test family documentation".to_owned()],
         },
     ];

@@ -10496,51 +10496,59 @@ fn catalog_artifact_stage_plan_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        let source_dir =
-            catalog_artifact_stage_source_dir(&source_cache_dir, &model.provenance.source);
-        let source_key = (
-            model.provenance.source.kind.clone(),
-            model.provenance.source.repo.clone(),
-            model.provenance.source.revision.clone(),
-        );
-        if planned_sources.insert(source_key) {
-            let mut source_errors = Vec::new();
-            if model.provenance.source.kind != "huggingface" {
-                source_errors.push(format!(
-                    "provenance source kind {} is not supported by artifact staging",
-                    model.provenance.source.kind
-                ));
-            }
-            let command = catalog_artifact_stage_source_download_command(
-                &model.provenance.source,
-                &source_dir,
-                hf_token_file.as_deref(),
-            );
-            let ok = source_errors.is_empty();
-            let entry = CatalogArtifactStageSourceEntry {
-                model_id: model.model_id.clone(),
-                tier: model.tier.clone(),
-                source_kind: model.provenance.source.kind.clone(),
-                source_repo: model.provenance.source.repo.clone(),
-                source_revision: model.provenance.source.revision.clone(),
-                source_dir: source_dir.clone(),
-                command,
-                ok,
-                errors: source_errors,
-            };
-            if !entry.ok {
-                errors.extend(
-                    entry
-                        .errors
-                        .iter()
-                        .map(|error| format!("{} source: {error}", entry.model_id)),
-                );
-            }
-            source_commands.push(entry);
-        }
-
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
+            let upstream_source = artifact
+                .upstream_source
+                .as_ref()
+                .unwrap_or(&model.provenance.source);
+            let source_dir = catalog_artifact_stage_source_dir(&source_cache_dir, upstream_source);
+            let source_key = (
+                upstream_source.kind.clone(),
+                upstream_source.repo.clone(),
+                upstream_source.revision.clone(),
+            );
+            if planned_sources.insert(source_key) {
+                let mut source_errors = Vec::new();
+                if upstream_source.kind != "huggingface" {
+                    source_errors.push(format!(
+                        "upstream source kind {} is not supported by artifact staging",
+                        upstream_source.kind
+                    ));
+                }
+                let allow_patterns = catalog_artifact_stage_source_patterns(
+                    catalog_doc,
+                    upstream_source,
+                    launch_only,
+                );
+                let command = catalog_artifact_stage_source_download_command(
+                    upstream_source,
+                    &source_dir,
+                    hf_token_file.as_deref(),
+                    allow_patterns.as_deref(),
+                );
+                let ok = source_errors.is_empty();
+                let entry = CatalogArtifactStageSourceEntry {
+                    model_id: model.model_id.clone(),
+                    tier: model.tier.clone(),
+                    source_kind: upstream_source.kind.clone(),
+                    source_repo: upstream_source.repo.clone(),
+                    source_revision: upstream_source.revision.clone(),
+                    source_dir: source_dir.clone(),
+                    command,
+                    ok,
+                    errors: source_errors,
+                };
+                if !entry.ok {
+                    errors.extend(
+                        entry
+                            .errors
+                            .iter()
+                            .map(|error| format!("{} source: {error}", entry.model_id)),
+                    );
+                }
+                source_commands.push(entry);
+            }
             catalog_expected_bytes = catalog_expected_bytes.saturating_add(artifact.weights_bytes);
             let artifact_rel_path = PathBuf::from(&artifact.path);
             if artifact_rel_path.is_absolute() {
@@ -10618,9 +10626,9 @@ fn catalog_artifact_stage_plan_report(
                 source_repo: artifact.source.repo.clone(),
                 source_revision: artifact.source.revision.clone(),
                 source_path: artifact.path.clone(),
-                upstream_source_kind: model.provenance.source.kind.clone(),
-                upstream_source_repo: model.provenance.source.repo.clone(),
-                upstream_source_revision: model.provenance.source.revision.clone(),
+                upstream_source_kind: upstream_source.kind.clone(),
+                upstream_source_repo: upstream_source.repo.clone(),
+                upstream_source_revision: upstream_source.revision.clone(),
                 upstream_source_dir: source_dir.clone(),
                 artifact_path,
                 catalog_weights_bytes: artifact.weights_bytes,
@@ -10667,9 +10675,15 @@ fn catalog_artifact_stage_plan_report(
         .map(|entry| entry.model_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let needs_llama_cpp = stage_commands
-        .iter()
-        .any(|entry| entry.engine == "llama.cpp");
+    let needs_llama_cpp = stage_commands.iter().any(|entry| {
+        entry.engine == "llama.cpp"
+            && catalog_doc
+                .models
+                .iter()
+                .find(|model| model.model_id == entry.model_id)
+                .and_then(|model| model.artifacts.get(&entry.artifact))
+                .is_some_and(|artifact| artifact.upstream_source.is_none())
+    });
     let preflight_command =
         catalog_artifact_stage_preflight_command(hf_token_file.as_deref(), needs_llama_cpp);
     CatalogArtifactStagePlanReport {
@@ -10993,18 +11007,76 @@ fn catalog_artifact_stage_source_download_command(
     source: &catalog::SourceRef,
     source_dir: &Path,
     hf_token_file: Option<&Path>,
+    allow_patterns: Option<&[String]>,
 ) -> CatalogCanaryPlanCommand {
     let repo = serde_json::to_string(&source.repo).expect("repo string serializes");
     let revision = serde_json::to_string(&source.revision).expect("revision string serializes");
     let local_dir =
         serde_json::to_string(&source_dir.display().to_string()).expect("path string serializes");
+    let allow_patterns = allow_patterns
+        .map(|patterns| {
+            format!(
+                ", allow_patterns={}",
+                serde_json::to_string(patterns).expect("allow patterns serialize")
+            )
+        })
+        .unwrap_or_default();
     let script = format!(
-        "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id={repo}, revision={revision}, local_dir={local_dir}, token=os.environ.get('HF_TOKEN'))"
+        "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id={repo}, revision={revision}, local_dir={local_dir}, token=os.environ.get('HF_TOKEN'){allow_patterns})"
     );
     let mut command =
         catalog_canary_plan_command(vec!["python3".to_owned(), "-c".to_owned(), script]);
     command.shell = with_hf_shell_prefix(command.shell, hf_token_file, false);
     command
+}
+
+fn catalog_artifact_stage_source_patterns(
+    catalog_doc: &catalog::CatalogDocument,
+    source: &catalog::SourceRef,
+    launch_only: bool,
+) -> Option<Vec<String>> {
+    let mut patterns = BTreeSet::new();
+    let mut selected = false;
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        for artifact in model.artifacts.values() {
+            let selected_source = artifact
+                .upstream_source
+                .as_ref()
+                .unwrap_or(&model.provenance.source);
+            if selected_source != source {
+                continue;
+            }
+            if artifact.upstream_source.is_none() {
+                return None;
+            }
+            selected = true;
+            patterns.insert(artifact.path.clone());
+            patterns.extend(
+                artifact
+                    .sidecars
+                    .values()
+                    .map(|sidecar| sidecar.path.clone()),
+            );
+        }
+    }
+    if !selected {
+        return None;
+    }
+    patterns.extend(
+        [
+            ".gitattributes",
+            "README.md",
+            "LICENSE",
+            "LICENSE.md",
+            "LICENSE.txt",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    Some(patterns.into_iter().collect())
 }
 
 fn catalog_artifact_stage_command(
@@ -11015,6 +11087,9 @@ fn catalog_artifact_stage_command(
     artifact_base: &Path,
     artifact_path: &Path,
 ) -> Result<CatalogCanaryPlanCommand> {
+    if artifact.upstream_source.is_some() {
+        return catalog_artifact_stage_mirror_command(source_dir, artifact, artifact_path);
+    }
     match artifact.engine.as_str() {
         "llama.cpp" => Ok(catalog_artifact_stage_gguf_command(
             model,
@@ -11034,7 +11109,7 @@ fn catalog_artifact_stage_command(
             artifact_base,
             artifact_path,
         )?),
-        "vllm" => Ok(catalog_artifact_stage_vllm_command(
+        "vllm" => Ok(catalog_artifact_stage_mirror_command(
             source_dir,
             artifact,
             artifact_path,
@@ -11133,7 +11208,7 @@ fn catalog_artifact_stage_trt_command(
     Ok(command)
 }
 
-fn catalog_artifact_stage_vllm_command(
+fn catalog_artifact_stage_mirror_command(
     source_dir: &Path,
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
@@ -11151,16 +11226,13 @@ fn catalog_artifact_stage_vllm_command(
     for (label, relative) in files {
         let relative = validate_catalog_artifact_relative_path(relative)?;
         if !seen_paths.insert(relative.clone()) {
-            bail!(
-                "vLLM artifact has duplicate staged path {}",
-                relative.display()
-            );
+            bail!("artifact has duplicate staged path {}", relative.display());
         }
         let source_file = source_dir.join(&relative);
         let target_file = target_root.join(&relative);
         let target_parent = target_file.parent().unwrap_or_else(|| Path::new("."));
         steps.push(format!(
-            "mkdir -p {} && test -s {} || {{ echo \"vLLM {label} source file not found: {}\" >&2; exit 1; }} && cp -f {} {} && test -s {}",
+            "mkdir -p {} && test -s {} || {{ echo \"prebuilt {label} source file not found: {}\" >&2; exit 1; }} && cp -f {} {} && test -s {}",
             shell_single_quote(&target_parent.display().to_string()),
             shell_single_quote(&source_file.display().to_string()),
             source_file.display(),
@@ -11169,6 +11241,12 @@ fn catalog_artifact_stage_vllm_command(
             shell_single_quote(&target_file.display().to_string())
         ));
     }
+    steps.push(format!(
+        "for MAYHEM_METADATA in .gitattributes README.md LICENSE LICENSE.md LICENSE.txt; do if [ -f {}/\"$MAYHEM_METADATA\" ]; then cp -f {}/\"$MAYHEM_METADATA\" {}/\"$MAYHEM_METADATA\"; fi; done",
+        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&target_root.display().to_string()),
+    ));
     let script = steps.join(" && ");
     let mut command =
         catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
@@ -11234,8 +11312,9 @@ fn catalog_artifact_upload_command(
     hf_token_file: Option<&Path>,
 ) -> Result<CatalogCanaryPlanCommand> {
     validate_catalog_artifact_relative_path(&artifact.path)?;
-    let upload_directory =
-        artifact.engine == "mlx" || (artifact.engine == "vllm" && !artifact.sidecars.is_empty());
+    let upload_directory = artifact.engine == "mlx"
+        || artifact.upstream_source.is_some()
+        || !artifact.sidecars.is_empty();
     let upload_root;
     let (upload_path, repo_path) = if upload_directory {
         upload_root = catalog_artifact_local_root(current_artifact_path, &artifact.path)?;
@@ -11322,6 +11401,8 @@ fn catalog_artifact_metadata_after_publish_shell(
     let published_prefix = artifact_base
         .join(safe_path_component(&artifact.source.kind))
         .join(safe_path_component(&artifact.source.repo));
+    let current_root = catalog_artifact_local_root(current_artifact_path, &artifact.path)
+        .expect("catalog artifact path was validated before publish planning");
     let mut metadata_argv = vec![
         "mayhem".to_owned(),
         "catalog".to_owned(),
@@ -11347,12 +11428,29 @@ fn catalog_artifact_metadata_after_publish_shell(
         })
         .collect::<Vec<_>>()
         .join(" ");
-    format!(
-        "PUBLISHED_REVISION=$({}) && test -n \"$PUBLISHED_REVISION\" && PUBLISHED_ARTIFACT_PATH={}/\"$PUBLISHED_REVISION\"/{} && mkdir -p \"$(dirname \"$PUBLISHED_ARTIFACT_PATH\")\" && ln -sfn {} \"$PUBLISHED_ARTIFACT_PATH\" && {}",
-        revision_command.shell,
+    let mut link_steps = vec![format!(
+        "PUBLISHED_ARTIFACT_PATH={}/\"$PUBLISHED_REVISION\"/{} && mkdir -p \"$(dirname \"$PUBLISHED_ARTIFACT_PATH\")\" && ln -sfn {} \"$PUBLISHED_ARTIFACT_PATH\"",
         shell_single_quote(&published_prefix.display().to_string()),
         shell_single_quote(&artifact.path),
         shell_single_quote(&current_artifact_path.display().to_string()),
+    )];
+    for sidecar in artifact.sidecars.values().filter(|sidecar| {
+        sidecar.source.kind == artifact.source.kind
+            && sidecar.source.repo == artifact.source.repo
+            && sidecar.source.revision == artifact.source.revision
+    }) {
+        let current_sidecar = current_root.join(&sidecar.path);
+        link_steps.push(format!(
+            "PUBLISHED_SIDECAR_PATH={}/\"$PUBLISHED_REVISION\"/{} && mkdir -p \"$(dirname \"$PUBLISHED_SIDECAR_PATH\")\" && ln -sfn {} \"$PUBLISHED_SIDECAR_PATH\"",
+            shell_single_quote(&published_prefix.display().to_string()),
+            shell_single_quote(&sidecar.path),
+            shell_single_quote(&current_sidecar.display().to_string()),
+        ));
+    }
+    format!(
+        "PUBLISHED_REVISION=$({}) && test -n \"$PUBLISHED_REVISION\" && {} && {}",
+        revision_command.shell,
+        link_steps.join(" && "),
         metadata_shell
     )
 }
@@ -11886,10 +11984,7 @@ fn validate_resumed_canary_core(
         report.modality_resource_profiles == modality_resource_profiles,
         "resume core report modality resource profiles do not bind its prompt measurements"
     );
-    let speciality_prompt_ids = speciality_canary_prompts(model, prompts)
-        .into_iter()
-        .map(|prompt| prompt.id.clone())
-        .collect::<Vec<_>>();
+    let speciality_prompt_ids = speciality_canary_prompt_ids(model, prompts)?;
     let mut speciality_errors = Vec::new();
     validate_speciality_calibration_report(
         model,
@@ -11943,19 +12038,13 @@ fn calibrate_model_specialities(
         model.model_id,
         model.canary.verification_method
     );
-    let speciality_prompts = speciality_canary_prompts(model, prompts)
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    ensure!(
-        !speciality_prompts.is_empty(),
-        "model {} has no canary prompts for speciality calibration",
-        model.model_id
-    );
-
     let mut calibrated = BTreeMap::new();
     let mut short_levels = Vec::new();
     for descriptor in &model.adapter.specialities {
+        let speciality_prompts = speciality_canary_prompts(model, prompts, descriptor)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut levels = BTreeMap::new();
         for level in &descriptor.levels {
             warm_token_canary_probes(
@@ -12044,19 +12133,66 @@ fn calibrate_model_specialities(
     Ok(calibrated)
 }
 
+fn speciality_canary_prompt_ids(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    model
+        .adapter
+        .specialities
+        .iter()
+        .map(|descriptor| {
+            Ok((
+                descriptor.name.clone(),
+                speciality_canary_prompts(model, prompts, descriptor)?
+                    .into_iter()
+                    .map(|prompt| prompt.id.clone())
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
 fn speciality_canary_prompts<'a>(
     model: &catalog::CatalogModel,
     prompts: &'a [CanaryPrompt],
-) -> Vec<&'a CanaryPrompt> {
-    let text_prompts = prompts
+    descriptor: &mayhem_proto::ModelSpecialityDescriptor,
+) -> Result<Vec<&'a CanaryPrompt>> {
+    let required_modalities = descriptor
+        .calibration_modalities
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let candidates = prompts
         .iter()
         .filter(|prompt| {
-            provider_canary_prompt_modalities(model, prompt)
-                .iter()
-                .all(|modality| modality == "text")
+            let modalities = provider_canary_prompt_modalities(model, prompt);
+            if required_modalities.is_empty() {
+                modalities.iter().all(|modality| modality == "text")
+            } else {
+                modalities
+                    .iter()
+                    .any(|modality| required_modalities.contains(modality.as_str()))
+            }
         })
         .collect::<Vec<_>>();
-    let sampled = text_prompts
+    for modality in &required_modalities {
+        ensure!(
+            prompts.iter().any(|prompt| {
+                provider_canary_prompt_modalities(model, prompt).contains(*modality)
+            }),
+            "model {} speciality {} requires a calibration prompt for modality {modality}",
+            model.model_id,
+            descriptor.name
+        );
+    }
+    ensure!(
+        !candidates.is_empty(),
+        "model {} has no canary prompts for speciality {} calibration",
+        model.model_id,
+        descriptor.name
+    );
+    let sampled = candidates
         .iter()
         .copied()
         .filter(|prompt| {
@@ -12066,10 +12202,15 @@ fn speciality_canary_prompts<'a>(
                 .is_some_and(|temperature| temperature > 0.0)
         })
         .collect::<Vec<_>>();
-    if sampled.is_empty() {
-        text_prompts
-    } else {
+    let sampled_covers_required = required_modalities.iter().all(|modality| {
         sampled
+            .iter()
+            .any(|prompt| provider_canary_prompt_modalities(model, prompt).contains(*modality))
+    });
+    if sampled.is_empty() || !sampled_covers_required {
+        Ok(candidates)
+    } else {
+        Ok(sampled)
     }
 }
 
@@ -14647,7 +14788,7 @@ fn validate_speciality_calibration_evidence(
 
 fn validate_speciality_calibration_report(
     model: &catalog::CatalogModel,
-    expected_prompt_ids: &[String],
+    expected_prompt_ids: &BTreeMap<String, Vec<String>>,
     report: &BTreeMap<String, BTreeMap<String, CanarySpecialityCalibrationReport>>,
     errors: &mut Vec<String>,
 ) {
@@ -14665,6 +14806,13 @@ fn validate_speciality_calibration_report(
     }
 
     for descriptor in &model.adapter.specialities {
+        let expected_descriptor_prompt_ids = expected_prompt_ids.get(&descriptor.name);
+        if expected_descriptor_prompt_ids.is_none() {
+            errors.push(format!(
+                "speciality calibration prompt coverage is missing {}",
+                descriptor.name
+            ));
+        }
         let Some(levels) = report.get(&descriptor.name) else {
             continue;
         };
@@ -14677,8 +14825,9 @@ fn validate_speciality_calibration_report(
                 .iter()
                 .map(|prompt| prompt.prompt_id.as_str())
                 .collect::<Vec<_>>();
-            let expected_prompt_ids_ref = expected_prompt_ids
-                .iter()
+            let expected_prompt_ids_ref = expected_descriptor_prompt_ids
+                .into_iter()
+                .flatten()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             if observed_prompt_ids != expected_prompt_ids_ref {
@@ -15850,7 +15999,7 @@ fn catalog_canary_matrix_report(
 struct CanarySetMatrixInfo {
     prompt_count: usize,
     prompt_ids: Vec<String>,
-    speciality_prompt_ids: Vec<String>,
+    speciality_prompt_ids: BTreeMap<String, Vec<String>>,
 }
 
 fn canary_set_matrix_check(
@@ -15950,10 +16099,8 @@ fn canary_set_matrix_check(
     if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
         validate_canary_sampling_range(model, &doc.prompts)?;
     }
-    let speciality_prompt_ids = speciality_canary_prompts(model, &doc.prompts)
-        .into_iter()
-        .map(|prompt| prompt.id.clone())
-        .collect();
+    let speciality_prompt_ids =
+        speciality_canary_prompt_ids(model, &doc.prompts).map_err(|error| error.to_string())?;
     Ok(CanarySetMatrixInfo {
         prompt_count: prompt_ids.len(),
         prompt_ids,
@@ -52327,6 +52474,14 @@ fn provider_engine_template_messages(
     mut messages: Vec<Value>,
     adapter: &catalog::CatalogAdapter,
 ) -> Result<Vec<Value>> {
+    if adapter.chat_template_id == "gemma4-instruct" {
+        for message in &mut messages {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                parts.sort_by_key(gemma4_content_part_order);
+            }
+        }
+        return Ok(messages);
+    }
     if adapter.chat_template_id != "qwen3.5-instruct" {
         return Ok(messages);
     }
@@ -52368,6 +52523,14 @@ fn provider_engine_template_messages(
         }
     }
     Ok(messages)
+}
+
+fn gemma4_content_part_order(part: &Value) -> u8 {
+    match part.get("type").and_then(Value::as_str) {
+        Some("image" | "image_url" | "video") => 0,
+        Some("audio" | "input_audio") => 2,
+        _ => 1,
+    }
 }
 
 fn provider_engine_template_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -62563,6 +62726,54 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_engine_request_normalizes_gemma4_media_order_for_prompt_and_backend() {
+        let mut adapter = catalog::CatalogAdapter::default();
+        adapter.chat_template_id = "gemma4-instruct".to_owned();
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                    {"type": "text", "text": "describe everything"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "video", "video": {
+                        "frames": ["data:image/png;base64,AA=="],
+                        "num_frames": 1,
+                        "fps": 1.0
+                    }}
+                ]
+            }]
+        });
+
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        let content_types = request.messages[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(content_types, ["image_url", "video", "text", "input_audio"]);
+        assert_eq!(
+            request
+                .media
+                .iter()
+                .map(|media| media.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["image", "video", "audio"]
+        );
+        let text_at = request.prompt.find("describe everything").unwrap();
+        let marker_positions = request
+            .prompt
+            .match_indices(MTMD_MEDIA_MARKER)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(marker_positions.len(), 3);
+        assert!(marker_positions[..2].iter().all(|index| *index < text_at));
+        assert!(marker_positions[2] > text_at);
+    }
+
+    #[test]
     fn provider_engine_request_maps_signed_body_speciality_to_native_parameter() {
         let descriptor = mayhem_proto::ModelSpecialityDescriptor {
             name: "reasoning_effort".to_owned(),
@@ -62584,6 +62795,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     max_reasoning_tokens: Some(24),
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["test family documentation".to_owned()],
         };
         let mut adapter = catalog::CatalogAdapter::default();
@@ -67096,6 +67308,7 @@ State initialization...
                     max_reasoning_tokens: Some(2_048),
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["pinned fixture card".to_owned()],
         }];
         let report = catalog_list_report(
@@ -67908,11 +68121,63 @@ State initialization...
         let mut errors = Vec::new();
         validate_speciality_calibration_report(
             &catalog.models[0],
-            &["p1".to_owned()],
+            &BTreeMap::from([("reasoning_effort".to_owned(), vec!["p1".to_owned()])]),
             &calibrated,
             &mut errors,
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn speciality_prompt_selection_covers_each_signed_non_text_modality() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        add_test_reasoning_speciality(&mut catalog.models[0]);
+        catalog.models[0].adapter.modality_set.extend([
+            "image".to_owned(),
+            "video".to_owned(),
+            "audio".to_owned(),
+        ]);
+        catalog.models[0].adapter.specialities[0].calibration_modalities =
+            vec!["image".to_owned(), "video".to_owned()];
+        let prompts = serde_json::from_value::<Vec<CanaryPrompt>>(json!([
+            {
+                "id": "text-sampled",
+                "messages": [{"role": "user", "content": "reason"}],
+                "temperature": 0.6,
+                "seed": 1
+            },
+            {
+                "id": "image-sampled",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "describe"}
+                ]}],
+                "temperature": 0.6,
+                "seed": 2
+            },
+            {
+                "id": "video-greedy",
+                "messages": [{"role": "user", "content": [
+                    {"type": "video", "video": {"data": "AAAA", "num_frames": 1}},
+                    {"type": "text", "text": "describe"}
+                ]}],
+                "temperature": 0.0
+            }
+        ]))
+        .unwrap();
+
+        let ids = speciality_canary_prompt_ids(&catalog.models[0], &prompts).unwrap();
+
+        assert_eq!(
+            ids["reasoning_effort"],
+            ["image-sampled".to_owned(), "video-greedy".to_owned()]
+        );
+
+        catalog.models[0].adapter.specialities[0].calibration_modalities = vec!["audio".to_owned()];
+        let error = speciality_canary_prompt_ids(&catalog.models[0], &prompts).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a calibration prompt for modality audio"));
     }
 
     #[test]
@@ -68853,6 +69118,127 @@ State initialization...
     }
 
     #[test]
+    fn artifact_stage_plan_mirrors_prebuilt_gguf_and_declared_mmproj() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let artifact = catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap();
+        artifact.upstream_source = Some(catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "quantizer/prebuilt-gguf".to_owned(),
+            revision: "9".repeat(40),
+            publisher_key: None,
+        });
+        artifact.path = "model-Q4_K_M.gguf".to_owned();
+        artifact.sidecars.insert(
+            "mmproj".to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                path: "mmproj-model-BF16.gguf".to_owned(),
+                artifact_root: "12".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: "34".repeat(32),
+            },
+        );
+
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.source_count, 1);
+        assert!(!report
+            .preflight_command
+            .shell
+            .contains("MAYHEM_LLAMA_CPP_DIR"));
+        let source = &report.source_commands[0];
+        assert_eq!(source.source_repo, "quantizer/prebuilt-gguf");
+        assert!(source.command.shell.contains("allow_patterns="));
+        assert!(source.command.shell.contains("model-Q4_K_M.gguf"));
+        assert!(source.command.shell.contains("mmproj-model-BF16.gguf"));
+        let entry = &report.stage_commands[0];
+        assert_eq!(entry.upstream_source_repo, "quantizer/prebuilt-gguf");
+        assert!(entry.stage_command.shell.contains("prebuilt weights"));
+        assert!(entry.stage_command.shell.contains("prebuilt mmproj"));
+        assert!(entry.stage_command.shell.contains("README.md"));
+        assert!(!entry.stage_command.shell.contains("convert_hf_to_gguf.py"));
+        assert!(!entry.stage_command.shell.contains("llama-quantize"));
+    }
+
+    #[test]
+    fn artifact_publish_plan_uploads_and_links_prebuilt_gguf_sidecars() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let artifact = catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap();
+        artifact.upstream_source = Some(catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "quantizer/prebuilt-gguf".to_owned(),
+            revision: "9".repeat(40),
+            publisher_key: None,
+        });
+        artifact.path = "model-Q4_K_M.gguf".to_owned();
+        artifact.sidecars.insert(
+            "mmproj".to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                path: "mmproj-model-BF16.gguf".to_owned(),
+                artifact_root: "12".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: "34".repeat(32),
+            },
+        );
+        let temp = env::temp_dir().join(format!(
+            "mayhem-artifact-publish-plan-prebuilt-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let artifact_base = temp.join("artifacts");
+        let artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+        let artifact_root = catalog_artifact_local_root(&artifact_path, &artifact.path).unwrap();
+        let sidecar_path = artifact_root.join("mmproj-model-BF16.gguf");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, b"prebuilt gguf").unwrap();
+        fs::write(&sidecar_path, b"prebuilt mmproj").unwrap();
+
+        let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: temp.join("catalog.json"),
+            artifact_base: artifact_base.clone(),
+            report_dir: temp.join("reports"),
+            catalog_output: temp.join("catalog.with-artifacts.json"),
+            catalog_sign: None,
+            hf_token_file: Some(temp.join("hf-token.txt")),
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        let entry = &report.publish_commands[0];
+        assert!(entry
+            .upload_command
+            .argv
+            .iter()
+            .any(|arg| arg == &artifact_root.display().to_string()));
+        assert_eq!(
+            entry.upload_command.argv.last().map(String::as_str),
+            Some(".")
+        );
+        assert!(entry
+            .metadata_after_publish_shell
+            .contains("mmproj-model-BF16.gguf"));
+        assert!(entry
+            .metadata_after_publish_shell
+            .contains(&sidecar_path.display().to_string()));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn artifact_stage_plan_mlx_does_not_precreate_output_dir() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -68866,6 +69252,7 @@ State initialization...
                     revision: "3".repeat(40),
                     publisher_key: None,
                 },
+                upstream_source: None,
                 path: "model.safetensors".to_owned(),
                 artifact_root: "cc".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -68972,6 +69359,7 @@ State initialization...
                     revision: "4".repeat(40),
                     publisher_key: None,
                 },
+                upstream_source: None,
                 path: "checkpoint.nvfp4.safetensors".to_owned(),
                 artifact_root: "bb".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -69131,6 +69519,7 @@ State initialization...
                     revision: "3".repeat(40),
                     publisher_key: None,
                 },
+                upstream_source: None,
                 path: "model.safetensors".to_owned(),
                 artifact_root: "cc".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -71495,6 +71884,7 @@ State initialization...
                     revision: "1".repeat(40),
                     publisher_key: None,
                 },
+                upstream_source: None,
                 path: "model.gguf".to_owned(),
                 artifact_root: root.to_owned(),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -71603,6 +71993,7 @@ State initialization...
                     max_reasoning_tokens: Some(24),
                 },
             ],
+            calibration_modalities: Vec::new(),
             research_evidence: vec!["pinned test family documentation".to_owned()],
         };
         let contract = model
@@ -71770,6 +72161,7 @@ State initialization...
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
             source,
+            upstream_source: None,
             path: "model.safetensors".to_owned(),
             artifact_root: "dd".repeat(32),
             artifact_root_kind: "blake3_merkle_v1".to_owned(),

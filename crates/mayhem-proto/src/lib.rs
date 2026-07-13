@@ -373,6 +373,8 @@ pub struct ModelSpecialityDescriptor {
     pub mechanism: String,
     pub default_level: String,
     pub levels: Vec<ModelSpecialityLevel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_modalities: Vec<String>,
     pub research_evidence: Vec<String>,
 }
 
