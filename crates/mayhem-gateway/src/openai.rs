@@ -606,6 +606,10 @@ pub struct SamplingProfile {
     pub min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
 }
 
 impl SamplingProfile {
@@ -615,6 +619,8 @@ impl SamplingProfile {
             && self.top_k.is_none()
             && self.min_p.is_none()
             && self.repeat_penalty.is_none()
+            && self.frequency_penalty.is_none()
+            && self.presence_penalty.is_none()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -624,6 +630,8 @@ impl SamplingProfile {
             self.top_k,
             self.min_p,
             self.repeat_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
         )
     }
 }
@@ -1417,6 +1425,8 @@ pub struct GatewayCanaryPrompt {
     pub top_k: Option<i32>,
     pub min_p: Option<f64>,
     pub repeat_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
     pub prompt: Option<String>,
     pub input: Option<String>,
     pub audio_b64: Option<String>,
@@ -8471,6 +8481,10 @@ struct CanaryPromptDocument {
     #[serde(default)]
     repeat_penalty: Option<f64>,
     #[serde(default)]
+    frequency_penalty: Option<f64>,
+    #[serde(default)]
+    presence_penalty: Option<f64>,
+    #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     input: Option<String>,
@@ -8844,6 +8858,8 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             top_k: prompt.top_k,
             min_p: prompt.min_p,
             repeat_penalty: prompt.repeat_penalty,
+            frequency_penalty: prompt.frequency_penalty,
+            presence_penalty: prompt.presence_penalty,
             prompt: prompt.prompt,
             input: prompt.input,
             audio_b64: prompt.audio_b64,
@@ -15186,6 +15202,8 @@ fn validate_sampling_values(
     top_k: Option<i32>,
     min_p: Option<f64>,
     repeat_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
 ) -> Result<(), String> {
     if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
         return Err("temperature must be finite and between 0 and 2".to_owned());
@@ -15202,6 +15220,12 @@ fn validate_sampling_values(
     if repeat_penalty.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0) {
         return Err("repeat_penalty must be finite and in (0, 10]".to_owned());
     }
+    if frequency_penalty.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
+        return Err("frequency_penalty must be finite and between -2 and 2".to_owned());
+    }
+    if presence_penalty.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
+        return Err("presence_penalty must be finite and between -2 and 2".to_owned());
+    }
     Ok(())
 }
 
@@ -15215,6 +15239,8 @@ fn apply_model_sampling_defaults(
         request.top_k,
         request.min_p,
         None,
+        request.frequency_penalty,
+        request.presence_penalty,
     )
     .map_err(|message| ApiError::bad_request(message, Some("sampling")))?;
     model.mayhem.sampling.validate().map_err(|message| {
@@ -15248,6 +15274,8 @@ fn apply_model_sampling_defaults(
     request.top_k = request.top_k.or(defaults.top_k);
     request.min_p = request.min_p.or(defaults.min_p);
     request.repeat_penalty = defaults.repeat_penalty;
+    request.frequency_penalty = request.frequency_penalty.or(defaults.frequency_penalty);
+    request.presence_penalty = request.presence_penalty.or(defaults.presence_penalty);
     Ok(())
 }
 
@@ -23298,8 +23326,8 @@ fn canary_chat_request(
         top_k: prompt.top_k,
         min_p: prompt.min_p,
         repeat_penalty: prompt.repeat_penalty,
-        frequency_penalty: None,
-        presence_penalty: None,
+        frequency_penalty: prompt.frequency_penalty,
+        presence_penalty: prompt.presence_penalty,
         seed: Some(prompt.seed.unwrap_or(seed)),
         stop: None,
         max_tokens: Some(prompt.max_tokens.max(1)),
@@ -24174,6 +24202,8 @@ fn sampling_profile_from_catalog_value(model: &Value) -> SamplingProfile {
             .and_then(|value| i32::try_from(value).ok()),
         min_p: sampling.get("min_p").and_then(Value::as_f64),
         repeat_penalty: sampling.get("repeat_penalty").and_then(Value::as_f64),
+        frequency_penalty: sampling.get("frequency_penalty").and_then(Value::as_f64),
+        presence_penalty: sampling.get("presence_penalty").and_then(Value::as_f64),
     }
 }
 
@@ -26940,10 +26970,13 @@ mod tests {
             top_k: Some(20),
             min_p: Some(0.02),
             repeat_penalty: Some(1.05),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(1.5),
         };
         let mut request = test_chat_request(&model.id);
         request.temperature = Some(0.3);
         request.top_k = Some(42);
+        request.frequency_penalty = Some(-0.5);
 
         apply_model_sampling_defaults(&model, &mut request).unwrap();
 
@@ -26952,6 +26985,8 @@ mod tests {
         assert_eq!(request.top_k, Some(42));
         assert_eq!(request.min_p, Some(0.02));
         assert_eq!(request.repeat_penalty, Some(1.05));
+        assert_eq!(request.frequency_penalty, Some(-0.5));
+        assert_eq!(request.presence_penalty, Some(1.5));
     }
 
     #[test]
@@ -26968,6 +27003,23 @@ mod tests {
     }
 
     #[test]
+    fn model_sampling_rejects_out_of_range_client_and_catalog_penalties() {
+        let mut model = test_model();
+        let mut request = test_chat_request(&model.id);
+        request.presence_penalty = Some(2.01);
+
+        let client_error = apply_model_sampling_defaults(&model, &mut request).unwrap_err();
+        assert_eq!(client_error.status, StatusCode::BAD_REQUEST);
+        assert!(client_error.message.contains("presence_penalty"));
+
+        model.mayhem.sampling.frequency_penalty = Some(-2.01);
+        let mut request = test_chat_request(&model.id);
+        let catalog_error = apply_model_sampling_defaults(&model, &mut request).unwrap_err();
+        assert_eq!(catalog_error.status, StatusCode::BAD_GATEWAY);
+        assert!(catalog_error.message.contains("frequency_penalty"));
+    }
+
+    #[test]
     fn automatic_canary_request_uses_profile_and_seeded_client_overrides() {
         let mut model = test_model();
         model.mayhem.sampling = SamplingProfile {
@@ -26976,6 +27028,8 @@ mod tests {
             top_k: Some(20),
             min_p: Some(0.02),
             repeat_penalty: Some(1.05),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(1.5),
         };
         let prompt = GatewayCanaryPrompt {
             id: "sampling-high".to_owned(),
@@ -26993,6 +27047,8 @@ mod tests {
             top_k: Some(40),
             min_p: Some(0.1),
             repeat_penalty: None,
+            frequency_penalty: Some(-0.25),
+            presence_penalty: Some(2.0),
             prompt: None,
             input: None,
             audio_b64: None,
@@ -27014,6 +27070,8 @@ mod tests {
         assert_eq!(request.top_k, Some(40));
         assert_eq!(request.min_p, Some(0.1));
         assert_eq!(request.repeat_penalty, Some(1.05));
+        assert_eq!(request.frequency_penalty, Some(-0.25));
+        assert_eq!(request.presence_penalty, Some(2.0));
         assert_eq!(request.seed, Some(77));
     }
 
@@ -27237,6 +27295,8 @@ mod tests {
                 top_k: None,
                 min_p: None,
                 repeat_penalty: None,
+                frequency_penalty: None,
+                presence_penalty: None,
                 prompt: Some("fixed image canary".to_owned()),
                 input: None,
                 audio_b64: None,

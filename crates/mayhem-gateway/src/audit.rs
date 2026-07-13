@@ -39,6 +39,10 @@ pub struct CanarySamplingProfile {
     pub min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -83,6 +87,14 @@ impl CanaryProbeSpec {
             (
                 "repeat_penalty",
                 self.sampling.repeat_penalty.map(Value::from),
+            ),
+            (
+                "frequency_penalty",
+                self.sampling.frequency_penalty.map(Value::from),
+            ),
+            (
+                "presence_penalty",
+                self.sampling.presence_penalty.map(Value::from),
             ),
         ] {
             if let Some(value) = value {
@@ -752,6 +764,8 @@ mod tests {
             max_tokens: 8,
             sampling: CanarySamplingProfile {
                 temperature: Some(0.0),
+                frequency_penalty: Some(-0.25),
+                presence_penalty: Some(1.5),
                 ..CanarySamplingProfile::default()
             },
         }
@@ -762,6 +776,8 @@ mod tests {
         let body = spec().openai_chat_body();
         assert_eq!(body["model"], "mayhem/dev-chat-tools");
         assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["frequency_penalty"], -0.25);
+        assert_eq!(body["presence_penalty"], 1.5);
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
 

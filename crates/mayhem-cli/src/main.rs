@@ -15908,6 +15908,17 @@ fn canary_set_matrix_check(
                 }
             }
         }
+        for (name, value) in [
+            ("frequency_penalty", prompt.frequency_penalty),
+            ("presence_penalty", prompt.presence_penalty),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
+                return Err(format!(
+                    "canary prompt {} in {set_id} has invalid {name}",
+                    prompt.id
+                ));
+            }
+        }
         prompt_ids.push(prompt.id.clone());
     }
     if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
@@ -15951,6 +15962,16 @@ fn canary_prompt_uses_model_sampling_defaults(
         && prompt.repeat_penalty.is_none_or(|value| {
             defaults
                 .repeat_penalty
+                .is_some_and(|default| sampling_float_eq(value, default))
+        })
+        && prompt.frequency_penalty.is_none_or(|value| {
+            defaults
+                .frequency_penalty
+                .is_some_and(|default| sampling_float_eq(value, default))
+        })
+        && prompt.presence_penalty.is_none_or(|value| {
+            defaults
+                .presence_penalty
                 .is_some_and(|default| sampling_float_eq(value, default))
         })
 }
@@ -28790,6 +28811,10 @@ struct CanaryPrompt {
     #[serde(default)]
     repeat_penalty: Option<f64>,
     #[serde(default)]
+    frequency_penalty: Option<f64>,
+    #[serde(default)]
+    presence_penalty: Option<f64>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     prompt: Option<String>,
@@ -29389,6 +29414,12 @@ fn canary_probe_request(model_id: &str, prompt: &CanaryPrompt) -> Value {
     }
     if let Some(repeat_penalty) = prompt.repeat_penalty {
         request["repeat_penalty"] = json!(repeat_penalty);
+    }
+    if let Some(frequency_penalty) = prompt.frequency_penalty {
+        request["frequency_penalty"] = json!(frequency_penalty);
+    }
+    if let Some(presence_penalty) = prompt.presence_penalty {
+        request["presence_penalty"] = json!(presence_penalty);
     }
     if let Some(seed) = prompt.seed {
         request["seed"] = json!(seed);
@@ -30699,6 +30730,14 @@ fn opencode_sampling_options(model: &TestModel) -> Value {
         ("top_p", sampling.top_p.map(Value::from)),
         ("top_k", sampling.top_k.map(Value::from)),
         ("min_p", sampling.min_p.map(Value::from)),
+        (
+            "frequency_penalty",
+            sampling.frequency_penalty.map(Value::from),
+        ),
+        (
+            "presence_penalty",
+            sampling.presence_penalty.map(Value::from),
+        ),
     ] {
         if let Some(value) = value {
             options.insert(name.to_owned(), value);
@@ -30719,6 +30758,8 @@ fn inferred_opencode_sampling(model: &TestModel) -> catalog::CatalogSamplingProf
             top_k: Some(20),
             min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     } else {
         catalog::CatalogSamplingProfile {
@@ -30727,6 +30768,8 @@ fn inferred_opencode_sampling(model: &TestModel) -> catalog::CatalogSamplingProf
             top_k: None,
             min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 }
@@ -41207,6 +41250,8 @@ fn gateway_sampling_profile(sampling: &catalog::CatalogSamplingProfile) -> Sampl
         top_k: sampling.top_k,
         min_p: sampling.min_p,
         repeat_penalty: sampling.repeat_penalty,
+        frequency_penalty: sampling.frequency_penalty,
+        presence_penalty: sampling.presence_penalty,
     }
 }
 
@@ -51775,10 +51820,12 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         .or(sampling.min_p)
         .map(|value| value as f32);
     request.repeat_penalty = provider_repeat_penalty(body, sampling)?.map(|value| value as f32);
-    request.frequency_penalty =
-        provider_optional_f64(body, "frequency_penalty")?.map(|value| value as f32);
-    request.presence_penalty =
-        provider_optional_f64(body, "presence_penalty")?.map(|value| value as f32);
+    request.frequency_penalty = provider_optional_f64(body, "frequency_penalty")?
+        .or(sampling.frequency_penalty)
+        .map(|value| value as f32);
+    request.presence_penalty = provider_optional_f64(body, "presence_penalty")?
+        .or(sampling.presence_penalty)
+        .map(|value| value as f32);
     request.stop = provider_stop_sequences(body)?;
     request.seed = provider_optional_u32(body, "seed")?;
     request.validate_sampling()?;
@@ -61667,11 +61714,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             top_k: Some(20),
             min_p: Some(0.02),
             repeat_penalty: Some(1.05),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(1.5),
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "sample" }],
             "temperature": 0.3,
             "top_k": 42,
+            "frequency_penalty": -0.5,
             "seed": 77
         });
 
@@ -61688,6 +61738,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.top_k, Some(42));
         assert_eq!(request.min_p, Some(0.02));
         assert_eq!(request.repeat_penalty, Some(1.05));
+        assert_eq!(request.frequency_penalty, Some(-0.5));
+        assert_eq!(request.presence_penalty, Some(1.5));
         assert_eq!(request.seed, Some(77));
     }
 
@@ -65930,6 +65982,8 @@ State initialization...
             top_k: Some(20),
             min_p: Some(0.05),
             repeat_penalty: Some(1.05),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(1.5),
             max_tokens: Some(16),
             prompt: None,
             input: None,
@@ -65951,6 +66005,8 @@ State initialization...
         assert_eq!(request["min_p"], 0.05);
         assert_eq!(request["specialities"]["thinking_mode"], "disabled");
         assert_eq!(request["repeat_penalty"], 1.05);
+        assert_eq!(request["frequency_penalty"], 0.25);
+        assert_eq!(request["presence_penalty"], 1.5);
 
         assert_eq!(request["model"], "admin/model");
         assert_eq!(
@@ -66318,6 +66374,8 @@ State initialization...
             top_k: Some(20),
             min_p: Some(0.05),
             repeat_penalty: Some(1.05),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(1.5),
         };
         let canaries_dir = test_canary_dir_with_prompts(
             &model.canary.set_id,
@@ -66329,6 +66387,8 @@ State initialization...
                     "top_p": 0.95,
                     "top_k": 20,
                     "min_p": 0.05,
+                    "frequency_penalty": 0.25,
+                    "presence_penalty": 1.5,
                     "seed": 101,
                     "max_tokens": 8
                 },
@@ -66362,6 +66422,25 @@ State initialization...
     }
 
     #[test]
+    fn canary_matrix_rejects_out_of_range_client_penalties() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.canary.set_id = "test-canary-invalid-penalty".to_owned();
+        let canaries_dir = test_canary_dir_with_prompts(
+            &model.canary.set_id,
+            json!([{
+                "id": "invalid-penalty",
+                "messages": [{"role": "user", "content": "invalid"}],
+                "presence_penalty": 2.01,
+                "seed": 101
+            }]),
+        );
+
+        let error = canary_set_matrix_check(&canaries_dir, model).unwrap_err();
+        assert!(error.contains("invalid presence_penalty"), "{error}");
+    }
+
+    #[test]
     fn canary_matrix_rejects_profile_without_both_sides_of_temperature_range() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         let model = &mut catalog.models[0];
@@ -66372,6 +66451,8 @@ State initialization...
             top_k: Some(20),
             min_p: Some(0.05),
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         };
         let canaries_dir = test_canary_dir_with_prompts(
             &model.canary.set_id,

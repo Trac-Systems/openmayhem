@@ -128,6 +128,10 @@ pub(crate) struct CatalogSamplingProfile {
     pub(crate) min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) presence_penalty: Option<f64>,
 }
 
 impl CatalogSamplingProfile {
@@ -137,6 +141,8 @@ impl CatalogSamplingProfile {
             && self.top_k.is_none()
             && self.min_p.is_none()
             && self.repeat_penalty.is_none()
+            && self.frequency_penalty.is_none()
+            && self.presence_penalty.is_none()
     }
 }
 
@@ -429,6 +435,10 @@ struct CanarySetPrompt {
     min_p: Option<f64>,
     #[serde(default)]
     repeat_penalty: Option<f64>,
+    #[serde(default)]
+    frequency_penalty: Option<f64>,
+    #[serde(default)]
+    presence_penalty: Option<f64>,
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -833,6 +843,24 @@ fn validate_model_sampling(model: &CatalogModel, errors: &mut Vec<String>) {
     {
         errors.push(format!(
             "{} sampling.repeat_penalty must be finite and in (0, 10]",
+            model.model_id
+        ));
+    }
+    if sampling
+        .frequency_penalty
+        .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+    {
+        errors.push(format!(
+            "{} sampling.frequency_penalty must be finite and between -2 and 2",
+            model.model_id
+        ));
+    }
+    if sampling
+        .presence_penalty
+        .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+    {
+        errors.push(format!(
+            "{} sampling.presence_penalty must be finite and between -2 and 2",
             model.model_id
         ));
     }
@@ -2891,6 +2919,24 @@ fn validate_canary_set(canaries_dir: &Path, set_id: &str, errors: &mut Vec<Strin
                         prompt.id
                     ));
                 }
+                if prompt
+                    .frequency_penalty
+                    .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid frequency_penalty",
+                        prompt.id
+                    ));
+                }
+                if prompt
+                    .presence_penalty
+                    .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+                {
+                    errors.push(format!(
+                        "canary prompt {} in {set_id} has invalid presence_penalty",
+                        prompt.id
+                    ));
+                }
                 if prompt.temperature.is_some_and(|value| value > 0.0) && prompt.seed.is_none() {
                     errors.push(format!(
                         "canary prompt {} in {set_id} must pin seed when temperature is non-zero",
@@ -3988,6 +4034,8 @@ mod tests {
             top_k: None,
             min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: None,
             max_tokens: Some(8),
         };
