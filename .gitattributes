@@ -1,0 +1,5 @@
+# Byte-hashed and signed release assets must be identical on every OS.
+RULES.md text eol=lf
+catalog/*.json text eol=lf
+catalog/**/*.json text eol=lf
+catalog/**/*.sig text eol=lf
