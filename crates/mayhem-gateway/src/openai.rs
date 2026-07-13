@@ -114,6 +114,8 @@ const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
 const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/canary-dev-v1.json");
 const EMBEDDED_CANARY_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-launch-v1.json");
+const EMBEDDED_CANARY_LAUNCH_V2: &str =
+    include_str!("../../../catalog/canaries/canary-launch-v2.json");
 const EMBEDDED_CANARY_IMAGE_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-image-launch-v1.json");
 const EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1: &str =
@@ -8834,6 +8836,7 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
     [
         EMBEDDED_CANARY_DEV_V1,
         EMBEDDED_CANARY_LAUNCH_V1,
+        EMBEDDED_CANARY_LAUNCH_V2,
         EMBEDDED_CANARY_IMAGE_LAUNCH_V1,
         EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1,
         EMBEDDED_CANARY_TTS_LAUNCH_V1,
