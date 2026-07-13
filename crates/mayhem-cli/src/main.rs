@@ -12436,13 +12436,14 @@ fn catalog_endpoint_calibration_execute(
             .map_err(|error| format!("translating endpoint request: {error:#}"))?;
     let sealed = catalog_endpoint_calibration_seal(contract, request, transport)
         .map_err(|error| format!("sealing provider request: {error:#}"))?;
-    let output = provider_engine_session_response_with_sampling(
+    let output = provider_engine_session_response_with_sampling_bounded(
         backend,
         Some(&model.model_id),
         &model.adapter,
         &model.sampling,
         &sealed,
         None,
+        Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
     )
     .map_err(|error| format!("executing provider request: {error:#}"))?;
     let response = catalog_endpoint_calibration_response(&contract.family, request, &output)
@@ -12454,6 +12455,8 @@ fn catalog_endpoint_calibration_execute(
         response,
     })
 }
+
+const ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS: u32 = 128;
 
 fn catalog_endpoint_calibration_transport(
     contract: &mayhem_proto::EndpointFamilyContract,
@@ -51025,7 +51028,27 @@ fn provider_engine_session_response_with_sampling(
     adapter: &catalog::CatalogAdapter,
     sampling: &catalog::CatalogSamplingProfile,
     body: &Value,
+    live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
+) -> Result<ProviderSessionOutput> {
+    provider_engine_session_response_with_sampling_bounded(
+        backend,
+        expected_model_id,
+        adapter,
+        sampling,
+        body,
+        live_stream,
+        None,
+    )
+}
+
+fn provider_engine_session_response_with_sampling_bounded(
+    backend: &mut dyn EngineBackend,
+    expected_model_id: Option<&str>,
+    adapter: &catalog::CatalogAdapter,
+    sampling: &catalog::CatalogSamplingProfile,
+    body: &Value,
     mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
+    output_token_cap: Option<u32>,
 ) -> Result<ProviderSessionOutput> {
     let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
     let endpoint_family = verified.family;
@@ -51293,12 +51316,15 @@ fn provider_engine_session_response_with_sampling(
 
     let tool_mode =
         provider_engine_tool_request(request_body, adapter)?.map(|(strategy, _)| strategy);
-    let request = provider_engine_request_from_endpoint_body_with_sampling(
+    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
         endpoint_family,
         request_body,
         adapter,
         sampling,
     )?;
+    if let Some(cap) = output_token_cap {
+        request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
+    }
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
     // Bill the canonical request content shared with the gateway, not backend-specific
@@ -62095,6 +62121,49 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(request.prompt.contains("describe this"));
         assert!(request.prompt.contains("[image:"));
         assert!(request.prompt.contains("[audio:wav:"));
+    }
+
+    #[test]
+    fn endpoint_calibration_bounds_backend_output_without_narrowing_the_contract() {
+        let mut adapter = catalog::CatalogAdapter::default();
+        adapter.endpoint_families.push(
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+                .unwrap(),
+        );
+        let body = json!({
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "boundary probe"}],
+            "max_tokens": 262_144
+        });
+        let sealed = provider_seal_local_contract_request(&body, &adapter, "test/model").unwrap();
+
+        let mut production = FakeEngineBackend::new("ok");
+        provider_engine_session_response_with_sampling(
+            &mut production,
+            Some("test/model"),
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+            &sealed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(production.last_request.unwrap().max_new_tokens, 262_144);
+
+        let mut calibration = FakeEngineBackend::new("ok");
+        provider_engine_session_response_with_sampling_bounded(
+            &mut calibration,
+            Some("test/model"),
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+            &sealed,
+            None,
+            Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+        )
+        .unwrap();
+        assert_eq!(
+            calibration.last_request.unwrap().max_new_tokens,
+            ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS
+        );
     }
 
     #[test]
