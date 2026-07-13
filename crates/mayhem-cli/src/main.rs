@@ -49516,6 +49516,7 @@ fn provider_canary_self_test_body(
             for (name, level) in &prompt.specialities {
                 object.insert(name.clone(), json!(level));
             }
+            provider_canary_self_test_disable_reasoning(model, object);
             for (name, value) in [
                 ("temperature", prompt.temperature.map(Value::from)),
                 ("top_p", prompt.top_p.map(Value::from)),
@@ -49591,6 +49592,39 @@ fn provider_canary_self_test_body(
             "seed": prompt.seed.unwrap_or(7),
         })),
         other => bail!("functional modality self-test is not wired for model_class {other}"),
+    }
+}
+
+fn provider_canary_self_test_disable_reasoning(
+    model: &catalog::CatalogModel,
+    body: &mut serde_json::Map<String, Value>,
+) {
+    // Startup modality probes are intentionally tiny, so use a signed direct-answer level.
+    for speciality in &model.adapter.specialities {
+        let controls_reasoning =
+            provider_reasoning_speciality_control(&speciality.name, &speciality.name)
+                || model.adapter.endpoint_families.iter().any(|contract| {
+                    contract
+                        .speciality_mappings
+                        .get(&speciality.name)
+                        .is_some_and(|mapping| {
+                            provider_reasoning_speciality_control(
+                                &speciality.name,
+                                &mapping.native_path,
+                            )
+                        })
+                });
+        if !controls_reasoning {
+            continue;
+        }
+        let Some(level) = speciality
+            .levels
+            .iter()
+            .find(|level| provider_reasoning_level_disabled(&level.name, &level.native_value))
+        else {
+            continue;
+        };
+        body.insert(speciality.name.clone(), json!(&level.name));
     }
 }
 
@@ -51128,28 +51162,40 @@ fn provider_reasoning_output_mode(
 
 fn provider_reasoning_speciality_enabled(request: &GenerateRequest) -> Option<bool> {
     request.speciality_parameters.iter().find_map(|speciality| {
-        let name = speciality.name.to_ascii_lowercase();
-        let native_path = speciality.native_path.to_ascii_lowercase();
-        let haystack = format!("{name} {native_path}");
-        if (!haystack.contains("reason") && !haystack.contains("think"))
-            || ["preserve", "history", "retain"]
-                .iter()
-                .any(|marker| haystack.contains(marker))
-        {
+        if !provider_reasoning_speciality_control(&speciality.name, &speciality.native_path) {
             return None;
         }
-        let level = speciality.level.to_ascii_lowercase();
-        let disabled_level = matches!(level.as_str(), "none" | "off" | "disabled");
-        let disabled_value = speciality.value == Value::Bool(false)
-            || speciality.value.as_u64() == Some(0)
-            || speciality.value.as_str().is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "none" | "off" | "disabled" | "false"
-                )
-            });
-        Some(!disabled_level && !disabled_value)
+        Some(!provider_reasoning_level_disabled(
+            &speciality.level,
+            &speciality.value,
+        ))
     })
+}
+
+fn provider_reasoning_speciality_control(name: &str, native_path: &str) -> bool {
+    let haystack = format!(
+        "{} {}",
+        name.to_ascii_lowercase(),
+        native_path.to_ascii_lowercase()
+    );
+    (haystack.contains("reason") || haystack.contains("think"))
+        && !["preserve", "history", "retain"]
+            .iter()
+            .any(|marker| haystack.contains(marker))
+}
+
+fn provider_reasoning_level_disabled(level: &str, value: &Value) -> bool {
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled"
+    ) || value == &Value::Bool(false)
+        || value.as_u64() == Some(0)
+        || value.as_str().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled" | "false"
+            )
+        })
 }
 
 fn provider_reasoning_visible_output(text: &str, mode: ProviderReasoningOutputMode) -> String {
@@ -62681,6 +62727,34 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }
 
         assert_eq!(covered, served);
+    }
+
+    #[test]
+    fn bounded_provider_modality_probe_uses_signed_direct_answer_level() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "hauhaucs/qwen3.6-35b-a3b-uncensored")
+            .expect("live Qwen model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let prompt = prompts
+            .iter()
+            .find(|prompt| {
+                prompt.specialities.get("thinking_mode").map(String::as_str) == Some("enabled")
+                    && provider_canary_prompt_modalities(model, prompt).contains("image")
+            })
+            .expect("enabled-thinking image canary");
+
+        let body = provider_canary_self_test_body(model, prompt).unwrap();
+
+        assert_eq!(body["max_tokens"], 4);
+        assert_eq!(body["thinking_mode"], "disabled");
+        assert_eq!(body["thinking_history"], "latest_only");
     }
 
     #[test]
