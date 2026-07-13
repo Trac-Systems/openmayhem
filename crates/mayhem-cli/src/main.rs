@@ -9256,6 +9256,8 @@ struct CatalogArtifactMetadataReport {
     chunk_count: usize,
     catalog_patch: CatalogArtifactMetadataPatch,
     catalog_binding: Option<CatalogArtifactMetadataBinding>,
+    #[serde(default)]
+    sidecars: BTreeMap<String, CatalogArtifactSidecarMetadataReport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -9289,6 +9291,35 @@ struct CatalogArtifactMetadataBinding {
     update_needed: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogArtifactSidecarMetadataReport {
+    ok: bool,
+    artifact_path: PathBuf,
+    chunk_size: usize,
+    total_bytes: u64,
+    chunk_count: usize,
+    catalog_patch: CatalogArtifactMetadataPatch,
+    catalog_binding: CatalogArtifactSidecarMetadataBinding,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogArtifactSidecarMetadataBinding {
+    sidecar: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    target_source_revision: Option<String>,
+    source_path: String,
+    current_artifact_root_kind: String,
+    current_artifact_root: String,
+    current_source_sha256: String,
+    current_weights_bytes: u64,
+    matches_current_artifact_root: bool,
+    matches_current_source_sha256: bool,
+    matches_current_weights_bytes: bool,
+    update_needed: bool,
+}
+
 fn catalog_artifact_metadata_report(
     catalog_binding: Option<(&catalog::CatalogDocument, PathBuf, &str, &str)>,
     artifact_path: PathBuf,
@@ -9298,23 +9329,23 @@ fn catalog_artifact_metadata_report(
     if chunk_size == 0 {
         bail!("--chunk-size must be positive");
     }
-    let metadata = fs::metadata(&artifact_path)
-        .with_context(|| format!("stat {}", artifact_path.display()))?;
-    if !metadata.is_file() {
-        bail!(
-            "artifact metadata currently requires a file artifact; archive snapshots before catalog finalization: {}",
-            artifact_path.display()
-        );
-    }
-    let source_sha256 = file_sha256_hex(&artifact_path)?;
-    let merkle = build_merkle_manifest(&artifact_path, chunk_size)?;
-    let catalog_patch = CatalogArtifactMetadataPatch {
-        artifact_root_kind: "blake3_merkle_v1".to_owned(),
-        artifact_root: merkle.root.clone(),
-        source_sha256,
-        source_revision,
-        weights_bytes: merkle.total_bytes,
-    };
+    let sidecar_source_revision = source_revision.clone();
+    let (catalog_patch, total_bytes, chunk_count) =
+        catalog_artifact_file_metadata(&artifact_path, chunk_size, source_revision)?;
+    let sidecars = catalog_binding
+        .as_ref()
+        .map(|(catalog_doc, _, model_id, artifact_name)| {
+            catalog_artifact_sidecar_metadata_reports(
+                catalog_doc,
+                model_id,
+                artifact_name,
+                &artifact_path,
+                chunk_size,
+                sidecar_source_revision,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
     let catalog_binding = catalog_binding
         .map(|(catalog_doc, catalog_path, model_id, artifact_name)| {
             catalog_artifact_metadata_binding(
@@ -9329,12 +9360,117 @@ fn catalog_artifact_metadata_report(
     Ok(CatalogArtifactMetadataReport {
         ok: true,
         artifact_path,
-        chunk_size: merkle.chunk_size,
-        total_bytes: merkle.total_bytes,
-        chunk_count: merkle.chunks.len(),
+        chunk_size,
+        total_bytes,
+        chunk_count,
         catalog_patch,
         catalog_binding,
+        sidecars,
     })
+}
+
+fn catalog_artifact_file_metadata(
+    artifact_path: &Path,
+    chunk_size: usize,
+    source_revision: Option<String>,
+) -> Result<(CatalogArtifactMetadataPatch, u64, usize)> {
+    let metadata =
+        fs::metadata(artifact_path).with_context(|| format!("stat {}", artifact_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "artifact metadata requires a file artifact; archive snapshots before catalog finalization: {}",
+            artifact_path.display()
+        );
+    }
+    let source_sha256 = file_sha256_hex(artifact_path)?;
+    let merkle = build_merkle_manifest(artifact_path, chunk_size)?;
+    let patch = CatalogArtifactMetadataPatch {
+        artifact_root_kind: "blake3_merkle_v1".to_owned(),
+        artifact_root: merkle.root,
+        source_sha256,
+        source_revision,
+        weights_bytes: merkle.total_bytes,
+    };
+    Ok((patch, merkle.total_bytes, merkle.chunks.len()))
+}
+
+fn catalog_artifact_sidecar_metadata_reports(
+    catalog_doc: &catalog::CatalogDocument,
+    model_id: &str,
+    artifact_name: &str,
+    artifact_path: &Path,
+    chunk_size: usize,
+    source_revision: Option<String>,
+) -> Result<BTreeMap<String, CatalogArtifactSidecarMetadataReport>> {
+    let model = catalog_doc
+        .models
+        .iter()
+        .find(|model| model.model_id == model_id)
+        .with_context(|| format!("model {model_id} not found while hashing artifact sidecars"))?;
+    let artifact = model.artifacts.get(artifact_name).with_context(|| {
+        format!("artifact {artifact_name} not found for model {model_id} while hashing sidecars")
+    })?;
+    let artifact_root = catalog_artifact_local_root(artifact_path, &artifact.path)?;
+    let mut reports = BTreeMap::new();
+
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        let sidecar_relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
+        let sidecar_path = artifact_root.join(sidecar_relative);
+        let target_source_revision = source_revision.clone().filter(|_| {
+            sidecar.source.kind == artifact.source.kind
+                && sidecar.source.repo == artifact.source.repo
+                && sidecar.source.revision == artifact.source.revision
+        });
+        let (catalog_patch, total_bytes, chunk_count) = catalog_artifact_file_metadata(
+            &sidecar_path,
+            chunk_size,
+            target_source_revision.clone(),
+        )?;
+        let matches_current_artifact_root = sidecar.artifact_root_kind
+            == catalog_patch.artifact_root_kind
+            && sidecar.artifact_root == catalog_patch.artifact_root;
+        let matches_current_source_sha256 = sidecar
+            .source_sha256
+            .eq_ignore_ascii_case(&catalog_patch.source_sha256);
+        let matches_target_source_revision =
+            target_source_revision.as_ref().map_or(true, |target| {
+                sidecar.source.revision.eq_ignore_ascii_case(target)
+            });
+        let matches_current_weights_bytes = sidecar.weights_bytes == catalog_patch.weights_bytes;
+        let update_needed = !matches_current_artifact_root
+            || !matches_current_source_sha256
+            || !matches_target_source_revision
+            || !matches_current_weights_bytes;
+        reports.insert(
+            sidecar_name.clone(),
+            CatalogArtifactSidecarMetadataReport {
+                ok: true,
+                artifact_path: sidecar_path,
+                chunk_size,
+                total_bytes,
+                chunk_count,
+                catalog_patch,
+                catalog_binding: CatalogArtifactSidecarMetadataBinding {
+                    sidecar: sidecar_name.clone(),
+                    source_kind: sidecar.source.kind.clone(),
+                    source_repo: sidecar.source.repo.clone(),
+                    source_revision: sidecar.source.revision.clone(),
+                    target_source_revision,
+                    source_path: sidecar.path.clone(),
+                    current_artifact_root_kind: sidecar.artifact_root_kind.clone(),
+                    current_artifact_root: sidecar.artifact_root.clone(),
+                    current_source_sha256: sidecar.source_sha256.clone(),
+                    current_weights_bytes: sidecar.weights_bytes,
+                    matches_current_artifact_root,
+                    matches_current_source_sha256,
+                    matches_current_weights_bytes,
+                    update_needed,
+                },
+            },
+        );
+    }
+
+    Ok(reports)
 }
 
 fn catalog_artifact_metadata_binding(
@@ -9514,9 +9650,24 @@ struct CatalogArtifactMetadataApplyEntry {
     artifact_root: String,
     source_sha256: String,
     weights_bytes: u64,
+    sidecars: BTreeMap<String, CatalogArtifactSidecarMetadataApplyEntry>,
     update_needed: bool,
     ok: bool,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogArtifactSidecarMetadataApplyEntry {
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    target_source_revision: Option<String>,
+    source_path: String,
+    artifact_root_kind: String,
+    artifact_root: String,
+    source_sha256: String,
+    weights_bytes: u64,
+    update_needed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9791,6 +9942,8 @@ fn catalog_artifact_metadata_apply_report(
                     .to_owned(),
             );
         }
+        let sidecars =
+            catalog_artifact_sidecar_metadata_apply_entries(artifact, &metadata, &mut entry_errors);
 
         let current_matches_patch = artifact.artifact_root_kind
             == metadata.catalog_patch.artifact_root_kind
@@ -9806,7 +9959,8 @@ fn catalog_artifact_metadata_apply_report(
                     artifact.source.revision.eq_ignore_ascii_case(target)
                 })
             && artifact.weights_bytes == metadata.catalog_patch.weights_bytes;
-        let update_needed = !current_matches_patch;
+        let update_needed =
+            !current_matches_patch || sidecars.values().any(|sidecar| sidecar.update_needed);
         let ok = entry_errors.is_empty();
         if !ok {
             errors.extend(
@@ -9830,6 +9984,7 @@ fn catalog_artifact_metadata_apply_report(
             artifact_root: metadata.catalog_patch.artifact_root.clone(),
             source_sha256: metadata.catalog_patch.source_sha256.to_ascii_lowercase(),
             weights_bytes: metadata.catalog_patch.weights_bytes,
+            sidecars,
             update_needed,
             ok,
             errors: entry_errors,
@@ -9849,6 +10004,132 @@ fn catalog_artifact_metadata_apply_report(
         entries,
         errors,
     }
+}
+
+fn catalog_artifact_sidecar_metadata_apply_entries(
+    artifact: &catalog::CatalogArtifact,
+    metadata: &CatalogArtifactMetadataReport,
+    errors: &mut Vec<String>,
+) -> BTreeMap<String, CatalogArtifactSidecarMetadataApplyEntry> {
+    let mut entries = BTreeMap::new();
+
+    for unexpected in metadata
+        .sidecars
+        .keys()
+        .filter(|name| !artifact.sidecars.contains_key(*name))
+    {
+        errors.push(format!(
+            "report contains undeclared sidecar {unexpected}; rerun artifact-metadata"
+        ));
+    }
+
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        let Some(report) = metadata.sidecars.get(sidecar_name) else {
+            errors.push(format!(
+                "report is missing declared sidecar {sidecar_name}; rerun artifact-metadata with the complete artifact directory"
+            ));
+            continue;
+        };
+        let binding = &report.catalog_binding;
+        if !report.ok {
+            errors.push(format!("sidecar {sidecar_name} metadata report ok=false"));
+        }
+        if report.catalog_patch.artifact_root_kind != "blake3_merkle_v1" {
+            errors.push(format!(
+                "sidecar {sidecar_name} artifact_root_kind must be blake3_merkle_v1, got {}",
+                report.catalog_patch.artifact_root_kind
+            ));
+        }
+        if !is_hex_len(&report.catalog_patch.artifact_root, 64) {
+            errors.push(format!(
+                "sidecar {sidecar_name} artifact_root must be 32-byte hex"
+            ));
+        }
+        if !is_hex_len(&report.catalog_patch.source_sha256, 64) {
+            errors.push(format!(
+                "sidecar {sidecar_name} source_sha256 must be 32-byte hex"
+            ));
+        }
+        if let Some(source_revision) = &report.catalog_patch.source_revision {
+            if !is_hex_len(source_revision, 40) {
+                errors.push(format!(
+                    "sidecar {sidecar_name} source_revision must be 40-byte git commit hex"
+                ));
+            }
+        }
+        if report.catalog_patch.weights_bytes == 0 || report.total_bytes == 0 {
+            errors.push(format!(
+                "sidecar {sidecar_name} weights_bytes/total_bytes must be positive"
+            ));
+        }
+        if report.catalog_patch.weights_bytes != report.total_bytes {
+            errors.push(format!(
+                "sidecar {sidecar_name} patch weights_bytes {} does not match total_bytes {}",
+                report.catalog_patch.weights_bytes, report.total_bytes
+            ));
+        }
+        if report.chunk_size == 0 || report.chunk_count == 0 {
+            errors.push(format!(
+                "sidecar {sidecar_name} chunk_size/chunk_count must be positive"
+            ));
+        }
+        if binding.sidecar != *sidecar_name
+            || binding.source_kind != sidecar.source.kind
+            || binding.source_repo != sidecar.source.repo
+            || binding.source_revision != sidecar.source.revision
+            || binding.source_path != sidecar.path
+        {
+            errors.push(format!(
+                "sidecar {sidecar_name} report source tuple does not match the current catalog"
+            ));
+        }
+        if binding.target_source_revision != report.catalog_patch.source_revision {
+            errors.push(format!(
+                "sidecar {sidecar_name} target revision does not match its metadata patch"
+            ));
+        }
+        if binding.current_artifact_root_kind != sidecar.artifact_root_kind
+            || binding.current_artifact_root != sidecar.artifact_root
+            || binding.current_source_sha256 != sidecar.source_sha256
+            || binding.current_weights_bytes != sidecar.weights_bytes
+        {
+            errors.push(format!(
+                "sidecar {sidecar_name} current catalog fields are stale; rerun artifact-metadata"
+            ));
+        }
+
+        let current_matches_patch = sidecar.artifact_root_kind
+            == report.catalog_patch.artifact_root_kind
+            && sidecar.artifact_root == report.catalog_patch.artifact_root
+            && sidecar
+                .source_sha256
+                .eq_ignore_ascii_case(&report.catalog_patch.source_sha256)
+            && report
+                .catalog_patch
+                .source_revision
+                .as_ref()
+                .map_or(true, |target| {
+                    sidecar.source.revision.eq_ignore_ascii_case(target)
+                })
+            && sidecar.weights_bytes == report.catalog_patch.weights_bytes;
+        entries.insert(
+            sidecar_name.clone(),
+            CatalogArtifactSidecarMetadataApplyEntry {
+                source_kind: sidecar.source.kind.clone(),
+                source_repo: sidecar.source.repo.clone(),
+                source_revision: sidecar.source.revision.clone(),
+                target_source_revision: report.catalog_patch.source_revision.clone(),
+                source_path: sidecar.path.clone(),
+                artifact_root_kind: report.catalog_patch.artifact_root_kind.clone(),
+                artifact_root: report.catalog_patch.artifact_root.clone(),
+                source_sha256: report.catalog_patch.source_sha256.to_ascii_lowercase(),
+                weights_bytes: report.catalog_patch.weights_bytes,
+                update_needed: !current_matches_patch,
+            },
+        );
+    }
+
+    entries
 }
 
 fn apply_artifact_metadata_reports(
@@ -9898,28 +10179,58 @@ fn apply_artifact_metadata_reports(
                     )
                 })?;
             source.insert("revision".to_owned(), json!(target_source_revision));
-
-            if let Some(sidecars) = artifact.get_mut("sidecars").and_then(Value::as_object_mut) {
-                for sidecar in sidecars.values_mut() {
-                    let Some(sidecar_source) =
-                        sidecar.get_mut("source").and_then(Value::as_object_mut)
-                    else {
-                        continue;
-                    };
-                    let matches_artifact_source =
-                        sidecar_source.get("kind").and_then(Value::as_str)
-                            == Some(&entry.source_kind)
-                            && sidecar_source.get("repo").and_then(Value::as_str)
-                                == Some(&entry.source_repo)
-                            && sidecar_source.get("revision").and_then(Value::as_str)
-                                == Some(&entry.source_revision);
-                    if matches_artifact_source {
-                        sidecar_source.insert("revision".to_owned(), json!(target_source_revision));
-                    }
+        }
+        artifact.insert("weights_bytes".to_owned(), json!(entry.weights_bytes));
+        if !entry.sidecars.is_empty() {
+            let sidecars = artifact
+                .get_mut("sidecars")
+                .and_then(Value::as_object_mut)
+                .with_context(|| {
+                    format!(
+                        "artifact {} for model {} has no sidecars object",
+                        entry.artifact, entry.model_id
+                    )
+                })?;
+            for (sidecar_name, sidecar_entry) in &entry.sidecars {
+                let sidecar = sidecars
+                    .get_mut(sidecar_name)
+                    .and_then(Value::as_object_mut)
+                    .with_context(|| {
+                        format!(
+                            "sidecar {} disappeared from artifact {} for model {}",
+                            sidecar_name, entry.artifact, entry.model_id
+                        )
+                    })?;
+                sidecar.insert(
+                    "artifact_root_kind".to_owned(),
+                    json!(sidecar_entry.artifact_root_kind),
+                );
+                sidecar.insert(
+                    "artifact_root".to_owned(),
+                    json!(sidecar_entry.artifact_root),
+                );
+                sidecar.insert(
+                    "source_sha256".to_owned(),
+                    json!(sidecar_entry.source_sha256),
+                );
+                sidecar.insert(
+                    "weights_bytes".to_owned(),
+                    json!(sidecar_entry.weights_bytes),
+                );
+                if let Some(target_source_revision) = &sidecar_entry.target_source_revision {
+                    let source = sidecar
+                        .get_mut("source")
+                        .and_then(Value::as_object_mut)
+                        .with_context(|| {
+                            format!(
+                                "sidecar {} for artifact {} model {} has no source object",
+                                sidecar_name, entry.artifact, entry.model_id
+                            )
+                        })?;
+                    source.insert("revision".to_owned(), json!(target_source_revision));
                 }
             }
         }
-        artifact.insert("weights_bytes".to_owned(), json!(entry.weights_bytes));
         if artifact
             .get("notes")
             .and_then(Value::as_str)
@@ -69917,12 +70228,16 @@ State initialization...
 
     #[test]
     fn artifact_metadata_apply_can_finalize_published_source_revision() {
-        let path = env::temp_dir().join(format!(
-            "mayhem-artifact-metadata-source-revision-{}-{}.bin",
+        let artifact_dir = env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-source-revision-{}-{}",
             std::process::id(),
             now_millis_for_path()
         ));
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let path = artifact_dir.join("model.gguf");
+        let config_path = artifact_dir.join("config.json");
         fs::write(&path, b"mayhem published source revision").unwrap();
+        fs::write(&config_path, b"{}").unwrap();
         let mut catalog = test_catalog(&"00".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
         catalog.models[0]
@@ -69969,6 +70284,31 @@ State initialization...
             Some(published_revision.as_str())
         );
         assert!(metadata.catalog_binding.as_ref().unwrap().update_needed);
+        let config_metadata = metadata.sidecars.get("config").unwrap();
+        assert_eq!(config_metadata.artifact_path, config_path);
+        assert_eq!(
+            config_metadata.catalog_patch.source_revision.as_deref(),
+            Some(published_revision.as_str())
+        );
+        assert!(config_metadata.catalog_binding.update_needed);
+
+        let mut incomplete_value = serde_json::to_value(&metadata).unwrap();
+        incomplete_value["sidecars"] = json!({});
+        let incomplete_metadata =
+            serde_json::from_value::<CatalogArtifactMetadataReport>(incomplete_value).unwrap();
+        let incomplete_path = write_temp_artifact_metadata_report(&incomplete_metadata);
+        let incomplete = catalog_artifact_metadata_apply_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            true,
+            &[incomplete_path],
+        );
+        assert!(!incomplete.ok);
+        assert!(incomplete
+            .errors
+            .iter()
+            .any(|error| { error.contains("report is missing declared sidecar config") }));
+
         let report_path = write_temp_artifact_metadata_report(&metadata);
 
         let report = catalog_artifact_metadata_apply_report(
@@ -69982,6 +70322,7 @@ State initialization...
             report.entries[0].target_source_revision.as_deref(),
             Some(published_revision.as_str())
         );
+        assert!(report.entries[0].sidecars["config"].update_needed);
 
         let mut catalog_value = json!({
             "models": [{
@@ -70027,13 +70368,26 @@ State initialization...
                 ["revision"],
             json!(published_revision)
         );
+        let config = &catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["sidecars"]["config"];
+        assert_eq!(
+            config["artifact_root"],
+            json!(config_metadata.catalog_patch.artifact_root)
+        );
+        assert_eq!(
+            config["source_sha256"],
+            json!(config_metadata.catalog_patch.source_sha256)
+        );
+        assert_eq!(
+            config["weights_bytes"],
+            json!(config_metadata.catalog_patch.weights_bytes)
+        );
         assert_eq!(
             catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["sidecars"]["external"]
                 ["source"]["revision"],
             json!("7".repeat(40))
         );
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(artifact_dir);
     }
 
     #[test]
