@@ -2346,7 +2346,7 @@
           }
         ],
         "chat_template_id": "qwen3.5-instruct",
-        "tool_call_strategy": "mayhem_json",
+        "tool_call_strategy": "qwen_function_xml",
         "reasoning_passthrough": "strip",
         "modality_set": [
           "text",

@@ -51314,8 +51314,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         "provider endpoint family {endpoint_family} has no engine execution path"
     );
 
-    let tool_mode =
-        provider_engine_tool_request(request_body, adapter)?.map(|(strategy, _)| strategy);
+    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
     let mut request = provider_engine_request_from_endpoint_body_with_sampling(
         endpoint_family,
         request_body,
@@ -51355,18 +51354,15 @@ fn provider_engine_session_response_with_sampling_bounded(
         )
         .context("generating provider session response with mayhem-engine")?;
     let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
-    let tool = if let Some(strategy) = tool_mode {
-        Some(
-            provider_engine_tool_call_output(&output.text, strategy).with_context(|| {
-                format!(
-                    "provider engine did not return valid tool-call JSON: {}",
-                    output.text.trim()
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+    let tool = tool_mode.as_ref().and_then(|mode| {
+        provider_engine_tool_call_output(&output.text, mode.strategy, &mode.tools)
+    });
+    if tool_mode.as_ref().is_some_and(|mode| mode.required) && tool.is_none() {
+        bail!(
+            "provider engine did not return a valid required tool call: {}",
+            output.text.trim()
+        );
+    }
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
@@ -51378,6 +51374,11 @@ fn provider_engine_session_response_with_sampling_bounded(
     if vision_tokens > 0 {
         usage_attribution.insert("vision_input_tokens".to_owned(), vision_tokens);
     }
+    let finish_reason = if tool.is_some() {
+        "tool_calls".to_owned()
+    } else {
+        output.finish_reason.to_string()
+    };
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: if tool.is_some() {
@@ -51388,11 +51389,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         tool,
         embeddings: None,
         artifacts,
-        finish_reason: if tool_mode.is_some() {
-            "tool_calls".to_owned()
-        } else {
-            output.finish_reason.to_string()
-        },
+        finish_reason,
         prompt_tokens: billed_prompt_tokens,
         completion_tokens,
         token_ids,
@@ -51873,21 +51870,25 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.stop = provider_stop_sequences(body)?;
     request.seed = provider_optional_u32(body, "seed")?;
     request.validate_sampling()?;
-    if let Some((strategy, tools)) = provider_engine_tool_request(body, adapter)? {
-        request.tools = provider_engine_template_tools(&tools);
-        match strategy {
-            ProviderEngineToolStrategy::MayhemJson => {
-                request.grammar = Some(GrammarSpec::ToolCall { tools });
-            }
-            ProviderEngineToolStrategy::OpenAiToolCalls => {
-                request.grammar = Some(GrammarSpec::JsonSchema {
-                    schema: provider_openai_tool_calls_json_schema(&tools),
-                });
+    let tool_request = provider_engine_tool_request(body, adapter)?;
+    if let Some(tool_request) = tool_request {
+        request.tools = provider_engine_template_tools(&tool_request.tools);
+        if tool_request.required {
+            match tool_request.strategy {
+                ProviderEngineToolStrategy::MayhemJson
+                | ProviderEngineToolStrategy::QwenFunctionXml => {
+                    request.grammar = Some(GrammarSpec::ToolCall {
+                        tools: tool_request.tools,
+                    });
+                }
+                ProviderEngineToolStrategy::OpenAiToolCalls => {
+                    request.grammar = Some(GrammarSpec::JsonSchema {
+                        schema: provider_openai_tool_calls_json_schema(&tool_request.tools),
+                    });
+                }
             }
         }
-        return Ok(request);
-    }
-    if provider_wants_json(body) {
+    } else if provider_wants_json(body) {
         request.grammar = Some(GrammarSpec::JsonSchema {
             schema: provider_response_json_schema(body),
         });
@@ -52338,34 +52339,72 @@ fn provider_message_starts_with_image(message: &Value) -> bool {
 enum ProviderEngineToolStrategy {
     MayhemJson,
     OpenAiToolCalls,
+    QwenFunctionXml,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderEngineToolRequest {
+    strategy: ProviderEngineToolStrategy,
+    tools: Vec<ToolSpec>,
+    required: bool,
 }
 
 fn provider_engine_tool_request(
     body: &Value,
     adapter: &catalog::CatalogAdapter,
-) -> Result<Option<(ProviderEngineToolStrategy, Vec<ToolSpec>)>> {
-    if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+) -> Result<Option<ProviderEngineToolRequest>> {
+    let tool_choice = body.get("tool_choice");
+    if tool_choice.and_then(Value::as_str) == Some("none") {
+        return Ok(None);
+    }
+    let required = match tool_choice {
+        None | Some(Value::Null) => false,
+        Some(Value::String(choice)) if choice == "auto" => false,
+        Some(Value::String(choice)) if matches!(choice.as_str(), "required" | "any") => true,
+        Some(Value::Object(choice)) if provider_engine_named_tool_choice(choice).is_some() => true,
+        Some(other) => bail!("unsupported tool_choice value: {other}"),
+    };
+    let advertised_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if advertised_tools.is_empty() {
         return Ok(None);
     }
     let tools = provider_engine_tool_specs(body)?;
     if tools.is_empty() {
+        ensure!(
+            !required,
+            "tool_choice requires a function that is present in tools"
+        );
         return Ok(None);
     }
     let strategy = match adapter.tool_call_strategy.as_str() {
         "mayhem_json" => ProviderEngineToolStrategy::MayhemJson,
         "openai_tool_calls" => ProviderEngineToolStrategy::OpenAiToolCalls,
-        "none" => return Ok(None),
+        "qwen_function_xml" => ProviderEngineToolStrategy::QwenFunctionXml,
+        "none" => {
+            ensure!(
+                !required,
+                "tool_choice requires a model adapter with tool-call support"
+            );
+            return Ok(None);
+        }
         other => bail!("unsupported catalog adapter.tool_call_strategy: {other}"),
     };
-    Ok(Some((strategy, tools)))
+    Ok(Some(ProviderEngineToolRequest {
+        strategy,
+        tools,
+        required,
+    }))
 }
 
 fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
     let chosen = body
         .get("tool_choice")
-        .and_then(|choice| choice.get("function"))
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_object)
+        .and_then(provider_engine_named_tool_choice);
     let tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -52394,6 +52433,14 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
         specs.push(spec);
     }
     Ok(specs)
+}
+
+fn provider_engine_named_tool_choice(choice: &serde_json::Map<String, Value>) -> Option<&str> {
+    choice
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| choice.get("name").and_then(Value::as_str))
 }
 
 fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec]) -> Value {
@@ -52450,11 +52497,21 @@ fn provider_response_json_schema(body: &Value) -> Value {
 fn provider_engine_tool_call_output(
     text: &str,
     strategy: ProviderEngineToolStrategy,
+    tools: &[ToolSpec],
 ) -> Option<Value> {
-    match strategy {
+    let tool = match strategy {
         ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_output(text),
         ProviderEngineToolStrategy::OpenAiToolCalls => provider_openai_tool_calls_output(text),
-    }
+        ProviderEngineToolStrategy::QwenFunctionXml => {
+            provider_qwen_function_xml_tool_call_output(text)
+                .or_else(|| provider_mayhem_json_tool_call_output(text))
+        }
+    }?;
+    let name = tool.get("name").and_then(Value::as_str)?;
+    tools
+        .iter()
+        .any(|candidate| candidate.name == name)
+        .then_some(tool)
 }
 
 fn provider_mayhem_json_tool_call_output(text: &str) -> Option<Value> {
@@ -52493,6 +52550,71 @@ fn provider_openai_tool_calls_output(text: &str) -> Option<Value> {
     );
     let id = call.get("id").and_then(Value::as_str).map(str::to_owned);
     Some(provider_normalized_tool_call(id, name, arguments))
+}
+
+fn provider_qwen_function_xml_tool_call_output(text: &str) -> Option<Value> {
+    const TOOL_OPEN: &str = "<tool_call>";
+    const TOOL_CLOSE: &str = "</tool_call>";
+    const FUNCTION_OPEN: &str = "<function=";
+    const FUNCTION_CLOSE: &str = "</function>";
+    const PARAMETER_OPEN: &str = "<parameter=";
+    const PARAMETER_CLOSE: &str = "</parameter>";
+
+    let tool_start = text.find(TOOL_OPEN)? + TOOL_OPEN.len();
+    let tool_end_relative = text[tool_start..].find(TOOL_CLOSE)?;
+    let tool_end = tool_start + tool_end_relative;
+    if !text[tool_end + TOOL_CLOSE.len()..].trim().is_empty() {
+        return None;
+    }
+    let tool_body = text[tool_start..tool_end].trim();
+    let function_start = tool_body.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len();
+    if !tool_body[..function_start - FUNCTION_OPEN.len()]
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+    let function_name_end = tool_body[function_start..].find('>')? + function_start;
+    let function_name = tool_body[function_start..function_name_end].trim();
+    if function_name.is_empty() {
+        return None;
+    }
+    let function_body_start = function_name_end + 1;
+    let function_body_end_relative = tool_body[function_body_start..].rfind(FUNCTION_CLOSE)?;
+    let function_body_end = function_body_start + function_body_end_relative;
+    if !tool_body[function_body_end + FUNCTION_CLOSE.len()..]
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+
+    let mut arguments = serde_json::Map::new();
+    let mut remaining = tool_body[function_body_start..function_body_end].trim();
+    while !remaining.is_empty() {
+        if !remaining.starts_with(PARAMETER_OPEN) {
+            return None;
+        }
+        let name_start = PARAMETER_OPEN.len();
+        let name_end = remaining[name_start..].find('>')? + name_start;
+        let name = remaining[name_start..name_end].trim();
+        if name.is_empty() || arguments.contains_key(name) {
+            return None;
+        }
+        let value_start = name_end + 1;
+        let value_end = remaining[value_start..].find(PARAMETER_CLOSE)? + value_start;
+        let raw_value = remaining[value_start..value_end].trim();
+        let value =
+            serde_json::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_owned()));
+        arguments.insert(name.to_owned(), value);
+        remaining = remaining[value_end + PARAMETER_CLOSE.len()..].trim();
+    }
+
+    Some(provider_normalized_tool_call(
+        None,
+        function_name.to_owned(),
+        Value::Object(arguments).to_string(),
+    ))
 }
 
 fn provider_tool_arguments_string(arguments: Value) -> String {
@@ -61962,7 +62084,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_request_uses_openai_tool_call_adapter_schema() {
+    fn provider_engine_request_leaves_auto_tool_choice_unconstrained() {
         let adapter = catalog::CatalogAdapter {
             tool_call_strategy: "openai_tool_calls".to_owned(),
             ..catalog::CatalogAdapter::default()
@@ -61986,6 +62108,95 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.tools[0]["function"]["name"], "write");
+        assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_request_does_not_replace_auto_tools_with_response_grammar() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "qwen_function_xml".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "inspect first, then answer" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "inspect",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "tool_choice": "auto",
+            "response_format": { "type": "json_object" }
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert_eq!(request.tools.len(), 1);
+        assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_request_rejects_missing_named_tool_choice() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "qwen_function_xml".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "tool_choice": { "type": "function", "name": "write" }
+        });
+        let error = provider_engine_request_from_body(&body, &adapter).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires a function that is present in tools"));
+    }
+
+    #[test]
+    fn provider_engine_request_accepts_tool_choice_without_advertised_tools() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "qwen_function_xml".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "answer normally" }],
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "calibration_tool" }
+            }
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert!(request.tools.is_empty());
+        assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_request_constrains_required_openai_tool_choice() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "tool_choice": "required"
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
         let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
             panic!("expected OpenAI tool_calls JSON schema grammar");
         };
@@ -62833,8 +63044,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_session_response_requires_valid_tool_json() {
-        let mut backend = FakeEngineBackend::new("not json");
+    fn provider_engine_session_response_allows_text_for_auto_tool_choice() {
+        let mut backend = FakeEngineBackend::new("normal final answer");
         let body = json!({
             "messages": [{ "role": "user", "content": "write a file" }],
             "tools": [{
@@ -62843,18 +63054,43 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }],
             "tool_choice": "auto"
         });
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "normal final answer");
+        assert!(output.tool.is_none());
+        assert!(backend
+            .last_request
+            .expect("engine request")
+            .grammar
+            .is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_requires_valid_forced_tool_call() {
+        let mut backend = FakeEngineBackend::new("not json");
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "write", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "required"
+        });
         let err = provider_engine_session_response(
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
             None,
         )
-        .expect_err("tool mode requires valid tool-call JSON");
+        .expect_err("required tool mode rejects a non-tool response");
 
-        assert!(
-            format!("{err:#}").contains("provider engine did not return valid tool-call JSON"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("valid required tool call"));
         assert!(matches!(
             backend
                 .last_request
@@ -62890,14 +63126,39 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(tool["id"], "call-openai");
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
-        assert!(matches!(
-            backend
-                .last_request
-                .expect("engine request")
-                .grammar
-                .expect("OpenAI tool_calls schema"),
-            GrammarSpec::JsonSchema { .. }
-        ));
+        assert!(backend
+            .last_request
+            .expect("engine request")
+            .grammar
+            .is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_normalizes_qwen_auto_tool_call() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "qwen_function_xml".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let mut backend = FakeEngineBackend::new(
+            "<think>use bash</think>\n<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n</parameter>\n</function>\n</tool_call>",
+        );
+        let body = json!({
+            "messages": [{ "role": "user", "content": "print ok" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "bash", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "auto"
+        });
+        let output = provider_engine_session_response(&mut backend, &adapter, &body, None).unwrap();
+
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert_eq!(output.content, "");
+        assert_eq!(output.tool.unwrap()["name"], "bash");
+        let request = backend.last_request.expect("engine request");
+        assert_eq!(request.tools.len(), 1);
+        assert!(request.grammar.is_none());
     }
 
     #[test]
@@ -64606,9 +64867,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_engine_tool_call_output_maps_engine_json_to_openai_shape() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
         let tool = provider_engine_tool_call_output(
             r#"{ "tool": "write", "arguments": { "filePath": "ok.txt" } }"#,
             ProviderEngineToolStrategy::MayhemJson,
+            &tools,
         )
         .expect("tool call");
 
@@ -64619,15 +64882,45 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_engine_tool_call_output_maps_openai_tool_calls_to_internal_shape() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
         let tool = provider_engine_tool_call_output(
             r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "write", "arguments": { "filePath": "ok.txt" } } }] }"#,
             ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools,
         )
         .expect("tool call");
 
         assert_eq!(tool["id"], "call-openai");
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
+    }
+
+    #[test]
+    fn provider_engine_tool_call_output_maps_qwen_function_xml_to_internal_shape() {
+        let tools = vec![ToolSpec::new("bash", json!({ "type": "object" }))];
+        let tool = provider_engine_tool_call_output(
+            "<think>use the requested tool</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nprintf 'ok\\n'\n</parameter>\n<parameter=timeout>\n120000\n</parameter>\n</function>\n</tool_call>",
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .expect("tool call");
+
+        assert_eq!(tool["name"], "bash");
+        assert_eq!(
+            serde_json::from_str::<Value>(tool["arguments"].as_str().unwrap()).unwrap(),
+            json!({ "command": "printf 'ok\\n'", "timeout": 120000 })
+        );
+    }
+
+    #[test]
+    fn provider_engine_tool_call_output_rejects_unadvertised_tool() {
+        let tools = vec![ToolSpec::new("read", json!({ "type": "object" }))];
+        assert!(provider_engine_tool_call_output(
+            "<tool_call><function=bash><parameter=command>echo no</parameter></function></tool_call>",
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .is_none());
     }
 
     #[tokio::test]

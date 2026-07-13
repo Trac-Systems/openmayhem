@@ -1725,7 +1725,7 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     if !matches!(
         adapter.tool_call_strategy.as_str(),
-        "none" | "mayhem_json" | "openai_tool_calls"
+        "none" | "mayhem_json" | "openai_tool_calls" | "qwen_function_xml"
     ) {
         errors.push(format!(
             "{} adapter.tool_call_strategy is unsupported: {}",
