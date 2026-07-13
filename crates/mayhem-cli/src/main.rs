@@ -2907,6 +2907,14 @@ struct CatalogArtifactStagePlanArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
+    /// Limit the plan to one catalog model id.
+    #[arg(long, value_name = "MODEL_ID")]
+    model: Option<String>,
+
+    /// Limit the plan to one artifact key of --model.
+    #[arg(long, value_name = "ARTIFACT", requires = "model")]
+    artifact: Option<String>,
+
     /// Include dev-tier models in addition to launch-tier models.
     #[arg(long)]
     include_dev: bool,
@@ -2961,6 +2969,14 @@ struct CatalogArtifactPublishPlanArgs {
     /// Hugging Face token file for printed upload/revision/verification commands.
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
+
+    /// Limit the plan to one catalog model id.
+    #[arg(long, value_name = "MODEL_ID")]
+    model: Option<String>,
+
+    /// Limit the plan to one artifact key of --model.
+    #[arg(long, value_name = "ARTIFACT", requires = "model")]
+    artifact: Option<String>,
 
     /// Include dev-tier models in addition to launch-tier models.
     #[arg(long)]
@@ -9543,6 +9559,8 @@ struct CatalogArtifactStagePlanReport {
     artifact_base: PathBuf,
     source_cache_dir: PathBuf,
     launch_only: bool,
+    model_filter: Option<String>,
+    artifact_filter: Option<String>,
     hf_token_file: Option<PathBuf>,
     model_count: usize,
     artifact_count: usize,
@@ -9604,6 +9622,8 @@ struct CatalogArtifactPublishPlanReport {
     report_dir: PathBuf,
     catalog_output: PathBuf,
     launch_only: bool,
+    model_filter: Option<String>,
+    artifact_filter: Option<String>,
     hf_token_file: Option<PathBuf>,
     model_count: usize,
     artifact_count: usize,
@@ -10028,6 +10048,8 @@ fn catalog_artifact_stage_plan(args: CatalogArtifactStagePlanArgs) -> Result<()>
         source_cache_dir,
         hf_token_file,
         launch_only: !args.include_dev,
+        model_filter: args.model,
+        artifact_filter: args.artifact,
     });
 
     if args.json {
@@ -10143,6 +10165,8 @@ fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result
         catalog_sign,
         hf_token_file,
         launch_only: !args.include_dev,
+        model_filter: args.model,
+        artifact_filter: args.artifact,
     });
 
     if args.json {
@@ -10470,6 +10494,8 @@ struct CatalogArtifactStagePlanInput<'a> {
     source_cache_dir: PathBuf,
     hf_token_file: Option<PathBuf>,
     launch_only: bool,
+    model_filter: Option<String>,
+    artifact_filter: Option<String>,
 }
 
 fn catalog_artifact_stage_plan_report(
@@ -10482,6 +10508,8 @@ fn catalog_artifact_stage_plan_report(
         source_cache_dir,
         hf_token_file,
         launch_only,
+        model_filter,
+        artifact_filter,
     } = input;
     let mut source_commands = Vec::new();
     let mut stage_commands = Vec::new();
@@ -10496,7 +10524,19 @@ fn catalog_artifact_stage_plan_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
+        if model_filter
+            .as_deref()
+            .is_some_and(|selected| selected != model.model_id)
+        {
+            continue;
+        }
         for (artifact_name, artifact) in &model.artifacts {
+            if artifact_filter
+                .as_deref()
+                .is_some_and(|selected| selected != artifact_name)
+            {
+                continue;
+            }
             let mut entry_errors = Vec::new();
             let upstream_source = artifact
                 .upstream_source
@@ -10520,6 +10560,8 @@ fn catalog_artifact_stage_plan_report(
                     catalog_doc,
                     upstream_source,
                     launch_only,
+                    model_filter.as_deref(),
+                    artifact_filter.as_deref(),
                 );
                 let command = catalog_artifact_stage_source_download_command(
                     upstream_source,
@@ -10615,6 +10657,8 @@ fn catalog_artifact_stage_plan_report(
                 &catalog_path,
                 &artifact_base,
                 hf_token_file.as_deref(),
+                model_filter.as_deref(),
+                artifact_filter.as_deref(),
             );
             let ok = entry_errors.is_empty();
             let entry = CatalogArtifactStagePlanEntry {
@@ -10653,11 +10697,22 @@ fn catalog_artifact_stage_plan_report(
     }
 
     if stage_commands.is_empty() {
-        errors.push(if launch_only {
-            "catalog has no launch model artifacts to stage".to_owned()
-        } else {
-            "catalog has no model artifacts to stage".to_owned()
-        });
+        errors.push(
+            match (model_filter.as_deref(), artifact_filter.as_deref()) {
+                (Some(model), Some(artifact)) => format!(
+                    "catalog selection matched no {} artifact {artifact} for model {model}",
+                    if launch_only { "launch" } else { "model" }
+                ),
+                (Some(model), None) => format!(
+                    "catalog selection matched no {} artifacts for model {model}",
+                    if launch_only { "launch" } else { "model" }
+                ),
+                (None, _) if launch_only => {
+                    "catalog has no launch model artifacts to stage".to_owned()
+                }
+                (None, _) => "catalog has no model artifacts to stage".to_owned(),
+            },
+        );
     }
 
     let artifact_base_space_ok = artifact_base_available_bytes
@@ -10691,6 +10746,8 @@ fn catalog_artifact_stage_plan_report(
         artifact_base,
         source_cache_dir,
         launch_only,
+        model_filter,
+        artifact_filter,
         hf_token_file,
         model_count,
         artifact_count: stage_commands.len(),
@@ -10717,6 +10774,8 @@ struct CatalogArtifactPublishPlanInput<'a> {
     catalog_sign: Option<CatalogCanaryPlanSignOptions>,
     hf_token_file: Option<PathBuf>,
     launch_only: bool,
+    model_filter: Option<String>,
+    artifact_filter: Option<String>,
 }
 
 fn catalog_artifact_publish_plan_report(
@@ -10731,6 +10790,8 @@ fn catalog_artifact_publish_plan_report(
         catalog_sign,
         hf_token_file,
         launch_only,
+        model_filter,
+        artifact_filter,
     } = input;
     let mut entries = Vec::new();
     let mut errors = Vec::new();
@@ -10743,7 +10804,19 @@ fn catalog_artifact_publish_plan_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
+        if model_filter
+            .as_deref()
+            .is_some_and(|selected| selected != model.model_id)
+        {
+            continue;
+        }
         for (artifact_name, artifact) in &model.artifacts {
+            if artifact_filter
+                .as_deref()
+                .is_some_and(|selected| selected != artifact_name)
+            {
+                continue;
+            }
             let mut entry_errors = Vec::new();
             catalog_expected_bytes = catalog_expected_bytes.saturating_add(artifact.weights_bytes);
             let artifact_rel_path = PathBuf::from(&artifact.path);
@@ -10879,11 +10952,22 @@ fn catalog_artifact_publish_plan_report(
     }
 
     if entries.is_empty() {
-        errors.push(if launch_only {
-            "catalog has no launch model artifacts to publish".to_owned()
-        } else {
-            "catalog has no model artifacts to publish".to_owned()
-        });
+        errors.push(
+            match (model_filter.as_deref(), artifact_filter.as_deref()) {
+                (Some(model), Some(artifact)) => format!(
+                    "catalog selection matched no {} artifact {artifact} for model {model}",
+                    if launch_only { "launch" } else { "model" }
+                ),
+                (Some(model), None) => format!(
+                    "catalog selection matched no {} artifacts for model {model}",
+                    if launch_only { "launch" } else { "model" }
+                ),
+                (None, _) if launch_only => {
+                    "catalog has no launch model artifacts to publish".to_owned()
+                }
+                (None, _) => "catalog has no model artifacts to publish".to_owned(),
+            },
+        );
     }
     let artifact_base_space_ok = artifact_base_available_bytes
         .map(|available| available >= missing_artifact_bytes || missing_artifact_bytes == 0);
@@ -10923,6 +11007,8 @@ fn catalog_artifact_publish_plan_report(
         report_dir,
         catalog_output,
         launch_only,
+        model_filter,
+        artifact_filter,
         hf_token_file,
         model_count,
         artifact_count: entries.len(),
@@ -11034,6 +11120,8 @@ fn catalog_artifact_stage_source_patterns(
     catalog_doc: &catalog::CatalogDocument,
     source: &catalog::SourceRef,
     launch_only: bool,
+    model_filter: Option<&str>,
+    artifact_filter: Option<&str>,
 ) -> Option<Vec<String>> {
     let mut patterns = BTreeSet::new();
     let mut selected = false;
@@ -11041,7 +11129,13 @@ fn catalog_artifact_stage_source_patterns(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        for artifact in model.artifacts.values() {
+        if model_filter.is_some_and(|selected| selected != model.model_id) {
+            continue;
+        }
+        for (artifact_name, artifact) in &model.artifacts {
+            if artifact_filter.is_some_and(|selected| selected != artifact_name) {
+                continue;
+            }
             let selected_source = artifact
                 .upstream_source
                 .as_ref()
@@ -11287,6 +11381,8 @@ fn catalog_artifact_stage_follow_up_command(
     catalog_path: &Path,
     artifact_base: &Path,
     hf_token_file: Option<&Path>,
+    model_filter: Option<&str>,
+    artifact_filter: Option<&str>,
 ) -> CatalogCanaryPlanCommand {
     let report_dir = artifact_base.join(".publish-reports");
     let mut argv = vec![
@@ -11299,6 +11395,12 @@ fn catalog_artifact_stage_follow_up_command(
     push_plan_path_arg(&mut argv, "--report-dir", &report_dir);
     if let Some(hf_token_file) = hf_token_file {
         push_plan_path_arg(&mut argv, "--hf-token-file", hf_token_file);
+    }
+    if let Some(model_filter) = model_filter {
+        push_plan_value_arg(&mut argv, "--model", model_filter);
+    }
+    if let Some(artifact_filter) = artifact_filter {
+        push_plan_value_arg(&mut argv, "--artifact", artifact_filter);
     }
     argv.push("--json".to_owned());
     catalog_canary_plan_command(argv)
@@ -69051,6 +69153,12 @@ State initialization...
     fn artifact_stage_plan_emits_source_build_and_followup_commands() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
+        let mut ignored = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        ignored.path = "ignored.gguf".to_owned();
+        ignored.weights_bytes = 9_999;
+        catalog.models[0]
+            .artifacts
+            .insert("ignored-artifact".to_owned(), ignored);
         let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
             catalog_doc: &catalog,
             catalog_path: PathBuf::from("/tmp/catalog.json"),
@@ -69058,6 +69166,8 @@ State initialization...
             source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
             hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
             launch_only: true,
+            model_filter: Some("test/model@4bit".to_owned()),
+            artifact_filter: Some("gguf-q4_k_m".to_owned()),
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69115,6 +69225,31 @@ State initialization...
             .argv
             .windows(2)
             .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
+        assert!(entry
+            .follow_up_publish_plan
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "test/model@4bit"));
+        assert!(entry
+            .follow_up_publish_plan
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--artifact" && pair[1] == "gguf-q4_k_m"));
+
+        let missing = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: None,
+            launch_only: true,
+            model_filter: Some("test/model@4bit".to_owned()),
+            artifact_filter: Some("missing-artifact".to_owned()),
+        });
+        assert!(!missing.ok);
+        assert!(missing.errors.iter().any(|error| error.contains(
+            "catalog selection matched no launch artifact missing-artifact for model test/model@4bit"
+        )));
     }
 
     #[test]
@@ -69148,6 +69283,8 @@ State initialization...
             source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
             hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69215,6 +69352,8 @@ State initialization...
             catalog_sign: None,
             hf_token_file: Some(temp.join("hf-token.txt")),
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69274,6 +69413,8 @@ State initialization...
             source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69325,6 +69466,8 @@ State initialization...
             source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69381,6 +69524,8 @@ State initialization...
             source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69403,6 +69548,12 @@ State initialization...
     fn artifact_publish_plan_emits_upload_revision_metadata_and_followups() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
+        let mut ignored = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        ignored.path = "ignored.gguf".to_owned();
+        ignored.weights_bytes = 9_999;
+        catalog.models[0]
+            .artifacts
+            .insert("ignored-artifact".to_owned(), ignored);
         let temp = env::temp_dir().join(format!(
             "mayhem-artifact-publish-plan-{}-{}",
             std::process::id(),
@@ -69435,6 +69586,8 @@ State initialization...
             catalog_sign: Some(sign),
             hf_token_file: Some(temp.join("hf-token.txt")),
             launch_only: true,
+            model_filter: Some("test/model@4bit".to_owned()),
+            artifact_filter: Some("gguf-q4_k_m".to_owned()),
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69501,6 +69654,23 @@ State initialization...
             .windows(2)
             .any(|pair| pair[0] == "--hf-token-file" && pair[1].ends_with("hf-token.txt")));
 
+        let missing = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: temp.join("catalog.json"),
+            artifact_base,
+            report_dir,
+            catalog_output: temp.join("reports/catalog.with-artifacts.json"),
+            catalog_sign: None,
+            hf_token_file: None,
+            launch_only: true,
+            model_filter: Some("test/model@4bit".to_owned()),
+            artifact_filter: Some("missing-artifact".to_owned()),
+        });
+        assert!(!missing.ok);
+        assert!(missing.errors.iter().any(|error| error.contains(
+            "catalog selection matched no launch artifact missing-artifact for model test/model@4bit"
+        )));
+
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -69556,6 +69726,8 @@ State initialization...
             catalog_sign: None,
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69609,6 +69781,8 @@ State initialization...
             catalog_sign: None,
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(report.ok, "{:?}", report.errors);
@@ -69638,6 +69812,8 @@ State initialization...
             catalog_sign: None,
             hf_token_file: None,
             launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
         });
 
         assert!(!report.ok);
