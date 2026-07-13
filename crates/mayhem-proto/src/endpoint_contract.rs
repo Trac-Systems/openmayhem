@@ -118,6 +118,7 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "messages.content.input_audio.data",
                 "messages.content.input_audio.format",
                 "messages.content.video.data",
+                "messages.content.video.frames",
                 "messages.content.video.content_type",
                 "messages.content.video.num_frames",
                 "messages.content.video.fps",
@@ -652,6 +653,7 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             &[json!("wav"), json!("mp3"), json!("flac"), json!("ogg")],
         ),
         "messages.content.video.data" => marker_string_spec(json!("$VIDEO_BASE64")),
+        "messages.content.video.frames" => array_spec(1, 64, json!(["$IMAGE_DATA_URL"])),
         "messages.content.video.content_type" => {
             enum_spec(None, &[json!("video/mp4"), json!("video/webm")])
         }
@@ -1428,9 +1430,11 @@ fn add_calibration_companion_mutations(
                 add("messages.content.input_audio.format", json!("wav"));
             }
             Some("video") => {
-                add("messages.content.video.data", json!("$VIDEO_BASE64"));
-                add("messages.content.video.content_type", json!("video/mp4"));
-                add("messages.content.video.num_frames", json!(16));
+                add(
+                    "messages.content.video.frames",
+                    json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
+                );
+                add("messages.content.video.num_frames", json!(2));
                 add("messages.content.video.fps", json!(8.0));
             }
             _ => {}
@@ -1444,14 +1448,40 @@ fn add_calibration_companion_mutations(
             add("messages.content.input_audio.data", json!("$AUDIO_BASE64"));
             add("messages.content.input_audio.format", json!("wav"));
         }
-        "messages.content.video.data"
-        | "messages.content.video.content_type"
-        | "messages.content.video.num_frames"
-        | "messages.content.video.fps" => {
+        "messages.content.video.data" | "messages.content.video.content_type" => {
             add("messages.content.type", json!("video"));
             add("messages.content.video.data", json!("$VIDEO_BASE64"));
             add("messages.content.video.content_type", json!("video/mp4"));
             add("messages.content.video.num_frames", json!(16));
+            add("messages.content.video.fps", json!(8.0));
+        }
+        "messages.content.video.frames" => {
+            let frame_count = value.and_then(Value::as_array).map(Vec::len).unwrap_or(2);
+            add("messages.content.type", json!("video"));
+            add(
+                "messages.content.video.frames",
+                Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
+            );
+            add("messages.content.video.num_frames", json!(frame_count));
+            add("messages.content.video.fps", json!(8.0));
+        }
+        "messages.content.video.num_frames" => {
+            let frame_count = value.and_then(Value::as_u64).unwrap_or(2).min(64) as usize;
+            add("messages.content.type", json!("video"));
+            add(
+                "messages.content.video.frames",
+                Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
+            );
+            add("messages.content.video.num_frames", json!(frame_count));
+            add("messages.content.video.fps", json!(8.0));
+        }
+        "messages.content.video.fps" => {
+            add("messages.content.type", json!("video"));
+            add(
+                "messages.content.video.frames",
+                json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
+            );
+            add("messages.content.video.num_frames", json!(2));
             add("messages.content.video.fps", json!(8.0));
         }
         _ => {}
@@ -2237,12 +2267,15 @@ mod tests {
         let request =
             materialize_endpoint_calibration_request(video, &substitutions).expect("video request");
         assert_eq!(
-            request["messages"][0]["content"][0]["video"]["content_type"],
-            "video/mp4"
+            request["messages"][0]["content"][0]["video"]["frames"]
+                .as_array()
+                .expect("decoded video frames")
+                .len(),
+            2
         );
         assert_eq!(
             request["messages"][0]["content"][0]["video"]["num_frames"],
-            16
+            2
         );
         assert_eq!(request["messages"][0]["role"], "user");
         assert!(validate_endpoint_request(&contract, &request).is_ok());

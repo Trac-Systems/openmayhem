@@ -86,7 +86,7 @@ use mayhem_proto::{
     USAGE_VIDEO_SECOND,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 
@@ -2226,7 +2226,7 @@ pub struct ScBridgeGatewaySessionBackend {
 #[derive(Clone, Debug)]
 pub struct ChatOutput {
     pub content: Option<String>,
-    pub tool_call: Option<ToolCallOutput>,
+    pub tool_calls: Vec<ToolCallOutput>,
     pub artifacts: Vec<GatewayArtifactOutput>,
     pub finish_reason: String,
     pub usage: Usage,
@@ -11962,7 +11962,7 @@ fn session_delta_payload_key(request_id: &str, field: &str, payload_id: &str) ->
 }
 
 fn valid_session_delta_ref_field(field: &str) -> bool {
-    matches!(field, "tool" | "embeddings" | "token_ids")
+    matches!(field, "tools" | "embeddings" | "token_ids")
 }
 
 fn collect_session_delta_chunk(
@@ -12092,7 +12092,7 @@ async fn collect_direct_session_output(
 ) -> Result<DirectSessionCollected, GatewaySessionError> {
     let failover = invocation.failover;
     let mut content = String::new();
-    let mut tool_call = None;
+    let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
     let mut claimed_usage_attribution = None;
@@ -12139,7 +12139,7 @@ async fn collect_direct_session_output(
                 let timeout = watchdog.timeout_error(session_id, now);
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -12158,7 +12158,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -12203,7 +12203,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         &receipt,
                         &token_ids,
                         &watchdog,
@@ -12218,9 +12218,12 @@ async fn collect_direct_session_output(
                         pending_checkpoint_receipt = Some(receipt);
                     }
                 }
-                if tool_call.is_none() {
-                    tool_call =
-                        tool_call_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?;
+                if tool_calls.is_empty() {
+                    if let Some(calls) =
+                        tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
+                    {
+                        tool_calls = calls;
+                    }
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
@@ -12242,7 +12245,7 @@ async fn collect_direct_session_output(
                             direct_session_throughput_floor_error(session_id, tok_s, min_tok_s);
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
-                            tool_call.clone(),
+                            tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
                             &watchdog,
@@ -12279,7 +12282,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         &receipt,
                         &token_ids,
                         &watchdog,
@@ -12307,7 +12310,7 @@ async fn collect_direct_session_output(
                 let err = format!("provider returned {code} on session {session_id}: {message}");
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -12329,7 +12332,7 @@ async fn collect_direct_session_output(
                     );
                     if let Some(partial) = interrupted_direct_session_partial(
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         &token_ids,
                         &watchdog,
@@ -12372,13 +12375,27 @@ async fn collect_direct_session_output(
         .get("vision_input_tokens")
         .copied()
         .unwrap_or(0);
+    let audio_tokens = final_receipt
+        .body
+        .usage_attribution
+        .get("audio_input_tokens")
+        .copied()
+        .unwrap_or(0);
     let input_modalities = chat_input_modalities(&request.messages);
     if vision_tokens > 0 && !input_modalities.image && !input_modalities.video {
         return Err(GatewaySessionError::new(
             "provider claimed vision tokens for a request without visual input",
         ));
     }
-    usage.prompt_tokens = usage.prompt_tokens.saturating_add(vision_tokens);
+    if audio_tokens > 0 && !input_modalities.audio {
+        return Err(GatewaySessionError::new(
+            "provider claimed audio tokens for a request without audio input",
+        ));
+    }
+    usage.prompt_tokens = usage
+        .prompt_tokens
+        .saturating_add(vision_tokens)
+        .saturating_add(audio_tokens);
     usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
@@ -12414,8 +12431,8 @@ async fn collect_direct_session_output(
     })?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
-            content: tool_call.is_none().then_some(content),
-            tool_call,
+            content: tool_calls.is_empty().then_some(content),
+            tool_calls,
             artifacts,
             finish_reason,
             usage,
@@ -13069,7 +13086,7 @@ fn embeddings_from_session_delta(
 
 fn interrupted_direct_session_partial(
     content: &str,
-    tool_call: Option<ToolCallOutput>,
+    tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
@@ -13092,8 +13109,8 @@ fn interrupted_direct_session_partial(
     });
     Some(GatewaySessionPartial {
         output: ChatOutput {
-            content: tool_call.is_none().then_some(content.to_owned()),
-            tool_call,
+            content: tool_calls.is_empty().then_some(content.to_owned()),
+            tool_calls,
             artifacts: Vec::new(),
             finish_reason: "interrupted".to_owned(),
             usage,
@@ -13109,7 +13126,7 @@ fn interrupted_direct_session_partial(
 fn retryable_interrupted_direct_session_error(
     err: GatewaySessionError,
     content: &str,
-    tool_call: Option<ToolCallOutput>,
+    tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
@@ -13118,7 +13135,7 @@ fn retryable_interrupted_direct_session_error(
 ) -> GatewaySessionError {
     if let Some(partial) = interrupted_direct_session_partial(
         content,
-        tool_call,
+        tool_calls,
         provider_receipt,
         token_ids,
         watchdog,
@@ -13133,7 +13150,7 @@ fn retryable_interrupted_direct_session_error(
 fn client_disconnect_direct_session_error(
     request: &ChatCompletionRequest,
     content: &str,
-    tool_call: Option<ToolCallOutput>,
+    tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
@@ -13142,7 +13159,7 @@ fn client_disconnect_direct_session_error(
     let err = retryable_interrupted_direct_session_error(
         GatewaySessionError::retryable("end-user disconnected before stream completed"),
         content,
-        tool_call.clone(),
+        tool_calls.clone(),
         provider_receipt,
         token_ids,
         watchdog,
@@ -13168,8 +13185,8 @@ fn client_disconnect_direct_session_error(
         err.message,
         GatewaySessionInterrupted {
             output: ChatOutput {
-                content: tool_call.is_none().then_some(content.to_owned()),
-                tool_call,
+                content: tool_calls.is_empty().then_some(content.to_owned()),
+                tool_calls,
                 artifacts: Vec::new(),
                 finish_reason: "interrupted".to_owned(),
                 usage,
@@ -13184,7 +13201,7 @@ fn client_disconnect_direct_session_error(
 fn direct_session_checkpoint_partial(
     request: &ChatCompletionRequest,
     content: &str,
-    tool_call: Option<ToolCallOutput>,
+    tool_calls: Vec<ToolCallOutput>,
     provider_receipt: ProviderSignedReceipt,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
@@ -13204,8 +13221,8 @@ fn direct_session_checkpoint_partial(
             });
     GatewaySessionPartial {
         output: ChatOutput {
-            content: tool_call.is_none().then_some(content.to_owned()),
-            tool_call,
+            content: tool_calls.is_empty().then_some(content.to_owned()),
+            tool_calls,
             artifacts: Vec::new(),
             finish_reason: "checkpoint".to_owned(),
             usage,
@@ -13264,7 +13281,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
     content: &str,
-    tool_call: Option<ToolCallOutput>,
+    tool_calls: Vec<ToolCallOutput>,
     receipt: &ProviderSignedReceipt,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
@@ -13291,7 +13308,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     let partial = direct_session_checkpoint_partial(
         request,
         content,
-        tool_call,
+        tool_calls,
         receipt.clone(),
         token_ids,
         watchdog,
@@ -14144,47 +14161,70 @@ fn receipt_ack_for_body(
     })
 }
 
-fn tool_call_from_session_delta_resolving(
+fn tool_calls_from_session_delta_resolving(
     frame: &Value,
     pending: &mut SessionDeltaPayloadChunks,
-) -> Result<Option<ToolCallOutput>, GatewaySessionError> {
-    if let Some(tool) = frame.get("tool").filter(|tool| !tool.is_null()) {
-        return Ok(tool_call_from_session_value(tool));
+) -> Result<Option<Vec<ToolCallOutput>>, GatewaySessionError> {
+    if let Some(tools) = frame.get("tools").filter(|tools| !tools.is_null()) {
+        return tool_calls_from_session_value(tools).map(Some);
     }
-    if let Some(tool) = resolve_session_delta_ref_field(frame, "tool", pending)? {
-        return Ok(tool_call_from_session_value(&tool));
+    if let Some(tools) = resolve_session_delta_ref_field(frame, "tools", pending)? {
+        return tool_calls_from_session_value(&tools).map(Some);
     }
     Ok(None)
 }
 
-fn tool_call_from_session_value(tool: &Value) -> Option<ToolCallOutput> {
-    if tool.is_null() {
-        return None;
+fn tool_calls_from_session_value(
+    tools: &Value,
+) -> Result<Vec<ToolCallOutput>, GatewaySessionError> {
+    let tools = tools.as_array().ok_or_else(|| {
+        GatewaySessionError::new("provider tools delta must be a non-empty array")
+    })?;
+    if tools.is_empty() {
+        return Err(GatewaySessionError::new(
+            "provider tools delta must be a non-empty array",
+        ));
     }
-    Some(ToolCallOutput {
-        id: tool
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| make_id("call")),
-        name: tool
-            .get("name")
-            .or_else(|| {
-                tool.get("function")
-                    .and_then(|function| function.get("name"))
+    let mut ids = BTreeSet::new();
+    tools
+        .iter()
+        .map(|tool| {
+            let id = tool
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| GatewaySessionError::new("provider tool call is missing id"))?
+                .to_owned();
+            if !ids.insert(id.clone()) {
+                return Err(GatewaySessionError::new(
+                    "provider tools delta contains duplicate call ids",
+                ));
+            }
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| GatewaySessionError::new("provider tool call is missing name"))?
+                .to_owned();
+            let arguments = tool
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    GatewaySessionError::new("provider tool call arguments must be JSON text")
+                })?
+                .to_owned();
+            serde_json::from_str::<Value>(&arguments).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "provider tool call arguments are invalid JSON: {err}"
+                ))
+            })?;
+            Ok(ToolCallOutput {
+                id,
+                name,
+                arguments,
             })
-            .and_then(Value::as_str)?
-            .to_owned(),
-        arguments: tool
-            .get("arguments")
-            .or_else(|| {
-                tool.get("function")
-                    .and_then(|function| function.get("arguments"))
-            })
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| "{}".to_owned()),
-    })
+        })
+        .collect()
 }
 
 fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
@@ -14226,7 +14266,7 @@ fn validate_usage_attribution(
     for axis in attribution.keys() {
         if !matches!(
             axis.as_str(),
-            "reasoning_output_tokens" | "vision_input_tokens"
+            "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens"
         ) {
             return Err(GatewaySessionError::new(format!(
                 "unsupported provider usage attribution {axis}"
@@ -14246,6 +14286,22 @@ fn validate_usage_attribution(
     if attribution.get("vision_input_tokens").copied().unwrap_or(0) > usage.input_tokens() {
         return Err(GatewaySessionError::new(
             "provider vision attribution exceeds billed input tokens",
+        ));
+    }
+    if attribution.get("audio_input_tokens").copied().unwrap_or(0) > usage.input_tokens() {
+        return Err(GatewaySessionError::new(
+            "provider audio attribution exceeds billed input tokens",
+        ));
+    }
+    if attribution
+        .get("vision_input_tokens")
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(attribution.get("audio_input_tokens").copied().unwrap_or(0))
+        > usage.input_tokens()
+    {
+        return Err(GatewaySessionError::new(
+            "provider media attribution exceeds billed input tokens",
         ));
     }
     Ok(())
@@ -15287,46 +15343,96 @@ fn apply_model_speciality_defaults(
     request: &mut ChatCompletionRequest,
 ) -> Result<(), ApiError> {
     let mut effective = BTreeMap::new();
+    let endpoint_family = request
+        .endpoint_family
+        .as_deref()
+        .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS);
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                format!(
+                    "model {} does not expose endpoint family {endpoint_family}",
+                    model.id
+                ),
+                Some("model"),
+            )
+        })?;
     for descriptor in &model.mayhem.adapter.specialities {
         let submitted = if descriptor.name == "reasoning_effort" {
-            request.reasoning_effort.as_deref()
+            request.reasoning_effort.as_ref().map(|value| {
+                // This temporary value is used only for matching below.
+                Value::String(value.clone())
+            })
         } else {
-            request
-                .speciality_values
-                .get(&descriptor.name)
-                .and_then(Value::as_str)
+            request.speciality_values.get(&descriptor.name).cloned()
         };
-        let level_name = submitted.unwrap_or(&descriptor.default_level);
-        let level = descriptor
-            .levels
-            .iter()
-            .find(|level| level.name == level_name)
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    format!(
-                        "model {} does not support speciality {} level {}; available levels: {}",
-                        model.id,
-                        descriptor.name,
-                        level_name,
-                        descriptor
-                            .levels
-                            .iter()
-                            .map(|level| level.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    Some("speciality"),
-                )
-            })?;
+        let level = match submitted.as_ref() {
+            Some(submitted) => descriptor.levels.iter().find(|level| {
+                submitted.as_str() == Some(level.name.as_str()) || submitted == &level.native_value
+            }),
+            None => descriptor
+                .levels
+                .iter()
+                .find(|level| level.name == descriptor.default_level),
+        }
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                format!(
+                    "model {} does not support speciality {} value {}; available levels: {}",
+                    model.id,
+                    descriptor.name,
+                    submitted
+                        .as_ref()
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| descriptor.default_level.clone()),
+                    descriptor
+                        .levels
+                        .iter()
+                        .map(|level| level.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some("speciality"),
+            )
+        })?;
         if descriptor.name == "reasoning_effort" {
             request.reasoning_effort = Some(level.name.clone());
             if request.max_tokens.is_none() && request.max_completion_tokens.is_none() {
                 request.max_completion_tokens = level.default_max_output_tokens;
             }
         } else {
-            request
-                .speciality_values
-                .insert(descriptor.name.clone(), Value::String(level.name.clone()));
+            let mapping = contract
+                .speciality_mappings
+                .get(&descriptor.name)
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        format!(
+                            "model {} endpoint family {} does not map speciality {}",
+                            model.id, endpoint_family, descriptor.name
+                        ),
+                        Some("speciality"),
+                    )
+                })?;
+            let uses_level_names = contract
+                .request_attribute_specs
+                .get(&mapping.request_path)
+                .is_some_and(|spec| {
+                    spec.value_types == [mayhem_proto::EndpointValueType::String]
+                        && spec.enum_values.iter().all(Value::is_string)
+                });
+            request.speciality_values.insert(
+                descriptor.name.clone(),
+                if uses_level_names {
+                    Value::String(level.name.clone())
+                } else {
+                    level.native_value.clone()
+                },
+            );
         }
         effective.insert(descriptor.name.clone(), level.name.clone());
     }
@@ -16122,7 +16228,7 @@ async fn recover_live_direct_chat_after_partial(
         .await;
 
     let mut output = result.output.clone();
-    if output.tool_call.is_none() {
+    if output.tool_calls.is_empty() {
         let content = output.content.take().unwrap_or_default();
         output.content = Some(strip_live_streamed_prefix(
             &content,
@@ -16174,7 +16280,7 @@ async fn run_live_direct_chat_sse_inner(
     }
 
     let mut content = String::new();
-    let mut tool_call = None;
+    let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
     let mut claimed_usage_attribution = None;
@@ -16216,7 +16322,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(client_disconnect_direct_session_error(
                     &session.request,
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -16258,7 +16364,7 @@ async fn run_live_direct_chat_sse_inner(
                 let timeout = watchdog.timeout_error(&session.invocation.session_id, now);
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -16277,7 +16383,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -16342,7 +16448,7 @@ async fn run_live_direct_chat_sse_inner(
                         return Err(client_disconnect_direct_session_error(
                             &session.request,
                             &content,
-                            tool_call.clone(),
+                            tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
                             &watchdog,
@@ -16358,7 +16464,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         &receipt,
                         &token_ids,
                         &watchdog,
@@ -16373,9 +16479,9 @@ async fn run_live_direct_chat_sse_inner(
                         pending_checkpoint_receipt = Some(receipt);
                     }
                 }
-                if tool_call.is_none() {
-                    if let Some(next_tool_call) =
-                        tool_call_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
+                if tool_calls.is_empty() {
+                    if let Some(next_tool_calls) =
+                        tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
                     {
                         if !send_sse_value(
                             tx,
@@ -16383,7 +16489,7 @@ async fn run_live_direct_chat_sse_inner(
                                 &session.id,
                                 session.created,
                                 &session.model.id,
-                                json!({ "tool_calls": [tool_call_value(&next_tool_call)] }),
+                                json!({ "tool_calls": tool_call_delta_values(&next_tool_calls) }),
                                 None,
                                 None,
                             ),
@@ -16393,14 +16499,14 @@ async fn run_live_direct_chat_sse_inner(
                             return Err(client_disconnect_direct_session_error(
                                 &session.request,
                                 &content,
-                                tool_call.clone(),
+                                tool_calls.clone(),
                                 latest_checkpoint_receipt.as_ref(),
                                 &token_ids,
                                 &watchdog,
                                 now,
                             ));
                         }
-                        tool_call = Some(next_tool_call);
+                        tool_calls = next_tool_calls;
                     }
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
@@ -16424,7 +16530,7 @@ async fn run_live_direct_chat_sse_inner(
                         );
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
-                            tool_call.clone(),
+                            tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
                             &watchdog,
@@ -16464,7 +16570,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         &receipt,
                         &token_ids,
                         &watchdog,
@@ -16495,7 +16601,7 @@ async fn run_live_direct_chat_sse_inner(
                 );
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
-                    tool_call.clone(),
+                    tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
@@ -16518,7 +16624,7 @@ async fn run_live_direct_chat_sse_inner(
                     );
                     if let Some(partial) = interrupted_direct_session_partial(
                         &content,
-                        tool_call.clone(),
+                        tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         &token_ids,
                         &watchdog,
@@ -16563,13 +16669,27 @@ async fn run_live_direct_chat_sse_inner(
         .get("vision_input_tokens")
         .copied()
         .unwrap_or(0);
+    let audio_tokens = final_receipt
+        .body
+        .usage_attribution
+        .get("audio_input_tokens")
+        .copied()
+        .unwrap_or(0);
     let input_modalities = chat_input_modalities(&session.request.messages);
     if vision_tokens > 0 && !input_modalities.image && !input_modalities.video {
         return Err(GatewaySessionError::new(
             "provider claimed vision tokens for a request without visual input",
         ));
     }
-    usage.prompt_tokens = usage.prompt_tokens.saturating_add(vision_tokens);
+    if audio_tokens > 0 && !input_modalities.audio {
+        return Err(GatewaySessionError::new(
+            "provider claimed audio tokens for a request without audio input",
+        ));
+    }
+    usage.prompt_tokens = usage
+        .prompt_tokens
+        .saturating_add(vision_tokens)
+        .saturating_add(audio_tokens);
     usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
@@ -16599,8 +16719,8 @@ async fn run_live_direct_chat_sse_inner(
         ))
     })?;
     let output = ChatOutput {
-        content: tool_call.is_none().then_some(content),
-        tool_call,
+        content: tool_calls.is_empty().then_some(content),
+        tool_calls,
         artifacts,
         finish_reason,
         usage,
@@ -16737,14 +16857,14 @@ async fn send_live_chat_tail(
     mayhem_meta: ResponseMayhemMeta<'_>,
     include_usage: bool,
 ) -> bool {
-    if let Some(tool_call) = &output.tool_call {
+    if !output.tool_calls.is_empty() {
         if !send_sse_value(
             tx,
             chat_chunk(
                 id,
                 created,
                 model_id,
-                json!({ "tool_calls": [tool_call_value(tool_call)] }),
+                json!({ "tool_calls": tool_call_delta_values(&output.tool_calls) }),
                 None,
                 None,
             ),
@@ -18845,7 +18965,7 @@ fn stitch_partials_into_result(
     partials: &[GatewaySessionPartial],
 ) {
     let prefix = partial_text(partials);
-    if !prefix.is_empty() && result.output.tool_call.is_none() {
+    if !prefix.is_empty() && result.output.tool_calls.is_empty() {
         let suffix = result.output.content.take().unwrap_or_default();
         result.output.content = Some(format!("{prefix}{suffix}"));
     }
@@ -20077,6 +20197,70 @@ fn validate_chat_video_input(
     video: &Value,
     limits: &GatewayMediaLimits,
 ) -> Result<(u64, u64), ApiError> {
+    let encoded = video
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let decoded_frames = video.get("frames").and_then(Value::as_array);
+    if encoded.is_some() == decoded_frames.is_some() {
+        return Err(ApiError::bad_request(
+            "video requires exactly one of data or decoded frames",
+            Some("messages"),
+        ));
+    }
+    if let Some(frames) = decoded_frames {
+        if video.get("content_type").is_some() {
+            return Err(ApiError::bad_request(
+                "video.content_type is only valid with video.data",
+                Some("messages"),
+            ));
+        }
+        if frames.is_empty()
+            || u64::try_from(frames.len()).unwrap_or(u64::MAX) > limits.max_video_frames
+        {
+            return Err(ApiError::bad_request(
+                format!(
+                    "video.frames must contain 1..={} decoded frames",
+                    limits.max_video_frames
+                ),
+                Some("messages"),
+            ));
+        }
+        let mut total_bytes = 0_u64;
+        for frame in frames {
+            let url = frame.as_str().ok_or_else(|| {
+                ApiError::bad_request(
+                    "video.frames entries must be base64 image data URLs",
+                    Some("messages"),
+                )
+            })?;
+            let (bytes, _) = validate_chat_image_data_url(url, limits)?;
+            total_bytes = total_bytes.saturating_add(bytes);
+            if total_bytes > limits.max_video_bytes {
+                return Err(ApiError::bad_request(
+                    format!(
+                        "decoded video frames exceed the {}-byte gateway limit",
+                        limits.max_video_bytes
+                    ),
+                    Some("messages"),
+                ));
+            }
+        }
+        let frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+        if video
+            .get("num_frames")
+            .and_then(Value::as_u64)
+            .is_some_and(|declared| declared != frame_count)
+        {
+            return Err(ApiError::bad_request(
+                "video.num_frames must match video.frames length",
+                Some("messages"),
+            ));
+        }
+        validate_chat_video_fps(video)?;
+        return Ok((total_bytes, frame_count));
+    }
+
     let content_type = video
         .get("content_type")
         .and_then(Value::as_str)
@@ -20087,11 +20271,7 @@ fn validate_chat_video_input(
             Some("messages"),
         ));
     }
-    let encoded = video
-        .get("data")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad_request("video.data is required", Some("messages")))?;
+    let encoded = encoded.expect("exactly one video representation was validated");
     let encoded_limit = usize::try_from(limits.max_video_bytes)
         .unwrap_or(usize::MAX / 4)
         .saturating_mul(4)
@@ -20137,6 +20317,11 @@ fn validate_chat_video_input(
             Some("messages"),
         ));
     }
+    validate_chat_video_fps(video)?;
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
+}
+
+fn validate_chat_video_fps(video: &Value) -> Result<(), ApiError> {
     if let Some(fps) = video.get("fps") {
         fps.as_f64()
             .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
@@ -20147,7 +20332,7 @@ fn validate_chat_video_input(
                 )
             })?;
     }
-    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
+    Ok(())
 }
 
 fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
@@ -23754,7 +23939,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
     let output = if let Some(tool_result) = last_tool_result(&request.messages) {
         ChatOutput {
             content: Some(format!("Tool result received: {tool_result}")),
-            tool_call: None,
+            tool_calls: Vec::new(),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             usage: usage_for(&prompt_text, &tool_result),
@@ -23767,7 +23952,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
         };
         ChatOutput {
             content: None,
-            tool_call: Some(tool_call),
+            tool_calls: vec![tool_call],
             artifacts: Vec::new(),
             finish_reason: "tool_calls".to_owned(),
             usage: usage_for(&prompt_text, "{}"),
@@ -23803,7 +23988,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
         ChatOutput {
             usage: usage_for(&prompt_text, &content),
             content: Some(content),
-            tool_call: None,
+            tool_calls: Vec::new(),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
         }
@@ -23819,11 +24004,11 @@ fn chat_response_value(
     receipt: Option<&StoredReceipt>,
     mayhem_meta: ResponseMayhemMeta<'_>,
 ) -> Value {
-    let message = if let Some(tool_call) = &output.tool_call {
+    let message = if !output.tool_calls.is_empty() {
         json!({
             "role": "assistant",
             "content": null,
-            "tool_calls": [tool_call_value(tool_call)],
+            "tool_calls": output.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
         })
     } else {
         json!({
@@ -23879,12 +24064,12 @@ fn chat_stream_chunks(
         None,
         None,
     )];
-    if let Some(tool_call) = &output.tool_call {
+    if !output.tool_calls.is_empty() {
         chunks.push(chat_chunk(
             id,
             created,
             model,
-            json!({ "tool_calls": [tool_call_value(tool_call)] }),
+            json!({ "tool_calls": tool_call_delta_values(&output.tool_calls) }),
             None,
             None,
         ));
@@ -24031,6 +24216,18 @@ fn tool_call_value(tool_call: &ToolCallOutput) -> Value {
     })
 }
 
+fn tool_call_delta_values(tool_calls: &[ToolCallOutput]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, tool_call)| {
+            let mut value = tool_call_value(tool_call);
+            value["index"] = json!(index);
+            value
+        })
+        .collect()
+}
+
 fn receipt_summary(receipt: &StoredReceipt) -> Value {
     json!({
         "rail": receipt.rail,
@@ -24063,10 +24260,15 @@ fn chat_usage_value(usage: &Usage, receipt: Option<&StoredReceipt>) -> Value {
             "reasoning_tokens": reasoning_tokens,
         });
     }
+    let mut prompt_details = Map::new();
     if let Some(vision_tokens) = attribution.get("vision_input_tokens") {
-        value["prompt_tokens_details"] = json!({
-            "vision_tokens": vision_tokens,
-        });
+        prompt_details.insert("vision_tokens".to_owned(), json!(vision_tokens));
+    }
+    if let Some(audio_tokens) = attribution.get("audio_input_tokens") {
+        prompt_details.insert("audio_tokens".to_owned(), json!(audio_tokens));
+    }
+    if !prompt_details.is_empty() {
+        value["prompt_tokens_details"] = Value::Object(prompt_details);
     }
     if !attribution.is_empty() {
         value["mayhem_attribution"] = json!(attribution);
@@ -26696,7 +26898,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
-            None,
+            Vec::new(),
             Some(&provider_receipt),
             &[1, 2, 3],
             &watchdog,
@@ -26733,7 +26935,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
-            None,
+            Vec::new(),
             None,
             &[1, 2, 3],
             &watchdog,
@@ -27538,7 +27740,7 @@ mod tests {
                 if attempt == 1 {
                     let output = ChatOutput {
                         content: Some("hello ".to_owned()),
-                        tool_call: None,
+                        tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "interrupted".to_owned(),
                         usage: Usage {
@@ -27574,7 +27776,7 @@ mod tests {
                 );
                 let output = ChatOutput {
                     content: Some("world".to_owned()),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -27632,7 +27834,7 @@ mod tests {
                 if attempt == 1 {
                     let output = ChatOutput {
                         content: Some("checkpoint ".to_owned()),
-                        tool_call: None,
+                        tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "interrupted".to_owned(),
                         usage: Usage {
@@ -27660,7 +27862,7 @@ mod tests {
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let output = ChatOutput {
                     content: Some("continued".to_owned()),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -27714,7 +27916,7 @@ mod tests {
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
                         content: Some(content.to_owned()),
-                        tool_call: None,
+                        tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "stop".to_owned(),
                         usage: Usage {
@@ -27767,7 +27969,7 @@ mod tests {
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
                         content: Some("recovered".to_owned()),
-                        tool_call: None,
+                        tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "stop".to_owned(),
                         usage: Usage {
@@ -27903,7 +28105,7 @@ mod tests {
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
                         content: Some("ok".to_owned()),
-                        tool_call: None,
+                        tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "stop".to_owned(),
                         usage: Usage {
@@ -29843,15 +30045,22 @@ mod tests {
     #[test]
     fn session_delta_refs_reassemble_large_tool_embeddings_and_token_ids() {
         let mut pending = SessionDeltaPayloadChunks::default();
-        let tool = json!({
-            "id": "call-large",
-            "name": "write_file",
-            "arguments": "x".repeat(10_000),
-        });
+        let tools = json!([
+            {
+                "id": "call-large-1",
+                "name": "write_file",
+                "arguments": json!({ "content": "x".repeat(10_000) }).to_string(),
+            },
+            {
+                "id": "call-large-2",
+                "name": "read_file",
+                "arguments": r#"{"path":"README.md"}"#,
+            }
+        ]);
         let embeddings = json!([vec![0.25_f32; 2048], vec![0.5_f32; 2048]]);
         let token_ids = json!((0..4096).collect::<Vec<i32>>());
         let fields = [
-            ("tool", tool.clone()),
+            ("tools", tools.clone()),
             ("embeddings", embeddings.clone()),
             ("token_ids", token_ids.clone()),
         ];
@@ -29876,15 +30085,15 @@ mod tests {
         let frame = json!({
             "t": "s.delta",
             "rid": "rid-large",
-            "tool": null,
-            "tool_ref": manifests["tool"],
+            "tools": null,
+            "tools_ref": manifests["tools"],
             "embeddings": null,
             "embeddings_ref": manifests["embeddings"],
             "token_ids": null,
             "token_ids_ref": manifests["token_ids"],
         });
 
-        let restored_tool = tool_call_from_session_delta_resolving(&frame, &mut pending)
+        let restored_tools = tool_calls_from_session_delta_resolving(&frame, &mut pending)
             .unwrap()
             .unwrap();
         let restored_embeddings = embeddings_from_session_delta(&frame, &mut pending)
@@ -29894,9 +30103,16 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(restored_tool.id, "call-large");
-        assert_eq!(restored_tool.name, "write_file");
-        assert_eq!(restored_tool.arguments, "x".repeat(10_000));
+        assert_eq!(restored_tools.len(), 2);
+        assert_eq!(restored_tools[0].id, "call-large-1");
+        assert_eq!(restored_tools[0].name, "write_file");
+        assert_eq!(
+            restored_tools[0].arguments,
+            json!({ "content": "x".repeat(10_000) }).to_string()
+        );
+        assert_eq!(restored_tools[1].id, "call-large-2");
+        assert_eq!(restored_tools[1].name, "read_file");
+        assert_eq!(restored_tools[1].arguments, r#"{"path":"README.md"}"#);
         assert_eq!(restored_embeddings.len(), 2);
         assert_eq!(restored_embeddings[0].len(), 2048);
         assert_eq!(restored_token_ids.len(), 4096);
@@ -29964,7 +30180,7 @@ mod tests {
     fn test_chat_output() -> ChatOutput {
         ChatOutput {
             content: Some("receipt ok".to_owned()),
-            tool_call: None,
+            tool_calls: Vec::new(),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             usage: Usage {

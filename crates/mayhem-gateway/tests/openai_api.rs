@@ -67,7 +67,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                         "direct session response from {} via {}",
                         model.id, invocation.session_id
                     )),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -135,7 +135,7 @@ impl GatewaySessionBackend for SpecialityRecordingBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(format!("speciality response from {}", model.id)),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -581,11 +581,18 @@ impl GatewaySessionBackend for ToolCallDirectSessionBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: None,
-                    tool_call: Some(ToolCallOutput {
-                        id: "call-normalized".to_owned(),
-                        name: "write".to_owned(),
-                        arguments: r#"{"filePath":"ok.txt"}"#.to_owned(),
-                    }),
+                    tool_calls: vec![
+                        ToolCallOutput {
+                            id: "call-normalized-1".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: r#"{"filePath":"one.txt"}"#.to_owned(),
+                        },
+                        ToolCallOutput {
+                            id: "call-normalized-2".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: r#"{"filePath":"two.txt"}"#.to_owned(),
+                        },
+                    ],
                     artifacts: Vec::new(),
                     finish_reason: "tool_calls".to_owned(),
                     usage: Usage {
@@ -624,7 +631,7 @@ impl GatewaySessionBackend for ArtifactDirectSessionBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(String::new()),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: vec![GatewayArtifactOutput {
                         id: "image-1".to_owned(),
                         content_type: "image/png".to_owned(),
@@ -673,7 +680,7 @@ impl GatewaySessionBackend for VisionInspectBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some("vision ok".to_owned()),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -731,7 +738,7 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
                         "direct retry response from {} via {}",
                         model.id, provider
                     )),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -789,7 +796,7 @@ impl GatewaySessionBackend for RetryFirstDirectSessionBackend {
                         "direct retry response from {} via {}",
                         model.id, provider
                     )),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -898,7 +905,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(format!("hedge inspected for {} via {}", model.id, provider)),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -960,7 +967,7 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(content),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -1021,7 +1028,7 @@ impl GatewaySessionBackend for SpecialityCanaryBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(format!("{effort} speciality canary output")),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -1098,7 +1105,7 @@ impl GatewaySessionBackend for ContextNeedleBackend {
             Ok(GatewaySessionResult {
                 output: ChatOutput {
                     content: Some(content),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -1290,7 +1297,7 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], true);
     assert_eq!(
         body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
-        "mayhem_json"
+        "qwen_function_xml"
     );
 }
 
@@ -4524,6 +4531,49 @@ async fn chat_completion_streams_openai_sse_chunks_with_usage() {
 }
 
 #[tokio::test]
+async fn chat_completion_returns_all_normalized_tool_calls() {
+    let mut model = routed_test_model();
+    model.mayhem.adapter = ShapeAdapterInfo {
+        tool_call_strategy: "openai_tool_calls".to_owned(),
+        ..ShapeAdapterInfo::default()
+    };
+    let state = test_gateway_state_from_models(vec![model])
+        .with_session_backend(Arc::new(ToolCallDirectSessionBackend));
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Write both files." }],
+        "tools": [{
+            "type": "function",
+            "function": { "name": "write", "parameters": { "type": "object" } }
+        }]
+    });
+    let (status, body) = json_request(
+        openai_router(state),
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool call array");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["id"], "call-normalized-1");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        r#"{"filePath":"one.txt"}"#
+    );
+    assert_eq!(calls[1]["id"], "call-normalized-2");
+    assert_eq!(
+        calls[1]["function"]["arguments"],
+        r#"{"filePath":"two.txt"}"#
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
 async fn chat_completion_streams_normalized_tool_call_delta() {
     let mut model = routed_test_model();
     model.mayhem.adapter = ShapeAdapterInfo {
@@ -4557,10 +4607,14 @@ async fn chat_completion_streams_normalized_tool_call_delta() {
         .starts_with("text/event-stream"));
     let body = String::from_utf8(bytes).expect("SSE body is utf8");
     assert!(body.contains("\"tool_calls\":["));
-    assert!(body.contains("\"id\":\"call-normalized\""));
+    assert!(body.contains("\"id\":\"call-normalized-1\""));
+    assert!(body.contains("\"id\":\"call-normalized-2\""));
+    assert!(body.contains("\"index\":0"));
+    assert!(body.contains("\"index\":1"));
     assert!(body.contains("\"type\":\"function\""));
     assert!(body.contains("\"name\":\"write\""));
-    assert!(body.contains("\"arguments\":\"{\\\"filePath\\\":\\\"ok.txt\\\"}\""));
+    assert!(body.contains("\"arguments\":\"{\\\"filePath\\\":\\\"one.txt\\\"}\""));
+    assert!(body.contains("\"arguments\":\"{\\\"filePath\\\":\\\"two.txt\\\"}\""));
     assert!(body.contains("\"finish_reason\":\"tool_calls\""));
     assert!(body.contains("data: [DONE]"));
 }

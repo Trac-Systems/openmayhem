@@ -4,6 +4,7 @@ import copy
 import inspect
 import io
 import json
+import math
 import os
 import sys
 import wave
@@ -514,8 +515,32 @@ def decode_video(item):
     import numpy as np
 
     requested = int(item.get("num_frames") or 8)
-    if requested <= 0 or requested > 1024:
-        raise ValueError("multimodal video num_frames must be between 1 and 1024")
+    if requested <= 0 or requested > 64:
+        raise ValueError("multimodal video num_frames must be between 1 and 64")
+    inline_frames = item.get("frames") or []
+    if inline_frames:
+        if item.get("data") or item.get("url"):
+            raise ValueError("multimodal video must use decoded frames or a container, not both")
+        if len(inline_frames) != requested:
+            raise ValueError("multimodal video num_frames does not match decoded frames")
+        decoded = []
+        for frame in inline_frames:
+            decoded.append(np.asarray(decode_image({"url": frame}), dtype=np.uint8))
+        shape = decoded[0].shape
+        if any(frame.shape != shape for frame in decoded):
+            raise ValueError("multimodal video decoded frames must have matching dimensions")
+        source_fps = float(item.get("fps") or 1.0)
+        if not math.isfinite(source_fps) or source_fps <= 0:
+            raise ValueError("multimodal video fps must be a positive finite number")
+        metadata = {
+            "fps": source_fps,
+            "duration": len(decoded) / source_fps,
+            "total_num_frames": len(decoded),
+            "frames_indices": list(range(len(decoded))),
+            "video_backend": "inline_frames",
+            "do_sample_frames": False,
+        }
+        return np.stack(decoded), metadata
     try:
         container = av.open(io.BytesIO(inline_media_bytes(item)))
         stream = container.streams.video[0]

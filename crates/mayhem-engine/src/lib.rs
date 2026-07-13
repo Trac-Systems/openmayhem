@@ -403,6 +403,7 @@ pub enum GenerateSpecialityTarget {
     ChatTemplateKwarg,
     SamplingParameter,
     PromptSuffix,
+    BackendParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -532,6 +533,8 @@ pub struct MediaInput {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_frames: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,6 +831,8 @@ pub struct UsageCounters {
     pub reasoning_tokens: u32,
     #[serde(default)]
     pub vision_tokens: u32,
+    #[serde(default)]
+    pub audio_tokens: u32,
 }
 
 impl UsageCounters {
@@ -839,6 +844,7 @@ impl UsageCounters {
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             reasoning_tokens: 0,
             vision_tokens: 0,
+            audio_tokens: 0,
         }
     }
 }
@@ -2757,7 +2763,8 @@ mod llama_cpp_backend {
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel};
     use llama_cpp_2::mtmd::{
-        mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
+        mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunkType,
+        MtmdInputText,
     };
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
@@ -2778,6 +2785,7 @@ mod llama_cpp_backend {
         backend: LlamaBackend,
         model: Option<LlamaModel>,
         mtmd: Option<MtmdContext>,
+        mtmd_image_token_budget: Option<i32>,
         loaded: Option<LoadedModelInfo>,
         config: Option<LoadConfig>,
     }
@@ -2790,6 +2798,7 @@ mod llama_cpp_backend {
                 backend,
                 model: None,
                 mtmd: None,
+                mtmd_image_token_budget: None,
                 loaded: None,
                 config: None,
             })
@@ -2853,9 +2862,9 @@ mod llama_cpp_backend {
                         ))
                     },
                 )?;
-                if !mtmd.support_vision() {
+                if !mtmd.support_vision() && !mtmd.support_audio() {
                     return Err(EngineError::InvalidConfig(format!(
-                        "vision projector {} does not advertise vision support",
+                        "multimodal projector {} advertises neither vision nor audio support",
                         projector.path.display()
                     )));
                 }
@@ -2873,6 +2882,7 @@ mod llama_cpp_backend {
 
             self.model = Some(model);
             self.mtmd = mtmd;
+            self.mtmd_image_token_budget = None;
             self.loaded = Some(info.clone());
             self.config = Some(config);
             Ok(info)
@@ -3088,6 +3098,8 @@ mod llama_cpp_backend {
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
         ) -> Result<GenerateOutput> {
+            let image_token_budget = llama_mtmd_image_token_budget(&request)?;
+            self.ensure_mtmd_image_token_budget(image_token_budget)?;
             let config = self.config()?.clone();
             let model = self.model()?;
             let mtmd = self.mtmd.as_ref().ok_or_else(|| {
@@ -3203,17 +3215,108 @@ mod llama_cpp_backend {
             let mut usage = UsageCounters::new(prompt_tokens as u32, completion_tokens);
             usage.reasoning_tokens =
                 llama_reasoning_tokens(model, &request, &stop_stream.output, completion_tokens);
-            let text_prompt_tokens = model
-                .str_to_token(&request.prompt, AddBos::Always)
-                .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
-                .unwrap_or(usage.prompt_tokens);
-            usage.vision_tokens = usage.prompt_tokens.saturating_sub(text_prompt_tokens);
+            for index in 0..chunks.len() {
+                let Some(chunk) = chunks.get(index) else {
+                    continue;
+                };
+                let tokens = u32::try_from(chunk.n_tokens()).unwrap_or(u32::MAX);
+                match chunk.chunk_type() {
+                    MtmdInputChunkType::Image => {
+                        usage.vision_tokens = usage.vision_tokens.saturating_add(tokens);
+                    }
+                    MtmdInputChunkType::Audio => {
+                        usage.audio_tokens = usage.audio_tokens.saturating_add(tokens);
+                    }
+                    MtmdInputChunkType::Text => {}
+                }
+            }
             Ok(GenerateOutput {
                 text: stop_stream.output,
                 usage,
                 finish_reason,
             })
         }
+
+        fn ensure_mtmd_image_token_budget(&mut self, budget: Option<i32>) -> Result<()> {
+            if self.mtmd_image_token_budget == budget {
+                return Ok(());
+            }
+            let config = self.config()?.clone();
+            let projector = config.vision_projector.as_ref().ok_or_else(|| {
+                EngineError::InvalidConfig(
+                    "llama.cpp received a visual-token budget without an mmproj sidecar".to_owned(),
+                )
+            })?;
+            verify_artifact(projector)?;
+            let projector_path = projector.path.to_str().ok_or_else(|| {
+                EngineError::InvalidConfig(format!(
+                    "multimodal projector path {} is not valid UTF-8",
+                    projector.path.display()
+                ))
+            })?;
+            self.mtmd.take();
+            let model = self.model()?;
+            let mut params = MtmdContextParams::default();
+            params.use_gpu = config.gpu_layers.unwrap_or(0) > 0;
+            params.print_timings = false;
+            if let Some(threads) = config.threads {
+                params.n_threads = threads;
+            }
+            params.media_marker = CString::new(mtmd_default_marker()).map_err(|err| {
+                EngineError::InvalidConfig(format!("invalid mtmd media marker: {err}"))
+            })?;
+            if let Some(budget) = budget {
+                params.image_min_tokens = budget;
+                params.image_max_tokens = budget;
+            }
+            let mtmd =
+                MtmdContext::init_from_file(projector_path, model, &params).map_err(|err| {
+                    EngineError::InvalidConfig(format!(
+                        "initializing llama.cpp multimodal projector {} failed: {err}",
+                        projector.path.display()
+                    ))
+                })?;
+            if !mtmd.support_vision() && !mtmd.support_audio() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "multimodal projector {} advertises neither vision nor audio support",
+                    projector.path.display()
+                )));
+            }
+            self.mtmd = Some(mtmd);
+            self.mtmd_image_token_budget = budget;
+            Ok(())
+        }
+    }
+
+    fn llama_mtmd_image_token_budget(request: &GenerateRequest) -> Result<Option<i32>> {
+        let mut budget = None;
+        for speciality in &request.speciality_parameters {
+            if speciality.target != GenerateSpecialityTarget::BackendParameter
+                || speciality.native_path != "mtmd.image_token_budget"
+            {
+                continue;
+            }
+            let value = speciality.value.as_i64().ok_or_else(|| {
+                EngineError::InvalidConfig(format!(
+                    "llama.cpp image-token budget speciality {} must map to an integer",
+                    speciality.name
+                ))
+            })?;
+            let value = i32::try_from(value).map_err(|_| {
+                EngineError::InvalidConfig("llama.cpp image-token budget exceeds i32".to_owned())
+            })?;
+            if !matches!(value, 70 | 140 | 280 | 560 | 1120) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "unsupported llama.cpp image-token budget {value}"
+                )));
+            }
+            if budget.replace(value).is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "llama.cpp received duplicate image-token budget specialities".to_owned(),
+                ));
+            }
+        }
+        Ok(budget)
     }
 
     fn apply_llama_speciality_parameters(request: &mut GenerateRequest) -> Result<()> {
@@ -3229,16 +3332,41 @@ mod llama_cpp_backend {
                     request.prompt.push_str(suffix);
                 }
                 GenerateSpecialityTarget::ChatTemplateKwarg => {
-                    return Err(EngineError::InvalidConfig(format!(
-                        "llama.cpp artifact cannot apply chat-template speciality {} ({}) through this backend; publish a prompt-suffix/native mapping or do not advertise the level",
-                        speciality.name, speciality.native_path
-                    )));
+                    if speciality.native_path != "enable_thinking" {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "llama.cpp artifact cannot apply chat-template speciality {} ({}) through this backend",
+                            speciality.name, speciality.native_path
+                        )));
+                    }
+                    let enabled = speciality.value.as_bool().ok_or_else(|| {
+                        EngineError::InvalidConfig(format!(
+                            "llama.cpp enable_thinking speciality {} must map to a boolean",
+                            speciality.name
+                        ))
+                    })?;
+                    let prompt_enables_thinking = request.prompt.contains("<|think|>");
+                    if enabled != prompt_enables_thinking {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "llama.cpp prompt did not apply enable_thinking={} for speciality {}",
+                            enabled, speciality.name
+                        )));
+                    }
                 }
                 GenerateSpecialityTarget::SamplingParameter => {
                     return Err(EngineError::InvalidConfig(format!(
                         "llama.cpp artifact does not support dynamic sampling speciality {} ({})",
                         speciality.name, speciality.native_path
                     )));
+                }
+                GenerateSpecialityTarget::BackendParameter => {
+                    if speciality.native_path != "mtmd.image_token_budget"
+                        || !matches!(speciality.value.as_i64(), Some(70 | 140 | 280 | 560 | 1120))
+                    {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "llama.cpp artifact does not support backend speciality {} ({}) at value {}",
+                            speciality.name, speciality.native_path, speciality.value
+                        )));
+                    }
                 }
             }
         }
@@ -3275,32 +3403,89 @@ mod llama_cpp_backend {
         if !enabled {
             return 0;
         }
-        let Some((prefix, _)) = text.split_once("</think>") else {
+        let close = ["</think>", "<channel|>"]
+            .into_iter()
+            .filter_map(|marker| text.find(marker).map(|index| (index, marker)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, marker)) = close else {
             return completion_tokens;
         };
+        let prefix = &text[..index];
         let attributed = model
-            .str_to_token(&format!("{prefix}</think>"), AddBos::Never)
+            .str_to_token(&format!("{prefix}{marker}"), AddBos::Never)
             .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             .unwrap_or(completion_tokens);
         attributed.min(completion_tokens)
     }
 
     fn media_bitmaps(mtmd: &MtmdContext, media: &[MediaInput]) -> Result<Vec<MtmdBitmap>> {
-        media
-            .iter()
-            .map(|input| {
-                if input.kind != "image" {
+        let mut bitmaps = Vec::new();
+        for input in media {
+            match input.kind.as_str() {
+                "image" if !mtmd.support_vision() => {
+                    return Err(EngineError::InvalidConfig(
+                        "llama.cpp mmproj does not advertise image support".to_owned(),
+                    ));
+                }
+                "audio" if !mtmd.support_audio() => {
+                    return Err(EngineError::InvalidConfig(
+                        "llama.cpp mmproj does not advertise audio support".to_owned(),
+                    ));
+                }
+                "image" | "audio" => {
+                    if !input.frames.is_empty() {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "llama.cpp {} media must not contain video frames",
+                            input.kind
+                        )));
+                    }
+                    let bytes = media_input_bytes(input)?;
+                    bitmaps.push(MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(|err| {
+                        EngineError::InvalidConfig(format!(
+                            "llama.cpp mtmd {} decode failed: {err}",
+                            input.kind
+                        ))
+                    })?);
+                }
+                "video" => {
+                    if !mtmd.support_vision() {
+                        return Err(EngineError::InvalidConfig(
+                            "llama.cpp mmproj does not advertise video-frame vision support"
+                                .to_owned(),
+                        ));
+                    }
+                    if input.frames.is_empty() || input.data.is_some() || input.url.is_some() {
+                        return Err(EngineError::InvalidConfig(
+                            "llama.cpp video input requires bounded decoded frames, not a container"
+                                .to_owned(),
+                        ));
+                    }
+                    if input.num_frames.is_some_and(|declared| {
+                        usize::try_from(declared).ok() != Some(input.frames.len())
+                    }) {
+                        return Err(EngineError::InvalidConfig(
+                            "llama.cpp video frame count does not match decoded frames".to_owned(),
+                        ));
+                    }
+                    for frame in &input.frames {
+                        let bytes = decode_data_url(frame)?;
+                        bitmaps.push(MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(
+                            |err| {
+                                EngineError::InvalidConfig(format!(
+                                    "llama.cpp mtmd video-frame decode failed: {err}"
+                                ))
+                            },
+                        )?);
+                    }
+                }
+                other => {
                     return Err(EngineError::InvalidConfig(format!(
-                        "llama.cpp mtmd currently supports image media only, got {}",
-                        input.kind
+                        "llama.cpp mtmd does not support media kind {other}"
                     )));
                 }
-                let bytes = media_input_bytes(input)?;
-                MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(|err| {
-                    EngineError::InvalidConfig(format!("llama.cpp mtmd image decode failed: {err}"))
-                })
-            })
-            .collect()
+            }
+        }
+        Ok(bitmaps)
     }
 
     fn media_input_bytes(input: &MediaInput) -> Result<Vec<u8>> {

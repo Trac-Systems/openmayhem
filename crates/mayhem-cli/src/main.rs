@@ -2,6 +2,7 @@
 
 mod catalog;
 mod endpoint_calibration;
+mod gemma4;
 mod python_runtime;
 
 use endpoint_calibration::{
@@ -7142,16 +7143,22 @@ fn catalog_local_run_memory(feasibility: &ProviderCtxFeasibility) -> CatalogList
 }
 
 fn catalog_download_estimate(artifact: &catalog::CatalogArtifact) -> CatalogListDownloadEstimate {
-    let sidecar_bytes = artifact.sidecars.values().fold(0_u64, |total, sidecar| {
-        total.saturating_add(sidecar.weights_bytes)
-    });
-    let bytes = artifact.weights_bytes.saturating_add(sidecar_bytes);
+    let bytes = catalog_artifact_resident_bytes(artifact);
     CatalogListDownloadEstimate {
         bytes,
         human: human_bytes(bytes),
         eta: "measured after the first download chunk".to_owned(),
         eta_source: "provider download progress refines ETA from observed link speed; no pre-download fake precision".to_owned(),
     }
+}
+
+fn catalog_artifact_resident_bytes(artifact: &catalog::CatalogArtifact) -> u64 {
+    artifact
+        .sidecars
+        .values()
+        .fold(artifact.weights_bytes, |total, sidecar| {
+            total.saturating_add(sidecar.weights_bytes)
+        })
 }
 
 fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
@@ -12755,7 +12762,7 @@ fn calibration_value_has_path(value: &Value, path: &str) -> bool {
 fn provider_session_output_fingerprint(output: &ProviderSessionOutput) -> String {
     stable_value_hash(&json!({
         "content": output.content,
-        "tool": output.tool,
+        "tools": output.tools,
         "embeddings": output.embeddings,
         "artifacts": output.artifacts.iter().map(|artifact| json!({
             "id": artifact.id,
@@ -12794,9 +12801,9 @@ fn catalog_endpoint_calibration_response(
                 "role": "assistant",
                 "content": output.content,
             });
-            if let Some(tool) = &output.tool {
+            if !output.tools.is_empty() {
                 message["content"] = Value::Null;
-                message["tool_calls"] = json!([tool]);
+                message["tool_calls"] = json!(output.tools);
             }
             Ok(json!({
                 "id": "chatcmpl-calibration",
@@ -16657,28 +16664,53 @@ fn calibration_chat_resource_items(
                         .or_else(|| part.get("video_url"))
                         .or_else(|| part.get("input_video"))
                         .unwrap_or(part);
-                    let encoded = video
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .context("calibration video input requires inline base64 data")?;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .context("calibration video data is invalid base64")?;
-                    let frames = video
-                        .get("frames")
-                        .or_else(|| video.get("num_frames"))
-                        .or_else(|| part.get("frames"))
-                        .or_else(|| part.get("num_frames"))
-                        .and_then(Value::as_u64)
-                        .filter(|frames| *frames > 0)
-                        .context("calibration video input requires a positive frames count")?;
-                    add_calibration_resource_item(
-                        &mut resources,
-                        "video",
-                        "frame",
-                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                        frames,
-                    )?;
+                    let decoded_frames = video.get("frames").and_then(Value::as_array);
+                    let (bytes, frames) = if let Some(decoded_frames) = decoded_frames {
+                        ensure!(
+                            !decoded_frames.is_empty(),
+                            "calibration video.frames must not be empty"
+                        );
+                        let mut bytes = 0_u64;
+                        for frame in decoded_frames {
+                            let url = frame
+                                .as_str()
+                                .context("calibration video.frames entries must be data URLs")?;
+                            let (content_type, frame_bytes) = calibration_data_url(url)?;
+                            ensure!(
+                                matches!(content_type.as_str(), "image/png" | "image/jpeg"),
+                                "calibration video frame must be a PNG or JPEG data URL"
+                            );
+                            bytes = bytes.saturating_add(
+                                u64::try_from(frame_bytes.len()).unwrap_or(u64::MAX),
+                            );
+                        }
+                        let frames = u64::try_from(decoded_frames.len()).unwrap_or(u64::MAX);
+                        ensure!(
+                            video
+                                .get("num_frames")
+                                .and_then(Value::as_u64)
+                                .is_none_or(|declared| declared == frames),
+                            "calibration video.num_frames must match video.frames length"
+                        );
+                        (bytes, frames)
+                    } else {
+                        let encoded = video.get("data").and_then(Value::as_str).context(
+                            "calibration video input requires inline base64 data or decoded frames",
+                        )?;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .context("calibration video data is invalid base64")?;
+                        let frames = video
+                            .get("frames")
+                            .or_else(|| video.get("num_frames"))
+                            .or_else(|| part.get("frames"))
+                            .or_else(|| part.get("num_frames"))
+                            .and_then(Value::as_u64)
+                            .filter(|frames| *frames > 0)
+                            .context("calibration video input requires a positive frames count")?;
+                        (u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames)
+                    };
+                    add_calibration_resource_item(&mut resources, "video", "frame", bytes, frames)?;
                 }
                 _ => {}
             }
@@ -42044,7 +42076,7 @@ fn provider_memory_estimate(
     configured_modalities: &BTreeMap<String, ConfigProviderModalityLimits>,
     served_ctx: u64,
 ) -> Result<ProviderMemoryEstimate> {
-    let weights_bytes = artifact.weights_bytes;
+    let weights_bytes = catalog_artifact_resident_bytes(artifact);
     let kv_bytes =
         served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact)?);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024);
@@ -42076,19 +42108,18 @@ fn provider_model_memory_fit(
     usable_bytes: u64,
     requested_ctx: u64,
 ) -> Result<mayhem_hwprobe::ModelMemoryFit> {
-    let overhead_bytes = (artifact.weights_bytes / 5)
-        .max(512 * 1024 * 1024)
-        .saturating_add(provider_modality_reserved_bytes(
-            &provider_modality_capacities(
-                model,
-                artifact_name,
-                served_modalities,
-                configured_modalities,
-            )?,
-        ));
+    let weights_bytes = catalog_artifact_resident_bytes(artifact);
+    let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024).saturating_add(
+        provider_modality_reserved_bytes(&provider_modality_capacities(
+            model,
+            artifact_name,
+            served_modalities,
+            configured_modalities,
+        )?),
+    );
     Ok(model_memory_fit(
         usable_bytes,
-        artifact.weights_bytes,
+        weights_bytes,
         overhead_bytes,
         provider_kv_bytes_per_token(enclave, model, artifact)?,
         requested_ctx,
@@ -46173,21 +46204,34 @@ fn provider_request_speciality_selection(
             "endpoint family {endpoint_family} has no native mapping for speciality {}",
             descriptor.name
         );
-        let level = body
-            .get(&descriptor.name)
-            .and_then(Value::as_str)
-            .unwrap_or(&descriptor.default_level);
-        ensure!(
-            descriptor
-                .levels
-                .iter()
-                .any(|candidate| candidate.name == level),
-            "model speciality {} does not support level {level}",
-            descriptor.name
-        );
-        selected.insert(descriptor.name.clone(), level.to_owned());
+        let submitted = body.get(&descriptor.name);
+        let level = provider_speciality_level(descriptor, submitted).with_context(|| {
+            format!(
+                "model speciality {} does not support value {}",
+                descriptor.name,
+                submitted
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| descriptor.default_level.clone())
+            )
+        })?;
+        selected.insert(descriptor.name.clone(), level.name.clone());
     }
     Ok(selected)
+}
+
+fn provider_speciality_level<'a>(
+    descriptor: &'a mayhem_proto::ModelSpecialityDescriptor,
+    submitted: Option<&Value>,
+) -> Option<&'a mayhem_proto::ModelSpecialityLevel> {
+    match submitted {
+        Some(submitted) => descriptor.levels.iter().find(|level| {
+            submitted.as_str() == Some(level.name.as_str()) || submitted == &level.native_value
+        }),
+        None => descriptor
+            .levels
+            .iter()
+            .find(|level| level.name == descriptor.default_level),
+    }
 }
 
 fn provider_session_request_modalities(family: &str, body: &Value) -> Result<Vec<String>> {
@@ -46388,6 +46432,50 @@ fn validate_provider_chat_audio_input(audio: &Value) -> Result<(u64, u64)> {
 }
 
 fn validate_provider_chat_video_input(video: &Value) -> Result<(u64, u64)> {
+    let encoded = video
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let decoded_frames = video.get("frames").and_then(Value::as_array);
+    ensure!(
+        encoded.is_some() != decoded_frames.is_some(),
+        "video requires exactly one of data or decoded frames"
+    );
+    if let Some(frames) = decoded_frames {
+        ensure!(
+            video.get("content_type").is_none(),
+            "video.content_type is only valid with video.data"
+        );
+        ensure!(
+            !frames.is_empty()
+                && u64::try_from(frames.len()).unwrap_or(u64::MAX)
+                    <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
+            "video.frames exceeds the provider media schema frame ceiling"
+        );
+        let mut total_bytes = 0_u64;
+        for frame in frames {
+            let url = frame
+                .as_str()
+                .context("video.frames entries must be base64 image data URLs")?;
+            let (bytes, _) = validate_provider_chat_image_data_url(url)?;
+            total_bytes = total_bytes.saturating_add(bytes);
+            ensure!(
+                total_bytes <= MAX_PROVIDER_MODALITY_ITEM_BYTES,
+                "decoded video frames exceed the provider media schema byte ceiling"
+            );
+        }
+        let frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+        ensure!(
+            video
+                .get("num_frames")
+                .and_then(Value::as_u64)
+                .is_none_or(|declared| declared == frame_count),
+            "video.num_frames must match video.frames length"
+        );
+        validate_provider_chat_video_fps(video)?;
+        return Ok((total_bytes, frame_count));
+    }
+
     let content_type = video
         .get("content_type")
         .and_then(Value::as_str)
@@ -46396,11 +46484,7 @@ fn validate_provider_chat_video_input(video: &Value) -> Result<(u64, u64)> {
         matches!(content_type, "video/mp4" | "video/webm" | "video/quicktime"),
         "video.content_type must be video/mp4, video/webm, or video/quicktime"
     );
-    let encoded = video
-        .get("data")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .context("video.data is required")?;
+    let encoded = encoded.expect("exactly one video representation was validated");
     ensure!(
         encoded.len()
             <= usize::try_from(MAX_PROVIDER_MODALITY_ITEM_BYTES)
@@ -46427,12 +46511,17 @@ fn validate_provider_chat_video_input(video: &Value) -> Result<(u64, u64)> {
         frames <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
         "video input exceeds the provider media schema frame ceiling"
     );
+    validate_provider_chat_video_fps(video)?;
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
+}
+
+fn validate_provider_chat_video_fps(video: &Value) -> Result<()> {
     if let Some(fps) = video.get("fps") {
         fps.as_f64()
             .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
             .context("video.fps must be a finite number between 0 and 240")?;
     }
-    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX), frames))
+    Ok(())
 }
 
 fn validate_provider_session_request_modalities(
@@ -47542,6 +47631,23 @@ struct ProviderSessionLiveStream<'a> {
 const PROVIDER_REASONING_OPEN_TAG: &str = "<think>";
 const PROVIDER_REASONING_CLOSE_TAG: &str = "</think>";
 
+#[derive(Clone, Copy)]
+struct ProviderReasoningDelimiters {
+    open: &'static str,
+    close: &'static str,
+}
+
+const PROVIDER_QWEN_REASONING_DELIMITERS: ProviderReasoningDelimiters =
+    ProviderReasoningDelimiters {
+        open: PROVIDER_REASONING_OPEN_TAG,
+        close: PROVIDER_REASONING_CLOSE_TAG,
+    };
+const PROVIDER_GEMMA4_REASONING_DELIMITERS: ProviderReasoningDelimiters =
+    ProviderReasoningDelimiters {
+        open: gemma4::THOUGHT_OPEN,
+        close: gemma4::THOUGHT_CLOSE,
+    };
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderReasoningOutputMode {
     Preserve,
@@ -47561,10 +47667,18 @@ enum ProviderReasoningStreamState {
 struct ProviderReasoningOutputFilter {
     state: ProviderReasoningStreamState,
     pending: String,
+    delimiters: ProviderReasoningDelimiters,
 }
 
 impl ProviderReasoningOutputFilter {
     fn new(mode: ProviderReasoningOutputMode) -> Self {
+        Self::with_delimiters(mode, PROVIDER_QWEN_REASONING_DELIMITERS)
+    }
+
+    fn with_delimiters(
+        mode: ProviderReasoningOutputMode,
+        delimiters: ProviderReasoningDelimiters,
+    ) -> Self {
         let state = match mode {
             ProviderReasoningOutputMode::Preserve => ProviderReasoningStreamState::Preserve,
             ProviderReasoningOutputMode::StripPrefilled => ProviderReasoningStreamState::Suppress,
@@ -47573,6 +47687,7 @@ impl ProviderReasoningOutputFilter {
         Self {
             state,
             pending: String::new(),
+            delimiters,
         }
     }
 
@@ -47598,8 +47713,8 @@ impl ProviderReasoningOutputFilter {
             ProviderReasoningStreamState::Probe => {
                 let trimmed = self.pending.trim_start();
                 if !trimmed.is_empty()
-                    && (PROVIDER_REASONING_OPEN_TAG.starts_with(trimmed)
-                        || PROVIDER_REASONING_CLOSE_TAG.starts_with(trimmed))
+                    && (self.delimiters.open.starts_with(trimmed)
+                        || self.delimiters.close.starts_with(trimmed))
                 {
                     self.pending.clear();
                     return String::new();
@@ -47620,17 +47735,17 @@ impl ProviderReasoningOutputFilter {
     fn resolve_probe(&mut self) -> String {
         let trimmed = self.pending.trim_start();
         if trimmed.is_empty()
-            || PROVIDER_REASONING_OPEN_TAG.starts_with(trimmed)
-            || PROVIDER_REASONING_CLOSE_TAG.starts_with(trimmed)
+            || self.delimiters.open.starts_with(trimmed)
+            || self.delimiters.close.starts_with(trimmed)
         {
             return String::new();
         }
-        if let Some(rest) = trimmed.strip_prefix(PROVIDER_REASONING_OPEN_TAG) {
+        if let Some(rest) = trimmed.strip_prefix(self.delimiters.open) {
             self.pending = rest.to_owned();
             self.state = ProviderReasoningStreamState::Suppress;
             return self.resolve_suppressed();
         }
-        if let Some(rest) = trimmed.strip_prefix(PROVIDER_REASONING_CLOSE_TAG) {
+        if let Some(rest) = trimmed.strip_prefix(self.delimiters.close) {
             let rest = rest.to_owned();
             self.pending.clear();
             return self.resolve_boundary(&rest);
@@ -47640,18 +47755,15 @@ impl ProviderReasoningOutputFilter {
     }
 
     fn resolve_suppressed(&mut self) -> String {
-        if let Some(index) = self.pending.find(PROVIDER_REASONING_CLOSE_TAG) {
-            let rest = self.pending[index + PROVIDER_REASONING_CLOSE_TAG.len()..].to_owned();
+        if let Some(index) = self.pending.find(self.delimiters.close) {
+            let rest = self.pending[index + self.delimiters.close.len()..].to_owned();
             self.pending.clear();
             return self.resolve_boundary(&rest);
         }
 
-        let retained = (1..PROVIDER_REASONING_CLOSE_TAG.len())
+        let retained = (1..self.delimiters.close.len())
             .rev()
-            .find(|length| {
-                self.pending
-                    .ends_with(&PROVIDER_REASONING_CLOSE_TAG[..*length])
-            })
+            .find(|length| self.pending.ends_with(&self.delimiters.close[..*length]))
             .unwrap_or(0);
         if retained == 0 {
             self.pending.clear();
@@ -47812,7 +47924,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             "i": self.next_index,
             "d": &self.pending_text,
             "token_ids_delta": &self.pending_token_ids,
-            "tool": null,
+            "tools": null,
             "fin": null,
         });
         tokio::task::block_in_place(|| {
@@ -47950,7 +48062,7 @@ async fn send_provider_session_output(
         .map(|state| state.last_checkpoint_tokens)
         .unwrap_or(0);
     let mut token_ids_sent_in_deltas = live_stream_state.is_some();
-    if output.tool.is_none() && live_stream_state.is_none() {
+    if output.tools.is_empty() && live_stream_state.is_none() {
         let max_frame_bytes = provider_session_max_frame_bytes();
         let parts = provider_stream_parts(
             &output.content,
@@ -48242,7 +48354,7 @@ async fn send_provider_session_final_output_frames(
         "rid": request_id,
         "i": next_index,
         "d": "",
-        "tool": null,
+        "tools": null,
         "embeddings": null,
         "fin": output.finish_reason,
         "usage": output.usage,
@@ -48251,14 +48363,14 @@ async fn send_provider_session_final_output_frames(
         "token_ids": null,
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
-    if let Some(tool) = &output.tool {
+    if !output.tools.is_empty() {
         attach_or_stream_provider_delta_field(
             bridge,
             active,
             request_id,
             &mut final_frame,
-            "tool",
-            serde_json::to_value(tool).context("serializing provider tool output")?,
+            "tools",
+            serde_json::to_value(&output.tools).context("serializing provider tool outputs")?,
             &mut next_index,
             max_frame_bytes,
         )
@@ -48384,7 +48496,7 @@ fn provider_session_final_delta_frames(
         "rid": request_id,
         "i": start_index,
         "d": "",
-        "tool": output.tool.as_ref(),
+        "tools": (!output.tools.is_empty()).then_some(&output.tools),
         "embeddings": output.embeddings.as_ref(),
         "fin": output.finish_reason,
         "usage": output.usage,
@@ -48398,13 +48510,13 @@ fn provider_session_final_delta_frames(
 
     let mut frames = Vec::new();
     let mut next_index = start_index;
-    if let Some(tool) = &output.tool {
+    if !output.tools.is_empty() {
         provider_session_add_delta_ref_frames(
             &mut frames,
             &mut final_frame,
             request_id,
-            "tool",
-            tool.clone(),
+            "tools",
+            json!(output.tools),
             &mut next_index,
             max_frame_bytes,
         )?;
@@ -48518,7 +48630,7 @@ fn provider_session_content_delta_frame(
         "i": index,
         "d": part,
         "token_ids_delta": token_ids_delta,
-        "tool": null,
+        "tools": null,
         "fin": null,
     })
 }
@@ -48716,7 +48828,7 @@ fn provider_session_artifact_delta_frame(
         "rid": request_id,
         "i": index,
         "d": "",
-        "tool": null,
+        "tools": null,
         "fin": null,
         "artifact": {
             "id": artifact.id,
@@ -49673,7 +49785,7 @@ fn validate_provider_canary_self_test_output(
 ) -> Result<()> {
     match model.model_class.as_str() {
         DEFAULT_MODEL_CLASS | "stt" => ensure!(
-            !output.content.trim().is_empty() || output.tool.is_some(),
+            !output.content.trim().is_empty() || !output.tools.is_empty(),
             "text modality canary produced no text or tool output"
         ),
         "embedding" => ensure!(
@@ -50835,7 +50947,7 @@ struct ProviderSessionArtifact {
 #[derive(Clone, Debug, PartialEq)]
 struct ProviderSessionOutput {
     content: String,
-    tool: Option<Value>,
+    tools: Vec<Value>,
     embeddings: Option<Vec<Vec<f32>>>,
     artifacts: Vec<ProviderSessionArtifact>,
     finish_reason: String,
@@ -50883,10 +50995,10 @@ fn validate_provider_session_output(
             "provider modality text output exceeds the session payload budget"
         );
     }
-    if let Some(tool) = output.tool.as_ref() {
+    if !output.tools.is_empty() {
         ensure!(
-            provider_session_serialized_len(tool)? <= payload_limit,
-            "provider tool output exceeds the session payload budget"
+            provider_session_serialized_len(&output.tools)? <= payload_limit,
+            "provider tool outputs exceed the session payload budget"
         );
     }
     if let Some(embeddings) = output.embeddings.as_ref() {
@@ -50923,7 +51035,7 @@ fn validate_provider_session_output(
         ensure!(
             matches!(
                 axis.as_str(),
-                "reasoning_output_tokens" | "vision_input_tokens"
+                "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens"
             ),
             "provider output contains unsupported usage attribution {axis}"
         );
@@ -50945,6 +51057,31 @@ fn validate_provider_session_output(
             .unwrap_or(0)
             <= output.usage.input_tokens(),
         "provider vision attribution exceeds billed input tokens"
+    );
+    ensure!(
+        output
+            .usage_attribution
+            .get("audio_input_tokens")
+            .copied()
+            .unwrap_or(0)
+            <= output.usage.input_tokens(),
+        "provider audio attribution exceeds billed input tokens"
+    );
+    ensure!(
+        output
+            .usage_attribution
+            .get("vision_input_tokens")
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(
+                output
+                    .usage_attribution
+                    .get("audio_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+            )
+            <= output.usage.input_tokens(),
+        "provider media attribution exceeds billed input tokens"
     );
     Ok(())
 }
@@ -51207,10 +51344,30 @@ fn provider_reasoning_level_disabled(level: &str, value: &Value) -> bool {
 }
 
 fn provider_reasoning_visible_output(text: &str, mode: ProviderReasoningOutputMode) -> String {
-    let mut filter = ProviderReasoningOutputFilter::new(mode);
+    provider_reasoning_visible_output_with_delimiters(
+        text,
+        mode,
+        PROVIDER_QWEN_REASONING_DELIMITERS,
+    )
+}
+
+fn provider_reasoning_visible_output_with_delimiters(
+    text: &str,
+    mode: ProviderReasoningOutputMode,
+    delimiters: ProviderReasoningDelimiters,
+) -> String {
+    let mut filter = ProviderReasoningOutputFilter::with_delimiters(mode, delimiters);
     let mut visible = filter.push(text);
     visible.push_str(&filter.finish());
     visible
+}
+
+fn provider_reasoning_delimiters(adapter: &catalog::CatalogAdapter) -> ProviderReasoningDelimiters {
+    if adapter.chat_template_id == "gemma4-instruct" {
+        PROVIDER_GEMMA4_REASONING_DELIMITERS
+    } else {
+        PROVIDER_QWEN_REASONING_DELIMITERS
+    }
 }
 
 #[cfg(test)]
@@ -51302,7 +51459,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("transcribing provider session audio with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: output.text,
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
@@ -51334,7 +51491,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts,
             finish_reason: "stop".to_owned(),
@@ -51377,7 +51534,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts,
             finish_reason: "stop".to_owned(),
@@ -51431,7 +51588,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         );
         return Ok(ProviderSessionOutput {
             content: String::new(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts,
             finish_reason: "stop".to_owned(),
@@ -51499,7 +51656,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts,
             finish_reason: "stop".to_owned(),
@@ -51527,7 +51684,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("generating provider session embeddings with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: Some(output.embeddings),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
@@ -51561,7 +51718,9 @@ fn provider_engine_session_response_with_sampling_bounded(
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
     let reasoning_output_mode = provider_reasoning_output_mode(adapter, &request);
-    let mut reasoning_stream_filter = ProviderReasoningOutputFilter::new(reasoning_output_mode);
+    let reasoning_delimiters = provider_reasoning_delimiters(adapter);
+    let mut reasoning_stream_filter =
+        ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
     // Bill the canonical request content shared with the gateway, not backend-specific
@@ -51602,10 +51761,13 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
     }
     let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
-    let tool = tool_mode.as_ref().and_then(|mode| {
-        provider_engine_tool_call_output(&output.text, mode.strategy, &mode.tools)
-    });
-    if tool_mode.as_ref().is_some_and(|mode| mode.required) && tool.is_none() {
+    let tools = tool_mode
+        .as_ref()
+        .and_then(|mode| {
+            provider_engine_tool_call_outputs(&output.text, mode.strategy, &mode.tools)
+        })
+        .unwrap_or_default();
+    if tool_mode.as_ref().is_some_and(|mode| mode.required) && tools.is_empty() {
         bail!(
             "provider engine did not return a valid required tool call: {}",
             output.text.trim()
@@ -51614,7 +51776,10 @@ fn provider_engine_session_response_with_sampling_bounded(
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
-    let billed_prompt_tokens = prompt_tokens.saturating_add(vision_tokens);
+    let audio_tokens = u64::from(output.usage.audio_tokens);
+    let billed_prompt_tokens = prompt_tokens
+        .saturating_add(vision_tokens)
+        .saturating_add(audio_tokens);
     let mut usage_attribution = BTreeMap::new();
     if reasoning_tokens > 0 {
         usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
@@ -51622,20 +51787,27 @@ fn provider_engine_session_response_with_sampling_bounded(
     if vision_tokens > 0 {
         usage_attribution.insert("vision_input_tokens".to_owned(), vision_tokens);
     }
-    let finish_reason = if tool.is_some() {
-        "tool_calls".to_owned()
-    } else {
+    if audio_tokens > 0 {
+        usage_attribution.insert("audio_input_tokens".to_owned(), audio_tokens);
+    }
+    let finish_reason = if tools.is_empty() {
         output.finish_reason.to_string()
+    } else {
+        "tool_calls".to_owned()
     };
-    let visible_output = provider_reasoning_visible_output(&output.text, reasoning_output_mode);
+    let visible_output = provider_reasoning_visible_output_with_delimiters(
+        &output.text,
+        reasoning_output_mode,
+        reasoning_delimiters,
+    );
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: if tool.is_some() {
-            String::new()
-        } else {
+        content: if tools.is_empty() {
             visible_output
+        } else {
+            String::new()
         },
-        tool,
+        tools,
         embeddings: None,
         artifacts,
         finish_reason,
@@ -52074,12 +52246,19 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         provider_endpoint_messages(endpoint_family, body)?,
         adapter,
     )?;
-    let prompt = provider_engine_prompt(&messages, adapter)?;
+    let (speciality_parameters, speciality_output_cap) =
+        provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
+    let tool_request = provider_engine_tool_request(body, adapter)?;
+    let template_tools = tool_request
+        .as_ref()
+        .map(|request| provider_engine_template_tools(&request.tools))
+        .unwrap_or_default();
+    let prompt =
+        provider_engine_prompt(&messages, &template_tools, &speciality_parameters, adapter)?;
     let mut request = GenerateRequest::new(prompt);
     request.messages = messages.clone();
     request.media = provider_engine_media_inputs(&messages);
-    let (speciality_parameters, speciality_output_cap) =
-        provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
+    request.tools = template_tools;
     request.speciality_parameters = speciality_parameters;
     if let Some(max_tokens) = body
         .get("max_tokens")
@@ -52119,9 +52298,7 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.stop = provider_stop_sequences(body)?;
     request.seed = provider_optional_u32(body, "seed")?;
     request.validate_sampling()?;
-    let tool_request = provider_engine_tool_request(body, adapter)?;
     if let Some(tool_request) = tool_request {
-        request.tools = provider_engine_template_tools(&tool_request.tools);
         if tool_request.required {
             match tool_request.strategy {
                 ProviderEngineToolStrategy::MayhemJson
@@ -52135,6 +52312,7 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
                         schema: provider_openai_tool_calls_json_schema(&tool_request.tools),
                     });
                 }
+                ProviderEngineToolStrategy::GemmaFunctionCall => {}
             }
         }
     } else if provider_wants_json(body) {
@@ -52222,21 +52400,18 @@ fn provider_engine_speciality_parameters(
     let mut parameters = Vec::new();
     let mut reasoning_output_cap = None;
     for descriptor in &adapter.specialities {
-        let level_name = selected
+        let submitted = selected
             .and_then(|values| values.get(&descriptor.name))
-            .or_else(|| body.get(&descriptor.name))
-            .and_then(Value::as_str)
-            .unwrap_or(&descriptor.default_level);
-        let level = descriptor
-            .levels
-            .iter()
-            .find(|level| level.name == level_name)
-            .with_context(|| {
-                format!(
-                    "model speciality {} does not support level {}",
-                    descriptor.name, level_name
-                )
-            })?;
+            .or_else(|| body.get(&descriptor.name));
+        let level = provider_speciality_level(descriptor, submitted).with_context(|| {
+            format!(
+                "model speciality {} does not support value {}",
+                descriptor.name,
+                submitted
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| descriptor.default_level.clone())
+            )
+        })?;
         let mapping = contract
             .speciality_mappings
             .get(&descriptor.name)
@@ -52255,6 +52430,9 @@ fn provider_engine_speciality_parameters(
             }
             mayhem_proto::EndpointSpecialityTarget::PromptSuffix => {
                 GenerateSpecialityTarget::PromptSuffix
+            }
+            mayhem_proto::EndpointSpecialityTarget::BackendParameter => {
+                GenerateSpecialityTarget::BackendParameter
             }
         };
         parameters.push(GenerateSpecialityParameter {
@@ -52415,51 +52593,83 @@ fn provider_engine_media_inputs(messages: &[Value]) -> Vec<MediaInput> {
         .iter()
         .filter_map(|message| message.get("content").and_then(Value::as_array))
         .flat_map(|parts| parts.iter())
-        .filter_map(provider_content_part_media_input)
+        .flat_map(provider_content_part_media_inputs)
         .collect()
 }
 
-fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
+fn provider_content_part_media_inputs(part: &Value) -> Vec<MediaInput> {
     match part.get("type").and_then(Value::as_str) {
         Some("image_url") => {
-            let url = part
+            let Some(url) = part
                 .get("image_url")
                 .and_then(|image| image.get("url"))
                 .or_else(|| part.get("url"))
-                .and_then(Value::as_str)?
-                .to_owned();
-            Some(MediaInput {
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return Vec::new();
+            };
+            vec![MediaInput {
                 kind: "image".to_owned(),
                 content_type: data_url_content_type(&url),
                 url: Some(url),
                 data: None,
+                frames: Vec::new(),
                 num_frames: None,
                 fps: None,
-            })
+            }]
         }
         Some("input_audio") => {
-            let audio = part.get("input_audio")?;
-            let data = audio.get("data").and_then(Value::as_str)?.to_owned();
+            let Some(audio) = part.get("input_audio") else {
+                return Vec::new();
+            };
+            let Some(data) = audio.get("data").and_then(Value::as_str).map(str::to_owned) else {
+                return Vec::new();
+            };
             if data.is_empty() {
-                return None;
+                return Vec::new();
             }
             let format = audio.get("format").and_then(Value::as_str).unwrap_or("wav");
-            Some(MediaInput {
+            vec![MediaInput {
                 kind: "audio".to_owned(),
                 content_type: Some(audio_content_type(format).to_owned()),
                 url: None,
                 data: Some(data),
+                frames: Vec::new(),
                 num_frames: None,
                 fps: None,
-            })
+            }]
         }
         Some("video") => {
-            let video = part.get("video")?;
-            let data = video.get("data").and_then(Value::as_str)?.to_owned();
-            if data.is_empty() {
-                return None;
+            let Some(video) = part.get("video") else {
+                return Vec::new();
+            };
+            if let Some(frames) = video.get("frames").and_then(Value::as_array) {
+                let frames = frames
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                return vec![MediaInput {
+                    kind: "video".to_owned(),
+                    content_type: None,
+                    url: None,
+                    data: None,
+                    num_frames: u32::try_from(frames.len()).ok(),
+                    frames,
+                    fps: video
+                        .get("fps")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32),
+                }];
             }
-            Some(MediaInput {
+            let Some(data) = video.get("data").and_then(Value::as_str).map(str::to_owned) else {
+                return Vec::new();
+            };
+            if data.is_empty() {
+                return Vec::new();
+            }
+            vec![MediaInput {
                 kind: "video".to_owned(),
                 content_type: video
                     .get("content_type")
@@ -52467,6 +52677,7 @@ fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
                     .map(str::to_owned),
                 url: None,
                 data: Some(data),
+                frames: Vec::new(),
                 num_frames: video
                     .get("num_frames")
                     .and_then(Value::as_u64)
@@ -52475,9 +52686,9 @@ fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
                     .get("fps")
                     .and_then(Value::as_f64)
                     .map(|value| value as f32),
-            })
+            }]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -52498,13 +52709,19 @@ fn audio_content_type(format: &str) -> &'static str {
     }
 }
 
-fn provider_engine_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter) -> Result<String> {
+fn provider_engine_prompt(
+    messages: &[Value],
+    tools: &[Value],
+    specialities: &[GenerateSpecialityParameter],
+    adapter: &catalog::CatalogAdapter,
+) -> Result<String> {
     match adapter.chat_template_id.as_str() {
         "generic_chatml" | "qwen2.5-instruct" | "qwen3.5-instruct" => {
             Ok(provider_engine_generic_chatml_prompt(messages, adapter))
         }
         "llama3-instruct" => Ok(provider_engine_llama3_prompt(messages, adapter)),
         "smolvlm2-instruct" => Ok(provider_engine_smolvlm2_prompt(messages, adapter)),
+        "gemma4-instruct" => gemma4::render_prompt(messages, tools, specialities),
         other => bail!("unsupported catalog adapter.chat_template_id: {other}"),
     }
 }
@@ -52589,6 +52806,7 @@ enum ProviderEngineToolStrategy {
     MayhemJson,
     OpenAiToolCalls,
     QwenFunctionXml,
+    GemmaFunctionCall,
 }
 
 #[derive(Clone, Debug)]
@@ -52633,6 +52851,7 @@ fn provider_engine_tool_request(
         "mayhem_json" => ProviderEngineToolStrategy::MayhemJson,
         "openai_tool_calls" => ProviderEngineToolStrategy::OpenAiToolCalls,
         "qwen_function_xml" => ProviderEngineToolStrategy::QwenFunctionXml,
+        "gemma_function_call" => ProviderEngineToolStrategy::GemmaFunctionCall,
         "none" => {
             ensure!(
                 !required,
@@ -52743,52 +52962,90 @@ fn provider_response_json_schema(body: &Value) -> Value {
         .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true }))
 }
 
-fn provider_engine_tool_call_output(
+fn provider_engine_tool_call_outputs(
     text: &str,
     strategy: ProviderEngineToolStrategy,
     tools: &[ToolSpec],
-) -> Option<Value> {
-    let tool = match strategy {
-        ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_output(text),
-        ProviderEngineToolStrategy::OpenAiToolCalls => provider_openai_tool_calls_output(text),
+) -> Option<Vec<Value>> {
+    let mut calls = match strategy {
+        ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_outputs(text),
+        ProviderEngineToolStrategy::OpenAiToolCalls => provider_openai_tool_call_outputs(text),
         ProviderEngineToolStrategy::QwenFunctionXml => {
-            provider_qwen_function_xml_tool_call_output(text)
-                .or_else(|| provider_mayhem_json_tool_call_output(text))
+            provider_qwen_function_xml_tool_call_outputs(text)
+                .or_else(|| provider_mayhem_json_tool_call_outputs(text))
         }
+        ProviderEngineToolStrategy::GemmaFunctionCall => Some(
+            gemma4::parse_tool_calls(text)?
+                .into_iter()
+                .map(|(name, arguments)| {
+                    provider_normalized_tool_call(None, name, arguments.to_string())
+                })
+                .collect(),
+        ),
     }?;
-    let name = tool.get("name").and_then(Value::as_str)?;
-    tools
-        .iter()
-        .any(|candidate| candidate.name == name)
-        .then_some(tool)
+    if calls.is_empty()
+        || calls.iter().any(|call| {
+            let Some(name) = call.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            !tools.iter().any(|candidate| candidate.name == name)
+        })
+    {
+        return None;
+    }
+    make_provider_tool_call_ids_unique(&mut calls)?;
+    Some(calls)
 }
 
-fn provider_mayhem_json_tool_call_output(text: &str) -> Option<Value> {
+fn provider_mayhem_json_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let calls = value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .or_else(|| value.as_array().map(Vec::as_slice));
+    if let Some(calls) = calls {
+        if calls.is_empty() {
+            return None;
+        }
+        return calls
+            .iter()
+            .map(provider_mayhem_json_tool_call_value)
+            .collect();
+    }
+    Some(vec![provider_mayhem_json_tool_call_value(&value)?])
+}
+
+fn provider_mayhem_json_tool_call_value(value: &Value) -> Option<Value> {
+    let function = value.get("function").unwrap_or(value);
     let name = value
         .get("tool")
         .or_else(|| value.get("name"))
+        .or_else(|| function.get("name"))
         .and_then(Value::as_str)?
         .to_owned();
     let arguments = provider_tool_arguments_string(
-        value.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        function
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
     );
-    Some(provider_normalized_tool_call(None, name, arguments))
+    let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+    Some(provider_normalized_tool_call(id, name, arguments))
 }
 
-fn provider_openai_tool_calls_output(text: &str) -> Option<Value> {
+fn provider_openai_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
-    let call = value
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .and_then(|calls| calls.first())
-        .or_else(|| {
-            if value.get("function").is_some() {
-                Some(&value)
-            } else {
-                None
-            }
-        })?;
+    if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+        if calls.is_empty() {
+            return None;
+        }
+        return calls.iter().map(provider_openai_tool_call_value).collect();
+    }
+    Some(vec![provider_openai_tool_call_value(&value)?])
+}
+
+fn provider_openai_tool_call_value(call: &Value) -> Option<Value> {
     let function = call.get("function")?;
     let name = function.get("name").and_then(Value::as_str)?.to_owned();
     let arguments = provider_tool_arguments_string(
@@ -52801,21 +53058,31 @@ fn provider_openai_tool_calls_output(text: &str) -> Option<Value> {
     Some(provider_normalized_tool_call(id, name, arguments))
 }
 
-fn provider_qwen_function_xml_tool_call_output(text: &str) -> Option<Value> {
+fn provider_qwen_function_xml_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
     const TOOL_OPEN: &str = "<tool_call>";
     const TOOL_CLOSE: &str = "</tool_call>";
+
+    let first_tool = text.find(TOOL_OPEN)?;
+    let mut remaining = &text[first_tool..];
+    let mut calls = Vec::new();
+    while !remaining.trim().is_empty() {
+        remaining = remaining.trim_start();
+        let tool_body = remaining.strip_prefix(TOOL_OPEN)?;
+        let tool_end = tool_body.find(TOOL_CLOSE)?;
+        calls.push(provider_qwen_function_xml_tool_call_body(
+            tool_body[..tool_end].trim(),
+        )?);
+        remaining = &tool_body[tool_end + TOOL_CLOSE.len()..];
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn provider_qwen_function_xml_tool_call_body(tool_body: &str) -> Option<Value> {
     const FUNCTION_OPEN: &str = "<function=";
     const FUNCTION_CLOSE: &str = "</function>";
     const PARAMETER_OPEN: &str = "<parameter=";
     const PARAMETER_CLOSE: &str = "</parameter>";
 
-    let tool_start = text.find(TOOL_OPEN)? + TOOL_OPEN.len();
-    let tool_end_relative = text[tool_start..].find(TOOL_CLOSE)?;
-    let tool_end = tool_start + tool_end_relative;
-    if !text[tool_end + TOOL_CLOSE.len()..].trim().is_empty() {
-        return None;
-    }
-    let tool_body = text[tool_start..tool_end].trim();
     let function_start = tool_body.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len();
     if !tool_body[..function_start - FUNCTION_OPEN.len()]
         .trim()
@@ -52866,6 +53133,32 @@ fn provider_qwen_function_xml_tool_call_output(text: &str) -> Option<Value> {
     ))
 }
 
+fn make_provider_tool_call_ids_unique(calls: &mut [Value]) -> Option<()> {
+    let mut seen = BTreeSet::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        let object = call.as_object_mut()?;
+        let current = object.get("id").and_then(Value::as_str)?.to_owned();
+        if seen.insert(current) {
+            continue;
+        }
+        let name = object.get("name").and_then(Value::as_str)?;
+        let arguments = object.get("arguments").and_then(Value::as_str)?;
+        let id = format!(
+            "call-{}",
+            stable_value_hash(&json!({
+                "tool": name,
+                "arguments": arguments,
+                "occurrence": index,
+            }))
+        );
+        if !seen.insert(id.clone()) {
+            return None;
+        }
+        object.insert("id".to_owned(), Value::String(id));
+    }
+    Some(())
+}
+
 fn provider_tool_arguments_string(arguments: Value) -> String {
     arguments
         .as_str()
@@ -52912,7 +53205,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             completion_tokens,
             token_ids: synthetic_provider_token_ids(completion_tokens),
             content,
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
@@ -52925,11 +53218,11 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
-            tool: Some(json!({
+            tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
                 "name": "bash",
                 "arguments": provider_tool_arguments("bash"),
-            })),
+            })],
             finish_reason: "tool_calls".to_owned(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -52943,11 +53236,11 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
-            tool: Some(json!({
+            tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
                 "name": tool_name,
                 "arguments": provider_tool_arguments(&tool_name),
-            })),
+            })],
             finish_reason: "tool_calls".to_owned(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -52977,7 +53270,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         completion_tokens,
         token_ids: synthetic_provider_token_ids(completion_tokens),
         content,
-        tool: None,
+        tools: Vec::new(),
         embeddings: None,
         artifacts: Vec::new(),
         finish_reason: "stop".to_owned(),
@@ -53097,19 +53390,35 @@ fn provider_content_part_to_text_for_adapter(
     part: &Value,
     adapter: &catalog::CatalogAdapter,
 ) -> String {
-    if part.get("type").and_then(Value::as_str) == Some("image_url")
-        && adapter_supports_image_input(adapter)
-    {
-        return MTMD_MEDIA_MARKER.to_owned();
+    match part.get("type").and_then(Value::as_str) {
+        Some("image_url") if adapter_supports_input(adapter, "image") => {
+            return MTMD_MEDIA_MARKER.to_owned();
+        }
+        Some("input_audio") if adapter_supports_input(adapter, "audio") => {
+            return MTMD_MEDIA_MARKER.to_owned();
+        }
+        Some("video") if adapter_supports_input(adapter, "video") => {
+            let frame_count = part
+                .get("video")
+                .and_then(|video| video.get("frames"))
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+            return MTMD_MEDIA_MARKER.repeat(frame_count);
+        }
+        _ => {}
     }
     provider_content_part_to_text(part)
 }
 
 fn adapter_supports_image_input(adapter: &catalog::CatalogAdapter) -> bool {
+    adapter_supports_input(adapter, "image")
+}
+
+fn adapter_supports_input(adapter: &catalog::CatalogAdapter, requested: &str) -> bool {
     adapter
         .modality_set
         .iter()
-        .any(|modality| matches!(modality.as_str(), "image" | "vision"))
+        .any(|modality| modality == requested || (requested == "image" && modality == "vision"))
 }
 
 fn provider_content_to_text(value: &Value) -> String {
@@ -59538,6 +59847,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_memory_estimate_includes_resident_artifact_sidecars() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let artifact = catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap();
+        let primary_bytes = artifact.weights_bytes;
+        artifact.sidecars.insert(
+            "mmproj".to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                path: "mmproj.gguf".to_owned(),
+                artifact_root: "bb".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 123,
+                source_sha256: "cc".repeat(32),
+            },
+        );
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts.get("gguf-q4_k_m").unwrap();
+
+        let estimate = provider_memory_estimate(
+            &contract.enclaves[0],
+            &catalog.models[0],
+            "gguf-q4_k_m",
+            artifact,
+            &["text".to_owned()],
+            &BTreeMap::new(),
+            4_096,
+        )
+        .unwrap();
+
+        assert_eq!(estimate.weights_bytes, primary_bytes + 123);
+        assert_eq!(
+            catalog_download_estimate(artifact).bytes,
+            primary_bytes + 123
+        );
+    }
+
+    #[test]
     fn provider_memory_estimate_reserves_calibrated_media_concurrency() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -61843,7 +62190,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
@@ -62071,7 +62418,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
@@ -62127,7 +62474,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let output = provider_session_response(&terms, &body);
 
         assert_eq!(output.finish_reason, "tool_calls");
-        let tool = output.tool.expect("tool call");
+        assert_eq!(output.tools.len(), 1);
+        let tool = &output.tools[0];
         assert_eq!(tool["name"], "write");
         assert!(tool["arguments"]
             .as_str()
@@ -62982,7 +63330,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
 
         assert_eq!(output.content, "engine says hi");
-        assert!(output.tool.is_none());
+        assert!(output.tools.is_empty());
         assert_eq!(output.finish_reason, "stop");
         let request = backend.last_request.expect("engine request");
         let canonical_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(&body));
@@ -63062,7 +63410,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
 
         assert_eq!(output.content, "");
-        assert!(output.tool.is_none());
+        assert!(output.tools.is_empty());
         assert_eq!(output.embeddings, Some(vec![vec![0.1, 0.2, 0.3]]));
         assert_eq!(output.finish_reason, "stop");
         assert_eq!(output.prompt_tokens, 4);
@@ -63361,7 +63709,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             };
             let output = ProviderSessionOutput {
                 content: String::new(),
-                tool: None,
+                tools: Vec::new(),
                 embeddings: None,
                 artifacts: vec![ProviderSessionArtifact {
                     id: "calibration-artifact".to_owned(),
@@ -63449,7 +63797,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
 
         assert_eq!(output.content, "normal final answer");
-        assert!(output.tool.is_none());
+        assert!(output.tools.is_empty());
         assert!(backend
             .last_request
             .expect("engine request")
@@ -63508,7 +63856,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(output.finish_reason, "tool_calls");
         assert_eq!(output.content, "");
-        let tool = output.tool.expect("tool call");
+        assert_eq!(output.tools.len(), 1);
+        let tool = &output.tools[0];
         assert_eq!(tool["id"], "call-openai");
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
@@ -63541,7 +63890,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(output.finish_reason, "tool_calls");
         assert_eq!(output.content, "");
-        assert_eq!(output.tool.unwrap()["name"], "bash");
+        assert_eq!(output.tools.len(), 1);
+        assert_eq!(output.tools[0]["name"], "bash");
         let request = backend.last_request.expect("engine request");
         assert_eq!(request.tools.len(), 1);
         assert!(request.grammar.is_none());
@@ -64648,7 +64998,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let body = json!({ "messages": [], "max_tokens": 8192 });
         let mut output = ProviderSessionOutput {
             content: "x".repeat(8192 * DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN),
-            tool: None,
+            tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "length".to_owned(),
@@ -64687,11 +65037,18 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_session_final_delta_frames_chunk_large_fields_under_transport_limit() {
         let output = ProviderSessionOutput {
             content: String::new(),
-            tool: Some(json!({
-                "id": "call-large",
-                "name": "write_file",
-                "arguments": "x".repeat(20_000),
-            })),
+            tools: vec![
+                json!({
+                    "id": "call-large-1",
+                    "name": "write_file",
+                    "arguments": json!({ "content": "x".repeat(20_000) }).to_string(),
+                }),
+                json!({
+                    "id": "call-large-2",
+                    "name": "read_file",
+                    "arguments": r#"{"path":"README.md"}"#,
+                }),
+            ],
             embeddings: Some(vec![vec![0.25_f32; 2048], vec![0.5_f32; 2048]]),
             artifacts: Vec::new(),
             finish_reason: "tool_calls".to_owned(),
@@ -64730,11 +65087,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             final_frame.get("t").and_then(Value::as_str),
             Some("s.delta")
         );
-        assert!(final_frame["tool"].is_null());
+        assert!(final_frame["tools"].is_null());
         assert!(final_frame["embeddings"].is_null());
         assert!(final_frame["token_ids"].is_null());
         assert_eq!(final_frame["quality"]["unit"], json!("output_tok_s"));
-        for field in ["tool", "embeddings", "token_ids"] {
+        for field in ["tools", "embeddings", "token_ids"] {
             let manifest_key = format!("{field}_ref");
             let manifest: PayloadChunkManifest =
                 serde_json::from_value(final_frame[manifest_key.as_str()].clone()).unwrap();
@@ -64747,7 +65104,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .collect::<Vec<_>>();
             let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
             match field {
-                "tool" => assert_eq!(restored["arguments"], json!("x".repeat(20_000))),
+                "tools" => {
+                    assert_eq!(restored.as_array().unwrap().len(), 2);
+                    assert_eq!(
+                        restored[0]["arguments"],
+                        json!(json!({ "content": "x".repeat(20_000) }).to_string())
+                    );
+                    assert_eq!(restored[1]["name"], "read_file");
+                }
                 "embeddings" => assert_eq!(restored.as_array().unwrap().len(), 2),
                 "token_ids" => assert_eq!(restored.as_array().unwrap().len(), 5000),
                 _ => unreachable!(),
@@ -65252,14 +65616,16 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_tool_call_output_maps_engine_json_to_openai_shape() {
+    fn provider_engine_tool_call_outputs_map_engine_json_to_openai_shape() {
         let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
-        let tool = provider_engine_tool_call_output(
+        let calls = provider_engine_tool_call_outputs(
             r#"{ "tool": "write", "arguments": { "filePath": "ok.txt" } }"#,
             ProviderEngineToolStrategy::MayhemJson,
             &tools,
         )
         .expect("tool call");
+        assert_eq!(calls.len(), 1);
+        let tool = &calls[0];
 
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
@@ -65267,42 +65633,59 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_tool_call_output_maps_openai_tool_calls_to_internal_shape() {
+    fn provider_engine_tool_call_outputs_preserve_all_openai_calls() {
         let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
-        let tool = provider_engine_tool_call_output(
-            r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "write", "arguments": { "filePath": "ok.txt" } } }] }"#,
+        let calls = provider_engine_tool_call_outputs(
+            r#"{ "tool_calls": [{ "id": "call-openai-1", "type": "function", "function": { "name": "write", "arguments": { "filePath": "one.txt" } } }, { "id": "call-openai-2", "type": "function", "function": { "name": "write", "arguments": { "filePath": "two.txt" } } }] }"#,
             ProviderEngineToolStrategy::OpenAiToolCalls,
             &tools,
         )
-        .expect("tool call");
+        .expect("tool calls");
 
-        assert_eq!(tool["id"], "call-openai");
-        assert_eq!(tool["name"], "write");
-        assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call-openai-1");
+        assert_eq!(calls[0]["arguments"], r#"{"filePath":"one.txt"}"#);
+        assert_eq!(calls[1]["id"], "call-openai-2");
+        assert_eq!(calls[1]["arguments"], r#"{"filePath":"two.txt"}"#);
     }
 
     #[test]
-    fn provider_engine_tool_call_output_maps_qwen_function_xml_to_internal_shape() {
-        let tools = vec![ToolSpec::new("bash", json!({ "type": "object" }))];
-        let tool = provider_engine_tool_call_output(
-            "<think>use the requested tool</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nprintf 'ok\\n'\n</parameter>\n<parameter=timeout>\n120000\n</parameter>\n</function>\n</tool_call>",
+    fn provider_engine_tool_call_outputs_preserve_all_qwen_xml_calls_in_order() {
+        let tools = vec![
+            ToolSpec::new("bash", json!({ "type": "object" })),
+            ToolSpec::new("glob", json!({ "type": "object" })),
+        ];
+        let calls = provider_engine_tool_call_outputs(
+            "<think>inspect the repository</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nprintf 'ok\\n'\n</parameter>\n<parameter=timeout>\n120000\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=glob>\n<parameter=pattern>\n**/*.rs\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=glob>\n<parameter=pattern>\n**/*.md\n</parameter>\n</function>\n</tool_call>",
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
         )
-        .expect("tool call");
+        .expect("tool calls");
 
-        assert_eq!(tool["name"], "bash");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["name"], "bash");
         assert_eq!(
-            serde_json::from_str::<Value>(tool["arguments"].as_str().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(calls[0]["arguments"].as_str().unwrap()).unwrap(),
             json!({ "command": "printf 'ok\\n'", "timeout": 120000 })
         );
+        assert_eq!(calls[1]["name"], "glob");
+        assert_eq!(calls[2]["name"], "glob");
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[1]["arguments"].as_str().unwrap()).unwrap(),
+            json!({ "pattern": "**/*.rs" })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[2]["arguments"].as_str().unwrap()).unwrap(),
+            json!({ "pattern": "**/*.md" })
+        );
+        assert_ne!(calls[1]["id"], calls[2]["id"]);
     }
 
     #[test]
-    fn provider_engine_tool_call_output_rejects_unadvertised_tool() {
+    fn provider_engine_tool_call_outputs_reject_whole_set_with_unadvertised_tool() {
         let tools = vec![ToolSpec::new("read", json!({ "type": "object" }))];
-        assert!(provider_engine_tool_call_output(
-            "<tool_call><function=bash><parameter=command>echo no</parameter></function></tool_call>",
+        assert!(provider_engine_tool_call_outputs(
+            "<tool_call><function=read><parameter=path>README.md</parameter></function></tool_call><tool_call><function=bash><parameter=command>echo no</parameter></function></tool_call>",
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
         )

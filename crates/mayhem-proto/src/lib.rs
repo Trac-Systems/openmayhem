@@ -357,6 +357,7 @@ pub enum EndpointSpecialityTarget {
     ChatTemplateKwarg,
     SamplingParameter,
     PromptSuffix,
+    BackendParameter,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

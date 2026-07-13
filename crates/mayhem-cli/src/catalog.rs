@@ -1717,6 +1717,7 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             | "qwen2.5-instruct"
             | "qwen3.5-instruct"
             | "smolvlm2-instruct"
+            | "gemma4-instruct"
     ) {
         errors.push(format!(
             "{} adapter.chat_template_id is unsupported: {}",
@@ -1725,7 +1726,7 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     if !matches!(
         adapter.tool_call_strategy.as_str(),
-        "none" | "mayhem_json" | "openai_tool_calls" | "qwen_function_xml"
+        "none" | "mayhem_json" | "openai_tool_calls" | "qwen_function_xml" | "gemma_function_call"
     ) {
         errors.push(format!(
             "{} adapter.tool_call_strategy is unsupported: {}",
@@ -1869,15 +1870,30 @@ fn validate_model_specialities(model: &CatalogModel, errors: &mut Vec<String>) {
                 .iter()
                 .map(|level| Value::String(level.name.clone()))
                 .collect::<Vec<_>>();
-            if spec.value_types != [EndpointValueType::String]
-                || spec.enum_values != expected_levels
-                || spec.default.as_ref() != Some(&Value::String(descriptor.default_level.clone()))
-                || expected_levels
+            let expected_native_values = descriptor
+                .levels
+                .iter()
+                .map(|level| level.native_value.clone())
+                .collect::<Vec<_>>();
+            let default_native_value = descriptor
+                .levels
+                .iter()
+                .find(|level| level.name == descriptor.default_level)
+                .map(|level| &level.native_value);
+            let level_name_contract = spec.value_types == [EndpointValueType::String]
+                && spec.enum_values == expected_levels
+                && spec.default.as_ref() == Some(&Value::String(descriptor.default_level.clone()))
+                && expected_levels
                     .iter()
-                    .any(|level| !spec.calibration_values.contains(level))
-            {
+                    .all(|level| spec.calibration_values.contains(level));
+            let native_value_contract = spec.enum_values == expected_native_values
+                && spec.default.as_ref() == default_native_value
+                && expected_native_values
+                    .iter()
+                    .all(|value| spec.calibration_values.contains(value));
+            if !level_name_contract && !native_value_contract {
                 errors.push(format!(
-                    "{} endpoint family {} speciality {} request spec must expose exactly its signed levels, default, and calibration values",
+                    "{} endpoint family {} speciality {} request spec must expose exactly its signed level names or native values, default, and calibration values",
                     model.model_id, contract.family, name
                 ));
             }
