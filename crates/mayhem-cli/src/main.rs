@@ -37,6 +37,7 @@ use hf_hub::progress::{
     DownloadEvent as HfDownloadEvent, ProgressEvent as HfProgressEvent,
     ProgressHandler as HfProgressHandler,
 };
+use hf_hub::repository::RepoTreeEntry;
 use hf_hub::{HFClient, HFClientSync};
 use image::ImageReader;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -45142,14 +45143,72 @@ fn download_provider_huggingface_file(
     })?;
 
     let result = (|| -> Result<PathBuf> {
-        let mut client_builder = HFClient::builder()
-            .cache_enabled(false)
-            .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")));
-        if let Some(token) = read_optional_token(args.hf_token_file.as_deref())? {
-            client_builder = client_builder.token(token);
+        let token = read_optional_token(args.hf_token_file.as_deref())?;
+        let user_agent = format!("openmayhem/{}", env!("CARGO_PKG_VERSION"));
+        let build_client = |follow_redirects: bool| -> Result<HFClientSync> {
+            let mut client_builder = HFClient::builder()
+                .cache_enabled(false)
+                .user_agent(&user_agent);
+            if !follow_redirects {
+                let http_client = reqwest::Client::builder()
+                    .user_agent(&user_agent)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .context("building the Hugging Face Xet metadata client")?;
+                client_builder = client_builder.client(http_client);
+            }
+            if let Some(token) = token.as_ref() {
+                client_builder = client_builder.token(token);
+            }
+            HFClientSync::from_inner(client_builder.build()?)
+                .context("starting the Hugging Face transfer client")
+        };
+
+        let standard_client = build_client(true)?;
+        let repository = standard_client.model(owner, repo_name);
+        let metadata = repository
+            .get_paths_info()
+            .paths(vec![remote_path.to_owned()])
+            .revision(source.revision.clone())
+            .send()
+            .with_context(|| {
+                format!(
+                    "reading immutable Hugging Face artifact metadata for {}/{}@{}:{}",
+                    owner, repo_name, source.revision, remote_path
+                )
+            })?
+            .into_iter()
+            .find_map(|entry| match entry {
+                RepoTreeEntry::File {
+                    path,
+                    size,
+                    xet_hash,
+                    ..
+                } if path == remote_path => Some((size, xet_hash.is_some())),
+                _ => None,
+            })
+            .with_context(|| {
+                format!(
+                    "admin-pinned Hugging Face artifact is missing at {}/{}@{}:{}",
+                    owner, repo_name, source.revision, remote_path
+                )
+            })?;
+        if metadata.0 != expected_bytes {
+            bail!(
+                "Hugging Face reports {label} as {} bytes; admin catalog requires {expected_bytes}",
+                metadata.0
+            );
         }
-        let client = HFClientSync::from_inner(client_builder.build()?)
-            .context("starting the Hugging Face Xet client")?;
+
+        // hf-hub 1.0.0 follows the external resolve redirect before checking
+        // X-Xet-Hash in its local-dir path. A no-redirect client preserves that
+        // header and activates its native Xet implementation. Ordinary Hub files
+        // retain the default redirecting client.
+        let client = if metadata.1 {
+            build_client(false)?
+        } else {
+            standard_client
+        };
         let progress = Arc::new(HuggingFaceProviderProgress::new(
             args,
             label,
