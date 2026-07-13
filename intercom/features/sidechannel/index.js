@@ -655,9 +655,38 @@ class Sidechannel extends Feature {
     const channel = payload?.channel ?? '';
     if (!this._powRequired(channel)) return;
     const difficulty = this.powDifficulty;
+    // The mining loop runs ~2^difficulty iterations. Re-serializing the whole
+    // payload per nonce froze the event loop for tens of seconds per message
+    // (2026-07-13 live incident: every relayed admission op took 24-43+ seconds
+    // and retries re-mined fresh payloads, livelocking the peer). The nonce is a
+    // number in the alphabetically sorted key order (channel, from, id, message,
+    // nonce, origin, ts), so the base splits into a constant prefix/suffix and
+    // each iteration is a cheap concat + sha256. `_powBase` stays the wire
+    // format; the split is verified against it before the pow is attached.
+    const prefix =
+      `{"channel":${stableStringify(payload?.channel ?? null)}` +
+      `,"from":${stableStringify(payload?.from ?? null)}` +
+      `,"id":${stableStringify(payload?.id ?? null)}` +
+      `,"message":${stableStringify(payload?.message ?? null)}` +
+      ',"nonce":';
+    const suffix =
+      `,"origin":${stableStringify(payload?.origin ?? null)}` +
+      `,"ts":${stableStringify(payload?.ts ?? null)}}`;
+    if (prefix + '0' + suffix !== this._powBase(payload, 0)) {
+      // Never mine an incompatible base: fall back to the canonical builder.
+      let nonce = 0;
+      while (true) {
+        const hash = sha256Hex(this._powBase(payload, nonce));
+        if (countLeadingZeroBits(hash) >= difficulty) {
+          payload.pow = { nonce, difficulty };
+          return;
+        }
+        nonce += 1;
+      }
+    }
     let nonce = 0;
     while (true) {
-      const hash = sha256Hex(this._powBase(payload, nonce));
+      const hash = sha256Hex(prefix + nonce + suffix);
       if (countLeadingZeroBits(hash) >= difficulty) {
         payload.pow = { nonce, difficulty };
         return;

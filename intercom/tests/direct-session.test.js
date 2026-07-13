@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Duplex } from 'node:stream';
 import test from 'node:test';
 import b4a from 'b4a';
 import c from '../node_modules/compact-encoding/index.js';
@@ -15,6 +16,34 @@ const sessionId = 'ab'.repeat(32);
 const remote = 'cd'.repeat(32);
 const localPeer = '12'.repeat(32);
 
+const memoryDuplexPair = () => {
+  let left = null;
+  let right = null;
+  left = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      right.push(Buffer.from(chunk));
+      callback();
+    },
+    final(callback) {
+      right.push(null);
+      callback();
+    },
+  });
+  right = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      left.push(Buffer.from(chunk));
+      callback();
+    },
+    final(callback) {
+      left.push(null);
+      callback();
+    },
+  });
+  return [left, right];
+};
+
 test('DirectSession exposes raised mx/s rate limits without relay semantics', () => {
   const directSession = new DirectSession({}, {});
   const stats = directSession.stats();
@@ -27,6 +56,10 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.connectMaxWaitMs, 120_000);
   assert.equal(stats.connectPollMs, 100);
   assert.equal(stats.openMaxWaitMs, 120_000);
+  assert.equal(stats.healthProtocol, 'mx/s-health');
+  assert.equal(stats.healthIntervalMs, 5_000);
+  assert.equal(stats.healthFreshMs, 15_000);
+  assert.equal(stats.healthTimeoutMs, 0);
   assert.equal(stats.maxSessions, 1024);
   assert.equal(stats.maxSessionsPerConnection, 128);
   assert.equal(stats.sessionCount, 0);
@@ -383,6 +416,45 @@ test('DirectSession reuses an inbound session even when the swarm connection lis
   assert.equal(opened.relayed, false);
 });
 
+test('DirectSession moves a session to a replacement Hyperswarm connection', () => {
+  const oldConnection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const newConnection = { remotePublicKey: b4a.from(remote, 'hex') };
+  let oldChannelCloses = 0;
+  const oldSession = {
+    sessionId,
+    remote,
+    connection: oldConnection,
+    channel: { close: () => { oldChannelCloses += 1; } },
+    drainWaiters: new Set(),
+    closed: false,
+  };
+  const directSession = new DirectSession({}, {});
+  directSession.sessions.set(`${remote}:${sessionId}`, oldSession);
+  directSession._prepareConnection = () => {};
+  directSession._muxForConnection = () => ({
+    createChannel: () => {
+      const channel = {
+        opened: true,
+        addMessage: () => ({ send: () => true }),
+        open: () => {},
+      };
+      return channel;
+    },
+  });
+
+  const replacement = directSession._ensureSession(newConnection, sessionId);
+
+  assert.equal(oldSession.closed, true);
+  assert.equal(oldChannelCloses, 1);
+  assert.equal(replacement.connection, newConnection);
+  assert.equal(replacement.closed, false);
+  assert.equal(directSession.sessions.get(`${remote}:${sessionId}`), replacement);
+
+  directSession._dropConnection(oldConnection);
+  assert.equal(replacement.closed, false);
+  assert.equal(directSession.sessions.get(`${remote}:${sessionId}`), replacement);
+});
+
 test('DirectSession pins an already-connected peer for automatic reconnects', async () => {
   const joined = [];
   const connection = { remotePublicKey: b4a.from(remote, 'hex') };
@@ -392,6 +464,11 @@ test('DirectSession pins an already-connected peer for automatic reconnects', as
       joinPeer: (key) => joined.push(b4a.toString(key, 'hex')),
     },
   }, {});
+  directSession._prepareConnection = () => {};
+  directSession.connectionHealth.set(connection, {
+    connection,
+    lastAckAt: Date.now(),
+  });
 
   const connected = await directSession.connectPeer(remote, 25);
 
@@ -399,6 +476,72 @@ test('DirectSession pins an already-connected peer for automatic reconnects', as
   assert.equal(connected.remote, remote);
   assert.equal(connected.connected, true);
   assert.equal(connected.direct, true);
+  assert.equal(directSession.stats().lastConnectAttempt.remote, remote);
+  assert.equal(directSession.stats().lastConnectAttempt.state, 'connected');
+});
+
+test('DirectSession prefers the most recently bidirectionally healthy connection', () => {
+  const stale = { remotePublicKey: b4a.from(remote, 'hex') };
+  const healthy = { remotePublicKey: b4a.from(remote, 'hex') };
+  const directSession = new DirectSession({
+    swarm: { connections: [stale, healthy] },
+  }, {});
+  directSession.connectionHealth.set(stale, { connection: stale, lastAckAt: 1 });
+  directSession.connectionHealth.set(healthy, { connection: healthy, lastAckAt: Date.now() });
+
+  assert.equal(directSession._findConnection(remote), healthy);
+});
+
+test('DirectSession health frames prove both transport directions', async () => {
+  const sent = [];
+  const directSession = new DirectSession({}, {});
+  const health = {
+    message: { send: (frame) => sent.push(frame) },
+    waiters: new Map(),
+    lastAckAt: 0,
+  };
+
+  directSession._handleHealthFrame(health, { t: 'ping', n: 'probe-one' });
+  assert.deepEqual(sent, [{ t: 'pong', n: 'probe-one' }]);
+
+  let resolved = false;
+  health.waiters.set('probe-two', {
+    resolve: () => { resolved = true; },
+    reject: () => {},
+    timer: null,
+  });
+  directSession._handleHealthFrame(health, { t: 'pong', n: 'probe-two' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(resolved, true);
+  assert.equal(health.waiters.size, 0);
+  assert.equal(directSession._healthIsFresh(health), true);
+});
+
+test('DirectSession completes a real bidirectional Protomux health probe', async () => {
+  const [leftConnection, rightConnection] = memoryDuplexPair();
+  const leftKey = '11'.repeat(32);
+  const rightKey = '22'.repeat(32);
+  leftConnection.remotePublicKey = b4a.from(rightKey, 'hex');
+  rightConnection.remotePublicKey = b4a.from(leftKey, 'hex');
+  const left = new DirectSession({
+    swarm: { connections: new Set([leftConnection]), joinPeer: () => {} },
+  }, {});
+  const right = new DirectSession({
+    swarm: { connections: new Set([rightConnection]), joinPeer: () => {} },
+  }, {});
+  left._prepareConnection(leftConnection);
+  right._prepareConnection(rightConnection);
+
+  await Promise.all([
+    left._ensureConnectionHealthy(leftConnection, 1_000),
+    right._ensureConnectionHealthy(rightConnection, 1_000),
+  ]);
+
+  assert.equal(left.stats().connections[0].healthy, true);
+  assert.equal(right.stats().connections[0].healthy, true);
+  leftConnection.destroy();
+  rightConnection.destroy();
 });
 
 test('ScBridge loopback helpers identify local direct session routes', () => {
@@ -422,4 +565,27 @@ test('ScBridge loopback helpers identify local direct session routes', () => {
 
   assert.throws(() => loopbackSessionInfo('bad', sessionId), /Invalid remote peer key/);
   assert.throws(() => loopbackSessionInfo(localPeer, 'bad'), /Invalid session_id/);
+});
+
+test('DirectSession keeps and uses a connection whose peer never opens mx/s-health', async () => {
+  let destroyed = 0;
+  const connection = {
+    remotePublicKey: b4a.from(remote, 'hex'),
+    destroy: () => { destroyed += 1; },
+  };
+  const directSession = new DirectSession({
+    swarm: {
+      connections: [connection],
+      joinPeer: () => {},
+    },
+  }, { healthTimeoutMs: 10 });
+  directSession._prepareConnection = () => {};
+
+  const connected = await directSession.connectPeer(remote, 200);
+
+  assert.equal(connected.connected, true);
+  assert.equal(destroyed, 0);
+  const attempt = directSession.stats().lastConnectAttempt;
+  assert.equal(attempt.state, 'connected');
+  assert.equal(attempt.verified, false);
 });

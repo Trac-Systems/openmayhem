@@ -567,6 +567,40 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
   assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '150');
 });
 
+test('MayhemContract applies consecutive fee-bearing epochs (settled_cum_au advances with cum_au)', async () => {
+  const { admin, provider, user, storage, contract } = await setupEpochContract();
+  const first = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000' }],
+  };
+  await seedSpendHoldsForApply(storage, first);
+  const firstApplied = await executeEpochApplyFeature(contract, storage, first, admin.publicKey);
+  assert.equal(firstApplied.ok, true, firstApplied.message);
+  const feeAfterFirst = (await storage.get('fee/fiat/cum')).value;
+  assert.equal(feeAfterFirst.cum_au, '300');
+  assert.equal(feeAfterFirst.settled_cum_au, '2000');
+
+  // Regression: the second fee-bearing epoch used to be rejected with
+  // "Guardian conservation invariant failed" because epochApply built nextFee
+  // with the new cum_au but the stale settled_cum_au.
+  const second = {
+    op: 'epoch_apply',
+    epoch: 2,
+    at: 7_200,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '20000' }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '20000' }],
+  };
+  await seedSpendHoldsForApply(storage, second);
+  const secondApplied = await executeEpochApplyFeature(contract, storage, second, admin.publicKey);
+  assert.equal(secondApplied.ok, true, secondApplied.message);
+  const feeAfterSecond = (await storage.get('fee/fiat/cum')).value;
+  assert.equal(feeAfterSecond.cum_au, '3300');
+  assert.equal(feeAfterSecond.settled_cum_au, '22000');
+});
+
 test('MayhemContract binds active admin epoch timing into commit and apply evidence', async () => {
   const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
   const tuned = await execute(

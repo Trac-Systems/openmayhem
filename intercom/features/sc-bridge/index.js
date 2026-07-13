@@ -273,6 +273,33 @@ class ScBridge extends Feature {
     }
   }
 
+  handleSessionClose(event) {
+    const payload = {
+      type: 'session_closed',
+      session_id: event?.session_id ?? null,
+      channel: event?.channel ?? null,
+      protocol: event?.protocol ?? null,
+      remote: event?.remote ?? null,
+      direct: event?.direct === true,
+      relayed: event?.relayed === true,
+      reason: event?.reason ?? 'Direct session closed.',
+      locally_initiated: event?.locally_initiated === true,
+      transport_error: event?.transport_error ?? null,
+      transport_error_code: event?.transport_error_code ?? null,
+      transport_initiator: event?.transport_initiator === true,
+      transport_bytes_read: Number(event?.transport_bytes_read) || 0,
+      transport_bytes_written: Number(event?.transport_bytes_written) || 0,
+      ts: Date.now(),
+    };
+    for (const client of this.clients) {
+      if (!client.ready) continue;
+      if (!sessionSubscriptionMatches(client.sessionAll, client.sessionIds, payload.session_id)) {
+        continue;
+      }
+      this._broadcastToClient(client, payload);
+    }
+  }
+
   _localPeerKey() {
     return localPeerKey(this.peer, this.info);
   }
@@ -775,6 +802,17 @@ class ScBridge extends Feature {
           .map((connection) => keyHex(connection?.remotePublicKey))
           .filter(Boolean);
         const connectionCount = this.sidechannel.connections.size;
+        const readyClients = Array.from(this.clients).filter((client) => client.ready);
+        const sidechannelConnections = Array.from(this.sidechannel.connections.entries())
+          .map(([connection, perConnection]) => ({
+            remote: keyHex(connection?.remotePublicKey),
+            openChannels: Array.from(perConnection.entries())
+              .filter(([, record]) => record?.message && record.channel?.opened === true)
+              .map(([name]) => name)
+              .sort(),
+          }))
+          .filter((connection) => connection.remote)
+          .sort((left, right) => left.remote.localeCompare(right.remote));
         reply({
           type: 'stats',
           channels,
@@ -782,6 +820,12 @@ class ScBridge extends Feature {
           peers,
           swarmPeers,
           sidechannelStarted: this.sidechannel.started === true,
+          clientCount: readyClients.length,
+          sessionSubscriberCount: readyClients.filter(
+            (client) => client.sessionAll || (client.sessionIds?.size ?? 0) > 0
+          ).length,
+          sessionAllSubscriberCount: readyClients.filter((client) => client.sessionAll).length,
+          sidechannelConnections,
         });
         return;
       }

@@ -9,6 +9,7 @@ import {
 
 const SESSION_PROTOCOL = 'mx/s';
 const SESSION_CHANNEL_PREFIX = 'mx/s/';
+const HEALTH_PROTOCOL = 'mx/s-health';
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const DEFAULT_RATE_BYTES_PER_SECOND = 1_000_000;
 const DEFAULT_RATE_BURST_BYTES = 1_000_000;
@@ -16,9 +17,13 @@ const DEFAULT_SEND_DRAIN_TIMEOUT_MS = 0;
 const DEFAULT_CONNECT_MAX_WAIT_MS = 120_000;
 const DEFAULT_CONNECT_POLL_MS = 100;
 const DEFAULT_OPEN_MAX_WAIT_MS = 120_000;
+const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
+const DEFAULT_HEALTH_FRESH_MS = 15_000;
+const DEFAULT_HEALTH_TIMEOUT_MS = 0;
 const DEFAULT_MAX_SESSIONS = 1024;
 const DEFAULT_MAX_SESSIONS_PER_CONNECTION = 128;
 const MAX_FRAME_TYPE_BYTES = 64;
+const MAX_HEALTH_FRAME_BYTES = 256;
 
 const normalizeKeyHex = (value) => {
   if (!value) return null;
@@ -76,6 +81,21 @@ class DirectSession extends Feature {
       DEFAULT_OPEN_MAX_WAIT_MS,
       { min: 1 }
     );
+    this.healthIntervalMs = safeIntegerOr(
+      config.healthIntervalMs,
+      DEFAULT_HEALTH_INTERVAL_MS,
+      { min: 1 }
+    );
+    this.healthFreshMs = safeIntegerOr(
+      config.healthFreshMs,
+      DEFAULT_HEALTH_FRESH_MS,
+      { min: this.healthIntervalMs }
+    );
+    this.healthTimeoutMs = safeIntegerOr(
+      config.healthTimeoutMs,
+      DEFAULT_HEALTH_TIMEOUT_MS,
+      { min: 0 }
+    );
     this.maxSessions = safeIntegerOr(config.maxSessions, DEFAULT_MAX_SESSIONS, { min: 1 });
     this.maxSessionsPerConnection = safeIntegerOr(
       config.maxSessionsPerConnection,
@@ -84,7 +104,12 @@ class DirectSession extends Feature {
     );
     this.sessions = new Map();
     this.pairedConnections = new WeakSet();
+    this.connectionErrors = new WeakMap();
+    this.connectionHealth = new Map();
+    this.healthNonce = 0;
+    this.lastConnectAttempt = null;
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
+    this.onClose = typeof config.onClose === 'function' ? config.onClose : null;
   }
 
   start() {
@@ -112,6 +137,10 @@ class DirectSession extends Feature {
       connectMaxWaitMs: this.connectMaxWaitMs,
       connectPollMs: this.connectPollMs,
       openMaxWaitMs: this.openMaxWaitMs,
+      healthProtocol: HEALTH_PROTOCOL,
+      healthIntervalMs: this.healthIntervalMs,
+      healthFreshMs: this.healthFreshMs,
+      healthTimeoutMs: this.healthTimeoutMs,
       maxSessions: this.maxSessions,
       maxSessionsPerConnection: this.maxSessionsPerConnection,
       sessionCount: this.sessions.size,
@@ -123,6 +152,17 @@ class DirectSession extends Feature {
         direct: true,
         relayed: false,
       })),
+      connections: Array.from(this.connectionHealth.values()).map((health) => ({
+        remote: this._remoteKey(health.connection),
+        healthy: this._healthIsFresh(health),
+        last_ack_age_ms: health.lastAckAt > 0 ? Date.now() - health.lastAckAt : null,
+        opened: health.opened === true,
+        initiator: health.connection?.isInitiator === true,
+        keep_alive_ms: Number(health.connection?.keepAlive) || 0,
+        raw_bytes_read: Number(health.connection?.rawBytesRead) || 0,
+        raw_bytes_written: Number(health.connection?.rawBytesWritten) || 0,
+      })),
+      lastConnectAttempt: this.lastConnectAttempt,
     };
   }
 
@@ -155,22 +195,61 @@ class DirectSession extends Feature {
     }
     // Mark the peer explicit even when a transient topic connection already exists.
     // Hyperswarm then maintains the direct connection after either side reconnects.
+    const attempt = {
+      remote: normalizedRemote,
+      started_at: Date.now(),
+      state: 'pending',
+      error: null,
+    };
+    this.lastConnectAttempt = attempt;
     this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
-    const existing = this._findConnection(normalizedRemote);
-    if (existing) {
-      this._prepareConnection(existing);
-      return this._peerInfo(normalizedRemote, true);
-    }
     const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, this.connectMaxWaitMs));
     const deadline = Date.now() + maxWaitMs;
+    const probed = new WeakSet();
+    let fallback = null;
     while (Date.now() < deadline) {
-      const connection = this._findConnection(normalizedRemote);
-      if (connection) {
+      const connections = this._connectionsForRemote(normalizedRemote);
+      for (const connection of connections) {
         this._prepareConnection(connection);
+        if (probed.has(connection)) continue;
+        const remaining = Math.max(1, deadline - Date.now());
+        // Health verification is advisory. Peers running releases without the
+        // mx/s-health protocol never open the channel, and a shared Hyperswarm
+        // connection also carries base replication — so a probe failure must never
+        // destroy the connection; the connection is kept as an unverified fallback.
+        const probeMs = Math.min(
+          remaining,
+          this.healthTimeoutMs > 0 ? this.healthTimeoutMs : this.healthFreshMs
+        );
+        try {
+          await this._ensureConnectionHealthy(connection, probeMs);
+          attempt.state = 'connected';
+          attempt.verified = true;
+          attempt.completed_at = Date.now();
+          return this._peerInfo(normalizedRemote, true);
+        } catch (error) {
+          attempt.error = error?.message ?? String(error);
+          probed.add(connection);
+          if (!fallback && connection.destroyed !== true && connection.closed !== true) {
+            fallback = connection;
+          }
+        }
+      }
+      if (fallback && fallback.destroyed !== true && fallback.closed !== true) {
+        attempt.state = 'connected';
+        attempt.verified = false;
+        attempt.completed_at = Date.now();
+        if (this.debug) {
+          console.log(
+            `[direct-session] using unverified (legacy health) connection to ${normalizedRemote}`
+          );
+        }
         return this._peerInfo(normalizedRemote, true);
       }
       await new Promise((resolve) => setTimeout(resolve, this.connectPollMs));
     }
+    attempt.state = 'failed';
+    attempt.completed_at = Date.now();
     throw new Error(`Timed out connecting to peer ${normalizedRemote}.`);
   }
 
@@ -240,6 +319,10 @@ class DirectSession extends Feature {
     const mux = this._muxForConnection(connection);
     if (!mux) return;
     this.pairedConnections.add(connection);
+    connection.on('error', (error) => {
+      this.connectionErrors.set(connection, error);
+    });
+    this._prepareHealthChannel(connection, mux);
     mux.pair({ protocol: SESSION_PROTOCOL }, (id) => {
       const sessionId = id ? b4a.toString(id, 'hex') : null;
       if (!normalizeSessionId(sessionId)) return;
@@ -253,7 +336,10 @@ class DirectSession extends Feature {
         this._reportEventError(`inbound session ${sessionId}`, error);
       }
     });
-    connection.on('close', () => this._dropConnection(connection));
+    connection.on('close', () => {
+      this._dropConnection(connection);
+      this._dropHealthConnection(connection);
+    });
   }
 
   _muxForConnection(connection) {
@@ -267,11 +353,198 @@ class DirectSession extends Feature {
   }
 
   _findConnection(remote) {
-    if (!this.peer?.swarm?.connections) return null;
-    for (const connection of this.peer.swarm.connections) {
-      if (this._remoteKey(connection) === remote) return connection;
+    return this._connectionsForRemote(remote)[0] ?? null;
+  }
+
+  _connectionsForRemote(remote) {
+    if (!this.peer?.swarm?.connections) return [];
+    return Array.from(this.peer.swarm.connections)
+      .filter((connection) => (
+        this._remoteKey(connection) === remote
+        && connection?.destroyed !== true
+        && connection?.closed !== true
+      ))
+      .sort((left, right) => {
+        const leftAck = this.connectionHealth.get(left)?.lastAckAt ?? 0;
+        const rightAck = this.connectionHealth.get(right)?.lastAckAt ?? 0;
+        return rightAck - leftAck;
+      });
+  }
+
+  _prepareHealthChannel(connection, mux) {
+    if (this.connectionHealth.has(connection)) return;
+    const health = {
+      connection,
+      mux,
+      channel: null,
+      message: null,
+      opened: false,
+      lastAckAt: 0,
+      timer: null,
+      waiters: new Map(),
+    };
+    this.connectionHealth.set(connection, health);
+    if (typeof mux.pair === 'function') {
+      mux.pair({ protocol: HEALTH_PROTOCOL }, () => {
+        this._openHealthChannel(health);
+      });
     }
-    return null;
+    this._openHealthChannel(health);
+  }
+
+  _openHealthChannel(health) {
+    if (!health || health.connection?.destroyed === true) return;
+    if (health.channel && health.channel.closed !== true && health.channel.destroyed !== true) {
+      return;
+    }
+    let channel = null;
+    try {
+      channel = health.mux.createChannel({
+        protocol: HEALTH_PROTOCOL,
+        onopen: () => {
+          health.opened = true;
+          this._sendHealthPing(health);
+        },
+        onclose: () => {
+          health.opened = false;
+          this._rejectHealthWaiters(health, new Error('Direct transport health channel closed.'));
+        },
+      });
+    } catch (error) {
+      this._reportEventError('health channel setup', error);
+      return;
+    }
+    if (!channel) return;
+    health.channel = channel;
+    health.message = channel.addMessage({
+      encoding: boundedJsonEncoding(MAX_HEALTH_FRAME_BYTES, 'Direct transport health frame'),
+      onmessage: (frame) => this._handleHealthFrame(health, frame),
+    });
+    channel.open();
+    health.timer = setInterval(() => this._healthTick(health), this.healthIntervalMs);
+    health.timer.unref?.();
+  }
+
+  _healthTick(health) {
+    if (!health || health.connection?.destroyed === true || health.connection?.closed === true) {
+      this._dropHealthConnection(health?.connection);
+      return;
+    }
+    if (!health.opened) return;
+    this._sendHealthPing(health);
+  }
+
+  _nextHealthNonce() {
+    this.healthNonce = (this.healthNonce + 1) % Number.MAX_SAFE_INTEGER;
+    return `${Date.now().toString(36)}-${this.healthNonce.toString(36)}`;
+  }
+
+  _sendHealthPing(health, waiter = null) {
+    if (!health?.opened || !health.message) return false;
+    const nonce = this._nextHealthNonce();
+    if (waiter) health.waiters.set(nonce, waiter);
+    try {
+      health.message.send({ t: 'ping', n: nonce });
+      return nonce;
+    } catch (error) {
+      if (waiter) health.waiters.delete(nonce);
+      if (waiter?.timer) clearTimeout(waiter.timer);
+      waiter?.reject(error);
+      return false;
+    }
+  }
+
+  _handleHealthFrame(health, frame) {
+    if (
+      !frame
+      || typeof frame !== 'object'
+      || Array.isArray(frame)
+      || decodedJsonWasRejected(frame)
+      || typeof frame.n !== 'string'
+      || frame.n.length === 0
+      || frame.n.length > 64
+    ) {
+      return;
+    }
+    if (frame.t === 'ping') {
+      try {
+        health.message?.send({ t: 'pong', n: frame.n });
+      } catch (_error) {}
+      return;
+    }
+    if (frame.t !== 'pong') return;
+    health.lastAckAt = Date.now();
+    const waiter = health.waiters.get(frame.n);
+    if (!waiter) return;
+    health.waiters.delete(frame.n);
+    if (waiter.timer) clearTimeout(waiter.timer);
+    waiter.resolve();
+  }
+
+  _healthIsFresh(health) {
+    return health?.lastAckAt > 0 && Date.now() - health.lastAckAt <= this.healthFreshMs;
+  }
+
+  async _ensureConnectionHealthy(connection, waitMs) {
+    const health = this.connectionHealth.get(connection);
+    if (!health) throw new Error('Direct transport health channel is unavailable.');
+    if (this._healthIsFresh(health)) return;
+    if (!health.opened) {
+      await this._awaitHealthChannelOpened(health, waitMs);
+    }
+    if (this._healthIsFresh(health)) return;
+    await new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        for (const [nonce, candidate] of health.waiters) {
+          if (candidate === waiter) health.waiters.delete(nonce);
+        }
+        reject(new Error(`Direct transport health probe timed out after ${waitMs} ms.`));
+      }, waitMs);
+      waiter.timer.unref?.();
+      if (!this._sendHealthPing(health, waiter)) {
+        if (waiter.timer) clearTimeout(waiter.timer);
+        reject(new Error('Direct transport health probe could not be sent.'));
+      }
+    });
+  }
+
+  async _awaitHealthChannelOpened(health, waitMs) {
+    if (health.opened) return;
+    let timer = null;
+    try {
+      await Promise.race([
+        health.channel?.fullyOpened?.() ?? Promise.reject(new Error('Health channel unavailable.')),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Direct transport health channel open timed out after ${waitMs} ms.`)),
+            waitMs
+          );
+          timer.unref?.();
+        }),
+      ]);
+      health.opened = health.channel?.opened === true;
+      if (!health.opened) throw new Error('Direct transport health channel did not open.');
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  _rejectHealthWaiters(health, error) {
+    for (const waiter of health?.waiters?.values?.() ?? []) {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    health?.waiters?.clear?.();
+  }
+
+  _dropHealthConnection(connection) {
+    if (!connection) return;
+    const health = this.connectionHealth.get(connection);
+    if (!health) return;
+    this.connectionHealth.delete(connection);
+    if (health.timer) clearInterval(health.timer);
+    this._rejectHealthWaiters(health, new Error('Direct transport closed.'));
   }
 
   _remoteKey(connection) {
@@ -293,7 +566,15 @@ class DirectSession extends Feature {
     if (!remote) throw new Error('Direct connection is missing remote key.');
     const key = sessionKey(remote, sessionId);
     const existing = this.sessions.get(key);
-    if (existing) return existing;
+    if (existing && existing.connection === connection && !existing.closed) return existing;
+    if (existing) {
+      this._closeRecord(
+        existing,
+        new Error(`Session ${sessionId} moved to a replacement connection.`),
+        true,
+        false
+      );
+    }
     if (!this._hasSessionCapacity(connection, sessionId)) {
       throw new Error(`Direct session capacity reached for ${remote}.`);
     }
@@ -494,12 +775,42 @@ class DirectSession extends Feature {
     return connectionSessions < this.maxSessionsPerConnection;
   }
 
-  _closeRecord(session, error, closeChannel) {
+  _closeRecord(session, error, closeChannel, emitClose = true) {
     if (!session || session.closed) return;
     session.closed = true;
+    const transportError = this.connectionErrors.get(session.connection) ?? null;
+    const closeReason = error?.message ?? 'Direct session closed.';
     this._rejectDrainWaiters(session, error);
     const key = sessionKey(session.remote, session.sessionId);
     if (this.sessions.get(key) === session) this.sessions.delete(key);
+    if (emitClose && this.onClose) {
+      try {
+        const result = this.onClose({
+          session_id: session.sessionId,
+          channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
+          protocol: SESSION_PROTOCOL,
+          remote: session.remote,
+          direct: true,
+          relayed: false,
+          reason: transportError
+            ? `${closeReason} Transport: ${transportError.code || 'ERROR'} ${transportError.message}`
+            : closeReason,
+          locally_initiated: closeChannel === true,
+          transport_error: transportError?.message ?? null,
+          transport_error_code: transportError?.code ?? null,
+          transport_initiator: session.connection?.isInitiator === true,
+          transport_bytes_read: Number(session.connection?.rawBytesRead) || 0,
+          transport_bytes_written: Number(session.connection?.rawBytesWritten) || 0,
+        });
+        if (result && typeof result.catch === 'function') {
+          result.catch((closeError) =>
+            this._reportEventError(`session ${session.sessionId} close`, closeError)
+          );
+        }
+      } catch (closeError) {
+        this._reportEventError(`session ${session.sessionId} close`, closeError);
+      }
+    }
     if (closeChannel) {
       try {
         session.channel?.close?.();
@@ -559,7 +870,10 @@ class DirectSession extends Feature {
   _dropConnection(connection) {
     const remote = this._remoteKey(connection);
     for (const session of this.sessions.values()) {
-      if (session.connection === connection || (remote && session.remote === remote)) {
+      if (
+        session.connection === connection
+        || (!session.connection && remote && session.remote === remote)
+      ) {
         this._closeRecord(session, new Error(`Connection to ${session.remote} closed.`), false);
       }
     }

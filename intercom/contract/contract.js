@@ -3923,10 +3923,21 @@ class MayhemContract extends Contract {
       const feeDeltaAu = feeDeltaByRail.get(rail) ?? ZERO_AU;
       const nextFeeCum = this.safeAddAu(fee.cum_au, feeDeltaAu);
       if (nextFeeCum instanceof Error) return nextFeeCum;
+      // settled_cum_au must advance with this epoch's settled rail debits in
+      // the SAME record that carries the new cum_au, otherwise
+      // guardianValidateFeeRecord rejects every fee-bearing epoch apply
+      // (settled < cum). This mirrors next_settled_cum_by_rail in
+      // guardianValidateEpochTotals, which is also what gets persisted.
+      const nextFeeSettledCum = this.safeAddAu(
+        fee.settled_cum_au ?? fee.cum_au,
+        debitRailTotals.get(rail) ?? ZERO_AU
+      );
+      if (nextFeeSettledCum instanceof Error) return nextFeeSettledCum;
       const nextFee = touchedRails.has(rail)
         ? {
             ...fee,
             cum_au: nextFeeCum,
+            settled_cum_au: nextFeeSettledCum,
             updated_epoch: this.value.epoch,
             updated_at: this.tx,
             last_apply_hash: applyHash,

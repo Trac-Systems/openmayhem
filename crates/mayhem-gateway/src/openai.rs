@@ -138,6 +138,7 @@ const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
 pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
+const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
 const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
 const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -193,7 +194,7 @@ const DASHBOARD_CHART_CSS: &str = r#"
 
 #[derive(Clone, Debug)]
 pub struct GatewayState {
-    models: Arc<Vec<GatewayModel>>,
+    models: Arc<Mutex<Arc<Vec<GatewayModel>>>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
@@ -2181,6 +2182,8 @@ pub struct GatewaySessionAttestation {
 pub struct GatewaySessionError {
     pub message: String,
     pub retryable: bool,
+    pub transport_closed: bool,
+    pub wait_elapsed: bool,
     pub clean_refusal: bool,
     pub clean_refusal_code: Option<String>,
     pub partial: Option<Box<GatewaySessionPartial>>,
@@ -2396,7 +2399,7 @@ impl GatewayState {
             GatewayMediaLimits::default()
         });
         Self {
-            models: Arc::new(models),
+            models: Arc::new(Mutex::new(Arc::new(models))),
             receipts: Arc::new(Mutex::new(Vec::new())),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
@@ -2494,8 +2497,32 @@ impl GatewayState {
     pub fn with_dev_session_shim(mut self) -> Self {
         self.session_backend = Arc::new(LocalOpenAiShapeBackend);
         self.dev_session_shim = true;
-        seed_dev_fallback_heartbeats(&self.provider_table, &self.models);
+        seed_dev_fallback_heartbeats(&self.provider_table, &self.models_snapshot());
         self
+    }
+
+    fn models_snapshot(&self) -> Arc<Vec<GatewayModel>> {
+        self.models.lock_recover("gateway model catalog").clone()
+    }
+
+    /// Swap the model catalog at runtime (contract catalog refresh). Keeps
+    /// live heartbeat and observation state; only the contract-derived rows
+    /// of the provider table are rebuilt, so enclave/binary approvals and
+    /// price changes take effect without a gateway restart.
+    pub fn replace_model_catalog(&self, models: Vec<GatewayModel>) {
+        let models = sanitize_gateway_models(models);
+        let snapshots = models
+            .iter()
+            .flat_map(|model| {
+                model.mayhem.route_candidates.iter().map(|candidate| {
+                    contract_snapshot_for_route(model, candidate, self.receipt_config.rules_ver)
+                })
+            })
+            .collect::<Vec<_>>();
+        self.provider_table
+            .lock_recover("provider table")
+            .replace_contract_snapshot(snapshots);
+        *self.models.lock_recover("gateway model catalog") = Arc::new(models);
     }
 
     pub fn with_canary_registry(mut self, registry: GatewayCanaryRegistry) -> Self {
@@ -2556,7 +2583,7 @@ impl GatewayState {
     }
 
     pub fn update_notice(&self) -> Option<GatewayUpdateNotice> {
-        gateway_update_notice(&self.models, &self.hidden_update_models)
+        gateway_update_notice(&self.models_snapshot(), &self.hidden_update_models)
     }
 
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
@@ -2772,11 +2799,14 @@ impl GatewayState {
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
-        self.models.iter().find(|model| model.id == id).cloned()
+        self.models_snapshot()
+            .iter()
+            .find(|model| model.id == id)
+            .cloned()
     }
 
     fn first_model(&self) -> Option<GatewayModel> {
-        self.models.first().cloned()
+        self.models_snapshot().first().cloned()
     }
 }
 
@@ -2893,7 +2923,7 @@ fn gateway_request_body_limit(state: &GatewayState) -> usize {
         return configured;
     }
     let max_ctx = state
-        .models
+        .models_snapshot()
         .iter()
         .flat_map(|model| {
             std::iter::once(model_served_ctx(model)).chain(
@@ -2989,7 +3019,7 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
         table.entries(now_millis_u64())
     };
     let data = state
-        .models
+        .models_snapshot()
         .iter()
         .map(|model| {
             let mut mayhem = serde_json::to_value(&model.mayhem).unwrap_or(Value::Null);
@@ -4686,7 +4716,7 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "app_version": installed_app_version(),
         "backend": state.session_backend.name(),
         "dev_session_shim": state.dev_session_shim,
-        "models": state.models.len(),
+        "models": state.models_snapshot().len(),
         "sessions_active": 0,
         "sessions_paused": state.paused_session_count(),
         "receipts": state.receipt_count(),
@@ -5191,7 +5221,7 @@ fn dashboard_user_html(
         table.entries(now_millis_u64())
     };
     let models = dashboard_filtered_models(
-        &state.models,
+        &state.models_snapshot(),
         &entries,
         chart_options.selected_speciality.as_ref(),
     );
@@ -5211,7 +5241,8 @@ fn dashboard_user_html(
     let session_rows = dashboard_session_rows(&latest_receipts);
     let model_rows = dashboard_model_rows(&models, &entries);
     let spend_body = dashboard_spend_body(&latest_receipts);
-    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let speciality_controls =
+        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
     let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
     let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
     let access_summary = state.access_summary();
@@ -5306,7 +5337,7 @@ fn dashboard_provider_html(
         table.entries(now_millis_u64())
     };
     let models = dashboard_filtered_models(
-        &state.models,
+        &state.models_snapshot(),
         &entries,
         chart_options.selected_speciality.as_ref(),
     );
@@ -5369,7 +5400,8 @@ fn dashboard_provider_html(
     let hardware_body = dashboard_provider_hwprobe_body(&candidates, &probes, &provider_scope);
     let claim_body =
         dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
-    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let speciality_controls =
+        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
     let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
     let price_charts = dashboard_price_chart_cards(&models, chart_options, Some(&provider_scope));
     let update_notice = state.update_notice();
@@ -5435,7 +5467,7 @@ fn dashboard_network_html(
         table.entries(now_millis_u64())
     };
     let models = dashboard_filtered_models(
-        &state.models,
+        &state.models_snapshot(),
         &entries,
         chart_options.selected_speciality.as_ref(),
     );
@@ -5464,7 +5496,8 @@ fn dashboard_network_html(
     let gateway_root = origin.trim_end_matches('/');
     let model_rows = dashboard_network_model_rows(&models, &entries);
     let provider_rows = dashboard_network_provider_rows(&models, &entries);
-    let speciality_controls = dashboard_speciality_controls(&state.models, &entries, chart_options);
+    let speciality_controls =
+        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
     let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
     let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
     dashboard_html_document(
@@ -9076,6 +9109,8 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: false,
+            transport_closed: false,
+            wait_elapsed: false,
             clean_refusal: false,
             clean_refusal_code: None,
             partial: None,
@@ -9087,6 +9122,34 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            transport_closed: false,
+            wait_elapsed: false,
+            clean_refusal: false,
+            clean_refusal_code: None,
+            partial: None,
+            interrupted: None,
+        }
+    }
+
+    pub fn transport_closed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            transport_closed: true,
+            wait_elapsed: false,
+            clean_refusal: false,
+            clean_refusal_code: None,
+            partial: None,
+            interrupted: None,
+        }
+    }
+
+    fn wait_elapsed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            transport_closed: false,
+            wait_elapsed: true,
             clean_refusal: false,
             clean_refusal_code: None,
             partial: None,
@@ -9102,6 +9165,8 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            transport_closed: false,
+            wait_elapsed: false,
             clean_refusal: true,
             clean_refusal_code: code.map(str::to_owned),
             partial: None,
@@ -9113,6 +9178,8 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            transport_closed: false,
+            wait_elapsed: false,
             clean_refusal: false,
             clean_refusal_code: None,
             partial: Some(Box::new(partial)),
@@ -9127,6 +9194,8 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            transport_closed: false,
+            wait_elapsed: false,
             clean_refusal: false,
             clean_refusal_code: None,
             partial: None,
@@ -9752,25 +9821,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -9782,7 +9840,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let request_id = blake3_hex(
@@ -9965,25 +10023,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for embedding session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -9995,7 +10042,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let request_id = blake3_hex(
@@ -10139,25 +10186,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for image session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -10169,7 +10205,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let transport_body = direct_session_image_generation_request_body(request);
@@ -10313,25 +10349,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for audio speech session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -10343,7 +10368,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let transport_body = direct_session_audio_speech_request_body(request);
@@ -10477,25 +10502,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for audio transcription session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -10507,7 +10521,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let transport_body = direct_session_audio_transcription_request_body(request);
@@ -10641,25 +10655,14 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        bridge
-            .session_send(direct_peer, &invocation.session_id, open_frame)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.open for {} generation session {} failed: {err}",
-                    request.output_modality, invocation.session_id
-                ))
-            })?;
-
-        let accept = next_session_frame_with_optional_wait(
+        let accept = send_open_and_await_session_accept(
             &mut bridge,
-            &invocation.session_id,
+            provider,
             direct_peer,
-            invocation.failover.session_accept_timeout(),
-            &["s.accept", "s.reject"],
+            invocation,
+            &open_frame,
         )
-        .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .await?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             return Err(provider_reject_session_error(
                 &accept,
@@ -10671,7 +10674,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation,
             &open_head,
             &att_nonce,
-            now / 1000,
+            now_millis_u64() / 1000,
         )?;
 
         let request_body = seal_direct_session_request_body(
@@ -10876,8 +10879,16 @@ fn provider_reject_session_error(frame: &Value, session_id: &str) -> GatewaySess
 fn clean_provider_reject_code(code: &str) -> bool {
     matches!(
         code,
-        "CAPACITY" | "BUSY" | "RATE" | "QUOTA" | "PRICE_FLOOR" | "DRAINING"
+        "CAPACITY" | "BUSY" | "RATE" | "QUOTA" | "PRICE_FLOOR" | "DRAINING" | "BALANCE"
     )
+}
+
+/// BALANCE means the end user's credit cannot cover the session's spend
+/// reservation. That is a property of the user, not the route, so retrying
+/// this or any other provider cannot succeed until the wallet changes.
+fn terminal_balance_refusal(err: &GatewaySessionError) -> Option<ApiError> {
+    (err.clean_refusal_code.as_deref() == Some("BALANCE"))
+        .then(|| ApiError::payment_required(err.message.clone(), Some("model")))
 }
 
 fn verify_provider_receipt_signature(
@@ -10940,17 +10951,17 @@ async fn next_session_frame_with_optional_wait(
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(GatewaySessionError::new(format!(
+                    return Err(GatewaySessionError::wait_elapsed(format!(
                         "timed out waiting for {} on session {}",
                         expected_types.join("|"),
                         session_id
                     )));
                 }
                 bridge
-                    .next_session_frame_for(session_id, Some(remaining))
+                    .next_session_event_for(session_id, Some(remaining))
                     .await
             }
-            None => bridge.next_session_frame_for(session_id, None).await,
+            None => bridge.next_session_event_for(session_id, None).await,
         };
         match event {
             Ok(event) => {
@@ -10961,7 +10972,19 @@ async fn next_session_frame_with_optional_wait(
                 }
                 if event.get("session_id").and_then(Value::as_str) != Some(session_id) {
                     return Err(GatewaySessionError::new(format!(
-                        "session frame envelope did not match {session_id}"
+                        "session event envelope did not match {session_id}"
+                    )));
+                }
+                if event.get("type").and_then(Value::as_str) == Some("session_closed") {
+                    let reason = event
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("direct transport closed");
+                    return Err(GatewaySessionError::transport_closed(format!(
+                        "direct transport closed while waiting for {} on session {}: {}",
+                        expected_types.join("|"),
+                        session_id,
+                        reason
                     )));
                 }
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -10985,7 +11008,7 @@ async fn next_session_frame_with_optional_wait(
                 }
             }
             Err(BridgeError::Timeout) => {
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::wait_elapsed(format!(
                     "timed out waiting for {} on session {}",
                     expected_types.join("|"),
                     session_id
@@ -15540,6 +15563,9 @@ async fn prepare_live_direct_chat_session(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(&state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -15622,33 +15648,27 @@ async fn open_live_direct_chat_session(
     });
     let open_head = session_frame_head(&open_frame)
         .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-    bridge
-        .session_send(direct_peer, &invocation.session_id, open_frame)
-        .await
-        .map_err(|err| {
-            GatewaySessionError::retryable(format!(
-                "sending s.open for session {} to provider {} transport peer {} failed: {err}",
-                invocation.session_id, provider, direct_peer
-            ))
-        })?;
-
-    let accept = next_session_frame_with_optional_wait(
+    let accept = send_open_and_await_session_accept(
         &mut bridge,
-        &invocation.session_id,
+        provider,
         direct_peer,
-        invocation.failover.session_accept_timeout(),
-        &["s.accept", "s.reject"],
+        invocation,
+        &open_frame,
     )
-    .await
-    .map_err(GatewaySessionError::into_retryable)?;
+    .await?;
     if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
         return Err(provider_reject_session_error(
             &accept,
             &invocation.session_id,
         ));
     }
-    let accept_info =
-        validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce, now / 1000)?;
+    let accept_info = validate_direct_session_accept(
+        &accept,
+        invocation,
+        &open_head,
+        &att_nonce,
+        now_millis_u64() / 1000,
+    )?;
     let request_id = blake3_hex(
         format!(
             "rid:{}:{}",
@@ -15683,6 +15703,122 @@ async fn open_live_direct_chat_session(
         request_id,
         accept_info.enclave_pubkey,
     ))
+}
+
+async fn send_open_and_await_session_accept(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    direct_peer: &str,
+    invocation: &GatewaySessionInvocation,
+    open_frame: &Value,
+) -> Result<Value, GatewaySessionError> {
+    bridge
+        .session_send(direct_peer, &invocation.session_id, open_frame)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "sending s.open for session {} to provider {} transport peer {} failed: {err}",
+                invocation.session_id, provider, direct_peer
+            ))
+        })?;
+    let explicit_accept_timeout = invocation.failover.session_accept_timeout();
+    let accept_wait = explicit_accept_timeout
+        .unwrap_or_else(|| Duration::from_millis(SESSION_OPEN_REPLAY_INTERVAL_MS));
+    // Total budget for the provider to answer s.open. Without it a silent
+    // provider (or a flapping transport) keeps this loop replaying forever,
+    // even after the end user is long gone.
+    let accept_deadline = Instant::now()
+        + explicit_accept_timeout.unwrap_or_else(|| invocation.failover.open_timeout());
+    loop {
+        if Instant::now() >= accept_deadline {
+            return Err(GatewaySessionError::retryable(format!(
+                "provider {} did not answer s.open for session {} within the accept budget",
+                provider, invocation.session_id
+            )));
+        }
+        match next_session_frame_with_optional_wait(
+            bridge,
+            &invocation.session_id,
+            direct_peer,
+            Some(accept_wait),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        {
+            Ok(accept) => return Ok(accept),
+            Err(err) if err.transport_closed => {
+                reopen_direct_session_and_replay_open(
+                    bridge,
+                    provider,
+                    direct_peer,
+                    &invocation.session_id,
+                    invocation.failover.open_timeout(),
+                    open_frame,
+                )
+                .await?;
+            }
+            Err(err) if err.wait_elapsed && explicit_accept_timeout.is_none() => {
+                if bridge
+                    .session_send(direct_peer, &invocation.session_id, open_frame)
+                    .await
+                    .is_err()
+                {
+                    reopen_direct_session_and_replay_open(
+                        bridge,
+                        provider,
+                        direct_peer,
+                        &invocation.session_id,
+                        invocation.failover.open_timeout(),
+                        open_frame,
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => return Err(err.into_retryable()),
+        }
+    }
+}
+
+async fn reopen_direct_session_and_replay_open(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    direct_peer: &str,
+    session_id: &str,
+    open_timeout: Duration,
+    open_frame: &Value,
+) -> Result<(), GatewaySessionError> {
+    bridge
+        .peer_connect(direct_peer, open_timeout)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::transport_closed(format!(
+                "reconnecting provider {provider} transport peer {direct_peer} for session {session_id} failed: {err}"
+            ))
+        })?;
+    let opened = bridge
+        .session_open(direct_peer, session_id)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::transport_closed(format!(
+                "reopening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
+            ))
+        })?;
+    if opened.get("direct").and_then(Value::as_bool) != Some(true)
+        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(GatewaySessionError::transport_closed(format!(
+            "reopened session {session_id} was not a direct non-relayed channel"
+        )));
+    }
+    bridge
+        .session_send(direct_peer, session_id, open_frame)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::transport_closed(format!(
+                "replaying s.open for session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
+            ))
+        })?;
+    Ok(())
 }
 
 fn live_direct_chat_sse_stream(session: LiveDirectChatSession) -> SseEventStream {
@@ -15721,7 +15857,15 @@ async fn run_live_direct_chat_sse(
             let recovered = if is_client_disconnect_error(&err) {
                 finish_live_direct_chat_after_client_disconnect(&mut session, err).await
             } else if err.retryable && err.partial.is_some() {
-                recover_live_direct_chat_after_partial(&mut session, &tx, err).await
+                // The redispatch opens fresh provider sessions from a task the
+                // HTTP response no longer owns; stop the moment the end user
+                // hangs up instead of retrying on behalf of nobody.
+                tokio::select! {
+                    _ = tx.closed() => Err(GatewaySessionError::new(
+                        "end-user disconnected during redispatch; abandoning session retry",
+                    )),
+                    recovered = recover_live_direct_chat_after_partial(&mut session, &tx, err) => recovered,
+                }
             } else {
                 Err(err)
             };
@@ -16914,6 +17058,9 @@ async fn run_chat_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -29156,6 +29303,7 @@ mod tests {
             "QUOTA",
             "PRICE_FLOOR",
             "DRAINING",
+            "BALANCE",
         ] {
             let err = provider_reject_session_error(
                 &json!({
@@ -29181,6 +29329,35 @@ mod tests {
         assert!(err.retryable);
         assert!(!err.clean_refusal);
         assert_eq!(err.clean_refusal_code, None);
+    }
+
+    #[test]
+    fn balance_reject_aborts_all_route_attempts_with_payment_required() {
+        let err = provider_reject_session_error(
+            &json!({
+                "t": "s.reject",
+                "code": "BALANCE",
+                "reason": "Insufficient unreserved credit balance.",
+            }),
+            "session-a",
+        );
+        let refusal = terminal_balance_refusal(&err).expect("BALANCE reject is terminal");
+        assert_eq!(refusal.status, StatusCode::PAYMENT_REQUIRED);
+
+        for code in ["CAPACITY", "BUSY", "DRAINING"] {
+            let err = provider_reject_session_error(
+                &json!({
+                    "t": "s.reject",
+                    "code": code,
+                    "reason": "self protection",
+                }),
+                "session-a",
+            );
+            assert!(
+                terminal_balance_refusal(&err).is_none(),
+                "{code} must stay route-retryable"
+            );
+        }
     }
 
     #[test]

@@ -273,7 +273,22 @@ class MayhemFeature extends Feature {
       }
     };
 
-    const retry = setInterval(() => void attempt(), this.retryMs);
+    // Each resend re-mines the sidechannel PoW, so retransmits back off instead of
+    // firing at a fixed cadence; a lost frame still recovers within seconds while a
+    // slow admin acknowledgment no longer keeps the peer mining continuously.
+    let retryDelay = this.retryMs;
+    let retryTimer = null;
+    const scheduleRetry = () => {
+      retryTimer = setTimeout(() => {
+        void attempt().finally(() => {
+          if (!pending.has(requestId)) return;
+          retryDelay = Math.min(retryDelay * 2, this.retryMs * 8);
+          scheduleRetry();
+        });
+      }, retryDelay);
+      if (typeof retryTimer?.unref === 'function') retryTimer.unref();
+    };
+    scheduleRetry();
     const timeout = this.timeoutMs > 0
       ? setTimeout(() => {
           const current = pending.get(requestId);
@@ -292,7 +307,7 @@ class MayhemFeature extends Feature {
     try {
       return await promise;
     } finally {
-      clearInterval(retry);
+      if (retryTimer !== null) clearTimeout(retryTimer);
       if (timeout !== null) clearTimeout(timeout);
     }
   }

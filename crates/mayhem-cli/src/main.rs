@@ -226,6 +226,8 @@ const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
 const PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA: usize = 8_192;
 const DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS: u64 = 15_000;
 const DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS: u64 = 10_000;
+const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS: u64 = 30_000;
+const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_INTERVAL_MILLIS: u64 = 2_000;
 const DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS: u64 = 2_000;
 const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MILLIS: u64 = 250;
 const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_MAX_MILLIS: u64 = 5_000;
@@ -5546,11 +5548,6 @@ struct MsbTransferOutput {
 struct MsbSettlementTransferOutput {
     to: String,
     amount: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SignOutput {
-    signature: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -26135,6 +26132,98 @@ async fn run_gateway_ledger_watcher(
     }
 }
 
+const DEFAULT_GATEWAY_CATALOG_REFRESH_MILLIS: u64 = 60_000;
+
+#[derive(Clone)]
+struct GatewayCatalogWatcherConfig {
+    rpc_url: String,
+    catalog_doc: Option<catalog::CatalogDocument>,
+    hardware: HardwareReport,
+    home: PathBuf,
+    refresh_interval: Duration,
+    initial_models_json: String,
+}
+
+fn spawn_gateway_catalog_watcher(state: GatewayState, config: GatewayCatalogWatcherConfig) {
+    tokio::spawn(async move {
+        loop {
+            let component_state = state.clone();
+            let component_config = config.clone();
+            match tokio::spawn(async move {
+                run_gateway_catalog_watcher(component_state, component_config).await
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    eprintln!("Gateway catalog watcher stopped unexpectedly; restarting");
+                }
+                Ok(Err(err)) => {
+                    eprintln!("Gateway catalog watcher component failed; restarting: {err:#}");
+                }
+                Err(err) => {
+                    eprintln!("Gateway catalog watcher component panicked; restarting: {err}");
+                }
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+async fn run_gateway_catalog_watcher(
+    state: GatewayState,
+    config: GatewayCatalogWatcherConfig,
+) -> Result<()> {
+    let rpc =
+        PeerRpcClient::new(&config.rpc_url).context("creating gateway catalog watcher RPC")?;
+    let mut applied_models_json = config.initial_models_json.clone();
+    let mut last_error = None;
+    loop {
+        sleep(config.refresh_interval).await;
+        let refresh = async {
+            let contract = read_contract_catalog(&rpc).await?;
+            let models = gateway_models_from_contract(&contract)?;
+            let (models, _version_gates) = match config.catalog_doc.as_ref() {
+                Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
+                None => (models, Vec::new()),
+            };
+            let models = match config.catalog_doc.as_ref() {
+                Some(catalog_doc) => annotate_gateway_models_with_local_runs(
+                    models,
+                    &contract,
+                    catalog_doc,
+                    &config.hardware,
+                    &config.home,
+                ),
+                None => models,
+            };
+            Result::<_, anyhow::Error>::Ok(models)
+        }
+        .await;
+        match refresh {
+            Ok(models) => {
+                last_error = None;
+                let models_json = serde_json::to_string(&models)
+                    .context("serializing refreshed gateway models")?;
+                if models_json != applied_models_json {
+                    let model_count = models.len();
+                    state.replace_model_catalog(models);
+                    applied_models_json = models_json;
+                    eprintln!(
+                        "Gateway model catalog refreshed from contract: {model_count} model(s)"
+                    );
+                }
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                if last_error.as_deref() != Some(message.as_str()) {
+                    eprintln!("Gateway catalog watcher retrying: {message}");
+                    last_error = Some(message);
+                }
+            }
+        }
+    }
+}
+
 fn gateway_provider_heartbeat_channels(models: &[GatewayModel]) -> Vec<String> {
     models
         .iter()
@@ -26430,6 +26519,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
+    let mut catalog_watcher: Option<GatewayCatalogWatcherConfig> = None;
     let (
         state,
         source,
@@ -26618,6 +26708,21 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             ),
             None => models,
         };
+        let catalog_refresh_millis = configured_nonnegative_millis(
+            "MAYHEM_GATEWAY_CATALOG_REFRESH_MS",
+            DEFAULT_GATEWAY_CATALOG_REFRESH_MILLIS,
+        )?;
+        if catalog_refresh_millis > 0 {
+            catalog_watcher = Some(GatewayCatalogWatcherConfig {
+                rpc_url: rpc_url.clone(),
+                catalog_doc: catalog_doc.clone(),
+                hardware: hardware.clone(),
+                home: home.clone(),
+                refresh_interval: Duration::from_millis(catalog_refresh_millis),
+                initial_models_json: serde_json::to_string(&models)
+                    .context("serializing startup gateway models")?,
+            });
+        }
         let heartbeat_channels = gateway_provider_heartbeat_channels(&models);
         let model_count = models.len();
         let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
@@ -26745,6 +26850,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     }
     if let Some(config) = ledger_watcher {
         spawn_gateway_ledger_watcher(state.clone(), config);
+    }
+    if let Some(config) = catalog_watcher.take() {
+        spawn_gateway_catalog_watcher(state.clone(), config);
     }
     spawn_gateway_preferred_provider_watcher(
         state.clone(),
@@ -35991,6 +36099,19 @@ struct ProviderSessionRuntime<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct ProviderSessionAcceptReplay {
+    open_head: String,
+    accept_frame: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ProviderSessionReplayDecision {
+    Cached(Value),
+    Pending,
+    Conflict,
+}
+
+#[derive(Clone, Debug)]
 struct ActiveProviderSession {
     remote: String,
     user_pubkey: String,
@@ -36006,6 +36127,21 @@ struct ActiveProviderSession {
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
+    accept_replay: Option<ProviderSessionAcceptReplay>,
+}
+
+fn provider_session_replay_decision(
+    active: &ActiveProviderSession,
+    open_frame: &Value,
+) -> Result<ProviderSessionReplayDecision> {
+    let replay_head = session_frame_head(open_frame).context("hashing replayed s.open frame")?;
+    Ok(match &active.accept_replay {
+        Some(replay) if replay.open_head == replay_head => {
+            ProviderSessionReplayDecision::Cached(replay.accept_frame.clone())
+        }
+        Some(_) => ProviderSessionReplayDecision::Conflict,
+        None => ProviderSessionReplayDecision::Pending,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -45004,6 +45140,7 @@ async fn run_provider_session_heartbeat_connection(
     let mut join_rooms = true;
     let mut heartbeat_cache_updated_at = None::<Instant>;
     while !ctx.load.is_stopped() {
+        let round_started = Instant::now();
         let sent = timeout(
             ctx.bridge_operation_timeout,
             send_provider_heartbeat_round(
@@ -45045,7 +45182,20 @@ async fn run_provider_session_heartbeat_connection(
         }
         join_rooms = false;
         seq = seq.saturating_add(1);
-        sleep(ctx.heartbeat_interval).await;
+        // Back-pressure sentinel: heartbeats must never fall behind silently
+        // again (stale beats at the gateway drop the provider from routing).
+        // A late round skips its sleep instead of stacking further delay, and
+        // the lag is reported even without session debug enabled.
+        let round_elapsed = round_started.elapsed();
+        match ctx.heartbeat_interval.checked_sub(round_elapsed) {
+            Some(remaining) => sleep(remaining).await,
+            None => eprintln!(
+                "warning: provider heartbeat pipeline is behind: seq {} took {}ms against a {}ms interval; sending the next beat immediately",
+                seq.saturating_sub(1),
+                round_elapsed.as_millis(),
+                ctx.heartbeat_interval.as_millis()
+            ),
+        }
     }
     Ok(())
 }
@@ -45129,6 +45279,7 @@ async fn serve_provider_sessions(
     let component_poll_interval =
         provider_heartbeat_reconnect_initial.min(bridge_liveness_interval);
     let request_stall_timeout = provider_session_request_timeout()?;
+    let session_bridge_operation_deadline = provider_session_bridge_operation_deadline()?;
     let (max_request_bytes, max_payload_chunks) = provider_session_request_limits(&terms)?;
     let mut bridge = reconnect_provider_session_bridge(
         &sc_bridge_url,
@@ -45137,9 +45288,9 @@ async fn serve_provider_sessions(
         None,
         provider_heartbeat_reconnect_initial,
         provider_heartbeat_reconnect_max,
+        session_bridge_operation_deadline,
     )
     .await?;
-    let mut bridge_liveness_checked_at = Instant::now();
 
     provider_log(
         ctx.args,
@@ -45292,47 +45443,6 @@ async fn serve_provider_sessions(
                     }
                 }
             }
-            if bridge_liveness_checked_at.elapsed() >= bridge_liveness_interval {
-                match timeout(bridge_operation_timeout, bridge.ping()).await {
-                    Ok(Ok(_)) => {
-                        bridge_liveness_checked_at = Instant::now();
-                    }
-                    Ok(Err(BridgeError::Closed)) | Ok(Err(BridgeError::WebSocket(_))) => {
-                        let dropped = clear_provider_sessions_after_bridge_drop(
-                            &mut sessions,
-                            &mut pending_requests,
-                            &mut pending_payloads,
-                            &heartbeat_load,
-                        );
-                        provider_session_debug(format!(
-                            "SC-Bridge provider session liveness confirmed a closed transport; dropped {dropped} active session(s), reconnecting"
-                        ));
-                        bridge = reconnect_provider_session_bridge(
-                            &sc_bridge_url,
-                            &sc_bridge_token,
-                            &admin_transport_peer,
-                            deadline,
-                            provider_heartbeat_reconnect_initial,
-                            provider_heartbeat_reconnect_max,
-                        )
-                        .await?;
-                        bridge_liveness_checked_at = Instant::now();
-                        continue;
-                    }
-                    Ok(Err(err)) => {
-                        provider_session_debug(format!(
-                            "SC-Bridge provider session ping failed transiently without dropping active sessions: {err}"
-                        ));
-                        bridge_liveness_checked_at = Instant::now();
-                    }
-                    Err(_) => {
-                        provider_session_debug(
-                            "SC-Bridge provider session ping timed out; preserving active sessions while the frame stream remains open",
-                        );
-                        bridge_liveness_checked_at = Instant::now();
-                    }
-                }
-            }
             expire_provider_pending_sessions(
                 &mut bridge,
                 &mut sessions,
@@ -45473,8 +45583,22 @@ async fn serve_provider_sessions(
             if wait.is_zero() {
                 continue;
             }
-            match bridge.next_session_frame(wait).await {
+            match bridge.next_session_event(wait).await {
                 Ok(event) => {
+                    if event.get("type").and_then(Value::as_str) == Some("session_closed") {
+                        provider_session_debug(format!(
+                            "direct transport closed for session {}; preserving admission state for an identical s.open replay: {}",
+                            event
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            event
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("transport closed")
+                        ));
+                        continue;
+                    }
                     let frame_type = event
                         .get("frame")
                         .and_then(|frame| frame.get("t"))
@@ -45574,9 +45698,9 @@ async fn serve_provider_sessions(
                             deadline,
                             provider_heartbeat_reconnect_initial,
                             provider_heartbeat_reconnect_max,
+                            session_bridge_operation_deadline,
                         )
                         .await?;
-                    bridge_liveness_checked_at = Instant::now();
                 }
                 Err(err) => {
                     let dropped = clear_provider_sessions_after_bridge_drop(
@@ -45595,9 +45719,9 @@ async fn serve_provider_sessions(
                         deadline,
                         provider_heartbeat_reconnect_initial,
                         provider_heartbeat_reconnect_max,
+                        session_bridge_operation_deadline,
                     )
                     .await?;
-                    bridge_liveness_checked_at = Instant::now();
                 }
             }
         }
@@ -45626,12 +45750,13 @@ async fn connect_provider_session_bridge(
     sc_bridge_url: &str,
     sc_bridge_token: &str,
     admin_transport_peer: &str,
+    operation_deadline: Option<Duration>,
 ) -> Result<ScBridgeClient> {
     provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
-    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-        sc_bridge_url,
-        sc_bridge_token.to_owned(),
-    )?)
+    let mut bridge = ScBridgeClient::connect(
+        ScBridgeConfig::new(sc_bridge_url, sc_bridge_token.to_owned())?
+            .with_operation_deadline(operation_deadline),
+    )
     .await
     .context("connecting to SC-Bridge for provider session serving")?;
     provider_session_debug("subscribing to all direct session frames");
@@ -45667,14 +45792,20 @@ async fn reconnect_provider_session_bridge(
     deadline: Option<Instant>,
     initial_delay: Duration,
     max_delay: Duration,
+    operation_deadline: Option<Duration>,
 ) -> Result<ScBridgeClient> {
     let mut delay = initial_delay;
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             bail!("provider session serving deadline reached while reconnecting to SC-Bridge");
         }
-        match connect_provider_session_bridge(sc_bridge_url, sc_bridge_token, admin_transport_peer)
-            .await
+        match connect_provider_session_bridge(
+            sc_bridge_url,
+            sc_bridge_token,
+            admin_transport_peer,
+            operation_deadline,
+        )
+        .await
         {
             Ok(bridge) => return Ok(bridge),
             Err(err) => {
@@ -46441,6 +46572,37 @@ fn provider_session_request_timeout() -> Result<Duration> {
     provider_session_request_timeout_from(configured.as_deref())
 }
 
+/// Deadline for one loopback SC-Bridge request/reply on the provider session bridge.
+/// This bounds control operations (session_send/session_open/peer_connect acks), NOT
+/// inference or streaming duration; a reply that never arrives means the local
+/// Intercom handler is stuck on a dead remote (2026-07-12 live wedge: one s.reject
+/// send waiting forever on remote drain silenced the whole provider). The default
+/// must stay above every peer-side bounded wait it can carry — the Intercom defaults
+/// are 120s `--session-connect-max-wait-ms` / `--session-open-max-wait-ms` and the
+/// 90s peer_connect open budget — so operators who raise those knobs must raise this
+/// one too. `0` disables the deadline (historical wait-forever behavior).
+const DEFAULT_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MILLIS: u64 = 180_000;
+
+fn provider_session_bridge_operation_deadline() -> Result<Option<Duration>> {
+    provider_session_bridge_operation_deadline_from(
+        std::env::var("MAYHEM_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn provider_session_bridge_operation_deadline_from(
+    configured: Option<&str>,
+) -> Result<Option<Duration>> {
+    let millis = match configured {
+        Some(value) => value.trim().parse::<u64>().with_context(|| {
+            "MAYHEM_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MS must be a non-negative integer in milliseconds (0 disables the deadline)"
+        })?,
+        None => DEFAULT_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MILLIS,
+    };
+    Ok((millis > 0).then(|| Duration::from_millis(millis)))
+}
+
 fn provider_session_request_timeout_from(configured: Option<&str>) -> Result<Duration> {
     let millis = match configured {
         Some(value) => value.trim().parse::<u64>().with_context(|| {
@@ -46580,9 +46742,32 @@ async fn handle_provider_session_frame(
                     ));
                     let _ = bridge.session_close(&remote, &session_id).await;
                 } else {
-                    provider_session_debug(format!(
-                        "ignoring replayed s.open for active session {session_id} from {remote}"
-                    ));
+                    match provider_session_replay_decision(existing, &frame)? {
+                        ProviderSessionReplayDecision::Cached(accept_frame) => {
+                            provider_session_debug(format!(
+                                "replaying cached s.accept for active session {session_id} after transport reconnect"
+                            ));
+                            if let Err(err) = bridge
+                                .session_send(&remote, &session_id, accept_frame)
+                                .await
+                            {
+                                provider_session_debug(format!(
+                                    "cached s.accept replay for session {session_id} is waiting for the next transport reconnect: {err}"
+                                ));
+                            }
+                        }
+                        ProviderSessionReplayDecision::Conflict => {
+                            provider_session_debug(format!(
+                                "refusing changed s.open replay for active session {session_id} from {remote}"
+                            ));
+                            let _ = bridge.session_close(&remote, &session_id).await;
+                        }
+                        ProviderSessionReplayDecision::Pending => {
+                            provider_session_debug(format!(
+                                "s.open replay for session {session_id} arrived before admission completed; preserving the original admission"
+                            ));
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -46694,6 +46879,7 @@ async fn handle_provider_session_frame(
                             ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                             ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                             checkpoint_every,
+                            accept_replay: None,
                         },
                     );
                     protection.record_accept();
@@ -46714,7 +46900,7 @@ async fn handle_provider_session_frame(
                         "v": 1,
                         "contract_version": terms.contract_version,
                         "session_id": session_id,
-                        "open_head": open_head,
+                        "open_head": open_head.clone(),
                         "att_nonce": att_nonce,
                         "att_report": session_attestation.report,
                         "engine": {
@@ -46741,17 +46927,30 @@ async fn handle_provider_session_frame(
                     .await
                     .context("signing s.accept")?;
                     accept_frame["sig"] = json!(accept_sig);
-                    bridge
-                        .session_send(&remote, &session_id, accept_frame)
-                        .await
-                        .context("sending s.accept")?;
+                    sessions
+                        .get_mut(&session_id)
+                        .context("accepted provider session disappeared before s.accept")?
+                        .accept_replay = Some(ProviderSessionAcceptReplay {
+                        open_head,
+                        accept_frame: accept_frame.clone(),
+                    });
                     record_provider_session_request_progress(
                         pending_requests,
                         &session_id,
                         Instant::now(),
                         request_stall_timeout,
                     );
-                    provider_session_debug(format!("sent s.accept for session {session_id}"));
+                    match bridge
+                        .session_send(&remote, &session_id, accept_frame)
+                        .await
+                    {
+                        Ok(_) => provider_session_debug(format!(
+                            "sent s.accept for session {session_id}"
+                        )),
+                        Err(err) => provider_session_debug(format!(
+                            "s.accept for session {session_id} is cached for replay after transport reconnect: {err}"
+                        )),
+                    }
                 }
                 ProviderSessionDecision::Reject { code, reason } => {
                     provider_session_debug(format!(
@@ -49922,19 +50121,46 @@ async fn provider_session_spend_reservation_decision(
         .context("signing provider spend reservation")?;
     value["provider_sig"] = json!(provider_sig);
     let key = spend_reservation_feature_key(&value)?;
-    let submitted = match rpc
-        .submit_feature(json!({
-            "feature": "mayhem",
-            "key": key,
-            "value": value,
-        }))
-        .await
-    {
-        Ok(submitted) => submitted,
-        Err(err) => {
-            return Ok(reject(format!(
-                "could not reserve user balance on contract before serving: {err}"
-            )));
+    // The local relay comes up shortly after the peer process; an admission that
+    // races that window should wait it out (bounded) instead of rejecting the
+    // session outright (observed live 2026-07-12: s.reject BALANCE on a relay that
+    // became ready seconds later). Only relay-readiness errors retry; every other
+    // failure rejects immediately as before.
+    let retry_window = configured_nonnegative_millis(
+        "MAYHEM_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MS",
+        DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS,
+    )?;
+    let retry_interval = Duration::from_millis(configured_positive_millis(
+        None,
+        "MAYHEM_PROVIDER_ADMISSION_RELAY_RETRY_INTERVAL_MS",
+        DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_INTERVAL_MILLIS,
+        "provider admission relay retry interval",
+    )?);
+    let retry_deadline = Instant::now() + Duration::from_millis(retry_window);
+    let submitted = loop {
+        match rpc
+            .submit_feature(json!({
+                "feature": "mayhem",
+                "key": key.clone(),
+                "value": value.clone(),
+            }))
+            .await
+        {
+            Ok(submitted) => break submitted,
+            Err(err) => {
+                let message = format!("{err:#}");
+                let relay_not_ready = message.contains("relay is not ready");
+                if relay_not_ready && Instant::now() < retry_deadline {
+                    provider_session_debug(format!(
+                        "spend reservation waiting for local relay readiness; retrying: {message}"
+                    ));
+                    tokio::time::sleep(retry_interval).await;
+                    continue;
+                }
+                return Ok(reject(format!(
+                    "could not reserve user balance on contract before serving: {err}"
+                )));
+            }
         }
     };
     if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -53433,34 +53659,56 @@ async fn sign_ethereum_message(
     run_wallet_helper(args).await
 }
 
-async fn sign_message(keypair_path: &Path, password: &str, message: &str) -> Result<String> {
+// One Pear wallet-helper spawn per signature froze busy providers: at a 2s
+// heartbeat interval each ~1.5-3.5s spawn put the heartbeat pipeline permanently
+// behind, so heartbeats arrived >60s stale and routing dropped the provider
+// (2026-07-13 live incident). The helper is spawned once per keypair to extract
+// the ed25519 seed (validated against its derived public key), then every
+// signature is computed natively; trac-wallet signatures are plain ed25519 over
+// the raw message bytes, so the output is byte-identical.
+static WALLET_SIGNING_KEYS: std::sync::OnceLock<
+    tokio::sync::Mutex<HashMap<(PathBuf, String), SigningKey>>,
+> = std::sync::OnceLock::new();
+
+async fn cached_wallet_signing_key(keypair_path: &Path, password: &str) -> Result<SigningKey> {
+    let cache = WALLET_SIGNING_KEYS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let cache_key = (keypair_path.to_path_buf(), password.to_owned());
+    let mut cache = cache.lock().await;
+    if let Some(key) = cache.get(&cache_key) {
+        return Ok(key.clone());
+    }
     let mut args = vec![
-        "sign".to_owned(),
+        "seed".to_owned(),
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
-        "--message".to_owned(),
-        message.to_owned(),
     ];
     if !password.is_empty() {
         args.extend(["--password".to_owned(), password.to_owned()]);
     }
-    let output: SignOutput = run_wallet_helper(args).await?;
-    Ok(output.signature)
+    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    let seed = hex_decode_array::<32>(&output.signing_seed_hex, "wallet signing seed")?;
+    let key = SigningKey::from_bytes(&seed);
+    let derived_public_key = hex_encode(&key.verifying_key().to_bytes());
+    if !derived_public_key.eq_ignore_ascii_case(output.public_key.trim()) {
+        bail!(
+            "wallet signing seed derives public key {}, expected {}",
+            derived_public_key,
+            output.public_key
+        );
+    }
+    cache.insert(cache_key, key.clone());
+    Ok(key)
+}
+
+async fn sign_message(keypair_path: &Path, password: &str, message: &str) -> Result<String> {
+    let key = cached_wallet_signing_key(keypair_path, password).await?;
+    Ok(hex_encode(&key.sign(message.as_bytes()).to_bytes()))
 }
 
 async fn sign_hex(keypair_path: &Path, password: &str, message_hex: &str) -> Result<String> {
-    let mut args = vec![
-        "sign".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-        "--message-hex".to_owned(),
-        message_hex.to_owned(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    let output: SignOutput = run_wallet_helper(args).await?;
-    Ok(output.signature)
+    let key = cached_wallet_signing_key(keypair_path, password).await?;
+    let message = hex_decode_vec(message_hex, "sign message hex")?;
+    Ok(hex_encode(&key.sign(&message).to_bytes()))
 }
 
 async fn wallet_signing_seed(
@@ -60594,6 +60842,40 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_replays_only_the_identical_cached_accept() {
+        let terms = test_provider_session_terms();
+        let open_frame = test_session_open_frame(&terms);
+        let accept_frame = json!({
+            "t": "s.accept",
+            "session_id": open_frame["session_id"].clone(),
+            "sig": "77".repeat(64),
+        });
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.accept_replay = Some(ProviderSessionAcceptReplay {
+            open_head: session_frame_head(&open_frame).unwrap(),
+            accept_frame: accept_frame.clone(),
+        });
+
+        assert_eq!(
+            provider_session_replay_decision(&active, &open_frame).unwrap(),
+            ProviderSessionReplayDecision::Cached(accept_frame)
+        );
+
+        let mut changed = open_frame.clone();
+        changed["nonce"] = json!("changed");
+        assert_eq!(
+            provider_session_replay_decision(&active, &changed).unwrap(),
+            ProviderSessionReplayDecision::Conflict
+        );
+
+        active.accept_replay = None;
+        assert_eq!(
+            provider_session_replay_decision(&active, &open_frame).unwrap(),
+            ProviderSessionReplayDecision::Pending
+        );
+    }
+
+    #[test]
     fn provider_session_open_accepts_unbracketed_non_text_terms() {
         let mut terms = test_provider_session_terms();
         terms.ctx_bracket = None;
@@ -61032,6 +61314,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            accept_replay: None,
         };
         let body = json!({
             "messages": [
@@ -61110,6 +61393,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            accept_replay: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "large atto receipt" }],
@@ -61162,6 +61446,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            accept_replay: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -61222,6 +61507,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            accept_replay: None,
         };
         assert_eq!(
             provider_session_receipt_ack_timeout(&active),
@@ -61259,6 +61545,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            accept_replay: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -63066,6 +63353,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    accept_replay: None,
                 },
             );
         }
@@ -63115,6 +63403,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    accept_replay: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -63163,6 +63452,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    accept_replay: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -63998,6 +64288,37 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             provider_session_expired_pending_ids(&pending, now),
             vec!["expired-a".to_owned(), "expired-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn provider_session_bridge_deadline_bounds_control_ops_and_stays_configurable() {
+        assert_eq!(
+            provider_session_bridge_operation_deadline_from(None).unwrap(),
+            Some(Duration::from_millis(
+                DEFAULT_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MILLIS
+            ))
+        );
+        assert_eq!(
+            provider_session_bridge_operation_deadline_from(Some("600000")).unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        // 0 restores the historical wait-forever behavior instead of erroring.
+        assert_eq!(
+            provider_session_bridge_operation_deadline_from(Some("0")).unwrap(),
+            None
+        );
+        assert!(provider_session_bridge_operation_deadline_from(Some("later")).is_err());
+        // The default must exceed the Intercom-side bounded waits it can carry
+        // (120s open/connect budgets + the 90s peer_connect budget); shrinking it
+        // below them would convert healthy slow P2P admissions into failures.
+        assert!(
+            DEFAULT_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MILLIS > 120_000,
+            "session bridge op deadline must exceed the peer-side open/connect wait budgets"
+        );
+        assert!(
+            DEFAULT_PROVIDER_SESSION_BRIDGE_OP_TIMEOUT_MILLIS > DEFAULT_OPEN_TIMEOUT_MILLIS,
+            "session bridge op deadline must exceed the peer_connect open budget"
         );
     }
 
@@ -68607,6 +68928,7 @@ State initialization...
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            accept_replay: None,
         }
     }
 

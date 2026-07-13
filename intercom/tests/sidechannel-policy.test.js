@@ -209,3 +209,32 @@ test('sidechannel does not send from a stale fully-opened callback after channel
   assert.equal(sends, 0);
   assert.equal(sidechannel.channels.has(room), false);
 });
+
+test('fast PoW mining stays byte-identical to the canonical pow base', () => {
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel, MAYHEM_RELAY_CHANNEL],
+    entryChannel,
+    powEnabled: true,
+    powDifficulty: 8,
+    powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
+  });
+  const payload = {
+    id: 'cc'.repeat(16),
+    channel: MAYHEM_RELAY_CHANNEL,
+    from: 'aa'.repeat(32),
+    origin: null,
+    ts: 1783899999999,
+    // Adversarial message: contains the literal `"nonce":0` and unsorted keys so a
+    // sloppy prefix/suffix split would produce a different mining base.
+    message: {
+      zebra: [1, { b: 2, a: '"nonce":0' }],
+      control: 'mx_relay_request_v1',
+      value: { op: 'spend_reserve', provider: 'ee'.repeat(32), nested: { nonce: 0 } },
+    },
+  };
+  sidechannel._attachPow(payload);
+  assert.equal(typeof payload.pow?.nonce, 'number');
+  // The receiver-side check recomputes the canonical `_powBase`; passing it proves
+  // the mined nonce came from the identical byte stream.
+  assert.equal(sidechannel._checkPow(payload, MAYHEM_RELAY_CHANNEL), true);
+});

@@ -56,6 +56,15 @@ pub struct ScBridgeConfig {
     pub max_message_bytes: usize,
     pub max_queued_events: usize,
     pub max_queued_bytes: usize,
+    /// Upper bound on how long one request/reply operation may await its bridge
+    /// reply. `None` preserves the historical wait-forever behavior. The bridge is a
+    /// loopback socket, so a reply that never arrives means the peer-side handler is
+    /// stuck (for example a direct-session send waiting on remote drain); callers that
+    /// must stay responsive (the provider session loop) set this so one dead session
+    /// cannot silence the whole process. Must be sized above the peer's own bounded
+    /// waits (`--session-open-max-wait-ms`, `--session-connect-max-wait-ms`), never
+    /// below them.
+    pub operation_deadline: Option<Duration>,
 }
 
 impl ScBridgeConfig {
@@ -75,7 +84,14 @@ impl ScBridgeConfig {
                 "MAYHEM_SC_BRIDGE_MAX_QUEUED_BYTES",
                 DEFAULT_SC_BRIDGE_MAX_QUEUED_BYTES,
             )?,
+            operation_deadline: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_operation_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.operation_deadline = deadline;
+        self
     }
 
     #[must_use]
@@ -112,6 +128,7 @@ pub struct ScBridgeClient {
     queued_event_bytes: usize,
     max_queued_events: usize,
     max_queued_bytes: usize,
+    operation_deadline: Option<Duration>,
 }
 
 impl ScBridgeClient {
@@ -131,6 +148,7 @@ impl ScBridgeClient {
             queued_event_bytes: 0,
             max_queued_events: config.max_queued_events,
             max_queued_bytes: config.max_queued_bytes,
+            operation_deadline: config.operation_deadline,
         };
         client
             .request(json!({ "type": "auth", "token": config.token }), "auth_ok")
@@ -329,6 +347,15 @@ impl ScBridgeClient {
         self.next_event_of_type("session_frame", wait).await
     }
 
+    pub async fn next_session_event(&mut self, wait: Duration) -> Result<Value> {
+        if let Some(event) = self.pop_queued_session_event(None) {
+            return Ok(event);
+        }
+        timeout(wait, self.read_session_event(None))
+            .await
+            .map_err(|_| BridgeError::Timeout)?
+    }
+
     pub async fn next_session_frame_unbounded(&mut self) -> Result<Value> {
         if let Some(event) = self.pop_queued_event("session_frame") {
             return Ok(event);
@@ -343,7 +370,7 @@ impl ScBridgeClient {
         wait: Option<Duration>,
     ) -> Result<Value> {
         let session_id = session_id.as_ref();
-        if let Some(event) = self.pop_queued_session_event(session_id) {
+        if let Some(event) = self.pop_queued_session_frame_event(session_id) {
             return Ok(event);
         }
         let deadline = wait.map(|wait| Instant::now() + wait);
@@ -368,6 +395,23 @@ impl ScBridgeClient {
             if is_async_event(&message) {
                 self.queue_event_back(message)?;
             }
+        }
+    }
+
+    pub async fn next_session_event_for(
+        &mut self,
+        session_id: impl AsRef<str>,
+        wait: Option<Duration>,
+    ) -> Result<Value> {
+        let session_id = session_id.as_ref();
+        if let Some(event) = self.pop_queued_session_event(Some(session_id)) {
+            return Ok(event);
+        }
+        match wait {
+            Some(wait) => timeout(wait, self.read_session_event(Some(session_id)))
+                .await
+                .map_err(|_| BridgeError::Timeout)?,
+            None => self.read_session_event(Some(session_id)).await,
         }
     }
 
@@ -405,7 +449,7 @@ impl ScBridgeClient {
         Some(event)
     }
 
-    fn pop_queued_session_event(&mut self, session_id: &str) -> Option<Value> {
+    fn pop_queued_session_frame_event(&mut self, session_id: &str) -> Option<Value> {
         let idx = self.queued_events.iter().position(|event| {
             event.get("type").and_then(Value::as_str) == Some("session_frame")
                 && event.get("session_id").and_then(Value::as_str) == Some(session_id)
@@ -415,6 +459,36 @@ impl ScBridgeClient {
             .queued_event_bytes
             .saturating_sub(json_value_bytes(&event));
         Some(event)
+    }
+
+    fn pop_queued_session_event(&mut self, session_id: Option<&str>) -> Option<Value> {
+        let idx = self.queued_events.iter().position(|event| {
+            is_session_event(event)
+                && session_id.is_none_or(|session_id| {
+                    event.get("session_id").and_then(Value::as_str) == Some(session_id)
+                })
+        })?;
+        let event = self.queued_events.remove(idx)?;
+        self.queued_event_bytes = self
+            .queued_event_bytes
+            .saturating_sub(json_value_bytes(&event));
+        Some(event)
+    }
+
+    async fn read_session_event(&mut self, session_id: Option<&str>) -> Result<Value> {
+        loop {
+            let message = self.read_json().await?;
+            if is_session_event(&message)
+                && session_id.is_none_or(|session_id| {
+                    message.get("session_id").and_then(Value::as_str) == Some(session_id)
+                })
+            {
+                return Ok(message);
+            }
+            if is_async_event(&message) {
+                self.queue_event_back(message)?;
+            }
+        }
     }
 
     fn queue_event_back(&mut self, event: Value) -> Result<()> {
@@ -452,12 +526,37 @@ impl ScBridgeClient {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         request["id"] = json!(id);
-        self.write
-            .send(Message::Text(request.to_string().into()))
-            .await?;
+        let deadline = self.operation_deadline.map(|wait| Instant::now() + wait);
+        match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                timeout(
+                    remaining,
+                    self.write.send(Message::Text(request.to_string().into())),
+                )
+                .await
+                .map_err(|_| BridgeError::Timeout)??;
+            }
+            None => {
+                self.write
+                    .send(Message::Text(request.to_string().into()))
+                    .await?;
+            }
+        }
 
         loop {
-            let message = self.read_json().await?;
+            let message = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(BridgeError::Timeout);
+                    }
+                    timeout(remaining, self.read_json())
+                        .await
+                        .map_err(|_| BridgeError::Timeout)??
+                }
+                None => self.read_json().await?,
+            };
             let message_id = message.get("id").and_then(Value::as_u64);
             if is_async_event(&message) {
                 self.queue_event_back(message)?;
@@ -498,9 +597,25 @@ impl ScBridgeClient {
 }
 
 fn is_async_event(message: &Value) -> bool {
+    match message.get("type").and_then(Value::as_str) {
+        // `session_closed` is both the reply type of a `session_close` request AND
+        // an async close broadcast. Replies carry the numeric request id; the
+        // broadcast never does. Without this distinction every session_close reply
+        // was misfiled into the event queue and the caller waited forever
+        // (2026-07-13 live wedge: the provider loop stalled per close and the
+        // gateway hung after receipt ack, so requests never returned).
+        Some("session_closed") => message.get("id").and_then(Value::as_u64).is_none(),
+        // Sidechannel events carry the sidechannel payload's own (string) id, and
+        // session frames carry none; neither collides with numeric request ids.
+        Some("sidechannel_message" | "session_frame") => true,
+        _ => false,
+    }
+}
+
+fn is_session_event(message: &Value) -> bool {
     matches!(
         message.get("type").and_then(Value::as_str),
-        Some("sidechannel_message" | "session_frame")
+        Some("session_frame" | "session_closed")
     )
 }
 
@@ -654,6 +769,140 @@ mod tests {
             config.max_queued_events,
             DEFAULT_SC_BRIDGE_MAX_QUEUED_EVENTS
         );
+    }
+
+    #[tokio::test]
+    async fn session_close_reply_is_not_swallowed_by_the_close_event_queue() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let session = "dd".repeat(32);
+        let server_session = session.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = socket.next().await.unwrap().unwrap();
+            let auth: Value = match auth {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected auth text, got {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": auth["id"], "type": "auth_ok"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let close = socket.next().await.unwrap().unwrap();
+            let close: Value = match close {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected close text, got {other:?}"),
+            };
+            // An async close broadcast (no id) arrives before the actual reply.
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "session_closed",
+                        "session_id": server_session,
+                        "reason": "remote closed",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": close["id"],
+                        "type": "session_closed",
+                        "session_id": server_session,
+                        "closed": true,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut client = ScBridgeClient::connect(
+            ScBridgeConfig::new(format!("ws://{address}"), "token")
+                .unwrap()
+                .with_operation_deadline(Some(Duration::from_secs(2))),
+        )
+        .await
+        .unwrap();
+        let closed = client
+            .session_close("ee".repeat(32), &session)
+            .await
+            .unwrap();
+        assert_eq!(closed["closed"], true);
+        // The async broadcast stays available as an event.
+        let event = client
+            .next_session_event(Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(event["type"], "session_closed");
+        assert_eq!(event["reason"], "remote closed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operation_deadline_unblocks_a_request_whose_reply_never_arrives() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = socket.next().await.unwrap().unwrap();
+            let auth: Value = match auth {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected auth text, got {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": auth["id"], "type": "auth_ok"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            // Read the stats request, deliver an unrelated async event, then go
+            // silent: the wedge under test is a bridge handler that never replies.
+            let _stats = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "session_frame",
+                        "session_id": "cc".repeat(32),
+                        "frame": {"t": "s.open"},
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            // Keep the socket open until the client has timed out.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let mut client = ScBridgeClient::connect(
+            ScBridgeConfig::new(format!("ws://{address}"), "token")
+                .unwrap()
+                .with_operation_deadline(Some(Duration::from_millis(150))),
+        )
+        .await
+        .unwrap();
+        let error = client.stats().await.unwrap_err();
+        assert!(matches!(error, BridgeError::Timeout), "got {error:?}");
+        // The async event that arrived while awaiting the reply is preserved.
+        let queued = client
+            .next_session_frame(Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(queued["session_id"], "cc".repeat(32));
+        server.await.unwrap();
     }
 
     #[tokio::test]

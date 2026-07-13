@@ -512,6 +512,24 @@ const directSessionOpenMaxWaitMs = Number.parseInt(
     '',
   10
 );
+const directSessionHealthIntervalMs = Number.parseInt(
+  (flags['session-health-interval-ms'] && String(flags['session-health-interval-ms'])) ||
+    env.SESSION_HEALTH_INTERVAL_MS ||
+    '',
+  10
+);
+const directSessionHealthFreshMs = Number.parseInt(
+  (flags['session-health-fresh-ms'] && String(flags['session-health-fresh-ms'])) ||
+    env.SESSION_HEALTH_FRESH_MS ||
+    '',
+  10
+);
+const directSessionHealthTimeoutMs = Number.parseInt(
+  (flags['session-health-timeout-ms'] && String(flags['session-health-timeout-ms'])) ||
+    env.SESSION_HEALTH_TIMEOUT_MS ||
+    '',
+  10
+);
 const directSessionMaxSessions = Number.parseInt(
   (flags['session-max-sessions'] && String(flags['session-max-sessions'])) ||
     env.SESSION_MAX_SESSIONS ||
@@ -956,6 +974,15 @@ const directSession = new DirectSession(peer, {
   openMaxWaitMs: Number.isSafeInteger(directSessionOpenMaxWaitMs)
     ? directSessionOpenMaxWaitMs
     : undefined,
+  healthIntervalMs: Number.isSafeInteger(directSessionHealthIntervalMs)
+    ? directSessionHealthIntervalMs
+    : undefined,
+  healthFreshMs: Number.isSafeInteger(directSessionHealthFreshMs)
+    ? directSessionHealthFreshMs
+    : undefined,
+  healthTimeoutMs: Number.isSafeInteger(directSessionHealthTimeoutMs)
+    ? directSessionHealthTimeoutMs
+    : undefined,
   maxSessions: Number.isSafeInteger(directSessionMaxSessions)
     ? directSessionMaxSessions
     : undefined,
@@ -964,6 +991,9 @@ const directSession = new DirectSession(peer, {
     : undefined,
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
+    : null,
+  onClose: scBridgeEnabled
+    ? (event) => scBridge.handleSessionClose(event)
     : null,
 });
 peer.directSession = directSession;
