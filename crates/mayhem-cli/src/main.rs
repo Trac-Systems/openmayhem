@@ -11521,6 +11521,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     let canary_set_sha256 =
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
     catalog_endpoint_calibration_preflight(model, &prompts)?;
+    preflight_calibration_prompt_resources(model, &prompts)?;
     let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
     let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
@@ -11702,6 +11703,21 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         "endpoint-family calibration matrix failed: {}",
         endpoint_errors.join("; ")
     );
+    Ok(())
+}
+
+fn preflight_calibration_prompt_resources(
+    model: &catalog::CatalogModel,
+    prompts: &[CanaryPrompt],
+) -> Result<()> {
+    if model.canary.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+        return Ok(());
+    }
+    for prompt in prompts {
+        let body = canary_probe_request(&model.model_id, prompt);
+        calibration_chat_resource_items(&body)
+            .with_context(|| format!("validating canary prompt {} resources", prompt.id))?;
+    }
     Ok(())
 }
 
@@ -59233,6 +59249,33 @@ mod tests {
             assert_eq!(resource.item_bytes, 5);
             assert_eq!(resource.item_units, 16);
         }
+    }
+
+    #[test]
+    fn calibration_resource_preflight_runs_before_backend_loading() {
+        let document: CanarySetDocument = serde_json::from_value(json!({
+            "set_id": "preflight-test",
+            "prompts": [{
+                "id": "video-input",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "video",
+                        "video": {
+                            "data": "dmlkZW8=",
+                            "content_type": "video/mp4",
+                            "num_frames": 16,
+                        },
+                    }],
+                }],
+                "max_tokens": 1,
+            }],
+        }))
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models.remove(0);
+        model.canary.verification_method = CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned();
+
+        preflight_calibration_prompt_resources(&model, &document.prompts).unwrap();
     }
 
     #[test]
