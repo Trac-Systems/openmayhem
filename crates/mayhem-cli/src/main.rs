@@ -45335,6 +45335,7 @@ fn download_provider_huggingface_xet_file(
         cas_url.scheme() == "https" && cas_url.host_str().is_some(),
         "Hugging Face returned an unsafe Xet CAS URL"
     );
+    let cas_endpoint = cas_url.as_str().trim_end_matches('/').to_owned();
 
     let mut refresh_headers = reqwest::header::HeaderMap::new();
     refresh_headers.insert(
@@ -45350,50 +45351,58 @@ fn download_provider_huggingface_xet_file(
         );
     }
 
-    let session = XetSessionBuilder::new()
-        .build()
-        .context("starting the Hugging Face Xet session")?;
-    let group = session
-        .new_file_download_group()
-        .context("creating the Hugging Face Xet download group")?
-        .with_endpoint(cas_url.to_string())
-        .with_token_info(connection.access_token, connection.exp)
-        .with_token_refresh_url(token_url, refresh_headers)
-        .build_blocking()
-        .context("authorizing the Hugging Face Xet download group")?;
-    let handle = group
-        .download_file_to_path_blocking(
-            XetFileInfo::new(xet_hash.to_owned(), expected_bytes),
-            destination.to_path_buf(),
-        )
-        .context("starting the Hugging Face Xet artifact download")?;
+    let xet_hash = xet_hash.to_owned();
+    let destination = destination.to_path_buf();
+    std::thread::spawn(move || -> Result<PathBuf> {
+        // This thread intentionally has no ambient Tokio handle. hf-xet's
+        // blocking API then owns its runtime instead of selecting External mode.
+        let session = XetSessionBuilder::new()
+            .build()
+            .context("starting the Hugging Face Xet session")?;
+        let group = session
+            .new_file_download_group()
+            .context("creating the Hugging Face Xet download group")?
+            .with_endpoint(cas_endpoint)
+            .with_token_info(connection.access_token, connection.exp)
+            .with_token_refresh_url(token_url, refresh_headers)
+            .build_blocking()
+            .context("authorizing the Hugging Face Xet download group")?;
+        let handle = group
+            .download_file_to_path_blocking(
+                XetFileInfo::new(xet_hash, expected_bytes),
+                destination.clone(),
+            )
+            .context("starting the Hugging Face Xet artifact download")?;
 
-    let poll_done = Arc::new(AtomicBool::new(false));
-    let poller = {
-        let handle = handle.clone();
-        let poll_done = Arc::clone(&poll_done);
-        std::thread::spawn(move || {
-            while !poll_done.load(Ordering::Relaxed) {
+        let poll_done = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let handle = handle.clone();
+            let poll_done = Arc::clone(&poll_done);
+            std::thread::spawn(move || {
+                while !poll_done.load(Ordering::Relaxed) {
+                    if let Some(report) = handle.progress() {
+                        progress.record(report.bytes_completed, report.total_bytes, "running");
+                    }
+                    if handle.result().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
                 if let Some(report) = handle.progress() {
                     progress.record(report.bytes_completed, report.total_bytes, "running");
                 }
-                if handle.result().is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            if let Some(report) = handle.progress() {
-                progress.record(report.bytes_completed, report.total_bytes, "running");
-            }
-        })
-    };
-    let result = group
-        .finish_blocking()
-        .context("finishing the Hugging Face Xet artifact download");
-    poll_done.store(true, Ordering::Relaxed);
-    let _ = poller.join();
-    result?;
-    Ok(destination.to_path_buf())
+            })
+        };
+        let result = group
+            .finish_blocking()
+            .context("finishing the Hugging Face Xet artifact download");
+        poll_done.store(true, Ordering::Relaxed);
+        let _ = poller.join();
+        result?;
+        Ok(destination)
+    })
+    .join()
+    .map_err(|_| anyhow!("Hugging Face Xet worker thread panicked"))?
 }
 
 fn provider_download_partial_path(destination: &Path) -> PathBuf {
