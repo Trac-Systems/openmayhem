@@ -16647,7 +16647,9 @@ fn calibration_chat_resource_items(
                         .context("calibration video data is invalid base64")?;
                     let frames = video
                         .get("frames")
+                        .or_else(|| video.get("num_frames"))
                         .or_else(|| part.get("frames"))
+                        .or_else(|| part.get("num_frames"))
                         .and_then(Value::as_u64)
                         .filter(|frames| *frames > 0)
                         .context("calibration video input requires a positive frames count")?;
@@ -59204,6 +59206,33 @@ mod tests {
             aggregate_calibrated_modality_resource_profiles(&catalog.models[0], &[report], &memory)
                 .unwrap_err();
         assert!(error.to_string().contains("decoded video working set"));
+    }
+
+    #[test]
+    fn calibration_video_resources_accept_frames_and_num_frames_aliases() {
+        for frame_field in ["frames", "num_frames"] {
+            let mut video = json!({
+                "data": "dmlkZW8=",
+                "content_type": "video/mp4",
+            });
+            video[frame_field] = json!(16);
+            let body = json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "video",
+                        "video": video,
+                    }],
+                }],
+            });
+
+            let resources = calibration_chat_resource_items(&body).unwrap();
+            let resource = resources.get("video").unwrap();
+            assert_eq!(resource.unit, "frame");
+            assert_eq!(resource.item_count, 1);
+            assert_eq!(resource.item_bytes, 5);
+            assert_eq!(resource.item_units, 16);
+        }
     }
 
     #[test]
