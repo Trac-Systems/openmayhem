@@ -444,6 +444,8 @@ mayhem up --provider --yes \
 
 Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1`; Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
 
+To add a higher-tier worker without restarting an already running stack, pass the same explicit proof options to `mayhem provider serve add <enclave-id> --hardware-quote-kind <kind> --hardware-quote-command <path>`.
+
 Model downloads come from Hugging Face. Without a token you download anonymously, and anonymous pulls are rate-limited: multi-gigabyte models can slow to a crawl or fail partway. A free Hugging Face token fixes that. Getting one takes two minutes, once:
 
 1. Create a free account at [huggingface.co/join](https://huggingface.co/join).

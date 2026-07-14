@@ -5297,6 +5297,18 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "GB|%")]
     memory_reserve: Option<String>,
 
+    /// Hardware quote kind used to admit Tier-2/3 markets, for example tpm2_quote_ek.
+    #[arg(long, value_name = "KIND")]
+    hardware_quote_kind: Option<String>,
+
+    /// Command that prints nonce-bound hardware quote evidence for Tier-2/3 workers.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_command: Option<PathBuf>,
+
+    /// Maximum seconds to wait for the per-session hardware quote command.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
+    hardware_quote_timeout_seconds: u64,
+
     /// Print a machine-readable auto-fit report.
     #[arg(long)]
     json: bool,
@@ -5330,6 +5342,18 @@ struct ProviderServeAddArgs {
     /// Bound admin-defined model speciality levels for this worker. Repeat per speciality.
     #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
     speciality_levels: Vec<String>,
+
+    /// Hardware quote kind used to admit a Tier-2/3 market, for example tpm2_quote_ek.
+    #[arg(long, value_name = "KIND")]
+    hardware_quote_kind: Option<String>,
+
+    /// Command that prints nonce-bound hardware quote evidence for the worker.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_command: Option<PathBuf>,
+
+    /// Maximum seconds to wait for the per-session hardware quote command.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
+    hardware_quote_timeout_seconds: u64,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -25096,6 +25120,9 @@ fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
         disable_modalities: plan.provider_disable_modalities.clone(),
         speciality_levels: plan.provider_speciality_levels.clone(),
         memory_reserve: None,
+        hardware_quote_kind: plan.provider_hardware_quote_kind.clone(),
+        hardware_quote_command: plan.provider_hardware_quote_command.clone(),
+        hardware_quote_timeout_seconds: plan.provider_hardware_quote_timeout_seconds,
         json: true,
         dev_skip_catalog_verify: false,
     }
@@ -25112,6 +25139,7 @@ async fn up_auto_fit_add_provider_workers(
         client,
         &computed.selection,
         &computed.hardware,
+        computed.hardware_quote_config.as_ref(),
         None,
     )
     .await?;
@@ -25159,6 +25187,7 @@ async fn up_explicit_add_provider_workers(
         client,
         &computed.selection,
         &computed.hardware,
+        computed.hardware_quote_config.as_ref(),
         Some(&worker_names),
     )
     .await?;
@@ -25181,6 +25210,7 @@ async fn up_add_selected_provider_workers(
     client: &reqwest::Client,
     selection: &ProviderAutoFitSelection,
     hardware: &HardwareReport,
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
     worker_names: Option<&[String]>,
 ) -> Result<Vec<Value>> {
     let runtimes = selection
@@ -25208,6 +25238,7 @@ async fn up_add_selected_provider_workers(
             Some(candidate.served_ctx),
             &candidate.served_modalities,
             &candidate.served_specialities,
+            hardware_quote_config,
             worker_name,
         )?;
         let response = post_gateway_json(
@@ -38523,6 +38554,7 @@ struct ProviderServePlanComputed {
     candidates: Vec<ProviderCandidate>,
     selection: ProviderAutoFitSelection,
     gpu_layers: Option<u32>,
+    hardware_quote_config: Option<ProviderHardwareQuoteConfig>,
 }
 
 async fn compute_provider_serve_plan(
@@ -38532,6 +38564,8 @@ async fn compute_provider_serve_plan(
     let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
         compute_provider_serve_candidates(home, args).await?;
     let selection = select_provider_auto_fit_set(&candidates)?;
+    let hardware_quote_config =
+        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
     Ok(ProviderServePlanComputed {
         rpc_url,
         provider_catalog,
@@ -38539,6 +38573,7 @@ async fn compute_provider_serve_plan(
         candidates,
         selection,
         gpu_layers,
+        hardware_quote_config,
     })
 }
 
@@ -38553,6 +38588,8 @@ async fn compute_provider_explicit_serve_plan(
     let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
         compute_provider_serve_candidates(home, args).await?;
     let selection = select_provider_explicit_set(&candidates, requested)?;
+    let hardware_quote_config =
+        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
     Ok(ProviderServePlanComputed {
         rpc_url,
         provider_catalog,
@@ -38560,6 +38597,7 @@ async fn compute_provider_explicit_serve_plan(
         candidates,
         selection,
         gpu_layers,
+        hardware_quote_config,
     })
 }
 
@@ -38572,6 +38610,8 @@ async fn compute_provider_default_serve_plan(
     let selected = select_provider_candidate(&candidates, None)?;
     let requested = vec![selected.enclave.enclave_id.clone()];
     let selection = select_provider_explicit_set(&candidates, &requested)?;
+    let hardware_quote_config =
+        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
     Ok(ProviderServePlanComputed {
         rpc_url,
         provider_catalog,
@@ -38579,6 +38619,7 @@ async fn compute_provider_default_serve_plan(
         candidates,
         selection,
         gpu_layers,
+        hardware_quote_config,
     })
 }
 
@@ -38651,6 +38692,7 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
         selection,
         computed.gpu_layers,
         &args.disable_modalities,
+        computed.hardware_quote_config.as_ref(),
     );
     let selected = selection
         .candidates
@@ -38753,6 +38795,9 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         disable_modalities: args.disable_modalities.clone(),
         speciality_levels: args.speciality_levels.clone(),
         memory_reserve: None,
+        hardware_quote_kind: args.hardware_quote_kind.clone(),
+        hardware_quote_command: args.hardware_quote_command.clone(),
+        hardware_quote_timeout_seconds: args.hardware_quote_timeout_seconds,
         json: true,
         dev_skip_catalog_verify: false,
     };
@@ -38783,6 +38828,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         Some(selected.served_ctx),
         &selected.served_modalities,
         &selected.served_specialities,
+        computed.hardware_quote_config.as_ref(),
         None,
     )?;
     let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
@@ -38874,6 +38920,7 @@ fn provider_serve_child_config(
     ctx: Option<u64>,
     served_modalities: &[String],
     served_specialities: &BTreeMap<String, Vec<String>>,
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
     name: Option<String>,
 ) -> Result<Value> {
     let config_path = config_path_for_home(home);
@@ -38911,6 +38958,7 @@ fn provider_serve_child_config(
         "--enclave".to_owned(),
         enclave.to_owned(),
     ];
+    append_provider_hardware_quote_args(&mut args, hardware_quote_config);
     if let Some(gpu_layers) = gpu_layers.or(configured_gpu_layers) {
         args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
     }
@@ -38948,6 +38996,23 @@ fn provider_serve_child_config(
         "restart_stable_after_ms": MAYHEMD_RESTART_STABLE_AFTER_MILLIS,
         "crash_loop_threshold": MAYHEMD_CRASH_LOOP_THRESHOLD,
     }))
+}
+
+fn append_provider_hardware_quote_args(
+    args: &mut Vec<String>,
+    config: Option<&ProviderHardwareQuoteConfig>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    args.extend([
+        "--hardware-quote-kind".to_owned(),
+        hardware_quote_kind_name(&config.kind),
+        "--hardware-quote-command".to_owned(),
+        config.command.display().to_string(),
+        "--hardware-quote-timeout-seconds".to_owned(),
+        config.timeout.as_secs().to_string(),
+    ]);
 }
 
 fn provider_backend_runtime_child_env(
@@ -39053,9 +39118,9 @@ fn provider_start_args_for_serve_plan(
         skip_disk_bench: args.skip_disk_bench,
         chunk_size: DEFAULT_CHUNK_SIZE,
         enclave_binary: None,
-        hardware_quote_kind: None,
-        hardware_quote_command: None,
-        hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
+        hardware_quote_kind: args.hardware_quote_kind.clone(),
+        hardware_quote_command: args.hardware_quote_command.clone(),
+        hardware_quote_timeout_seconds: args.hardware_quote_timeout_seconds,
         sim: true,
         no_heartbeat: true,
         heartbeat_count: 1,
@@ -39086,6 +39151,7 @@ fn provider_auto_fit_up_command(
     selection: &ProviderAutoFitSelection,
     gpu_layers: Option<u32>,
     disabled_modalities: &[String],
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
 ) -> String {
     let enclaves = selection
         .candidates
@@ -39105,6 +39171,14 @@ fn provider_auto_fit_up_command(
     if let Some(gpu_layers) = gpu_layers {
         parts.push("--provider-gpu-layers".to_owned());
         parts.push(gpu_layers.to_string());
+    }
+    if let Some(config) = hardware_quote_config {
+        parts.push("--provider-hardware-quote-kind".to_owned());
+        parts.push(shell_single_quote(&hardware_quote_kind_name(&config.kind)));
+        parts.push("--provider-hardware-quote-command".to_owned());
+        parts.push(shell_single_quote(&config.command.display().to_string()));
+        parts.push("--provider-hardware-quote-timeout-seconds".to_owned());
+        parts.push(config.timeout.as_secs().to_string());
     }
     for modality in disabled_modalities {
         parts.push("--provider-disable-modality".to_owned());
@@ -45201,8 +45275,11 @@ async fn collect_provider_hardware_quote(
     }
     .context("preparing Mayhem hardware quote binding")?;
     let kind_name = hardware_quote_kind_name(&config.kind);
-    let mut command = Command::new(&config.command);
+    let (program, program_args) =
+        provider_hardware_quote_invocation(&config.command, cfg!(windows));
+    let mut command = Command::new(program);
     command
+        .args(program_args)
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -45248,6 +45325,28 @@ async fn collect_provider_hardware_quote(
             config.command.display()
         )
     })
+}
+
+fn provider_hardware_quote_invocation(command: &Path, windows: bool) -> (PathBuf, Vec<String>) {
+    if windows
+        && command
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+    {
+        return (
+            PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-File".to_owned(),
+                command.display().to_string(),
+            ],
+        );
+    }
+    (command.to_path_buf(), Vec::new())
 }
 
 fn parse_hardware_quote_command_output(
@@ -62450,6 +62549,12 @@ mod tests {
             "35",
             "--ctx",
             "131072",
+            "--hardware-quote-kind",
+            "tpm2-quote-ek",
+            "--hardware-quote-command",
+            "mayhem-tpm2-quote-windows.ps1",
+            "--hardware-quote-timeout-seconds",
+            "90",
             "--json",
         ])
         .unwrap();
@@ -62465,6 +62570,12 @@ mod tests {
         assert_eq!(args.enclave, "enclave-a");
         assert_eq!(args.gpu_layers, Some(35));
         assert_eq!(args.ctx, Some(131_072));
+        assert_eq!(args.hardware_quote_kind.as_deref(), Some("tpm2-quote-ek"));
+        assert_eq!(
+            args.hardware_quote_command.as_deref(),
+            Some(Path::new("mayhem-tpm2-quote-windows.ps1"))
+        );
+        assert_eq!(args.hardware_quote_timeout_seconds, 90);
         assert!(args.json);
 
         let serve_remove = Cli::try_parse_from([
@@ -62539,6 +62650,32 @@ mod tests {
         assert!(report.get("env").is_none());
         assert!(!encoded.contains("local-secret-value"));
         assert!(!encoded.contains("provider-python"));
+    }
+
+    #[test]
+    fn provider_serve_child_carries_fresh_hardware_quote_configuration() {
+        let config = ProviderHardwareQuoteConfig {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            command: PathBuf::from(r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1"),
+            timeout: Duration::from_secs(90),
+        };
+        let mut args = vec!["provider".to_owned(), "start".to_owned()];
+
+        append_provider_hardware_quote_args(&mut args, Some(&config));
+
+        assert_eq!(
+            args,
+            vec![
+                "provider",
+                "start",
+                "--hardware-quote-kind",
+                "tpm2_quote_ek",
+                "--hardware-quote-command",
+                r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1",
+                "--hardware-quote-timeout-seconds",
+                "90",
+            ]
+        );
     }
 
     #[test]
@@ -64109,6 +64246,29 @@ mod tests {
             .expect("quote config present");
         assert!(config.command.is_absolute());
         assert!(config.command.ends_with(Path::new("tools/gpu-attestation")));
+    }
+
+    #[test]
+    fn windows_powershell_quote_helpers_need_no_wrapper_script() {
+        let helper = Path::new(r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1");
+        let (program, args) = provider_hardware_quote_invocation(helper, true);
+        assert_eq!(program, Path::new("powershell.exe"));
+        assert_eq!(
+            args,
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1",
+            ]
+        );
+
+        let executable = Path::new(r"C:\mayhem\scripts\quote.exe");
+        let (program, args) = provider_hardware_quote_invocation(executable, true);
+        assert_eq!(program, executable);
+        assert!(args.is_empty());
     }
 
     #[test]
