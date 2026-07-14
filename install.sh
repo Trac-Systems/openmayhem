@@ -531,12 +531,17 @@ install_from_artifact() {
 
 install_from_source() {
   local bin src target_root
+  local -a cargo_args
 
   [[ -f "$SOURCE_DIR/Cargo.toml" ]] || die "source dir does not contain Cargo.toml: $SOURCE_DIR"
   command -v cargo >/dev/null 2>&1 || die "Rust/Cargo is required for --from-source installs"
 
   log "building release binaries from $SOURCE_DIR"
-  (cd "$SOURCE_DIR" && cargo build --release --workspace --bins)
+  cargo_args=(build --release --workspace --bins)
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    cargo_args+=(--features mayhem-cli/llama-cpp-metal)
+  fi
+  (cd "$SOURCE_DIR" && cargo "${cargo_args[@]}")
 
   target_root="${CARGO_TARGET_DIR:-$SOURCE_DIR/target}"
   if [[ "$target_root" != /* ]]; then

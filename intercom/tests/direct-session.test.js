@@ -59,7 +59,7 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.healthProtocol, 'mx/s-health');
   assert.equal(stats.healthIntervalMs, 5_000);
   assert.equal(stats.healthFreshMs, 15_000);
-  assert.equal(stats.healthTimeoutMs, 0);
+  assert.equal(stats.healthTimeoutMs, 30_000);
   assert.equal(stats.maxSessions, 1024);
   assert.equal(stats.maxSessionsPerConnection, 128);
   assert.equal(stats.sessionCount, 0);
@@ -480,6 +480,38 @@ test('DirectSession pins an already-connected peer for automatic reconnects', as
   assert.equal(directSession.stats().lastConnectAttempt.state, 'connected');
 });
 
+test('DirectSession re-arms a disconnected peer already parked as explicit', async () => {
+  const left = [];
+  const joined = [];
+  const connections = [];
+  const connection = { remotePublicKey: b4a.from(remote, 'hex') };
+  let directSession = null;
+  directSession = new DirectSession({
+    swarm: {
+      connections,
+      leavePeer: (key) => left.push(b4a.toString(key, 'hex')),
+      joinPeer: (key) => {
+        joined.push(b4a.toString(key, 'hex'));
+        connections.push(connection);
+        directSession.connectionHealth.set(connection, {
+          connection,
+          lastAckAt: Date.now(),
+        });
+      },
+    },
+  }, {});
+  directSession._prepareConnection = () => {};
+  directSession.explicitPeers.add(remote);
+
+  const connected = await directSession.connectPeer(remote, 25);
+
+  assert.deepEqual(left, [remote]);
+  assert.deepEqual(joined, [remote]);
+  assert.equal(connected.remote, remote);
+  assert.equal(connected.connected, true);
+  assert.equal(directSession.stats().lastConnectAttempt.state, 'connected');
+});
+
 test('DirectSession prefers the most recently bidirectionally healthy connection', () => {
   const stale = { remotePublicKey: b4a.from(remote, 'hex') };
   const healthy = { remotePublicKey: b4a.from(remote, 'hex') };
@@ -567,7 +599,7 @@ test('ScBridge loopback helpers identify local direct session routes', () => {
   assert.throws(() => loopbackSessionInfo(localPeer, 'bad'), /Invalid session_id/);
 });
 
-test('DirectSession keeps and uses a connection whose peer never opens mx/s-health', async () => {
+test('DirectSession keeps and uses a legacy connection when health retirement is disabled', async () => {
   let destroyed = 0;
   const connection = {
     remotePublicKey: b4a.from(remote, 'hex'),
@@ -578,7 +610,7 @@ test('DirectSession keeps and uses a connection whose peer never opens mx/s-heal
       connections: [connection],
       joinPeer: () => {},
     },
-  }, { healthTimeoutMs: 10 });
+  }, { healthTimeoutMs: 0 });
   directSession._prepareConnection = () => {};
 
   const connected = await directSession.connectPeer(remote, 200);
@@ -588,4 +620,121 @@ test('DirectSession keeps and uses a connection whose peer never opens mx/s-heal
   const attempt = directSession.stats().lastConnectAttempt;
   assert.equal(attempt.state, 'connected');
   assert.equal(attempt.verified, false);
+});
+
+test('DirectSession accepts a late health acknowledgement from a previously verified peer', async () => {
+  const connection = {
+    remotePublicKey: b4a.from(remote, 'hex'),
+    destroyed: false,
+    closed: false,
+  };
+  const directSession = new DirectSession({
+    swarm: {
+      connections: [connection],
+      joinPeer: () => {},
+    },
+  }, {
+    connectPollMs: 1,
+    healthFreshMs: 100,
+    healthTimeoutMs: 10,
+  });
+  const health = {
+    connection,
+    opened: true,
+    lastAckAt: 0,
+    unhealthySince: 0,
+  };
+  directSession.connectionHealth.set(connection, health);
+  directSession.verifiedPeers.add(remote);
+  directSession._prepareConnection = () => {};
+  directSession._ensureConnectionHealthy = async () => {
+    setTimeout(() => {
+      health.lastAckAt = Date.now();
+    }, 2);
+    throw new Error('initial probe raced channel startup');
+  };
+
+  const connected = await directSession.connectPeer(remote, 100);
+
+  assert.equal(connected.connected, true);
+  assert.equal(directSession.lastConnectAttempt.state, 'connected');
+  assert.equal(directSession.lastConnectAttempt.verified, true);
+  assert.equal(directSession.verifiedPeers.has(remote), true);
+});
+
+test('DirectSession retires a verified dead connection despite stale active session state', () => {
+  let destroyed = 0;
+  const connection = {
+    remotePublicKey: b4a.from(remote, 'hex'),
+    destroy: () => { destroyed += 1; },
+  };
+  const directSession = new DirectSession({}, { healthTimeoutMs: 10 });
+  const health = {
+    connection,
+    channel: { closed: false, destroyed: false },
+    message: null,
+    opened: false,
+    lastAckAt: 0,
+    unhealthySince: Date.now() - 11,
+    timer: null,
+    waiters: new Map(),
+  };
+  directSession.explicitPeers.add(remote);
+  directSession.verifiedPeers.add(remote);
+  directSession.connectionHealth.set(connection, health);
+
+  directSession.sessions.set(`${remote}:${sessionId}`, {
+    sessionId,
+    remote,
+    connection,
+    channel: { close: () => {} },
+    drainWaiters: new Set(),
+    closed: false,
+  });
+  directSession._healthTick(health);
+  assert.equal(destroyed, 1);
+  assert.equal(directSession.connectionHealth.has(connection), false);
+});
+
+test('DirectSession does not retire an explicit legacy connection without proven health support', () => {
+  let destroyed = 0;
+  const connection = {
+    remotePublicKey: b4a.from(remote, 'hex'),
+    destroy: () => { destroyed += 1; },
+  };
+  const directSession = new DirectSession({}, { healthTimeoutMs: 10 });
+  const health = {
+    connection,
+    channel: { closed: false, destroyed: false },
+    message: null,
+    opened: false,
+    lastAckAt: 0,
+    unhealthySince: Date.now() - 100,
+    timer: null,
+    waiters: new Map(),
+  };
+  directSession.explicitPeers.add(remote);
+  directSession.connectionHealth.set(connection, health);
+
+  directSession._healthTick(health);
+
+  assert.equal(destroyed, 0);
+  assert.equal(directSession.connectionHealth.has(connection), true);
+});
+
+test('DirectSession re-arms a pinned peer after its retired connection closes', () => {
+  const left = [];
+  const joined = [];
+  const directSession = new DirectSession({
+    swarm: {
+      leavePeer: (key) => left.push(b4a.toString(key, 'hex')),
+      joinPeer: (key) => joined.push(b4a.toString(key, 'hex')),
+    },
+  });
+  directSession.explicitPeers.add(remote);
+
+  assert.equal(directSession._rejoinExplicitPeer(remote), true);
+  assert.deepEqual(left, [remote]);
+  assert.deepEqual(joined, [remote]);
+  assert.equal(directSession._rejoinExplicitPeer('ff'.repeat(32)), false);
 });

@@ -37996,6 +37996,22 @@ fn provider_llama_accelerator_preflight(
     n_layers_gpu: Option<u32>,
     hardware: &HardwareReport,
 ) -> Result<()> {
+    provider_llama_accelerator_preflight_for_build(
+        n_layers_gpu,
+        hardware,
+        cfg!(feature = "llama-cpp-cuda"),
+        cfg!(feature = "llama-cpp-metal"),
+        cfg!(feature = "llama-cpp-vulkan"),
+    )
+}
+
+fn provider_llama_accelerator_preflight_for_build(
+    n_layers_gpu: Option<u32>,
+    hardware: &HardwareReport,
+    cuda_enabled: bool,
+    metal_enabled: bool,
+    vulkan_enabled: bool,
+) -> Result<()> {
     if n_layers_gpu.unwrap_or(0) == 0 {
         return Ok(());
     }
@@ -38003,19 +38019,31 @@ fn provider_llama_accelerator_preflight(
         .gpus
         .iter()
         .any(|gpu| gpu.vendor == GpuVendor::Nvidia);
+    let has_metal = hardware
+        .gpus
+        .iter()
+        .any(|gpu| gpu.vendor == GpuVendor::Apple && gpu.backend == GpuBackend::Metal);
     let has_vulkan = hardware
         .gpus
         .iter()
         .any(|gpu| gpu.backend == GpuBackend::Vulkan);
-    if has_nvidia && cfg!(feature = "llama-cpp-cuda") {
+    if has_nvidia && cuda_enabled {
         return Ok(());
     }
-    if has_vulkan && cfg!(feature = "llama-cpp-vulkan") {
+    if has_metal && metal_enabled {
+        return Ok(());
+    }
+    if has_vulkan && vulkan_enabled {
         return Ok(());
     }
     if has_nvidia {
         bail!(
             "llama.cpp selected GPU layers on NVIDIA hardware, but this Mayhem build lacks llama-cpp-cuda; rebuild from source with `--features llama-cpp-cuda`"
+        );
+    }
+    if has_metal {
+        bail!(
+            "llama.cpp selected GPU layers on Apple Metal hardware, but this Mayhem build lacks llama-cpp-metal; rebuild from source with `--features llama-cpp-metal`"
         );
     }
     if has_vulkan {
@@ -61764,6 +61792,24 @@ mod tests {
         assert!(message.contains("TensorRT-LLM requires a compatible NVIDIA GPU"));
         assert!(message.contains("no NVIDIA GPU detected"));
         assert!(message.contains("suggestion: use catalog artifact mlx-4bit via mlx"));
+    }
+
+    #[test]
+    fn provider_llama_preflight_accepts_metal_only_when_built_for_it() {
+        let hardware = test_hardware(FixtureProfile::AppleSilicon);
+
+        provider_llama_accelerator_preflight_for_build(Some(16), &hardware, false, true, false)
+            .unwrap();
+
+        let err = provider_llama_accelerator_preflight_for_build(
+            Some(16),
+            &hardware,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("lacks llama-cpp-metal"));
     }
 
     #[test]

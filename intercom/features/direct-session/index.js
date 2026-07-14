@@ -19,7 +19,7 @@ const DEFAULT_CONNECT_POLL_MS = 100;
 const DEFAULT_OPEN_MAX_WAIT_MS = 120_000;
 const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_HEALTH_FRESH_MS = 15_000;
-const DEFAULT_HEALTH_TIMEOUT_MS = 0;
+const DEFAULT_HEALTH_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_SESSIONS = 1024;
 const DEFAULT_MAX_SESSIONS_PER_CONNECTION = 128;
 const MAX_FRAME_TYPE_BYTES = 64;
@@ -106,6 +106,8 @@ class DirectSession extends Feature {
     this.pairedConnections = new WeakSet();
     this.connectionErrors = new WeakMap();
     this.connectionHealth = new Map();
+    this.explicitPeers = new Set();
+    this.verifiedPeers = new Set();
     this.healthNonce = 0;
     this.lastConnectAttempt = null;
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
@@ -154,8 +156,13 @@ class DirectSession extends Feature {
       })),
       connections: Array.from(this.connectionHealth.values()).map((health) => ({
         remote: this._remoteKey(health.connection),
+        explicit: this.explicitPeers.has(this._remoteKey(health.connection)),
+        health_capable: this.verifiedPeers.has(this._remoteKey(health.connection)),
         healthy: this._healthIsFresh(health),
         last_ack_age_ms: health.lastAckAt > 0 ? Date.now() - health.lastAckAt : null,
+        unhealthy_age_ms: health.unhealthySince > 0
+          ? Date.now() - health.unhealthySince
+          : null,
         opened: health.opened === true,
         initiator: health.connection?.isInitiator === true,
         keep_alive_ms: Number(health.connection?.keepAlive) || 0,
@@ -202,7 +209,15 @@ class DirectSession extends Feature {
       error: null,
     };
     this.lastConnectAttempt = attempt;
-    this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
+    const wasExplicit = this.explicitPeers.has(normalizedRemote);
+    this.explicitPeers.add(normalizedRemote);
+    if (wasExplicit && this._connectionsForRemote(normalizedRemote).length === 0) {
+      // joinPeer is a no-op for a peer already parked in Hyperswarm's explicit
+      // retry backoff. Refresh that public intent before this caller waits.
+      this._rejoinExplicitPeer(normalizedRemote);
+    } else {
+      this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
+    }
     const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, this.connectMaxWaitMs));
     const deadline = Date.now() + maxWaitMs;
     const probed = new WeakSet();
@@ -211,7 +226,17 @@ class DirectSession extends Feature {
       const connections = this._connectionsForRemote(normalizedRemote);
       for (const connection of connections) {
         this._prepareConnection(connection);
-        if (probed.has(connection)) continue;
+        if (probed.has(connection)) {
+          const health = this.connectionHealth.get(connection);
+          if (this._healthIsFresh(health)) {
+            this.verifiedPeers.add(normalizedRemote);
+            attempt.state = 'connected';
+            attempt.verified = true;
+            attempt.completed_at = Date.now();
+            return this._peerInfo(normalizedRemote, true);
+          }
+          continue;
+        }
         const remaining = Math.max(1, deadline - Date.now());
         // Health verification is advisory. Peers running releases without the
         // mx/s-health protocol never open the channel, and a shared Hyperswarm
@@ -223,6 +248,7 @@ class DirectSession extends Feature {
         );
         try {
           await this._ensureConnectionHealthy(connection, probeMs);
+          this.verifiedPeers.add(normalizedRemote);
           attempt.state = 'connected';
           attempt.verified = true;
           attempt.completed_at = Date.now();
@@ -230,6 +256,11 @@ class DirectSession extends Feature {
         } catch (error) {
           attempt.error = error?.message ?? String(error);
           probed.add(connection);
+          if (this.healthTimeoutMs > 0 && this.verifiedPeers.has(normalizedRemote)) {
+            const health = this.connectionHealth.get(connection);
+            if (health && health.unhealthySince === 0) health.unhealthySince = Date.now();
+            continue;
+          }
           if (!fallback && connection.destroyed !== true && connection.closed !== true) {
             fallback = connection;
           }
@@ -337,9 +368,28 @@ class DirectSession extends Feature {
       }
     });
     connection.on('close', () => {
+      const remote = this._remoteKey(connection);
       this._dropConnection(connection);
       this._dropHealthConnection(connection);
+      this._rejoinExplicitPeer(remote);
     });
+  }
+
+  _rejoinExplicitPeer(remote) {
+    if (
+      !remote
+      || !this.explicitPeers.has(remote)
+      || typeof this.peer?.swarm?.joinPeer !== 'function'
+    ) {
+      return false;
+    }
+    const key = b4a.from(remote, 'hex');
+    // Hyperswarm's retry ladder eventually parks an already-explicit peer for
+    // minutes. Cycle only the public explicit-peer intent so joinPeer queues a
+    // fresh attempt instead of returning early for that parked peer.
+    this.peer.swarm.leavePeer?.(key);
+    this.peer.swarm.joinPeer(key);
+    return true;
   }
 
   _muxForConnection(connection) {
@@ -380,10 +430,13 @@ class DirectSession extends Feature {
       message: null,
       opened: false,
       lastAckAt: 0,
+      unhealthySince: 0,
       timer: null,
       waiters: new Map(),
     };
     this.connectionHealth.set(connection, health);
+    health.timer = setInterval(() => this._healthTick(health), this.healthIntervalMs);
+    health.timer.unref?.();
     if (typeof mux.pair === 'function') {
       mux.pair({ protocol: HEALTH_PROTOCOL }, () => {
         this._openHealthChannel(health);
@@ -421,8 +474,6 @@ class DirectSession extends Feature {
       onmessage: (frame) => this._handleHealthFrame(health, frame),
     });
     channel.open();
-    health.timer = setInterval(() => this._healthTick(health), this.healthIntervalMs);
-    health.timer.unref?.();
   }
 
   _healthTick(health) {
@@ -430,7 +481,34 @@ class DirectSession extends Feature {
       this._dropHealthConnection(health?.connection);
       return;
     }
-    if (!health.opened) return;
+    const remote = this._remoteKey(health.connection);
+    const explicitlyPinned = remote && this.explicitPeers.has(remote);
+    if (this._healthIsFresh(health)) {
+      health.unhealthySince = 0;
+    } else if (
+      explicitlyPinned
+      && this.verifiedPeers.has(remote)
+      && this.healthTimeoutMs > 0
+    ) {
+      const now = Date.now();
+      if (health.unhealthySince === 0) {
+        health.unhealthySince = now;
+      } else if (now - health.unhealthySince >= this.healthTimeoutMs) {
+        if (this.debug) {
+          console.log(`[direct-session] retiring unresponsive explicit connection to ${remote}`);
+        }
+        try {
+          health.connection.destroy?.();
+        } catch (_error) {}
+        this._dropConnection(health.connection);
+        this._dropHealthConnection(health.connection);
+        return;
+      }
+    }
+    if (!health.opened) {
+      this._openHealthChannel(health);
+      return;
+    }
     this._sendHealthPing(health);
   }
 
@@ -474,6 +552,9 @@ class DirectSession extends Feature {
     }
     if (frame.t !== 'pong') return;
     health.lastAckAt = Date.now();
+    health.unhealthySince = 0;
+    const remote = this._remoteKey(health.connection);
+    if (remote) this.verifiedPeers.add(remote);
     const waiter = health.waiters.get(frame.n);
     if (!waiter) return;
     health.waiters.delete(frame.n);

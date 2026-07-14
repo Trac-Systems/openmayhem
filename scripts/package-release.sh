@@ -248,6 +248,9 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   if [[ "$TARGET_SET" -eq 1 ]]; then
     cargo_args+=(--target "$TARGET")
   fi
+  case "$TARGET" in
+    *-apple-darwin) cargo_args+=(--features mayhem-cli/llama-cpp-metal) ;;
+  esac
   log "building release binaries"
   (cd "$ROOT_DIR" && cargo "${cargo_args[@]}")
 fi

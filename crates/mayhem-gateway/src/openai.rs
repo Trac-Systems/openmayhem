@@ -21935,7 +21935,8 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
-        let max_spend_au = estimate_max_spend_au(price, request, &prompt_text);
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let max_spend_au = estimate_max_spend_au(price, request, served_ctx);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         if max_spend_au > self.ledger_balance_au() {
             return Err(ApiError::payment_required(
@@ -21946,7 +21947,6 @@ impl GatewayState {
         self.access_control
             .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
-        let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
@@ -25389,12 +25389,15 @@ fn embedding_response_value(embedding: &[f32], encoding_format: &str) -> Value {
 fn estimate_max_spend_au(
     price: &PriceRefAu,
     request: &ChatCompletionRequest,
-    prompt_text: &str,
+    served_ctx: u32,
 ) -> MoneyAu {
-    let usage = ReceiptUsage::text(
-        rough_tokens(prompt_text),
-        u64::from(request.max_tokens.unwrap_or(1024).max(1)),
-    );
+    let served_ctx = u64::from(served_ctx).max(1);
+    let max_output_tokens = request
+        .max_tokens
+        .max(request.max_completion_tokens)
+        .unwrap_or(1024)
+        .max(1);
+    let usage = ReceiptUsage::text(served_ctx, u64::from(max_output_tokens).min(served_ctx));
     calculate_au_owed(price, &usage).max(1_000)
 }
 
@@ -25996,6 +25999,40 @@ mod tests {
             .prepare_chat_invocation_for_route(&model, &request, None, &max_bid)
             .expect_err("gateway rejects quotes above the user max-bid");
         assert_eq!(err.param, Some("X-Mayhem-Max-Price-Au"));
+    }
+
+    #[test]
+    fn chat_spend_voucher_bounds_media_expansion_by_served_context() {
+        let mut model = test_model();
+        model.mayhem.caps.vision = true;
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": test_png_data_url()}},
+        ]);
+        request.max_completion_tokens = Some(2_048);
+
+        let invocation = GatewayState::from_models(vec![model.clone()])
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("multimodal request receives a context-bounded voucher");
+        let full_context_bound = calculate_au_owed(
+            &model.mayhem.price_ref_au,
+            &ReceiptUsage::text(u64::from(model.mayhem.caps.ctx), 2_048),
+        )
+        .max(1_000);
+        let provider_media_receipt =
+            calculate_au_owed(&model.mayhem.price_ref_au, &ReceiptUsage::text(289, 2_048));
+
+        assert_eq!(
+            invocation.spend_voucher.body.max_spend_au,
+            full_context_bound
+        );
+        assert!(invocation.spend_voucher.body.max_spend_au >= provider_media_receipt);
     }
 
     #[test]
