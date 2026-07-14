@@ -549,7 +549,23 @@ pub struct MayhemModelInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kyb_identities: Vec<ProviderKybInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markets: Vec<GatewayMarketInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_candidates: Vec<GatewayRouteCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayMarketInfo {
+    pub enclave_id: String,
+    pub att_tier: u8,
+    pub quant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_bracket: Option<String>,
+    pub room_ids: Vec<String>,
+    pub providers_online: u32,
+    pub route_count: u32,
+    pub availability: String,
+    pub price_ref_au: PriceRefAu,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2374,6 +2390,7 @@ impl GatewayState {
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
+                markets: Vec::new(),
                 route_candidates: Vec::new(),
             },
         }])
@@ -7283,6 +7300,33 @@ fn dashboard_model_price_series(
 ) -> Vec<DashboardPriceSeries> {
     let mut by_key: BTreeMap<(String, String, String, String), DashboardPriceSeries> =
         BTreeMap::new();
+    if provider_scope.is_none() {
+        for market in &model.mayhem.markets {
+            let tier = format!("T{}", market.att_tier.max(1));
+            let quant = normalize_quant_bucket(&market.quant)
+                .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
+            for mut series in dashboard_price_series_from_price(&market.price_ref_au, &tier, &quant)
+            {
+                if let Some(ctx_bracket) = market.ctx_bracket.as_ref() {
+                    if series.ctx_bracket == "base" {
+                        series.ctx_bracket = ctx_bracket.clone();
+                    }
+                    for point in &mut series.points {
+                        if point.ctx_bracket == "base" {
+                            point.ctx_bracket = ctx_bracket.clone();
+                        }
+                    }
+                }
+                let key = (
+                    series.tier.clone(),
+                    series.quant.clone(),
+                    series.unit.clone(),
+                    series.ctx_bracket.clone(),
+                );
+                by_key.insert(key, series);
+            }
+        }
+    }
     for candidate in &model.mayhem.route_candidates {
         if let Some(scope) = provider_scope {
             if !dashboard_provider_in_scope(scope, &candidate.provider) {
@@ -9074,6 +9118,17 @@ fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
                 .mayhem
                 .route_candidates
                 .retain(canonical_route_candidate);
+            model.mayhem.markets.retain(canonical_market_info);
+            model.mayhem.markets.sort_by(|left, right| {
+                left.att_tier
+                    .cmp(&right.att_tier)
+                    .then_with(|| left.quant.cmp(&right.quant))
+                    .then_with(|| left.ctx_bracket.cmp(&right.ctx_bracket))
+                    .then_with(|| left.enclave_id.cmp(&right.enclave_id))
+            });
+            model.mayhem.markets.dedup_by(|left, right| {
+                left.enclave_id == right.enclave_id && left.ctx_bracket == right.ctx_bracket
+            });
             if !model.mayhem.route_candidates.is_empty() {
                 let providers = model
                     .mayhem
@@ -9088,9 +9143,26 @@ fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
                     .map(|candidate| candidate.room_id.as_str())
                     .collect::<BTreeSet<_>>();
                 model.mayhem.providers_online = providers.len().min(u32::MAX as usize) as u32;
+                if model.mayhem.markets.is_empty() {
+                    model.mayhem.rooms = rooms.len().min(u32::MAX as usize) as u32;
+                }
+            }
+            if !model.mayhem.markets.is_empty() {
+                let rooms = model
+                    .mayhem
+                    .markets
+                    .iter()
+                    .flat_map(|market| market.room_ids.iter().map(String::as_str))
+                    .collect::<BTreeSet<_>>();
                 model.mayhem.rooms = rooms.len().min(u32::MAX as usize) as u32;
             }
             if model.mayhem.source == "contract" && model.mayhem.route_candidates.is_empty() {
+                model.mayhem.providers_online = 0;
+            }
+            if model.mayhem.source == "contract"
+                && model.mayhem.route_candidates.is_empty()
+                && model.mayhem.markets.is_empty()
+            {
                 return None;
             }
             Some(model)
@@ -9110,6 +9182,25 @@ fn canonical_route_candidate(candidate: &GatewayRouteCandidate) -> bool {
             .all(|root| is_hex_len(root, 64))
         && is_hex_len(&candidate.manifest_hash, 64)
         && is_hex_len(&candidate.binary_hash, 64)
+}
+
+fn canonical_market_info(market: &GatewayMarketInfo) -> bool {
+    let availability_matches_routes = match market.availability.as_str() {
+        "routable" => market.route_count > 0 && market.providers_online > 0,
+        "no_eligible_provider_yet" => market.route_count == 0 && market.providers_online == 0,
+        _ => false,
+    };
+    is_hex_len(&market.enclave_id, 64)
+        && (1..=3).contains(&market.att_tier)
+        && !market.room_ids.is_empty()
+        && market
+            .room_ids
+            .iter()
+            .all(|room_id| is_hex_len(room_id, 32))
+        && market.providers_online <= market.route_count
+        && market.price_ref_au.denom == "au_usd"
+        && !market.price_ref_au.rate_map.is_empty()
+        && availability_matches_routes
 }
 
 impl GatewaySessionError {
@@ -24461,6 +24552,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             failover: failover_policy_from_catalog_value(model),
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
+            markets: Vec::new(),
             route_candidates: Vec::new(),
         },
     })
@@ -27267,9 +27359,51 @@ mod tests {
                 failover: GatewayFailoverPolicyConfig::default(),
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
+                markets: Vec::new(),
                 route_candidates: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn contract_model_with_empty_canonical_market_remains_discoverable_but_unroutable() {
+        let mut model = test_model();
+        model.mayhem.source = "contract".to_owned();
+        model.mayhem.providers_online = 9;
+        model.mayhem.rooms = 9;
+        model.mayhem.markets = vec![GatewayMarketInfo {
+            enclave_id: "11".repeat(32),
+            att_tier: 2,
+            quant: "int4".to_owned(),
+            ctx_bracket: Some("le8k".to_owned()),
+            room_ids: vec!["22".repeat(16)],
+            providers_online: 0,
+            route_count: 0,
+            availability: "no_eligible_provider_yet".to_owned(),
+            price_ref_au: PriceRefAu {
+                denom: "au_usd".to_owned(),
+                ver: 1,
+                rate_map: text_generation_rate_map(30, 90),
+                per_req_au: 0,
+                min_session_au: 0,
+                derivation: None,
+                history: Vec::new(),
+            },
+        }];
+        model.mayhem.route_candidates.clear();
+
+        let state = GatewayState::from_models(vec![model]);
+        let models = state.models_snapshot();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].mayhem.providers_online, 0);
+        assert_eq!(models[0].mayhem.rooms, 1);
+        assert_eq!(models[0].mayhem.markets.len(), 1);
+        assert!(models[0].mayhem.route_candidates.is_empty());
+        let series = dashboard_model_price_series(&models[0], None);
+        assert!(!series.is_empty());
+        assert!(series.iter().all(|entry| entry.tier == "T2"));
+        assert!(series.iter().all(|entry| entry.ctx_bracket == "le8k"));
     }
 
     #[test]

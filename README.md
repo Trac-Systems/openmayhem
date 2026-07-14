@@ -230,10 +230,15 @@ What people actually use it for:
 
 ```bash
 mayhem up --rail fiat --yes       # fiat, tap, or tnk; persists across restarts
-mayhem models --gateway           # models with live routes right now
+mayhem models --gateway           # canonical markets, prices, and current route counts
 mayhem status                     # component health, ports, balances
 mayhem price show <model-id> --tier 1   # live market price + its derivation
 ```
+
+`mayhem models --gateway` also lists an admin-created, priced tier market before a provider has
+joined it. Its market row says `routes=0 status=no_eligible_provider_yet`; it is discoverable for
+provider onboarding but cannot receive a request. `/v1/models` exposes the same distinction under
+`mayhem.markets[]`. Only entries in `mayhem.route_candidates[]` are routable capacity.
 
 ### Pay — card first, one price everywhere
 
@@ -326,7 +331,7 @@ mayhem up --max-price-au 500000000000     # same thing for one run only (beats t
 **Discovery filters (see what qualifies before you spend):**
 
 ```bash
-mayhem models --gateway --min-att-tier 3  # only confidential-compute routes
+mayhem models --gateway --min-att-tier 3  # Tier-3 markets; inspect routes/status before use
 mayhem models --gateway --require-kyb     # only identity-verified businesses
 mayhem models --gateway --quant int4      # filter by quantization
 ```
@@ -387,7 +392,7 @@ mayhem tokens revoke laptop      # immediate
 |---|---|
 | `mayhem up` / `mayhem down` | start/stop the supervised stack; prints endpoint + dashboard URLs |
 | `mayhem status` | live component state, ports, sync, balances |
-| `mayhem models --gateway` | models with live routes, capabilities, tiers, quant |
+| `mayhem models --gateway` | canonical priced markets, capabilities, tiers, quant, route counts, and availability |
 | `mayhem opencode` | wire the bundled opencode agent to the gateway; re-run to re-sync models |
 | `mayhem price show <model> [--tier]` | current market price with published derivation |
 | `mayhem pay stripe` / `mayhem deposit tap\|tnk` | buy credits on your chosen rail (card is the default) |
@@ -549,7 +554,7 @@ Every model × tier is an independent market. The admin seeds a starting price o
 
 Prices are quoted separately for input and output tokens, in dollars per million. Embeddings bill per input token. Image generation bills per image and per step, scaled by resolution. Audio has its own metered units.
 
-Every epoch's price is published with its derivation: the seed, the measured utilization, the public constants, and the settled work behind them. Run the formula yourself and you get the same number. `mayhem price show` prints it, the dashboards render it, and every model gets a financial-style price chart (candles and volume, built from real epoch prices) on the user and provider dashboards.
+Every epoch's price is published with its derivation: the seed, the measured utilization, the public constants, and the settled work behind them. Run the formula yourself and you get the same number. `mayhem price show` prints it, the dashboards render it, and every model gets a financial-style price chart (candles and volume, built from real epoch prices) on the user and provider dashboards. A newly opened market is visible immediately even at zero routes; it remains unroutable until an eligible provider joins.
 
 Context is part of the deal too. Providers advertise the context window they serve; the network verifies it with targeted probes and it's guaranteed for the duration of your session. Larger context brackets clear at their own prices, and a `min-ctx` filter routes you only to providers with the headroom you need. When every provider is busy, an opt-in `--max-wait` holds your request for the next free slot instead of failing it.
 

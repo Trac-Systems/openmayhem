@@ -69,12 +69,12 @@ use mayhem_gateway::{
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
-        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
-        GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore,
-        GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo,
-        SamplingProfile, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
-        ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL,
-        MAX_ROUTE_MAX_WAIT_MS,
+        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel,
+        GatewayRouteCandidate, GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord,
+        GatewayTokenStore, GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu,
+        ProviderKybInfo, SamplingProfile, ScBridgeGatewaySessionBackend,
+        ScBridgeGatewaySessionConfig, ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS,
+        MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_au, rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
     text_rate_per_1k_au, HardwareQuoteVerifierCommand, HeartbeatModalityCapacity,
@@ -29760,6 +29760,7 @@ struct ModelSummary {
     attestation_tier_labels: BTreeMap<String, String>,
     quant_buckets: BTreeMap<String, u64>,
     kyb_identities: Vec<ProviderKybInfo>,
+    markets: Vec<Value>,
     max_attestation_tier: u8,
     prompt_confidential: bool,
     prompt_confidentiality_note: String,
@@ -30980,6 +30981,69 @@ fn price_show_markets_from_gateway_models(
     for model in models {
         let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
         let mayhem = model.get("mayhem").unwrap_or(&Value::Null);
+        let mut listed_enclaves = BTreeSet::new();
+        for market in mayhem
+            .get("markets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let enclave_id = market
+                .get("enclave_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let market_tier = market.get("att_tier").and_then(Value::as_u64).unwrap_or(1) as u8;
+            if tier.is_some_and(|wanted| wanted != market_tier) {
+                continue;
+            }
+            if target != model_id && target != enclave_id {
+                continue;
+            }
+            let price = market.get("price_ref_au").cloned().unwrap_or(Value::Null);
+            if enclave_id.is_empty() || price.is_null() {
+                continue;
+            }
+            listed_enclaves.insert(enclave_id.to_owned());
+            let ctx_bracket = market
+                .get("ctx_bracket")
+                .and_then(Value::as_str)
+                .unwrap_or("base");
+            let key = format!("{enclave_id}/{ctx_bracket}");
+            let room_ids = market.get("room_ids").cloned().unwrap_or_else(|| json!([]));
+            let room_id = room_ids
+                .as_array()
+                .and_then(|rooms| rooms.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            markets.entry(key).or_insert_with(|| {
+                json!({
+                    "model": model_id,
+                    "enclave_id": enclave_id,
+                    "room_id": room_id,
+                    "room_ids": room_ids,
+                    "provider": Value::Null,
+                    "providers_online": market
+                        .get("providers_online")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    "route_count": market
+                        .get("route_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    "availability": market
+                        .get("availability")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no_eligible_provider_yet"),
+                    "att_tier": market_tier,
+                    "quant": market
+                        .get("quant")
+                        .and_then(Value::as_str)
+                        .unwrap_or(DEFAULT_QUANT_BUCKET),
+                    "ctx_bracket": market.get("ctx_bracket").cloned().unwrap_or(Value::Null),
+                    "price_ref_au": price,
+                })
+            });
+        }
         for route in mayhem
             .get("route_candidates")
             .and_then(Value::as_array)
@@ -30997,6 +31061,9 @@ fn price_show_markets_from_gateway_models(
             if target != model_id && target != enclave_id {
                 continue;
             }
+            if route_tier <= 3 && listed_enclaves.contains(enclave_id) {
+                continue;
+            }
             let price = route
                 .get("price_ref_au")
                 .or_else(|| mayhem.get("price_ref_au"))
@@ -31008,7 +31075,7 @@ fn price_show_markets_from_gateway_models(
             let key = if enclave_id.is_empty() {
                 format!("{model_id}:T{route_tier}")
             } else {
-                enclave_id.to_owned()
+                format!("{enclave_id}:T{route_tier}")
             };
             markets.entry(key).or_insert_with(|| {
                 json!({
@@ -31016,6 +31083,9 @@ fn price_show_markets_from_gateway_models(
                     "enclave_id": enclave_id,
                     "room_id": route.get("room_id").cloned().unwrap_or(Value::Null),
                     "provider": route.get("provider").cloned().unwrap_or(Value::Null),
+                    "providers_online": 1,
+                    "route_count": 1,
+                    "availability": "routable",
                     "att_tier": route_tier,
                     "quant": route
                         .get("quant")
@@ -31026,9 +31096,13 @@ fn price_show_markets_from_gateway_models(
             });
         }
         if mayhem
-            .get("route_candidates")
+            .get("markets")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
+            && mayhem
+                .get("route_candidates")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
             && target == model_id
             && tier.is_none()
         {
@@ -31040,6 +31114,9 @@ fn price_show_markets_from_gateway_models(
                         "enclave_id": Value::Null,
                         "room_id": Value::Null,
                         "provider": Value::Null,
+                        "providers_online": 0,
+                        "route_count": 0,
+                        "availability": "no_eligible_provider_yet",
                         "att_tier": Value::Null,
                         "quant": DEFAULT_QUANT_BUCKET,
                         "price_ref_au": price,
@@ -31186,7 +31263,19 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         })
         .unwrap_or_else(|| attestation_tier_labels_for_counts(&attestation_tiers));
     let quant_buckets = quant_buckets_from_mayhem(mayhem);
-    let max_attestation_tier = max_attestation_tier(&attestation_tiers);
+    let markets = mayhem
+        .get("markets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let max_market_tier = markets
+        .iter()
+        .filter_map(|market| market.get("att_tier").and_then(Value::as_u64))
+        .filter_map(|tier| u8::try_from(tier).ok())
+        .filter(|tier| (1..=3).contains(tier))
+        .max()
+        .unwrap_or(1);
+    let max_attestation_tier = max_attestation_tier(&attestation_tiers).max(max_market_tier);
     let prompt_confidential = attestation_tiers
         .get("T3")
         .or_else(|| attestation_tiers.get("3"))
@@ -31236,6 +31325,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         attestation_tier_labels,
         quant_buckets,
         kyb_identities,
+        markets,
         max_attestation_tier,
         prompt_confidential,
         prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
@@ -32234,6 +32324,43 @@ fn print_models_report(report: &Value) -> Result<()> {
         if !speciality_summary.is_empty() {
             println!("  specialities: {speciality_summary}");
         }
+        for market in model
+            .get("markets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let market_price = market
+                .get("price_ref_au")
+                .map(gateway_price_rate_map)
+                .unwrap_or_default();
+            let enclave_id = market
+                .get("enclave_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            println!(
+                "  market T{} quant={} routes={} providers={} status={} price={} enclave={}",
+                market.get("att_tier").and_then(Value::as_u64).unwrap_or(0),
+                market
+                    .get("quant")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_QUANT_BUCKET),
+                market
+                    .get("route_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                market
+                    .get("providers_online")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                market
+                    .get("availability")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                format_rate_map(&market_price),
+                truncate_for_table(enclave_id, 16),
+            );
+        }
     }
     Ok(())
 }
@@ -32309,12 +32436,14 @@ fn print_price_show_report(report: &Value) -> Result<()> {
         let price = market.get("price_ref_au").unwrap_or(&Value::Null);
         let rate_map = gateway_price_rate_map(price);
         println!(
-            "{}  {}  T{}  quant={}  ver={}",
+            "{}  {}  T{}  quant={}  ver={}  routes={}  status={}",
             market["model"].as_str().unwrap_or(""),
             market["enclave_id"].as_str().unwrap_or("model-level"),
             market["att_tier"].as_u64().unwrap_or(0),
             market["quant"].as_str().unwrap_or(DEFAULT_QUANT_BUCKET),
-            price.get("ver").and_then(Value::as_u64).unwrap_or(0)
+            price.get("ver").and_then(Value::as_u64).unwrap_or(0),
+            market["route_count"].as_u64().unwrap_or(0),
+            market["availability"].as_str().unwrap_or("unknown"),
         );
         println!("  price: {}", format_rate_map(&rate_map));
         let per_request_usd = au_to_usd_amount(
@@ -43157,11 +43286,8 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .map(|kyb| (kyb.provider.clone(), kyb))
         .collect::<BTreeMap<_, _>>();
     let mut rooms_by_id = BTreeMap::new();
-    let mut rooms_by_model: BTreeMap<String, u32> = BTreeMap::new();
     for room in &open_rooms {
         rooms_by_id.insert(room.room_id.clone(), *room);
-        let count = rooms_by_model.entry(room.model_id.clone()).or_default();
-        *count = count.saturating_add(1);
     }
 
     let mut price_history_by_market: BTreeMap<String, Vec<Value>> = BTreeMap::new();
@@ -43211,26 +43337,6 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             ledger_price_market_key(&schedule.enclave_id, schedule.ctx_bracket.as_deref()),
             price,
         );
-    }
-
-    let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
-    let mut class_by_model: BTreeMap<String, String> = BTreeMap::new();
-    for enclave in active_enclaves.values() {
-        if rooms_by_model.get(&enclave.model_id).copied().unwrap_or(0) == 0 {
-            continue;
-        }
-        if !contract.prices.iter().any(|price| {
-            price.enclave_id == enclave.enclave_id && current_au_usd_price(price).is_some()
-        }) {
-            continue;
-        };
-        class_by_model
-            .entry(enclave.model_id.clone())
-            .or_insert_with(|| enclave.model_class.clone());
-        caps_by_model
-            .entry(enclave.model_id.clone())
-            .and_modify(|caps| merge_model_caps(caps, &gateway_caps_from_contract(&enclave.caps)))
-            .or_insert_with(|| gateway_caps_from_contract(&enclave.caps));
     }
 
     let active_serves_by_key: BTreeMap<String, &LedgerServe> = contract
@@ -43434,9 +43540,128 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .insert(serving.provider.clone());
     }
 
+    let mut markets_by_model: BTreeMap<String, BTreeMap<String, GatewayMarketInfo>> =
+        BTreeMap::new();
+    let mut listed_price_by_model: BTreeMap<String, GatewayServedPrice> = BTreeMap::new();
+    let mut market_rooms_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
+    let mut class_by_model: BTreeMap<String, String> = BTreeMap::new();
+    for schedule in &contract.prices {
+        let Some(enclave) = active_enclaves.get(&schedule.enclave_id) else {
+            continue;
+        };
+        if schedule.model_id != enclave.model_id {
+            continue;
+        }
+        let market_key =
+            ledger_price_market_key(&schedule.enclave_id, schedule.ctx_bracket.as_deref());
+        let Some(price) = prices_by_market.get(&market_key) else {
+            continue;
+        };
+        let room_ids = open_rooms
+            .iter()
+            .filter(|room| room_matches_enclave(room, enclave))
+            .map(|room| room.room_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if room_ids.is_empty() {
+            continue;
+        }
+
+        let enclave_caps = gateway_caps_from_contract(&enclave.caps);
+        let mut route_count = 0usize;
+        let mut market_providers = BTreeSet::new();
+        for candidate in route_candidates_by_model
+            .get(&enclave.model_id)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+        {
+            if candidate.enclave_id != enclave.enclave_id || !room_ids.contains(&candidate.room_id)
+            {
+                continue;
+            }
+            let served_ctx = candidate.served_ctx.unwrap_or(enclave_caps.ctx);
+            let candidate_ctx_bracket = price_ctx_bracket_for_model_class(
+                &enclave.model_class,
+                u64::from(served_ctx),
+                &contract.ctx_bracket_schedule,
+                now,
+            )?;
+            if candidate_ctx_bracket.as_deref() != schedule.ctx_bracket.as_deref() {
+                continue;
+            }
+            route_count = route_count.saturating_add(1);
+            market_providers.insert(candidate.provider.clone());
+        }
+        let route_count = usize_to_u32(route_count);
+        let providers_online = usize_to_u32(market_providers.len());
+        let availability = if route_count > 0 {
+            "routable"
+        } else {
+            "no_eligible_provider_yet"
+        };
+        let price_ref_au = gateway_price_ref_from_ledger_with_history(
+            price,
+            price_history_by_market
+                .get(market_key.as_str())
+                .map(Vec::as_slice),
+        );
+        markets_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .insert(
+                market_key.clone(),
+                GatewayMarketInfo {
+                    enclave_id: enclave.enclave_id.clone(),
+                    att_tier: enclave.att_tier,
+                    quant: normalize_ledger_quant(&enclave.quant),
+                    ctx_bracket: schedule.ctx_bracket.clone(),
+                    room_ids: room_ids.clone(),
+                    providers_online,
+                    route_count,
+                    availability: availability.to_owned(),
+                    price_ref_au,
+                },
+            );
+        market_rooms_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .extend(room_ids);
+        listed_price_by_model
+            .entry(enclave.model_id.clone())
+            .and_modify(|existing| {
+                if price_sort_key(price) < price_sort_key(&existing.price) {
+                    *existing = GatewayServedPrice {
+                        price: price.clone(),
+                        market_key: market_key.clone(),
+                    };
+                }
+            })
+            .or_insert_with(|| GatewayServedPrice {
+                price: price.clone(),
+                market_key: market_key.clone(),
+            });
+        class_by_model
+            .entry(enclave.model_id.clone())
+            .or_insert_with(|| enclave.model_class.clone());
+        caps_by_model
+            .entry(enclave.model_id.clone())
+            .and_modify(|caps| merge_model_caps(caps, &enclave_caps))
+            .or_insert(enclave_caps);
+    }
+
     let mut models = Vec::new();
-    for (model_id, price) in served_price_by_model {
-        let rooms = rooms_by_model.get(&model_id).copied().unwrap_or(0);
+    for (model_id, market_map) in markets_by_model {
+        let markets = market_map.into_values().collect::<Vec<_>>();
+        let price = served_price_by_model
+            .remove(&model_id)
+            .or_else(|| listed_price_by_model.remove(&model_id))
+            .expect("listed contract market has a current price");
+        let rooms = market_rooms_by_model
+            .get(&model_id)
+            .map(|rooms| usize_to_u32(rooms.len()))
+            .unwrap_or(0);
         let route_candidates = route_candidates_by_model
             .remove(&model_id)
             .unwrap_or_default()
@@ -43451,21 +43676,24 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .get(&model_id)
             .map(|providers| usize_to_u32(providers.len()))
             .unwrap_or(0);
-        if rooms == 0 || providers_online == 0 {
-            continue;
-        }
-        let attestation_tiers = tiers_by_model
+        let mut attestation_tiers = tiers_by_model
             .remove(&model_id)
             .unwrap_or_default()
             .into_iter()
             .map(|(tier, providers)| (tier, usize_to_u32(providers.len())))
             .collect::<BTreeMap<_, _>>();
-        let quant_buckets = quants_by_model
+        let mut quant_buckets = quants_by_model
             .remove(&model_id)
             .unwrap_or_default()
             .into_iter()
             .map(|(quant, providers)| (quant, usize_to_u32(providers.len())))
             .collect::<BTreeMap<_, _>>();
+        for market in &markets {
+            attestation_tiers
+                .entry(format!("T{}", market.att_tier))
+                .or_insert(0);
+            quant_buckets.entry(market.quant.clone()).or_insert(0);
+        }
         models.push(GatewayModel {
             id: model_id.clone(),
             created: 1_782_950_400,
@@ -43498,6 +43726,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
                 source: "contract".to_owned(),
                 kyb_identities,
+                markets,
                 route_candidates,
             },
         });
@@ -64065,6 +64294,11 @@ mod tests {
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert!(models[0].mayhem.caps.tools);
         assert_eq!(models[0].mayhem.caps.ctx, 8192);
+        assert_eq!(models[0].mayhem.markets.len(), 1);
+        assert_eq!(models[0].mayhem.markets[0].att_tier, 1);
+        assert_eq!(models[0].mayhem.markets[0].route_count, 1);
+        assert_eq!(models[0].mayhem.markets[0].providers_online, 1);
+        assert_eq!(models[0].mayhem.markets[0].availability, "routable");
         assert_eq!(models[0].mayhem.route_candidates.len(), 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
@@ -64132,11 +64366,29 @@ mod tests {
 
         let mut contract = test_contract(&root);
         contract.roomserve.clear();
-        assert!(gateway_models_from_contract(&contract).unwrap().is_empty());
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].mayhem.providers_online, 0);
+        assert_eq!(models[0].mayhem.rooms, 1);
+        assert!(models[0].mayhem.route_candidates.is_empty());
+        assert_eq!(models[0].mayhem.markets.len(), 1);
+        assert_eq!(models[0].mayhem.markets[0].route_count, 0);
+        assert_eq!(models[0].mayhem.markets[0].providers_online, 0);
+        assert_eq!(
+            models[0].mayhem.markets[0].availability,
+            "no_eligible_provider_yet"
+        );
 
         let mut contract = test_contract(&root);
         contract.providers[0].status = "banned".to_owned();
-        assert!(gateway_models_from_contract(&contract).unwrap().is_empty());
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].mayhem.route_candidates.is_empty());
+        assert_eq!(models[0].mayhem.markets[0].route_count, 0);
+        assert_eq!(
+            models[0].mayhem.markets[0].availability,
+            "no_eligible_provider_yet"
+        );
 
         let mut missing_role = test_contract(&root);
         missing_role.enclaves[0].created_by_role = None;
@@ -64193,9 +64445,12 @@ mod tests {
         other_price.enclave_id = other_enclave_id.clone();
         wrong_same_model_enclave.prices.push(other_price);
         wrong_same_model_enclave.roomserve[0].enclave_id = other_enclave_id;
-        assert!(gateway_models_from_contract(&wrong_same_model_enclave)
-            .unwrap()
-            .is_empty());
+        let models = gateway_models_from_contract(&wrong_same_model_enclave).unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].mayhem.route_candidates.is_empty());
+        assert_eq!(models[0].mayhem.markets.len(), 1);
+        assert_eq!(models[0].mayhem.markets[0].enclave_id, "11".repeat(32));
+        assert_eq!(models[0].mayhem.markets[0].route_count, 0);
     }
 
     #[test]
@@ -64452,6 +64707,17 @@ mod tests {
         assert_eq!(model.mayhem.attestation_tiers["T3"], 1);
         assert_eq!(model.mayhem.quant_buckets["int4"], 1);
         assert_eq!(model.mayhem.quant_buckets["fp16"], 1);
+        assert_eq!(model.mayhem.markets.len(), 2);
+        let markets_by_tier = model
+            .mayhem
+            .markets
+            .iter()
+            .map(|market| (market.att_tier, market))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(markets_by_tier[&1].route_count, 1);
+        assert_eq!(markets_by_tier[&1].availability, "routable");
+        assert_eq!(markets_by_tier[&3].route_count, 1);
+        assert_eq!(markets_by_tier[&3].availability, "routable");
         assert_eq!(model.mayhem.route_candidates.len(), 2);
 
         let by_tier = model
@@ -64494,6 +64760,40 @@ mod tests {
             tier3_price.derivation.as_ref().unwrap()["epoch"].as_u64(),
             Some(12)
         );
+
+        contract
+            .roomserve
+            .retain(|serving| serving.enclave_id != "77".repeat(32));
+        contract
+            .serves
+            .retain(|serve| serve.enclave_id != "77".repeat(32));
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.mayhem.route_candidates.len(), 1);
+        assert_eq!(model.mayhem.price_ref_au.ver, 1);
+        let tier3_market = model
+            .mayhem
+            .markets
+            .iter()
+            .find(|market| market.att_tier == 3)
+            .expect("empty Tier-3 market remains discoverable");
+        assert_eq!(tier3_market.route_count, 0);
+        assert_eq!(tier3_market.providers_online, 0);
+        assert_eq!(tier3_market.availability, "no_eligible_provider_yet");
+        assert_eq!(tier3_market.price_ref_au.ver, 9);
+
+        let model_values = models
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let tier3_prices =
+            price_show_markets_from_gateway_models(&model_values, &model_id, Some(3)).unwrap();
+        assert_eq!(tier3_prices.len(), 1);
+        assert_eq!(tier3_prices[0]["route_count"], 0);
+        assert_eq!(tier3_prices[0]["availability"], "no_eligible_provider_yet");
+        assert_eq!(tier3_prices[0]["price_ref_au"]["ver"], 9);
     }
 
     #[test]
@@ -70345,6 +70645,39 @@ State initialization...
         let quant_filtered = filter_model_summaries_by_quant(filtered, Some("fp16"));
         assert_eq!(quant_filtered.len(), 1);
         assert_eq!(quant_filtered[0].id, "mayhem/t3");
+    }
+
+    #[test]
+    fn model_summaries_can_filter_for_an_empty_higher_tier_market() {
+        let summaries = gateway_model_summaries(&[json!({
+            "id": "mayhem/tiered",
+            "mayhem": {
+                "providers_online": 1,
+                "rooms": 2,
+                "price_ref_au": { "denom": "au_usd", "rate_map": [] },
+                "attestation_tiers": { "T1": 1, "T2": 0 },
+                "quant_buckets": { "int4": 1 },
+                "caps": { "tools": false, "json": false, "ctx": 8192 },
+                "markets": [{
+                    "enclave_id": "11".repeat(32),
+                    "att_tier": 2,
+                    "quant": "int4",
+                    "room_ids": ["22".repeat(16)],
+                    "providers_online": 0,
+                    "route_count": 0,
+                    "availability": "no_eligible_provider_yet",
+                    "price_ref_au": { "denom": "au_usd", "rate_map": [] }
+                }]
+            }
+        })])
+        .unwrap();
+
+        let filtered = filter_model_summaries_by_min_att_tier(summaries, Some(2));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].max_attestation_tier, 2);
+        assert_eq!(filtered[0].markets[0]["route_count"], 0);
+        assert!(!filtered[0].prompt_confidential);
     }
 
     #[test]

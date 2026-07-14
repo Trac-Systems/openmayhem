@@ -14,11 +14,11 @@ use mayhem_gateway::openai::{
     GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult, GatewayCanaryModelConfig,
     GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
     GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
-    GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
-    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
-    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, SamplingProfile,
-    ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel, GatewayRouteCandidate,
+    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
+    GatewaySessionResult, GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput,
+    ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt,
+    SamplingProfile, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, audio_fingerprint, image_average_hash_hex, normalize_rate_map,
@@ -1299,6 +1299,60 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
         body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
         "qwen_function_xml"
     );
+}
+
+#[tokio::test]
+async fn models_endpoint_lists_empty_canonical_market_without_routing_or_billing_it() {
+    let mut model = routed_test_model();
+    model.mayhem.providers_online = 0;
+    model.mayhem.rooms = 1;
+    model.mayhem.markets = vec![GatewayMarketInfo {
+        enclave_id: "11".repeat(32),
+        att_tier: 2,
+        quant: "int4".to_owned(),
+        ctx_bracket: Some("le8k".to_owned()),
+        room_ids: vec!["22".repeat(16)],
+        providers_online: 0,
+        route_count: 0,
+        availability: "no_eligible_provider_yet".to_owned(),
+        price_ref_au: PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 2,
+            rate_map: text_generation_rate_map(30, 90),
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        },
+    }];
+    model.mayhem.route_candidates.clear();
+    let state = test_gateway_state_from_models(vec![model]);
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["data"][0]["mayhem"]["markets"][0]["att_tier"], 2);
+    assert_eq!(body["data"][0]["mayhem"]["markets"][0]["route_count"], 0);
+    assert_eq!(
+        body["data"][0]["mayhem"]["markets"][0]["availability"],
+        "no_eligible_provider_yet"
+    );
+    assert!(body["data"][0]["mayhem"]["route_candidates"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Do not fabricate a route." }]
+    });
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no provider available"));
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
@@ -4116,6 +4170,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
             failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
+            markets: Vec::new(),
             route_candidates: providers
                 .iter()
                 .enumerate()
