@@ -2182,6 +2182,7 @@ pub struct GatewaySessionAttestation {
 pub struct GatewaySessionError {
     pub message: String,
     pub retryable: bool,
+    pub before_first_output: bool,
     pub transport_closed: bool,
     pub wait_elapsed: bool,
     pub clean_refusal: bool,
@@ -9116,6 +9117,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: false,
+            before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
             clean_refusal: false,
@@ -9129,6 +9131,21 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
+            transport_closed: false,
+            wait_elapsed: false,
+            clean_refusal: false,
+            clean_refusal_code: None,
+            partial: None,
+            interrupted: None,
+        }
+    }
+
+    pub fn retryable_before_output(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            before_first_output: true,
             transport_closed: false,
             wait_elapsed: false,
             clean_refusal: false,
@@ -9142,6 +9159,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
             transport_closed: true,
             wait_elapsed: false,
             clean_refusal: false,
@@ -9155,6 +9173,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
             transport_closed: false,
             wait_elapsed: true,
             clean_refusal: false,
@@ -9172,6 +9191,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
             clean_refusal: true,
@@ -9185,6 +9205,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
             clean_refusal: false,
@@ -9201,6 +9222,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
             clean_refusal: false,
@@ -9212,6 +9234,12 @@ impl GatewaySessionError {
 
     pub fn into_retryable(mut self) -> Self {
         self.retryable = true;
+        self
+    }
+
+    fn into_retryable_before_output(mut self) -> Self {
+        self.retryable = true;
+        self.before_first_output = true;
         self
     }
 }
@@ -11735,7 +11763,7 @@ fn direct_session_timeout_error(
     kind: DirectSessionTimeoutKind,
     session_id: &str,
 ) -> GatewaySessionError {
-    GatewaySessionError::new(match kind {
+    GatewaySessionError::retryable(match kind {
         DirectSessionTimeoutKind::TimeToFirstToken => {
             format!("timed out waiting for first s.delta on session {session_id}")
         }
@@ -12104,7 +12132,21 @@ async fn collect_direct_session_output(
     while finish_reason.is_none() || final_provider_receipt.is_none() {
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
-            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+            .map_err(|kind| {
+                retryable_interrupted_direct_session_error(
+                    direct_session_timeout_error(kind, session_id),
+                    &content,
+                    tool_calls.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                    "mid_stream_timeout",
+                )
+            })?;
         let frame = match next_session_frame_with_optional_wait(
             bridge,
             session_id,
@@ -12124,21 +12166,19 @@ async fn collect_direct_session_output(
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
                 let timeout = watchdog.timeout_error(session_id, now);
-                if let Some(partial) = interrupted_direct_session_partial(
+                return Err(retryable_interrupted_direct_session_error(
+                    timeout,
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now,
                     "mid_stream_timeout",
-                ) {
-                    return Err(GatewaySessionError::retryable_partial(
-                        timeout.message,
-                        partial,
-                    ));
-                }
-                return Err(timeout);
+                ));
             }
             Err(err) if err.retryable => {
                 let now = now_millis_u64();
@@ -12147,6 +12187,9 @@ async fn collect_direct_session_output(
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now,
@@ -12295,18 +12338,19 @@ async fn collect_direct_session_output(
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
                 let err = format!("provider returned {code} on session {session_id}: {message}");
-                if let Some(partial) = interrupted_direct_session_partial(
+                return Err(retryable_interrupted_direct_session_error(
+                    GatewaySessionError::new(err),
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now_millis_u64(),
                     "mid_stream_error",
-                ) {
-                    return Err(GatewaySessionError::retryable_partial(err, partial));
-                }
-                return Err(GatewaySessionError::new(err));
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -12317,18 +12361,19 @@ async fn collect_direct_session_output(
                     let err = format!(
                         "provider closed session {session_id} before final delta: {reason}"
                     );
-                    if let Some(partial) = interrupted_direct_session_partial(
+                    return Err(retryable_interrupted_direct_session_error(
+                        GatewaySessionError::new(err),
                         &content,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
+                        latest_checkpoint_receipt.is_some()
+                            || pending_checkpoint_receipt.is_some()
+                            || final_provider_receipt.is_some(),
                         &token_ids,
                         &watchdog,
                         now_millis_u64(),
                         "mid_stream_close",
-                    ) {
-                        return Err(GatewaySessionError::retryable_partial(err, partial));
-                    }
-                    return Err(GatewaySessionError::new(err));
+                    ));
                 }
                 return Err(GatewaySessionError::new(format!(
                     "provider closed session {session_id} before s.receipt: {reason}"
@@ -12519,7 +12564,7 @@ async fn collect_direct_session_embedding_output(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider returned {code} on embedding session {session_id}: {message}"
                 )));
             }
@@ -12528,7 +12573,7 @@ async fn collect_direct_session_embedding_output(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider closed embedding session {session_id} before completion: {reason}"
                 )));
             }
@@ -12634,7 +12679,7 @@ async fn collect_direct_session_image_generation_output(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider returned {code} on image session {session_id}: {message}"
                 )));
             }
@@ -12643,7 +12688,7 @@ async fn collect_direct_session_image_generation_output(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider closed image session {session_id} before completion: {reason}"
                 )));
             }
@@ -12749,7 +12794,7 @@ async fn collect_direct_session_audio_speech_output(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider returned {code} on audio speech session {session_id}: {message}"
                 )));
             }
@@ -12758,7 +12803,7 @@ async fn collect_direct_session_audio_speech_output(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider closed audio speech session {session_id} before completion: {reason}"
                 )));
             }
@@ -12863,7 +12908,7 @@ async fn collect_direct_session_artifact_generation_output(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider returned {code} on {} generation session {session_id}: {message}",
                     request.output_modality
                 )));
@@ -12873,7 +12918,7 @@ async fn collect_direct_session_artifact_generation_output(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider closed {} generation session {session_id} before completion: {reason}",
                     request.output_modality
                 )));
@@ -12998,7 +13043,7 @@ async fn collect_direct_session_audio_transcription_output(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider returned {code} on audio transcription session {session_id}: {message}"
                 )));
             }
@@ -13007,7 +13052,7 @@ async fn collect_direct_session_audio_transcription_output(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                return Err(GatewaySessionError::new(format!(
+                return Err(GatewaySessionError::retryable(format!(
                     "provider closed audio transcription session {session_id} before completion: {reason}"
                 )));
             }
@@ -13115,6 +13160,7 @@ fn retryable_interrupted_direct_session_error(
     content: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
+    receipt_seen: bool,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
@@ -13130,6 +13176,9 @@ fn retryable_interrupted_direct_session_error(
         reason,
     ) {
         return GatewaySessionError::retryable_partial(err.message, partial);
+    }
+    if watchdog.first_delta_at_millis.is_none() && !receipt_seen {
+        return err.into_retryable_before_output();
     }
     err
 }
@@ -13148,6 +13197,7 @@ fn client_disconnect_direct_session_error(
         content,
         tool_calls.clone(),
         provider_receipt,
+        provider_receipt.is_some(),
         token_ids,
         watchdog,
         now_millis,
@@ -15978,31 +16028,48 @@ async fn run_live_direct_chat_sse(
             let _ = send_sse_done(&tx).await;
         }
         Err(err) => {
-            let recovered = if is_client_disconnect_error(&err) {
-                finish_live_direct_chat_after_client_disconnect(&mut session, err).await
-            } else if err.retryable && err.partial.is_some() {
+            let (recovered, attempt_recorded) = if is_client_disconnect_error(&err) {
+                (
+                    finish_live_direct_chat_after_client_disconnect(&mut session, err).await,
+                    true,
+                )
+            } else if err.retryable && (err.partial.is_some() || err.before_first_output) {
                 // The redispatch opens fresh provider sessions from a task the
                 // HTTP response no longer owns; stop the moment the end user
                 // hangs up instead of retrying on behalf of nobody.
-                tokio::select! {
-                    _ = tx.closed() => Err(GatewaySessionError::new(
-                        "end-user disconnected during redispatch; abandoning session retry",
-                    )),
-                    recovered = recover_live_direct_chat_after_partial(&mut session, &tx, err) => recovered,
-                }
+                (
+                    tokio::select! {
+                        _ = tx.closed() => Err(GatewaySessionError::new(
+                            "end-user disconnected during redispatch; abandoning session retry",
+                        )),
+                        recovered = recover_live_direct_chat_after_retryable(&mut session, &tx, err) => recovered,
+                    },
+                    true,
+                )
             } else {
-                Err(err)
+                (Err(err), false)
             };
             match recovered {
                 Ok(()) => {
                     let _ = send_sse_done(&tx).await;
                 }
                 Err(err) => {
-                    record_route_observation(
-                        &session.state,
-                        session.route.as_ref(),
-                        observation_sample_from_error(session.attempt_started.elapsed()),
-                    );
+                    if !attempt_recorded {
+                        if err.retryable {
+                            record_retryable_route_attempt(
+                                &session.state,
+                                session.route.as_ref(),
+                                session.attempt_started.elapsed(),
+                                &err,
+                            );
+                        } else {
+                            record_route_failure_attempt(
+                                &session.state,
+                                session.route.as_ref(),
+                                session.attempt_started.elapsed(),
+                            );
+                        }
+                    }
                     let _ = close_direct_session_channel(
                         &mut session.bridge,
                         &session.transport_peer,
@@ -16143,33 +16210,32 @@ async fn wait_for_client_disconnect_provider_receipt(
     }
 }
 
-async fn recover_live_direct_chat_after_partial(
+async fn recover_live_direct_chat_after_retryable(
     session: &mut LiveDirectChatSession,
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     mut err: GatewaySessionError,
 ) -> Result<(), GatewaySessionError> {
-    let partial = err
-        .partial
-        .take()
-        .map(|partial| *partial)
-        .ok_or_else(|| GatewaySessionError::new(err.message.clone()))?;
-    session
-        .state
-        .record_partial_provider_receipt(
-            &session.model,
-            &session.request,
-            &session.invocation,
-            &partial,
-        )
-        .map_err(|err| GatewaySessionError::new(err.message))?;
-    if let Some(route) = session.route.as_ref() {
-        session.state.cool_route_provider(route, now_millis_u64());
+    let partial = err.partial.take().map(|partial| *partial);
+    if partial.is_none() && !err.before_first_output {
+        return Err(GatewaySessionError::new(err.message));
     }
-    record_route_observation(
+    record_retryable_route_attempt(
         &session.state,
         session.route.as_ref(),
-        observation_sample_from_error(session.attempt_started.elapsed()),
+        session.attempt_started.elapsed(),
+        &err,
     );
+    if let Some(partial) = partial.as_ref() {
+        session
+            .state
+            .record_partial_provider_receipt(
+                &session.model,
+                &session.request,
+                &session.invocation,
+                partial,
+            )
+            .map_err(|err| GatewaySessionError::new(err.message))?;
+    }
     let _ = close_direct_session_channel(
         &mut session.bridge,
         &session.transport_peer,
@@ -16178,14 +16244,20 @@ async fn recover_live_direct_chat_after_partial(
     )
     .await;
 
-    let partials = vec![partial];
-    let retry_request = redispatch_request_with_partials(&session.request, &partials);
+    let partials = partial.into_iter().collect::<Vec<_>>();
+    let retry_request = if partials.is_empty() {
+        session.request.clone()
+    } else {
+        redispatch_request_with_partials(&session.request, &partials)
+    };
     let mut retry_options = session.options.clone();
-    retry_options.min_ctx = Some(exact_conversation_floor_after_partials(
-        &retry_request,
-        &partials,
-        session.options.min_ctx,
-    ));
+    if !partials.is_empty() {
+        retry_options.min_ctx = Some(exact_conversation_floor_after_partials(
+            &retry_request,
+            &partials,
+            session.options.min_ctx,
+        ));
+    }
     let GatewaySessionRun {
         result,
         invocation,
@@ -16294,7 +16366,21 @@ async fn run_live_direct_chat_sse_inner(
     while finish_reason.is_none() || final_provider_receipt.is_none() {
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
-            .map_err(|kind| direct_session_timeout_error(kind, &session.invocation.session_id))?;
+            .map_err(|kind| {
+                retryable_interrupted_direct_session_error(
+                    direct_session_timeout_error(kind, &session.invocation.session_id),
+                    &content,
+                    tool_calls.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                    "mid_stream_timeout",
+                )
+            })?;
         let wait_millis = if latest_checkpoint_ack_frame.is_some() {
             Some(
                 remaining_millis
@@ -16349,21 +16435,19 @@ async fn run_live_direct_chat_sse_inner(
                     }
                 }
                 let timeout = watchdog.timeout_error(&session.invocation.session_id, now);
-                if let Some(partial) = interrupted_direct_session_partial(
+                return Err(retryable_interrupted_direct_session_error(
+                    timeout,
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now,
                     "mid_stream_timeout",
-                ) {
-                    return Err(GatewaySessionError::retryable_partial(
-                        timeout.message,
-                        partial,
-                    ));
-                }
-                return Err(timeout);
+                ));
             }
             Err(err) if err.retryable => {
                 let now = now_millis_u64();
@@ -16372,6 +16456,9 @@ async fn run_live_direct_chat_sse_inner(
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now,
@@ -16586,18 +16673,19 @@ async fn run_live_direct_chat_sse_inner(
                     "provider returned {code} on session {}: {message}",
                     session.invocation.session_id
                 );
-                if let Some(partial) = interrupted_direct_session_partial(
+                return Err(retryable_interrupted_direct_session_error(
+                    GatewaySessionError::new(err),
                     &content,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
+                    latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                     &token_ids,
                     &watchdog,
                     now_millis_u64(),
                     "mid_stream_error",
-                ) {
-                    return Err(GatewaySessionError::retryable_partial(err, partial));
-                }
-                return Err(GatewaySessionError::new(err));
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -16609,18 +16697,19 @@ async fn run_live_direct_chat_sse_inner(
                         "provider closed session {} before final delta: {reason}",
                         session.invocation.session_id
                     );
-                    if let Some(partial) = interrupted_direct_session_partial(
+                    return Err(retryable_interrupted_direct_session_error(
+                        GatewaySessionError::new(err),
                         &content,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
+                        latest_checkpoint_receipt.is_some()
+                            || pending_checkpoint_receipt.is_some()
+                            || final_provider_receipt.is_some(),
                         &token_ids,
                         &watchdog,
                         now_millis_u64(),
                         "mid_stream_close",
-                    ) {
-                        return Err(GatewaySessionError::retryable_partial(err, partial));
-                    }
-                    return Err(GatewaySessionError::new(err));
+                    ));
                 }
                 return Err(GatewaySessionError::new(format!(
                     "provider closed session {} before s.receipt: {reason}",
@@ -28009,6 +28098,59 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct AcceptThenCloseThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatewaySessionBackend for AcceptThenCloseThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-accept-close-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let attempt = {
+                    let mut providers = self.providers.lock().expect("providers lock");
+                    providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    providers.len()
+                };
+                if attempt == 1 {
+                    return Err(GatewaySessionError::retryable_before_output(
+                        "provider accepted then closed before first output",
+                    ));
+                }
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        content: Some("recovered after close".to_owned()),
+                        tool_calls: Vec::new(),
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 3,
+                            total_tokens: prompt_tokens + 3,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![1, 2, 3],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(40.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct SuccessBackend {
         providers: Arc<Mutex<Vec<String>>>,
     }
@@ -29250,6 +29392,97 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert!(receipts[1].receipt.body.final_receipt);
         assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 1);
+    }
+
+    #[tokio::test]
+    async fn accept_then_close_before_output_reroutes_and_demotes_without_a_receipt() {
+        let model = test_routed_model(2);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(AcceptThenCloseThenSuccessBackend {
+                providers: providers.clone(),
+            }),
+        );
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("an accepted session that closes before output should fail over");
+
+        assert_eq!(
+            run.result.output.content.as_deref(),
+            Some("recovered after close")
+        );
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        assert_ne!(providers[0], providers[1]);
+        let failed_route = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| candidate.provider == providers[0])
+            .expect("failed provider route");
+        assert!(state.route_provider_in_cooloff(failed_route, now_millis_u64()));
+        let failed_entry = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key.provider == providers[0])
+            .expect("failed provider observation");
+        assert_eq!(failed_entry.observed.samples, 1);
+        assert_eq!(failed_entry.observed.consecutive_failures, 1);
+        assert!(state.receipts().is_empty());
+    }
+
+    #[test]
+    fn pre_output_retry_classification_requires_no_delta_and_no_receipt() {
+        let watchdog = DirectSessionWatchdog::new(1_000, None, None, None, None);
+        let pre_output = retryable_interrupted_direct_session_error(
+            GatewaySessionError::new("provider closed"),
+            "",
+            Vec::new(),
+            None,
+            false,
+            &[],
+            &watchdog,
+            1_001,
+            "mid_stream_close",
+        );
+        assert!(pre_output.retryable);
+        assert!(pre_output.before_first_output);
+        assert!(pre_output.partial.is_none());
+
+        let receipt_seen = retryable_interrupted_direct_session_error(
+            GatewaySessionError::new("provider closed"),
+            "",
+            Vec::new(),
+            None,
+            true,
+            &[],
+            &watchdog,
+            1_001,
+            "mid_stream_close",
+        );
+        assert!(!receipt_seen.retryable);
+        assert!(!receipt_seen.before_first_output);
+
+        let mut after_delta = watchdog;
+        after_delta.record_delta(1_001);
+        let output_started = retryable_interrupted_direct_session_error(
+            GatewaySessionError::new("provider closed"),
+            "partial output",
+            Vec::new(),
+            None,
+            false,
+            &[],
+            &after_delta,
+            1_002,
+            "mid_stream_close",
+        );
+        assert!(!output_started.retryable);
+        assert!(!output_started.before_first_output);
     }
 
     #[tokio::test]
