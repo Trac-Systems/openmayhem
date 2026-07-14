@@ -6,7 +6,11 @@ OpenMayhem is a peer-to-peer AI inference marketplace. Providers plug in machine
 
 The CLI binary is `mayhem`. The network runs on [Trac Network](https://www.tracsystems.io/trac-network), which carries the peer-to-peer transport and the replicated contract that every node verifies identically.
 
+Website: **[openmayhem.ai](https://www.openmayhem.ai/)** — the project site.
+
 Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup help, provider earnings talk, announcements.
+
+Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account; every served model is mirrored there and the signed catalog is published from it.
 
 ```text
 your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P session ──▶ a provider's machine
@@ -425,12 +429,19 @@ mayhem up --provider --yes
 
 That's the whole happy path. The software probes your hardware, shows which admin-approved models fit (with estimated speed and context, before anything downloads), fetches and verifies the model, and starts serving. The provider dashboard shows download, verify, seal, load, and serving progress live.
 
-Model downloads come from Hugging Face. A free Hugging Face token raises your rate limits and makes multi-gigabyte pulls faster and more reliable. Worth setting up once:
+Model downloads come from Hugging Face. Without a token you download anonymously, and anonymous pulls are rate-limited: multi-gigabyte models can slow to a crawl or fail partway. A free Hugging Face token fixes that. Getting one takes two minutes, once:
+
+1. Create a free account at [huggingface.co/join](https://huggingface.co/join).
+2. Open [Settings → Access Tokens](https://huggingface.co/settings/tokens), click "Create new token", pick the **Read** role, and copy the `hf_...` value.
+
+Then either export it or point the CLI at a file containing it:
 
 ```bash
 export HF_TOKEN=hf_...                    # or:
 mayhem provider start --hf-token-file ~/.mayhem/hf.txt
 ```
+
+The Read role can only download; keep the token out of anything you commit or share.
 
 ```bash
 mayhem provider list              # your enclave and room joins

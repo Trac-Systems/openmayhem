@@ -1,0 +1,8 @@
+Upstream: https://github.com/huggingface/xet-core.git
+Revision: fc6cbec1828c472b57f4555818e14aa69ff10b9e (v1.5.2-rc0)
+
+Only xet_client, xet_core_structures, and xet_runtime are vendored. The local
+xet_client changes opt authenticated reconstruction requests into the existing
+bounded retry policy for intermittent 401 responses, and preserve partial bytes
+after a truncated single-range response so only the missing suffix is resumed
+from the same signed Xet URL. Other 401 responses remain fatal.

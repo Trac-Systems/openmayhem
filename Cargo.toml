@@ -13,6 +13,7 @@ members = [
     "crates/mayhemd",
     "services/paygate",
 ]
+exclude = ["third_party/xet-core"]
 
 [workspace.package]
 version = "0.2.0"
@@ -25,3 +26,10 @@ panic = "unwind"
 
 [profile.release]
 panic = "unwind"
+
+[patch.crates-io]
+# Includes bounded reconstruction-only retries for intermittent CAS 401s and
+# suffix-resume for truncated range responses. See third_party/xet-core/UPSTREAM.
+xet-client = { path = "third_party/xet-core/xet_client" }
+xet-core-structures = { path = "third_party/xet-core/xet_core_structures" }
+xet-runtime = { path = "third_party/xet-core/xet_runtime" }

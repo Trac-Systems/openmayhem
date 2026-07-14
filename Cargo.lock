@@ -4593,8 +4593,6 @@ dependencies = [
 [[package]]
 name = "xet-client"
 version = "1.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b45fc10a88b05d4824d7fc0f97d04c13eaea98da5e8032194b8a0cbdab942090"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4630,8 +4628,6 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb39bc5e0478e8f03e15f08b0a396f197fcfa2ef5027da666fd100c806bf0ea3"
 dependencies = [
  "async-trait",
  "base64",
@@ -4697,8 +4693,6 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8e1f8cfa256029d1bba7860ca12bfd145f17aa7aede5d968e9c304047656be1"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -175,6 +175,21 @@ impl ScBridgeClient {
         .await
     }
 
+    pub async fn unsubscribe(
+        &mut self,
+        channels: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Value> {
+        let channels = channels
+            .into_iter()
+            .map(|channel| channel.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        self.request(
+            json!({ "type": "unsubscribe", "channels": channels }),
+            "subscribed",
+        )
+        .await
+    }
+
     pub async fn join(&mut self, channel: impl AsRef<str>) -> Result<Value> {
         self.request(
             json!({ "type": "join", "channel": channel.as_ref() }),

@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    Arc, Once,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -148,6 +148,7 @@ const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS: u64 = 86_400;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS: u32 = 1_024;
 const MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
+static HF_XET_LOGGING_INIT: Once = Once::new();
 const MAX_PROVIDER_MODALITY_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PROVIDER_MODALITY_ITEM_UNITS: u64 = 1_000_000_000_000;
 
@@ -5096,6 +5097,10 @@ struct ProviderJoinArgs {
     /// Canonical room ids to join, comma-separated, or auto for all open admin rooms for the model.
     #[arg(long, default_value = "auto")]
     rooms: String,
+
+    /// Maximum context tokens this provider commits to serve. Defaults to the catalog maximum.
+    #[arg(long)]
+    ctx: Option<u64>,
 
     /// Disable a non-core catalog modality. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
@@ -26776,7 +26781,6 @@ fn token_budget_label(token: &GatewayTokenRecord) -> String {
 struct GatewayProviderHeartbeatWatcherConfig {
     sc_bridge_url: String,
     sc_bridge_token: String,
-    channels: Vec<String>,
     max_age_millis: u64,
     max_clock_skew_millis: u64,
 }
@@ -26994,13 +26998,51 @@ fn gateway_provider_heartbeat_channels(models: &[GatewayModel]) -> Vec<String> {
         .collect()
 }
 
+fn gateway_provider_heartbeat_channel_changes(
+    subscribed: &BTreeSet<String>,
+    desired: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    (
+        desired.difference(subscribed).cloned().collect(),
+        subscribed.difference(desired).cloned().collect(),
+    )
+}
+
+async fn reconcile_gateway_provider_heartbeat_channels(
+    state: &GatewayState,
+    bridge: &mut ScBridgeClient,
+    subscribed: &mut BTreeSet<String>,
+) -> Result<()> {
+    let desired = gateway_provider_heartbeat_channels(&state.models_snapshot())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let (added, removed) = gateway_provider_heartbeat_channel_changes(subscribed, &desired);
+    if !added.is_empty() {
+        bridge
+            .subscribe(added.iter().map(String::as_str))
+            .await
+            .context("subscribing to new provider heartbeat sidechannels")?;
+        for channel in &added {
+            bridge
+                .join(channel)
+                .await
+                .with_context(|| format!("joining provider heartbeat sidechannel {channel}"))?;
+        }
+    }
+    if !removed.is_empty() {
+        bridge
+            .unsubscribe(removed.iter().map(String::as_str))
+            .await
+            .context("unsubscribing from retired provider heartbeat sidechannels")?;
+    }
+    *subscribed = desired;
+    Ok(())
+}
+
 fn spawn_gateway_provider_heartbeat_watcher(
     state: GatewayState,
     config: GatewayProviderHeartbeatWatcherConfig,
 ) {
-    if config.channels.is_empty() {
-        return;
-    }
     tokio::spawn(async move {
         loop {
             let component_state = state.clone();
@@ -27035,22 +27077,13 @@ async fn run_gateway_provider_heartbeat_watcher(
     )?)
     .await
     .context("connecting to SC-Bridge for gateway provider heartbeat watcher")?;
-    bridge
-        .subscribe(config.channels.iter().map(String::as_str))
-        .await
-        .context("subscribing to provider heartbeat sidechannels")?;
-    for channel in &config.channels {
-        bridge
-            .join(channel)
-            .await
-            .with_context(|| format!("joining provider heartbeat sidechannel {channel}"))?;
-    }
-
+    let mut subscribed = BTreeSet::new();
     let mut receiver =
         HeartbeatReceiver::with_limits(config.max_age_millis, config.max_clock_skew_millis);
     loop {
+        reconcile_gateway_provider_heartbeat_channels(state, &mut bridge, &mut subscribed).await?;
         match bridge
-            .next_sidechannel_message(Duration::from_secs(86_400))
+            .next_sidechannel_message(Duration::from_secs(1))
             .await
         {
             Ok(event) => {
@@ -27481,7 +27514,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     .context("serializing startup gateway models")?,
             });
         }
-        let heartbeat_channels = gateway_provider_heartbeat_channels(&models);
         let model_count = models.len();
         let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
             .await?
@@ -27501,7 +27533,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         let heartbeat_watcher = Some(GatewayProviderHeartbeatWatcherConfig {
             sc_bridge_url: sc_bridge_url.clone(),
             sc_bridge_token: sc_bridge_token.clone(),
-            channels: heartbeat_channels,
             max_age_millis: provider_heartbeat_ttl_millis,
             max_clock_skew_millis: provider_heartbeat_clock_skew_millis,
         });
@@ -39713,7 +39744,8 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
     let contract = read_contract_catalog(&ctx.rpc).await?;
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
-    let served_ctx = u64::from(gateway_caps_from_contract(&enclave.caps).ctx);
+    let catalog_ctx = u64::from(gateway_caps_from_contract(&enclave.caps).ctx);
+    let served_ctx = resolve_provider_join_served_ctx(catalog_ctx, args.ctx)?;
     let price_ctx_bracket = price_ctx_bracket_for_model_class(
         &enclave.model_class,
         served_ctx,
@@ -39784,6 +39816,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "enclave": enclave,
         "price": price,
         "hardware_fingerprint": hardware_fingerprint,
+        "served_ctx": serve_terms.served_ctx,
         "served_modalities": serve_terms.served_modalities,
         "served_specialities": serve_terms.served_specialities,
         "rooms": rooms,
@@ -39794,6 +39827,17 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+fn resolve_provider_join_served_ctx(catalog_ctx: u64, requested: Option<u64>) -> Result<u64> {
+    ensure!(catalog_ctx > 0, "admin enclave has no usable context limit");
+    let served_ctx = requested.unwrap_or(catalog_ctx);
+    ensure!(served_ctx > 0, "--ctx must be greater than zero");
+    ensure!(
+        served_ctx <= catalog_ctx,
+        "--ctx {served_ctx} exceeds the admin catalog maximum {catalog_ctx}"
+    );
+    Ok(served_ctx)
 }
 
 async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
@@ -45356,6 +45400,13 @@ fn download_provider_huggingface_xet_file(
     std::thread::spawn(move || -> Result<PathBuf> {
         // This thread intentionally has no ambient Tokio handle. hf-xet's
         // blocking API then owns its runtime instead of selecting External mode.
+        if std::env::var_os("HF_XET_LOG_DEST").is_some()
+            || std::env::var_os("HF_XET_LOG_FILE").is_some()
+        {
+            HF_XET_LOGGING_INIT.call_once(|| {
+                xet::init_logging(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")));
+            });
+        }
         let session = XetSessionBuilder::new()
             .build()
             .context("starting the Hugging Face Xet session")?;
@@ -55928,6 +55979,37 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn gateway_heartbeat_watcher_reconciles_catalog_room_changes() {
+        let subscribed = ["mx/room/old", "mx/room/shared"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let desired = ["mx/room/new", "mx/room/shared"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let (added, removed) = gateway_provider_heartbeat_channel_changes(&subscribed, &desired);
+
+        assert_eq!(added, vec!["mx/room/new"]);
+        assert_eq!(removed, vec!["mx/room/old"]);
+    }
+
+    #[test]
+    fn provider_join_context_is_explicitly_bounded_by_catalog() {
+        assert_eq!(
+            resolve_provider_join_served_ctx(131_072, None).unwrap(),
+            131_072
+        );
+        assert_eq!(
+            resolve_provider_join_served_ctx(131_072, Some(65_536)).unwrap(),
+            65_536
+        );
+        assert!(resolve_provider_join_served_ctx(131_072, Some(0)).is_err());
+        assert!(resolve_provider_join_served_ctx(131_072, Some(131_073)).is_err());
+    }
 
     #[test]
     fn child_process_asset_root_strips_windows_verbatim_disk_prefix() {

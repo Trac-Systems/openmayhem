@@ -2513,7 +2513,7 @@ impl GatewayState {
         self
     }
 
-    fn models_snapshot(&self) -> Arc<Vec<GatewayModel>> {
+    pub fn models_snapshot(&self) -> Arc<Vec<GatewayModel>> {
         self.models.lock_recover("gateway model catalog").clone()
     }
 

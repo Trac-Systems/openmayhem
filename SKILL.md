@@ -156,6 +156,12 @@ into each other.
 - **Self-protection limits?** (`--max-concurrent`, `--accept-rate`, `--budget` as USD/day|month|total).
 - **Which model?** (run `mayhem doctor` first — it reports which backends/models fit this hardware
   and expected speed; do NOT start a provider whose backend the doctor marks insufficient).
+- **Hugging Face token set?** Model downloads come from Hugging Face. Anonymous downloads are
+  rate-limited: multi-gigabyte pulls can crawl or fail outright. Recommend a free token to every
+  provider. How to get one: create a free account at https://huggingface.co/join, open
+  https://huggingface.co/settings/tokens, choose "Create new token" with the **Read** role, copy
+  the `hf_...` value. Then `export HF_TOKEN=hf_...` before `mayhem up --provider`, or pass
+  `--hf-token-file <path>`. Read-only scope; costs nothing; never commit it anywhere.
 
 **Execute (in order):**
 ```
@@ -229,6 +235,8 @@ forwarded as-is.
   toolchain. Install the §3.2 prerequisite; do not patch code.
 - **Model never loads / provider earns nothing on NVIDIA** → CUDA toolkit (`nvcc`) missing though
   `nvidia-smi` works. Install the toolkit.
+- **Model download crawls or fails (429/403 from Hugging Face)** → anonymous rate limit. Set a
+  free HF token (§4.2): `export HF_TOKEN=hf_...`, then retry the download.
 - **Consent/rules hashing fails on Windows** → CRLF conversion of `RULES.md`; `git checkout -- RULES.md`.
 - **"Malicious Script Blocked" on macOS** → false positive; run installer in a self-opened Terminal;
   `softwareupdate --background`.
