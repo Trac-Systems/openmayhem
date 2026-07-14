@@ -12,31 +12,123 @@ secrets="$root/.mayhem-local/secrets/GO-LIVE"
 live_env="$secrets/00-mayhem-live.env"
 overlay_env="$secrets/10-mayhem-stack.env"
 systemd_env="$secrets/mayhem-systemd.env"
+systemd_env_tmp="$systemd_env.tmp"
+
+cleanup() {
+  rm -f "$systemd_env_tmp"
+}
+trap cleanup EXIT
 
 for path in "$live_env" "$overlay_env" "$repo/ops/systemd/mayhem-stack.service"; do
   [[ -f "$path" ]] || { echo "Missing required file: $path" >&2; exit 1; }
 done
 
 umask 077
-awk '/^export [A-Za-z_][A-Za-z0-9_]*=/{sub(/^export /, ""); print}' "$live_env" > "$systemd_env.tmp"
-awk '/^[A-Za-z_][A-Za-z0-9_]*=/{print}' "$overlay_env" >> "$systemd_env.tmp"
-cat >> "$systemd_env.tmp" <<'ENV'
-MAYHEM_REPO='/opt/mayhem/source'
-MAYHEM_PEER_RPC='http://127.0.0.1:49223/v1'
-MAYHEM_CONTRACT_RPC_URL='http://127.0.0.1:49223/v1'
-MAYHEM_PAYGATE_BIND='127.0.0.1:11436'
-MAYHEM_PAYGATE_CONTRACT_DRY_RUN='0'
-MAYHEM_PAYGATE_STRIPE_EVENTS_PATH='/opt/mayhem/.mayhem-local/paygate/stripe-events.jsonl'
-MAYHEM_STRIPE_BACKFILL_ENABLED='1'
-MAYHEM_STRIPE_BACKFILL_CURSOR_PATH='/opt/mayhem/.mayhem-local/paygate/stripe-backfill-cursor.json'
-MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS='300'
-MAYHEM_ADMIN_WALLET_PASSWORD=''
-MAYHEM_WALLET_PASSWORD=''
-MAYHEM_TNK_WALLET_PASSWORD=''
-MAYHEM_MSB_NETWORK='mainnet'
-ENV
-mv "$systemd_env.tmp" "$systemd_env"
+awk '
+  /^(export )?[A-Za-z_][A-Za-z0-9_]*=/ {
+    sub(/^export /, "")
+    key = $0
+    sub(/=.*/, "", key)
+    if (!(key in seen)) {
+      order[++count] = key
+      seen[key] = 1
+    }
+    value[key] = $0
+  }
+  END {
+    for (i = 1; i <= count; i++) print value[order[i]]
+  }
+' "$live_env" "$overlay_env" > "$systemd_env_tmp"
+
+append_default() {
+  local key="$1" value="$2"
+  if ! grep -q "^${key}=" "$systemd_env_tmp"; then
+    printf "%s='%s'\n" "$key" "$value" >> "$systemd_env_tmp"
+  fi
+}
+
+append_default MAYHEM_REPO "$repo"
+append_default MAYHEM_PEER_RPC 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_CONTRACT_RPC_URL 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
+append_default MAYHEM_PAYGATE_CONTRACT_DRY_RUN '0'
+append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
+append_default MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE 'express'
+append_default MAYHEM_STRIPE_CONNECT_ACCOUNTS_PATH "$root/.mayhem-local/paygate/stripe-connect-accounts.jsonl"
+append_default MAYHEM_STRIPE_CONNECT_RETURN_URL 'https://dashboard.stripe.com/'
+append_default MAYHEM_STRIPE_CONNECT_REFRESH_URL 'https://dashboard.stripe.com/'
+append_default MAYHEM_STRIPE_BACKFILL_ENABLED '1'
+append_default MAYHEM_STRIPE_BACKFILL_CURSOR_PATH "$root/.mayhem-local/paygate/stripe-backfill-cursor.json"
+append_default MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS '300'
+append_default MAYHEM_FIAT_SETTLEMENT_ENABLED '1'
+append_default MAYHEM_FIAT_OPERATOR_ACCOUNT 'platform_balance'
+append_default MAYHEM_FIAT_OPERATOR_CURRENCY 'eur'
+append_default MAYHEM_ADMIN_WALLET_PASSWORD ''
+append_default MAYHEM_WALLET_PASSWORD ''
+append_default MAYHEM_TNK_WALLET_PASSWORD ''
+append_default MAYHEM_MSB_NETWORK 'mainnet'
+
+env_value() {
+  local key="$1" value
+  value="$(awk -F= -v key="$key" '$1 == key { value = substr($0, index($0, "=") + 1) } END { print value }' "$systemd_env_tmp")"
+  if [[ "$value" == \'*\' || "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+require_equal() {
+  local key="$1" expected="$2"
+  [[ "$(env_value "$key")" == "$expected" ]] || {
+    echo "Refusing live install: $key is not the canonical mainnet value." >&2
+    exit 1
+  }
+}
+
+require_prefix() {
+  local key="$1" prefix="$2" value
+  value="$(env_value "$key")"
+  [[ "$value" == "$prefix"* ]] || {
+    echo "Refusing live install: $key is missing or has the wrong live-mode prefix." >&2
+    exit 1
+  }
+}
+
+require_live_rpc() {
+  local key="$1" value
+  value="$(env_value "$key")"
+  [[ "$value" == https://* ]] || {
+    echo "Refusing live install: $key must contain an HTTPS mainnet endpoint." >&2
+    exit 1
+  }
+  [[ ! "$value" =~ (localhost|127\.0\.0\.1|testnet|sepolia|goerli|holesky) ]] || {
+    echo "Refusing live install: $key contains a non-mainnet endpoint." >&2
+    exit 1
+  }
+}
+
+require_equal MAYHEM_NETWORK 'mainnet'
+require_equal MAYHEM_MSB_NETWORK 'mainnet'
+require_equal MSB_BOOTSTRAP 'acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685'
+require_equal MSB_CHANNEL '0000trac0network0msb0mainnet0000'
+require_equal MAYHEM_TNK_TREASURY_ADDRESS 'trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh'
+require_equal MAYHEM_TAP_ETH_CHAIN_ID '1'
+require_equal MAYHEM_TAP_TOKEN_ADDR '0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454'
+require_equal MAYHEM_TAP_POOL_ADDRESS '0x9B254d37C28Fb5893F46513a61925eDC2F300615'
+require_live_rpc MAYHEM_TAP_ETH_RPC
+require_live_rpc MAYHEM_TAP_ETH_RPC_FALLBACKS
+require_equal MAYHEM_PAYGATE_STRIPE_ENABLED '1'
+require_equal MAYHEM_STRIPE_MODE 'live'
+require_equal MAYHEM_STRIPE_API_BASE_URL 'https://api.stripe.com'
+require_prefix MAYHEM_STRIPE_SECRET_KEY 'sk_live_'
+
+mv "$systemd_env_tmp" "$systemd_env"
 chmod 600 "$systemd_env"
+
+if [[ "${MAYHEM_RENDER_ONLY:-0}" == "1" ]]; then
+  echo "Canonical mainnet payment environment validated at $systemd_env."
+  exit 0
+fi
 
 install -d -m 700 -o mayhem -g mayhem \
   "$root/backups" \

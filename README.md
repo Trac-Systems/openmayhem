@@ -474,6 +474,19 @@ mayhem provider rails set --rails fiat,tap,tnk    # accept everything (recommend
 mayhem provider rails get
 ```
 
+When accepting fiat, finish the one-time Stripe Connect setup from the same
+terminal:
+
+```bash
+mayhem provider stripe onboard --country DE
+mayhem provider stripe status
+```
+
+The onboarding command always prints the exact `https://connect.stripe.com/...`
+URL before attempting to open a browser. On a remote terminal, pass `--no-open`
+and open that copy/paste URL anywhere; rerunning `status` completes the
+admin-approved payout binding without giving the provider ledger write access.
+
 Earnings settle **automatically at the end of every epoch (hourly)** on each rail you earned in. You keep 85%; the network fee funds gas sponsorship and operations.
 
 Two rails push the money to you. One is a pull, for a reason:
@@ -519,6 +532,7 @@ mayhem provider rails get
 | `mayhem up --provider` | start serving with everything supervised |
 | `mayhem provider list / health` | joins, ledger state, heartbeats, visibility |
 | `mayhem provider rails set/get` | which payment rails you accept |
+| `mayhem provider stripe onboard/status` | create or resume Stripe Connect onboarding and verify payout readiness |
 | `mayhem provider min-ask set/get` | your price floor per market |
 | `mayhem provider limits set` | concurrency / accept-rate / daily budget caps |
 | `mayhem provider drain` | graceful sign-off |

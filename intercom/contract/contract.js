@@ -4740,6 +4740,11 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    const history = await this.get(this.tx);
+    if (history && stableJson(history) !== stableJson(record)) {
+      return new Error('TNK rate oracle history collision.');
+    }
+    if (!history) await this.put(this.tx, record);
     await this.put('rate/latest', record);
     console.log('mayhem rateOracle', record);
     return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
@@ -4876,15 +4881,8 @@ class MayhemContract extends Contract {
       return new Error('TNK settlement epoch apply hash does not match current state.');
     }
 
-    const rate = await this.guardianRequireFreshRate(this.value.at);
+    const rate = await this.guardianRequireHistoricalTnkRate(this.value, this.value.at);
     if (rate instanceof Error) return rate;
-    if (
-      this.compareAu(rate.tnk_usd_au, this.value.rate_tnk_usd_au) !== 0 ||
-      rate.source !== this.value.rate_source ||
-      rate.ts !== this.value.rate_ts
-    ) {
-      return new Error('TNK settlement rate does not match current oracle.');
-    }
 
     const params = await this.activeParamsAt(this.value.at, [
       'holdback_epochs',
@@ -11089,6 +11087,42 @@ class MayhemContract extends Contract {
     const rate = await this.requireFreshRate(at);
     if (rate instanceof Error) {
       return new Error(`Guardian rate freshness invariant failed: ${rate.message}`);
+    }
+    return rate;
+  }
+
+  async guardianRequireHistoricalTnkRate(settlement, at) {
+    const oracleValue = {
+      op: 'rate_oracle',
+      tnk_usd_au: settlement.rate_tnk_usd_au,
+      source: settlement.rate_source,
+      ts: settlement.rate_ts,
+    };
+    const key = await this.rateFeatureKey(oracleValue);
+    if (key instanceof Error) {
+      return new Error(`Guardian TNK settlement rate invariant failed: ${key.message}`);
+    }
+    const rate = await this.get(key);
+    if (!rate) {
+      return new Error('Guardian TNK settlement rate invariant failed: exact admin-posted oracle history required.');
+    }
+    if (
+      rate.denom !== 'tnk_usd_au' ||
+      this.compareAu(rate.tnk_usd_au, settlement.rate_tnk_usd_au) !== 0 ||
+      rate.source !== settlement.rate_source ||
+      rate.ts !== settlement.rate_ts ||
+      rate.updated_at !== key ||
+      rate.posted_by_role !== 'admin' ||
+      !this.isHexBytes(rate.posted_by, 32)
+    ) {
+      return new Error('Guardian TNK settlement rate invariant failed: oracle history is invalid.');
+    }
+    if (rate.ts > at) {
+      return new Error('Guardian TNK settlement rate invariant failed: oracle timestamp is in the future.');
+    }
+    const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
+    if (at - rate.ts > params.rate_staleness_seconds) {
+      return new Error('Guardian TNK settlement rate invariant failed: oracle is stale.');
     }
     return rate;
   }

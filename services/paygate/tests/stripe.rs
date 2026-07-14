@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body, Bytes},
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, Method, Request, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -26,6 +26,7 @@ use tower::ServiceExt;
 struct StripeCapture {
     requests: Arc<Mutex<Vec<StripeRequest>>>,
     events: Arc<Mutex<Vec<Value>>>,
+    connect_ready: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +171,87 @@ async fn mock_create_checkout_session(
     }))
 }
 
+fn mock_connect_account(ready: bool) -> Value {
+    json!({
+        "id": "acct_test_provider",
+        "object": "account",
+        "type": "express",
+        "country": "DE",
+        "default_currency": "eur",
+        "details_submitted": ready,
+        "charges_enabled": false,
+        "payouts_enabled": ready,
+        "capabilities": {
+            "transfers": if ready { "active" } else { "pending" }
+        },
+        "requirements": {
+            "currently_due": if ready { json!([]) } else { json!(["business_profile.url"]) },
+            "eventually_due": if ready { json!([]) } else { json!(["external_account"]) },
+            "disabled_reason": if ready { Value::Null } else { json!("requirements.past_due") }
+        }
+    })
+}
+
+async fn mock_create_connect_account(
+    State(capture): State<StripeCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Json<Value> {
+    let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    capture.requests.lock().await.push(StripeRequest {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        idempotency_key: headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        body: format!("connect-account:{body}"),
+    });
+    Json(mock_connect_account(*capture.connect_ready.lock().await))
+}
+
+async fn mock_retrieve_connect_account(
+    State(capture): State<StripeCapture>,
+    AxumPath(account_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    capture.requests.lock().await.push(StripeRequest {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        idempotency_key: None,
+        body: format!("connect-status:{account_id}"),
+    });
+    Json(mock_connect_account(*capture.connect_ready.lock().await))
+}
+
+async fn mock_create_connect_link(
+    State(capture): State<StripeCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Json<Value> {
+    let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    capture.requests.lock().await.push(StripeRequest {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        idempotency_key: headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        body: format!("connect-link:{body}"),
+    });
+    Json(json!({
+        "object": "account_link",
+        "url": "https://connect.stripe.com/setup/test-link",
+        "expires_at": 1_900_000_000u64
+    }))
+}
+
 async fn mock_list_events(
     State(capture): State<StripeCapture>,
     Query(query): Query<HashMap<String, String>>,
@@ -218,6 +300,12 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
     let app = Router::new()
         .route("/v1/payment_intents", post(mock_create_payment_intent))
         .route("/v1/checkout/sessions", post(mock_create_checkout_session))
+        .route("/v1/accounts", post(mock_create_connect_account))
+        .route(
+            "/v1/accounts/{account_id}",
+            get(mock_retrieve_connect_account),
+        )
+        .route("/v1/account_links", post(mock_create_connect_link))
         .route("/v1/events", get(mock_list_events))
         .with_state(capture.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -363,6 +451,7 @@ async fn start_mock_contract(mode: ContractFeatureMode) -> (String, ContractRpcC
 
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
     let backfill_cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
+    let connect_accounts_path = event_store_path.with_file_name("stripe-connect-accounts.jsonl");
     PaygateConfig {
         contract_dry_run: true,
         rails: RailConfig {
@@ -373,6 +462,7 @@ fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> Pay
                 api_base_url: stripe_base,
                 event_store_path,
                 backfill_cursor_path,
+                connect_accounts_path,
                 ..StripeSettings::default()
             },
         },
@@ -699,6 +789,89 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
     assert!(requests[0]
         .body
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_fiat_amount_minor%5D=250"));
+}
+
+#[tokio::test]
+async fn stripe_connect_onboarding_reuses_account_and_reports_ready_status() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let event_store_path = temp.path().join("stripe-events.jsonl");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let config = test_config(stripe_base, event_store_path.clone());
+    let state = PaygateState::try_new_with_contract_poster(
+        config.clone(),
+        OracleKeypair::from_seed_hex(&"13".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+
+    let (status, body) = json_request(
+        paygate_router(state),
+        Method::POST,
+        "/v1/stripe/connect/onboard",
+        json!({
+            "provider": "a".repeat(64),
+            "country": "DE",
+            "request_nonce": "1".repeat(64)
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rail"], "fiat");
+    assert_eq!(body["processor_rail"], "stripe");
+    assert_eq!(body["account"]["id"], "acct_test_provider");
+    assert_eq!(body["account"]["default_currency"], "eur");
+    assert_eq!(body["account"]["ready"], false);
+    assert_eq!(
+        body["copy_paste"]["onboarding_url"],
+        "https://connect.stripe.com/setup/test-link"
+    );
+
+    *capture.connect_ready.lock().await = true;
+    let reloaded = PaygateState::try_new_with_contract_poster(
+        config,
+        OracleKeypair::from_seed_hex(&"13".repeat(32)).expect("oracle"),
+        poster,
+    )
+    .expect("reloaded state");
+    let (status, body) = json_request(
+        paygate_router(reloaded),
+        Method::POST,
+        "/v1/stripe/connect/status",
+        json!({
+            "provider": "a".repeat(64),
+            "request_nonce": "2".repeat(64)
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["account"]["ready"], true);
+    assert_eq!(body["account"]["payouts_enabled"], true);
+    assert_eq!(body["account"]["transfers_enabled"], true);
+    assert!(body["onboarding"].is_null());
+    let requests = capture.requests.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.body.starts_with("connect-account:"))
+            .count(),
+        1
+    );
+    assert!(requests.iter().any(|request| {
+        request.body.starts_with("connect-account:")
+            && request.body.contains("type=express")
+            && request.body.contains("country=DE")
+            && request
+                .body
+                .contains("metadata%5Bmayhem_provider%5D=aaaaaaaa")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.body.starts_with("connect-link:")
+            && request.body.contains("type=account_onboarding")
+            && request.body.contains("account=acct_test_provider")
+    }));
 }
 
 #[tokio::test]

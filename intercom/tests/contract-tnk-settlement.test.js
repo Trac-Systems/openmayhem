@@ -237,6 +237,14 @@ test('MayhemContract tnkSettlement records official per-output transfers and is 
   const ctx = await setupTnkSettlementContract();
   const settlement = await settlementValue(ctx);
 
+  const newerRate = await executeRateFeature(ctx.contract, ctx.storage, {
+    ...rate,
+    tnk_usd_au: '60000000000000000',
+    source: 'mexc-spot',
+    ts: rate.ts + 1,
+  }, ctx.admin.publicKey);
+  assert.equal(newerRate.ok, true, newerRate.message);
+
   ctx.contract._mayhemLastFeatureResult = undefined;
   const placeholderResult = await executeFeature(
     ctx.contract,
@@ -261,6 +269,7 @@ test('MayhemContract tnkSettlement records official per-output transfers and is 
   const nonAdmin = nonAdminResult ?? ctx.contract._mayhemLastFeatureResult;
   assert.match(nonAdmin.message, /admin required/i);
 
+  const preSettlementSnapshot = ctx.storage.snapshotBytes();
   const settled = await executeTnkSettlementFeature(
     ctx.contract,
     ctx.storage,
@@ -330,6 +339,34 @@ test('MayhemContract tnkSettlement records official per-output transfers and is 
   );
   assert.match(changed.message, /already exists/i);
   assert.equal(ctx.storage.snapshotBytes(), snapshot);
+
+  const rebuiltStorage = MemoryStorage.fromSnapshotBytes(preSettlementSnapshot);
+  const rebuiltContract = new MayhemContract(
+    { peer: { wallet: makeVerifier(ctx.providers[0].identity.wallet) } },
+    {}
+  );
+  const rebuilt = await executeTnkSettlementFeature(
+    rebuiltContract,
+    rebuiltStorage,
+    settlement,
+    ctx.admin.publicKey
+  );
+  assert.deepEqual(rebuilt, settled);
+  assert.equal(rebuiltStorage.snapshotBytes(), snapshot);
+});
+
+test('MayhemContract tnkSettlement rejects a rate without immutable admin oracle history', async () => {
+  const ctx = await setupTnkSettlementContract();
+  const settlement = await settlementValue(ctx, { rate_source: 'mexc-spot' });
+
+  const result = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    settlement,
+    ctx.admin.publicKey
+  );
+  assert.match(result.message, /exact admin-posted oracle history required/i);
+  assert.equal(await ctx.storage.get('settle/tnk/1'), null);
 });
 
 test('MayhemContract tnkSettlement releases clean-exit provider earnings after holdback maturity', async () => {

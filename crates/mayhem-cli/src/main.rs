@@ -437,6 +437,11 @@ enum ProviderCommands {
         #[command(subcommand)]
         command: ProviderRailsCommands,
     },
+    /// Onboard and inspect this provider's Stripe Connect payout account.
+    Stripe {
+        #[command(subcommand)]
+        command: ProviderStripeCommands,
+    },
     /// Inspect or set this provider's local min-ask per admin-created market.
     MinAsk {
         #[command(subcommand)]
@@ -514,6 +519,14 @@ enum ProviderRailsCommands {
     Get(ProviderRailsGetArgs),
     /// Set the provider's accepted serving rails.
     Set(ProviderRailsSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderStripeCommands {
+    /// Create or refresh the hosted Stripe Connect onboarding link.
+    Onboard(ProviderStripeOnboardArgs),
+    /// Refresh Stripe account readiness and admin payout binding status.
+    Status(ProviderStripeStatusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -4489,6 +4502,14 @@ struct AdminFiatSettlementArgs {
     /// Stripe API base URL. Defaults to MAYHEM_STRIPE_API_BASE_URL or https://api.stripe.com.
     #[arg(long)]
     stripe_api_base_url: Option<String>,
+
+    /// Maximum attempts for transient Stripe account/transfer API failures.
+    #[arg(long, default_value_t = 4)]
+    stripe_transfer_max_attempts: u32,
+
+    /// Initial retry delay for transient Stripe API failures.
+    #[arg(long, default_value_t = 500)]
+    stripe_transfer_retry_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -4928,6 +4949,61 @@ struct ProviderRailsSetArgs {
     /// Comma-separated accepted serving rails from fiat,tap,tnk.
     #[arg(long)]
     rails: String,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStripeArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStripeOnboardArgs {
+    #[command(flatten)]
+    provider: ProviderStripeArgs,
+
+    /// Two-letter ISO country code for the provider business or individual.
+    #[arg(long)]
+    country: String,
+
+    /// Print the onboarding URL but do not launch a browser.
+    #[arg(long)]
+    no_open: bool,
+
+    /// Return after creating the onboarding link instead of polling account readiness.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// Maximum seconds to wait for Stripe readiness and admin payout binding.
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+
+    /// Poll interval in milliseconds while waiting for account readiness.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStripeStatusArgs {
+    #[command(flatten)]
+    provider: ProviderStripeArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -5584,7 +5660,7 @@ struct MsbTransferOutput {
     validator_connections: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct MsbSettlementTransferOutput {
     to: String,
     amount: String,
@@ -5858,6 +5934,10 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         ProviderCommands::Rails { command } => match command {
             ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
             ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
+        },
+        ProviderCommands::Stripe { command } => match command {
+            ProviderStripeCommands::Onboard(args) => provider_stripe_onboard(args).await,
+            ProviderStripeCommands::Status(args) => provider_stripe_status(args).await,
         },
         ProviderCommands::MinAsk { command } => match command {
             ProviderMinAskCommands::Get(args) => provider_min_ask_get(args),
@@ -20793,6 +20873,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         resolve_tnk_treasury_keypair_path(args.treasury_keypair.as_deref())?;
     let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
     let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
+    let manifest_path = tnk_settlement_manifest_path(&home, &network, epoch);
     let provided_msb_tx_hashes = args
         .msb_tx_hashes
         .iter()
@@ -20811,8 +20892,21 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         } else {
             Some(provided_msb_tx_hashes.as_slice())
         },
+        args.submit_transfer.then_some(manifest_path.as_path()),
     )
     .await?;
+    let settlement_manifest = if plan.already_settled.is_none() {
+        Some(tnk_settlement_manifest_value(
+            &plan,
+            epoch,
+            &network,
+            &treasury_address,
+        )?)
+    } else {
+        None
+    };
+    let settlement_manifest_path = settlement_manifest.as_ref().map(|_| manifest_path);
+    let planned_at = plan.payload.get("at").and_then(Value::as_u64).unwrap_or(at);
 
     if plan.already_settled.is_none()
         && plan
@@ -20828,6 +20922,13 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
 
     let mut msb_transfers = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
+        let manifest = settlement_manifest
+            .as_ref()
+            .context("TNK settlement manifest missing for unsettled epoch")?;
+        let manifest_path = settlement_manifest_path
+            .as_ref()
+            .context("TNK settlement manifest path missing for unsettled epoch")?;
+        ensure_tnk_settlement_manifest(manifest_path, manifest)?;
         let keypair_path = treasury_keypair_path.as_ref().context(
             "treasury keypair required for --submit-transfer; pass --treasury-keypair or set MAYHEM_TNK_TREASURY_KEYPAIR_PATH",
         )?;
@@ -20852,12 +20953,16 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         let (stores_directory, store_name) = msb_store_from_keypair_path(keypair_path)?;
         let mut hashes = Vec::with_capacity(plan.msb_outputs.len());
         for (index, output) in plan.msb_outputs.iter().enumerate() {
-            let transfer = submit_msb_transfer(
+            let operation_id = tnk_settlement_output_operation_id(manifest, index, output);
+            let journal_path = tnk_settlement_output_journal_path(manifest_path, &operation_id)?;
+            let transfer = submit_journaled_msb_settlement_transfer(
                 &network,
                 &stores_directory,
                 &store_name,
                 &output.to,
                 &output.amount,
+                &operation_id,
+                &journal_path,
                 args.msb_transfer_timeout_seconds,
                 args.msb_transfer_max_retries,
                 (index == 0)
@@ -20889,6 +20994,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             hashes.push(transfer.tx_hash.clone());
             msb_transfers.push(json!({
                 "output_index": index,
+                "operation_id": operation_id,
+                "journal_file": journal_path,
                 "transfer": transfer,
             }));
         }
@@ -20913,6 +21020,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     };
 
     let mut feature_result = None;
+    let mut settlement_state = None;
     if let Some(feature) = feature.as_ref().filter(|_| args.tx.submit && !args.tx.sim) {
         let submitted = rpc
             .submit_feature(feature)
@@ -20922,12 +21030,29 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             bail!("TNK settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
+        let expected_hashes = settlement_report
+            .get("msb_tx_hashes")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let expected_root = settlement_report
+            .get("transfer_root")
+            .cloned()
+            .unwrap_or(Value::Null);
+        settlement_state = Some(
+            wait_for_state(&rpc, &format!("settle/tnk/{epoch}"), |value| {
+                value.get("msb_tx_hashes") == Some(&expected_hashes)
+                    && value.get("transfer_root") == Some(&expected_root)
+                    && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
+            })
+            .await
+            .context("waiting for exact TNK settlement ledger evidence")?,
+        );
     }
 
     let copy_paste_submit = format!(
         "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}{}{}",
         epoch,
-        at,
+        planned_at,
         shell_single_quote(&treasury_address),
         shell_single_quote(&operator_tnk_address),
         shell_single_quote(&network),
@@ -20978,13 +21103,25 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let msb_transfer_commands = plan
         .msb_outputs
         .iter()
-        .map(|output| {
+        .enumerate()
+        .map(|(index, output)| {
+            let manifest = settlement_manifest
+                .as_ref()
+                .expect("unsettled TNK outputs have a settlement manifest");
+            let manifest_path = settlement_manifest_path
+                .as_ref()
+                .expect("unsettled TNK outputs have a manifest path");
+            let operation_id = tnk_settlement_output_operation_id(manifest, index, output);
+            let journal_path = tnk_settlement_output_journal_path(manifest_path, &operation_id)
+                .expect("TNK settlement manifest path has a parent");
             format!(
-                "pear-runtime run {} --msb-transfer-helper=transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --to {} --amount {} --timeout-seconds {} --max-retries {}",
+                "pear-runtime run {} --msb-transfer-helper=settlement-transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --to {} --amount {} --operation-id {} --journal-file {} --timeout-seconds {} --max-retries {}",
                 shell_single_quote(&msb_app_path.display().to_string()),
                 shell_single_quote(&network),
                 shell_single_quote(&output.to),
                 shell_single_quote(&output.amount),
+                shell_single_quote(&operation_id),
+                shell_single_quote(&journal_path.display().to_string()),
                 args.msb_transfer_timeout_seconds,
                 args.msb_transfer_max_retries
             )
@@ -20998,13 +21135,15 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         "already_settled": plan.already_settled,
         "rpc_url": rpc_url,
         "epoch": epoch,
-        "at": at,
+        "at": planned_at,
         "network": network,
         "treasury_from": treasury_address,
         "operator_to": operator_tnk_address,
+        "settlement_manifest_file": settlement_manifest_path,
         "settlement": settlement_report,
         "feature": feature,
         "feature_result": feature_result,
+        "settlement_state": settlement_state,
         "msb_transfers": msb_transfers,
         "msb_outputs": plan.msb_outputs,
         "skipped_providers": plan.skipped_providers,
@@ -21041,6 +21180,12 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     }
     if args.submit_transfer && !args.tx.submit {
         bail!("--submit-transfer requires --submit so the Stripe transfers and contract evidence are submitted together");
+    }
+    if args.stripe_transfer_max_attempts == 0 {
+        bail!("--stripe-transfer-max-attempts must be positive");
+    }
+    if args.stripe_transfer_retry_ms == 0 {
+        bail!("--stripe-transfer-retry-ms must be positive");
     }
     let epoch = args
         .epoch
@@ -21091,22 +21236,75 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
 
     let mut stripe_transfers = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
+        let blocking_skips = plan
+            .skipped_providers
+            .iter()
+            .filter(|entry| entry.get("blocking").and_then(Value::as_bool) == Some(true))
+            .count();
+        if blocking_skips > 0 {
+            bail!(
+                "fiat settlement has {blocking_skips} provider payout error(s); no Stripe transfers were attempted"
+            );
+        }
         let secret_key = load_stripe_secret_key(args.stripe_env_file.as_ref(), &home)?;
         let api_base_url = stripe_api_base_url(args.stripe_api_base_url.as_deref())?;
+        validate_stripe_transfer_environment(
+            &secret_key,
+            &api_base_url,
+            env::var("MAYHEM_STRIPE_MODE").ok().as_deref(),
+            stripe_transfer_runtime_is_mainnet()?,
+        )?;
         let client = reqwest::Client::new();
         let mut refs = Vec::with_capacity(plan.stripe_outputs.len());
         for (index, output) in plan.stripe_outputs.iter().enumerate() {
             if output.role == "provider" {
-                let transfer = stripe_create_transfer(
+                let account = stripe_connect_payout_status(
+                    &client,
+                    &api_base_url,
+                    &secret_key,
+                    &output.to,
+                    args.stripe_transfer_max_attempts,
+                    args.stripe_transfer_retry_ms,
+                )
+                .await
+                .with_context(|| {
+                    format!("checking Stripe Connect payout readiness for {}", output.to)
+                })?;
+                if !account.ready {
+                    bail!(
+                        "Stripe Connect account {} is not payout-ready (details_submitted={}, payouts_enabled={}, transfers_enabled={})",
+                        account.id,
+                        account.details_submitted,
+                        account.payouts_enabled,
+                        account.transfers_enabled
+                    );
+                }
+                if account.default_currency != output.currency {
+                    bail!(
+                        "Stripe Connect account {} default currency {} did not match planned {}",
+                        account.id,
+                        account.default_currency,
+                        output.currency
+                    );
+                }
+                let transfer = stripe_create_transfer_verified(
                     &client,
                     &api_base_url,
                     &secret_key,
                     output,
-                    &format!(
-                        "mayhem:fiat:settle:v1:{epoch}:{}:{}",
-                        output.provider.as_deref().unwrap_or("provider"),
-                        plan.epoch_apply_hash
-                    ),
+                    &stripe_transfer_idempotency_key(
+                        epoch,
+                        output
+                            .provider
+                            .as_deref()
+                            .context("Stripe provider transfer output missing provider")?,
+                        &plan.epoch_apply_hash,
+                    )?,
+                    epoch,
+                    index,
+                    &plan.epoch_apply_hash,
+                    args.stripe_transfer_max_attempts,
+                    args.stripe_transfer_retry_ms,
                 )
                 .await
                 .with_context(|| {
@@ -21135,6 +21333,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 refs.push(transfer.id.clone());
                 stripe_transfers.push(json!({
                     "output_index": index,
+                    "account": account,
                     "transfer": transfer,
                 }));
             } else {
@@ -21166,6 +21365,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     };
 
     let mut feature_result = None;
+    let mut settlement_state = None;
     if let Some(feature) = feature.as_ref().filter(|_| args.tx.submit && !args.tx.sim) {
         let submitted = rpc
             .submit_feature(feature)
@@ -21175,6 +21375,23 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             bail!("fiat settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
+        let expected_refs = settlement_report
+            .get("stripe_refs")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let expected_root = settlement_report
+            .get("transfer_root")
+            .cloned()
+            .unwrap_or(Value::Null);
+        settlement_state = Some(
+            wait_for_state(&rpc, &format!("settle/fiat/{epoch}"), |value| {
+                value.get("stripe_refs") == Some(&expected_refs)
+                    && value.get("transfer_root") == Some(&expected_root)
+                    && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
+            })
+            .await
+            .context("waiting for exact fiat settlement ledger evidence")?,
+        );
     }
 
     let copy_paste_submit = format!(
@@ -21221,26 +21438,40 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         .enumerate()
         .filter(|(_, output)| output.role == "provider")
         .map(|(index, output)| {
-            format!(
-                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={}",
+            let provider = output
+                .provider
+                .as_deref()
+                .context("Stripe provider transfer output missing provider")?;
+            let idempotency_key =
+                stripe_transfer_idempotency_key(epoch, provider, &plan.epoch_apply_hash)?;
+            let transfer_group = format!(
+                "mayhem_fiat_epoch_{epoch}_{}",
+                plan.epoch_apply_hash
+                    .get(..16)
+                    .unwrap_or(&plan.epoch_apply_hash)
+            );
+            Ok(format!(
+                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d transfer_group={} -d metadata[mayhem_provider]={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={} -d metadata[mayhem_epoch_apply_hash]={}",
                 shell_single_quote(&format!("{}/v1/transfers", stripe_api_base_url(args.stripe_api_base_url.as_deref()).unwrap_or_else(|_| "https://api.stripe.com".to_owned()).trim_end_matches('/'))),
-                shell_single_quote(&format!(
-                    "Idempotency-Key: mayhem:fiat:settle:v1:{epoch}:{}:{}",
-                    output.provider.as_deref().unwrap_or("provider"),
-                    plan.epoch_apply_hash
-                )),
+                shell_single_quote(&format!("Idempotency-Key: {idempotency_key}")),
                 output.amount_minor,
                 shell_single_quote(&output.currency),
                 shell_single_quote(&output.to),
+                shell_single_quote(&transfer_group),
+                shell_single_quote(provider),
                 epoch,
-                index
-            )
+                index,
+                shell_single_quote(&plan.epoch_apply_hash)
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
+    let nothing_to_settle = plan.already_settled.is_none() && plan.stripe_outputs.is_empty();
+    let reconciliation = fiat_settlement_reconciliation(&plan.stripe_outputs, &stripe_transfers)?;
     let report = json!({
         "ok": true,
         "submitted": feature_result.is_some(),
+        "nothing_to_settle": nothing_to_settle,
         "sim": args.tx.submit && args.tx.sim,
         "already_settled": plan.already_settled,
         "rpc_url": rpc_url,
@@ -21251,9 +21482,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         "settlement": settlement_report,
         "feature": feature,
         "feature_result": feature_result,
+        "settlement_state": settlement_state,
         "stripe_transfers": stripe_transfers,
         "stripe_outputs": plan.stripe_outputs,
         "skipped_providers": plan.skipped_providers,
+        "reconciliation": reconciliation,
         "copy_paste": {
             "submit_settlement": copy_paste_submit,
             "stripe_transfer_curl": stripe_transfer_commands,
@@ -21970,6 +22203,9 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
         return Ok(());
     }
     println!("Already settled: false");
+    if report["nothing_to_settle"].as_bool() == Some(true) {
+        println!("Nothing to settle: true (no whole-minor-unit fiat outputs)");
+    }
     if let Some(settlement) = report.get("settlement").filter(|value| !value.is_null()) {
         println!(
             "Gross: {} au_usd",
@@ -22100,9 +22336,10 @@ fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
     );
     for skipped in report["skipped_providers"].as_array().into_iter().flatten() {
         println!(
-            "  skipped provider={} au={} reason={}",
+            "  skipped provider={} au={} blocking={} reason={}",
             skipped["provider"].as_str().unwrap_or(""),
             skipped["au"].as_str().unwrap_or("0"),
+            skipped["blocking"].as_bool().unwrap_or(true),
             skipped["reason"].as_str().unwrap_or("")
         );
     }
@@ -33204,6 +33441,239 @@ fn validate_msb_tx_hash(value: &str) -> Result<String> {
     Ok(value)
 }
 
+fn tnk_settlement_manifest_value(
+    plan: &TnkSettlementPlan,
+    epoch: u64,
+    network: &str,
+    treasury_address: &str,
+) -> Result<Value> {
+    let msb_tx_hashes = plan
+        .payload
+        .get("msb_tx_hashes")
+        .and_then(Value::as_array)
+        .context("TNK settlement plan missing msb_tx_hashes")?;
+    if !msb_tx_hashes.is_empty() {
+        bail!("TNK settlement manifest must be created before MSB transfers");
+    }
+    let transfer_root = plan
+        .payload
+        .get("transfer_root")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .context("TNK settlement plan missing transfer_root")?;
+    let epoch_apply_hash = plan
+        .payload
+        .get("epoch_apply_hash")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .context("TNK settlement plan missing epoch_apply_hash")?;
+    Ok(json!({
+        "schema_version": 1,
+        "epoch": epoch,
+        "network": network,
+        "treasury_from": treasury_address,
+        "operator_to": plan.payload.get("operator_to"),
+        "epoch_apply_hash": epoch_apply_hash,
+        "transfer_root": transfer_root,
+        "payload": &plan.payload,
+        "outputs": &plan.msb_outputs,
+        "skipped_providers": &plan.skipped_providers,
+    }))
+}
+
+fn read_tnk_settlement_manifest(
+    path: &Path,
+    epoch: u64,
+    network: &str,
+    treasury_address: &str,
+    operator_tnk_address: &str,
+) -> Result<Option<TnkSettlementPlan>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", path.display()))?;
+    if manifest.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        bail!(
+            "unsupported TNK settlement manifest schema in {}",
+            path.display()
+        );
+    }
+    for (field, expected) in [
+        ("network", network),
+        ("treasury_from", treasury_address),
+        ("operator_to", operator_tnk_address),
+    ] {
+        if manifest.get(field).and_then(Value::as_str) != Some(expected) {
+            bail!(
+                "TNK settlement manifest {} has a different {field}; refusing new transfers",
+                path.display()
+            );
+        }
+    }
+    if manifest.get("epoch").and_then(Value::as_u64) != Some(epoch) {
+        bail!(
+            "TNK settlement manifest {} has a different epoch; refusing new transfers",
+            path.display()
+        );
+    }
+    let payload = manifest
+        .get("payload")
+        .cloned()
+        .context("TNK settlement manifest missing frozen payload")?;
+    for (field, expected) in [
+        ("op", "tnk_settlement"),
+        ("rail", "tnk"),
+        ("network", network),
+        ("treasury_from", treasury_address),
+        ("operator_to", operator_tnk_address),
+    ] {
+        if payload.get(field).and_then(Value::as_str) != Some(expected) {
+            bail!(
+                "TNK settlement manifest {} frozen payload has a different {field}",
+                path.display()
+            );
+        }
+    }
+    if payload.get("epoch").and_then(Value::as_u64) != Some(epoch) {
+        bail!("TNK settlement manifest frozen payload has a different epoch");
+    }
+    let hashes = payload
+        .get("msb_tx_hashes")
+        .and_then(Value::as_array)
+        .context("TNK settlement manifest frozen payload missing msb_tx_hashes")?;
+    if !hashes.is_empty() {
+        bail!("TNK settlement manifest frozen payload must predate MSB transfers");
+    }
+    for field in ["epoch_apply_hash", "transfer_root"] {
+        if payload.get(field) != manifest.get(field) {
+            bail!("TNK settlement manifest {field} does not match frozen payload");
+        }
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .context("TNK settlement manifest frozen payload missing outputs")?;
+    let expected_root = stable_value_hash(&json!({
+        "domain": "mayhem-tnk-settlement-transfer-root-v1",
+        "value": outputs,
+    }));
+    if payload.get("transfer_root").and_then(Value::as_str) != Some(expected_root.as_str()) {
+        bail!("TNK settlement manifest frozen payload transfer root is invalid");
+    }
+    let msb_outputs = msb_outputs_from_tnk_settlement_payload(&payload)?;
+    let recorded_outputs: Vec<MsbSettlementTransferOutput> = serde_json::from_value(
+        manifest
+            .get("outputs")
+            .cloned()
+            .context("TNK settlement manifest missing transfer outputs")?,
+    )
+    .context("parsing TNK settlement manifest transfer outputs")?;
+    if recorded_outputs != msb_outputs {
+        bail!("TNK settlement manifest transfer outputs do not match frozen payload");
+    }
+    let skipped_providers = manifest
+        .get("skipped_providers")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("TNK settlement manifest missing skipped_providers")?;
+    Ok(Some(TnkSettlementPlan {
+        payload,
+        msb_outputs,
+        skipped_providers,
+        already_settled: None,
+    }))
+}
+
+fn tnk_settlement_manifest_path(home: &Path, network: &str, epoch: u64) -> PathBuf {
+    home.join("settlement")
+        .join("tnk")
+        .join(network)
+        .join(format!("epoch-{epoch}.json"))
+}
+
+fn ensure_tnk_settlement_manifest(path: &Path, expected: &Value) -> Result<()> {
+    if path.exists() {
+        let existing: Value = serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?;
+        if &existing != expected {
+            bail!(
+                "TNK settlement epoch journal {} does not match the current plan; refusing new transfers",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let parent = path
+        .parent()
+        .context("TNK settlement manifest path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", parent.display()))?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return ensure_tnk_settlement_manifest(path, expected)
+        }
+        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+    };
+    let mut bytes = serde_json::to_vec_pretty(expected)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn tnk_settlement_output_operation_id(
+    manifest: &Value,
+    output_index: usize,
+    output: &MsbSettlementTransferOutput,
+) -> String {
+    stable_value_hash(&json!({
+        "domain": "mayhem-tnk-msb-output-v1",
+        "epoch": manifest.get("epoch"),
+        "network": manifest.get("network"),
+        "treasury_from": manifest.get("treasury_from"),
+        "epoch_apply_hash": manifest.get("epoch_apply_hash"),
+        "transfer_root": manifest.get("transfer_root"),
+        "output_index": output_index,
+        "to": output.to,
+        "amount": output.amount,
+    }))
+}
+
+fn tnk_settlement_output_journal_path(manifest_path: &Path, operation_id: &str) -> Result<PathBuf> {
+    let parent = manifest_path
+        .parent()
+        .context("TNK settlement manifest path has no parent")?;
+    Ok(parent.join(format!("output-{operation_id}.json")))
+}
+
 async fn build_tnk_settlement_plan(
     rpc: &PeerRpcClient,
     epoch: u64,
@@ -33212,6 +33682,7 @@ async fn build_tnk_settlement_plan(
     treasury_address: &str,
     operator_tnk_address: &str,
     msb_tx_hashes: Option<&[String]>,
+    manifest_path: Option<&Path>,
 ) -> Result<TnkSettlementPlan> {
     for (label, value) in [
         ("MSB network", network),
@@ -33249,6 +33720,27 @@ async fn build_tnk_settlement_plan(
         .filter(|hash| is_hex_len(hash, 64))
         .context("epoch/apply/state missing 32-byte last_apply_hash")?
         .to_ascii_lowercase();
+
+    if let Some(path) = manifest_path {
+        if let Some(plan) = read_tnk_settlement_manifest(
+            path,
+            epoch,
+            network,
+            treasury_address,
+            operator_tnk_address,
+        )? {
+            if plan.payload.get("epoch_apply_hash").and_then(Value::as_str)
+                != Some(epoch_apply_hash.as_str())
+            {
+                bail!(
+                    "TNK settlement manifest {} does not match the current epoch apply hash; refusing new transfers",
+                    path.display()
+                );
+            }
+            require_tnk_settlement_rate_history(rpc, &plan.payload).await?;
+            return Ok(plan);
+        }
+    }
 
     let rate_value = read_state_value(rpc, "rate/latest")
         .await?
@@ -33306,6 +33798,7 @@ async fn build_tnk_settlement_plan(
                 "provider": earning.provider,
                 "au": money_au_json(0),
                 "reason": "provider record missing",
+                "blocking": true,
             }));
             continue;
         };
@@ -33384,9 +33877,24 @@ async fn build_tnk_settlement_plan(
         "tnk_e18": totals.tnk_e18,
         "outputs": outputs,
     });
-    let msb_outputs = payload["outputs"]
-        .as_array()
-        .expect("outputs constructed as array")
+    require_tnk_settlement_rate_history(rpc, &payload).await?;
+    let msb_outputs = msb_outputs_from_tnk_settlement_payload(&payload)?;
+
+    Ok(TnkSettlementPlan {
+        payload,
+        msb_outputs,
+        skipped_providers,
+        already_settled: None,
+    })
+}
+
+fn msb_outputs_from_tnk_settlement_payload(
+    payload: &Value,
+) -> Result<Vec<MsbSettlementTransferOutput>> {
+    payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .context("TNK settlement payload missing outputs")?
         .iter()
         .map(|output| {
             let tnk_e18 = output
@@ -33404,14 +33912,61 @@ async fn build_tnk_settlement_plan(
                 amount: tnk_e18_to_decimal(tnk_e18),
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
 
-    Ok(TnkSettlementPlan {
-        payload,
-        msb_outputs,
-        skipped_providers,
-        already_settled: None,
-    })
+async fn require_tnk_settlement_rate_history(rpc: &PeerRpcClient, payload: &Value) -> Result<()> {
+    let rate_tnk_usd_au = payload
+        .get("rate_tnk_usd_au")
+        .and_then(value_money_au)
+        .filter(|value| *value > 0)
+        .context("TNK settlement payload missing positive rate_tnk_usd_au")?;
+    let source = payload
+        .get("rate_source")
+        .and_then(Value::as_str)
+        .context("TNK settlement payload missing rate_source")?;
+    if !matches!(source, "gate-spot" | "mexc-spot") {
+        bail!("unsupported TNK settlement rate source {source}");
+    }
+    let ts = payload
+        .get("rate_ts")
+        .and_then(Value::as_u64)
+        .context("TNK settlement payload missing rate_ts")?;
+    let at = payload
+        .get("at")
+        .and_then(Value::as_u64)
+        .context("TNK settlement payload missing timestamp")?;
+    let oracle = json!({
+        "op": "rate_oracle",
+        "tnk_usd_au": money_au_json(rate_tnk_usd_au),
+        "source": source,
+        "ts": ts,
+    });
+    let key = rate_feature_key(&oracle)?;
+    let history = read_state_value(rpc, &key)
+        .await?
+        .with_context(|| format!("immutable TNK oracle history {key} is missing; wait for a live rate publication before settlement"))?;
+    if history.get("denom").and_then(Value::as_str) != Some("tnk_usd_au")
+        || history.get("tnk_usd_au").and_then(value_money_au) != Some(rate_tnk_usd_au)
+        || history.get("source").and_then(Value::as_str) != Some(source)
+        || history.get("ts").and_then(Value::as_u64) != Some(ts)
+        || history.get("updated_at").and_then(Value::as_str) != Some(key.as_str())
+        || history.get("posted_by_role").and_then(Value::as_str) != Some("admin")
+        || !history
+            .get("posted_by")
+            .and_then(Value::as_str)
+            .is_some_and(|value| is_hex_len(value, 64))
+    {
+        bail!("immutable TNK oracle history {key} is invalid");
+    }
+    if ts > at {
+        bail!("TNK settlement oracle timestamp is in the future");
+    }
+    let params = read_tnk_settlement_params(rpc, at).await?;
+    if at - ts > params.rate_staleness_seconds {
+        bail!("TNK settlement oracle history is stale at the frozen settlement timestamp");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -33825,6 +34380,7 @@ async fn build_fiat_settlement_plan(
                     "provider": earning.provider,
                     "au": money_au_json(payable_au),
                     "reason": "payable amount is below one Stripe minor unit",
+                    "blocking": false,
                 }));
             }
             continue;
@@ -33842,6 +34398,7 @@ async fn build_fiat_settlement_plan(
                 "provider": earning.provider,
                 "au": money_au_json(transferable_au),
                 "reason": error.to_string(),
+                "blocking": true,
             })),
         }
     }
@@ -33862,12 +34419,6 @@ async fn build_fiat_settlement_plan(
             au: operator_fee_au,
         });
     }
-    if outputs.is_empty() {
-        bail!(
-            "fiat settlement has no whole-cent provider or operator fee outputs; nothing to record"
-        );
-    }
-
     let provided_refs = stripe_refs.map(|refs| refs.to_vec()).unwrap_or_default();
     if !provided_refs.is_empty() && provided_refs.len() != outputs.len() {
         bail!(
@@ -33979,6 +34530,55 @@ fn fiat_settlement_output_totals(outputs: &[FiatSettlementOutput]) -> Result<Fia
     })
 }
 
+fn fiat_settlement_reconciliation(
+    outputs: &[FiatSettlementOutput],
+    stripe_transfers: &[Value],
+) -> Result<Value> {
+    let totals = fiat_settlement_output_totals(outputs)?;
+    let mut provider_minor = BTreeMap::<String, u128>::new();
+    let mut operator_retained_minor = BTreeMap::<String, u128>::new();
+    for output in outputs {
+        let target = match output.role.as_str() {
+            "provider" => &mut provider_minor,
+            "operator_fee" => &mut operator_retained_minor,
+            other => bail!("invalid fiat settlement output role {other}"),
+        };
+        let next = target
+            .get(&output.currency)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(u128::from(output.amount_minor))
+            .context("fiat settlement reconciliation overflow")?;
+        target.insert(output.currency.clone(), next);
+    }
+    let provider_output_count = outputs
+        .iter()
+        .filter(|output| output.role == "provider")
+        .count();
+    let verified_transfer_count = stripe_transfers
+        .iter()
+        .filter(|entry| entry.pointer("/transfer/verified").and_then(Value::as_bool) == Some(true))
+        .count();
+    Ok(json!({
+        "denom": "au_usd",
+        "provider_au": money_au_json(totals.provider_au),
+        "operator_fee_au": money_au_json(totals.operator_fee_au),
+        "gross_au": money_au_json(totals.gross_au),
+        "provider_minor_by_currency": provider_minor
+            .into_iter()
+            .map(|(currency, amount)| (currency, amount.to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        "operator_retained_minor_by_currency": operator_retained_minor
+            .into_iter()
+            .map(|(currency, amount)| (currency, amount.to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        "operator_fee_mechanism": "retained_platform_balance",
+        "provider_output_count": provider_output_count,
+        "verified_transfer_count": verified_transfer_count,
+        "all_provider_transfers_verified": verified_transfer_count == provider_output_count,
+    }))
+}
+
 async fn read_fee_record(rpc: &PeerRpcClient, rail: &str) -> Result<LedgerFeeRecord> {
     match read_state_value(rpc, &format!("fee/{rail}/cum")).await? {
         Some(value) => serde_json::from_value(value)
@@ -34064,6 +34664,27 @@ fn normalize_fiat_settlement_ref(value: &str, label: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn stripe_transfer_idempotency_key(
+    epoch: u64,
+    provider: &str,
+    epoch_apply_hash: &str,
+) -> Result<String> {
+    if epoch == 0 {
+        bail!("Stripe transfer idempotency epoch must be positive");
+    }
+    if !is_hex_len(provider, 64) {
+        bail!("Stripe transfer idempotency provider must be a 32-byte hex key");
+    }
+    if !is_hex_len(epoch_apply_hash, 64) {
+        bail!("Stripe transfer idempotency apply hash must be 32-byte hex");
+    }
+    Ok(format!(
+        "mayhem:fiat:settle:v1:{epoch}:{}:{}",
+        provider.to_ascii_lowercase(),
+        epoch_apply_hash.to_ascii_lowercase()
+    ))
+}
+
 fn operator_fiat_settlement_ref(
     override_ref: Option<&str>,
     epoch: u64,
@@ -34110,6 +34731,64 @@ fn stripe_api_base_url(override_url: Option<&str>) -> Result<String> {
         bail!("Stripe API base URL must be https");
     }
     Ok(trimmed)
+}
+
+fn stripe_transfer_runtime_is_mainnet() -> Result<bool> {
+    let networks = ["MAYHEM_NETWORK", "MAYHEM_MSB_NETWORK"]
+        .into_iter()
+        .filter_map(|key| {
+            env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (key, value))
+        })
+        .map(|(key, value)| {
+            normalize_intercom_network(&value)
+                .with_context(|| format!("invalid {key} for Stripe settlement"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if networks.len() > 1 {
+        bail!("conflicting network settings refuse Stripe settlement");
+    }
+    Ok(networks
+        .first()
+        .map_or(true, |network| network == "mainnet"))
+}
+
+fn validate_stripe_transfer_environment(
+    secret_key: &str,
+    api_base_url: &str,
+    mode: Option<&str>,
+    mainnet: bool,
+) -> Result<()> {
+    let mode = mode.unwrap_or("").trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "live" => {
+            ensure!(
+                secret_key.starts_with("sk_live_"),
+                "Stripe live settlement requires an sk_live_ secret key"
+            );
+            ensure!(
+                api_base_url == "https://api.stripe.com",
+                "Stripe live settlement requires the official Stripe API endpoint"
+            );
+        }
+        "test" => {
+            ensure!(
+                !mainnet,
+                "Stripe test mode is forbidden on the mainnet settlement runtime"
+            );
+            ensure!(
+                secret_key.starts_with("sk_test_"),
+                "Stripe test settlement requires an sk_test_ secret key"
+            );
+        }
+        _ => bail!("MAYHEM_STRIPE_MODE must explicitly be live or test for Stripe settlement"),
+    }
+    if mainnet && mode != "live" {
+        bail!("mainnet Stripe settlement requires MAYHEM_STRIPE_MODE=live");
+    }
+    Ok(())
 }
 
 fn load_stripe_secret_key(path: Option<&PathBuf>, home: &Path) -> Result<String> {
@@ -34159,42 +34838,364 @@ fn stripe_secret_key_from_text(text: &str) -> Option<String> {
     None
 }
 
-async fn stripe_create_transfer(
+async fn stripe_connect_payout_status(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    account_id: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeConnectPayoutStatus> {
+    if !account_id.starts_with("acct_") || !is_safe_key_part(account_id) {
+        bail!("Stripe Connect account id is invalid");
+    }
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/accounts/{account_id}",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_error) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("calling Stripe account API"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe account API returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&body).context("parsing Stripe account response")?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| *id == account_id)
+            .context("Stripe account response id mismatch")?
+            .to_owned();
+        let default_currency = value
+            .get("default_currency")
+            .and_then(Value::as_str)
+            .context("Stripe account response missing default_currency")
+            .and_then(normalize_admin_fiat_currency)?;
+        let details_submitted = value
+            .get("details_submitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let payouts_enabled = value
+            .get("payouts_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let transfers_enabled = value
+            .pointer("/capabilities/transfers")
+            .and_then(Value::as_str)
+            == Some("active");
+        return Ok(StripeConnectPayoutStatus {
+            id,
+            default_currency,
+            details_submitted,
+            payouts_enabled,
+            transfers_enabled,
+            ready: details_submitted && payouts_enabled && transfers_enabled,
+            attempts: attempt,
+        });
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+async fn stripe_create_transfer_verified(
     client: &reqwest::Client,
     api_base_url: &str,
     secret_key: &str,
     output: &FiatSettlementOutput,
     idempotency_key: &str,
+    epoch: u64,
+    output_index: usize,
+    epoch_apply_hash: &str,
+    max_attempts: u32,
+    retry_ms: u64,
 ) -> Result<StripeTransferResult> {
     let provider = output
         .provider
         .as_deref()
         .context("Stripe provider transfer output missing provider")?;
+    let transfer_group = format!(
+        "mayhem_fiat_epoch_{epoch}_{}",
+        epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
+    );
     let params = [
         ("amount", output.amount_minor.to_string()),
         ("currency", output.currency.clone()),
         ("destination", output.to.clone()),
+        ("transfer_group", transfer_group.clone()),
         ("metadata[mayhem_provider]", provider.to_owned()),
         ("metadata[mayhem_au]", output.au.to_string()),
+        ("metadata[mayhem_epoch]", epoch.to_string()),
+        ("metadata[mayhem_output_index]", output_index.to_string()),
+        (
+            "metadata[mayhem_epoch_apply_hash]",
+            epoch_apply_hash.to_owned(),
+        ),
     ];
-    let response = client
-        .post(format!(
-            "{}/v1/transfers",
-            api_base_url.trim_end_matches('/')
-        ))
-        .basic_auth(secret_key, Some(""))
-        .header("Idempotency-Key", idempotency_key)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_urlencoded_body(&params))
-        .send()
-        .await
-        .context("calling Stripe transfers API")?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("Stripe transfer returned {status}: {body}");
+    let form = form_urlencoded_body(&params);
+    let recovered = stripe_find_existing_transfer(
+        client,
+        api_base_url,
+        secret_key,
+        output,
+        &transfer_group,
+        provider,
+        epoch,
+        output_index,
+        epoch_apply_hash,
+        max_attempts,
+        retry_ms,
+    )
+    .await?;
+    let (created, attempts) = if let Some(mut recovered) = recovered {
+        recovered.recovered = true;
+        (recovered, 0)
+    } else {
+        let mut created = None;
+        for attempt in 1..=max_attempts {
+            let response = client
+                .post(format!(
+                    "{}/v1/transfers",
+                    api_base_url.trim_end_matches('/')
+                ))
+                .basic_auth(secret_key, Some(""))
+                .header("Idempotency-Key", idempotency_key)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(form.clone())
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_error) if attempt < max_attempts => {
+                    stripe_retry_sleep(retry_ms, attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error).context("calling Stripe transfers API"),
+            };
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                if stripe_status_is_retryable(status) && attempt < max_attempts {
+                    stripe_retry_sleep(retry_ms, attempt).await;
+                    continue;
+                }
+                bail!(
+                    "Stripe transfer API returned {status}: {}",
+                    stripe_api_error_message(&body)
+                );
+            }
+            let value: Value =
+                serde_json::from_str(&body).context("parsing Stripe transfer response")?;
+            created = Some(stripe_transfer_result(&value, attempt)?);
+            break;
+        }
+        let created = created.context("Stripe transfer attempts were exhausted")?;
+        let attempts = created.attempts;
+        (created, attempts)
+    };
+    if created.transfer_group.as_deref() != Some(&transfer_group) {
+        bail!("Stripe transfer response transfer_group mismatch");
     }
-    let value: Value = serde_json::from_str(&body).context("parsing Stripe transfer response")?;
+
+    let mut verified = None;
+    let mut verified_identity = false;
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/transfers/{}",
+                api_base_url.trim_end_matches('/'),
+                created.id
+            ))
+            .basic_auth(secret_key, Some(""))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_error) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("verifying Stripe transfer"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe transfer verification returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&body).context("parsing Stripe transfer verification")?;
+        verified_identity = stripe_transfer_has_identity(
+            &value,
+            provider,
+            output.au,
+            epoch,
+            output_index,
+            epoch_apply_hash,
+        );
+        verified = Some(stripe_transfer_result(&value, attempts)?);
+        break;
+    }
+    let mut verified = verified.context("Stripe transfer verification attempts were exhausted")?;
+    if verified.id != created.id
+        || verified.destination != output.to
+        || verified.currency != output.currency
+        || verified.amount_minor != output.amount_minor
+        || verified.transfer_group.as_deref() != Some(&transfer_group)
+        || !verified_identity
+    {
+        bail!("Stripe transfer verification did not match the planned output");
+    }
+    verified.verified = true;
+    verified.recovered = created.recovered;
+    Ok(verified)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stripe_find_existing_transfer(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    output: &FiatSettlementOutput,
+    transfer_group: &str,
+    provider: &str,
+    epoch: u64,
+    output_index: usize,
+    epoch_apply_hash: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<Option<StripeTransferResult>> {
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/transfers",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .query(&[
+                ("transfer_group", transfer_group),
+                ("destination", output.to.as_str()),
+                ("limit", "100"),
+            ])
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_error) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("reconciling existing Stripe transfers"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe transfer reconciliation returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&body).context("parsing Stripe transfer reconciliation")?;
+        if value.get("has_more").and_then(Value::as_bool) == Some(true) {
+            bail!("Stripe transfer reconciliation exceeded one 100-transfer destination page");
+        }
+        let transfers = value
+            .get("data")
+            .and_then(Value::as_array)
+            .context("Stripe transfer reconciliation missing data")?;
+        let matches = transfers
+            .iter()
+            .filter(|candidate| {
+                stripe_transfer_has_identity(
+                    candidate,
+                    provider,
+                    output.au,
+                    epoch,
+                    output_index,
+                    epoch_apply_hash,
+                )
+            })
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            bail!("Stripe has duplicate transfers for one Mayhem settlement output");
+        }
+        let Some(value) = matches.first() else {
+            return Ok(None);
+        };
+        let mut transfer = stripe_transfer_result(value, 0)?;
+        if transfer.destination != output.to
+            || transfer.currency != output.currency
+            || transfer.amount_minor != output.amount_minor
+            || transfer.transfer_group.as_deref() != Some(transfer_group)
+        {
+            bail!("existing Stripe transfer identity conflicts with the planned output");
+        }
+        transfer.recovered = true;
+        return Ok(Some(transfer));
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+fn stripe_transfer_has_identity(
+    value: &Value,
+    provider: &str,
+    au: MoneyAu,
+    epoch: u64,
+    output_index: usize,
+    epoch_apply_hash: &str,
+) -> bool {
+    let au = au.to_string();
+    let epoch = epoch.to_string();
+    let output_index = output_index.to_string();
+    value
+        .pointer("/metadata/mayhem_provider")
+        .and_then(Value::as_str)
+        == Some(provider)
+        && value.pointer("/metadata/mayhem_au").and_then(Value::as_str) == Some(au.as_str())
+        && value
+            .pointer("/metadata/mayhem_epoch")
+            .and_then(Value::as_str)
+            == Some(epoch.as_str())
+        && value
+            .pointer("/metadata/mayhem_output_index")
+            .and_then(Value::as_str)
+            == Some(output_index.as_str())
+        && value
+            .pointer("/metadata/mayhem_epoch_apply_hash")
+            .and_then(Value::as_str)
+            == Some(epoch_apply_hash)
+}
+
+fn stripe_transfer_result(value: &Value, attempts: u32) -> Result<StripeTransferResult> {
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -34220,7 +35221,70 @@ async fn stripe_create_transfer(
         amount_minor,
         currency,
         destination,
+        transfer_group: value
+            .get("transfer_group")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        verified: false,
+        recovered: false,
+        attempts,
     })
+}
+
+fn stripe_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::CONFLICT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+async fn stripe_retry_sleep(base_ms: u64, attempt: u32) {
+    let shift = attempt.saturating_sub(1).min(6);
+    let delay_ms = base_ms.saturating_mul(1_u64 << shift).min(30_000);
+    sleep(Duration::from_millis(delay_ms)).await;
+}
+
+fn stripe_api_error_message(body: &str) -> String {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "Stripe request failed".to_owned());
+    redact_stripe_credentials(&message.chars().take(500).collect::<String>())
+}
+
+fn redact_stripe_credentials(input: &str) -> String {
+    const PREFIXES: [&str; 7] = [
+        "sk_test_", "sk_live_", "rk_test_", "rk_live_", "pk_test_", "pk_live_", "whsec_",
+    ];
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    loop {
+        let Some((offset, _)) = PREFIXES
+            .iter()
+            .filter_map(|prefix| remaining.find(prefix).map(|offset| (offset, prefix)))
+            .min_by_key(|(offset, _)| *offset)
+        else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..offset]);
+        let credential = &remaining[offset..];
+        let mut end = 0;
+        while let Some(byte) = credential.as_bytes().get(end) {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'*' | b'.') {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        output.push_str("[REDACTED]");
+        remaining = &credential[end..];
+    }
+    output
 }
 
 fn form_urlencoded_body(params: &[(&str, String)]) -> String {
@@ -34372,6 +35436,48 @@ fn emit_tnk_handoff(
         stdout.flush()?;
     }
     Ok(())
+}
+
+async fn submit_journaled_msb_settlement_transfer(
+    network: &str,
+    stores_directory: &Path,
+    store_name: &str,
+    to: &str,
+    amount: &str,
+    operation_id: &str,
+    journal_file: &Path,
+    timeout_seconds: u64,
+    max_retries: u64,
+    expected_balance_before: Option<&str>,
+) -> Result<MsbTransferOutput> {
+    let mut args = vec![
+        "settlement-transfer".to_owned(),
+        "--network".to_owned(),
+        network.to_owned(),
+        "--stores-directory".to_owned(),
+        stores_directory.display().to_string(),
+        "--store-name".to_owned(),
+        store_name.to_owned(),
+        "--to".to_owned(),
+        to.to_owned(),
+        "--amount".to_owned(),
+        amount.to_owned(),
+        "--operation-id".to_owned(),
+        operation_id.to_owned(),
+        "--journal-file".to_owned(),
+        journal_file.display().to_string(),
+        "--timeout-seconds".to_owned(),
+        timeout_seconds.to_string(),
+        "--max-retries".to_owned(),
+        max_retries.to_string(),
+    ];
+    if let Some(balance) = expected_balance_before {
+        args.extend([
+            "--expected-balance-before".to_owned(),
+            balance.trim().to_owned(),
+        ]);
+    }
+    run_msb_transfer_helper(args).await
 }
 
 async fn submit_msb_transfer(
@@ -35696,6 +36802,21 @@ struct StripeTransferResult {
     amount_minor: u64,
     currency: String,
     destination: String,
+    transfer_group: Option<String>,
+    verified: bool,
+    recovered: bool,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StripeConnectPayoutStatus {
+    id: String,
+    default_currency: String,
+    details_submitted: bool,
+    payouts_enabled: bool,
+    transfers_enabled: bool,
+    ready: bool,
+    attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38863,6 +39984,235 @@ async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
     }
 
     print_provider_rails_report(&report, args.tx.json)
+}
+
+struct ProviderStripeContext {
+    home: PathBuf,
+    rpc_url: String,
+    rpc: PeerRpcClient,
+    wallet: WalletInfo,
+}
+
+async fn provider_stripe_context(args: &ProviderStripeArgs) -> Result<ProviderStripeContext> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await
+    .context("resolving provider wallet")?;
+    Ok(ProviderStripeContext {
+        home,
+        rpc: PeerRpcClient::new(&rpc_url)?,
+        rpc_url,
+        wallet,
+    })
+}
+
+fn stripe_connect_request_nonce() -> Result<String> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("generating Stripe Connect request nonce")?;
+    Ok(hex_lower(&random))
+}
+
+async fn request_provider_stripe_status(ctx: &ProviderStripeContext) -> Result<Value> {
+    ctx.rpc
+        .post(
+            "payment/stripe/connect/status",
+            json!({
+                "provider": ctx.wallet.public_key,
+                "request_nonce": stripe_connect_request_nonce()?,
+            }),
+        )
+        .await
+        .context("requesting Stripe Connect status through the local Intercom peer")
+}
+
+fn validate_provider_stripe_response(value: &Value, provider: &str) -> Result<()> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true)
+        || value.get("rail").and_then(Value::as_str) != Some("fiat")
+        || value.get("processor_rail").and_then(Value::as_str) != Some("stripe")
+        || value.get("provider").and_then(Value::as_str) != Some(provider)
+    {
+        bail!("Stripe Connect response did not match the requesting fiat provider");
+    }
+    let account = value
+        .get("account")
+        .and_then(Value::as_object)
+        .context("Stripe Connect response missing account")?;
+    let account_id = account
+        .get("id")
+        .and_then(Value::as_str)
+        .context("Stripe Connect response missing account id")?;
+    if !account_id.starts_with("acct_") {
+        bail!("Stripe Connect response account id is invalid");
+    }
+    Ok(())
+}
+
+fn provider_stripe_ready(value: &Value) -> bool {
+    value.pointer("/account/ready").and_then(Value::as_bool) == Some(true)
+        && value.pointer("/payout_binding/ok").and_then(Value::as_bool) == Some(true)
+        && value
+            .pointer("/payout_binding/pending")
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
+fn provider_stripe_onboarding_url(value: &Value) -> Result<Option<String>> {
+    let Some(onboarding) = value.get("onboarding").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let url = required_hosted_checkout_url(onboarding, "url", "connect.stripe.com")?;
+    if let Some(copy_paste_url) = value
+        .pointer("/copy_paste/onboarding_url")
+        .and_then(Value::as_str)
+    {
+        if copy_paste_url != url {
+            bail!("Stripe Connect copy/paste URL does not match the hosted onboarding URL");
+        }
+    }
+    Ok(Some(url))
+}
+
+fn emit_provider_stripe_handoff(json_output: bool, url: &str) -> Result<()> {
+    let lines = [
+        "Stripe Connect provider onboarding".to_owned(),
+        format!("Copy/paste onboarding URL: {url}"),
+    ];
+    if json_output {
+        let mut stderr = io::stderr().lock();
+        for line in lines {
+            writeln!(stderr, "{line}")?;
+        }
+        stderr.flush()?;
+    } else {
+        let mut stdout = io::stdout().lock();
+        for line in lines {
+            writeln!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn print_provider_stripe_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Provider: {}",
+        report.get("provider").and_then(Value::as_str).unwrap_or("")
+    );
+    println!(
+        "Stripe account: {} ({})",
+        report
+            .pointer("/account/id")
+            .and_then(Value::as_str)
+            .unwrap_or("not created"),
+        report
+            .pointer("/account/account_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Onboarding: details_submitted={} payouts_enabled={} transfers_enabled={}",
+        report
+            .pointer("/account/details_submitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        report
+            .pointer("/account/payouts_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        report
+            .pointer("/account/transfers_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    println!(
+        "Admin payout binding: {}",
+        if provider_stripe_ready(report) {
+            "ready"
+        } else {
+            "pending"
+        }
+    );
+    Ok(())
+}
+
+async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    if args.poll_interval_ms == 0 {
+        bail!("--poll-interval-ms must be positive");
+    }
+    let country = args.country.trim().to_ascii_uppercase();
+    if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        bail!("--country must be a two-letter ISO country code");
+    }
+    let ctx = provider_stripe_context(&args.provider).await?;
+    let mut report = ctx
+        .rpc
+        .post(
+            "payment/stripe/connect/onboard",
+            json!({
+                "provider": ctx.wallet.public_key,
+                "country": country,
+                "request_nonce": stripe_connect_request_nonce()?,
+            }),
+        )
+        .await
+        .context("requesting Stripe Connect onboarding through the local Intercom peer")?;
+    validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+    let onboarding_url = provider_stripe_onboarding_url(&report)?;
+    let mut browser_opened = false;
+    if let Some(url) = onboarding_url.as_deref() {
+        emit_provider_stripe_handoff(args.provider.json, url)?;
+        browser_opened = open_checkout_url(url, args.no_open).await;
+    }
+
+    let started = Instant::now();
+    if !args.no_wait && !provider_stripe_ready(&report) {
+        let timeout = Duration::from_secs(args.timeout_seconds);
+        let interval = Duration::from_millis(args.poll_interval_ms);
+        loop {
+            if started.elapsed() >= timeout {
+                break;
+            }
+            sleep(interval).await;
+            report = request_provider_stripe_status(&ctx).await?;
+            validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+            if provider_stripe_ready(&report) {
+                break;
+            }
+        }
+    }
+    report["home"] = json!(ctx.home);
+    report["rpc_url"] = json!(ctx.rpc_url);
+    report["browser_opened"] = json!(browser_opened);
+    report["wait"] = json!({
+        "requested": !args.no_wait,
+        "ready": provider_stripe_ready(&report),
+        "waited_ms": millis_since(started),
+    });
+    print_provider_stripe_report(&report, args.provider.json)
+}
+
+async fn provider_stripe_status(args: ProviderStripeStatusArgs) -> Result<()> {
+    let ctx = provider_stripe_context(&args.provider).await?;
+    let mut report = request_provider_stripe_status(&ctx).await?;
+    validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+    report["home"] = json!(ctx.home);
+    report["rpc_url"] = json!(ctx.rpc_url);
+    print_provider_stripe_report(&report, args.provider.json)
 }
 
 fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
@@ -56043,7 +57393,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use mayhem_proto::{ctx_bracket_for_tokens, CTX_BRACKET_TABLE_VERSION};
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59468,6 +60822,8 @@ mod tests {
                 stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
+                stripe_transfer_max_attempts: 4,
+                stripe_transfer_retry_ms: 500,
             })
             .unwrap(),
             fiat_settlement_payload
@@ -59495,6 +60851,8 @@ mod tests {
                 stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
+                stripe_transfer_max_attempts: 4,
+                stripe_transfer_retry_ms: 500,
             }))
             .unwrap_err()
             .to_string(),
@@ -59690,6 +61048,263 @@ mod tests {
             ]),
             "amount=85&metadata%5Bmayhem_provider%5D=aa+bb"
         );
+    }
+
+    #[test]
+    fn stripe_transfer_environment_separates_live_and_test_credentials() {
+        assert!(validate_stripe_transfer_environment(
+            "sk_live_redacted",
+            "https://api.stripe.com",
+            Some("live"),
+            true,
+        )
+        .is_ok());
+        assert!(validate_stripe_transfer_environment(
+            "sk_test_redacted",
+            "https://api.stripe.com",
+            Some("test"),
+            false,
+        )
+        .is_ok());
+
+        for error in [
+            validate_stripe_transfer_environment(
+                "sk_test_redacted",
+                "https://api.stripe.com",
+                Some("test"),
+                true,
+            ),
+            validate_stripe_transfer_environment(
+                "sk_test_redacted",
+                "https://api.stripe.com",
+                Some("live"),
+                true,
+            ),
+            validate_stripe_transfer_environment(
+                "sk_live_redacted",
+                "https://proxy.invalid",
+                Some("live"),
+                true,
+            ),
+            validate_stripe_transfer_environment(
+                "sk_live_redacted",
+                "https://api.stripe.com",
+                None,
+                true,
+            ),
+        ] {
+            let message = error.unwrap_err().to_string();
+            assert!(!message.contains("redacted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stripe_transfer_retries_and_replays_with_one_deterministic_identity() {
+        let provider = "aa".repeat(32);
+        let apply_hash = "bb".repeat(32);
+        let idempotency_key = stripe_transfer_idempotency_key(7, &provider, &apply_hash).unwrap();
+        assert_eq!(
+            idempotency_key,
+            format!("mayhem:fiat:settle:v1:7:{provider}:{apply_hash}")
+        );
+
+        let transfer_group = format!("mayhem_fiat_epoch_7_{}", &apply_hash[..16]);
+        let transfer_value = json!({
+            "id": "tr_test_replay",
+            "amount": 85,
+            "currency": "usd",
+            "destination": "acct_provider",
+            "transfer_group": transfer_group,
+            "metadata": {
+                "mayhem_provider": provider,
+                "mayhem_au": (FIAT_MINOR_AU_CLI * 85).to_string(),
+                "mayhem_epoch": "7",
+                "mayhem_output_index": "0",
+                "mayhem_epoch_apply_hash": apply_hash,
+            },
+        });
+        let transfer_json = transfer_value.to_string();
+        let responses = vec![
+            (
+                200_u16,
+                json!({"object": "list", "has_more": false, "data": []}).to_string(),
+            ),
+            (
+                500_u16,
+                json!({"error": {"message": "transient"}}).to_string(),
+            ),
+            (200, transfer_json.clone()),
+            (200, transfer_json.clone()),
+            (
+                200,
+                json!({"object": "list", "has_more": false, "data": [transfer_value]}).to_string(),
+            ),
+            (200, transfer_json),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_server = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "Stripe mock request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break offset + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "Stripe mock request ended before body");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                captured_server
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let output = FiatSettlementOutput {
+            role: "provider".to_owned(),
+            provider: Some(provider.clone()),
+            to: "acct_provider".to_owned(),
+            currency: "usd".to_owned(),
+            amount_minor: 85,
+            au: FIAT_MINOR_AU_CLI * 85,
+        };
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{address}");
+        let first = stripe_create_transfer_verified(
+            &client,
+            &api_base,
+            "sk_test_redacted",
+            &output,
+            &idempotency_key,
+            7,
+            0,
+            &apply_hash,
+            3,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(first.verified);
+        assert!(!first.recovered);
+        assert_eq!(first.attempts, 2);
+
+        let replay = stripe_create_transfer_verified(
+            &client,
+            &api_base,
+            "sk_test_redacted",
+            &output,
+            &idempotency_key,
+            7,
+            0,
+            &apply_hash,
+            3,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(replay.verified);
+        assert!(replay.recovered);
+        assert_eq!(replay.attempts, 0);
+        assert_eq!(replay.id, first.id);
+        server.join().unwrap();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        for index in [1_usize, 2] {
+            assert!(requests[index].starts_with("POST /v1/transfers HTTP/1.1"));
+            assert!(requests[index]
+                .to_ascii_lowercase()
+                .contains(&format!("idempotency-key: {idempotency_key}").to_ascii_lowercase()));
+        }
+        for index in [3_usize, 5] {
+            assert!(requests[index].starts_with("GET /v1/transfers/tr_test_replay HTTP/1.1"));
+        }
+        for index in [0_usize, 4] {
+            assert!(requests[index].starts_with("GET /v1/transfers?"));
+            assert!(requests[index].contains("transfer_group="));
+            assert!(requests[index].contains("destination=acct_provider"));
+        }
+        assert!(requests[2].contains("metadata%5Bmayhem_epoch_apply_hash%5D="));
+    }
+
+    #[test]
+    fn fiat_settlement_reconciliation_separates_provider_transfers_and_retained_fee() {
+        let outputs = vec![
+            FiatSettlementOutput {
+                role: "provider".to_owned(),
+                provider: Some("aa".repeat(32)),
+                to: "acct_provider".to_owned(),
+                currency: "usd".to_owned(),
+                amount_minor: 85,
+                au: FIAT_MINOR_AU_CLI * 85,
+            },
+            FiatSettlementOutput {
+                role: "operator_fee".to_owned(),
+                provider: None,
+                to: "platform_balance".to_owned(),
+                currency: "eur".to_owned(),
+                amount_minor: 15,
+                au: FIAT_MINOR_AU_CLI * 15,
+            },
+        ];
+        let report =
+            fiat_settlement_reconciliation(&outputs, &[json!({"transfer": {"verified": true}})])
+                .unwrap();
+        assert_eq!(report["provider_minor_by_currency"]["usd"], "85");
+        assert_eq!(report["operator_retained_minor_by_currency"]["eur"], "15");
+        assert_eq!(
+            report["operator_fee_mechanism"],
+            "retained_platform_balance"
+        );
+        assert_eq!(report["all_provider_transfers_verified"], true);
+    }
+
+    #[test]
+    fn stripe_settlement_errors_never_expose_credential_material() {
+        let body = json!({
+            "error": {
+                "message": "Expired API Key provided: sk_test_********LAST123 and pk_live_public456"
+            }
+        })
+        .to_string();
+        let message = stripe_api_error_message(&body);
+        assert_eq!(
+            message,
+            "Expired API Key provided: [REDACTED] and [REDACTED]"
+        );
+        assert!(!message.contains("LAST123"));
+        assert!(!message.contains("public456"));
     }
 
     #[test]
@@ -60446,6 +62061,32 @@ mod tests {
         );
         assert!(normalize_provider_accepted_rails_arg("fiat,fiat").is_err());
         assert!(normalize_provider_accepted_rails_arg("unsupported").is_err());
+
+        let stripe = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stripe",
+            "onboard",
+            "--country",
+            "DE",
+            "--no-open",
+            "--no-wait",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = stripe.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Stripe { command } = *command else {
+            panic!("expected provider Stripe command");
+        };
+        let ProviderStripeCommands::Onboard(args) = command else {
+            panic!("expected provider Stripe onboarding command");
+        };
+        assert_eq!(args.country, "DE");
+        assert!(args.no_open);
+        assert!(args.no_wait);
+        assert!(args.provider.json);
 
         let serve_plan = Cli::try_parse_from([
             "mayhem",
@@ -67876,6 +69517,44 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_stripe_onboarding_requires_exact_connect_host_and_copy_paste_match() {
+        let valid = json!({
+            "ok": true,
+            "rail": "fiat",
+            "processor_rail": "stripe",
+            "provider": "aa".repeat(32),
+            "account": {
+                "id": "acct_test_provider",
+                "ready": false
+            },
+            "onboarding": {
+                "url": "https://connect.stripe.com/setup/test"
+            },
+            "copy_paste": {
+                "onboarding_url": "https://connect.stripe.com/setup/test"
+            },
+            "payout_binding": {
+                "ok": true,
+                "pending": true
+            }
+        });
+        validate_provider_stripe_response(&valid, &"aa".repeat(32)).unwrap();
+        assert_eq!(
+            provider_stripe_onboarding_url(&valid).unwrap().as_deref(),
+            Some("https://connect.stripe.com/setup/test")
+        );
+
+        let mut wrong_host = valid.clone();
+        wrong_host["onboarding"]["url"] =
+            json!("https://connect.stripe.com.evil.example/setup/test");
+        assert!(provider_stripe_onboarding_url(&wrong_host).is_err());
+
+        let mut mismatch = valid;
+        mismatch["copy_paste"]["onboarding_url"] = json!("https://connect.stripe.com/setup/other");
+        assert!(provider_stripe_onboarding_url(&mismatch).is_err());
+    }
+
+    #[test]
     fn pay_tnk_helpers_prepare_deposit_bound_transfer() {
         let tnk_e18 =
             au_to_tnk_e18_ceil_u128(10_000_000_000_000_000_000, 50_000_000_000_000_000).unwrap();
@@ -68016,6 +69695,100 @@ State initialization...
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(parsed.amount, "0.255");
+    }
+
+    #[test]
+    fn tnk_settlement_manifest_is_immutable_per_epoch() {
+        let home = test_temp_dir("mayhem-tnk-settlement-manifest");
+        let outputs = vec![json!({
+            "role": "provider",
+            "provider": "11".repeat(32),
+            "to": "testtrac1provider",
+            "au": "62500000000000000",
+            "tnk_e18": "1250000000000000000",
+        })];
+        let transfer_root = stable_value_hash(&json!({
+            "domain": "mayhem-tnk-settlement-transfer-root-v1",
+            "value": &outputs,
+        }));
+        let plan = TnkSettlementPlan {
+            payload: json!({
+                "op": "tnk_settlement",
+                "epoch": 7,
+                "at": 90_000,
+                "rail": "tnk",
+                "network": "testnet1",
+                "treasury_from": "testtrac1treasury",
+                "operator_to": "testtrac1operator",
+                "epoch_apply_hash": "11".repeat(32),
+                "rate_tnk_usd_au": "50000000000000000",
+                "rate_source": "gate-spot",
+                "rate_ts": 90_000,
+                "msb_tx_hashes": [],
+                "transfer_root": transfer_root,
+                "provider_count": 1,
+                "provider_au": "62500000000000000",
+                "operator_fee_au": "0",
+                "gross_au": "62500000000000000",
+                "tnk_e18": "1250000000000000000",
+                "outputs": outputs,
+            }),
+            msb_outputs: vec![MsbSettlementTransferOutput {
+                to: "testtrac1provider".to_owned(),
+                amount: "1.25".to_owned(),
+            }],
+            skipped_providers: Vec::new(),
+            already_settled: None,
+        };
+        let manifest =
+            tnk_settlement_manifest_value(&plan, 7, "testnet1", "testtrac1treasury").unwrap();
+        let path = tnk_settlement_manifest_path(&home, "testnet1", 7);
+        ensure_tnk_settlement_manifest(&path, &manifest).unwrap();
+        ensure_tnk_settlement_manifest(&path, &manifest).unwrap();
+
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, manifest);
+        let recovered = read_tnk_settlement_manifest(
+            &path,
+            7,
+            "testnet1",
+            "testtrac1treasury",
+            "testtrac1operator",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.payload, plan.payload);
+        assert_eq!(recovered.msb_outputs, plan.msb_outputs);
+        let operation_id = tnk_settlement_output_operation_id(&manifest, 0, &plan.msb_outputs[0]);
+        assert!(is_hex_len(&operation_id, 64));
+        assert_eq!(
+            tnk_settlement_output_journal_path(&path, &operation_id)
+                .unwrap()
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap(),
+            format!("output-{operation_id}.json")
+        );
+
+        let mut changed = manifest.clone();
+        changed["transfer_root"] = json!("33".repeat(32));
+        let error = ensure_tnk_settlement_manifest(&path, &changed).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the current plan"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            manifest
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -6,7 +6,12 @@ import MayhemFeature, {
   requestIdFor,
   serviceRequestIdFor,
 } from '../features/mayhem/index.js';
-import { createServer, requestStripeCheckout, submitMayhemFeature } from '../src/rpc.js';
+import {
+  createServer,
+  requestStripeCheckout,
+  requestStripeConnect,
+  submitMayhemFeature,
+} from '../src/rpc.js';
 
 const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
@@ -88,6 +93,12 @@ const stripeCheckoutValue = (who = providerKey) => ({
   success_url: 'https://stripe.com',
   cancel_url: 'https://stripe.com',
   idempotency_key: 'checkout-test-1',
+});
+
+const stripeConnectValue = (provider = providerKey) => ({
+  provider,
+  country: 'DE',
+  request_nonce: '12'.repeat(32),
 });
 
 test('read-only participant relays a signed feature to the sole admin writer', async () => {
@@ -640,6 +651,76 @@ test('read-only user requests Stripe checkout from the admin service without app
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended.length, 0);
   assert.equal(writer.flushes.length, 0);
+});
+
+test('read-only provider requests Stripe Connect onboarding without becoming a writer', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async serviceHandler(service, value) {
+      serviceCalls += 1;
+      assert.equal(service, 'stripe_connect_onboard');
+      assert.deepEqual(value, stripeConnectValue());
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        provider: providerKey,
+        account: { id: 'acct_test_provider', ready: false },
+        onboarding: { url: 'https://connect.stripe.com/setup/test' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await requestStripeConnect(
+    participant.peer,
+    'stripe_connect_onboard',
+    stripeConnectValue()
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(result.onboarding.url, 'https://connect.stripe.com/setup/test');
+  assert.equal(serviceCalls, 1);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+  assert.equal(writer.flushes.length, 0);
+});
+
+test('Stripe Connect service relay binds the provider transport identity', async () => {
+  const participant = peerFor(providerKey);
+  const participantFeature = new MayhemFeature(participant.peer, {});
+  participantFeature.key = 'mayhem';
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+
+  await assert.rejects(
+    participantFeature.requestService(
+      'stripe_connect_onboard',
+      stripeConnectValue(otherKey)
+    ),
+    /Invalid Mayhem service request identity/
+  );
+  assert.equal(broadcasts, 0);
 });
 
 test('Stripe service relay binds the request identity and deduplicates retries', async () => {

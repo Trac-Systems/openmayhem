@@ -164,6 +164,7 @@ test('MayhemContract rateOracle feature is admin controlled and monotonic', asyn
     posted_by: admin.publicKey,
     posted_by_role: 'admin',
   });
+  assert.deepEqual((await storage.get(firstKey)).value, (await storage.get('rate/latest')).value);
 
   const older = await executeRateFeature(
     contract,

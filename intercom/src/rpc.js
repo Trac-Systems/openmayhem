@@ -45,6 +45,21 @@ export async function requestStripeCheckout(peer, body) {
   return await registered.requestService('stripe_checkout', body);
 }
 
+export async function requestStripeConnect(peer, service, body) {
+  if (!isObject(body)) throw new Error('Missing JSON body.');
+  if (typeof body.provider !== 'string' || !body.provider.trim()) {
+    throw new Error('Missing provider.');
+  }
+  if (!['stripe_connect_onboard', 'stripe_connect_status'].includes(service)) {
+    throw new Error('Invalid Stripe Connect service.');
+  }
+  const registered = peer.protocol?.instance?.features?.mayhem;
+  if (!registered || typeof registered.requestService !== 'function') {
+    throw new Error('Mayhem service relay is not ready.');
+  }
+  return await registered.requestService(service, body);
+}
+
 const errorResponse = (error) => {
   if (error?.code === 'BODY_TOO_LARGE') return [413, error.message];
   if (error?.code === 'BAD_JSON') return [400, error.message];
@@ -83,6 +98,14 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/payment/stripe/checkout') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await requestStripeCheckout(peer, body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/onboard') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestStripeConnect(peer, 'stripe_connect_onboard', body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/status') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestStripeConnect(peer, 'stripe_connect_status', body));
       }
       for (const route of sortedRoutes) {
         if (req.method !== route.method || requestPath !== route.path) continue;

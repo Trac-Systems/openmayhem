@@ -26,7 +26,7 @@ use hmac::{Hmac, Mac};
 use mayhem_proto::MoneyAu;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::Mutex, time::sleep};
@@ -43,6 +43,7 @@ pub const DEFAULT_STRIPE_API_BASE_URL: &str = "https://api.stripe.com";
 pub const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
 pub const DEFAULT_STRIPE_BACKFILL_INTERVAL_SECONDS: u64 = 300;
 pub const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
+pub const DEFAULT_STRIPE_CONNECT_RETURN_URL: &str = "https://dashboard.stripe.com/";
 pub const AU_PER_USD_CENT: MoneyAu = 10_000_000_000_000_000;
 pub const STRIPE_MIN_USD_CENTS: u64 = 50;
 pub const DEFAULT_STRIPE_CURRENCY: &str = "usd";
@@ -112,14 +113,26 @@ pub struct StripeSettings {
     pub backfill_enabled: bool,
     pub backfill_cursor_path: PathBuf,
     pub backfill_interval_seconds: u64,
+    pub connect_account_type: StripeConnectAccountType,
+    pub connect_accounts_path: PathBuf,
+    pub connect_return_url: String,
+    pub connect_refresh_url: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StripeMode {
     #[default]
     Test,
     Live,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StripeConnectAccountType {
+    #[default]
+    Express,
+    Custom,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,6 +176,10 @@ struct StripeConfigFile {
     backfill_enabled: Option<bool>,
     backfill_cursor_path: Option<PathBuf>,
     backfill_interval_seconds: Option<u64>,
+    connect_account_type: Option<String>,
+    connect_accounts_path: Option<PathBuf>,
+    connect_return_url: Option<String>,
+    connect_refresh_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +210,7 @@ pub struct PaygateState {
     oracle_public_key: String,
     http: reqwest::Client,
     stripe_events: Arc<Mutex<StripeEventStore>>,
+    stripe_connect: Arc<Mutex<StripeConnectStore>>,
     contract: Arc<dyn ContractPoster>,
 }
 
@@ -226,6 +244,8 @@ struct HealthStripeRail {
     api_configured: bool,
     webhook_configured: bool,
     backfill_enabled: bool,
+    connect_account_type: &'static str,
+    connect_configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +342,58 @@ pub struct StripeCheckoutSessionSummary {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckoutCopyPaste {
     pub checkout_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StripeConnectOnboardRequest {
+    pub provider: String,
+    pub country: String,
+    pub request_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StripeConnectStatusRequest {
+    pub provider: String,
+    pub request_nonce: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeConnectAccountSummary {
+    pub id: String,
+    pub account_type: String,
+    pub country: String,
+    pub default_currency: String,
+    pub details_submitted: bool,
+    pub charges_enabled: bool,
+    pub payouts_enabled: bool,
+    pub transfers_enabled: bool,
+    pub ready: bool,
+    pub currently_due: Vec<String>,
+    pub eventually_due: Vec<String>,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeConnectOnboardingSummary {
+    pub url: String,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeConnectResponse {
+    pub ok: bool,
+    pub rail: &'static str,
+    pub processor_rail: &'static str,
+    pub provider: String,
+    pub mode: &'static str,
+    pub account: StripeConnectAccountSummary,
+    pub onboarding: Option<StripeConnectOnboardingSummary>,
+    pub copy_paste: Option<StripeConnectCopyPaste>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeConnectCopyPaste {
+    pub onboarding_url: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -472,6 +544,23 @@ struct StripeEventStore {
     path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StripeConnectAccountRecord {
+    schema_version: u32,
+    mode: StripeMode,
+    provider: String,
+    account_id: String,
+    account_type: StripeConnectAccountType,
+    country: String,
+    created_at: u64,
+}
+
+#[derive(Debug)]
+struct StripeConnectStore {
+    accounts: HashMap<String, StripeConnectAccountRecord>,
+    path: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 enum StripeEventBegin {
     Started,
@@ -517,6 +606,10 @@ impl Default for StripeSettings {
             backfill_enabled: true,
             backfill_cursor_path: default_stripe_backfill_cursor_path(),
             backfill_interval_seconds: DEFAULT_STRIPE_BACKFILL_INTERVAL_SECONDS,
+            connect_account_type: StripeConnectAccountType::Express,
+            connect_accounts_path: default_stripe_connect_accounts_path(),
+            connect_return_url: DEFAULT_STRIPE_CONNECT_RETURN_URL.to_owned(),
+            connect_refresh_url: DEFAULT_STRIPE_CONNECT_RETURN_URL.to_owned(),
         }
     }
 }
@@ -526,6 +619,15 @@ impl StripeMode {
         match self {
             StripeMode::Test => "test",
             StripeMode::Live => "live",
+        }
+    }
+}
+
+impl StripeConnectAccountType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Express => "express",
+            Self::Custom => "custom",
         }
     }
 }
@@ -598,6 +700,25 @@ impl PaygateConfig {
                         .to_owned(),
                 ));
             }
+            if self
+                .rails
+                .stripe
+                .connect_accounts_path
+                .as_os_str()
+                .is_empty()
+            {
+                return Err(PaygateError::InvalidConfig(
+                    "stripe.connect_accounts_path cannot be empty".to_owned(),
+                ));
+            }
+            validate_connect_redirect_url(
+                "stripe.connect_return_url",
+                &self.rails.stripe.connect_return_url,
+            )?;
+            validate_connect_redirect_url(
+                "stripe.connect_refresh_url",
+                &self.rails.stripe.connect_refresh_url,
+            )?;
             if self.rails.stripe.mode == StripeMode::Live {
                 if self.rails.stripe.api_base_url.trim_end_matches('/')
                     != DEFAULT_STRIPE_API_BASE_URL
@@ -668,6 +789,19 @@ impl PaygateConfig {
         if let Some(seconds) = file.stripe.backfill_interval_seconds {
             self.rails.stripe.backfill_interval_seconds = seconds;
         }
+        if let Some(account_type) = file.stripe.connect_account_type {
+            self.rails.stripe.connect_account_type =
+                parse_stripe_connect_account_type("stripe.connect_account_type", &account_type)?;
+        }
+        if let Some(path) = file.stripe.connect_accounts_path {
+            self.rails.stripe.connect_accounts_path = expand_home(path);
+        }
+        if let Some(url) = file.stripe.connect_return_url {
+            self.rails.stripe.connect_return_url = url;
+        }
+        if let Some(url) = file.stripe.connect_refresh_url {
+            self.rails.stripe.connect_refresh_url = url;
+        }
         Ok(())
     }
 
@@ -719,6 +853,21 @@ impl PaygateConfig {
         if let Ok(seconds) = env::var("MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS") {
             self.rails.stripe.backfill_interval_seconds =
                 parse_u64("MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS", &seconds)?;
+        }
+        if let Ok(account_type) = env::var("MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE") {
+            self.rails.stripe.connect_account_type = parse_stripe_connect_account_type(
+                "MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE",
+                &account_type,
+            )?;
+        }
+        if let Ok(path) = env::var("MAYHEM_STRIPE_CONNECT_ACCOUNTS_PATH") {
+            self.rails.stripe.connect_accounts_path = expand_home(PathBuf::from(path));
+        }
+        if let Ok(url) = env::var("MAYHEM_STRIPE_CONNECT_RETURN_URL") {
+            self.rails.stripe.connect_return_url = url;
+        }
+        if let Ok(url) = env::var("MAYHEM_STRIPE_CONNECT_REFRESH_URL") {
+            self.rails.stripe.connect_refresh_url = url;
         }
         Ok(())
     }
@@ -779,7 +928,14 @@ impl PaygateState {
             config.contract_dry_run,
             http.clone(),
         ));
-        Self::with_parts(config, oracle, http, StripeEventStore::memory(), contract)
+        Self::with_parts(
+            config,
+            oracle,
+            http,
+            StripeEventStore::memory(),
+            StripeConnectStore::memory(),
+            contract,
+        )
     }
 
     pub fn try_new(config: PaygateConfig, oracle: OracleKeypair) -> Result<Self> {
@@ -791,11 +947,13 @@ impl PaygateState {
             http.clone(),
         ));
         let stripe_events = StripeEventStore::load(&config.rails.stripe.event_store_path)?;
+        let stripe_connect = StripeConnectStore::load(&config.rails.stripe.connect_accounts_path)?;
         Ok(Self::with_parts(
             config,
             oracle,
             http,
             stripe_events,
+            stripe_connect,
             contract,
         ))
     }
@@ -808,11 +966,13 @@ impl PaygateState {
         config.validate()?;
         let http = reqwest::Client::new();
         let stripe_events = StripeEventStore::load(&config.rails.stripe.event_store_path)?;
+        let stripe_connect = StripeConnectStore::load(&config.rails.stripe.connect_accounts_path)?;
         Ok(Self::with_parts(
             config,
             oracle,
             http,
             stripe_events,
+            stripe_connect,
             contract,
         ))
     }
@@ -822,6 +982,7 @@ impl PaygateState {
         oracle: OracleKeypair,
         http: reqwest::Client,
         stripe_events: StripeEventStore,
+        stripe_connect: StripeConnectStore,
         contract: Arc<dyn ContractPoster>,
     ) -> Self {
         let oracle_public_key = oracle.public_key_hex();
@@ -831,6 +992,7 @@ impl PaygateState {
             oracle_public_key,
             http,
             stripe_events: Arc::new(Mutex::new(stripe_events)),
+            stripe_connect: Arc::new(Mutex::new(stripe_connect)),
             contract,
         }
     }
@@ -857,6 +1019,14 @@ impl PaygateState {
                     api_configured: self.config.rails.stripe.secret_key.is_some(),
                     webhook_configured: self.config.rails.stripe.webhook_secret.is_some(),
                     backfill_enabled: self.config.rails.stripe.backfill_enabled,
+                    connect_account_type: self.config.rails.stripe.connect_account_type.as_str(),
+                    connect_configured: !self
+                        .config
+                        .rails
+                        .stripe
+                        .connect_accounts_path
+                        .as_os_str()
+                        .is_empty(),
                 },
             },
             controls: HealthControls {
@@ -1120,6 +1290,19 @@ pub fn paygate_router(state: PaygateState) -> Router {
             "/v1/stripe/checkout-sessions",
             post(create_stripe_checkout_session),
         )
+        .route(
+            "/stripe/connect/onboard",
+            post(create_stripe_connect_onboarding),
+        )
+        .route(
+            "/v1/stripe/connect/onboard",
+            post(create_stripe_connect_onboarding),
+        )
+        .route("/stripe/connect/status", post(read_stripe_connect_status))
+        .route(
+            "/v1/stripe/connect/status",
+            post(read_stripe_connect_status),
+        )
         .route("/stripe/return", get(stripe_return))
         .route("/v1/stripe/return", get(stripe_return))
         .route("/stripe/cancel", get(stripe_cancel))
@@ -1159,6 +1342,26 @@ async fn create_stripe_checkout_session(
     Json(request): Json<StripeCreateCheckoutSessionRequest>,
 ) -> Response {
     match create_checkout_session(&state, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn create_stripe_connect_onboarding(
+    State(state): State<Arc<PaygateState>>,
+    Json(request): Json<StripeConnectOnboardRequest>,
+) -> Response {
+    match create_connect_onboarding(&state, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn read_stripe_connect_status(
+    State(state): State<Arc<PaygateState>>,
+    Json(request): Json<StripeConnectStatusRequest>,
+) -> Response {
+    match read_connect_status(&state, request).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -1265,6 +1468,359 @@ async fn create_checkout_session(
     })
 }
 
+async fn create_connect_onboarding(
+    state: &PaygateState,
+    request: StripeConnectOnboardRequest,
+) -> Result<StripeConnectResponse> {
+    let stripe = require_stripe(state)?;
+    validate_provider_id(&request.provider)?;
+    validate_connect_request_nonce(&request.request_nonce)?;
+    let country = normalize_stripe_country(&request.country)?;
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+
+    let record = {
+        let mut store = state.stripe_connect.lock().await;
+        if let Some(record) = store.get(stripe.mode, &request.provider).cloned() {
+            if record.country != country {
+                return Err(PaygateError::InvalidRequest(format!(
+                    "provider already has a Stripe Connect account in {}",
+                    record.country
+                )));
+            }
+            record
+        } else {
+            let account = stripe_create_connect_account(
+                &state.http,
+                stripe,
+                secret_key,
+                &request.provider,
+                &country,
+            )
+            .await?;
+            let record = StripeConnectAccountRecord {
+                schema_version: 1,
+                mode: stripe.mode,
+                provider: request.provider.clone(),
+                account_id: account.id,
+                account_type: stripe.connect_account_type,
+                country,
+                created_at: unix_epoch_seconds()?,
+            };
+            store.insert(record.clone())?;
+            record
+        }
+    };
+
+    let account =
+        stripe_retrieve_connect_account(&state.http, stripe, secret_key, &record.account_id)
+            .await?;
+    let (onboarding, copy_paste) = if account.ready {
+        (None, None)
+    } else {
+        let onboarding = stripe_create_connect_account_link(
+            &state.http,
+            stripe,
+            secret_key,
+            &record.account_id,
+            &request.provider,
+            &request.request_nonce,
+        )
+        .await?;
+        let copy_paste = StripeConnectCopyPaste {
+            onboarding_url: onboarding.url.clone(),
+        };
+        (Some(onboarding), Some(copy_paste))
+    };
+    Ok(StripeConnectResponse {
+        ok: true,
+        rail: "fiat",
+        processor_rail: "stripe",
+        provider: request.provider,
+        mode: stripe.mode.as_str(),
+        account,
+        onboarding,
+        copy_paste,
+    })
+}
+
+async fn read_connect_status(
+    state: &PaygateState,
+    request: StripeConnectStatusRequest,
+) -> Result<StripeConnectResponse> {
+    let stripe = require_stripe(state)?;
+    validate_provider_id(&request.provider)?;
+    validate_connect_request_nonce(&request.request_nonce)?;
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+    let record = state
+        .stripe_connect
+        .lock()
+        .await
+        .get(stripe.mode, &request.provider)
+        .cloned()
+        .ok_or_else(|| {
+            PaygateError::InvalidRequest(
+                "provider has not started Stripe Connect onboarding".to_owned(),
+            )
+        })?;
+    let account =
+        stripe_retrieve_connect_account(&state.http, stripe, secret_key, &record.account_id)
+            .await?;
+    Ok(StripeConnectResponse {
+        ok: true,
+        rail: "fiat",
+        processor_rail: "stripe",
+        provider: request.provider,
+        mode: stripe.mode.as_str(),
+        account,
+        onboarding: None,
+        copy_paste: None,
+    })
+}
+
+fn require_stripe(state: &PaygateState) -> Result<&StripeSettings> {
+    let stripe = &state.config.rails.stripe;
+    if !stripe.enabled {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe processor is not enabled".to_owned(),
+        ));
+    }
+    Ok(stripe)
+}
+
+async fn stripe_create_connect_account(
+    http: &reqwest::Client,
+    stripe: &StripeSettings,
+    secret_key: &str,
+    provider: &str,
+    country: &str,
+) -> Result<StripeConnectAccountSummary> {
+    let form = [
+        ("type", stripe.connect_account_type.as_str().to_owned()),
+        ("country", country.to_owned()),
+        ("capabilities[transfers][requested]", "true".to_owned()),
+        ("metadata[mayhem_provider]", provider.to_owned()),
+        ("metadata[mayhem_mode]", stripe.mode.as_str().to_owned()),
+        (
+            "business_profile[product_description]",
+            "Mayhem inference provider".to_owned(),
+        ),
+    ];
+    let response = http
+        .post(format!(
+            "{}/v1/accounts",
+            stripe.api_base_url.trim_end_matches('/')
+        ))
+        .basic_auth(secret_key, Some(""))
+        .header(
+            "Idempotency-Key",
+            stripe_connect_idempotency_key(stripe.mode, provider),
+        )
+        .form(&form)
+        .send()
+        .await?;
+    let value = stripe_json_response(response, "creating connected account").await?;
+    stripe_connect_account_summary(value)
+}
+
+async fn stripe_retrieve_connect_account(
+    http: &reqwest::Client,
+    stripe: &StripeSettings,
+    secret_key: &str,
+    account_id: &str,
+) -> Result<StripeConnectAccountSummary> {
+    validate_stripe_account_id(account_id)?;
+    let response = http
+        .get(format!(
+            "{}/v1/accounts/{account_id}",
+            stripe.api_base_url.trim_end_matches('/')
+        ))
+        .basic_auth(secret_key, Some(""))
+        .send()
+        .await?;
+    let value = stripe_json_response(response, "retrieving connected account").await?;
+    stripe_connect_account_summary(value)
+}
+
+async fn stripe_create_connect_account_link(
+    http: &reqwest::Client,
+    stripe: &StripeSettings,
+    secret_key: &str,
+    account_id: &str,
+    provider: &str,
+    request_nonce: &str,
+) -> Result<StripeConnectOnboardingSummary> {
+    validate_stripe_account_id(account_id)?;
+    let form = [
+        ("account", account_id.to_owned()),
+        ("type", "account_onboarding".to_owned()),
+        ("return_url", stripe.connect_return_url.clone()),
+        ("refresh_url", stripe.connect_refresh_url.clone()),
+        ("collection_options[fields]", "eventually_due".to_owned()),
+    ];
+    let response = http
+        .post(format!(
+            "{}/v1/account_links",
+            stripe.api_base_url.trim_end_matches('/')
+        ))
+        .basic_auth(secret_key, Some(""))
+        .header(
+            "Idempotency-Key",
+            stripe_connect_link_idempotency_key(stripe.mode, provider, request_nonce),
+        )
+        .form(&form)
+        .send()
+        .await?;
+    let value = stripe_json_response(response, "creating connected-account link").await?;
+    let url = json_string_field(&value, "url")?;
+    validate_hosted_checkout_url("account_link.url", &url, "connect.stripe.com")?;
+    Ok(StripeConnectOnboardingSummary {
+        url,
+        expires_at: json_u64_field(&value, "expires_at")?,
+    })
+}
+
+async fn stripe_json_response(response: reqwest::Response, action: &str) -> Result<Value> {
+    let status = response.status();
+    let body = response.text().await?;
+    let value: Value = serde_json::from_str(&body).map_err(|_| {
+        PaygateError::Stripe(format!(
+            "Stripe returned an invalid response while {action}"
+        ))
+    })?;
+    if !status.is_success() {
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("Stripe request failed");
+        return Err(PaygateError::Stripe(format!(
+            "Stripe returned {status} while {action}: {}",
+            redact_stripe_credentials(message)
+        )));
+    }
+    Ok(value)
+}
+
+fn redact_stripe_credentials(input: &str) -> String {
+    const PREFIXES: [&str; 7] = [
+        "sk_test_", "sk_live_", "rk_test_", "rk_live_", "pk_test_", "pk_live_", "whsec_",
+    ];
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    loop {
+        let Some((offset, _)) = PREFIXES
+            .iter()
+            .filter_map(|prefix| remaining.find(prefix).map(|offset| (offset, prefix)))
+            .min_by_key(|(offset, _)| *offset)
+        else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..offset]);
+        let credential = &remaining[offset..];
+        let mut end = 0;
+        while let Some(byte) = credential.as_bytes().get(end) {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'*' | b'.') {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        output.push_str("[REDACTED]");
+        remaining = &credential[end..];
+    }
+    output
+}
+
+fn stripe_connect_account_summary(value: Value) -> Result<StripeConnectAccountSummary> {
+    let id = json_string_field(&value, "id")?;
+    validate_stripe_account_id(&id)?;
+    let account_type = json_string_field(&value, "type")?;
+    if !matches!(account_type.as_str(), "express" | "custom") {
+        return Err(PaygateError::Stripe(
+            "connected account has an unsupported type".to_owned(),
+        ));
+    }
+    let country = normalize_stripe_country(&json_string_field(&value, "country")?)?;
+    let default_currency =
+        normalize_stripe_currency(Some(&json_string_field(&value, "default_currency")?))?;
+    let details_submitted = value
+        .get("details_submitted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let charges_enabled = value
+        .get("charges_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let payouts_enabled = value
+        .get("payouts_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let transfers_enabled = value
+        .pointer("/capabilities/transfers")
+        .and_then(Value::as_str)
+        == Some("active");
+    let currently_due = stripe_string_array(&value, "/requirements/currently_due")?;
+    let eventually_due = stripe_string_array(&value, "/requirements/eventually_due")?;
+    let disabled_reason = value
+        .pointer("/requirements/disabled_reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(StripeConnectAccountSummary {
+        id,
+        account_type,
+        country,
+        default_currency,
+        details_submitted,
+        charges_enabled,
+        payouts_enabled,
+        transfers_enabled,
+        ready: details_submitted && payouts_enabled && transfers_enabled,
+        currently_due,
+        eventually_due,
+        disabled_reason,
+    })
+}
+
+fn stripe_string_array(value: &Value, pointer: &str) -> Result<Vec<String>> {
+    let Some(array) = value.pointer(pointer) else {
+        return Ok(Vec::new());
+    };
+    array
+        .as_array()
+        .ok_or_else(|| PaygateError::Stripe(format!("Stripe object {pointer} must be an array")))?
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_owned).ok_or_else(|| {
+                PaygateError::Stripe(format!("Stripe object {pointer} contains a non-string"))
+            })
+        })
+        .collect()
+}
+
+fn stripe_connect_idempotency_key(mode: StripeMode, provider: &str) -> String {
+    format!("mayhem-connect-account-{}-{provider}", mode.as_str())
+}
+
+fn stripe_connect_link_idempotency_key(
+    mode: StripeMode,
+    provider: &str,
+    request_nonce: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "mayhem-connect-link-v1:{}:{provider}:{}",
+        mode.as_str(),
+        request_nonce
+    ));
+    format!("mayhem-connect-link-{}", hex::encode(hasher.finalize()))
+}
+
 async fn stripe_create_payment_intent(
     http: &reqwest::Client,
     stripe: &StripeSettings,
@@ -1306,7 +1862,8 @@ async fn stripe_create_payment_intent(
     let body = response.text().await?;
     if !status.is_success() {
         return Err(PaygateError::Stripe(format!(
-            "Stripe returned {status}: {body}"
+            "Stripe returned {status}: {}",
+            redact_stripe_credentials(&body)
         )));
     }
     let value: Value = serde_json::from_str(&body)?;
@@ -1394,7 +1951,8 @@ async fn stripe_create_checkout_session(
     let body = response.text().await?;
     if !status.is_success() {
         return Err(PaygateError::Stripe(format!(
-            "Stripe returned {status}: {body}"
+            "Stripe returned {status}: {}",
+            redact_stripe_credentials(&body)
         )));
     }
     let value: Value = serde_json::from_str(&body)?;
@@ -1737,7 +2295,8 @@ async fn stripe_fetch_backfill_events(
             let body = response.text().await?;
             if !status.is_success() {
                 return Err(PaygateError::Stripe(format!(
-                    "Stripe events backfill returned {status}: {body}"
+                    "Stripe events backfill returned {status}: {}",
+                    redact_stripe_credentials(&body)
                 )));
             }
             let value: Value = serde_json::from_str(&body)?;
@@ -2124,6 +2683,77 @@ impl StripeEventStore {
     }
 }
 
+impl StripeConnectStore {
+    fn memory() -> Self {
+        Self {
+            accounts: HashMap::new(),
+            path: None,
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let mut store = Self {
+            accounts: HashMap::new(),
+            path: Some(path.to_path_buf()),
+        };
+        if !path.exists() {
+            return Ok(store);
+        }
+        let text = fs::read_to_string(path)?;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let record: StripeConnectAccountRecord = serde_json::from_str(line)?;
+            if record.schema_version != 1 {
+                return Err(PaygateError::InvalidConfig(format!(
+                    "unsupported Stripe Connect account schema_version {}",
+                    record.schema_version
+                )));
+            }
+            store
+                .accounts
+                .insert(Self::key(record.mode, &record.provider), record);
+        }
+        Ok(store)
+    }
+
+    fn key(mode: StripeMode, provider: &str) -> String {
+        format!("{}:{provider}", mode.as_str())
+    }
+
+    fn get(&self, mode: StripeMode, provider: &str) -> Option<&StripeConnectAccountRecord> {
+        self.accounts.get(&Self::key(mode, provider))
+    }
+
+    fn insert(&mut self, record: StripeConnectAccountRecord) -> Result<()> {
+        let key = Self::key(record.mode, &record.provider);
+        if let Some(existing) = self.accounts.get(&key) {
+            if existing.account_id == record.account_id {
+                return Ok(());
+            }
+            return Err(PaygateError::InvalidConfig(
+                "provider already has a different Stripe Connect account".to_owned(),
+            ));
+        }
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(path)?;
+            #[cfg(unix)]
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            writeln!(file, "{}", serde_json::to_string(&record)?)?;
+            file.sync_all()?;
+        }
+        self.accounts.insert(key, record);
+        Ok(())
+    }
+}
+
 impl StripeBackfillCursor {
     fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -2221,6 +2851,16 @@ fn parse_stripe_mode(field: &str, value: &str) -> Result<StripeMode> {
     }
 }
 
+fn parse_stripe_connect_account_type(field: &str, value: &str) -> Result<StripeConnectAccountType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "express" => Ok(StripeConnectAccountType::Express),
+        "custom" => Ok(StripeConnectAccountType::Custom),
+        _ => Err(PaygateError::InvalidConfig(format!(
+            "{field} must be express or custom"
+        ))),
+    }
+}
+
 fn parse_u64(field: &str, value: &str) -> Result<u64> {
     value
         .trim()
@@ -2296,6 +2936,12 @@ fn default_stripe_backfill_cursor_path() -> PathBuf {
         .join("stripe-backfill-cursor.json")
 }
 
+fn default_stripe_connect_accounts_path() -> PathBuf {
+    mayhem_home()
+        .join("paygate")
+        .join("stripe-connect-accounts.jsonl")
+}
+
 fn mayhem_home() -> PathBuf {
     env::var_os("MAYHEM_HOME")
         .map(PathBuf::from)
@@ -2336,6 +2982,17 @@ fn validate_checkout_url(field: &str, value: &str) -> Result<()> {
             || trimmed.starts_with("http://localhost"))
     {
         return Err(PaygateError::InvalidRequest(format!("{field} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_connect_redirect_url(field: &str, value: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| PaygateError::InvalidConfig(format!("{field} is invalid")))?;
+    if parsed.scheme() != "https" || parsed.username() != "" || parsed.password().is_some() {
+        return Err(PaygateError::InvalidConfig(format!(
+            "{field} must be an unauthenticated HTTPS URL"
+        )));
     }
     Ok(())
 }
@@ -2383,6 +3040,44 @@ fn normalize_stripe_locale(value: Option<&str>) -> Result<String> {
         ));
     }
     Ok(locale)
+}
+
+fn normalize_stripe_country(value: &str) -> Result<String> {
+    let country = value.trim().to_ascii_uppercase();
+    if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe Connect country must be a two-letter ISO country code".to_owned(),
+        ));
+    }
+    Ok(country)
+}
+
+fn validate_provider_id(provider: &str) -> Result<()> {
+    if provider.len() != 64 || !provider.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PaygateError::InvalidRequest(
+            "provider must be a 32-byte hexadecimal public key".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_connect_request_nonce(nonce: &str) -> Result<()> {
+    if nonce.len() != 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PaygateError::InvalidRequest(
+            "request_nonce must be a 32-byte hexadecimal value".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stripe_account_id(account_id: &str) -> Result<()> {
+    if account_id.starts_with("acct_") && is_safe_key_part(account_id) {
+        Ok(())
+    } else {
+        Err(PaygateError::Stripe(
+            "Stripe connected account id is invalid".to_owned(),
+        ))
+    }
 }
 
 fn is_safe_key_part(value: &str) -> bool {
@@ -2573,6 +3268,18 @@ mod tests {
         assert!(live_err
             .to_string()
             .contains("live mode requires a sk_live_"));
+    }
+
+    #[test]
+    fn stripe_processor_errors_never_expose_credential_material() {
+        let input = "Expired API Key provided: sk_test_********LAST123 and pk_live_public456";
+        let redacted = redact_stripe_credentials(input);
+        assert_eq!(
+            redacted,
+            "Expired API Key provided: [REDACTED] and [REDACTED]"
+        );
+        assert!(!redacted.contains("LAST123"));
+        assert!(!redacted.contains("public456"));
     }
 
     #[test]

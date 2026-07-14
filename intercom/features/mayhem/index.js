@@ -69,10 +69,14 @@ const participantFor = (value) => {
 };
 
 const serviceParticipantFor = (service, value) => {
-  if (service !== 'stripe_checkout' || !value || typeof value !== 'object' || Array.isArray(value)) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null;
   }
-  return normalizeKey(value.who);
+  if (service === 'stripe_checkout') return normalizeKey(value.who);
+  if (service === 'stripe_connect_onboard' || service === 'stripe_connect_status') {
+    return normalizeKey(value.provider);
+  }
+  return null;
 };
 
 const relayError = (message, requestId = null) => ({

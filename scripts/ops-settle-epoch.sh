@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenMayhem manual epoch settlement (admin server).
 # Settles the active billing epoch WITH its retained gateway receipts:
-#   receipts export (from gateway) -> recompute-epoch-roots -> epoch-commit -> epoch-apply
+#   receipts export -> recompute -> epoch-commit -> epoch-apply -> fiat transfer/evidence
 # Every submit is preceded by a sim. Aborts on any mismatch.
 # Usage: ops-settle-epoch.sh [epoch]   (defaults to updated_epoch + 1)
 set -euo pipefail
@@ -13,6 +13,10 @@ ADMIN_HOME="${MAYHEM_ADMIN_HOME:-/opt/mayhem/.mayhem-local/live-home}"
 ADMIN_STORE="${MAYHEM_ADMIN_STORE:-mayhem-canonical-admin}"
 SOURCE_DIR="${MAYHEM_SOURCE_DIR:-/opt/mayhem/source}"
 STATE_DIR="${MAYHEM_CADENCE_STATE_DIR:-/opt/mayhem/.mayhem-local/settlement}"
+FIAT_SETTLEMENT_ENABLED="${MAYHEM_FIAT_SETTLEMENT_ENABLED:-1}"
+FIAT_OPERATOR_ACCOUNT="${MAYHEM_FIAT_OPERATOR_ACCOUNT:-platform_balance}"
+FIAT_OPERATOR_CURRENCY="${MAYHEM_FIAT_OPERATOR_CURRENCY:-eur}"
+FIAT_STRIPE_ENV_FILE="${MAYHEM_FIAT_STRIPE_ENV_FILE:-}"
 
 json_field() {
     python3 -c '
@@ -157,6 +161,62 @@ if [[ "$after" != "$epoch" ]]; then
     echo "abort: applied epoch $epoch but updated_epoch is $after" >&2
     exit 1
 fi
+
+if [[ "$FIAT_SETTLEMENT_ENABLED" == "1" ]]; then
+    fiat_common=(
+        --home "$ADMIN_HOME"
+        --rpc-url "$RPC_URL"
+        --peer-store-name "$ADMIN_STORE"
+        --epoch "$epoch"
+        --at "$at"
+        --operator-stripe-account "$FIAT_OPERATOR_ACCOUNT"
+        --operator-currency "$FIAT_OPERATOR_CURRENCY"
+        --json
+    )
+    if [[ -n "$FIAT_STRIPE_ENV_FILE" ]]; then
+        fiat_common+=(--stripe-env-file "$FIAT_STRIPE_ENV_FILE")
+    fi
+
+    "$MAYHEM_BIN" admin fiat-settlement "${fiat_common[@]}" \
+        >"$run_dir/fiat-settlement-plan.json"
+    fiat_plan="$(python3 - "$run_dir/fiat-settlement-plan.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+blocking = sum(1 for item in d.get("skipped_providers", []) if item.get("blocking", True))
+print(
+    str(bool(d.get("ok"))).lower(),
+    str(d.get("already_settled") is not None).lower(),
+    str(bool(d.get("nothing_to_settle"))).lower(),
+    blocking,
+)
+PY
+)"
+    read -r fiat_ok fiat_already fiat_empty fiat_blocking <<<"$fiat_plan"
+    if [[ "$fiat_ok" != "true" || "$fiat_blocking" != "0" ]]; then
+        echo "abort: fiat settlement plan failed or has blocking provider payout errors (see $run_dir/fiat-settlement-plan.json)" >&2
+        exit 1
+    fi
+    if [[ "$fiat_already" == "true" ]]; then
+        echo "fiat settlement already recorded for epoch $epoch"
+    elif [[ "$fiat_empty" == "true" ]]; then
+        echo "fiat settlement has no whole-minor-unit outputs for epoch $epoch"
+    else
+        "$MAYHEM_BIN" admin fiat-settlement "${fiat_common[@]}" \
+            --submit-transfer --submit >"$run_dir/fiat-settlement.json"
+        python3 - "$run_dir/fiat-settlement.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if not d.get("ok") or not d.get("submitted"):
+    raise SystemExit("fiat settlement did not submit exact ledger evidence")
+if not d.get("reconciliation", {}).get("all_provider_transfers_verified"):
+    raise SystemExit("not every planned provider Stripe transfer was verified")
+if d.get("settlement_state") is None:
+    raise SystemExit("fiat settlement ledger state was not observed after submit")
+PY
+        echo "fiat Stripe transfers verified and ledger evidence recorded"
+    fi
+fi
+
 date +%s >"$STATE_DIR/cadence.last-advance" 2>/dev/null || true
 echo "epoch $epoch settled; billing epoch is now $((epoch + 1))"
 echo "NOTE: settled receipts remain in gateway memory and will block the"

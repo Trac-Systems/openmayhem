@@ -209,6 +209,7 @@ async function fiatSettlementValue(ctx, {
 test('MayhemContract fiatSettlement records Stripe transfer evidence and is idempotent', async () => {
   const ctx = await setupFiatSettlementContract();
   const settlement = await fiatSettlementValue(ctx);
+  const preSettlementSnapshot = ctx.storage.snapshotBytes();
 
   ctx.contract._mayhemLastFeatureResult = undefined;
   const nonAdminResult = await executeFeature(
@@ -279,6 +280,31 @@ test('MayhemContract fiatSettlement records Stripe transfer evidence and is idem
     stripe_refs: settlement.stripe_refs,
   });
   assert.equal(ctx.storage.snapshotBytes(), snapshot);
+
+  const changedReplay = structuredClone(settlement);
+  changedReplay.stripe_refs[0] = 'tr_changed_replay';
+  const rejected = await executeFiatSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    changedReplay,
+    ctx.admin.publicKey
+  );
+  assert.match(rejected.message, /already exists for epoch/i);
+  assert.equal(ctx.storage.snapshotBytes(), snapshot);
+
+  const rebuiltStorage = MemoryStorage.fromSnapshotBytes(preSettlementSnapshot);
+  const rebuiltContract = new MayhemContract(
+    { peer: { wallet: makeVerifier(ctx.providers[0].identity.wallet) } },
+    {}
+  );
+  const rebuilt = await executeFiatSettlementFeature(
+    rebuiltContract,
+    rebuiltStorage,
+    settlement,
+    ctx.admin.publicKey
+  );
+  assert.deepEqual(rebuilt, settled);
+  assert.equal(rebuiltStorage.snapshotBytes(), snapshot);
 });
 
 test('MayhemContract fiatSettlement holds providers without admin Stripe payout targets', async () => {
