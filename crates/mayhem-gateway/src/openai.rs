@@ -737,17 +737,6 @@ fn default_quant_bucket() -> String {
     DEFAULT_QUANT_BUCKET.to_owned()
 }
 
-fn route_candidate_approved_binary_hashes(candidate: &GatewayRouteCandidate) -> BTreeSet<String> {
-    std::iter::once(candidate.binary_hash.to_ascii_lowercase())
-        .chain(
-            candidate
-                .approved_binary_hashes
-                .iter()
-                .map(|hash| hash.to_ascii_lowercase()),
-        )
-        .collect()
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PriceRefAu {
     pub denom: String,
@@ -2182,7 +2171,6 @@ pub struct GatewayHedgeProbeResult {
 #[derive(Clone, Debug)]
 pub struct GatewaySessionAttestation {
     pub contract: EnclaveContractRecord,
-    pub trusted_binary_hashes: BTreeSet<String>,
     pub trusted_apple_app_attest_jwks: Option<Value>,
     pub trusted_nvidia_gb10_device_jwks: Option<Value>,
     pub trusted_nvidia_nras_jwks: Option<Value>,
@@ -10834,7 +10822,6 @@ fn validate_direct_session_accept(
         let mut request = AttestationVerificationRequest::new(
             &report,
             &attestation.contract,
-            &attestation.trusted_binary_hashes,
             expected_att_nonce,
             provider,
             now_ts,
@@ -21925,7 +21912,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -22029,7 +22015,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -22132,7 +22117,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -22235,7 +22219,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -22338,7 +22321,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -22444,7 +22426,6 @@ impl GatewayState {
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
-            trusted_binary_hashes: route_candidate_approved_binary_hashes(candidate),
             trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
             trusted_nvidia_gb10_device_jwks: self
                 .hardware_quote_trust
@@ -27137,7 +27118,6 @@ mod tests {
             },
             attestation: Some(GatewaySessionAttestation {
                 contract,
-                trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
                 trusted_apple_app_attest_jwks: None,
                 trusted_nvidia_gb10_device_jwks: None,
                 trusted_nvidia_nras_jwks: None,

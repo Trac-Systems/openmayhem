@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -27,7 +26,6 @@ fn test_report() -> (
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
     EnclaveContractRecord,
-    BTreeSet<String>,
 ) {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("mayhem-enclave-test-bin");
@@ -66,9 +64,7 @@ fn test_report() -> (
         att_tier: 1,
         caps: serde_json::json!({}),
     };
-    let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
-
-    (temp, attestation.report, contract, trusted)
+    (temp, attestation.report, contract)
 }
 
 fn test_hardware_report(
@@ -77,7 +73,6 @@ fn test_hardware_report(
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
     EnclaveContractRecord,
-    BTreeSet<String>,
 ) {
     test_hardware_report_with_evidence_and_metadata(quote_kind, None, |_, _| {
         "test-hardware-quote".to_owned()
@@ -91,7 +86,6 @@ fn test_hardware_report_with_metadata(
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
     EnclaveContractRecord,
-    BTreeSet<String>,
 ) {
     test_hardware_report_with_evidence_and_metadata(quote_kind, Some(metadata), |_, _| {
         "test-hardware-quote".to_owned()
@@ -118,7 +112,6 @@ fn test_hardware_report_with_evidence(
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
     EnclaveContractRecord,
-    BTreeSet<String>,
 ) {
     test_hardware_report_with_evidence_and_metadata(quote_kind, None, evidence_for_binding)
 }
@@ -131,7 +124,6 @@ fn test_hardware_report_with_evidence_and_metadata(
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
     EnclaveContractRecord,
-    BTreeSet<String>,
 ) {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("mayhem-enclave-test-bin");
@@ -209,9 +201,7 @@ fn test_hardware_report_with_evidence_and_metadata(
         att_tier: attestation.report.att_tier,
         caps: serde_json::json!({}),
     };
-    let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
-
-    (temp, attestation.report, contract, trusted)
+    (temp, attestation.report, contract)
 }
 
 const TEST_NVIDIA_NRAS_KID: &str = "nras-test-kid";
@@ -389,11 +379,10 @@ fn test_nvidia_gb10_device_evidence(body: &AttestationBody, binding: &str, model
 
 #[test]
 fn verifies_signed_tier1_report() {
-    let (_temp, report, contract, trusted) = test_report();
+    let (_temp, report, contract) = test_report();
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -409,12 +398,11 @@ fn verifies_signed_tier1_report() {
 
 #[test]
 fn verification_rejects_wrong_provider_pubkey_on_default_path() {
-    let (_temp, report, contract, trusted) = test_report();
+    let (_temp, report, contract) = test_report();
     let wrong_provider = "dd".repeat(32);
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &wrong_provider,
         210,
@@ -433,12 +421,11 @@ fn verification_rejects_wrong_provider_pubkey_on_default_path() {
 
 #[test]
 fn verification_rejects_runtime_tp_degree_mismatch() {
-    let (_temp, report, mut contract, trusted) = test_report();
+    let (_temp, report, mut contract) = test_report();
     contract.caps = serde_json::json!({ "tp_degree": 2 });
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -457,12 +444,11 @@ fn verification_rejects_runtime_tp_degree_mismatch() {
 
 #[test]
 fn verification_rejects_runtime_model_class_mismatch() {
-    let (_temp, report, mut contract, trusted) = test_report();
+    let (_temp, report, mut contract) = test_report();
     contract.model_class = "embedding".to_owned();
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -481,7 +467,7 @@ fn verification_rejects_runtime_model_class_mismatch() {
 
 #[test]
 fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::AppleAppAttestJwt,
         test_apple_app_attest_evidence,
     );
@@ -489,7 +475,6 @@ fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -505,14 +490,13 @@ fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
 
 #[test]
 fn apple_app_attest_tier2_identity_requires_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::AppleAppAttestJwt,
         test_apple_app_attest_evidence,
     );
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -529,7 +513,7 @@ fn apple_app_attest_tier2_identity_requires_trusted_jwks() {
 
 #[test]
 fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaGb10DeviceJwt,
         |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark"),
     );
@@ -537,7 +521,6 @@ fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -553,7 +536,7 @@ fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
 
 #[test]
 fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaGb10DeviceJwt,
         |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA H100"),
     );
@@ -561,7 +544,6 @@ fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -580,7 +562,7 @@ fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
 
 #[test]
 fn nvidia_nras_tier3_report_requires_admin_verifier_even_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) =
+    let (_temp, report, contract) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
@@ -588,7 +570,6 @@ fn nvidia_nras_tier3_report_requires_admin_verifier_even_with_trusted_jwks() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -607,14 +588,13 @@ fn nvidia_nras_tier3_report_requires_admin_verifier_even_with_trusted_jwks() {
 
 #[test]
 fn nvidia_nras_tier3_report_requires_trusted_jwks() {
-    let (_temp, report, contract, trusted) =
+    let (_temp, report, contract) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -632,7 +612,7 @@ fn nvidia_nras_tier3_report_requires_trusted_jwks() {
 
 #[test]
 fn hardware_quote_kind_must_match_report_tier() {
-    let (_temp, mut report, mut contract, trusted) =
+    let (_temp, mut report, mut contract) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
@@ -641,7 +621,6 @@ fn hardware_quote_kind_must_match_report_tier() {
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -663,7 +642,7 @@ fn hardware_quote_kind_must_match_report_tier() {
 
 #[test]
 fn nvidia_nras_tier3_report_without_admin_verifier_fails_before_appraisal() {
-    let (_temp, report, contract, trusted) =
+    let (_temp, report, contract) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, false)
         });
@@ -671,7 +650,6 @@ fn nvidia_nras_tier3_report_without_admin_verifier_fails_before_appraisal() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -690,7 +668,7 @@ fn nvidia_nras_tier3_report_without_admin_verifier_fails_before_appraisal() {
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_requires_admin_verifier_even_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, true),
     );
@@ -698,7 +676,6 @@ fn nvidia_nvtrust_offline_cc_quote_requires_admin_verifier_even_with_trusted_jwk
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -717,14 +694,13 @@ fn nvidia_nvtrust_offline_cc_quote_requires_admin_verifier_even_with_trusted_jwk
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, true),
     );
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -742,7 +718,7 @@ fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, false),
     );
@@ -750,7 +726,6 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -769,7 +744,7 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark"),
     );
@@ -780,7 +755,6 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -816,13 +790,11 @@ fn write_verifier_script(dir: &tempfile::TempDir, stdout_json: &str) -> std::pat
 fn request_with_external_verifier<'a>(
     report: &'a mayhem_proto::AttestationReport,
     contract: &'a EnclaveContractRecord,
-    trusted: &'a BTreeSet<String>,
     verifier: &'a HardwareQuoteVerifierCommand,
 ) -> AttestationVerificationRequest<'a> {
     let mut request = AttestationVerificationRequest::new(
         report,
         contract,
-        trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -834,14 +806,13 @@ fn request_with_external_verifier<'a>(
 #[cfg(unix)]
 #[test]
 fn tpm2_ek_tier2_requires_external_verifier() {
-    let (_temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (_temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
         serde_json::json!({ "device_key": "ab".repeat(32) }),
     );
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -858,12 +829,13 @@ fn tpm2_ek_tier2_requires_external_verifier() {
 
 #[cfg(unix)]
 #[test]
-fn external_tpm2_ek_verifier_accepts_root_and_device_key() {
+fn external_tpm2_ek_verifier_accepts_source_build_with_valid_device_proof() {
     let device_key = "ab".repeat(32);
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, mut contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
         serde_json::json!({ "device_key": device_key }),
     );
+    contract.binary_hash = "11".repeat(32);
     let script = write_verifier_script(
         &temp,
         &format!(
@@ -875,18 +847,19 @@ fn external_tpm2_ek_verifier_accepts_root_and_device_key() {
         command: script,
         timeout: Duration::from_secs(15),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
-    let verified =
-        verify_tier1_attestation(&request).expect("TPM EK quote verifies as Tier 2 identity");
+    let verified = verify_tier1_attestation(&request)
+        .expect("TPM proof, not a runtime allowlist, admits Tier 2");
 
     assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
+    assert_ne!(report.binary_hash, contract.binary_hash);
 }
 
 #[cfg(unix)]
 #[test]
 fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
         serde_json::json!({ "device_key": "ab".repeat(32) }),
     );
@@ -901,7 +874,7 @@ fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
         command: script,
         timeout: Duration::from_secs(15),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("TPM verifier-confirmed EK must match provider metadata");
@@ -916,7 +889,7 @@ fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
 #[cfg(unix)]
 #[test]
 fn external_tpm2_ek_verifier_rejects_replayed_wrong_binding() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
         serde_json::json!({ "device_key": "ab".repeat(32) }),
     );
@@ -932,7 +905,7 @@ fn external_tpm2_ek_verifier_rejects_replayed_wrong_binding() {
         command: script,
         timeout: Duration::from_secs(15),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("TPM verifier verdict must be bound to this Mayhem attestation nonce");
@@ -946,7 +919,7 @@ fn external_tpm2_ek_verifier_rejects_replayed_wrong_binding() {
 #[cfg(unix)]
 #[test]
 fn external_tpm2_ek_verifier_rejects_missing_contract_device_key_metadata() {
-    let (temp, report, contract, trusted) =
+    let (temp, report, contract) =
         test_hardware_report_with_metadata(HardwareQuoteKind::Tpm2QuoteEk, serde_json::json!({}));
     let script = write_verifier_script(
         &temp,
@@ -959,7 +932,7 @@ fn external_tpm2_ek_verifier_rejects_missing_contract_device_key_metadata() {
         command: script,
         timeout: Duration::from_secs(15),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("TPM verifier-confirmed EK must match provider-submitted contract metadata");
@@ -974,7 +947,7 @@ fn external_tpm2_ek_verifier_rejects_missing_contract_device_key_metadata() {
 #[cfg(unix)]
 #[test]
 fn external_tpm2_ek_verifier_rejects_public_key_only_root_label() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::Tpm2QuoteEk,
         serde_json::json!({ "device_key": "ab".repeat(32) }),
     );
@@ -989,7 +962,7 @@ fn external_tpm2_ek_verifier_rejects_public_key_only_root_label() {
         command: script,
         timeout: Duration::from_secs(15),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("Tier 2 TPM must be manufacturer/EK-cert rooted, not EK-public-only");
@@ -1003,9 +976,10 @@ fn external_tpm2_ek_verifier_rejects_public_key_only_root_label() {
 
 #[cfg(unix)]
 #[test]
-fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
-    let (temp, report, contract, trusted) =
+fn external_nvidia_cc_verifier_admits_source_build_on_valid_roots_and_golden_measurement() {
+    let (temp, report, mut contract) =
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    contract.binary_hash = "11".repeat(32);
     let script = write_verifier_script(
         &temp,
         r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
@@ -1014,19 +988,19 @@ fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let verified = verify_tier1_attestation(&request)
         .expect("external verifier accepts NVIDIA GPU + CPU CC + golden measurement");
 
     assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
+    assert_ne!(report.binary_hash, contract.binary_hash);
 }
 
 #[cfg(unix)]
 #[test]
 fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
-    let (temp, report, contract, trusted) =
-        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let (temp, report, contract) = test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
         r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
@@ -1035,7 +1009,7 @@ fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("NVIDIA GPU-only evidence is not Tier-3 prompt confidentiality");
@@ -1050,8 +1024,7 @@ fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
 #[cfg(unix)]
 #[test]
 fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
-    let (temp, report, contract, trusted) =
-        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let (temp, report, contract) = test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
         r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","intel_tdx_dcap"],"matched_measurements":{"workload":{"vtpm_pcr_0":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}}"#,
@@ -1060,7 +1033,7 @@ fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     verify_tier1_attestation(&request)
         .expect("Intel TDX/DCAP CPU root is supported as a best-effort CPU CC root");
@@ -1069,7 +1042,7 @@ fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
 #[cfg(unix)]
 #[test]
 fn external_azure_maa_cpu_path_requires_azure_scope_gpu_roots_and_workload_pcr() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::json!({
             "platform_id": "azure-ncc",
@@ -1084,7 +1057,7 @@ fn external_azure_maa_cpu_path_requires_azure_scope_gpu_roots_and_workload_pcr()
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     verify_tier1_attestation(&request).expect(
         "Azure-scoped MAA CPU path is accepted only after verifier validates JWT/JWKS/issuer/nonce/claims and workload PCR",
@@ -1094,7 +1067,7 @@ fn external_azure_maa_cpu_path_requires_azure_scope_gpu_roots_and_workload_pcr()
 #[cfg(unix)]
 #[test]
 fn external_azure_maa_cpu_path_is_not_universal_cpu_root() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::json!({
             "platform_id": "onprem-qemu-v1"
@@ -1108,7 +1081,7 @@ fn external_azure_maa_cpu_path_is_not_universal_cpu_root() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("MAA is not a universal CPU/VM root outside Azure platform entries");
@@ -1123,7 +1096,7 @@ fn external_azure_maa_cpu_path_is_not_universal_cpu_root() {
 #[cfg(unix)]
 #[test]
 fn external_azure_maa_cpu_path_still_rejects_wrong_workload_pcr() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::json!({
             "platform_id": "azure-ncc",
@@ -1138,7 +1111,7 @@ fn external_azure_maa_cpu_path_still_rejects_wrong_workload_pcr() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("MAA platform proof never skips Mayhem workload PCR matching");
@@ -1153,7 +1126,7 @@ fn external_azure_maa_cpu_path_still_rejects_wrong_workload_pcr() {
 #[cfg(unix)]
 #[test]
 fn external_tier3_registration_requires_workload_measurement_layer() {
-    let (temp, report, mut contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, mut contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::json!({
             "platform_id": "azure-ncc",
@@ -1178,7 +1151,7 @@ fn external_tier3_registration_requires_workload_measurement_layer() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("Tier-3 cannot register with only vendor-layer measurements");
@@ -1193,8 +1166,7 @@ fn external_tier3_registration_requires_workload_measurement_layer() {
 #[cfg(unix)]
 #[test]
 fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
-    let (temp, report, contract, trusted) =
-        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let (temp, report, contract) = test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     let script = write_verifier_script(
         &temp,
         r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"workload":{"vtpm_pcr_0":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}},"platform_id":"provider-declared-azure-ncc","region":"centralus","snp_chip_family":"genoa","snp_chip_id":"chip-123","snp_tcb":"svn27","gpu_model":"H100","gpu_driver":"550.90","gpu_vbios":"96.00.00"}"#,
@@ -1203,7 +1175,7 @@ fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("hardware-valid unknown image measurement is rejected");
@@ -1222,7 +1194,7 @@ fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
 #[cfg(unix)]
 #[test]
 fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() {
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::Value::Null,
     );
@@ -1234,7 +1206,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("Tier-3 quote submissions must carry a platform hint for admin workflow");
@@ -1245,7 +1217,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
             if reason.contains("platform_id")
     ));
 
-    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+    let (temp, report, contract) = test_hardware_report_with_metadata(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         serde_json::json!({
             "platform_id": "provider-can-lie-here",
@@ -1260,7 +1232,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     verify_tier1_attestation(&request)
         .expect("declared platform/region hints do not influence Tier-3 trust acceptance");
@@ -1269,7 +1241,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
 #[cfg(unix)]
 #[test]
 fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
-    let (temp, report, mut contract, trusted) =
+    let (temp, report, mut contract) =
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
     contract.launch_measurements = serde_json::Value::Null;
     let script = write_verifier_script(
@@ -1280,7 +1252,7 @@ fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
         command: script,
         timeout: Duration::from_secs(5),
     };
-    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+    let request = request_with_external_verifier(&report, &contract, &verifier);
 
     let err = verify_tier1_attestation(&request)
         .expect_err("Tier-3 registration without golden measurement fails closed");
@@ -1294,11 +1266,10 @@ fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
 
 #[test]
 fn tier3_quote_kinds_fail_closed_without_admin_verifier() {
-    let (_temp, report, contract, trusted) = test_hardware_report(HardwareQuoteKind::IntelTdxDcap);
+    let (_temp, report, contract) = test_hardware_report(HardwareQuoteKind::IntelTdxDcap);
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -1314,54 +1285,30 @@ fn tier3_quote_kinds_fail_closed_without_admin_verifier() {
 }
 
 #[test]
-fn verification_rejects_wrong_binary_hash() {
-    let (_temp, report, contract, trusted) = test_report();
-    let empty_release_set = BTreeSet::new();
+fn verification_accepts_source_built_runtime_without_admin_approval() {
+    let (_temp, report, mut contract) = test_report();
+    contract.binary_hash = "11".repeat(32);
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &empty_release_set,
-        &report.nonce_u,
-        &report.provider_pubkey,
-        210,
-    );
-
-    let err = verify_tier1_attestation(&request).expect_err("binary must be trusted");
-
-    assert!(matches!(err, GatewayError::BinaryHashNotTrusted { .. }));
-    assert_eq!(trusted.len(), 1);
-}
-
-#[test]
-fn verification_accepts_approved_non_primary_runtime_release_for_same_enclave() {
-    let (_temp, report, mut contract, mut trusted) = test_report();
-    let primary_hash = "11".repeat(32);
-    contract.binary_hash = primary_hash.clone();
-    trusted.insert(primary_hash);
-
-    let request = AttestationVerificationRequest::new(
-        &report,
-        &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
     );
 
     let verified = verify_tier1_attestation(&request)
-        .expect("an approved runtime release must keep the canonical enclave identity");
+        .expect("a measured source build must not require admin admission");
     assert_eq!(verified.enclave_id, contract.enclave_id);
     assert_ne!(report.binary_hash, contract.binary_hash);
 }
 
 #[test]
 fn verification_rejects_wrong_manifest() {
-    let (_temp, report, mut contract, trusted) = test_report();
+    let (_temp, report, mut contract) = test_report();
     contract.manifest_hash = "manifest-hash-v2".to_owned();
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         210,
@@ -1380,12 +1327,11 @@ fn verification_rejects_wrong_manifest() {
 
 #[test]
 fn verification_rejects_stale_nonce() {
-    let (_temp, report, contract, trusted) = test_report();
+    let (_temp, report, contract) = test_report();
     let stale_nonce = "bb".repeat(32);
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &stale_nonce,
         &report.provider_pubkey,
         210,
@@ -1398,11 +1344,10 @@ fn verification_rejects_stale_nonce() {
 
 #[test]
 fn verification_rejects_stale_report_timestamp() {
-    let (_temp, report, contract, trusted) = test_report();
+    let (_temp, report, contract) = test_report();
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
-        &trusted,
         &report.nonce_u,
         &report.provider_pubkey,
         100_000,

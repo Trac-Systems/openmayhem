@@ -171,7 +171,7 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
 - GPU serving: an NVIDIA driver new enough for CUDA 12 (550+), and the CUDA toolkit (`nvcc`) so llama.cpp builds its CUDA kernels. Cloud GPU images usually ship both — check with `nvidia-smi` and `nvcc --version`.
 - vLLM or TensorRT-LLM artifacts only: Python 3.10+ with `venv` and `pip` (`sudo apt-get install -y python3 python3-venv python3-pip`). Skip if you serve llama.cpp artifacts only.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
-- Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). Most server boards and all recent desktops have one; enable it in BIOS if `/dev/tpm*` is absent.
+- Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). Most server boards and all recent desktops have one; enable it in BIOS if `/dev/tpm*` is absent. The provider explicitly enables the TPM quote path when starting; Mayhem never runs hardware-proof helpers merely because it detected a TPM.
 
 **macOS (Apple Silicon):**
 
@@ -189,7 +189,7 @@ Metal ships with the OS — nothing GPU-specific to install.
 - CMake: `winget install Kitware.CMake`
 - Rust via rustup (MSVC toolchain, the default), Node.js 20+: `winget install OpenJS.NodeJS.LTS`
 - Current NVIDIA driver for GPU serving
-- Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so Tier 2 works out of the box.
+- Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so the hardware needed for Tier 2 is normally present; the provider still explicitly selects the TPM quote helper when starting.
 
 ### Agent install checklist (deterministic — for coding agents driving the install)
 
@@ -427,7 +427,17 @@ All four settle the same way, on the same evidence, at the market price of whate
 mayhem up --provider --yes
 ```
 
-That's the whole happy path. The software probes your hardware, shows which admin-approved models fit (with estimated speed and context, before anything downloads), fetches and verifies the model, and starts serving. The provider dashboard shows download, verify, seal, load, and serving progress live.
+That's the whole Tier-1 happy path. The software probes your hardware, shows which admin-approved models fit (with estimated speed and context, before anything downloads), fetches and verifies the model, and starts serving. The provider dashboard shows download, verify, seal, load, and serving progress live. Your Mayhem binary may be built from source: its measured hash is signed evidence, not an admin approval list. The model, artifact, manifest, room, and market still come only from the admin-published catalog and ledger.
+
+Higher-tier proof is explicit. It never needs a manual provider approval after it verifies, and Mayhem does not auto-run a proof helper just because hardware was detected. For example, a Linux TPM provider starts Tier 2 with:
+
+```bash
+mayhem up --provider --yes \
+  --provider-hardware-quote-kind tpm2-quote-ek \
+  --provider-hardware-quote-command scripts/hardware/mayhem-tpm2-quote-linux.sh
+```
+
+Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1`; Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
 
 Model downloads come from Hugging Face. Without a token you download anonymously, and anonymous pulls are rate-limited: multi-gigabyte models can slow to a crawl or fail partway. A free Hugging Face token fixes that. Getting one takes two minutes, once:
 

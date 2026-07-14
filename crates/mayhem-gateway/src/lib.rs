@@ -72,8 +72,6 @@ pub enum GatewayError {
     },
     #[error("attestation enclave_id mismatch: expected {expected}, got {actual}")]
     EnclaveIdMismatch { expected: String, actual: String },
-    #[error("attestation binary_hash is not in the trusted release set: {binary_hash}")]
-    BinaryHashNotTrusted { binary_hash: String },
     #[error("attestation nonce mismatch: expected {expected}, got {actual}")]
     NonceMismatch { expected: String, actual: String },
     #[error("attestation nonce must be 32 bytes of hex")]
@@ -157,7 +155,6 @@ pub struct HardwareQuoteVerifierCommand {
 pub struct AttestationVerificationRequest<'a> {
     pub report: &'a AttestationReport,
     pub contract: &'a EnclaveContractRecord,
-    pub trusted_binary_hashes: &'a BTreeSet<String>,
     pub expected_nonce: &'a str,
     pub expected_provider_pubkey: &'a str,
     pub now_ts: u64,
@@ -307,7 +304,6 @@ impl<'a> AttestationVerificationRequest<'a> {
     pub fn new(
         report: &'a AttestationReport,
         contract: &'a EnclaveContractRecord,
-        trusted_binary_hashes: &'a BTreeSet<String>,
         expected_nonce: &'a str,
         expected_provider_pubkey: &'a str,
         now_ts: u64,
@@ -315,7 +311,6 @@ impl<'a> AttestationVerificationRequest<'a> {
         Self {
             report,
             contract,
-            trusted_binary_hashes,
             expected_nonce,
             expected_provider_pubkey,
             now_ts,
@@ -519,16 +514,6 @@ pub fn verify_tier1_attestation(
         return Err(GatewayError::EnclaveIdMismatch {
             expected: request.contract.enclave_id.clone(),
             actual: report.enclave_id.clone(),
-        });
-    }
-
-    if !request
-        .trusted_binary_hashes
-        .iter()
-        .any(|trusted| trusted.eq_ignore_ascii_case(&report.binary_hash))
-    {
-        return Err(GatewayError::BinaryHashNotTrusted {
-            binary_hash: report.binary_hash.clone(),
         });
     }
 

@@ -3932,11 +3932,11 @@ struct AdminRegisterEnclaveArgs {
     #[arg(long)]
     binary_hash: String,
 
-    /// JSON array of admin-approved runtime binary BLAKE3 hashes. The primary --binary-hash is always included.
+    /// JSON array of admin-published reference runtime BLAKE3 hashes. Informational provenance only; never provider admission.
     #[arg(long)]
     approved_binary_hashes_json: Option<String>,
 
-    /// Path to a JSON array of admin-approved runtime binary BLAKE3 hashes.
+    /// Path to admin-published reference runtime BLAKE3 hashes.
     #[arg(long, value_name = "PATH")]
     approved_binary_hashes_file: Option<PathBuf>,
 
@@ -3975,15 +3975,15 @@ struct AdminUpdateEnclaveArgs {
     #[arg(long)]
     att_tier: Option<u8>,
 
-    /// Make this the preferred admin-approved runtime binary; the prior preferred hash remains approved.
+    /// Make this the preferred admin-published reference runtime; the prior reference is retained.
     #[arg(long)]
     binary_hash: Option<String>,
 
-    /// Replace the exact admin-approved runtime binary set with this JSON array.
+    /// Replace the admin-published reference runtime set with this JSON array.
     #[arg(long)]
     approved_binary_hashes_json: Option<String>,
 
-    /// Replace the exact admin-approved runtime binary set from this JSON array file.
+    /// Replace the admin-published reference runtime set from this JSON array file.
     #[arg(long, value_name = "PATH")]
     approved_binary_hashes_file: Option<PathBuf>,
 
@@ -5934,11 +5934,6 @@ fn provider_friendly_error(error: &anyhow::Error) -> String {
     {
         return detail(
             "Mayhem could not unlock the provider credentials; check the wallet password, keypair path, and local bridge token.",
-        );
-    }
-    if lower.contains("binary hash") || lower.contains("measured enclave binary") {
-        return detail(
-            "This Mayhem binary is not an admin-approved runtime release; update Mayhem, then retry.",
         );
     }
     if lower.contains("hash")
@@ -38207,6 +38202,19 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &candidates,
         Some(initial_selected.enclave.enclave_id.as_str()),
     )?;
+    let configured_attestation_tier = hardware_quote_config
+        .as_ref()
+        .map(|config| config.kind.attestation_tier());
+    let hardware_quote_config =
+        provider_hardware_quote_config_for_enclave(hardware_quote_config, &selected.enclave)?;
+    if configured_attestation_tier.is_some_and(|tier| tier > selected.enclave.att_tier)
+        && selected.enclave.att_tier == mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER
+    {
+        provider_log(
+            &args,
+            "Selected a Tier-1 enclave explicitly; hardware quote generation is not used for this lower-tier market",
+        );
+    }
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
     let protection_config = ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
@@ -38367,13 +38375,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .transpose()?
         .unwrap_or(std::env::current_exe()?);
     let binary_hash = measure_binary(&binary_path)?;
-    let approved_binary_hashes = enclave_approved_binary_hashes(&selected.enclave);
-    if !approved_binary_hashes.contains(&binary_hash) {
-        bail!(
-            "measured enclave binary hash {} is not in the admin-approved runtime release set; update Mayhem or ask the admin to approve this release",
-            binary_hash,
-        );
-    }
     let now = unix_epoch_seconds()?;
     let nonce_u = blake3::hash(
         format!(
@@ -43443,6 +43444,29 @@ fn provider_hardware_quote_config(
     }
 }
 
+fn provider_hardware_quote_config_for_enclave(
+    config: Option<ProviderHardwareQuoteConfig>,
+    enclave: &LedgerEnclave,
+) -> Result<Option<ProviderHardwareQuoteConfig>> {
+    if enclave.att_tier == mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER {
+        return Ok(None);
+    }
+    let config = config.with_context(|| {
+        format!(
+            "selected admin enclave {} requires Tier-{} proof; provide an explicit matching --hardware-quote-kind and --hardware-quote-command",
+            enclave.enclave_id, enclave.att_tier
+        )
+    })?;
+    let quote_tier = config.kind.attestation_tier();
+    ensure!(
+        quote_tier == enclave.att_tier,
+        "selected admin enclave {} requires Tier-{} proof, but --hardware-quote-kind generates Tier-{quote_tier}; choose a matching canonical tier market or proof kind",
+        enclave.enclave_id,
+        enclave.att_tier,
+    );
+    Ok(Some(config))
+}
+
 fn resolve_provider_quote_command(command: &Path) -> Result<PathBuf> {
     if command.components().count() == 1 {
         return Ok(command.to_path_buf());
@@ -44648,11 +44672,21 @@ fn select_provider_candidate(
         let by_id = is_32_byte_hex(requested);
         return candidates
             .iter()
-            .find(|candidate| {
+            .filter(|candidate| {
                 if by_id {
                     candidate.enclave.enclave_id == requested
                 } else {
                     candidate.enclave.model_id == requested
+                }
+            })
+            .max_by_key(|candidate| {
+                if by_id {
+                    (0, 0)
+                } else {
+                    (
+                        candidate.enclave.att_tier,
+                        backend_rank(&candidate.enclave.backend),
+                    )
                 }
             })
             .cloned()
@@ -44665,7 +44699,12 @@ fn select_provider_candidate(
 
     candidates
         .iter()
-        .max_by_key(|candidate| backend_rank(&candidate.enclave.backend))
+        .max_by_key(|candidate| {
+            (
+                backend_rank(&candidate.enclave.backend),
+                candidate.enclave.att_tier,
+            )
+        })
         .cloned()
         .context("no provider candidate available")
 }
@@ -58573,18 +58612,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_friendly_error_keeps_binary_hash_mismatch_actionable() {
-        let err = anyhow::anyhow!(
-            "measured enclave binary hash aa is not in the admin-approved runtime release set"
-        );
-
-        let message = provider_friendly_error(&err);
-
-        assert!(message.contains("Mayhem binary"), "{message}");
-        assert!(!message.contains("model artifact"), "{message}");
-    }
-
-    #[test]
     fn admin_set_price_payload_uses_canonical_au_usd_terms() {
         let args = AdminSetPriceArgs {
             tx: test_admin_tx_args(),
@@ -62020,12 +62047,22 @@ mod tests {
         args.hardware_quote_kind = Some("tpm2-quote-ek".to_owned());
         args.hardware_quote_command = Some(PathBuf::from("mayhem-tpm2-quote"));
         let mut contract = test_contract(&root);
-        contract.enclaves[0].att_tier = 2;
+        let mut tier2_enclave = contract.enclaves[0].clone();
+        tier2_enclave.enclave_id = "22".repeat(32);
+        tier2_enclave.att_tier = 2;
+        contract.enclaves.push(tier2_enclave);
+        let mut tier2_price = contract.prices[0].clone();
+        tier2_price.enclave_id = "22".repeat(32);
+        contract.prices.push(tier2_price);
 
         let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args)
-            .expect("configured TPM quote command can serve Tier-2 enclave");
+            .expect("configured TPM quote command can serve Tier-1 or Tier-2 markets");
+        let selected = select_provider_candidate(&candidates, Some("test/model@4bit"))
+            .expect("model selection chooses the strongest explicitly provable tier");
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(selected.enclave.att_tier, 2);
+        assert_eq!(selected.enclave.enclave_id, "22".repeat(32));
         assert_eq!(
             parse_hardware_quote_kind("tpm2-quote-ek").unwrap(),
             HardwareQuoteKind::Tpm2QuoteEk
@@ -62034,6 +62071,40 @@ mod tests {
             provider_quote_generation_attestation_tier(&args).unwrap(),
             mayhem_proto::TIER2_DEVICE_IDENTITY_TIER
         );
+        let config = provider_hardware_quote_config(&args).unwrap();
+        assert!(
+            provider_hardware_quote_config_for_enclave(config, &selected.enclave)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn provider_quote_config_never_mislabels_a_selected_tier_market() {
+        let root = "aa".repeat(32);
+        let contract = test_contract(&root);
+        let mut tier2_args = test_provider_start_args();
+        tier2_args.hardware_quote_kind = Some("tpm2-quote-ek".to_owned());
+        tier2_args.hardware_quote_command = Some(PathBuf::from("mayhem-tpm2-quote"));
+
+        let tier1_config = provider_hardware_quote_config(&tier2_args).unwrap();
+        assert!(
+            provider_hardware_quote_config_for_enclave(tier1_config, &contract.enclaves[0])
+                .unwrap()
+                .is_none()
+        );
+
+        let mut tier2_enclave = contract.enclaves[0].clone();
+        tier2_enclave.att_tier = 2;
+        let mut tier3_args = test_provider_start_args();
+        tier3_args.hardware_quote_kind = Some("nvidia_nvtrust_offline_jwt".to_owned());
+        tier3_args.hardware_quote_command = Some(PathBuf::from("mayhem-nvtrust-quote"));
+        let err = provider_hardware_quote_config_for_enclave(
+            provider_hardware_quote_config(&tier3_args).unwrap(),
+            &tier2_enclave,
+        )
+        .expect_err("a Tier-3 quote must not be advertised as a Tier-2 market proof");
+        assert!(err.to_string().contains("requires Tier-2 proof"), "{err}");
     }
 
     #[test]
