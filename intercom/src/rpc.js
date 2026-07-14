@@ -37,7 +37,9 @@ export async function submitMayhemFeature(peer, body) {
 
 export async function requestStripeCheckout(peer, body) {
   if (!isObject(body)) throw new Error('Missing JSON body.');
-  if (typeof body.who !== 'string' || !body.who.trim()) throw new Error('Missing who.');
+  if (!isObject(body.payload) || typeof body.payload.who !== 'string' || !body.payload.who.trim()) {
+    throw new Error('Missing who.');
+  }
   const registered = peer.protocol?.instance?.features?.mayhem;
   if (!registered || typeof registered.requestService !== 'function') {
     throw new Error('Mayhem service relay is not ready.');
@@ -47,7 +49,8 @@ export async function requestStripeCheckout(peer, body) {
 
 export async function requestStripeConnect(peer, service, body) {
   if (!isObject(body)) throw new Error('Missing JSON body.');
-  if (typeof body.provider !== 'string' || !body.provider.trim()) {
+  if (!isObject(body.payload) ||
+      typeof body.payload.provider !== 'string' || !body.payload.provider.trim()) {
     throw new Error('Missing provider.');
   }
   if (!['stripe_connect_onboard', 'stripe_connect_status'].includes(service)) {

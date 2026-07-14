@@ -102,6 +102,7 @@ const stripeCheckoutRequest = async (peer, value) => {
     'currency',
     'locale',
     'idempotency_key',
+    'request_nonce',
     'success_url',
     'cancel_url',
   ]);
@@ -130,6 +131,10 @@ const stripeCheckoutRequest = async (peer, value) => {
       (typeof value.idempotency_key !== 'string' || value.idempotency_key.length > 255)) {
     throw new Error('Invalid Stripe checkout idempotency key.');
   }
+  const requestNonce = String(value.request_nonce || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(requestNonce)) {
+    throw new Error('Invalid Stripe checkout request nonce.');
+  }
 
   const payments = (await peer.base.view.get('payments/current'))?.value;
   if (!payments || payments.denom !== 'au_usd' || payments.set_by_role !== 'admin') {
@@ -150,8 +155,13 @@ const stripeCheckoutRequest = async (peer, value) => {
     env.MAYHEM_STRIPE_WORKER_URL,
     '/v1/stripe/checkout-sessions'
   );
+  const workerValue = { ...value };
+  delete workerValue.request_nonce;
+  if (!workerValue.idempotency_key) {
+    workerValue.idempotency_key = `mayhem-checkout-${requestNonce}`;
+  }
   return await postInternalStripeRequest(endpoint, {
-    ...value,
+    ...workerValue,
     currency,
     locale,
   }, stripeWorkerRequestTimeoutMs);

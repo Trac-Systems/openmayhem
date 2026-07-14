@@ -24510,11 +24510,12 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("").to_owned();
     let wallet = resolve_cli_wallet(
         &home,
         config.as_ref(),
         &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
+        &wallet_password,
     )
     .await?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
@@ -24547,6 +24548,8 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         idempotency_key: args.idempotency_key.as_deref(),
         success_url: args.success_url.as_deref(),
         cancel_url: args.cancel_url.as_deref(),
+        wallet: &wallet,
+        wallet_password: &wallet_password,
     })
     .await?;
     emit_checkout_handoff(args.json, rail, amount_au, &currency, &checkout.url)?;
@@ -35616,6 +35619,8 @@ struct PayCheckoutRequest<'a> {
     idempotency_key: Option<&'a str>,
     success_url: Option<&'a str>,
     cancel_url: Option<&'a str>,
+    wallet: &'a WalletInfo,
+    wallet_password: &'a str,
 }
 
 #[cfg(test)]
@@ -35689,13 +35694,22 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
     body["cancel_url"] = Value::String(cancel_url);
     body["currency"] = Value::String(request.currency.to_ascii_lowercase());
     body["locale"] = Value::String(request.locale.to_ascii_lowercase());
+    body["request_nonce"] = Value::String(service_request_nonce()?);
     if let Some(idempotency_key) = request.idempotency_key.filter(|value| !value.is_empty()) {
         body["idempotency_key"] = Value::String(idempotency_key.to_owned());
     }
 
+    let signed = signed_service_request(
+        "stripe_checkout",
+        request.rpc,
+        request.wallet,
+        request.wallet_password,
+        body,
+    )
+    .await?;
     let value = request
         .rpc
-        .post("payment/stripe/checkout", &body)
+        .post("payment/stripe/checkout", &signed)
         .await
         .context("requesting Stripe hosted checkout through the local Intercom peer")?;
     checkout_from_stripe_response(request.rail, &value)
@@ -39991,6 +40005,7 @@ struct ProviderStripeContext {
     rpc_url: String,
     rpc: PeerRpcClient,
     wallet: WalletInfo,
+    wallet_password: String,
 }
 
 async fn provider_stripe_context(args: &ProviderStripeArgs) -> Result<ProviderStripeContext> {
@@ -39998,11 +40013,12 @@ async fn provider_stripe_context(args: &ProviderStripeArgs) -> Result<ProviderSt
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("").to_owned();
     let wallet = resolve_cli_wallet(
         &home,
         config.as_ref(),
         &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
+        &wallet_password,
     )
     .await
     .context("resolving provider wallet")?;
@@ -40011,24 +40027,101 @@ async fn provider_stripe_context(args: &ProviderStripeArgs) -> Result<ProviderSt
         rpc: PeerRpcClient::new(&rpc_url)?,
         rpc_url,
         wallet,
+        wallet_password,
     })
 }
 
-fn stripe_connect_request_nonce() -> Result<String> {
+fn service_request_nonce() -> Result<String> {
     let mut random = [0_u8; 32];
-    getrandom::fill(&mut random).context("generating Stripe Connect request nonce")?;
+    getrandom::fill(&mut random).context("generating service request nonce")?;
     Ok(hex_lower(&random))
 }
 
+fn service_request_signing_message(
+    service: &str,
+    actor: &str,
+    admin: &str,
+    transport: &str,
+    payload: &Value,
+) -> String {
+    stable_json_value(&json!({
+        "actor": actor,
+        "admin": admin,
+        "domain": "mayhem-service-request",
+        "payload": payload,
+        "service": service,
+        "signing_version": 1,
+        "transport": transport,
+    }))
+    .to_string()
+}
+
+async fn signed_service_request(
+    service: &str,
+    rpc: &PeerRpcClient,
+    wallet: &WalletInfo,
+    wallet_password: &str,
+    payload: Value,
+) -> Result<Value> {
+    let status = rpc
+        .status()
+        .await
+        .context("reading local Intercom identity for service request")?;
+    let peer = status
+        .get("peer")
+        .and_then(Value::as_object)
+        .context("local Intercom status is missing peer identity")?;
+    let transport = peer
+        .get("pubKeyHex")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing transport identity")?;
+    let admin = peer
+        .get("admin")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing canonical admin identity")?;
+    ensure!(
+        is_hex_len(&transport, 64),
+        "local Intercom transport identity must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(&admin, 64),
+        "local Intercom admin identity must be 32-byte hexadecimal"
+    );
+    let actor = wallet.public_key.to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&actor, 64),
+        "Mayhem service actor identity must be 32-byte hexadecimal"
+    );
+    let message = service_request_signing_message(service, &actor, &admin, &transport, &payload);
+    let signature = sign_message(Path::new(&wallet.keypair_path), wallet_password, &message)
+        .await
+        .context("signing Mayhem service request")?;
+    Ok(json!({
+        "actor": actor,
+        "admin": admin,
+        "payload": payload,
+        "signature": signature,
+        "signing_version": 1,
+        "transport": transport,
+    }))
+}
+
 async fn request_provider_stripe_status(ctx: &ProviderStripeContext) -> Result<Value> {
+    let signed = signed_service_request(
+        "stripe_connect_status",
+        &ctx.rpc,
+        &ctx.wallet,
+        &ctx.wallet_password,
+        json!({
+            "provider": ctx.wallet.public_key,
+            "request_nonce": service_request_nonce()?,
+        }),
+    )
+    .await?;
     ctx.rpc
-        .post(
-            "payment/stripe/connect/status",
-            json!({
-                "provider": ctx.wallet.public_key,
-                "request_nonce": stripe_connect_request_nonce()?,
-            }),
-        )
+        .post("payment/stripe/connect/status", &signed)
         .await
         .context("requesting Stripe Connect status through the local Intercom peer")
 }
@@ -40159,16 +40252,21 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
         bail!("--country must be a two-letter ISO country code");
     }
     let ctx = provider_stripe_context(&args.provider).await?;
+    let signed = signed_service_request(
+        "stripe_connect_onboard",
+        &ctx.rpc,
+        &ctx.wallet,
+        &ctx.wallet_password,
+        json!({
+            "provider": ctx.wallet.public_key,
+            "country": country,
+            "request_nonce": service_request_nonce()?,
+        }),
+    )
+    .await?;
     let mut report = ctx
         .rpc
-        .post(
-            "payment/stripe/connect/onboard",
-            json!({
-                "provider": ctx.wallet.public_key,
-                "country": country,
-                "request_nonce": stripe_connect_request_nonce()?,
-            }),
-        )
+        .post("payment/stripe/connect/onboard", &signed)
         .await
         .context("requesting Stripe Connect onboarding through the local Intercom peer")?;
     validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
@@ -69513,6 +69611,51 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(
             !open_checkout_url("https://checkout.stripe.com/c/pay/cs_test", true).await,
             "disabled browser launch should stay on the copy/paste URL path"
+        );
+    }
+
+    #[test]
+    fn service_request_signing_message_matches_intercom_canonical_form() {
+        let actor = "bb".repeat(32);
+        let nonce = "12".repeat(32);
+        let message = service_request_signing_message(
+            "stripe_connect_status",
+            &actor,
+            &"aa".repeat(32),
+            &"cc".repeat(32),
+            &json!({
+                "provider": actor.clone(),
+                "request_nonce": nonce.clone(),
+            }),
+        );
+        assert_eq!(
+            message,
+            format!(
+                "{{\"actor\":\"{actor}\",\"admin\":\"{}\",\"domain\":\"mayhem-service-request\",\"payload\":{{\"provider\":\"{actor}\",\"request_nonce\":\"{nonce}\"}},\"service\":\"stripe_connect_status\",\"signing_version\":1,\"transport\":\"{}\"}}",
+                "aa".repeat(32),
+                "cc".repeat(32),
+            )
+        );
+
+        let signing_key = SigningKey::from_bytes(&[1_u8; 32]);
+        let actor = hex_encode(&signing_key.verifying_key().to_bytes());
+        assert_eq!(
+            actor,
+            "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+        );
+        let message = service_request_signing_message(
+            "stripe_connect_status",
+            &actor,
+            &"aa".repeat(32),
+            &"cc".repeat(32),
+            &json!({
+                "provider": actor,
+                "request_nonce": "12".repeat(32),
+            }),
+        );
+        assert_eq!(
+            hex_encode(&signing_key.sign(message.as_bytes()).to_bytes()),
+            "75532c9727d07be74033c992d1ef38cda19553e4250a6d40d91f267c072f202361fd5860615bc731e271e048a612b4996eb60eefca8ccd2abce1057c1ce68e0b"
         );
     }
 

@@ -7,6 +7,8 @@ const RELAY_CONTROL_RESULT = 'mayhem_feature_result';
 const SERVICE_CONTROL_REQUEST = 'mayhem_service_request';
 const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
 const RELAY_VERSION = 1;
+const SERVICE_SIGNING_VERSION = 1;
+const SERVICE_SIGNING_DOMAIN = 'mayhem-service-request';
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
 const DEFAULT_TIMEOUT_MS = 0;
@@ -58,6 +60,16 @@ const serviceRequestIdFor = (service, value) =>
       })
     )
     .digest('hex');
+
+const serviceSigningMessage = (service, value) => stableJson({
+  actor: normalizeKey(value?.actor),
+  admin: normalizeKey(value?.admin),
+  domain: SERVICE_SIGNING_DOMAIN,
+  payload: stableValue(value?.payload),
+  service: String(service ?? ''),
+  signing_version: SERVICE_SIGNING_VERSION,
+  transport: normalizeKey(value?.transport),
+});
 
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -198,22 +210,23 @@ class MayhemFeature extends Feature {
   }
 
   async requestService(service, value) {
-    const actor = serviceParticipantFor(service, value);
     const self = normalizeKey(this.peer?.wallet?.publicKey);
-    if (!actor || !self || actor !== self) {
-      throw new Error('Invalid Mayhem service request identity.');
-    }
     const admin = await this._adminKey();
+    const envelope = this._verifyServiceRequest(service, value, { admin, transport: self });
+    const actor = envelope?.actor;
+    if (!actor || !self) {
+      throw new Error('Invalid Mayhem service request signature.');
+    }
     if (this.peer.base?.writable && self === admin) {
       if (!this.serviceHandler) throw new Error('Mayhem admin service is not configured.');
-      return await this.serviceHandler(service, stableValue(value));
+      return await this.serviceHandler(service, envelope.payload);
     }
     const sidechannel = this.peer?.sidechannel;
     if (!sidechannel?.started || typeof sidechannel.broadcast !== 'function') {
       throw new Error('Mayhem service relay is not ready.');
     }
 
-    const canonicalValue = stableValue(value);
+    const canonicalValue = envelope;
     const requestId = serviceRequestIdFor(service, canonicalValue);
     const existing = this.servicePending.get(requestId);
     if (existing) return await existing.promise;
@@ -348,6 +361,51 @@ class MayhemFeature extends Feature {
     return sidechannel?.verifyPayload?.(payload, expectedKey) === true;
   }
 
+  _verifyServiceRequest(service, value, expected = {}) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const allowedKeys = new Set([
+      'actor',
+      'admin',
+      'payload',
+      'signature',
+      'signing_version',
+      'transport',
+    ]);
+    if (Object.keys(value).some((key) => !allowedKeys.has(key))) return null;
+    if (value.signing_version !== SERVICE_SIGNING_VERSION) return null;
+    const actor = normalizeKey(value.actor);
+    const admin = normalizeKey(value.admin);
+    const transport = normalizeKey(value.transport);
+    const signature = String(value.signature ?? '').toLowerCase();
+    const payload = stableValue(value.payload);
+    if (!/^[0-9a-f]{64}$/.test(actor) ||
+        !/^[0-9a-f]{64}$/.test(admin) ||
+        !/^[0-9a-f]{64}$/.test(transport) ||
+        !/^[0-9a-f]{128}$/.test(signature)) return null;
+    if (admin !== normalizeKey(expected.admin) || transport !== normalizeKey(expected.transport)) {
+      return null;
+    }
+    if (serviceParticipantFor(service, payload) !== actor) return null;
+    if (typeof this.peer?.wallet?.verify !== 'function') return null;
+    try {
+      if (!this.peer.wallet.verify(
+        signature,
+        b4a.from(serviceSigningMessage(service, { actor, admin, payload, transport })),
+        actor
+      )) return null;
+    } catch (_error) {
+      return null;
+    }
+    return {
+      actor,
+      admin,
+      payload,
+      signature,
+      signing_version: SERVICE_SIGNING_VERSION,
+      transport,
+    };
+  }
+
   _pruneProcessed() {
     this._pruneMap(this.processed);
   }
@@ -442,9 +500,10 @@ class MayhemFeature extends Feature {
     if (!admin || self !== admin) return;
 
     const message = payload.message;
-    const actor = serviceParticipantFor(message.service, message.value);
     const transport = normalizeKey(payload.from);
-    if (!actor || actor !== transport || !this._verifyEnvelope(payload, transport)) return;
+    const envelope = this._verifyServiceRequest(message.service, message.value, { admin, transport });
+    const actor = envelope?.actor;
+    if (!actor || !transport || !this._verifyEnvelope(payload, transport)) return;
     if (message.version !== RELAY_VERSION) return;
     const expectedId = serviceRequestIdFor(message.service, message.value);
     if (message.request_id !== expectedId) return;
@@ -463,7 +522,7 @@ class MayhemFeature extends Feature {
     }
     if (!cached) {
       const promise = Promise.resolve()
-        .then(() => this.serviceHandler(message.service, stableValue(message.value)))
+        .then(() => this.serviceHandler(message.service, envelope.payload))
         .catch((error) => relayError(error?.message || 'Mayhem admin service request failed.', expectedId));
       cached = { at: Date.now(), pending: true, promise };
       this.serviceProcessed.set(expectedId, cached);
@@ -593,5 +652,6 @@ export {
   participantFor,
   requestIdFor,
   serviceRequestIdFor,
+  serviceSigningMessage,
 };
 export default MayhemFeature;

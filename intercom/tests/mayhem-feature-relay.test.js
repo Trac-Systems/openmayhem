@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import b4a from 'b4a';
+import sodium from 'sodium-universal';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
   requestIdFor,
   serviceRequestIdFor,
+  serviceSigningMessage,
 } from '../features/mayhem/index.js';
 import {
   createServer,
@@ -16,6 +19,11 @@ import {
 const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
 const otherKey = 'cc'.repeat(32);
+
+const fakeSignature = (publicKey, message) => {
+  const suffix = String(message).length.toString(16).padStart(4, '0');
+  return `${publicKey}${suffix}`.padEnd(128, '0').slice(0, 128);
+};
 
 const viewFor = (state) => ({
   async get(key) {
@@ -31,8 +39,10 @@ const peerFor = (publicKey, { writable = false } = {}) => {
     wallet: {
       publicKey,
       sign(message) {
-        const suffix = String(message).length.toString(16).padStart(4, '0');
-        return `${publicKey}${suffix}`.padEnd(128, '0').slice(0, 128);
+        return fakeSignature(publicKey, message);
+      },
+      verify(signature, message, signer) {
+        return signature === fakeSignature(signer, message);
       },
     },
     base: {
@@ -93,12 +103,65 @@ const stripeCheckoutValue = (who = providerKey) => ({
   success_url: 'https://stripe.com',
   cancel_url: 'https://stripe.com',
   idempotency_key: 'checkout-test-1',
+  request_nonce: '34'.repeat(32),
 });
 
 const stripeConnectValue = (provider = providerKey) => ({
   provider,
   country: 'DE',
   request_nonce: '12'.repeat(32),
+});
+
+const signedServiceValue = (signer, service, payload, transport = signer.wallet.publicKey) => {
+  const actor = payload.who || payload.provider;
+  const envelope = {
+    actor,
+    admin: adminKey,
+    payload,
+    signing_version: 1,
+    transport,
+  };
+  return {
+    ...envelope,
+    signature: signer.wallet.sign(serviceSigningMessage(service, envelope)),
+  };
+};
+
+test('service signing message has one cross-runtime canonical form', () => {
+  const payload = {
+    provider: providerKey,
+    request_nonce: '12'.repeat(32),
+  };
+  assert.equal(
+    serviceSigningMessage('stripe_connect_status', {
+      actor: providerKey,
+      admin: adminKey,
+      payload,
+      transport: otherKey,
+    }),
+    `{"actor":"${providerKey}","admin":"${adminKey}","domain":"mayhem-service-request","payload":{"provider":"${providerKey}","request_nonce":"${'12'.repeat(32)}"},"service":"stripe_connect_status","signing_version":1,"transport":"${otherKey}"}`
+  );
+});
+
+test('service signing message has one cross-runtime Ed25519 signature', () => {
+  const seed = b4a.alloc(32, 1);
+  const publicKey = b4a.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
+  const secretKey = b4a.alloc(sodium.crypto_sign_SECRETKEYBYTES);
+  sodium.crypto_sign_seed_keypair(publicKey, secretKey, seed);
+  const actor = b4a.toString(publicKey, 'hex');
+  assert.equal(actor, '8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c');
+  const message = serviceSigningMessage('stripe_connect_status', {
+    actor,
+    admin: adminKey,
+    payload: { provider: actor, request_nonce: '12'.repeat(32) },
+    transport: otherKey,
+  });
+  const signature = b4a.alloc(sodium.crypto_sign_BYTES);
+  sodium.crypto_sign_detached(signature, b4a.from(message), secretKey);
+  assert.equal(
+    b4a.toString(signature, 'hex'),
+    '75532c9727d07be74033c992d1ef38cda19553e4250a6d40d91f267c072f202361fd5860615bc731e271e048a612b4996eb60eefca8ccd2abce1057c1ce68e0b'
+  );
 });
 
 test('read-only participant relays a signed feature to the sole admin writer', async () => {
@@ -609,8 +672,9 @@ test('read-only user relays a dual-signed TAP account binding to the admin appen
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
 });
 
-test('read-only user requests Stripe checkout from the admin service without appending', async () => {
-  const participant = peerFor(providerKey);
+test('read-only transport relays a wallet-signed Stripe checkout without appending', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   let serviceCalls = 0;
   const participantFeature = new MayhemFeature(participant.peer, {
@@ -642,7 +706,11 @@ test('read-only user requests Stripe checkout from the admin service without app
   connect(participant.peer, participantFeature, writer.peer, writerFeature);
   connect(writer.peer, writerFeature, participant.peer, participantFeature);
 
-  const result = await requestStripeCheckout(participant.peer, stripeCheckoutValue());
+  const checkout = stripeCheckoutValue();
+  const result = await requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', checkout, otherKey)
+  );
 
   assert.equal(result.ok, true);
   assert.equal(result.relayed, true);
@@ -653,8 +721,9 @@ test('read-only user requests Stripe checkout from the admin service without app
   assert.equal(writer.flushes.length, 0);
 });
 
-test('read-only provider requests Stripe Connect onboarding without becoming a writer', async () => {
-  const participant = peerFor(providerKey);
+test('read-only transport relays wallet-signed Stripe Connect onboarding without appending', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   let serviceCalls = 0;
   const participantFeature = new MayhemFeature(participant.peer, {
@@ -688,7 +757,7 @@ test('read-only provider requests Stripe Connect onboarding without becoming a w
   const result = await requestStripeConnect(
     participant.peer,
     'stripe_connect_onboard',
-    stripeConnectValue()
+    signedServiceValue(signer.peer, 'stripe_connect_onboard', stripeConnectValue(), otherKey)
   );
 
   assert.equal(result.ok, true);
@@ -700,7 +769,7 @@ test('read-only provider requests Stripe Connect onboarding without becoming a w
   assert.equal(writer.flushes.length, 0);
 });
 
-test('Stripe Connect service relay binds the provider transport identity', async () => {
+test('Stripe Connect service relay rejects a forged provider signature locally', async () => {
   const participant = peerFor(providerKey);
   const participantFeature = new MayhemFeature(participant.peer, {});
   participantFeature.key = 'mayhem';
@@ -716,9 +785,36 @@ test('Stripe Connect service relay binds the provider transport identity', async
   await assert.rejects(
     participantFeature.requestService(
       'stripe_connect_onboard',
-      stripeConnectValue(otherKey)
+      signedServiceValue(participant.peer, 'stripe_connect_onboard', stripeConnectValue(otherKey))
     ),
-    /Invalid Mayhem service request identity/
+    /Invalid Mayhem service request signature/
+  );
+  assert.equal(broadcasts, 0);
+});
+
+test('Stripe service relay rejects a signed request replayed through another transport', async () => {
+  const signer = peerFor(providerKey);
+  const attacker = peerFor(otherKey);
+  const attackerFeature = new MayhemFeature(attacker.peer, {});
+  attackerFeature.key = 'mayhem';
+  let broadcasts = 0;
+  attacker.peer.sidechannel = {
+    started: true,
+    broadcast: () => {
+      broadcasts += 1;
+      return true;
+    },
+  };
+
+  const value = signedServiceValue(
+    signer.peer,
+    'stripe_connect_onboard',
+    stripeConnectValue(),
+    providerKey
+  );
+  await assert.rejects(
+    attackerFeature.requestService('stripe_connect_onboard', value),
+    /Invalid Mayhem service request signature/
   );
   assert.equal(broadcasts, 0);
 });
@@ -736,8 +832,11 @@ test('Stripe service relay binds the request identity and deduplicates retries',
     },
   };
   await assert.rejects(
-    participantFeature.requestService('stripe_checkout', stripeCheckoutValue(otherKey)),
-    /Invalid Mayhem service request identity/
+    participantFeature.requestService(
+      'stripe_checkout',
+      signedServiceValue(participant.peer, 'stripe_checkout', stripeCheckoutValue(otherKey))
+    ),
+    /Invalid Mayhem service request signature/
   );
   assert.equal(broadcasts, 0);
 
@@ -755,11 +854,16 @@ test('Stripe service relay binds the request identity and deduplicates retries',
     verifyPayload: () => true,
     broadcast: () => true,
   };
-  const value = stripeCheckoutValue();
+  const value = signedServiceValue(
+    participant.peer,
+    'stripe_checkout',
+    stripeCheckoutValue(),
+    otherKey
+  );
   const requestId = serviceRequestIdFor('stripe_checkout', value);
   const payload = {
-    from: providerKey,
-    sig: `signed:${providerKey}`,
+    from: otherKey,
+    sig: `signed:${otherKey}`,
     message: {
       control: 'mayhem_service_request',
       version: 1,
@@ -776,6 +880,7 @@ test('Stripe service relay binds the request identity and deduplicates retries',
 });
 
 test('poisoned relay service request is rejected locally and a retry still runs', async () => {
+  const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   let serviceCalls = 0;
   const writerFeature = new MayhemFeature(writer.peer, {
@@ -795,7 +900,7 @@ test('poisoned relay service request is rejected locally and a retry still runs'
       return true;
     },
   };
-  const value = stripeCheckoutValue();
+  const value = signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue());
   const requestId = serviceRequestIdFor('stripe_checkout', value);
   const payload = {
     from: providerKey,
