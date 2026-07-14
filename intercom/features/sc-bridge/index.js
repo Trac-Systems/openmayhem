@@ -19,6 +19,7 @@ import {
   closeOwnedSessions,
   disownSession,
   ownSession,
+  sessionFrameRecipients,
   sessionOwnershipKey,
   sessionSubscriptionMatches,
 } from './session-ownership.js';
@@ -238,7 +239,7 @@ class ScBridge extends Feature {
     }
   }
 
-  handleSessionFrame(event) {
+  handleSessionFrame(event, excludedClient = null) {
     const payload = {
       type: 'session_frame',
       session_id: event?.session_id ?? null,
@@ -256,16 +257,11 @@ class ScBridge extends Feature {
           `${payload.session_id || ''} from ${payload.remote || ''}; clients ${this.clients.size}`
       );
     }
-    for (const client of this.clients) {
-      if (!client.ready) continue;
-      if (!sessionSubscriptionMatches(client.sessionAll, client.sessionIds, payload.session_id)) {
-        if (this.debug) {
-          console.log(
-            `[sc-bridge] skip client ${client.id} for session ${payload.session_id || ''}`
-          );
-        }
-        continue;
-      }
+    for (const client of sessionFrameRecipients(
+      this.clients,
+      payload.session_id,
+      excludedClient
+    )) {
       if (this.debug) {
         console.log(`[sc-bridge] emit session_frame to client ${client.id}`);
       }
@@ -312,20 +308,23 @@ class ScBridge extends Feature {
     return loopbackSessionInfo(remote, sessionId, extra);
   }
 
-  _emitLoopbackSessionFrame(remote, sessionId, frame) {
+  _emitLoopbackSessionFrame(remote, sessionId, frame, excludedClient = null) {
     if (typeof this.directSession?._validateFrame === 'function') {
       this.directSession._validateFrame(frame);
     }
     const session = this._loopbackSessionInfo(remote, sessionId, { opened: true });
-    this.handleSessionFrame({
-      session_id: session.session_id,
-      channel: session.channel,
-      protocol: session.protocol,
-      remote: session.remote,
-      direct: true,
-      relayed: false,
-      frame,
-    });
+    this.handleSessionFrame(
+      {
+        session_id: session.session_id,
+        channel: session.channel,
+        protocol: session.protocol,
+        remote: session.remote,
+        direct: true,
+        relayed: false,
+        frame,
+      },
+      excludedClient
+    );
     return session;
   }
 
@@ -593,7 +592,12 @@ class ScBridge extends Feature {
         }
         if (this._isLocalPeer(remote)) {
           try {
-            const session = this._emitLoopbackSessionFrame(remote, sessionId, message.frame);
+            const session = this._emitLoopbackSessionFrame(
+              remote,
+              sessionId,
+              message.frame,
+              client
+            );
             reply({ type: 'session_sent', ...session });
           } catch (err) {
             sendError(err?.message ? `Session send failed: ${err.message}` : 'Session send failed.');

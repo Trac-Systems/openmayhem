@@ -30,3 +30,11 @@ export const closeOwnedSessions = (sessions, close) => {
 export const sessionSubscriptionMatches = (sessionAll, sessionIds, sessionId) => (
   sessionAll === true || (sessionIds instanceof Set && sessionIds.has(sessionId))
 );
+
+export const sessionFrameRecipients = (clients, sessionId, excludedClient = null) => (
+  Array.from(clients).filter((client) => (
+    client !== excludedClient &&
+    client.ready === true &&
+    sessionSubscriptionMatches(client.sessionAll, client.sessionIds, sessionId)
+  ))
+);

@@ -12,6 +12,7 @@ import {
   closeOwnedSessions,
   disownSession,
   ownSession,
+  sessionFrameRecipients,
   sessionSubscriptionMatches,
 } from '../features/sc-bridge/session-ownership.js';
 
@@ -137,4 +138,22 @@ test('SC-Bridge does not leak session frames to an unsubscribed local client', (
   assert.equal(sessionSubscriptionMatches(false, new Set(), sessionId), false);
   assert.equal(sessionSubscriptionMatches(false, new Set([sessionId]), sessionId), true);
   assert.equal(sessionSubscriptionMatches(true, null, sessionId), true);
+});
+
+test('SC-Bridge loopback delivers to the other local subscriber but never echoes to its sender', () => {
+  const sessionId = 'cd'.repeat(32);
+  const sender = {
+    id: 1,
+    ready: true,
+    sessionAll: true,
+    sessionIds: new Set(),
+  };
+  const receiver = {
+    id: 2,
+    ready: true,
+    sessionAll: false,
+    sessionIds: new Set([sessionId]),
+  };
+  const recipients = sessionFrameRecipients(new Set([sender, receiver]), sessionId, sender);
+  assert.deepEqual(recipients, [receiver]);
 });
