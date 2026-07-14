@@ -130,6 +130,36 @@ if [[ "${MAYHEM_RENDER_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+hydrate_npm_package() {
+  local dir="$1"
+
+  [[ -f "$dir/package.json" ]] || {
+    echo "Missing runtime package manifest: $dir/package.json" >&2
+    exit 1
+  }
+  [[ -f "$dir/package-lock.json" ]] || {
+    echo "Missing runtime dependency lock: $dir/package-lock.json" >&2
+    exit 1
+  }
+
+  echo "Installing locked runtime dependencies in $dir."
+  runuser -u mayhem -- npm ci --omit=dev --prefix "$dir"
+}
+
+command -v npm >/dev/null 2>&1 || {
+  echo "npm is required to install the mainnet runtime dependencies." >&2
+  exit 1
+}
+command -v runuser >/dev/null 2>&1 || {
+  echo "runuser is required to install dependencies as the mayhem user." >&2
+  exit 1
+}
+
+hydrate_npm_package "$repo/intercom/trac/msb"
+hydrate_npm_package "$repo/intercom/trac/trac-peer"
+hydrate_npm_package "$repo/intercom"
+hydrate_npm_package "$repo/contracts"
+
 install -d -m 700 -o mayhem -g mayhem \
   "$root/backups" \
   "$root/.mayhem-local/paygate" \
