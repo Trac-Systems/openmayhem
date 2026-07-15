@@ -250,7 +250,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   const providerEntry = await first.storage.get(`prov/${provider.publicKey}`);
   assert.deepEqual(providerEntry.value, {
     provider: provider.publicKey,
-    payout: null,
+    payouts: {},
     accepted_rails: ['fiat'],
     accepted_rails_schema_version: 1,
     accepted_rails_set_by: provider.publicKey,
@@ -1748,7 +1748,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   assert.equal(registered.ok, true, registered.message);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
-  assert.equal(providerEntry.value.payout, null);
+  assert.deepEqual(providerEntry.value.payouts, {});
   assert.equal(providerEntry.value.probation.since_seconds, 0);
 
   const providerPayout = await execute(
@@ -1801,12 +1801,14 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   });
 
   const updated = await storage.get(`prov/${provider.publicKey}`);
-  assert.deepEqual(updated.value.payout, {
-    addr: 'admin-approved-target',
-    method: 'tnk',
-    set_by: admin.publicKey,
-    set_by_role: 'admin',
-    set_at: makeTxKey(8),
+  assert.deepEqual(updated.value.payouts, {
+    tnk: {
+      addr: 'admin-approved-target',
+      method: 'tnk',
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      set_at: makeTxKey(8),
+    },
   });
   assert.equal(updated.value.updated_at, makeTxKey(8));
 });

@@ -144,6 +144,17 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
         },
         sender: admin.publicKey,
       },
+      {
+        type: 'setProviderPayout',
+        value: {
+          op: 'set_provider_payout',
+          provider: provider.identity.publicKey,
+          payout_addr: `acct_${provider.identity.publicKey.slice(0, 16)}`,
+          payout_method: 'stripe',
+          payout_currency: 'eur',
+        },
+        sender: admin.publicKey,
+      },
     ]) {
       const result = await execute(contract, storage, op.type, op.value, op.sender, txNo++);
       assert.equal(result.ok, true, result.message);

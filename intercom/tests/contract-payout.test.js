@@ -144,12 +144,14 @@ const payoutConfirm = (provider, overrides = {}) => ({
 test('MayhemContract setProviderPayout stamps admin authority evidence', async () => {
   const { admin, provider, storage, contract } = await setupPayoutContract();
   const registered = (await storage.get(`prov/${provider.publicKey}`)).value;
-  assert.deepEqual(registered.payout, {
-    addr: 'trac1providerpayouttarget',
-    method: 'tnk',
-    set_by: admin.publicKey,
-    set_by_role: 'admin',
-    set_at: makeTxKey(4),
+  assert.deepEqual(registered.payouts, {
+    tnk: {
+      addr: 'trac1providerpayouttarget',
+      method: 'tnk',
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      set_at: makeTxKey(4),
+    },
   });
 
   const retargeted = await execute(
@@ -168,13 +170,16 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
   );
   assert.equal(retargeted.ok, true, retargeted.message);
   const updated = (await storage.get(`prov/${provider.publicKey}`)).value;
-  assert.deepEqual(updated.payout, {
-    addr: 'acct_test_provider',
-    method: 'stripe',
-    currency: 'eur',
-    set_by: admin.publicKey,
-    set_by_role: 'admin',
-    set_at: makeTxKey(6),
+  assert.deepEqual(updated.payouts, {
+    tnk: registered.payouts.tnk,
+    stripe: {
+      addr: 'acct_test_provider',
+      method: 'stripe',
+      currency: 'eur',
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      set_at: makeTxKey(6),
+    },
   });
 
   const tapTarget = await execute(
@@ -192,13 +197,17 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
   );
   assert.equal(tapTarget.ok, true, tapTarget.message);
   const tapUpdated = (await storage.get(`prov/${provider.publicKey}`)).value;
-  assert.deepEqual(tapUpdated.payout, {
-    addr: '0x' + '3'.repeat(40),
-    method: 'tap',
-    set_by: admin.publicKey,
-    set_by_role: 'admin',
-    set_at: makeTxKey(7),
+  assert.deepEqual(tapUpdated.payouts, {
+    ...updated.payouts,
+    tap: {
+      addr: '0x' + '3'.repeat(40),
+      method: 'tap',
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      set_at: makeTxKey(7),
+    },
   });
+  assert.equal('payout' in tapUpdated, false);
 });
 
 test('MayhemContract epoch roots commit provider entitlements without ev/pay evidence', async () => {

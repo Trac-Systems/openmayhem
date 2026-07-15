@@ -700,13 +700,15 @@ async function seedSettlementState({ harness, admin, provider, account, args, us
     provider,
     status: 'active',
     accepted_rails: ['fiat'],
-    payout: {
-      addr: account.id,
-      method: 'stripe',
-      currency: args.currency,
-      set_by: admin,
-      set_by_role: 'admin',
-      set_at: 'stripe-sandbox-payout-smoke',
+    payouts: {
+      stripe: {
+        addr: account.id,
+        method: 'stripe',
+        currency: args.currency,
+        set_by: admin,
+        set_by_role: 'admin',
+        set_at: 'stripe-sandbox-payout-smoke',
+      },
     },
     probation: { successful_sessions: 1 },
     registered_at: 'stripe-sandbox-payout-smoke',

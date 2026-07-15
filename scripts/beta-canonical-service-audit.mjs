@@ -15,7 +15,7 @@ const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const hex64 = /^[0-9a-fA-F]{64}$/;
 const hex40 = /^[0-9a-fA-F]{40}$/;
 const roomIdHex = /^[0-9a-fA-F]{32}$/;
-const payoutMethods = new Set(['tnk', 'stripe']);
+const payoutMethods = new Set(['tnk', 'tap', 'stripe']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
@@ -658,24 +658,32 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   }
 
   for (const [providerId, provider] of activeProviders.entries()) {
-    const payout = provider?.payout;
-    if (!payout || typeof payout !== 'object' || Array.isArray(payout)) {
-      fail(`prov/${providerId} is missing an admin-set payout target`);
+    const payouts = provider?.payouts;
+    if (!payouts || typeof payouts !== 'object' || Array.isArray(payouts) ||
+        Object.keys(payouts).length === 0) {
+      fail(`prov/${providerId} is missing admin-set payout targets`);
       continue;
     }
-    if (typeof payout.addr !== 'string' || payout.addr.length === 0) {
-      fail(`prov/${providerId}.payout.addr is missing`);
+    let verified = true;
+    for (const [method, payout] of Object.entries(payouts)) {
+      const prefix = `prov/${providerId}.payouts.${method}`;
+      if (!payoutMethods.has(method) || payout?.method !== method) {
+        fail(`${prefix}.method must match tnk, tap, or stripe`);
+        verified = false;
+      }
+      if (typeof payout?.addr !== 'string' || payout.addr.length === 0) {
+        fail(`${prefix}.addr is missing`);
+        verified = false;
+      }
+      if (payout?.set_by !== admin) {
+        fail(`${prefix} was not set by admin ${admin}`);
+        verified = false;
+      } else if (payout.set_by_role !== 'admin') {
+        fail(`${prefix}.set_by_role must be admin`);
+        verified = false;
+      }
     }
-    if (!payoutMethods.has(payout.method)) {
-      fail(`prov/${providerId}.payout.method must be tnk or stripe`);
-    }
-    if (payout.set_by !== admin) {
-      fail(`prov/${providerId}.payout was not set by admin ${admin}`);
-    } else if (payout.set_by_role !== 'admin') {
-      fail(`prov/${providerId}.payout.set_by_role must be admin`);
-    } else {
-      adminSetPayoutTargets += 1;
-    }
+    if (verified) adminSetPayoutTargets += 1;
   }
 
   for (const [enclaveId, enclave] of activeEnclaves.entries()) {

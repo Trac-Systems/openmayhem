@@ -211,12 +211,13 @@ const contractResultAccepted = (response) => {
 const waitForProviderPayout = async (peer, provider, accountId, currency) => {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const record = (await peer.base.view.get(`prov/${provider}`))?.value;
-    if (record?.payout?.addr === accountId &&
-        record?.payout?.method === 'stripe' &&
-        record?.payout?.currency === currency &&
-        record?.payout?.set_by === peer.wallet.publicKey &&
-        record?.payout?.set_by_role === 'admin') {
-      return record.payout;
+    const payout = record?.payouts?.stripe;
+    if (payout?.addr === accountId &&
+        payout?.method === 'stripe' &&
+        payout?.currency === currency &&
+        payout?.set_by === peer.wallet.publicKey &&
+        payout?.set_by_role === 'admin') {
+      return payout;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
@@ -235,7 +236,7 @@ const bindStripePayoutTarget = async (peer, provider, account) => {
     throw new Error(`Stripe payout currency ${currency || '(missing)'} is not enabled by the admin.`);
   }
   const current = (await peer.base.view.get(`prov/${provider}`))?.value;
-  const payout = current?.payout;
+  const payout = current?.payouts?.stripe;
   if (payout?.addr === accountId && payout?.method === 'stripe' &&
       payout?.currency === currency && payout?.set_by_role === 'admin') {
     return { ok: true, changed: false, payout };

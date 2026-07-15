@@ -34552,9 +34552,10 @@ fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) 
         bail!("provider status is not payable");
     }
     let payout = provider
-        .get("payout")
+        .get("payouts")
+        .and_then(|payouts| payouts.get("tnk"))
         .and_then(Value::as_object)
-        .context("provider payout target is not set")?;
+        .context("provider TNK payout target is not set")?;
     if payout.get("method").and_then(Value::as_str) != Some("tnk") {
         bail!("provider payout target is not TNK");
     }
@@ -34909,9 +34910,10 @@ fn fiat_provider_payout_target(
         bail!("provider status is not payable");
     }
     let payout = provider
-        .get("payout")
+        .get("payouts")
+        .and_then(|payouts| payouts.get("stripe"))
         .and_then(Value::as_object)
-        .context("provider payout target is not set")?;
+        .context("provider Stripe payout target is not set")?;
     if payout.get("method").and_then(Value::as_str) != Some("stripe") {
         bail!("provider payout target is not Stripe");
     }
@@ -71229,11 +71231,13 @@ State initialization...
         let provider = json!({
             "provider": provider_id,
             "status": "active",
-            "payout": {
-                "method": "tnk",
-                "addr": "testtrac1provider",
-                "set_by": admin,
-                "set_by_role": "admin",
+            "payouts": {
+                "tnk": {
+                    "method": "tnk",
+                    "addr": "testtrac1provider",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                }
             }
         });
 
@@ -71243,12 +71247,42 @@ State initialization...
         );
 
         let mut wrong_method = provider.clone();
-        wrong_method["payout"]["method"] = json!("stripe");
+        wrong_method["payouts"]["tnk"]["method"] = json!("stripe");
         assert!(tnk_provider_payout_target(&wrong_method, &provider_id, &admin).is_err());
 
         let mut wrong_admin = provider.clone();
-        wrong_admin["payout"]["set_by"] = json!("bb".repeat(32));
+        wrong_admin["payouts"]["tnk"]["set_by"] = json!("bb".repeat(32));
         assert!(tnk_provider_payout_target(&wrong_admin, &provider_id, &admin).is_err());
+    }
+
+    #[test]
+    fn fiat_settlement_provider_payout_uses_rail_specific_stripe_target() {
+        let admin = "aa".repeat(32);
+        let provider_id = "11".repeat(32);
+        let provider = json!({
+            "provider": provider_id,
+            "status": "active",
+            "payouts": {
+                "tnk": {
+                    "method": "tnk",
+                    "addr": "trac1provider",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                },
+                "stripe": {
+                    "method": "stripe",
+                    "addr": "acct_provider",
+                    "currency": "eur",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                }
+            }
+        });
+
+        assert_eq!(
+            fiat_provider_payout_target(&provider, &provider_id, &admin).unwrap(),
+            ("acct_provider".to_owned(), "eur".to_owned())
+        );
     }
 
     #[test]

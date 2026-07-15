@@ -2019,7 +2019,7 @@ class MayhemContract extends Contract {
 
     const record = {
       provider: providerId,
-      payout: null,
+      payouts: {},
       accepted_rails: ['fiat'],
       accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
       accepted_rails_set_by: providerId,
@@ -2139,15 +2139,23 @@ class MayhemContract extends Contract {
     const record = await this.get(key);
     if (!record) return new Error('Provider not found.');
 
+    const payoutTargets = record.payouts ?? {};
+    if (typeof payoutTargets !== 'object' || Array.isArray(payoutTargets)) {
+      return new Error('Invalid provider payout targets.');
+    }
+    const { payout: _discardedPayout, ...currentRecord } = record;
     const updated = {
-      ...record,
-      payout: {
-        addr: this.value.payout_addr,
-        method: this.value.payout_method,
-        ...(payoutCurrency ? { currency: payoutCurrency } : {}),
-        set_by: this.address,
-        set_by_role: 'admin',
-        set_at: this.tx,
+      ...currentRecord,
+      payouts: {
+        ...payoutTargets,
+        [this.value.payout_method]: {
+          addr: this.value.payout_addr,
+          method: this.value.payout_method,
+          ...(payoutCurrency ? { currency: payoutCurrency } : {}),
+          set_by: this.address,
+          set_by_role: 'admin',
+          set_at: this.tx,
+        },
       },
       updated_at: this.tx,
     };
@@ -4898,12 +4906,13 @@ class MayhemContract extends Contract {
       if (provider.status !== 'active' && provider.status !== 'banned') {
         return new Error('TNK settlement provider status is not payable.');
       }
-      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      const payout = provider.payouts?.tnk;
+      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'tnk');
       if (payoutError) return payoutError;
-      if (provider.payout.method !== 'tnk') {
+      if (payout.method !== 'tnk') {
         return new Error('TNK settlement provider payout target must be TNK.');
       }
-      if (provider.payout.addr !== output.to) {
+      if (payout.addr !== output.to) {
         return new Error('TNK settlement provider payout target mismatch.');
       }
 
@@ -5302,15 +5311,16 @@ class MayhemContract extends Contract {
       if (provider.status !== 'active' && provider.status !== 'banned') {
         return new Error('Fiat settlement provider status is not payable.');
       }
-      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      const payout = provider.payouts?.stripe;
+      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'stripe');
       if (payoutError) return payoutError;
-      if (provider.payout.method !== 'stripe') {
+      if (payout.method !== 'stripe') {
         return new Error('Fiat settlement provider payout target must be Stripe.');
       }
-      if (provider.payout.addr !== output.to) {
+      if (payout.addr !== output.to) {
         return new Error('Fiat settlement provider payout target mismatch.');
       }
-      if (provider.payout.currency !== output.currency) {
+      if (payout.currency !== output.currency) {
         return new Error('Fiat settlement provider payout currency mismatch.');
       }
 
@@ -6311,8 +6321,8 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async requireAdminSetPayoutTarget(provider) {
-    const payout = provider?.payout;
+  async requireAdminSetPayoutTarget(provider, method) {
+    const payout = provider?.payouts?.[method];
     if (!payout || typeof payout !== 'object') {
       return new Error('Provider payout target is not set.');
     }

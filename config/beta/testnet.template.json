@@ -101,23 +101,23 @@
       "<file:beta/enclave-downloads.json#sha256:64-hex>"
     ],
     "canary_set": [
-      "file:catalog/canaries/canary-launch-v1.json#sha256:5bd39e15239fde9ad9e6819502e67817be69b389b9b1abd85b01f04a4168a708"
+      "file:catalog/canaries/canary-launch-v1.json#sha256:5f4ae8f3b4310392bdf77d59d5da8e526918d28b518c90459113b02a175a6050"
     ]
   },
   "canonical_enclaves": [
     {
       "enclave_id": "<derived-catalog-enclave-id-64-hex>",
-      "model_id": "meta/llama-3.1-8b-instruct@4bit",
+      "model_id": "google/gemma-4-E4B-it",
       "backend": "llama.cpp",
-      "artifact_root": "728336d639762b036988a3e6f0dfdced2105d1a3b4e20059d1eebd14211afee1",
+      "artifact_root": "8ce9eb721bce597b57398bef795050d5a900bc9c609a6a3510fb5ef335c8ae30",
       "artifact_root_kind": "blake3_merkle_v1",
       "artifact_source": {
         "kind": "huggingface",
-        "repo": "TracNetwork/mayhem-catalog-llama-3.1-8b-instruct-GGUF",
-        "revision": "8288f9e10f06b872a7a86677f2e7de9494ec492d",
-        "path": "llama-3.1-8b-instruct-Q4_K_M.gguf"
+        "repo": "TracNetwork/mayhem-catalog-google-gemma-4-E4B-it-GGUF",
+        "revision": "68772908c9431af9c9bfc3cee0ebefcd74995891",
+        "path": "gemma-4-E4B-it-Q4_K_M.gguf"
       },
-      "source_sha256": "2adb2a83111081a779838438d4b647d53df8357768db17ba69de430eda21157a",
+      "source_sha256": "3f72a20a06f626c78e6c475ae07a64c88b2663149c0f6197b56bf7cf1f37585c",
       "manifest_hash": "<sealed-manifest-hash-64-hex>",
       "binary_hash": "<release-binary-hash-64-hex>",
       "att_tier": 1,
@@ -149,7 +149,7 @@
       "rooms": [
         {
           "label": "launch-us-east",
-          "nonce": "mayhem-testnet-beta-v1-llama-3-1-8b-us-east",
+          "nonce": "mayhem-testnet-beta-v1-gemma-4-e4b-us-east",
           "admin_created": true,
           "policy": {
             "region_hint": "us-east",
@@ -162,10 +162,11 @@
   "seed_providers": [
     {
       "provider_pubkey": "<seed-provider-public-key-64-hex>",
-      "payout": {
-        "admin_approved": true,
-        "method": "tnk",
-        "addr": "<testtrac1-admin-approved-payout-target>"
+      "payouts": {
+        "tnk": {
+          "admin_approved": true,
+          "addr": "<testtrac1-admin-approved-payout-target>"
+        }
       },
       "joins": [
         {

@@ -78,11 +78,13 @@ test('TAP settlement resolves provider claim addresses only from current admin l
     ['admin', admin],
     [`prov/${providerId.publicKeyHex}`, {
       status: 'active',
-      payout: {
-        method: 'tap',
-        addr: providerAccount,
-        set_by: admin,
-        set_by_role: 'admin',
+      payouts: {
+        tap: {
+          method: 'tap',
+          addr: providerAccount,
+          set_by: admin,
+          set_by_role: 'admin',
+        },
       },
     }],
   ]);
@@ -100,7 +102,7 @@ test('TAP settlement resolves provider claim addresses only from current admin l
     { [providerId.publicKeyHex]: providerAccount.toLowerCase() }
   );
 
-  state.get(`prov/${providerId.publicKeyHex}`).payout.set_by = 'bb'.repeat(32);
+  state.get(`prov/${providerId.publicKeyHex}`).payouts.tap.set_by = 'bb'.repeat(32);
   await assert.rejects(
     resolveProviderAccountsFromLedger({
       bundle,
@@ -766,11 +768,13 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     }],
     [`prov/${providerId.publicKeyHex}`, {
       status: 'active',
-      payout: {
-        method: 'tap',
-        addr: providerSigner.address,
-        set_by: admin,
-        set_by_role: 'admin',
+      payouts: {
+        tap: {
+          method: 'tap',
+          addr: providerSigner.address,
+          set_by: admin,
+          set_by_role: 'admin',
+        },
       },
     }],
   ]);

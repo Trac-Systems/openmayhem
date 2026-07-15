@@ -10,15 +10,15 @@ import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/b
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOutDir = '.mayhem-local/p8.5-synthetic';
 const testtracAddress = 'testtrac1n57xm5deqnmzrwmzymvandzvkekkshjpaygcvpdkuwzqr4862rus5lyrjg';
-const modelId = 'meta/llama-3.1-8b-instruct@4bit';
+const modelId = 'google/gemma-4-E4B-it';
 const backend = 'llama.cpp';
 const artifactRoot = hex('artifact:root');
 const artifactRootKind = 'blake3_merkle_v1';
 const artifactSource = {
   kind: 'huggingface',
-  repo: 'TracNetwork/mayhem-catalog-llama-3.1-8b-instruct-GGUF',
-  revision: '0e9e39f249a16976918f6564b8830bc894c89659',
-  path: 'llama-3.1-8b-instruct-Q4_K_M.gguf',
+  repo: 'TracNetwork/mayhem-catalog-google-gemma-4-E4B-it-GGUF',
+  revision: '68772908c9431af9c9bfc3cee0ebefcd74995891',
+  path: 'gemma-4-E4B-it-Q4_K_M.gguf',
 };
 const sourceSha256 = hex('artifact:source-sha256');
 const msbBootstrap = 'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef';
@@ -576,10 +576,11 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
     ],
     seed_providers: providerIds.map((provider) => ({
       provider_pubkey: provider,
-      payout: {
-        admin_approved: true,
-        method: 'tnk',
-        addr: testtracAddress,
+      payouts: {
+        tnk: {
+          admin_approved: true,
+          addr: testtracAddress,
+        },
       },
       joins: [
         {
@@ -617,11 +618,13 @@ function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomI
       status: 'active',
       registered_by: provider,
       enclaves: [enclave.enclave_id],
-      payout: {
-        method: 'tnk',
-        addr: testtracAddress,
-        set_by: adminPubkey,
-        set_by_role: 'admin',
+      payouts: {
+        tnk: {
+          method: 'tnk',
+          addr: testtracAddress,
+          set_by: adminPubkey,
+          set_by_role: 'admin',
+        },
       },
     })),
     enclaves: [

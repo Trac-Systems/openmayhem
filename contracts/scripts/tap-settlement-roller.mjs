@@ -1343,7 +1343,7 @@ export async function resolveProviderAccountsFromLedger({ bundle, peerRpcUrl, fe
     if (!record || record.status !== 'active') {
       throw new Error(`active provider record is missing for ${provider}`);
     }
-    const payout = record.payout;
+    const payout = record.payouts?.tap;
     if (!payout || payout.method !== 'tap') {
       throw new Error(`admin-set TAP payout target is missing for provider ${provider}`);
     }

@@ -454,7 +454,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
 
   const providerRecord = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerRecord.value.status, 'active');
-  assert.equal(providerRecord.value.payout, null);
+  assert.deepEqual(providerRecord.value.payouts, {});
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by, admin.publicKey);
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by_role, 'admin');
   assert.equal((await storage.get(`room/${roomId}`)).value.creator, admin.publicKey);

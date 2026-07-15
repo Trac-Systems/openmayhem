@@ -107,6 +107,16 @@ async function setupFiatSettlementContract({
         sender: admin.publicKey,
       });
     }
+    ops.push({
+      type: 'setProviderPayout',
+      value: {
+        op: 'set_provider_payout',
+        provider: provider.identity.publicKey,
+        payout_addr: `trac1${provider.identity.publicKey.slice(0, 24)}`,
+        payout_method: 'tnk',
+      },
+      sender: admin.publicKey,
+    });
     for (const op of ops) {
       const result = await execute(contract, storage, op.type, op.value, op.sender, txNo++);
       assert.equal(result.ok, true, result.message);
