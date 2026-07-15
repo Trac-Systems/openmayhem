@@ -171,7 +171,7 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
 - GPU serving: an NVIDIA driver new enough for CUDA 12 (550+), and the CUDA toolkit (`nvcc`) so llama.cpp builds its CUDA kernels. Cloud GPU images usually ship both — check with `nvidia-smi` and `nvcc --version`.
 - vLLM or TensorRT-LLM artifacts only: Python 3.10+ with `venv` and `pip` (`sudo apt-get install -y python3 python3-venv python3-pip`). Skip if you serve llama.cpp artifacts only.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
-- Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). Most server boards and all recent desktops have one; enable it in BIOS if `/dev/tpm*` is absent. The provider explicitly enables the TPM quote path when starting; Mayhem never runs hardware-proof helpers merely because it detected a TPM.
+- Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). The quote helper runs as the provider user. If the distro exposes the device as `root:tss`, add the existing login to that existing distro group once with `sudo usermod -aG tss "$USER"`, then log out and back in. Mayhem never creates users or groups, changes device ACLs, or runs hardware-proof helpers merely because it detected a TPM.
 
 **macOS (Apple Silicon):**
 
@@ -189,7 +189,7 @@ Metal ships with the OS — nothing GPU-specific to install.
 - CMake: `winget install Kitware.CMake`
 - Rust via rustup (MSVC toolchain, the default), Node.js 20+: `winget install OpenJS.NodeJS.LTS`
 - Current NVIDIA driver for GPU serving
-- Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so the hardware needed for Tier 2 is normally present; the provider still explicitly selects the TPM quote helper when starting.
+- Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so the hardware needed for Tier 2 is normally present; the provider still explicitly selects the TPM quote helper when starting. Tier-2 providers also need the .NET SDK 6 or newer (`winget install Microsoft.DotNet.SDK.8`). The helper uses Windows TBS plus PCP/NCrypt from the normal provider account: no Administrator shell, service, cached quote, user/group creation, or TPM policy change is required.
 
 ### Agent install checklist (deterministic — for coding agents driving the install)
 
@@ -442,7 +442,7 @@ mayhem up --provider --yes \
   --provider-hardware-quote-command scripts/hardware/mayhem-tpm2-quote-linux.sh
 ```
 
-Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1`; Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
+Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1` from the same normal account that runs `mayhem`; it obtains a fresh nonce-bound quote through Windows TBS and binds the TPM EK through PCP/NCrypt and the manufacturer certificate chain. It does not need Administrator privileges or a privileged helper. Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
 
 To add a higher-tier worker without restarting an already running stack, pass the same explicit proof options to `mayhem provider serve add <enclave-id> --hardware-quote-kind <kind> --hardware-quote-command <path>`.
 

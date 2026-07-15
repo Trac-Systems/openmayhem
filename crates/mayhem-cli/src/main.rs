@@ -26667,9 +26667,25 @@ fn resolve_pear_runtime_path() -> Result<PathBuf> {
             }
         }
     }
+    if cfg!(windows) {
+        if let Ok(app_data) = env::var("APPDATA") {
+            let path =
+                windows_pear_runtime_path(Path::new(&app_data), cfg!(target_arch = "aarch64"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
     command_from_path("pear-runtime").context(
         "pear-runtime was not found; install Pear or set MAYHEM_PEAR_RUNTIME to the pear-runtime binary",
     )
+}
+
+fn windows_pear_runtime_path(app_data: &Path, aarch64: bool) -> PathBuf {
+    app_data
+        .join("pear/current/by-arch")
+        .join(if aarch64 { "win32-arm64" } else { "win32-x64" })
+        .join("bin/pear-runtime.exe")
 }
 
 fn command_from_path(name: &str) -> Option<PathBuf> {
@@ -75518,6 +75534,19 @@ State initialization...
         assert_eq!(executable_sibling_name("mayhemd", true), "mayhemd.exe");
         assert_eq!(executable_sibling_name("mayhemd.exe", true), "mayhemd.exe");
         assert_eq!(executable_sibling_name("mayhemd", false), "mayhemd");
+    }
+
+    #[test]
+    fn windows_pear_runtime_path_uses_roaming_app_data_arch_layout() {
+        let app_data = Path::new(r"C:\Users\provider\AppData\Roaming");
+        assert_eq!(
+            windows_pear_runtime_path(app_data, false),
+            app_data.join("pear/current/by-arch/win32-x64/bin/pear-runtime.exe")
+        );
+        assert_eq!(
+            windows_pear_runtime_path(app_data, true),
+            app_data.join("pear/current/by-arch/win32-arm64/bin/pear-runtime.exe")
+        );
     }
 
     #[test]

@@ -82,12 +82,19 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
 `nvcc --version`. `nvidia-smi` proving the driver does NOT prove the toolkit — without it the model
 silently never loads and the provider earns nothing. **vLLM/TensorRT artifacts:** Python 3.10+ with
 `venv`/`pip`.
+**Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
+that device as `root:tss`, add the login to the existing group with
+`sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes
+device ACLs.
 
 **Windows 11+:**
 - Visual Studio Build Tools with "Desktop development with C++" (MSVC + Windows SDK)
 - LLVM for libclang: `winget install LLVM.LLVM` (set `LIBCLANG_PATH` if the build can't find it)
 - CMake: `winget install Kitware.CMake`; Rust via rustup (MSVC); Node 20+: `winget install OpenJS.NodeJS.LTS`
 - Run `install.ps1` from PowerShell. The engine runs sandboxed (AppContainer).
+- **Tier 2:** install .NET SDK 6+ (`winget install Microsoft.DotNet.SDK.8`). The TPM helper uses
+  Windows TBS plus PCP/NCrypt as the normal provider user; do not elevate `mayhem` or create a
+  service, setup account/group, EK cache, or TPM policy exception.
 - **Pitfall (git line endings):** if consent/rules hashing fails, git converted `RULES.md` to CRLF.
   Restore it from the exact repo bytes (`git checkout -- RULES.md`) before continuing.
 - **Pitfall (slower per-turn admission):** Windows loopback/IPC + sandbox add per-turn overhead;
@@ -172,6 +179,10 @@ mayhem provider min-ask set <...>               # participation floor (per marke
 mayhem provider limits set [--max-concurrent N] [--accept-rate R] [--budget <USD/day|month|total>]
 mayhem provider health                          # green AND the model appears in /v1/models
 ```
+For explicit Tier 2, pass `--provider-hardware-quote-kind tpm2-quote-ek` and the platform helper
+to `mayhem up --provider --yes`: `scripts/hardware/mayhem-tpm2-quote-linux.sh` on Linux or
+`scripts/hardware/mayhem-tpm2-quote-windows.ps1` on Windows. Both run under the provider account;
+a valid proof automatically joins the existing admin-created Tier-2 market.
 **Relay:** the provider dashboard URL, health status, and (later) `mayhem provider earnings`.
 **Pitfall:** green health with the route missing from `/v1/models` = the model failed to load —
 re-run `mayhem doctor` and check the backend extras (§3.2). **Claiming earnings:** TAP payouts are

@@ -204,17 +204,117 @@ static byte[] TpmName(TpmPublic publicArea)
 
 static void VerifyDeviceKeyBinding(JsonElement evidence, string deviceKey)
 {
-    if (!evidence.TryGetProperty("ek_public_tss_b64", out var ekPublicValue) ||
-        ekPublicValue.ValueKind != JsonValueKind.String)
+    if (evidence.TryGetProperty("ek_public_tss_b64", out var ekPublicValue) &&
+        ekPublicValue.ValueKind == JsonValueKind.String)
     {
+        var ekPublic = Convert.FromBase64String(Required(evidence, "ek_public_tss_b64"));
+        var expected = Convert.ToHexString(SHA256.HashData(ekPublic)).ToLowerInvariant();
+        if (!expected.Equals(deviceKey, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("TPM EK device_key does not match EK public evidence");
+        }
         return;
     }
-    var ekPublic = Convert.FromBase64String(Required(evidence, "ek_public_tss_b64"));
-    var expected = Convert.ToHexString(SHA256.HashData(ekPublic)).ToLowerInvariant();
-    if (!expected.Equals(deviceKey, StringComparison.OrdinalIgnoreCase))
+
+    if (evidence.TryGetProperty("ek_public_bcrypt_b64", out var windowsEkValue) &&
+        windowsEkValue.ValueKind == JsonValueKind.String)
     {
-        throw new InvalidOperationException("TPM EK device_key does not match EK public evidence");
+        var windowsEk = Convert.FromBase64String(Required(evidence, "ek_public_bcrypt_b64"));
+        var identity = WindowsEkIdentityBytes(windowsEk);
+        var expected = Convert.ToHexString(SHA256.HashData(identity)).ToLowerInvariant();
+        if (!expected.Equals(deviceKey, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("TPM EK device_key does not match Windows PCP EK public evidence");
+        }
     }
+}
+
+static bool IsWindowsEccPublicMagic(uint magic) =>
+    magic is 0x314b4345 or 0x334b4345 or 0x354b4345 or
+             0x31534345 or 0x33534345 or 0x35534345;
+
+static byte[] WindowsEkIdentityBytes(byte[] blob)
+{
+    const uint RsaPublicMagic = 0x31415352;
+    if (blob.Length < 8)
+    {
+        throw new InvalidOperationException("Windows PCP EK public blob is truncated");
+    }
+    var magic = ReadLe32(blob, 0);
+    if (magic == RsaPublicMagic)
+    {
+        var parameters = WindowsRsaParameters(blob);
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(parameters);
+        return rsa.ExportRSAPublicKey();
+    }
+    if (IsWindowsEccPublicMagic(magic))
+    {
+        var keyLength = checked((int)ReadLe32(blob, 4));
+        if (keyLength <= 0 || blob.Length != 8 + (keyLength * 2))
+        {
+            throw new InvalidOperationException("Windows PCP ECC EK public blob has an invalid length");
+        }
+        return new byte[] { 0x04 }
+            .Concat(blob.Skip(8).Take(keyLength))
+            .Concat(blob.Skip(8 + keyLength).Take(keyLength))
+            .ToArray();
+    }
+    throw new InvalidOperationException($"unsupported Windows PCP EK public blob magic 0x{magic:x8}");
+}
+
+static RSAParameters WindowsRsaParameters(byte[] blob)
+{
+    if (blob.Length < 24)
+    {
+        throw new InvalidOperationException("Windows PCP RSA EK public blob is truncated");
+    }
+    var exponentLength = checked((int)ReadLe32(blob, 8));
+    var modulusLength = checked((int)ReadLe32(blob, 12));
+    if (exponentLength <= 0 || modulusLength <= 0 || blob.Length != 24 + exponentLength + modulusLength)
+    {
+        throw new InvalidOperationException("Windows PCP RSA EK public blob has an invalid length");
+    }
+    return new RSAParameters
+    {
+        Exponent = blob.Skip(24).Take(exponentLength).ToArray(),
+        Modulus = blob.Skip(24 + exponentLength).Take(modulusLength).ToArray(),
+    };
+}
+
+static bool WindowsEkMatchesCertificate(byte[] blob, X509Certificate2 certificate)
+{
+    const uint RsaPublicMagic = 0x31415352;
+    var magic = ReadLe32(blob, 0);
+    if (magic == RsaPublicMagic)
+    {
+        using var rsa = certificate.GetRSAPublicKey();
+        if (rsa is null)
+        {
+            return false;
+        }
+        var expected = WindowsRsaParameters(blob);
+        var actual = rsa.ExportParameters(false);
+        return actual.Exponent.AsSpan().SequenceEqual(expected.Exponent) &&
+               actual.Modulus.AsSpan().SequenceEqual(expected.Modulus);
+    }
+    if (IsWindowsEccPublicMagic(magic))
+    {
+        using var ecdsa = certificate.GetECDsaPublicKey();
+        if (ecdsa is null)
+        {
+            return false;
+        }
+        var keyLength = checked((int)ReadLe32(blob, 4));
+        if (keyLength <= 0 || blob.Length != 8 + (keyLength * 2))
+        {
+            return false;
+        }
+        var actual = ecdsa.ExportParameters(false);
+        return actual.Q.X.AsSpan().SequenceEqual(blob.AsSpan(8, keyLength)) &&
+               actual.Q.Y.AsSpan().SequenceEqual(blob.AsSpan(8 + keyLength, keyLength));
+    }
+    return false;
 }
 
 static void VerifyQuoteManually(
@@ -386,6 +486,21 @@ static bool SubjectNamesAllowed(IEnumerable<X509Certificate2> certs)
 static void VerifyEkChain(JsonElement evidence)
 {
     var leaf = new X509Certificate2(B64(evidence, "ek_cert_der_b64"));
+    var tool = OptionalString(evidence, "tool") ?? string.Empty;
+    if (tool.Equals("tss.net/windows-tbs", StringComparison.OrdinalIgnoreCase))
+    {
+        var deviceKey = Required(evidence, "device_key").ToLowerInvariant();
+        var certificateKey = Convert.ToHexString(SHA256.HashData(leaf.GetPublicKey())).ToLowerInvariant();
+        if (!certificateKey.Equals(deviceKey, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Windows TPM EK certificate public key does not match device_key");
+        }
+        var publicBlob = B64(evidence, "ek_public_bcrypt_b64");
+        if (!WindowsEkMatchesCertificate(publicBlob, leaf))
+        {
+            throw new InvalidOperationException("Windows PCP EK public evidence does not match TPM EK certificate");
+        }
+    }
     var evidenceChain = EvidenceChain(evidence, leaf);
     var roots = LoadRootBundle();
     using var chain = new X509Chain();

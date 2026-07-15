@@ -1012,20 +1012,20 @@ fn probe_memory(host: &HostInfo) -> MemoryInfo {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn windows_memory_bytes(index: usize) -> Option<u64> {
-    if !cfg!(target_os = "windows") {
-        return None;
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    match index {
+        0 => (system.total_memory() > 0).then(|| system.total_memory()),
+        1 => Some(system.available_memory()),
+        _ => None,
     }
-    let output = command_stdout(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "$m=Get-CimInstance Win32_OperatingSystem; [Console]::WriteLine([string]$m.TotalVisibleMemorySize + ',' + [string]$m.FreePhysicalMemory)",
-        ],
-    )?;
-    let kib = output.split(',').nth(index)?.trim().parse::<u64>().ok()?;
-    kib.checked_mul(1024)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_memory_bytes(_index: usize) -> Option<u64> {
+    None
 }
 
 fn meminfo_kib(text: &str, key: &str) -> Option<u64> {
@@ -1984,6 +1984,15 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_memory_probe_reports_physical_memory_without_cim() {
+        let total = windows_memory_bytes(0).expect("Windows physical memory");
+        let available = windows_memory_bytes(1).expect("Windows available memory");
+        assert!(total > 0);
+        assert!(available <= total);
+    }
 
     fn fixture_report(fixture: FixtureProfile) -> HardwareReport {
         probe(ProbeOptions {

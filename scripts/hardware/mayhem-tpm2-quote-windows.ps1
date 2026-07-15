@@ -23,47 +23,6 @@ $env:MAYHEM_HW_QUOTE_BINDING = $binding
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
   Fail ".NET SDK is required for the Windows TPM helper"
 }
-if (-not (Get-Command Get-TpmEndorsementKeyInfo -ErrorAction SilentlyContinue)) {
-  Fail "Get-TpmEndorsementKeyInfo is required to read the TPM EK identity"
-}
-
-$ekInfo = Get-TpmEndorsementKeyInfo -HashAlgorithm sha256
-if (-not $ekInfo.IsPresent -or [string]::IsNullOrWhiteSpace($ekInfo.PublicKeyHash)) {
-  Fail "TPM endorsement key public hash is not available"
-}
-$deviceKey = ([string]$ekInfo.PublicKeyHash).ToLowerInvariant()
-if ($deviceKey -notmatch '^[0-9a-f]{64}$') {
-  Fail "TPM endorsement key public hash is not a 32-byte hex digest"
-}
-$env:MAYHEM_TPM2_EK_PUBLIC_HASH = $deviceKey
-
-$certs = @()
-if ($ekInfo.ManufacturerCertificates) {
-  $certs += @($ekInfo.ManufacturerCertificates)
-}
-if ($ekInfo.AdditionalCertificates) {
-  $certs += @($ekInfo.AdditionalCertificates)
-}
-$cert = $certs | Select-Object -First 1
-if ($cert) {
-  $env:MAYHEM_TPM2_EK_CERT_DER_B64 = [Convert]::ToBase64String($cert.RawData)
-  $env:MAYHEM_TPM2_EK_CERT_THUMBPRINT = $cert.Thumbprint
-  $env:MAYHEM_TPM2_EK_CERT_SUBJECT = $cert.Subject
-  $env:MAYHEM_TPM2_EK_CERT_ISSUER = $cert.Issuer
-  try {
-    $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-    $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-    [void]$chain.Build($cert)
-    $chainB64 = @($chain.ChainElements | ForEach-Object {
-      [Convert]::ToBase64String($_.Certificate.RawData)
-    })
-    if ($chainB64.Count -gt 0) {
-      $env:MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON = ($chainB64 | ConvertTo-Json -Compress)
-    }
-  } catch {
-    $env:MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON = ""
-  }
-}
 
 try {
   $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
@@ -94,7 +53,7 @@ $dotnetMajor = ($dotnetVersion -split '\.')[0]
 if ($dotnetMajor -notmatch '^[0-9]+$' -or [int]$dotnetMajor -lt 6) {
   Fail ".NET SDK 6 or newer is required; found $dotnetVersion"
 }
-$targetFramework = "net$dotnetMajor.0"
+$targetFramework = "net$dotnetMajor.0-windows"
 
 $helperRoot = $env:MAYHEM_TPM2_HELPER_DIR
 if ([string]::IsNullOrWhiteSpace($helperRoot)) {
@@ -125,12 +84,243 @@ $csproj = @"
 
 $program = @'
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using Microsoft.Win32;
 using Tpm2Lib;
 
+sealed class WindowsEkEvidence
+{
+    const string ProviderName = "Microsoft Platform Crypto Provider";
+    const string EndorsementPath = @"SYSTEM\CurrentControlSet\Services\TPM\WMI\Endorsement";
+    const uint RsaPublicMagic = 0x31415352;
+
+    static readonly HashSet<uint> EccPublicMagics = new()
+    {
+        0x314b4345,
+        0x334b4345,
+        0x354b4345,
+        0x31534345,
+        0x33534345,
+        0x35534345,
+    };
+
+    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
+    static extern int NCryptOpenStorageProvider(
+        out IntPtr provider,
+        string providerName,
+        uint flags);
+
+    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
+    static extern int NCryptGetProperty(
+        IntPtr handle,
+        string property,
+        [Out] byte[]? output,
+        int outputLength,
+        out int resultLength,
+        uint flags);
+
+    [DllImport("ncrypt.dll")]
+    static extern int NCryptFreeObject(IntPtr handle);
+
+    public byte[] PublicBlob { get; private set; } = Array.Empty<byte>();
+    public string DeviceKey { get; private set; } = string.Empty;
+    public X509Certificate2? Certificate { get; private set; }
+    public IReadOnlyList<byte[]> Chain { get; private set; } = Array.Empty<byte[]>();
+
+    public static WindowsEkEvidence Read()
+    {
+        var publicBlob = ReadPcpPublicBlob();
+        var identityBytes = PublicIdentityBytes(publicBlob);
+        var certificates = ReadRegisteredCertificates();
+        var certificate = certificates.FirstOrDefault(cert => CertificateMatches(cert, publicBlob));
+        if (certificate is not null && !certificate.GetPublicKey().SequenceEqual(identityBytes))
+        {
+            throw new InvalidOperationException("Windows TPM EK certificate public key does not match PCP_EKPUB");
+        }
+
+        var deviceKey = Convert.ToHexString(SHA256.HashData(identityBytes)).ToLowerInvariant();
+        var chain = new List<byte[]>();
+        if (certificate is not null)
+        {
+            chain.Add(certificate.RawData);
+            using var builder = new X509Chain();
+            builder.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            builder.Build(certificate);
+            foreach (var element in builder.ChainElements.Cast<X509ChainElement>())
+            {
+                if (!chain.Any(existing => existing.SequenceEqual(element.Certificate.RawData)))
+                {
+                    chain.Add(element.Certificate.RawData);
+                }
+            }
+        }
+
+        return new WindowsEkEvidence
+        {
+            PublicBlob = publicBlob,
+            DeviceKey = deviceKey,
+            Certificate = certificate,
+            Chain = chain,
+        };
+    }
+
+    static byte[] ReadPcpPublicBlob()
+    {
+        var status = NCryptOpenStorageProvider(out var provider, ProviderName, 0);
+        if (status != 0)
+        {
+            throw new InvalidOperationException($"NCryptOpenStorageProvider failed (0x{unchecked((uint)status):x8})");
+        }
+        try
+        {
+            foreach (var property in new[] { "PCP_EKPUB", "PCP_RSA_EKPUB", "PCP_ECC_EKPUB" })
+            {
+                status = NCryptGetProperty(provider, property, null, 0, out var length, 0);
+                if (status != 0 || length <= 0)
+                {
+                    continue;
+                }
+                var bytes = new byte[length];
+                status = NCryptGetProperty(provider, property, bytes, bytes.Length, out length, 0);
+                if (status == 0 && length > 0)
+                {
+                    if (length != bytes.Length)
+                    {
+                        Array.Resize(ref bytes, length);
+                    }
+                    return bytes;
+                }
+            }
+            throw new InvalidOperationException("Windows Platform Crypto Provider did not expose a TPM EK public key");
+        }
+        finally
+        {
+            NCryptFreeObject(provider);
+        }
+    }
+
+    static byte[] PublicIdentityBytes(byte[] blob)
+    {
+        if (blob.Length < 8)
+        {
+            throw new InvalidOperationException("Windows TPM EK public blob is truncated");
+        }
+        var magic = BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(0, 4));
+        if (magic == RsaPublicMagic)
+        {
+            var parameters = RsaParameters(blob);
+            using var rsa = RSA.Create();
+            rsa.ImportParameters(parameters);
+            return rsa.ExportRSAPublicKey();
+        }
+        if (EccPublicMagics.Contains(magic))
+        {
+            var keyLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(4, 4)));
+            if (keyLength <= 0 || blob.Length != 8 + (keyLength * 2))
+            {
+                throw new InvalidOperationException("Windows TPM ECC EK public blob has an invalid length");
+            }
+            return new byte[] { 0x04 }
+                .Concat(blob.AsSpan(8, keyLength).ToArray())
+                .Concat(blob.AsSpan(8 + keyLength, keyLength).ToArray())
+                .ToArray();
+        }
+        throw new InvalidOperationException($"unsupported Windows TPM EK public blob magic 0x{magic:x8}");
+    }
+
+    static RSAParameters RsaParameters(byte[] blob)
+    {
+        if (blob.Length < 24)
+        {
+            throw new InvalidOperationException("Windows TPM RSA EK public blob is truncated");
+        }
+        var exponentLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(8, 4)));
+        var modulusLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(12, 4)));
+        if (exponentLength <= 0 || modulusLength <= 0 || blob.Length != 24 + exponentLength + modulusLength)
+        {
+            throw new InvalidOperationException("Windows TPM RSA EK public blob has an invalid length");
+        }
+        return new RSAParameters
+        {
+            Exponent = blob.AsSpan(24, exponentLength).ToArray(),
+            Modulus = blob.AsSpan(24 + exponentLength, modulusLength).ToArray(),
+        };
+    }
+
+    static bool CertificateMatches(X509Certificate2 certificate, byte[] publicBlob)
+    {
+        var magic = BinaryPrimitives.ReadUInt32LittleEndian(publicBlob.AsSpan(0, 4));
+        if (magic == RsaPublicMagic)
+        {
+            using var rsa = certificate.GetRSAPublicKey();
+            if (rsa is null)
+            {
+                return false;
+            }
+            var expected = RsaParameters(publicBlob);
+            var actual = rsa.ExportParameters(false);
+            return actual.Exponent.AsSpan().SequenceEqual(expected.Exponent) &&
+                   actual.Modulus.AsSpan().SequenceEqual(expected.Modulus);
+        }
+        if (EccPublicMagics.Contains(magic))
+        {
+            using var ecdsa = certificate.GetECDsaPublicKey();
+            if (ecdsa is null)
+            {
+                return false;
+            }
+            var keyLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(publicBlob.AsSpan(4, 4)));
+            var actual = ecdsa.ExportParameters(false);
+            return actual.Q.X.AsSpan().SequenceEqual(publicBlob.AsSpan(8, keyLength)) &&
+                   actual.Q.Y.AsSpan().SequenceEqual(publicBlob.AsSpan(8 + keyLength, keyLength));
+        }
+        return false;
+    }
+
+    static List<X509Certificate2> ReadRegisteredCertificates()
+    {
+        var certificates = new List<X509Certificate2>();
+        foreach (var store in new[] { "EKCertStore", "EKCertStoreECC" })
+        {
+            using var root = Registry.LocalMachine.OpenSubKey(
+                EndorsementPath + "\\" + store + "\\Certificates",
+                false);
+            if (root is null)
+            {
+                continue;
+            }
+            foreach (var thumbprint in root.GetSubKeyNames())
+            {
+                using var key = root.OpenSubKey(thumbprint, false);
+                if (key?.GetValue("Blob") is not byte[] blob)
+                {
+                    continue;
+                }
+                var collection = new X509Certificate2Collection();
+#pragma warning disable SYSLIB0057
+                collection.Import(blob);
+#pragma warning restore SYSLIB0057
+                foreach (var certificate in collection)
+                {
+                    if (!certificates.Any(existing => existing.Thumbprint == certificate.Thumbprint))
+                    {
+                        certificates.Add(certificate);
+                    }
+                }
+            }
+        }
+        return certificates;
+    }
+}
+
+static class Program
+{
 static string NeedEnv(string name)
 {
     var value = Environment.GetEnvironmentVariable(name);
@@ -214,9 +404,12 @@ static (TpmHandle Handle, TpmPublic Public) CreateQuoteKey(Tpm2 tpm, TpmHandle p
     return (handle, publicPart);
 }
 
+public static void Main()
+{
 var binding = NeedEnv("MAYHEM_HW_QUOTE_BINDING").ToLowerInvariant();
 var bindingBytes = HexToBytes(binding);
-var deviceKey = NeedEnv("MAYHEM_TPM2_EK_PUBLIC_HASH").ToLowerInvariant();
+var ek = WindowsEkEvidence.Read();
+var deviceKey = ek.DeviceKey;
 var pcrSelectionText = Environment.GetEnvironmentVariable("MAYHEM_TPM2_PCR_SELECTION");
 if (string.IsNullOrWhiteSpace(pcrSelectionText))
 {
@@ -258,21 +451,20 @@ try
         ["quote_signature_b64"] = B64(Marshaller.GetTpmRepresentation(quoteSig)),
         ["pcr_selection_tpm_b64"] = B64(Marshaller.GetTpmRepresentation(selectedPcrs)),
         ["pcr_values_tpm_b64"] = B64(Marshaller.GetTpmRepresentation(pcrValues)),
+        ["ek_public_bcrypt_b64"] = B64(ek.PublicBlob),
         ["device_key"] = deviceKey,
         ["quote_verified_locally"] = true
     };
 
-    var certB64 = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_DER_B64");
-    if (!string.IsNullOrWhiteSpace(certB64))
+    if (ek.Certificate is not null)
     {
-        evidence["ek_cert_der_b64"] = certB64;
-        evidence["ek_cert_thumbprint"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_THUMBPRINT");
-        evidence["ek_cert_subject"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_SUBJECT");
-        evidence["ek_cert_issuer"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_ISSUER");
-        var chainJson = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON");
-        if (!string.IsNullOrWhiteSpace(chainJson))
+        evidence["ek_cert_der_b64"] = B64(ek.Certificate.RawData);
+        evidence["ek_cert_thumbprint"] = ek.Certificate.Thumbprint;
+        evidence["ek_cert_subject"] = ek.Certificate.Subject;
+        evidence["ek_cert_issuer"] = ek.Certificate.Issuer;
+        if (ek.Chain.Count > 0)
         {
-            evidence["ek_chain_der_b64"] = JsonSerializer.Deserialize<JsonElement>(chainJson);
+            evidence["ek_chain_der_b64"] = ek.Chain.Select(B64).ToArray();
         }
     }
 
@@ -294,7 +486,7 @@ try
         {
             ["ek_sha256"] = deviceKey,
             ["pcr_selection"] = pcrSelectionText,
-            ["ek_cert_present"] = !string.IsNullOrWhiteSpace(certB64)
+            ["ek_cert_present"] = ek.Certificate is not null
         }
     };
     if (gpu is not null)
@@ -314,6 +506,8 @@ finally
     {
         try { tpm.FlushContext(primary); } catch { }
     }
+}
+}
 }
 '@
 
