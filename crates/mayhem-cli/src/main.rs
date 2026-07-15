@@ -27528,6 +27528,20 @@ fn configured_nonnegative_millis(env_name: &str, default_value: u64) -> Result<u
     }
 }
 
+fn gateway_startup_wallet_report(
+    public_key: Option<&String>,
+    rail: &str,
+    balance_au: Option<MoneyAu>,
+) -> Option<Value> {
+    public_key.map(|public_key| {
+        json!({
+            "public_key": public_key,
+            "balance_au": money_au_json(balance_au.unwrap_or(0)),
+            "balance_source": format!("bal/{public_key}/{rail}"),
+        })
+    })
+}
+
 async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -28054,16 +28068,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "provider_heartbeat_ttl_ms": provider_heartbeat_ttl_millis,
         "provider_heartbeat_clock_skew_ms": provider_heartbeat_clock_skew_millis,
         "rail": args.rail.as_str(),
-        "wallet": wallet_public_key.as_ref().map(|public_key| json!({
-            "public_key": public_key,
-            "balance_au": balance_au.unwrap_or(0),
-            "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
-        })),
+        "wallet": gateway_startup_wallet_report(
+            wallet_public_key.as_ref(),
+            args.rail.as_str(),
+            balance_au,
+        ),
         "receipt_checkpoint_every": {
             "tokens": receipt_checkpoint_every.tokens,
             "ms": receipt_checkpoint_every.ms,
         },
-        "default_max_price_au": default_max_price_au,
+        "default_max_price_au": default_max_price_au.map(money_au_json),
         "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
         "preferred_provider_models": preferred_providers.len(),
@@ -40058,7 +40072,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         },
         "rules": &rules,
         "market": {
-            "min_ask_au": args.min_ask_au,
+            "min_ask_au": money_au_json(args.min_ask_au),
         },
         "context": {
             "served_ctx": selected.served_ctx,
@@ -40073,7 +40087,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "protection": {
             "max_sessions": protection_config.max_sessions,
             "accept_rate_per_minute": protection_config.accept_rate_per_minute,
-            "serve_budget_au": protection_config.budget_au,
+            "serve_budget_au": money_au_json(protection_config.budget_au),
             "serve_budget_units": protection_config.budget_units,
             "serve_budget_period_seconds": protection_config.budget_period.as_secs(),
         },
@@ -66317,6 +66331,49 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         verifying_key
             .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn gateway_startup_report_accepts_balance_above_json_u64_limit() {
+        let max = MoneyAu::MAX;
+        let public_key = "ab".repeat(32);
+        let wallet = gateway_startup_wallet_report(Some(&public_key), "tap", Some(max))
+            .expect("startup wallet report");
+        let report = json!({
+            "wallet": wallet,
+            "default_max_price_au": Some(money_au_json(max)),
+            "market": {
+                "min_ask_au": Some(money_au_json(max)),
+            },
+            "protection": {
+                "serve_budget_au": Some(money_au_json(max)),
+            },
+        });
+
+        let encoded = serde_json::to_string(&report).expect("large money report json");
+        let decoded: Value = serde_json::from_str(&encoded).expect("large money report roundtrip");
+        let expected = max.to_string();
+        assert_eq!(decoded["wallet"]["public_key"], public_key);
+        assert_eq!(
+            decoded["wallet"]["balance_source"],
+            format!("bal/{public_key}/tap")
+        );
+        assert_eq!(
+            decoded["wallet"]["balance_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["default_max_price_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["market"]["min_ask_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["protection"]["serve_budget_au"].as_str(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
