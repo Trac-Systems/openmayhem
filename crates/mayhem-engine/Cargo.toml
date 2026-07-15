@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["llama-cpp"]
-llama-cpp = ["dep:base64", "dep:encoding_rs", "dep:llama-cpp-2", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
+llama-cpp = ["dep:encoding_rs", "dep:llama-cpp-2", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
 llama-cpp-cuda = ["llama-cpp", "llama-cpp-2/cuda"]
 llama-cpp-metal = ["llama-cpp", "llama-cpp-2/metal"]
 llama-cpp-openmp = ["llama-cpp", "llama-cpp-2/openmp"]
@@ -21,7 +21,7 @@ trt-llm = []
 vllm = []
 
 [dependencies]
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 blake3 = "1"
 encoding_rs = { version = "0.8", optional = true }
 llama-cpp-2 = { version = "0.1.150", optional = true, default-features = false, features = ["common", "sampler"] }

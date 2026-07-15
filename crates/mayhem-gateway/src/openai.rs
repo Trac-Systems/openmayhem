@@ -1445,6 +1445,7 @@ pub struct GatewayCanaryPrompt {
     pub size: Option<String>,
     pub steps: Option<u64>,
     pub cfg_scale: Option<f32>,
+    pub shift: Option<f32>,
     pub seed: Option<i64>,
 }
 
@@ -1658,9 +1659,23 @@ pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
     #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub moderation: Option<String>,
+    #[serde(default)]
     pub n: Option<u32>,
     #[serde(default)]
+    pub output_compression: Option<u32>,
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub partial_images: Option<u32>,
+    #[serde(default)]
     pub size: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
@@ -1674,9 +1689,13 @@ pub struct ImageGenerationRequest {
     #[serde(default)]
     pub cfg_scale: Option<f32>,
     #[serde(default)]
+    pub shift: Option<f32>,
+    #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
     pub scheduler: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
     #[serde(default)]
     pub user: Option<String>,
     #[serde(skip)]
@@ -1779,53 +1798,47 @@ pub fn normalize_endpoint_request_for_provider(
             .collect::<Vec<_>>()
             .join("; ")
     })?;
-    let mut normalized_request = match contract.family.as_str() {
+    let defaulted_request =
+        mayhem_proto::materialize_endpoint_request_defaults(contract, raw_request)?;
+    mayhem_proto::validate_endpoint_request(contract, &defaulted_request).map_err(
+        |violations| {
+            format!(
+                "request with signed defaults violates contract: {}",
+                violations
+                    .iter()
+                    .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        },
+    )?;
+    match contract.family.as_str() {
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
         | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
-            let request = serde_json::from_value::<ChatCompletionRequest>(raw_request.clone())
+            serde_json::from_value::<ChatCompletionRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid chat request: {err}"))?;
-            let mut normalized =
-                direct_session_contract_request(&direct_session_request_body(&request));
-            if contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT {
-                normalized
-                    .as_object_mut()
-                    .expect("chat normalization always produces an object")
-                    .remove("metadata");
-            }
-            normalized
         }
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => {
-            let request = serde_json::from_value::<CompletionRequest>(raw_request.clone())
+            serde_json::from_value::<CompletionRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid completion request: {err}"))?;
-            json_object_without_nulls(
-                serde_json::to_value(request)
-                    .map_err(|err| format!("normalizing completion request: {err}"))?,
-            )
         }
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES => {
-            let request = serde_json::from_value::<ResponsesRequest>(raw_request.clone())
+            serde_json::from_value::<ResponsesRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid Responses request: {err}"))?;
-            json_object_without_nulls(
-                serde_json::to_value(request)
-                    .map_err(|err| format!("normalizing Responses request: {err}"))?,
-            )
         }
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
-            let request = serde_json::from_value::<EmbeddingRequest>(raw_request.clone())
+            serde_json::from_value::<EmbeddingRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid embedding request: {err}"))?;
-            direct_session_contract_request(&direct_session_embedding_request_body(&request))
         }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
-            let request = serde_json::from_value::<ImageGenerationRequest>(raw_request.clone())
+            serde_json::from_value::<ImageGenerationRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid image request: {err}"))?;
-            direct_session_contract_request(&direct_session_image_generation_request_body(&request))
         }
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => {
-            let request = serde_json::from_value::<AudioSpeechRequest>(raw_request.clone())
+            serde_json::from_value::<AudioSpeechRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid speech request: {err}"))?;
-            direct_session_contract_request(&direct_session_audio_speech_request_body(&request))
         }
-        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => raw_request.clone(),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => {}
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
         | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
@@ -1834,26 +1847,19 @@ pub fn normalize_endpoint_request_for_provider(
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
         | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
-        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => raw_request.clone(),
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {}
         other => {
             return Err(format!(
                 "endpoint family {other} has no gateway normalization path"
             ))
         }
-    };
+    }
+    let mut normalized_request = defaulted_request;
     restore_explicit_null_attributes(raw_request, &mut normalized_request);
-    let raw_object = raw_request
-        .as_object()
-        .ok_or_else(|| "endpoint request must be an object".to_owned())?;
-    let normalized_object = normalized_request
-        .as_object()
-        .ok_or_else(|| "normalized endpoint request must be an object".to_owned())?;
-    for (key, value) in raw_object {
-        if normalized_object.get(key) != Some(value) {
-            return Err(format!(
-                "gateway normalization changed or dropped supplied attribute {key}"
-            ));
-        }
+    if let Some(path) = changed_supplied_endpoint_path(raw_request, &normalized_request, "") {
+        return Err(format!(
+            "gateway normalization changed or dropped supplied attribute {path}"
+        ));
     }
     mayhem_proto::validate_endpoint_request(contract, &normalized_request).map_err(
         |violations| {
@@ -1875,6 +1881,31 @@ pub fn normalize_endpoint_request_for_provider(
     })
 }
 
+fn changed_supplied_endpoint_path(raw: &Value, normalized: &Value, path: &str) -> Option<String> {
+    let Value::Object(raw) = raw else {
+        return (raw != normalized).then(|| path.to_owned());
+    };
+    let Value::Object(normalized) = normalized else {
+        return Some(path.to_owned());
+    };
+    for (key, raw_value) in raw {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        let Some(normalized_value) = normalized.get(key) else {
+            return Some(child_path);
+        };
+        if let Some(changed) =
+            changed_supplied_endpoint_path(raw_value, normalized_value, &child_path)
+        {
+            return Some(changed);
+        }
+    }
+    None
+}
+
 fn restore_explicit_null_attributes(raw_request: &Value, normalized_request: &mut Value) {
     let (Some(raw), Some(normalized)) =
         (raw_request.as_object(), normalized_request.as_object_mut())
@@ -1886,13 +1917,6 @@ fn restore_explicit_null_attributes(raw_request: &Value, normalized_request: &mu
             normalized.insert(key.clone(), Value::Null);
         }
     }
-}
-
-fn json_object_without_nulls(mut value: Value) -> Value {
-    if let Some(object) = value.as_object_mut() {
-        object.retain(|_, value| !value.is_null());
-    }
-    value
 }
 
 #[derive(Debug)]
@@ -3195,26 +3219,44 @@ fn parse_catalog_endpoint_request<T: DeserializeOwned>(
     state: &GatewayState,
     raw_request: &Value,
     endpoint_family: &str,
-) -> Result<T, ApiError> {
+) -> Result<(T, Value), ApiError> {
     let model_id = endpoint_request_model(raw_request)?;
-    validate_catalog_endpoint_request(state, model_id, endpoint_family, raw_request)?;
-    serde_json::from_value(raw_request.clone()).map_err(|err| {
+    let normalized =
+        normalize_catalog_endpoint_request(state, model_id, endpoint_family, raw_request)?;
+    let request = serde_json::from_value(normalized.clone()).map_err(|err| {
         ApiError::bad_request(format!("invalid endpoint request: {err}"), Some("request"))
-    })
+    })?;
+    Ok((request, normalized))
 }
 
-fn validate_catalog_endpoint_request(
+fn normalize_catalog_endpoint_request(
     state: &GatewayState,
     model_id: &str,
     endpoint_family: &str,
     raw_request: &Value,
-) -> Result<(), ApiError> {
+) -> Result<Value, ApiError> {
+    let contract = catalog_endpoint_contract(state, model_id, endpoint_family)?;
+    normalize_endpoint_request_for_provider(&contract, raw_request)
+        .map(|normalized| normalized.normalized_request)
+        .map_err(|err| {
+            ApiError::bad_request(
+                format!("request normalization failed: {err}"),
+                Some("request"),
+            )
+        })
+}
+
+fn catalog_endpoint_contract(
+    state: &GatewayState,
+    model_id: &str,
+    endpoint_family: &str,
+) -> Result<EndpointFamilyContract, ApiError> {
     let model = require_model(state, model_id)?;
-    let contract = model
+    model
         .mayhem
         .adapter
         .endpoint_families
-        .iter()
+        .into_iter()
         .find(|contract| contract.family == endpoint_family)
         .ok_or_else(|| {
             ApiError::bad_request(
@@ -3224,20 +3266,7 @@ fn validate_catalog_endpoint_request(
                 ),
                 Some("model"),
             )
-        })?;
-    if let Err(violations) = mayhem_proto::validate_endpoint_request(contract, raw_request) {
-        let summary = violations
-            .iter()
-            .take(4)
-            .map(|violation| format!("{}: {}", violation.path, violation.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApiError::bad_request(
-            format!("request violates the signed model endpoint contract: {summary}"),
-            Some("request"),
-        ));
-    }
-    Ok(())
+        })
 }
 
 fn endpoint_request_model(raw_request: &Value) -> Result<&str, ApiError> {
@@ -3265,16 +3294,15 @@ async fn create_chat_completion(
         Ok(family) => family,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<ChatCompletionRequest>(
-        &state,
-        &raw_request,
-        &endpoint_family,
-    ) {
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<
+        ChatCompletionRequest,
+    >(&state, &raw_request, &endpoint_family)
+    {
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(endpoint_family);
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -3347,7 +3375,7 @@ async fn create_completion(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let request = match parse_catalog_endpoint_request::<CompletionRequest>(
+    let (request, normalized_request) = match parse_catalog_endpoint_request::<CompletionRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
@@ -3360,7 +3388,7 @@ async fn create_completion(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_completion(state.clone(), request, raw_request, options).await {
+    match build_completion(state.clone(), request, normalized_request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
@@ -3381,7 +3409,7 @@ async fn create_response(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let request = match parse_catalog_endpoint_request::<ResponsesRequest>(
+    let (request, normalized_request) = match parse_catalog_endpoint_request::<ResponsesRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
@@ -3394,7 +3422,7 @@ async fn create_response(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_response(state.clone(), request, raw_request, options).await {
+    match build_response(state.clone(), request, normalized_request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
@@ -3415,7 +3443,7 @@ async fn create_embedding(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<EmbeddingRequest>(
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<EmbeddingRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
@@ -3424,7 +3452,7 @@ async fn create_embedding(
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -3449,16 +3477,17 @@ async fn create_image_generation(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<ImageGenerationRequest>(
-        &state,
-        &raw_request,
-        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
-    ) {
-        Ok(request) => request,
-        Err(err) => return err.into_response(),
-    };
+    let (mut request, normalized_request) =
+        match parse_catalog_endpoint_request::<ImageGenerationRequest>(
+            &state,
+            &raw_request,
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        ) {
+            Ok(request) => request,
+            Err(err) => return err.into_response(),
+        };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -3539,8 +3568,9 @@ async fn execute_artifact_generation_endpoint(
 ) -> Result<(ArtifactGenerationRequest, CompletedArtifactGeneration), ApiError> {
     let model_id = endpoint_request_model(&raw_request)?.to_owned();
     let access_token = state.authorize_gateway_request(headers, Some(&model_id))?;
-    validate_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
-    let request = artifact_generation_request(&model_id, endpoint_family, raw_request)?;
+    let normalized =
+        normalize_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
+    let request = artifact_generation_request(&model_id, endpoint_family, normalized)?;
     let mut options = state.request_options_from_headers(headers)?;
     options.access_token = access_token;
     let run = build_artifact_generation(state, request.clone(), options).await?;
@@ -3791,7 +3821,7 @@ async fn create_audio_speech(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<AudioSpeechRequest>(
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<AudioSpeechRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
@@ -3800,7 +3830,7 @@ async fn create_audio_speech(
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -3825,20 +3855,22 @@ async fn create_audio_transcription(
         .await
         .and_then(|request| Ok((request, options)))
     {
-        Ok((request, mut options)) => {
+        Ok((mut request, mut options)) => {
             let access_token = match state.authorize_gateway_request(&headers, Some(&request.model))
             {
                 Ok(access_token) => access_token,
                 Err(err) => return err.into_response(),
             };
-            if let Err(err) = validate_catalog_endpoint_request(
+            let normalized = match normalize_catalog_endpoint_request(
                 &state,
                 &request.model,
                 mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
                 &request.contract_request,
             ) {
-                return err.into_response();
-            }
+                Ok(normalized) => normalized,
+                Err(err) => return err.into_response(),
+            };
+            request.contract_request = normalized;
             options.access_token = access_token;
             match build_audio_transcription(&state, request, options).await {
                 Ok(value) => Json(value).into_response(),
@@ -3863,11 +3895,12 @@ async fn create_hf_inference(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    if let Err(err) =
-        validate_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
-    {
-        return err.into_response();
-    }
+    let raw_request =
+        match normalize_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
+        {
+            Ok(normalized) => normalized,
+            Err(err) => return err.into_response(),
+        };
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -4069,14 +4102,32 @@ fn hf_image_generation_request(
             Some("parameters"),
         ));
     }
-    let size = width
-        .zip(height)
-        .map(|(width, height)| format!("{width}x{height}"));
     Ok(ImageGenerationRequest {
         model: model_id.to_owned(),
         prompt,
-        n: Some(1),
-        size,
+        background: None,
+        moderation: None,
+        n: parameters
+            .get("num_images_per_prompt")
+            .and_then(Value::as_u64)
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| {
+                ApiError::bad_request(
+                    "parameters.num_images_per_prompt is too large",
+                    Some("parameters"),
+                )
+            })?,
+        output_compression: None,
+        output_format: None,
+        partial_images: None,
+        size: None,
+        width: width.map(u32::try_from).transpose().map_err(|_| {
+            ApiError::bad_request("parameters.width is too large", Some("parameters"))
+        })?,
+        height: height.map(u32::try_from).transpose().map_err(|_| {
+            ApiError::bad_request("parameters.height is too large", Some("parameters"))
+        })?,
         response_format: Some("b64_json".to_owned()),
         quality: None,
         style: None,
@@ -4091,11 +4142,16 @@ fn hf_image_generation_request(
             .get("guidance_scale")
             .and_then(Value::as_f64)
             .map(|value| value as f32),
+        shift: parameters
+            .get("shift")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
         seed: parameters.get("seed").and_then(Value::as_i64),
         scheduler: parameters
             .get("scheduler")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        stream: None,
         user: None,
         endpoint_family: Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE.to_owned()),
         endpoint_request: Some(raw_request),
@@ -8542,6 +8598,8 @@ struct CanaryPromptDocument {
     #[serde(default)]
     cfg_scale: Option<f32>,
     #[serde(default)]
+    shift: Option<f32>,
+    #[serde(default)]
     seed: Option<i64>,
 }
 
@@ -8907,6 +8965,7 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             size: prompt.size,
             steps: prompt.steps,
             cfg_scale: prompt.cfg_scale,
+            shift: prompt.shift,
             seed: prompt.seed,
         })
         .collect()
@@ -11285,13 +11344,52 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
         "model": &request.model,
         "prompt": &request.prompt,
         "n": image_generation_count(request),
-        "size": request.size.as_deref().unwrap_or("512x512"),
         "steps": image_generation_steps(request),
         "cfg_scale": image_generation_cfg_scale(request),
-        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "response_format": request
+            .response_format
+            .as_deref()
+            .expect("validated image request has an admin-signed response format"),
         "endpoint_family": image_generation_endpoint_family(request),
     });
+    set_optional_json(
+        &mut body,
+        "background",
+        request.background.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "moderation",
+        request.moderation.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "output_compression",
+        request.output_compression.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "output_format",
+        request.output_format.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "partial_images",
+        request.partial_images.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "size",
+        request.size.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "width", request.width.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "height",
+        request.height.map(|value| json!(value)),
+    );
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
+    set_optional_json(&mut body, "shift", request.shift.map(|value| json!(value)));
     set_optional_json(
         &mut body,
         "quality",
@@ -11311,6 +11409,11 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
         &mut body,
         "scheduler",
         request.scheduler.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "stream",
+        request.stream.map(|value| json!(value)),
     );
     set_optional_json(
         &mut body,
@@ -18507,7 +18610,8 @@ fn request_requirements_for_image_generation(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
-    let (width, height) = parse_image_generation_size(request).unwrap_or((1, 1));
+    let (width, height) = parse_image_generation_size(request)
+        .expect("validated image request has admin-signed dimensions");
     let image_count = image_generation_count(request);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -19599,7 +19703,10 @@ async fn build_image_generation(
     }
     let data = image_generation_response_data(
         &output.artifacts,
-        request.response_format.as_deref().unwrap_or("b64_json"),
+        request
+            .response_format
+            .as_deref()
+            .expect("validated image request has an admin-signed response format"),
     )?;
     Ok(json!({
         "id": id,
@@ -21464,8 +21571,7 @@ impl GatewayState {
             if !expected_hashes.contains_key(&prompt.id) {
                 continue;
             }
-            let request =
-                canary_image_generation_request(&model.id, prompt, self.canary_policy.seed);
+            let request = canary_image_generation_request(model, prompt, self.canary_policy.seed)?;
             validate_image_generation_request(model, &request)?;
             let invocation = self.prepare_image_generation_invocation_for_route(
                 model,
@@ -23703,27 +23809,56 @@ fn canary_image_prompt_text(prompt: &GatewayCanaryPrompt) -> String {
 }
 
 fn canary_image_generation_request(
-    model_id: &str,
+    model: &GatewayModel,
     prompt: &GatewayCanaryPrompt,
     seed: i64,
-) -> ImageGenerationRequest {
-    ImageGenerationRequest {
-        model: model_id.to_owned(),
-        prompt: canary_image_prompt_text(prompt),
-        n: Some(1),
-        size: prompt.size.clone(),
-        response_format: Some("b64_json".to_owned()),
-        quality: None,
-        style: None,
-        negative_prompt: None,
-        steps: prompt.steps,
-        cfg_scale: prompt.cfg_scale,
-        seed: Some(prompt.seed.unwrap_or(seed)),
-        scheduler: None,
-        user: None,
-        endpoint_family: None,
-        endpoint_request: None,
-    }
+) -> Result<ImageGenerationRequest, ApiError> {
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "image canary model has no signed OpenAI image endpoint contract",
+                Some("model"),
+            )
+        })?;
+    let mut raw = json!({
+        "model": model.id,
+        "prompt": canary_image_prompt_text(prompt),
+    });
+    set_optional_json(
+        &mut raw,
+        "size",
+        prompt.size.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(&mut raw, "steps", prompt.steps.map(|value| json!(value)));
+    set_optional_json(
+        &mut raw,
+        "cfg_scale",
+        prompt.cfg_scale.map(|value| json!(value)),
+    );
+    set_optional_json(&mut raw, "shift", prompt.shift.map(|value| json!(value)));
+    raw["seed"] = json!(prompt.seed.unwrap_or(seed));
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|error| {
+        ApiError::bad_gateway(
+            format!("signed image canary request is invalid: {error}"),
+            Some("model"),
+        )
+    })?;
+    let mut request =
+        serde_json::from_value::<ImageGenerationRequest>(normalized.normalized_request.clone())
+            .map_err(|error| {
+                ApiError::bad_gateway(
+                    format!("signed image canary request cannot be decoded: {error}"),
+                    Some("model"),
+                )
+            })?;
+    request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(request)
 }
 
 fn canary_text_input(prompt: &GatewayCanaryPrompt) -> String {
@@ -25191,6 +25326,12 @@ fn validate_image_generation_request(
         ));
     }
     let (width, height) = parse_image_generation_size(request)?;
+    if !(64..=2_048).contains(&width) || !(64..=2_048).contains(&height) {
+        return Err(ApiError::bad_request(
+            "image dimensions must each be between 64 and 2048",
+            Some("size"),
+        ));
+    }
     if let Some(max_width) = model.mayhem.caps.max_image_width {
         if width > max_width {
             return Err(ApiError::bad_request(
@@ -25207,8 +25348,30 @@ fn validate_image_generation_request(
             ));
         }
     }
-    let _ = image_generation_count(request);
-    let steps = image_generation_steps(request);
+    let image_count = request.n.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image count",
+            Some("model"),
+        )
+    })?;
+    if !(1..=4).contains(&image_count) {
+        return Err(ApiError::bad_request(
+            "n must be between 1 and 4",
+            Some("n"),
+        ));
+    }
+    let steps = request.steps.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image steps",
+            Some("model"),
+        )
+    })?;
+    if !(1..=150).contains(&steps) {
+        return Err(ApiError::bad_request(
+            "steps must be between 1 and 150",
+            Some("steps"),
+        ));
+    }
     if let Some(max_steps) = model.mayhem.caps.max_image_steps {
         if steps > max_steps {
             return Err(ApiError::bad_request(
@@ -25217,8 +25380,34 @@ fn validate_image_generation_request(
             ));
         }
     }
-    let _ = image_generation_cfg_scale(request);
-    match request.response_format.as_deref().unwrap_or("b64_json") {
+    let cfg_scale = request.cfg_scale.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image guidance",
+            Some("model"),
+        )
+    })?;
+    if !cfg_scale.is_finite() || !(0.0..=50.0).contains(&cfg_scale) {
+        return Err(ApiError::bad_request(
+            "cfg_scale must be finite and between 0 and 50",
+            Some("cfg_scale"),
+        ));
+    }
+    if request
+        .shift
+        .is_some_and(|shift| !shift.is_finite() || !(1.0..=10.0).contains(&shift))
+    {
+        return Err(ApiError::bad_request(
+            "shift must be finite and between 1 and 10",
+            Some("shift"),
+        ));
+    }
+    let response_format = request.response_format.as_deref().ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image response_format",
+            Some("model"),
+        )
+    })?;
+    match response_format {
         "b64_json" | "url" => Ok(()),
         _ => Err(ApiError::bad_request(
             "only response_format=b64_json or response_format=url is supported",
@@ -25228,19 +25417,51 @@ fn validate_image_generation_request(
 }
 
 fn image_generation_count(request: &ImageGenerationRequest) -> u32 {
-    request.n.unwrap_or(1).clamp(1, 4)
+    request
+        .n
+        .expect("validated image request has an admin-signed count")
 }
 
 fn image_generation_steps(request: &ImageGenerationRequest) -> u64 {
-    request.steps.unwrap_or(1).clamp(1, 150)
+    request
+        .steps
+        .expect("validated image request has admin-signed steps")
 }
 
 fn image_generation_cfg_scale(request: &ImageGenerationRequest) -> f32 {
-    request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0)
+    request
+        .cfg_scale
+        .expect("validated image request has admin-signed guidance")
 }
 
 fn parse_image_generation_size(request: &ImageGenerationRequest) -> Result<(u32, u32), ApiError> {
-    let size = request.size.as_deref().unwrap_or("512x512");
+    if request.size.is_some() && (request.width.is_some() || request.height.is_some()) {
+        return Err(ApiError::bad_request(
+            "size cannot be combined with width/height",
+            Some("size"),
+        ));
+    }
+    if request.width.is_some() != request.height.is_some() {
+        return Err(ApiError::bad_request(
+            "width and height must be supplied together",
+            Some("width"),
+        ));
+    }
+    if let Some((width, height)) = request.width.zip(request.height) {
+        if width == 0 || height == 0 {
+            return Err(ApiError::bad_request(
+                "image dimensions must be greater than zero",
+                Some("width"),
+            ));
+        }
+        return Ok((width, height));
+    }
+    let size = request.size.as_deref().ok_or_else(|| {
+        ApiError::bad_request(
+            "signed model defaults did not resolve image dimensions",
+            Some("size"),
+        )
+    })?;
     let (width, height) = size
         .split_once('x')
         .ok_or_else(|| ApiError::bad_request("size must be WIDTHxHEIGHT", Some("size")))?;
@@ -25275,7 +25496,8 @@ fn image_generation_failover_work_units(request: &ImageGenerationRequest) -> Res
 }
 
 fn image_generation_usage_for_request(request: &ImageGenerationRequest) -> ReceiptUsage {
-    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
+    let resolution_scale = image_generation_resolution_scale(request)
+        .expect("validated image request has admin-signed dimensions");
     image_generation_usage_for_count(
         u64::from(image_generation_count(request)),
         image_generation_steps(request),
@@ -25287,7 +25509,8 @@ fn image_generation_usage_for_observed(
     request: &ImageGenerationRequest,
     observed_artifacts: usize,
 ) -> ReceiptUsage {
-    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
+    let resolution_scale = image_generation_resolution_scale(request)
+        .expect("validated image request has admin-signed dimensions");
     image_generation_usage_for_count(
         u64::try_from(observed_artifacts).unwrap_or(u64::MAX),
         image_generation_steps(request),
@@ -25743,6 +25966,193 @@ mod tests {
         assert_eq!(normalized.normalized_request["stream"], false);
     }
 
+    fn z_image_test_contract() -> EndpointFamilyContract {
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("OpenAI image contract");
+        let supported = [
+            "model",
+            "prompt",
+            "negative_prompt",
+            "n",
+            "size",
+            "width",
+            "height",
+            "response_format",
+            "steps",
+            "cfg_scale",
+            "shift",
+            "seed",
+        ];
+        contract
+            .request_attributes
+            .retain(|path| supported.contains(&path.as_str()));
+        contract
+            .request_attribute_specs
+            .retain(|path, _| supported.contains(&path.as_str()));
+        for group in &mut contract.interaction_groups {
+            group.retain(|path| supported.contains(&path.as_str()));
+        }
+        contract.interaction_groups.retain(|group| group.len() > 1);
+        for (path, value) in [
+            ("n", json!(1)),
+            ("width", json!(1024)),
+            ("height", json!(1024)),
+            ("response_format", json!("b64_json")),
+            ("steps", json!(9)),
+            ("cfg_scale", json!(0.0)),
+            ("shift", json!(3.0)),
+            ("negative_prompt", json!("")),
+        ] {
+            contract
+                .request_attribute_specs
+                .get_mut(path)
+                .unwrap()
+                .default = Some(value);
+        }
+        for path in ["width", "height"] {
+            contract
+                .request_attribute_specs
+                .get_mut(path)
+                .unwrap()
+                .multiple_of = Some(16.0);
+        }
+        for path in ["steps"] {
+            let spec = contract.request_attribute_specs.get_mut(path).unwrap();
+            spec.minimum = Some(7.0);
+            spec.maximum = Some(9.0);
+            spec.calibration_values = vec![json!(7), json!(8), json!(9)];
+        }
+        let guidance = contract
+            .request_attribute_specs
+            .get_mut("cfg_scale")
+            .unwrap();
+        guidance.maximum = Some(49.0);
+        guidance.calibration_values = vec![json!(0.0), json!(1.0), json!(7.5)];
+        contract
+    }
+
+    #[test]
+    fn image_normalization_uses_only_signed_controls_and_preserves_aliases() {
+        let contract = z_image_test_contract();
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({"model":"test/z-image", "prompt":"a brass compass"}),
+        )
+        .expect("signed defaults");
+        assert_eq!(normalized.normalized_request["n"], json!(1));
+        assert_eq!(normalized.normalized_request["width"], json!(1024));
+        assert_eq!(normalized.normalized_request["height"], json!(1024));
+        assert_eq!(normalized.normalized_request["steps"], json!(9));
+        assert_eq!(normalized.normalized_request["cfg_scale"], json!(0.0));
+        assert_eq!(normalized.normalized_request["negative_prompt"], json!(""));
+        assert_eq!(normalized.normalized_request["shift"], json!(3.0));
+        assert_eq!(
+            normalized.normalized_request["response_format"],
+            json!("b64_json")
+        );
+        assert!(normalized.normalized_request.get("size").is_none());
+
+        let explicit = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "size":"768x1024",
+                "n":4
+            }),
+        )
+        .expect("explicit OpenAI size alias");
+        assert_eq!(explicit.normalized_request["size"], json!("768x1024"));
+        assert_eq!(explicit.normalized_request["n"], json!(4));
+        assert!(explicit.normalized_request.get("width").is_none());
+        assert!(explicit.normalized_request.get("height").is_none());
+
+        assert!(normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "size":"770x1024"
+            }),
+        )
+        .is_err());
+        let negative_at_default_guidance = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "negative_prompt":"blur, watermark"
+            }),
+        )
+        .expect("negative prompt remains valid at guidance zero");
+        assert_eq!(
+            negative_at_default_guidance.normalized_request["negative_prompt"],
+            json!("blur, watermark")
+        );
+        assert_eq!(
+            negative_at_default_guidance.normalized_request["cfg_scale"],
+            json!(0.0)
+        );
+
+        for steps in [7, 8, 9] {
+            let normalized = normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"steps", "steps":steps}),
+            )
+            .expect("recommended step level");
+            assert_eq!(normalized.normalized_request["steps"], json!(steps));
+        }
+        for steps in [6, 10] {
+            assert!(normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"steps", "steps":steps}),
+            )
+            .is_err());
+        }
+        for shift in [1.0, 3.0, 10.0] {
+            let normalized = normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"shift", "shift":shift}),
+            )
+            .expect("official flow-shift level");
+            assert_eq!(normalized.normalized_request["shift"], json!(shift));
+        }
+        for shift in [0.9, 10.1] {
+            assert!(normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"shift", "shift":shift}),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn nested_endpoint_defaults_preserve_supplied_leaves() {
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+        )
+        .expect("HF image contract");
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.height")
+            .expect("height spec")
+            .default = Some(json!(1024));
+
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "inputs": "a brass compass",
+                "parameters": {"width": 768}
+            }),
+        )
+        .expect("nested signed defaults");
+
+        assert_eq!(normalized.normalized_request["parameters"]["width"], 768);
+        assert_eq!(normalized.normalized_request["parameters"]["height"], 1024);
+    }
+
     #[test]
     fn poisoned_gateway_mutex_does_not_cascade_into_later_requests() {
         let shared = Arc::new(Mutex::new(vec!["before"]));
@@ -25972,16 +26382,25 @@ mod tests {
         let small_image = ImageGenerationRequest {
             model: model.id.clone(),
             prompt: "small".to_owned(),
+            background: None,
+            moderation: None,
             n: Some(1),
+            output_compression: None,
+            output_format: None,
+            partial_images: None,
             size: Some("512x512".to_owned()),
-            response_format: None,
+            width: None,
+            height: None,
+            response_format: Some("b64_json".to_owned()),
             steps: Some(1),
-            cfg_scale: None,
+            cfg_scale: Some(1.0),
+            shift: None,
             seed: None,
             quality: None,
             style: None,
             negative_prompt: None,
             scheduler: None,
+            stream: None,
             user: None,
             endpoint_family: None,
             endpoint_request: None,
@@ -27496,6 +27915,7 @@ mod tests {
             size: None,
             steps: None,
             cfg_scale: None,
+            shift: None,
             seed: Some(77),
         };
 
@@ -27580,6 +28000,8 @@ mod tests {
                 "num_inference_steps": 17,
                 "guidance_scale": 6.5,
                 "negative_prompt": "blue",
+                "num_images_per_prompt": 3,
+                "shift": 4.5,
                 "scheduler": "euler",
                 "seed": 23
             }
@@ -27587,9 +28009,13 @@ mod tests {
 
         let request = hf_image_generation_request("test/image", raw.clone()).unwrap();
         assert_eq!(request.prompt, "a red cube");
-        assert_eq!(request.size.as_deref(), Some("768x512"));
+        assert_eq!(request.size, None);
+        assert_eq!(request.width, Some(768));
+        assert_eq!(request.height, Some(512));
         assert_eq!(request.steps, Some(17));
         assert_eq!(request.cfg_scale, Some(6.5));
+        assert_eq!(request.n, Some(3));
+        assert_eq!(request.shift, Some(4.5));
         assert_eq!(request.negative_prompt.as_deref(), Some("blue"));
         assert_eq!(request.scheduler.as_deref(), Some("euler"));
         assert_eq!(request.seed, Some(23));
@@ -27744,6 +28170,7 @@ mod tests {
                 size: Some("64x64".to_owned()),
                 steps: Some(1),
                 cfg_scale: Some(1.0),
+                shift: None,
                 seed: Some(7),
             }],
         )]);
@@ -28974,16 +29401,25 @@ mod tests {
         let image_request = ImageGenerationRequest {
             model: model.id.clone(),
             prompt: "quiet launch panel".to_owned(),
+            background: None,
+            moderation: None,
             n: Some(1),
+            output_compression: None,
+            output_format: None,
+            partial_images: None,
             size: Some("512x512".to_owned()),
-            response_format: None,
+            width: None,
+            height: None,
+            response_format: Some("b64_json".to_owned()),
             steps: Some(4),
-            cfg_scale: None,
+            cfg_scale: Some(1.0),
+            shift: None,
             seed: None,
             quality: None,
             style: None,
             negative_prompt: None,
             scheduler: None,
+            stream: None,
             user: None,
             endpoint_family: None,
             endpoint_request: None,
@@ -29782,7 +30218,7 @@ mod tests {
             "seconds": "4",
             "size": "1280x720"
         });
-        validate_catalog_endpoint_request(
+        let raw = normalize_catalog_endpoint_request(
             &state,
             &model.id,
             mayhem_proto::ENDPOINT_OPENAI_VIDEOS,

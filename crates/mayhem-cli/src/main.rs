@@ -3053,6 +3053,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long, value_name = "PATH")]
     vision_projector_path: Option<PathBuf>,
 
+    /// Local admin-bound artifact sidecar as NAME=PATH. Repeat for multi-part backends.
+    #[arg(long = "artifact-sidecar", value_name = "NAME=PATH")]
+    artifact_sidecars: Vec<String>,
+
     /// Restrict calibration to one prompt id. Defaults to all prompts in the canary set.
     #[arg(long)]
     prompt_id: Option<String>,
@@ -12204,6 +12208,10 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .as_ref()
         .map(|path| absolutize(path.clone()))
         .transpose()?;
+    let artifact_sidecar_paths = catalog_calibration_sidecar_paths(
+        &args.artifact_sidecars,
+        vision_projector_path.as_deref(),
+    )?;
     let report_output = args
         .report_output
         .as_ref()
@@ -12241,10 +12249,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
     verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
-    verify_calibration_vision_projector_matches_catalog(
-        artifact,
-        vision_projector_path.as_deref(),
-    )?;
+    verify_calibration_sidecars_match_catalog(artifact, &artifact_sidecar_paths)?;
     let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
         &model.canary.set_id,
@@ -12285,12 +12290,8 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             Ok::<_, anyhow::Error>(report)
         })
         .transpose()?;
-    let mut backend = catalog_calibration_backend(
-        artifact,
-        &artifact_path,
-        vision_projector_path.as_deref(),
-        &args,
-    )?;
+    let mut backend =
+        catalog_calibration_backend(artifact, &artifact_path, &artifact_sidecar_paths, &args)?;
     let report = if let Some(mut report) = resume_core_report {
         report.endpoint_calibration =
             catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
@@ -13007,11 +13008,19 @@ fn catalog_endpoint_calibration_report(
     prompts: &[CanaryPrompt],
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
     run_endpoint_calibration_matrix(
         &model.adapter.endpoint_families,
         &substitutions,
         |contract, _case, request| {
-            catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)
+            let cache_key = (contract.family.clone(), stable_value_hash(request));
+            if let Some(execution) = execution_cache.get(&cache_key) {
+                return Ok(execution.clone());
+            }
+            let execution =
+                catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)?;
+            execution_cache.insert(cache_key, execution.clone());
+            Ok(execution)
         },
     )
 }
@@ -13479,10 +13488,13 @@ fn calibration_endpoint_attribute_is_handled(
                 | "prompt"
                 | "n"
                 | "size"
+                | "width"
+                | "height"
                 | "response_format"
                 | "negative_prompt"
                 | "steps"
                 | "cfg_scale"
+                | "shift"
                 | "seed"
                 | "scheduler"
         ),
@@ -13491,9 +13503,11 @@ fn calibration_endpoint_attribute_is_handled(
             "inputs"
                 | "parameters.guidance_scale"
                 | "parameters.negative_prompt"
+                | "parameters.num_images_per_prompt"
                 | "parameters.num_inference_steps"
                 | "parameters.width"
                 | "parameters.height"
+                | "parameters.shift"
                 | "parameters.scheduler"
                 | "parameters.seed"
         ),
@@ -13824,26 +13838,77 @@ fn verify_calibration_artifact_matches_catalog(
     Ok(())
 }
 
-fn verify_calibration_vision_projector_matches_catalog(
-    artifact: &catalog::CatalogArtifact,
+fn catalog_calibration_sidecar_paths(
+    assignments: &[String],
     vision_projector_path: Option<&Path>,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let mut paths = BTreeMap::new();
+    for assignment in assignments {
+        let (name, path) = assignment
+            .split_once('=')
+            .with_context(|| format!("invalid --artifact-sidecar {assignment:?}; use NAME=PATH"))?;
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+            "invalid --artifact-sidecar name {name:?}"
+        );
+        ensure!(
+            !path.trim().is_empty(),
+            "artifact sidecar {name} path is empty"
+        );
+        let path = absolutize(PathBuf::from(path))?;
+        ensure!(
+            paths.insert(name.to_owned(), path).is_none(),
+            "artifact sidecar {name} was supplied more than once"
+        );
+    }
+    if let Some(path) = vision_projector_path {
+        ensure!(
+            paths
+                .insert("mmproj".to_owned(), path.to_path_buf())
+                .is_none(),
+            "mmproj was supplied through both --vision-projector-path and --artifact-sidecar"
+        );
+    }
+    Ok(paths)
+}
+
+fn verify_calibration_sidecars_match_catalog(
+    artifact: &catalog::CatalogArtifact,
+    paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    match (artifact.sidecars.get("mmproj"), vision_projector_path) {
-        (Some(sidecar), Some(path)) => verify_calibration_bound_file(
+    for (name, path) in paths {
+        let sidecar = artifact.sidecars.get(name).with_context(|| {
+            format!("artifact sidecar {name} is not declared by the admin catalog artifact")
+        })?;
+        verify_calibration_bound_file(
             path,
             &sidecar.artifact_root_kind,
             &sidecar.artifact_root,
             sidecar.weights_bytes,
-            "vision projector",
-        ),
-        (Some(_), None) => bail!(
-            "catalog artifact declares an admin-bound mmproj; pass --vision-projector-path so calibration proves the image path"
-        ),
-        (None, Some(_)) => bail!(
-            "--vision-projector-path is only allowed when the catalog artifact declares the mmproj sidecar"
-        ),
-        (None, None) => Ok(()),
+            &format!("artifact sidecar {name}"),
+        )?;
     }
+    if artifact.sidecars.contains_key("mmproj") && !paths.contains_key("mmproj") {
+        bail!(
+            "catalog artifact declares an admin-bound mmproj; pass --vision-projector-path so calibration proves the image path"
+        );
+    }
+    if artifact
+        .stable_diffusion_cpp
+        .is_some_and(|config| config.separate_diffusion_model)
+    {
+        for required in ["text_encoder", "vae"] {
+            ensure!(
+                paths.contains_key(required),
+                "split stable-diffusion.cpp calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn verify_calibration_bound_file(
@@ -16174,6 +16239,17 @@ fn catalog_canary_calibration_plan_command(
         let path = catalog_canary_plan_sidecar_path(artifact_base, sidecar);
         push_plan_path_arg(&mut argv, "--vision-projector-path", &path);
     }
+    for (name, sidecar) in &artifact.sidecars {
+        if name == "mmproj" {
+            continue;
+        }
+        let path = catalog_canary_plan_sidecar_path(artifact_base, sidecar);
+        push_plan_value_arg(
+            &mut argv,
+            "--artifact-sidecar",
+            format!("{name}={}", path.display()),
+        );
+    }
     push_plan_value_arg(&mut argv, "--ctx-size", args.ctx_size.max(1).to_string());
     push_plan_value_arg(&mut argv, "--seed", args.seed.to_string());
     if let Some(threads) = args.threads {
@@ -16856,7 +16932,7 @@ fn canary_set_file_sha256(
 fn catalog_calibration_backend(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
-    vision_projector_path: Option<&Path>,
+    sidecar_paths: &BTreeMap<String, PathBuf>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
     let managed_runtime = if matches!(artifact.engine.as_str(), "mlx" | "trt-llm" | "vllm") {
@@ -16910,13 +16986,38 @@ fn catalog_calibration_backend(
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
     }
-    if let Some(path) = vision_projector_path {
+    if let Some(path) = sidecar_paths.get("mmproj") {
         let sidecar = artifact
             .sidecars
             .get("mmproj")
             .context("verified vision projector is missing its catalog sidecar")?;
         config.vision_projector =
             Some(ModelArtifact::gguf(path).with_sha256(sidecar.source_sha256.clone()));
+    }
+    if artifact.engine == "stable-diffusion.cpp" {
+        config.stable_diffusion_cpp = artifact
+            .stable_diffusion_cpp
+            .context("stable-diffusion.cpp calibration is missing signed runtime semantics")?;
+        if let Some(path) = sidecar_paths.get("text_encoder") {
+            let sidecar = artifact
+                .sidecars
+                .get("text_encoder")
+                .context("verified text_encoder is missing its catalog sidecar")?;
+            config.stable_diffusion_llm = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+        if let Some(path) = sidecar_paths.get("vae") {
+            let sidecar = artifact
+                .sidecars
+                .get("vae")
+                .context("verified VAE is missing its catalog sidecar")?;
+            config.stable_diffusion_vae = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
     }
 
     match artifact.engine.as_str() {
@@ -17133,6 +17234,7 @@ fn calibrate_image_perceptual_hash_prompt(
     }
     request.steps = prompt.steps.unwrap_or(1).max(1);
     request.guidance_scale = prompt.cfg_scale.unwrap_or(1.0);
+    request.flow_shift = prompt.shift;
     let mut artifacts = Vec::new();
     backend
         .generate_image(request, &mut |chunk: ArtifactChunk| {
@@ -29893,6 +29995,8 @@ struct CanaryPrompt {
     steps: Option<u32>,
     #[serde(default)]
     cfg_scale: Option<f32>,
+    #[serde(default)]
+    shift: Option<f32>,
     #[serde(default)]
     seed: Option<u32>,
 }
@@ -52763,15 +52867,27 @@ fn provider_canary_self_test_body(
             "kind": "embedding",
             "input": canary_prompt_text(prompt)?,
         })),
-        "image-generation" => Ok(json!({
-            "kind": "image_generation",
-            "prompt": canary_prompt_text(prompt)?,
-            "n": 1,
-            "size": prompt.size.clone().unwrap_or_else(|| "64x64".to_owned()),
-            "steps": prompt.steps.unwrap_or(1).clamp(1, 2),
-            "cfg_scale": prompt.cfg_scale.unwrap_or(1.0),
-            "seed": prompt.seed.unwrap_or(7),
-        })),
+        "image-generation" => {
+            let mut body = json!({
+                "kind": "image_generation",
+                "prompt": canary_prompt_text(prompt)?,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("image canary body is an object");
+            for (name, value) in [
+                ("size", prompt.size.clone().map(Value::from)),
+                ("steps", prompt.steps.map(Value::from)),
+                ("cfg_scale", prompt.cfg_scale.map(Value::from)),
+                ("shift", prompt.shift.map(Value::from)),
+                ("seed", prompt.seed.map(Value::from)),
+            ] {
+                if let Some(value) = value {
+                    object.insert(name.to_owned(), value);
+                }
+            }
+            Ok(body)
+        }
         "video-generation" => Ok(json!({
             "kind": "video_generation",
             "prompt": canary_prompt_text(prompt)?,
@@ -52989,6 +53105,34 @@ fn provider_engine_load_config(
         .then_some(selected.feasibility.memory_budget.worker_limit_bytes);
     config.backend_cache_dir = backend_runtime.cache_dir.clone();
     config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
+    if selected.artifact.engine == "stable-diffusion.cpp" {
+        config.stable_diffusion_cpp = selected
+            .artifact
+            .stable_diffusion_cpp
+            .context("stable-diffusion.cpp catalog artifact is missing signed runtime semantics")?;
+        if let Some(path) = artifact_paths.sidecars.get("text_encoder") {
+            let sidecar = selected
+                .artifact
+                .sidecars
+                .get("text_encoder")
+                .context("downloaded text_encoder is missing from selected catalog artifact")?;
+            config.stable_diffusion_llm = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+        if let Some(path) = artifact_paths.sidecars.get("vae") {
+            let sidecar = selected
+                .artifact
+                .sidecars
+                .get("vae")
+                .context("downloaded VAE is missing from selected catalog artifact")?;
+            config.stable_diffusion_vae = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+    }
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
         let sidecar = selected
             .artifact
@@ -54272,7 +54416,19 @@ fn provider_verify_endpoint_request<'a>(
                 .join("; ")
         )
     })?;
-    if let Some(expected_model_id) = expected_model_id {
+    let request_with_defaults =
+        mayhem_proto::materialize_endpoint_request_defaults(contract, request)
+            .map_err(anyhow::Error::msg)?;
+    ensure!(
+        &request_with_defaults == request,
+        "provider request omitted an admin-signed endpoint default"
+    );
+    if let Some(expected_model_id) = expected_model_id.filter(|_| {
+        contract
+            .request_attributes
+            .iter()
+            .any(|path| path == "model")
+    }) {
         ensure!(
             request.get("model").and_then(Value::as_str) == Some(expected_model_id),
             "provider request model does not match the loaded canonical model"
@@ -54367,6 +54523,19 @@ fn provider_seal_local_contract_request(
         }
         request = public;
     }
+    request = mayhem_proto::materialize_endpoint_request_defaults(contract, &request)
+        .map_err(anyhow::Error::msg)?;
+    mayhem_proto::validate_endpoint_request(contract, &request).map_err(|violations| {
+        anyhow::anyhow!(
+            "local provider request violates signed endpoint contract: {}",
+            violations
+                .iter()
+                .take(4)
+                .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
     let mut transport = json!({"kind": provider_endpoint_transport_kind(family)?});
     for key in ["audio", "audio_seconds"] {
         if let Some(value) = body.get(key) {
@@ -54617,6 +54786,8 @@ fn provider_engine_session_response_with_sampling_bounded(
         let request = provider_image_generation_request_from_body(endpoint_family, request_body)?;
         let image_count = request.image_count;
         let steps = u64::from(request.steps);
+        let width = request.width;
+        let height = request.height;
         let mut artifact_chunks = Vec::new();
         let output = backend
             .generate_image(request, &mut |chunk: ArtifactChunk| {
@@ -54632,7 +54803,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         if artifacts.is_empty() {
             bail!("provider image generation engine produced no image artifacts");
         }
-        let usage = provider_image_generation_usage(artifacts.len() as u64, steps);
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
         if artifacts.len() as u32 != image_count {
             bail!(
                 "provider image generation engine produced {} artifact(s), expected {image_count}",
@@ -55083,10 +55254,20 @@ fn provider_image_generation_request_from_body(
         .context("image_generation request missing prompt")?
         .to_owned();
     let image_count = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
-        1
+        u32::try_from(
+            parameters
+                .and_then(|parameters| parameters.get("num_images_per_prompt"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+        )
+        .context("image_generation num_images_per_prompt overflowed u32")?
     } else {
-        u32::try_from(body.get("n").and_then(Value::as_u64).unwrap_or(1))
-            .context("image_generation n overflowed u32")?
+        u32::try_from(
+            body.get("n")
+                .and_then(Value::as_u64)
+                .context("signed image endpoint defaults did not resolve n")?,
+        )
+        .context("image_generation n overflowed u32")?
     };
     let steps = body
         .get("steps")
@@ -55096,7 +55277,7 @@ fn provider_image_generation_request_from_body(
                 .and_then(|parameters| parameters.get("num_inference_steps"))
                 .and_then(Value::as_u64)
         })
-        .unwrap_or(1);
+        .context("signed image endpoint defaults did not resolve steps")?;
     let cfg_scale = body
         .get("cfg_scale")
         .and_then(Value::as_f64)
@@ -55105,7 +55286,8 @@ fn provider_image_generation_request_from_body(
                 .and_then(|parameters| parameters.get("guidance_scale"))
                 .and_then(Value::as_f64)
         })
-        .unwrap_or(1.0) as f32;
+        .context("signed image endpoint defaults did not resolve guidance scale")?
+        as f32;
     let (width, height) = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
         (
             parameters
@@ -55114,14 +55296,27 @@ fn provider_image_generation_request_from_body(
                 .map(u32::try_from)
                 .transpose()
                 .context("image_generation width overflowed u32")?
-                .unwrap_or(512),
+                .context("signed image endpoint defaults did not resolve width")?,
             parameters
                 .and_then(|parameters| parameters.get("height"))
                 .and_then(Value::as_u64)
                 .map(u32::try_from)
                 .transpose()
                 .context("image_generation height overflowed u32")?
-                .unwrap_or(512),
+                .context("signed image endpoint defaults did not resolve height")?,
+        )
+    } else if body.get("width").is_some() || body.get("height").is_some() {
+        let width = body
+            .get("width")
+            .and_then(Value::as_u64)
+            .context("image_generation width is missing or invalid")?;
+        let height = body
+            .get("height")
+            .and_then(Value::as_u64)
+            .context("image_generation height is missing or invalid")?;
+        (
+            u32::try_from(width).context("image_generation width overflowed u32")?,
+            u32::try_from(height).context("image_generation height overflowed u32")?,
         )
     } else {
         provider_image_generation_size(body)?
@@ -55130,6 +55325,11 @@ fn provider_image_generation_request_from_body(
     request.image_count = image_count;
     request.steps = u32::try_from(steps).context("image_generation steps overflowed u32")?;
     request.guidance_scale = cfg_scale;
+    request.flow_shift = body
+        .get("shift")
+        .or_else(|| parameters.and_then(|parameters| parameters.get("shift")))
+        .and_then(Value::as_f64)
+        .map(|value| value as f32);
     request.width = width;
     request.height = height;
     request.negative_prompt = body
@@ -55157,7 +55357,7 @@ fn provider_image_generation_size(body: &Value) -> Result<(u32, u32)> {
     let size = body
         .get("size")
         .and_then(Value::as_str)
-        .unwrap_or("512x512");
+        .context("signed image endpoint defaults did not resolve size")?;
     let (width, height) = size
         .split_once('x')
         .context("image_generation size must be WIDTHxHEIGHT")?;
@@ -55264,10 +55464,22 @@ fn provider_duration_seconds_ceil(value: &Value) -> Option<u64> {
     })
 }
 
-fn provider_image_generation_usage(image_count: u64, steps: u64) -> ReceiptUsage {
+fn provider_image_generation_usage(
+    image_count: u64,
+    steps: u64,
+    width: u32,
+    height: u32,
+) -> ReceiptUsage {
+    let pixels = u64::from(width).saturating_mul(u64::from(height)).max(1);
+    let resolution_scale = pixels.div_ceil(512 * 512).max(1);
     ReceiptUsage::from_units([
         (USAGE_IMAGE, image_count),
-        (USAGE_STEP, image_count.saturating_mul(steps)),
+        (
+            USAGE_STEP,
+            image_count
+                .saturating_mul(steps)
+                .saturating_mul(resolution_scale),
+        ),
     ])
 }
 
@@ -58042,6 +58254,8 @@ mod tests {
         transcription_output: mayhem_engine::AudioTranscriptionOutput,
         speech_audio_seconds: u64,
         artifact_chunks: Vec<ArtifactChunk>,
+        repeat_image_artifact_to_count: bool,
+        image_generation_calls: usize,
         last_request: Option<GenerateRequest>,
         last_image_request: Option<EngineImageGenerationRequest>,
         last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
@@ -58139,6 +58353,8 @@ mod tests {
                 },
                 speech_audio_seconds: 3,
                 artifact_chunks: Vec::new(),
+                repeat_image_artifact_to_count: false,
+                image_generation_calls: 0,
                 last_request: None,
                 last_image_request: None,
                 last_embedding_request: None,
@@ -58152,6 +58368,11 @@ mod tests {
 
         fn with_artifact_chunks(mut self, artifact_chunks: Vec<ArtifactChunk>) -> Self {
             self.artifact_chunks = artifact_chunks;
+            self
+        }
+
+        fn with_repeated_image_artifact(mut self) -> Self {
+            self.repeat_image_artifact_to_count = true;
             self
         }
     }
@@ -58215,13 +58436,23 @@ mod tests {
             request: EngineImageGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
         ) -> mayhem_engine::Result<mayhem_engine::ImageGenerationOutput> {
+            self.image_generation_calls = self.image_generation_calls.saturating_add(1);
             let output = mayhem_engine::ImageGenerationOutput {
                 image_count: request.image_count,
                 steps: request.steps,
             };
+            let image_count = request.image_count;
             self.last_image_request = Some(request);
-            for chunk in self.artifact_chunks.clone() {
-                artifact_sink.on_artifact_chunk(chunk)?;
+            if self.repeat_image_artifact_to_count && self.artifact_chunks.len() == 1 {
+                for index in 0..image_count {
+                    let mut chunk = self.artifact_chunks[0].clone();
+                    chunk.artifact_id = format!("image-{}", index + 1);
+                    artifact_sink.on_artifact_chunk(chunk)?;
+                }
+            } else {
+                for chunk in self.artifact_chunks.clone() {
+                    artifact_sink.on_artifact_chunk(chunk)?;
+                }
             }
             Ok(output)
         }
@@ -67002,6 +67233,160 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn image_provider_canary_uses_explicit_values_or_signed_defaults() {
+        let mut model = test_catalog(&"aa".repeat(32)).models.remove(0);
+        model.model_class = "image-generation".to_owned();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("image endpoint contract")];
+        let contract = model.adapter.endpoint_families.first_mut().unwrap();
+        for (name, value) in [
+            ("n", json!(1)),
+            ("width", json!(1024)),
+            ("height", json!(1024)),
+            ("response_format", json!("b64_json")),
+            ("steps", json!(9)),
+            ("cfg_scale", json!(0.0)),
+            ("seed", json!(7)),
+        ] {
+            contract
+                .request_attribute_specs
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("missing {name} image attribute"))
+                .default = Some(value);
+        }
+
+        let defaulted_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "signed-defaults",
+            "prompt": "a compass on a map"
+        }))
+        .unwrap();
+        let body = provider_canary_self_test_body(&model, &defaulted_prompt).unwrap();
+        assert!(body.get("n").is_none());
+        assert!(body.get("size").is_none());
+        assert!(body.get("steps").is_none());
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let request = &sealed["contract_request"];
+        assert_eq!(request["n"], 1);
+        assert_eq!(request["width"], 1024);
+        assert_eq!(request["height"], 1024);
+        assert_eq!(request["steps"], 9);
+        assert_eq!(request["cfg_scale"], 0.0);
+
+        let explicit_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "explicit-values",
+            "prompt": "a compass on a map",
+            "size": "1536x1024",
+            "steps": 9,
+            "cfg_scale": 0.0,
+            "seed": 11
+        }))
+        .unwrap();
+        let explicit = provider_canary_self_test_body(&model, &explicit_prompt).unwrap();
+        assert_eq!(explicit["size"], "1536x1024");
+        assert_eq!(explicit["steps"], 9);
+        assert_eq!(explicit["cfg_scale"], 0.0);
+        assert_eq!(explicit["seed"], 11);
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_matrix_has_unique_ids() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+
+        for contract in &model.adapter.endpoint_families {
+            mayhem_proto::generate_endpoint_calibration_cases(contract)
+                .unwrap_or_else(|error| panic!("{}: {error}", contract.family));
+        }
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_preflight_is_complete() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_executes_each_normalized_request_once() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let mut backend = FakeEngineBackend::new("")
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "image-1".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: b"\x89PNG".to_vec(),
+                final_chunk: true,
+            }])
+            .with_repeated_image_artifact();
+
+        let report = catalog_endpoint_calibration_report(&mut backend, model, &prompts);
+        let failures = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| !case.ok)
+            .map(|case| {
+                format!(
+                    "{}: translation={:?}; backend={:?}; response={:?}",
+                    case.case_id,
+                    case.provider_translation.error,
+                    case.backend_execution.error,
+                    case.response_normalization.error
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(report.ok, "{failures:#?}");
+        let accepted = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| case.expect_accept)
+            .count();
+        let distinct_normalized = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter_map(|case| {
+                case.gateway_normalization
+                    .fingerprint
+                    .as_ref()
+                    .map(|fingerprint| (case.endpoint_family.clone(), fingerprint.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(backend.image_generation_calls, distinct_normalized);
+        assert!(backend.image_generation_calls < accepted);
+    }
+
+    #[test]
     fn provider_validates_and_meters_signed_chat_modalities() {
         let png = tiny_png_data_url();
         let wav = base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000));
@@ -67358,8 +67743,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "kind": "image_generation",
             "prompt": "draw a red square",
             "n": 1,
-            "size": "64x64",
+            "size": "1024x1024",
             "steps": 3,
+            "cfg_scale": 1.0,
             "seed": 9
         });
 
@@ -67373,7 +67759,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(output.artifacts.len(), 1);
         assert_eq!(output.usage.get(USAGE_IMAGE), 1);
-        assert_eq!(output.usage.get(USAGE_STEP), 3);
+        assert_eq!(output.usage.get(USAGE_STEP), 12);
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
         let request = backend
@@ -67381,10 +67767,74 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .expect("image generation request");
         assert_eq!(request.prompt, "draw a red square");
         assert_eq!(request.image_count, 1);
-        assert_eq!(request.width, 64);
-        assert_eq!(request.height, 64);
+        assert_eq!(request.width, 1024);
+        assert_eq!(request.height, 1024);
         assert_eq!(request.steps, 3);
         assert_eq!(request.seed, Some(9));
+    }
+
+    #[test]
+    fn provider_image_translation_preserves_signed_controls_without_fallbacks() {
+        let openai = provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            &json!({
+                "prompt":"a brass compass",
+                "n":4,
+                "width":768,
+                "height":1024,
+                "steps":9,
+                "cfg_scale":0.0,
+                "negative_prompt":"blur, watermark",
+                "shift":3.0,
+                "seed":17
+            }),
+        )
+        .unwrap();
+        assert_eq!(openai.image_count, 4);
+        assert_eq!((openai.width, openai.height), (768, 1024));
+        assert_eq!(openai.steps, 9);
+        assert_eq!(openai.guidance_scale, 0.0);
+        assert_eq!(openai.negative_prompt.as_deref(), Some("blur, watermark"));
+        assert_eq!(openai.flow_shift, Some(3.0));
+        assert_eq!(openai.seed, Some(17));
+
+        let hf = provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+            &json!({
+                "inputs":"a brass compass",
+                "parameters":{
+                    "width":1024,
+                    "height":768,
+                    "num_images_per_prompt":3,
+                    "num_inference_steps":11,
+                    "guidance_scale":2.5,
+                    "negative_prompt":"text, watermark",
+                    "shift":4.5,
+                    "seed":23
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(hf.image_count, 3);
+        assert_eq!((hf.width, hf.height), (1024, 768));
+        assert_eq!(hf.steps, 11);
+        assert_eq!(hf.guidance_scale, 2.5);
+        assert_eq!(hf.negative_prompt.as_deref(), Some("text, watermark"));
+        assert_eq!(hf.flow_shift, Some(4.5));
+        assert_eq!(hf.seed, Some(23));
+
+        assert!(provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            &json!({
+                "prompt":"a brass compass",
+                "n":1,
+                "steps":9,
+                "cfg_scale":0.0
+            }),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("signed image endpoint defaults did not resolve size"));
     }
 
     #[test]
@@ -71346,6 +71796,7 @@ State initialization...
             size: None,
             steps: None,
             cfg_scale: None,
+            shift: None,
             seed: None,
         };
 
@@ -73215,6 +73666,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -73326,6 +73778,7 @@ State initialization...
             "nvfp4".to_owned(),
             catalog::CatalogArtifact {
                 engine: "trt-llm".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-nvfp4".to_owned(),
@@ -73513,6 +73966,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -75058,6 +75512,7 @@ State initialization...
             artifact: "gguf-q4_k_m".to_owned(),
             artifact_path: PathBuf::from("/tmp/model.gguf"),
             vision_projector_path: None,
+            artifact_sidecars: Vec::new(),
             prompt_id: None,
             ctx_size: 1024,
             threads: None,
@@ -76013,6 +76468,7 @@ State initialization...
             "gguf-q4_k_m".to_owned(),
             catalog::CatalogArtifact {
                 engine: "llama.cpp".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model".to_owned(),
@@ -76295,6 +76751,7 @@ State initialization...
         );
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
+            stable_diffusion_cpp: None,
             source,
             upstream_source: None,
             path: "model.safetensors".to_owned(),

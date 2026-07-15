@@ -138,6 +138,37 @@ pub struct ModelArtifact {
     pub sha256: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StableDiffusionCppConfig {
+    #[serde(default)]
+    pub separate_diffusion_model: bool,
+    #[serde(default)]
+    pub guidance_scale_offset: i32,
+    #[serde(default)]
+    pub steps_offset: i32,
+}
+
+impl StableDiffusionCppConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(-16..=16).contains(&self.guidance_scale_offset) {
+            return Err(EngineError::InvalidConfig(
+                "stable-diffusion.cpp guidance_scale_offset must be between -16 and 16".to_owned(),
+            ));
+        }
+        if !(-16..=16).contains(&self.steps_offset) {
+            return Err(EngineError::InvalidConfig(
+                "stable-diffusion.cpp steps_offset must be between -16 and 16".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ModelArtifact {
     pub fn gguf(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -217,6 +248,12 @@ pub struct LoadConfig {
     pub vision_projector: Option<ModelArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub piper_config: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_diffusion_llm: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_diffusion_vae: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "StableDiffusionCppConfig::is_default")]
+    pub stable_diffusion_cpp: StableDiffusionCppConfig,
     #[serde(default = "default_context_size")]
     pub ctx_size: u32,
     #[serde(default = "default_batch_size")]
@@ -312,6 +349,9 @@ impl Default for LoadConfig {
             artifact: ModelArtifact::gguf(PathBuf::new()),
             vision_projector: None,
             piper_config: None,
+            stable_diffusion_llm: None,
+            stable_diffusion_vae: None,
+            stable_diffusion_cpp: StableDiffusionCppConfig::default(),
             ctx_size: DEFAULT_CONTEXT_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
@@ -438,6 +478,8 @@ pub struct ImageGenerationRequest {
     #[serde(default = "default_image_guidance_scale")]
     pub guidance_scale: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_shift: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_method: Option<String>,
@@ -456,6 +498,7 @@ impl ImageGenerationRequest {
             height: default_image_height(),
             steps: default_image_steps(),
             guidance_scale: default_image_guidance_scale(),
+            flow_shift: None,
             seed: None,
             sampling_method: None,
             scheduler: None,
@@ -486,6 +529,14 @@ impl ImageGenerationRequest {
         if !self.guidance_scale.is_finite() || !(0.0..=50.0).contains(&self.guidance_scale) {
             return Err(EngineError::InvalidConfig(
                 "image guidance_scale must be finite and between 0 and 50".to_owned(),
+            ));
+        }
+        if self
+            .flow_shift
+            .is_some_and(|shift| !shift.is_finite() || !(1.0..=10.0).contains(&shift))
+        {
+            return Err(EngineError::InvalidConfig(
+                "image flow_shift must be finite and between 1 and 10".to_owned(),
             ));
         }
         for (name, value) in [
@@ -2195,10 +2246,16 @@ mod piper_backend {
 
 mod stable_diffusion_cpp_backend {
     use std::env;
-    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use base64::{engine::general_purpose, Engine as _};
+    use serde_json::{json, Value};
 
     use super::{
         stable_diffusion_payload_path, validate_load_config, verify_artifact, ArtifactChunk,
@@ -2207,33 +2264,249 @@ mod stable_diffusion_cpp_backend {
         TokenSink, Tokenization, DEFAULT_SEED,
     };
 
-    const MAX_IMAGE_COUNT: u32 = 4;
+    const SERVER_CAPTURE_LIMIT: usize = 16 * 1024;
+    const HTTP_HEADER_LIMIT: usize = 64 * 1024;
+    const HEALTH_RESPONSE_LIMIT: usize = 1024 * 1024;
+
+    type OutputTail = Arc<Mutex<Vec<u8>>>;
+
+    #[derive(Debug)]
+    struct StableDiffusionServerProcess {
+        child: Child,
+        stdout_tail: OutputTail,
+        stderr_tail: OutputTail,
+        stdout_thread: Option<JoinHandle<()>>,
+        stderr_thread: Option<JoinHandle<()>>,
+    }
+
+    impl StableDiffusionServerProcess {
+        fn new(mut child: Child) -> Self {
+            let stdout_tail = Arc::new(Mutex::new(Vec::new()));
+            let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+            let stdout_thread = child
+                .stdout
+                .take()
+                .map(|stdout| spawn_output_capture(stdout, Arc::clone(&stdout_tail)));
+            let stderr_thread = child
+                .stderr
+                .take()
+                .map(|stderr| spawn_output_capture(stderr, Arc::clone(&stderr_tail)));
+            Self {
+                child,
+                stdout_tail,
+                stderr_tail,
+                stdout_thread,
+                stderr_thread,
+            }
+        }
+
+        fn output_summary(&self) -> String {
+            let stdout = captured_output(&self.stdout_tail);
+            let stderr = captured_output(&self.stderr_tail);
+            format!("stderr={stderr:?}; stdout={stdout:?}")
+        }
+
+        fn join_capture_threads(&mut self) {
+            if let Some(thread) = self.stdout_thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(thread) = self.stderr_thread.take() {
+                let _ = thread.join();
+            }
+        }
+
+        fn shutdown(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.join_capture_threads();
+        }
+    }
+
+    impl Drop for StableDiffusionServerProcess {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    #[derive(Debug)]
+    struct HttpResponse {
+        status: u16,
+        body: Vec<u8>,
+    }
 
     #[derive(Debug)]
     pub struct StableDiffusionCppBackend {
-        binary: PathBuf,
+        server_binary: PathBuf,
         loaded: Option<LoadedModelInfo>,
         config: Option<LoadConfig>,
+        server_address: Option<SocketAddr>,
+        server: Option<StableDiffusionServerProcess>,
     }
 
     impl StableDiffusionCppBackend {
         pub fn new() -> Result<Self> {
-            let binary = env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
+            let server_binary = env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_SERVER_BIN")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("sd-cli"));
-            Ok(Self::with_binary(binary))
+                .or_else(|| {
+                    env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
+                        .map(PathBuf::from)
+                        .map(derive_server_binary)
+                })
+                .unwrap_or_else(|| PathBuf::from(server_executable_name()));
+            Ok(Self::with_server_binary(server_binary))
         }
 
         pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
+            Self::with_server_binary(derive_server_binary(binary.into()))
+        }
+
+        pub fn with_server_binary(server_binary: impl Into<PathBuf>) -> Self {
             Self {
-                binary: binary.into(),
+                server_binary: server_binary.into(),
                 loaded: None,
                 config: None,
+                server_address: None,
+                server: None,
             }
         }
 
         fn config(&self) -> Result<&LoadConfig> {
             self.config.as_ref().ok_or(EngineError::NotLoaded)
+        }
+
+        fn stop_server(&mut self) {
+            self.server_address = None;
+            if let Some(mut server) = self.server.take() {
+                server.shutdown();
+            }
+        }
+
+        fn build_server_command(
+            &self,
+            config: &LoadConfig,
+            address: SocketAddr,
+        ) -> Result<Command> {
+            let model_path = stable_diffusion_payload_path(&config.artifact.path)?;
+            let llm_path = config
+                .stable_diffusion_llm
+                .as_ref()
+                .map(|artifact| stable_diffusion_payload_path(&artifact.path))
+                .transpose()?;
+            let vae_path = config
+                .stable_diffusion_vae
+                .as_ref()
+                .map(|artifact| stable_diffusion_payload_path(&artifact.path))
+                .transpose()?;
+            let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| config.stable_diffusion_backend.clone());
+
+            let mut command = Command::new(&self.server_binary);
+            if config.stable_diffusion_cpp.separate_diffusion_model {
+                command.arg("--diffusion-model").arg(model_path);
+            } else {
+                command.arg("-m").arg(model_path);
+            }
+            if let Some(llm_path) = llm_path {
+                command.arg("--llm").arg(llm_path);
+            }
+            if let Some(vae_path) = vae_path {
+                command.arg("--vae").arg(vae_path);
+            }
+            if let Some(backend) = backend {
+                command.arg("--backend").arg(backend);
+            }
+            command
+                .arg("--rng")
+                .arg("cpu")
+                .arg("--listen-ip")
+                .arg(address.ip().to_string())
+                .arg("--listen-port")
+                .arg(address.port().to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            Ok(command)
+        }
+
+        fn start_server(
+            &mut self,
+            config: &LoadConfig,
+        ) -> Result<(SocketAddr, StableDiffusionServerProcess)> {
+            let address = reserve_loopback_address()?;
+            let mut command = self.build_server_command(config, address)?;
+            let child = command.spawn().map_err(|err| {
+                EngineError::StableDiffusionCpp(format!(
+                    "starting {} failed: {err}",
+                    self.server_binary.display()
+                ))
+            })?;
+            let mut server = StableDiffusionServerProcess::new(child);
+            let timeout = configured_startup_timeout()?;
+            let started = Instant::now();
+
+            loop {
+                if let Some(status) = server.child.try_wait().map_err(|err| {
+                    EngineError::StableDiffusionCpp(format!(
+                        "checking {} failed: {err}",
+                        self.server_binary.display()
+                    ))
+                })? {
+                    server.join_capture_threads();
+                    return Err(EngineError::StableDiffusionCpp(format!(
+                        "{} exited during model load with {status}; {}",
+                        self.server_binary.display(),
+                        server.output_summary()
+                    )));
+                }
+
+                if server_ready(address) {
+                    return Ok((address, server));
+                }
+
+                if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                    server.shutdown();
+                    return Err(EngineError::StableDiffusionCpp(format!(
+                        "{} did not become ready within the configured {} seconds; {}",
+                        self.server_binary.display(),
+                        timeout.expect("checked above").as_secs(),
+                        server.output_summary()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn with_ready_server(config: LoadConfig, address: SocketAddr) -> Result<Self> {
+            validate_stable_diffusion_config(&config)?;
+            Ok(Self {
+                server_binary: PathBuf::from(server_executable_name()),
+                loaded: Some(loaded_model_info(&config)),
+                config: Some(config),
+                server_address: Some(address),
+                server: None,
+            })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn server_command_args(
+            &self,
+            config: &LoadConfig,
+            address: SocketAddr,
+        ) -> Result<Vec<String>> {
+            self.build_server_command(config, address).map(|command| {
+                command
+                    .get_args()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect()
+            })
+        }
+    }
+
+    impl Drop for StableDiffusionCppBackend {
+        fn drop(&mut self) {
+            self.stop_server();
         }
     }
 
@@ -2243,24 +2516,29 @@ mod stable_diffusion_cpp_backend {
         }
 
         fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
-            validate_load_config(&config)?;
-            if config.artifact.format != ArtifactFormat::StableDiffusionCheckpoint {
-                return Err(EngineError::InvalidConfig(format!(
-                    "stable-diffusion.cpp backend requires stable-diffusion checkpoints, got {:?}",
-                    config.artifact.format
-                )));
-            }
-            verify_artifact(&config.artifact)?;
-            let info = LoadedModelInfo {
-                backend: self.backend_id().to_owned(),
-                artifact: config.artifact.clone(),
-                ctx_size: config.ctx_size,
-                n_ctx_train: 0,
-                n_vocab: 0,
-            };
+            validate_stable_diffusion_config(&config)?;
+            let info = loaded_model_info(&config);
+            self.stop_server();
+            let (address, server) = self.start_server(&config)?;
             self.loaded = Some(info.clone());
             self.config = Some(config);
+            self.server_address = Some(address);
+            self.server = Some(server);
             Ok(info)
+        }
+
+        fn component_healthy(&mut self) -> bool {
+            match self.server.as_mut() {
+                Some(server) => matches!(server.child.try_wait(), Ok(None)),
+                None => self.server_address.is_some(),
+            }
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.server
+                .as_ref()
+                .map(|server| vec![server.child.id()])
+                .unwrap_or_default()
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
@@ -2291,83 +2569,119 @@ mod stable_diffusion_cpp_backend {
         ) -> Result<ImageGenerationOutput> {
             request.validate()?;
             let config = self.config()?.clone();
-            let image_count = request.image_count.clamp(1, MAX_IMAGE_COUNT);
-            let width = request.width.clamp(64, 2048);
-            let height = request.height.clamp(64, 2048);
-            let steps = request.steps.clamp(1, 150);
-            let cfg_scale = request.guidance_scale.clamp(0.0, 50.0);
+            if request.prompt.contains("sd_cpp_extra_args") {
+                return Err(EngineError::InvalidConfig(
+                    "image prompt may not contain stable-diffusion.cpp control tags".to_owned(),
+                ));
+            }
+            let image_count = request.image_count;
+            let width = request.width;
+            let height = request.height;
+            let steps = request.steps;
+            let engine_steps = i64::from(steps)
+                .checked_add(i64::from(config.stable_diffusion_cpp.steps_offset))
+                .filter(|value| (1..=150).contains(value))
+                .ok_or_else(|| {
+                    EngineError::InvalidConfig(format!(
+                        "image steps {steps} with backend offset {} fall outside 1..=150",
+                        config.stable_diffusion_cpp.steps_offset
+                    ))
+                })?;
+            let cfg_scale = request.guidance_scale;
+            let engine_cfg_scale =
+                cfg_scale + config.stable_diffusion_cpp.guidance_scale_offset as f32;
+            if !engine_cfg_scale.is_finite() || !(0.0..=50.0).contains(&engine_cfg_scale) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "image guidance_scale {cfg_scale} with backend offset {} falls outside 0..=50",
+                    config.stable_diffusion_cpp.guidance_scale_offset
+                )));
+            }
             let seed_base = request.seed.unwrap_or(DEFAULT_SEED);
-            let model_path = stable_diffusion_payload_path(&config.artifact.path)?;
-            let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| config.stable_diffusion_backend.clone());
-
-            for image_index in 0..image_count {
-                let output_path = stable_diffusion_output_path(image_index);
-                if output_path.exists() {
-                    fs::remove_file(&output_path)?;
-                }
-                let seed = seed_base.wrapping_add(image_index);
-                let mut command = Command::new(&self.binary);
-                command
-                    .arg("-m")
-                    .arg(&model_path)
-                    .arg("-p")
-                    .arg(&request.prompt)
-                    .arg("-o")
-                    .arg(&output_path)
-                    .arg("--steps")
-                    .arg(steps.to_string())
-                    .arg("--cfg-scale")
-                    .arg(cfg_scale.to_string())
-                    .arg("--seed")
-                    .arg(seed.to_string())
-                    .arg("--width")
-                    .arg(width.to_string())
-                    .arg("--height")
-                    .arg(height.to_string())
-                    .arg("--rng")
-                    .arg("cpu");
-                if let Some(negative_prompt) = request.negative_prompt.as_deref() {
-                    command.arg("--negative-prompt").arg(negative_prompt);
-                }
-                if let Some(sampling_method) = request.sampling_method.as_deref() {
-                    command.arg("--sampling-method").arg(sampling_method);
-                }
-                if let Some(scheduler) = request.scheduler.as_deref() {
-                    command.arg("--scheduler").arg(scheduler);
-                }
-                if let Some(backend) = &backend {
-                    command.arg("--backend").arg(backend);
-                }
-                let output = command.output().map_err(|err| {
+            let address = self.server_address.ok_or(EngineError::NotLoaded)?;
+            let mut body = json!({
+                "prompt": request.prompt,
+                "width": width,
+                "height": height,
+                "steps": engine_steps,
+                "cfg_scale": engine_cfg_scale,
+                "seed": seed_base,
+                "batch_size": image_count,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("stable-diffusion request body is an object");
+            if let Some(negative_prompt) = request.negative_prompt {
+                object.insert("negative_prompt".to_owned(), Value::String(negative_prompt));
+            }
+            if let Some(sampling_method) = request.sampling_method {
+                object.insert("sampler_name".to_owned(), Value::String(sampling_method));
+            }
+            if let Some(scheduler) = request.scheduler {
+                object.insert("scheduler".to_owned(), Value::String(scheduler));
+            }
+            if let Some(flow_shift) = request.flow_shift {
+                let extra = serde_json::to_string(&json!({
+                    "sample_params": {"flow_shift": flow_shift}
+                }))?;
+                let prompt = object
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .expect("stable-diffusion request prompt is text");
+                object.insert(
+                    "prompt".to_owned(),
+                    Value::String(format!(
+                        "{prompt} <sd_cpp_extra_args>{extra}</sd_cpp_extra_args>"
+                    )),
+                );
+            }
+            let encoded_body = serde_json::to_vec(&body)?;
+            let response = http_request(
+                address,
+                "POST",
+                "/sdapi/v1/txt2img",
+                Some(&encoded_body),
+                max_image_response_bytes(image_count, width, height)?,
+                None,
+            )?;
+            if !(200..300).contains(&response.status) {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "sd-server returned HTTP {}: {}",
+                    response.status,
+                    response_snippet(&response.body)
+                )));
+            }
+            let response: Value = serde_json::from_slice(&response.body)?;
+            let images = response
+                .get("images")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    EngineError::StableDiffusionCpp(
+                        "sd-server response is missing the images array".to_owned(),
+                    )
+                })?;
+            if images.len() != image_count as usize {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "sd-server returned {} images for requested batch of {image_count}",
+                    images.len()
+                )));
+            }
+            for (image_index, image) in images.iter().enumerate() {
+                let encoded = image.as_str().ok_or_else(|| {
                     EngineError::StableDiffusionCpp(format!(
-                        "starting {} failed: {err}",
-                        self.binary.display()
+                        "sd-server image {} is not base64 text",
+                        image_index + 1
                     ))
                 })?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                    return Err(EngineError::StableDiffusionCpp(format!(
-                        "{} exited with {}; stderr={stderr:?}; stdout={stdout:?}",
-                        self.binary.display(),
-                        output.status
-                    )));
-                }
-                let bytes = fs::read(&output_path).map_err(|err| {
+                let bytes = general_purpose::STANDARD.decode(encoded).map_err(|err| {
                     EngineError::StableDiffusionCpp(format!(
-                        "{} did not create readable output {}: {err}",
-                        self.binary.display(),
-                        output_path.display()
+                        "decoding sd-server image {} failed: {err}",
+                        image_index + 1
                     ))
                 })?;
-                if bytes.is_empty() {
+                if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(EngineError::StableDiffusionCpp(format!(
-                        "{} created empty output {}",
-                        self.binary.display(),
-                        output_path.display()
+                        "sd-server image {} is not a PNG",
+                        image_index + 1
                     )));
                 }
                 artifact_sink.on_artifact_chunk(ArtifactChunk {
@@ -2377,98 +2691,383 @@ mod stable_diffusion_cpp_backend {
                     bytes,
                     final_chunk: true,
                 })?;
-                let _ = fs::remove_file(&output_path);
             }
 
             Ok(ImageGenerationOutput { image_count, steps })
         }
     }
 
-    fn stable_diffusion_output_path(image_index: u32) -> PathBuf {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        env::temp_dir().join(format!(
-            "mayhem-sd-{}-{millis}-{image_index}.png",
-            std::process::id()
-        ))
+    fn validate_stable_diffusion_config(config: &LoadConfig) -> Result<()> {
+        validate_load_config(config)?;
+        if config.artifact.format != ArtifactFormat::StableDiffusionCheckpoint {
+            return Err(EngineError::InvalidConfig(format!(
+                "stable-diffusion.cpp backend requires stable-diffusion checkpoints, got {:?}",
+                config.artifact.format
+            )));
+        }
+        config.stable_diffusion_cpp.validate()?;
+        verify_artifact(&config.artifact)?;
+        for (label, artifact) in [
+            ("LLM", config.stable_diffusion_llm.as_ref()),
+            ("VAE", config.stable_diffusion_vae.as_ref()),
+        ] {
+            if let Some(artifact) = artifact {
+                if artifact.format != ArtifactFormat::StableDiffusionCheckpoint {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "stable-diffusion.cpp {label} sidecar must use stable-diffusion checkpoint format"
+                    )));
+                }
+                verify_artifact(artifact)?;
+            }
+        }
+        if config.stable_diffusion_cpp.separate_diffusion_model
+            && (config.stable_diffusion_llm.is_none() || config.stable_diffusion_vae.is_none())
+        {
+            return Err(EngineError::InvalidConfig(
+                "separate stable-diffusion.cpp diffusion models require pinned LLM and VAE sidecars"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn loaded_model_info(config: &LoadConfig) -> LoadedModelInfo {
+        LoadedModelInfo {
+            backend: "stable-diffusion.cpp".to_owned(),
+            artifact: config.artifact.clone(),
+            ctx_size: config.ctx_size,
+            n_ctx_train: 0,
+            n_vocab: 0,
+        }
+    }
+
+    fn server_executable_name() -> &'static str {
+        if cfg!(windows) {
+            "sd-server.exe"
+        } else {
+            "sd-server"
+        }
+    }
+
+    fn derive_server_binary(binary: PathBuf) -> PathBuf {
+        let Some(name) = binary.file_name().and_then(|name| name.to_str()) else {
+            return binary;
+        };
+        let replacement = if name.eq_ignore_ascii_case("sd-cli.exe") {
+            Some("sd-server.exe")
+        } else if name.eq_ignore_ascii_case("sd-cli") {
+            Some("sd-server")
+        } else {
+            None
+        };
+        replacement
+            .map(|replacement| binary.with_file_name(replacement))
+            .unwrap_or(binary)
+    }
+
+    fn reserve_loopback_address() -> Result<SocketAddr> {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        Ok(address)
+    }
+
+    fn configured_startup_timeout() -> Result<Option<Duration>> {
+        let Some(raw) = env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_STARTUP_TIMEOUT_SECONDS") else {
+            return Ok(None);
+        };
+        let raw = raw.to_string_lossy();
+        let seconds = raw.parse::<u64>().map_err(|_| {
+            EngineError::InvalidConfig(
+                "MAYHEM_STABLE_DIFFUSION_CPP_STARTUP_TIMEOUT_SECONDS must be a positive integer"
+                    .to_owned(),
+            )
+        })?;
+        if seconds == 0 {
+            return Err(EngineError::InvalidConfig(
+                "MAYHEM_STABLE_DIFFUSION_CPP_STARTUP_TIMEOUT_SECONDS must be greater than zero"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(Duration::from_secs(seconds)))
+    }
+
+    fn server_ready(address: SocketAddr) -> bool {
+        let Ok(response) = http_request(
+            address,
+            "GET",
+            "/v1/models",
+            None,
+            HEALTH_RESPONSE_LIMIT,
+            Some(Duration::from_secs(1)),
+        ) else {
+            return false;
+        };
+        response.status == 200
+            && serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .and_then(|value| value.get("data").cloned())
+                .is_some_and(|data| data.is_array())
+    }
+
+    fn spawn_output_capture<R>(mut reader: R, tail: OutputTail) -> JoinHandle<()>
+    where
+        R: Read + Send + 'static,
+    {
+        thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(count) = reader.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                let Ok(mut captured) = tail.lock() else {
+                    break;
+                };
+                captured.extend_from_slice(&chunk[..count]);
+                if captured.len() > SERVER_CAPTURE_LIMIT {
+                    let excess = captured.len() - SERVER_CAPTURE_LIMIT;
+                    captured.drain(..excess);
+                }
+            }
+        })
+    }
+
+    fn captured_output(tail: &OutputTail) -> String {
+        tail.lock()
+            .map(|captured| String::from_utf8_lossy(&captured).trim().to_owned())
+            .unwrap_or_else(|_| "<capture unavailable>".to_owned())
+    }
+
+    fn max_image_response_bytes(image_count: u32, width: u32, height: u32) -> Result<usize> {
+        let raw_bytes = usize::try_from(image_count)
+            .ok()
+            .and_then(|count| count.checked_mul(width as usize))
+            .and_then(|pixels| pixels.checked_mul(height as usize))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                EngineError::InvalidConfig("image response size exceeds platform limits".to_owned())
+            })?;
+        raw_bytes
+            .checked_mul(2)
+            .and_then(|bound| bound.checked_add(1024 * 1024))
+            .ok_or_else(|| {
+                EngineError::InvalidConfig("image response size exceeds platform limits".to_owned())
+            })
+    }
+
+    fn http_request(
+        address: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        body_limit: usize,
+        read_timeout: Option<Duration>,
+    ) -> Result<HttpResponse> {
+        let mut stream =
+            TcpStream::connect_timeout(&address, Duration::from_millis(250)).map_err(|err| {
+                EngineError::StableDiffusionCpp(format!(
+                    "connecting to local sd-server at {address} failed: {err}"
+                ))
+            })?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(read_timeout)?;
+        let body = body.unwrap_or_default();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(body)?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        if reader.read_line(&mut status_line)? == 0 {
+            return Err(EngineError::StableDiffusionCpp(
+                "local sd-server closed without an HTTP response".to_owned(),
+            ));
+        }
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| {
+                EngineError::StableDiffusionCpp(format!(
+                    "local sd-server returned an invalid status line: {:?}",
+                    status_line.trim()
+                ))
+            })?;
+
+        let mut header_bytes = status_line.len();
+        let mut content_length = None;
+        let mut chunked = false;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Err(EngineError::StableDiffusionCpp(
+                    "local sd-server closed inside HTTP headers".to_owned(),
+                ));
+            }
+            header_bytes = header_bytes.saturating_add(line.len());
+            if header_bytes > HTTP_HEADER_LIMIT {
+                return Err(EngineError::StableDiffusionCpp(
+                    "local sd-server HTTP headers exceed 64 KiB".to_owned(),
+                ));
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                        EngineError::StableDiffusionCpp(
+                            "local sd-server returned an invalid Content-Length".to_owned(),
+                        )
+                    })?);
+                } else if name.eq_ignore_ascii_case("transfer-encoding")
+                    && value
+                        .split(',')
+                        .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+                {
+                    chunked = true;
+                }
+            }
+        }
+
+        let body = if chunked {
+            read_chunked_body(&mut reader, body_limit)?
+        } else if let Some(content_length) = content_length {
+            if content_length > body_limit {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "local sd-server response is {content_length} bytes, above the {body_limit}-byte bound"
+                )));
+            }
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body)?;
+            body
+        } else {
+            let mut body = Vec::new();
+            reader
+                .take((body_limit as u64).saturating_add(1))
+                .read_to_end(&mut body)?;
+            if body.len() > body_limit {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "local sd-server response exceeds the {body_limit}-byte bound"
+                )));
+            }
+            body
+        };
+        Ok(HttpResponse { status, body })
+    }
+
+    fn read_chunked_body<R: BufRead>(reader: &mut R, body_limit: usize) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Err(EngineError::StableDiffusionCpp(
+                    "local sd-server closed inside a chunked response".to_owned(),
+                ));
+            }
+            let size = line
+                .trim()
+                .split(';')
+                .next()
+                .and_then(|value| usize::from_str_radix(value, 16).ok())
+                .ok_or_else(|| {
+                    EngineError::StableDiffusionCpp(
+                        "local sd-server returned an invalid chunk size".to_owned(),
+                    )
+                })?;
+            if size == 0 {
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                break;
+            }
+            if body.len().saturating_add(size) > body_limit {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "local sd-server response exceeds the {body_limit}-byte bound"
+                )));
+            }
+            let start = body.len();
+            body.resize(start + size, 0);
+            reader.read_exact(&mut body[start..])?;
+            let mut terminator = [0_u8; 2];
+            reader.read_exact(&mut terminator)?;
+            if terminator != *b"\r\n" {
+                return Err(EngineError::StableDiffusionCpp(
+                    "local sd-server returned an invalid chunk terminator".to_owned(),
+                ));
+            }
+        }
+        Ok(body)
+    }
+
+    fn response_snippet(body: &[u8]) -> String {
+        String::from_utf8_lossy(&body[..body.len().min(4096)])
+            .chars()
+            .map(|character| {
+                if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                    '\u{fffd}'
+                } else {
+                    character
+                }
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod stable_diffusion_tests {
-    #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+
+    use base64::{engine::general_purpose, Engine as _};
 
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn stable_diffusion_cpp_backend_emits_generated_image_artifact() {
+    fn stable_diffusion_cpp_backend_uses_one_native_request_and_emits_every_image() {
         let root =
             std::env::temp_dir().join(format!("mayhem-engine-sd-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let model = root.join("model.safetensors");
         fs::write(&model, stable_empty_safetensors()).unwrap();
-        let sd_cli = root.join("sd-cli");
-        fs::write(
-            &sd_cli,
-            r#"#!/bin/sh
-out=""
-cfg=""
-negative=""
-sampler=""
-scheduler=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-o" ]; then
-    shift
-    out="$1"
-  fi
-  if [ "$1" = "--cfg-scale" ]; then
-    shift
-    cfg="$1"
-  fi
-  if [ "$1" = "--negative-prompt" ]; then
-    shift
-    negative="$1"
-  fi
-  if [ "$1" = "--sampling-method" ]; then
-    shift
-    sampler="$1"
-  fi
-  if [ "$1" = "--scheduler" ]; then
-    shift
-    scheduler="$1"
-  fi
-  shift
-done
-[ "$cfg" = "1.25" ] || exit 23
-[ "$negative" = "blur" ] || exit 24
-[ "$sampler" = "euler" ] || exit 25
-[ "$scheduler" = "discrete" ] || exit 26
-printf '\211PNG\r\n\032\n' > "$out"
-"#,
+        let expected = json!({
+            "prompt": "a red square <sd_cpp_extra_args>{\"sample_params\":{\"flow_shift\":3.0}}</sd_cpp_extra_args>",
+            "negative_prompt": "blur",
+            "batch_size": 2,
+            "width": 64,
+            "height": 64,
+            "steps": 2,
+            "cfg_scale": 1.25,
+            "seed": 7,
+            "sampler_name": "euler",
+            "scheduler": "discrete",
+        });
+        let first = b"\x89PNG\r\n\x1a\nfirst".to_vec();
+        let second = b"\x89PNG\r\n\x1a\nsecond".to_vec();
+        let (address, server) = serve_sdapi_once(expected, vec![first.clone(), second.clone()]);
+        let mut backend = StableDiffusionCppBackend::with_ready_server(
+            LoadConfig::stable_diffusion_checkpoint(&model),
+            address,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&sd_cli).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&sd_cli, permissions).unwrap();
-
-        let mut backend = StableDiffusionCppBackend::with_binary(&sd_cli);
-        backend
-            .load(LoadConfig::stable_diffusion_checkpoint(&model))
-            .unwrap();
         let mut request = ImageGenerationRequest::new("a red square");
         request.negative_prompt = Some("blur".to_owned());
-        request.image_count = 1;
+        request.image_count = 2;
         request.width = 64;
         request.height = 64;
         request.steps = 2;
         request.guidance_scale = 1.25;
+        request.flow_shift = Some(3.0);
         request.seed = Some(7);
         request.sampling_method = Some("euler".to_owned());
         request.scheduler = Some("discrete".to_owned());
@@ -2480,11 +3079,110 @@ printf '\211PNG\r\n\032\n' > "$out"
             })
             .unwrap();
 
-        assert_eq!(artifacts.len(), 1);
+        server.join().unwrap();
+        assert_eq!(artifacts.len(), 2);
         assert_eq!(artifacts[0].artifact_id, "image-1");
         assert_eq!(artifacts[0].content_type, "image/png");
-        assert_eq!(artifacts[0].bytes, b"\x89PNG\r\n\x1a\n");
+        assert_eq!(artifacts[0].bytes, first);
+        assert_eq!(artifacts[1].artifact_id, "image-2");
+        assert_eq!(artifacts[1].bytes, second);
         assert!(artifacts[0].final_chunk);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_diffusion_cpp_backend_wires_split_components_and_signed_offsets() {
+        let root = std::env::temp_dir().join(format!(
+            "mayhem-engine-sd-components-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let diffusion = root.join("diffusion.gguf");
+        let llm = root.join("text-encoder.gguf");
+        let vae = root.join("vae.safetensors");
+        fs::write(&diffusion, b"GGUF").unwrap();
+        fs::write(&llm, b"GGUF").unwrap();
+        fs::write(&vae, stable_empty_safetensors()).unwrap();
+
+        let mut config = LoadConfig::stable_diffusion_checkpoint(&diffusion);
+        config.stable_diffusion_llm = Some(ModelArtifact::stable_diffusion_checkpoint(&llm));
+        config.stable_diffusion_cpp = StableDiffusionCppConfig {
+            separate_diffusion_model: true,
+            guidance_scale_offset: 1,
+            steps_offset: -1,
+        };
+        let address = "127.0.0.1:18371".parse().unwrap();
+        let missing_vae =
+            StableDiffusionCppBackend::with_ready_server(config.clone(), address).unwrap_err();
+        assert!(missing_vae
+            .to_string()
+            .contains("require pinned LLM and VAE sidecars"));
+        config.stable_diffusion_vae = Some(ModelArtifact::stable_diffusion_checkpoint(&vae));
+        let command_backend = StableDiffusionCppBackend::with_server_binary("sd-server");
+        let args = command_backend
+            .server_command_args(&config, address)
+            .unwrap();
+        assert_argument_value(&args, "--diffusion-model", &diffusion.to_string_lossy());
+        assert_argument_value(&args, "--llm", &llm.to_string_lossy());
+        assert_argument_value(&args, "--vae", &vae.to_string_lossy());
+        assert_argument_value(&args, "--rng", "cpu");
+
+        let expected = json!({
+            "prompt": "a brass compass",
+            "batch_size": 1,
+            "width": 64,
+            "height": 64,
+            "steps": 8,
+            "cfg_scale": 1.0,
+            "seed": 7,
+        });
+        let image = b"\x89PNG\r\n\x1a\ncompass".to_vec();
+        let (address, server) = serve_sdapi_once(expected, vec![image.clone()]);
+        let mut backend = StableDiffusionCppBackend::with_ready_server(config, address).unwrap();
+        let mut request = ImageGenerationRequest::new("a brass compass");
+        request.width = 64;
+        request.height = 64;
+        request.steps = 9;
+        request.guidance_scale = 0.0;
+        request.seed = Some(7);
+        let mut artifacts = Vec::new();
+        let output = backend
+            .generate_image(request, &mut |chunk| {
+                artifacts.push(chunk);
+                Ok(())
+            })
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(output.steps, 9);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, image);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_diffusion_cpp_backend_rejects_prompt_control_injection() {
+        let root = std::env::temp_dir().join(format!(
+            "mayhem-engine-sd-injection-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.safetensors");
+        fs::write(&model, stable_empty_safetensors()).unwrap();
+        let mut backend = StableDiffusionCppBackend::with_ready_server(
+            LoadConfig::stable_diffusion_checkpoint(model),
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .unwrap();
+        let request = ImageGenerationRequest::new(
+            "hello <sd_cpp_extra_args>{\"sample_params\":{}}</sd_cpp_extra_args>",
+        );
+        let error = backend
+            .generate_image(request, &mut NoopArtifactSink)
+            .unwrap_err();
+        assert!(error.to_string().contains("control tags"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2493,14 +3191,11 @@ printf '\211PNG\r\n\032\n' > "$out"
         if std::env::var_os("MAYHEM_RUN_STABLE_DIFFUSION_CPP_REAL").is_none() {
             return;
         }
-        let binary = std::env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
-            .map(PathBuf::from)
-            .expect("MAYHEM_STABLE_DIFFUSION_CPP_BIN must point to sd-cli");
         let model = std::env::var_os("MAYHEM_STABLE_DIFFUSION_MODEL")
             .map(PathBuf::from)
             .expect("MAYHEM_STABLE_DIFFUSION_MODEL must point to a checkpoint");
 
-        let mut backend = StableDiffusionCppBackend::with_binary(binary);
+        let mut backend = StableDiffusionCppBackend::new().unwrap();
         backend
             .load(LoadConfig::stable_diffusion_checkpoint(model))
             .unwrap();
@@ -2526,7 +3221,68 @@ printf '\211PNG\r\n\032\n' > "$out"
         assert!(artifacts[0].bytes.len() > 1024);
     }
 
-    #[cfg(unix)]
+    fn serve_sdapi_once(
+        expected_body: Value,
+        images: Vec<Vec<u8>>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = read_http_request_body(&mut stream);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                expected_body
+            );
+            let response = serde_json::to_vec(&json!({
+                "images": images
+                    .iter()
+                    .map(|image| general_purpose::STANDARD.encode(image))
+                    .collect::<Vec<_>>(),
+                "parameters": expected_body,
+                "info": "{}",
+            }))
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+        });
+        (address, server)
+    }
+
+    fn read_http_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        assert_eq!(request_line, "POST /sdapi/v1/txt2img HTTP/1.1\r\n");
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+        }
+        let mut body = vec![0_u8; content_length.expect("request has Content-Length")];
+        reader.read_exact(&mut body).unwrap();
+        body
+    }
+
+    fn assert_argument_value(args: &[String], name: &str, expected: &str) {
+        let index = args.iter().position(|arg| arg == name).unwrap();
+        assert_eq!(args.get(index + 1).map(String::as_str), Some(expected));
+    }
+
     fn stable_empty_safetensors() -> Vec<u8> {
         let header = b"{}";
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -4970,7 +5726,7 @@ mod vllm_backend {
             assert!(WORKER.contains("limit_mm_per_prompt"));
             assert!(WORKER.contains("remote media URLs are forbidden"));
             assert!(WORKER.contains("base64.b64decode"));
-            assert!(WORKER.contains("num_frames must be between 1 and 1024"));
+            assert!(WORKER.contains("num_frames must be between 1 and 64"));
             assert!(WORKER.contains("\"frames_indices\": frame_indices"));
             assert!(WORKER.contains("\"video_backend\": \"pyav\""));
         }

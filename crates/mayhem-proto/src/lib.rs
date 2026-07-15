@@ -10,9 +10,10 @@ mod endpoint_contract;
 pub use endpoint_contract::{
     endpoint_attribute_value_matches, endpoint_contract_fingerprint,
     endpoint_family_contract_template, generate_endpoint_calibration_cases,
-    materialize_endpoint_calibration_request, validate_endpoint_attribute_value,
-    validate_endpoint_request, validate_endpoint_response, EndpointCalibrationCase,
-    EndpointCalibrationMutation, EndpointCalibrationValue, EndpointContractViolation,
+    materialize_endpoint_calibration_request, materialize_endpoint_request_defaults,
+    validate_endpoint_attribute_value, validate_endpoint_request, validate_endpoint_response,
+    EndpointCalibrationCase, EndpointCalibrationMutation, EndpointCalibrationValue,
+    EndpointContractViolation,
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
@@ -308,6 +309,8 @@ pub struct EndpointAttributeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple_of: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_length: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_length: Option<u64>,
@@ -328,6 +331,7 @@ impl EndpointAttributeSpec {
             enum_values: Vec::new(),
             minimum: None,
             maximum: None,
+            multiple_of: None,
             min_length: None,
             max_length: None,
             min_items: None,

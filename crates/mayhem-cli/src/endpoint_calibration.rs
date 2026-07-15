@@ -65,6 +65,7 @@ pub(crate) struct EndpointCalibrationReport {
     pub(crate) ok: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct EndpointCalibrationExecution {
     pub(crate) provider_translation_fingerprint: String,
     pub(crate) handled_request_attributes: BTreeSet<String>,

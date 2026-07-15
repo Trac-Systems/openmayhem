@@ -1776,7 +1776,12 @@ async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["mayhem"]["backend"], "test-image-canary-session");
-    assert_eq!(state.receipts().len(), 2);
+    assert_eq!(
+        state.receipts().len(),
+        2,
+        "automatic image probe state: {:?}",
+        state.probes()
+    );
     let seen_requests = requests.lock().expect("image request lock").clone();
     assert_eq!(seen_requests.len(), 2);
     assert_eq!(seen_requests[0].prompt, "a user image");
@@ -3245,10 +3250,21 @@ fn routed_image_generation_test_model() -> GatewayModel {
         output_modalities: vec!["image".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["image".to_owned()];
-    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+    let mut endpoint = mayhem_proto::endpoint_family_contract_template(
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
     )
-    .unwrap()];
+    .unwrap();
+    endpoint
+        .request_attribute_specs
+        .get_mut("cfg_scale")
+        .expect("image template has cfg_scale")
+        .default = Some(json!(1.0));
+    endpoint
+        .request_attribute_specs
+        .get_mut("n")
+        .expect("image template has n")
+        .default = Some(json!(1));
+    model.mayhem.adapter.endpoint_families = vec![endpoint];
     for candidate in &mut model.mayhem.route_candidates {
         candidate.served_modalities = vec!["image".to_owned()];
         candidate.price_ver = 4;
@@ -3646,6 +3662,13 @@ fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
 }
 
 fn image_resolution_scale_for_test(request: &ImageGenerationRequest) -> u64 {
+    if let Some((width, height)) = request.width.zip(request.height) {
+        return u64::from(width)
+            .saturating_mul(u64::from(height))
+            .max(1)
+            .div_ceil(512 * 512)
+            .max(1);
+    }
     let size = request.size.as_deref().unwrap_or("512x512");
     let Some((width, height)) = size.split_once('x') else {
         return 1;
@@ -3687,6 +3710,9 @@ fn image_cfg_scale_for_test(request: &ImageGenerationRequest) -> f32 {
 }
 
 fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
+    if let Some(dimensions) = request.width.zip(request.height) {
+        return dimensions;
+    }
     let size = request.size.as_deref().unwrap_or("512x512");
     let Some((width, height)) = size.split_once('x') else {
         return (512, 512);
@@ -3698,23 +3724,64 @@ fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
 }
 
 fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
-    stable_value_hash_for_test(&json!({
+    let mut body = json!({
         "kind": "image_generation",
         "model": &request.model,
         "prompt": &request.prompt,
-        "n": request.n.unwrap_or(1).clamp(1, 4),
-        "size": request.size.as_deref().unwrap_or("512x512"),
-        "steps": image_steps_for_test(request),
-        "cfg_scale": image_cfg_scale_for_test(request),
-        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "n": request.n.expect("normalized image count"),
+        "steps": request.steps.expect("normalized image steps"),
+        "cfg_scale": request.cfg_scale.expect("normalized image guidance"),
+        "response_format": request.response_format.as_deref().expect("normalized image response format"),
         "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS),
-        "seed": request.seed,
-        "quality": request.quality,
-        "style": request.style,
-        "negative_prompt": request.negative_prompt,
-        "scheduler": request.scheduler,
-        "user": request.user,
-    }))
+    });
+    let optional = [
+        (
+            "background",
+            request.background.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "moderation",
+            request.moderation.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "output_compression",
+            request.output_compression.map(|value| json!(value)),
+        ),
+        (
+            "output_format",
+            request.output_format.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "partial_images",
+            request.partial_images.map(|value| json!(value)),
+        ),
+        ("size", request.size.as_ref().map(|value| json!(value))),
+        ("width", request.width.map(|value| json!(value))),
+        ("height", request.height.map(|value| json!(value))),
+        ("seed", request.seed.map(|value| json!(value))),
+        (
+            "quality",
+            request.quality.as_ref().map(|value| json!(value)),
+        ),
+        ("style", request.style.as_ref().map(|value| json!(value))),
+        (
+            "negative_prompt",
+            request.negative_prompt.as_ref().map(|value| json!(value)),
+        ),
+        ("shift", request.shift.map(|value| json!(value))),
+        (
+            "scheduler",
+            request.scheduler.as_ref().map(|value| json!(value)),
+        ),
+        ("stream", request.stream.map(|value| json!(value))),
+        ("user", request.user.as_ref().map(|value| json!(value))),
+    ];
+    for (name, value) in optional {
+        if let Some(value) = value {
+            body[name] = value;
+        }
+    }
+    stable_value_hash_for_test(&body)
 }
 
 fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
@@ -3868,6 +3935,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::from([(
@@ -3928,6 +3996,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     size: Some("64x64".to_owned()),
                     steps: Some(1),
                     cfg_scale: Some(1.0),
+                    shift: None,
                     seed: Some(7),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -3985,6 +4054,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -4042,6 +4112,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -4099,6 +4170,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
