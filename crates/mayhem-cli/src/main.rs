@@ -27,6 +27,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use anyhow::anyhow;
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine as _;
@@ -106,6 +109,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use xet::xet_session::{XetFileInfo, XetSessionBuilder};
@@ -45296,9 +45300,6 @@ async fn collect_provider_hardware_quote(
     let mut command = Command::new(program);
     command
         .args(program_args)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .env("MAYHEM_HW_QUOTE_KIND", &kind_name)
         .env("MAYHEM_HW_QUOTE_BINDING", &binding)
         .env("MAYHEM_HW_QUOTE_NONCE", &binding)
@@ -45309,21 +45310,8 @@ async fn collect_provider_hardware_quote(
         )
         .env("MAYHEM_ATTESTATION_BINARY_HASH", &identity.binary_hash)
         .env("MAYHEM_ATTESTATION_MANIFEST_HASH", &identity.manifest_hash);
-    let output = timeout(config.timeout, command.output())
-        .await
-        .with_context(|| {
-            format!(
-                "hardware quote command {} timed out after {}s",
-                config.command.display(),
-                config.timeout.as_secs()
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "running hardware quote command {}",
-                config.command.display()
-            )
-        })?;
+    let output =
+        run_provider_hardware_quote_command(&mut command, &config.command, config.timeout).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -45341,6 +45329,107 @@ async fn collect_provider_hardware_quote(
             config.command.display()
         )
     })
+}
+
+async fn run_provider_hardware_quote_command(
+    command: &mut Command,
+    command_path: &Path,
+    command_timeout: Duration,
+) -> Result<std::process::Output> {
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running hardware quote command {}", command_path.display()))?;
+    let child_pid = child.id();
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("hardware quote command stdout pipe is missing")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("hardware quote command stderr pipe is missing")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = match timeout(command_timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            terminate_hardware_quote_process_tree(child_pid);
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(err).with_context(|| {
+                format!(
+                    "waiting for hardware quote command {}",
+                    command_path.display()
+                )
+            });
+        }
+        Err(_) => {
+            terminate_hardware_quote_process_tree(child_pid);
+            let _ = child.kill().await;
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            bail!(
+                "hardware quote command {} timed out after {}s; its process tree was terminated",
+                command_path.display(),
+                command_timeout.as_secs()
+            );
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .context("joining hardware quote stdout reader")?
+        .context("reading hardware quote stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("joining hardware quote stderr reader")?
+        .context("reading hardware quote stderr")?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_hardware_quote_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 fn provider_hardware_quote_invocation(command: &Path, windows: bool) -> (PathBuf, Vec<String>) {
@@ -49984,34 +50073,29 @@ async fn handle_provider_session_frame(
                     .context("accepted s.open invalid spend voucher")?;
                     let checkpoint_every = provider_session_frame_checkpoint_policy(&frame)
                         .context("accepted s.open missing checkpoint policy")?;
-                    sessions.insert(
-                        session_id.clone(),
-                        ActiveProviderSession {
-                            remote: remote.clone(),
-                            rail: session_rail.to_owned(),
-                            user_pubkey: frame
-                                .get("user")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
-                            session_id: session_id.clone(),
-                            price_ver: spend_voucher.body.price_ver,
-                            locked_rate_map: normalize_rate_map(
-                                spend_voucher.body.locked_rate_map.clone(),
-                            ),
-                            locked_per_req_au: spend_voucher.body.locked_per_req_au,
-                            locked_min_session_au: spend_voucher.body.locked_min_session_au,
-                            served_ctx: spend_voucher.body.served_ctx,
-                            required_modalities: spend_voucher.body.required_modalities.clone(),
-                            required_specialities: spend_voucher.body.required_specialities.clone(),
-                            ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
-                            ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
-                            checkpoint_every,
-                            accept_replay: None,
-                        },
-                    );
-                    protection.record_accept();
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    let mut active = ActiveProviderSession {
+                        remote: remote.clone(),
+                        rail: session_rail.to_owned(),
+                        user_pubkey: frame
+                            .get("user")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        session_id: session_id.clone(),
+                        price_ver: spend_voucher.body.price_ver,
+                        locked_rate_map: normalize_rate_map(
+                            spend_voucher.body.locked_rate_map.clone(),
+                        ),
+                        locked_per_req_au: spend_voucher.body.locked_per_req_au,
+                        locked_min_session_au: spend_voucher.body.locked_min_session_au,
+                        served_ctx: spend_voucher.body.served_ctx,
+                        required_modalities: spend_voucher.body.required_modalities.clone(),
+                        required_specialities: spend_voucher.body.required_specialities.clone(),
+                        ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
+                        ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
+                        checkpoint_every,
+                        accept_replay: None,
+                    };
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
@@ -50055,13 +50139,13 @@ async fn handle_provider_session_frame(
                     .await
                     .context("signing s.accept")?;
                     accept_frame["sig"] = json!(accept_sig);
-                    sessions
-                        .get_mut(&session_id)
-                        .context("accepted provider session disappeared before s.accept")?
-                        .accept_replay = Some(ProviderSessionAcceptReplay {
+                    active.accept_replay = Some(ProviderSessionAcceptReplay {
                         open_head,
                         accept_frame: accept_frame.clone(),
                     });
+                    sessions.insert(session_id.clone(), active);
+                    protection.record_accept();
+                    heartbeat_load.set_active_sessions(sessions.len());
                     record_provider_session_request_progress(
                         pending_requests,
                         &session_id,
@@ -65619,6 +65703,58 @@ mod tests {
             draft.provider_signing_message_hex,
             other_draft.provider_signing_message_hex
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardware_quote_timeout_terminates_the_complete_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = test_temp_dir("mayhem-hardware-quote-timeout-tree");
+        let quote_command = temp.join("quote-hang.sh");
+        let child_pid_path = temp.join("child.pid");
+        fs::write(
+            &quote_command,
+            r#"#!/bin/sh
+sleep 30 &
+child=$!
+printf '%s\n' "$child" > "$1"
+wait "$child"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&quote_command, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut command = Command::new(&quote_command);
+        command.arg(&child_pid_path);
+        let started = Instant::now();
+        let error = run_provider_hardware_quote_command(
+            &mut command,
+            &quote_command,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(error.to_string().contains("process tree was terminated"));
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        for _ in 0..50 {
+            if !process_is_running(child_pid) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_is_running(child_pid),
+            "hardware quote descendant {child_pid} survived timeout"
+        );
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[cfg(unix)]

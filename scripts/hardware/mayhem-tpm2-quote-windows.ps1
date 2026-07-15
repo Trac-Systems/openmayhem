@@ -67,6 +67,7 @@ New-Item -ItemType Directory -Force -Path $helperRoot | Out-Null
 
 $csprojPath = Join-Path $helperRoot "MayhemTpm2QuoteWindows.csproj"
 $programPath = Join-Path $helperRoot "Program.cs"
+$buildStampPath = Join-Path $helperRoot "build-source.sha256"
 
 $csproj = @"
 <Project Sdk="Microsoft.NET.Sdk">
@@ -518,12 +519,52 @@ if (-not (Test-Path $programPath) -or ((Get-Content -Raw $programPath) -ne $prog
   Set-Content -Path $programPath -Value $program -Encoding UTF8
 }
 
-& dotnet restore $csprojPath --nologo | Out-Null
-if ($LASTEXITCODE -ne 0) {
-  Fail "dotnet restore failed for Microsoft.TSS"
+$sourceBytes = [Text.Encoding]::UTF8.GetBytes($csproj + "`n--PROGRAM--`n" + $program)
+$sourceDigest = [Security.Cryptography.SHA256]::Create().ComputeHash($sourceBytes)
+$sourceHash = -join ($sourceDigest | ForEach-Object { $_.ToString("x2") })
+$outputRoot = Join-Path $helperRoot "bin\Release\$targetFramework"
+$helperExe = Join-Path $outputRoot "MayhemTpm2QuoteWindows.exe"
+$stampMatches = (Test-Path $buildStampPath) -and
+  ((Get-Content -Raw $buildStampPath).Trim() -eq $sourceHash)
+
+if (-not $stampMatches -or -not (Test-Path $helperExe)) {
+  $rootDigest = [Security.Cryptography.SHA256]::Create().ComputeHash(
+    [Text.Encoding]::UTF8.GetBytes($helperRoot.ToLowerInvariant())
+  )
+  $rootHash = -join ($rootDigest | ForEach-Object { $_.ToString("x2") })
+  $buildMutex = New-Object Threading.Mutex($false, "Local\MayhemTpm2QuoteWindows-$($rootHash.Substring(0,16))")
+  $mutexHeld = $false
+  try {
+    try {
+      $mutexHeld = $buildMutex.WaitOne([TimeSpan]::FromMinutes(10))
+    } catch [Threading.AbandonedMutexException] {
+      $mutexHeld = $true
+    }
+    if (-not $mutexHeld) {
+      Fail "timed out waiting for another TPM helper build"
+    }
+    $stampMatches = (Test-Path $buildStampPath) -and
+      ((Get-Content -Raw $buildStampPath).Trim() -eq $sourceHash)
+    if (-not $stampMatches -or -not (Test-Path $helperExe)) {
+      & dotnet restore $csprojPath --nologo | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        Fail "dotnet restore failed for Microsoft.TSS"
+      }
+      & dotnet build $csprojPath -c Release --no-restore --nologo | Out-Null
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $helperExe)) {
+        Fail "building the Windows TPM quote helper failed"
+      }
+      Set-Content -Path $buildStampPath -Value $sourceHash -Encoding ASCII
+    }
+  } finally {
+    if ($mutexHeld) {
+      $null = $buildMutex.ReleaseMutex()
+    }
+    $buildMutex.Dispose()
+  }
 }
 
-& dotnet run --project $csprojPath -c Release --no-restore --nologo
+& $helperExe
 if ($LASTEXITCODE -ne 0) {
   Fail "Windows TPM quote generation failed"
 }

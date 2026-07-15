@@ -9947,27 +9947,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let request_id = blake3_hex(
             format!(
@@ -10149,27 +10138,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let request_id = blake3_hex(
             format!(
@@ -10312,27 +10290,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let transport_body = direct_session_image_generation_request_body(request);
         let request_body = seal_direct_session_request_body(
@@ -10475,27 +10442,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let transport_body = direct_session_audio_speech_request_body(request);
         let request_body = seal_direct_session_request_body(
@@ -10628,27 +10584,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let transport_body = direct_session_audio_transcription_request_body(request);
         let request_body = seal_direct_session_request_body(
@@ -10781,27 +10726,16 @@ impl ScBridgeGatewaySessionBackend {
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-        let accept = send_open_and_await_session_accept(
+        let accept_info = send_open_and_validate_session_accept(
             &mut bridge,
             provider,
             direct_peer,
             invocation,
             &open_frame,
-        )
-        .await?;
-        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            return Err(provider_reject_session_error(
-                &accept,
-                &invocation.session_id,
-            ));
-        }
-        let accept_info = validate_direct_session_accept(
-            &accept,
-            invocation,
             &open_head,
             &att_nonce,
-            now_millis_u64() / 1000,
-        )?;
+        )
+        .await?;
 
         let request_body = seal_direct_session_request_body(
             model,
@@ -15883,91 +15817,146 @@ async fn open_live_direct_chat_session(
     if opened.get("direct").and_then(Value::as_bool) != Some(true)
         || opened.get("relayed").and_then(Value::as_bool) == Some(true)
     {
+        let _ = bridge
+            .session_close(direct_peer, &invocation.session_id)
+            .await;
         return Err(GatewaySessionError::retryable(format!(
             "session {} was not opened as a direct non-relayed channel",
             invocation.session_id
         )));
     }
 
-    let now = now_millis_u64();
-    let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
-    let open_frame = json!({
-        "t": "s.open",
-        "v": 1,
-        "contract_version": invocation.contract_version,
-        "session_id": invocation.session_id.clone(),
-        "rail": invocation.rail.clone(),
-        "user": invocation.user_pubkey.clone(),
-        "enclave_id": invocation.enclave_id.clone(),
-        "price_ver": invocation.price_ver,
-        "at": invocation.opened_at,
-        "served_ctx": invocation.served_ctx,
-        "ctx_bracket": invocation.ctx_bracket.clone(),
-        "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
-        "rules_ver": invocation.rules_ver,
-        "voucher": invocation.spend_voucher.clone(),
-        "att_nonce": att_nonce,
-        "ts": now,
-        "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
-        "sig": invocation.spend_voucher.user_sig.clone(),
-    });
-    let open_head = session_frame_head(&open_frame)
-        .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
-    let accept = send_open_and_await_session_accept(
-        &mut bridge,
-        provider,
-        direct_peer,
-        invocation,
-        &open_frame,
-    )
-    .await?;
-    if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-        return Err(provider_reject_session_error(
-            &accept,
-            &invocation.session_id,
-        ));
-    }
-    let accept_info = validate_direct_session_accept(
-        &accept,
-        invocation,
-        &open_head,
-        &att_nonce,
-        now_millis_u64() / 1000,
-    )?;
-    let request_id = blake3_hex(
-        format!(
-            "rid:{}:{}",
-            invocation.session_id,
-            serde_json::to_string(&request.messages).unwrap_or_default()
+    let open_result = async {
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        let accept_info = send_open_and_validate_session_accept(
+            &mut bridge,
+            provider,
+            direct_peer,
+            invocation,
+            &open_frame,
+            &open_head,
+            &att_nonce,
         )
-        .as_bytes(),
-    )
-    .chars()
-    .take(32)
-    .collect::<String>();
-    let transport_body = direct_session_request_body(request);
-    let request_body = seal_direct_session_request_body(
-        model,
-        direct_chat_endpoint_family(request),
-        transport_body.clone(),
-        direct_chat_contract_request(request, &transport_body),
-    )?;
-    send_direct_session_request_frames(
-        &mut bridge,
-        direct_peer,
-        &invocation.session_id,
-        &request_id,
-        &request_body,
-        direct_session_request_byte_limit(invocation, &request_body)?,
-    )
-    .await?;
+        .await?;
+        let request_id = blake3_hex(
+            format!(
+                "rid:{}:{}",
+                invocation.session_id,
+                serde_json::to_string(&request.messages).unwrap_or_default()
+            )
+            .as_bytes(),
+        )
+        .chars()
+        .take(32)
+        .collect::<String>();
+        let transport_body = direct_session_request_body(request);
+        let request_body = seal_direct_session_request_body(
+            model,
+            direct_chat_endpoint_family(request),
+            transport_body.clone(),
+            direct_chat_contract_request(request, &transport_body),
+        )?;
+        let byte_limit = direct_session_request_byte_limit(invocation, &request_body)?;
+        send_direct_session_request_frames(
+            &mut bridge,
+            direct_peer,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+            byte_limit,
+        )
+        .await?;
+        Ok::<_, GatewaySessionError>((request_id, accept_info.enclave_pubkey))
+    }
+    .await;
+    let (request_id, enclave_pubkey) = match open_result {
+        Ok(opened) => opened,
+        Err(err) => {
+            let _ = close_direct_session_channel(
+                &mut bridge,
+                direct_peer,
+                &invocation.session_id,
+                "open_failed",
+            )
+            .await;
+            return Err(err);
+        }
+    };
     Ok((
         bridge,
         provider.to_owned(),
         direct_peer.to_owned(),
         request_id,
-        accept_info.enclave_pubkey,
+        enclave_pubkey,
     ))
+}
+
+async fn send_open_and_validate_session_accept(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    direct_peer: &str,
+    invocation: &GatewaySessionInvocation,
+    open_frame: &Value,
+    open_head: &str,
+    att_nonce: &str,
+) -> Result<ValidatedDirectSessionAccept, GatewaySessionError> {
+    let result = async {
+        let accept = send_open_and_await_session_accept(
+            bridge,
+            provider,
+            direct_peer,
+            invocation,
+            open_frame,
+        )
+        .await?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
+        }
+        validate_direct_session_accept(
+            &accept,
+            invocation,
+            open_head,
+            att_nonce,
+            now_millis_u64() / 1000,
+        )
+    }
+    .await;
+    if result.is_err() {
+        let _ = close_direct_session_channel(
+            bridge,
+            direct_peer,
+            &invocation.session_id,
+            "accept_failed",
+        )
+        .await;
+    }
+    result
 }
 
 async fn send_open_and_await_session_accept(

@@ -284,4 +284,149 @@ mod tests {
             30_000_000
         );
     }
+
+    #[test]
+    fn non_llm_roster_rate_maps_preserve_canonical_start_prices() {
+        let image_rate_map = |step_rate_au, step_granularity| {
+            vec![
+                RateMapEntry {
+                    unit: USAGE_IMAGE.to_owned(),
+                    per_unit_au: 1,
+                    granularity: 1,
+                },
+                RateMapEntry {
+                    unit: USAGE_STEP.to_owned(),
+                    per_unit_au: step_rate_au,
+                    granularity: step_granularity,
+                },
+            ]
+        };
+        for (rate_map, metered_steps, expected_au) in [
+            (
+                image_rate_map(2_499_999_999_999_999, 36),
+                36,
+                2_500_000_000_000_000,
+            ),
+            (
+                image_rate_map(2_499_999_999_999_999, 16),
+                16,
+                2_500_000_000_000_000,
+            ),
+            (
+                image_rate_map(4_999_999_999_999_999, 160),
+                160,
+                5_000_000_000_000_000,
+            ),
+            (
+                image_rate_map(7_499_999_999_999_999, 200),
+                200,
+                7_500_000_000_000_000,
+            ),
+        ] {
+            assert_eq!(
+                usage_units_au(&rate_map, &[(USAGE_IMAGE, 1), (USAGE_STEP, metered_steps)]),
+                expected_au
+            );
+        }
+
+        let stt_rate_map = |per_minute_au| {
+            vec![RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: per_minute_au,
+                granularity: 60,
+            }]
+        };
+        assert_eq!(
+            usage_units_au(
+                &stt_rate_map(1_500_000_000_000_000),
+                &[(USAGE_AUDIO_SECOND, 60)]
+            ),
+            1_500_000_000_000_000
+        );
+        assert_eq!(
+            usage_units_au(
+                &stt_rate_map(1_000_000_000_000_000),
+                &[(USAGE_AUDIO_SECOND, 60)]
+            ),
+            1_000_000_000_000_000
+        );
+
+        let kokoro_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 18_000_000_000_000,
+                granularity: 1,
+            },
+        ];
+        assert_eq!(
+            usage_units_au(
+                &kokoro_rate_map,
+                &[(USAGE_INPUT_CHARACTER, 12), (USAGE_AUDIO_SECOND, 1)]
+            ),
+            18_000_000_000_012
+        );
+        let chatterbox_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 60_000_000_000_000,
+                granularity: 1,
+            },
+        ];
+        assert_eq!(
+            usage_units_au(
+                &chatterbox_rate_map,
+                &[(USAGE_INPUT_CHARACTER, 12), (USAGE_AUDIO_SECOND, 1)]
+            ),
+            60_000_000_000_012
+        );
+
+        let ace_step_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 100_000_000_000_000,
+                granularity: 1,
+            },
+        ];
+        assert_eq!(
+            usage_units_au(
+                &ace_step_rate_map,
+                &[(USAGE_INPUT_CHARACTER, 0), (USAGE_AUDIO_SECOND, 100)]
+            ),
+            10_000_000_000_000_000
+        );
+
+        let embedding_rate_map = vec![RateMapEntry {
+            unit: USAGE_INPUT_TOKEN.to_owned(),
+            per_unit_au: 4_000_000_000_000_000,
+            granularity: 1_000_000,
+        }];
+        assert_eq!(
+            usage_units_au(&embedding_rate_map, &[(USAGE_INPUT_TOKEN, 1_000_000)]),
+            4_000_000_000_000_000
+        );
+        let reranker_rate_map = vec![RateMapEntry {
+            unit: USAGE_INPUT_TOKEN.to_owned(),
+            per_unit_au: 10_000_000_000_000_000,
+            granularity: 1_000_000,
+        }];
+        assert_eq!(
+            usage_units_au(&reranker_rate_map, &[(USAGE_INPUT_TOKEN, 1_000_000)]),
+            10_000_000_000_000_000
+        );
+    }
 }

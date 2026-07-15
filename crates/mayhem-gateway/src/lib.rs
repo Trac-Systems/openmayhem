@@ -725,7 +725,8 @@ fn verify_hardware_quote_with_command(
         hardware_quote_invalid(KIND, format!("admin verifier input JSON failed: {err}"))
     })?;
     input.push(b'\n');
-    let mut child = Command::new(&verifier.command)
+    let mut command = Command::new(&verifier.command);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -738,17 +739,21 @@ fn verify_hardware_quote_with_command(
         .env(
             "MAYHEM_HW_VERIFY_ATTESTATION_TIER",
             quote.kind.attestation_tier().to_string(),
+        );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|err| {
+        hardware_quote_invalid(
+            KIND,
+            format!(
+                "admin verifier {} could not start: {err}",
+                verifier.command.display()
+            ),
         )
-        .spawn()
-        .map_err(|err| {
-            hardware_quote_invalid(
-                KIND,
-                format!(
-                    "admin verifier {} could not start: {err}",
-                    verifier.command.display()
-                ),
-            )
-        })?;
+    })?;
     let write_result = child
         .stdin
         .as_mut()
@@ -760,6 +765,7 @@ fn verify_hardware_quote_with_command(
         });
     drop(child.stdin.take());
     if let Err(err) = write_result {
+        terminate_hardware_quote_verifier_process_tree(child.id());
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
@@ -767,6 +773,7 @@ fn verify_hardware_quote_with_command(
     let status = match child.wait_timeout(verifier.timeout) {
         Ok(Some(status)) => status,
         Ok(None) => {
+            terminate_hardware_quote_verifier_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             return Err(hardware_quote_invalid(
@@ -779,6 +786,7 @@ fn verify_hardware_quote_with_command(
             ));
         }
         Err(err) => {
+            terminate_hardware_quote_verifier_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             return Err(hardware_quote_invalid(
@@ -882,6 +890,29 @@ fn verify_hardware_quote_with_command(
         )?;
     }
     Ok(())
+}
+
+fn terminate_hardware_quote_verifier_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 fn tier3_quote_platform_id<'a>(kind: &'static str, quote: &'a HardwareQuote) -> Result<&'a str> {

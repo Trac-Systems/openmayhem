@@ -3,6 +3,10 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use std::thread::sleep;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -825,6 +829,70 @@ fn tpm2_ek_tier2_requires_external_verifier() {
         GatewayError::HardwareQuoteInvalid { reason, .. }
             if reason.contains("TPM 2.0 EK quotes require")
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_verifier_timeout_terminates_descendant_processes() {
+    let device_key = "ab".repeat(32);
+    let (temp, report, contract) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": device_key }),
+    );
+    let child_pid_path = temp.path().join("verifier-child.pid");
+    let script = temp.path().join("verify-hardware-hang.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > '{}'\ncat >/dev/null\nwait \"$child\"\n",
+            child_pid_path.display()
+        ),
+    )
+    .expect("write hanging verifier script");
+    let mut permissions = fs::metadata(&script)
+        .expect("hanging verifier metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod hanging verifier");
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        // The full attestation suite runs many external verifier fixtures in
+        // parallel. Leave enough startup time to create the descendant before
+        // exercising the timeout cleanup itself.
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &verifier);
+
+    let error = verify_tier1_attestation(&request).expect_err("verifier must time out");
+    assert!(matches!(
+        error,
+        GatewayError::HardwareQuoteInvalid { reason, .. } if reason.contains("timed out")
+    ));
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .expect("read verifier descendant pid")
+        .trim()
+        .to_owned();
+    for _ in 0..50 {
+        if !Command::new("kill")
+            .args(["-0", &child_pid])
+            .output()
+            .expect("inspect verifier descendant")
+            .status
+            .success()
+        {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !Command::new("kill")
+            .args(["-0", &child_pid])
+            .output()
+            .expect("inspect terminated verifier descendant")
+            .status
+            .success(),
+        "external verifier descendant {child_pid} survived timeout"
+    );
 }
 
 #[cfg(unix)]

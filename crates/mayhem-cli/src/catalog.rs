@@ -4251,6 +4251,83 @@ mod tests {
     }
 
     #[test]
+    fn non_llm_roster_rate_maps_cover_every_required_machine_unit() {
+        let mut model = verification_test_model(
+            "admin/non-llm-rate-map-fixture",
+            DEFAULT_MODEL_CLASS,
+            "fixture",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        let rate = |unit: &str, per_unit_au, granularity| CatalogRateMapEntry {
+            unit: unit.to_owned(),
+            per_unit_au,
+            granularity,
+        };
+        let cases = [
+            (
+                MODEL_CLASS_IMAGE_GENERATION,
+                vec![
+                    rate(USAGE_IMAGE, 1, 1),
+                    rate(USAGE_STEP, 2_499_999_999_999_999, 36),
+                ],
+            ),
+            (
+                MODEL_CLASS_STT,
+                vec![rate(USAGE_AUDIO_SECOND, 1_000_000_000_000_000, 60)],
+            ),
+            (
+                MODEL_CLASS_TTS,
+                vec![
+                    rate(USAGE_INPUT_CHARACTER, 1, 1),
+                    rate(USAGE_AUDIO_SECOND, 18_000_000_000_000, 1),
+                ],
+            ),
+            (
+                MODEL_CLASS_TTS,
+                vec![
+                    rate(USAGE_INPUT_CHARACTER, 1, 1),
+                    rate(USAGE_AUDIO_SECOND, 60_000_000_000_000, 1),
+                ],
+            ),
+            (
+                MODEL_CLASS_MUSIC_GENERATION,
+                vec![
+                    rate(USAGE_INPUT_CHARACTER, 1, 1),
+                    rate(USAGE_AUDIO_SECOND, 100_000_000_000_000, 1),
+                ],
+            ),
+            (
+                MODEL_CLASS_EMBEDDING,
+                vec![rate(USAGE_INPUT_TOKEN, 4_000_000_000_000_000, 1_000_000)],
+            ),
+            (
+                MODEL_CLASS_EMBEDDING,
+                vec![rate(USAGE_INPUT_TOKEN, 10_000_000_000_000_000, 1_000_000)],
+            ),
+        ];
+
+        for (model_class, rate_map) in cases {
+            model.model_class = model_class.to_owned();
+            model.price_ref_au.rate_map = rate_map;
+            let mut errors = Vec::new();
+            validate_required_modality_price_units(&model, &mut errors);
+            validate_price_rate_map(&model, &mut errors);
+            assert!(errors.is_empty(), "{model_class}: {errors:#?}");
+        }
+    }
+
+    #[test]
     fn video_generation_requires_video_units_in_every_price_validator() {
         let mut model = verification_test_model(
             "admin/video@small",

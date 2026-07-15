@@ -7,6 +7,8 @@ fail() {
 }
 
 command -v dotnet >/dev/null 2>&1 || fail "missing required command: dotnet"
+command -v flock >/dev/null 2>&1 || fail "missing required command: flock"
+command -v sha256sum >/dev/null 2>&1 || fail "missing required command: sha256sum"
 
 dotnet_version="$(dotnet --version)"
 dotnet_major="${dotnet_version%%.*}"
@@ -785,5 +787,24 @@ else
   rm -f "$program_tmp"
 fi
 
-dotnet restore "$csproj" --nologo >/dev/null
-dotnet run --project "$csproj" -c Release --no-restore --nologo
+source_hash="$({ cat "$csproj"; printf '\n--PROGRAM--\n'; cat "$program"; } | sha256sum | awk '{print $1}')"
+build_stamp="$helper_root/build-source.sha256"
+helper="$helper_root/bin/Release/$target_framework/MayhemTpm2Verify"
+
+exec 9>"$helper_root/build.lock"
+flock -w 600 9 || fail "timed out waiting for another TPM verifier build"
+stamp_hash=""
+if [ -f "$build_stamp" ]; then
+  stamp_hash="$(tr -d '\r\n' <"$build_stamp")"
+fi
+if [ "$stamp_hash" != "$source_hash" ] || [ ! -x "$helper" ]; then
+  dotnet restore "$csproj" --nologo >/dev/null
+  dotnet build "$csproj" -c Release --no-restore --nologo >/dev/null
+  [ -x "$helper" ] || fail "building the TPM verifier helper failed"
+  stamp_tmp="$(mktemp "$helper_root/build-source.sha256.XXXXXX")"
+  printf '%s\n' "$source_hash" >"$stamp_tmp"
+  mv "$stamp_tmp" "$build_stamp"
+fi
+flock -u 9
+
+exec "$helper"
