@@ -37511,13 +37511,15 @@ impl ProviderHeartbeatLoad {
         self.store_rolling_ms(&self.rolling_ttft_ms, ttft_ms.max(1));
     }
 
-    fn record_turn_result(&self, elapsed: Duration, throughput_units: u64) {
+    fn record_turn_result(&self, elapsed: Duration, measured_throughput: Option<f64>) {
         let elapsed_ms = duration_millis_u64(elapsed).max(1);
         self.store_rolling_ms(&self.rolling_turn_ms, elapsed_ms);
-        if throughput_units > 0 {
-            let tok_s_milli = ((u128::from(throughput_units) * 1_000_000_u128)
-                / u128::from(elapsed_ms))
-            .min(u128::from(u64::MAX)) as u64;
+        if let Some(measured_throughput) =
+            measured_throughput.filter(|value| value.is_finite() && *value > 0.0)
+        {
+            let tok_s_milli = (measured_throughput * 1_000.0)
+                .round()
+                .clamp(1.0, u64::MAX as f64) as u64;
             self.store_rolling_ms(&self.rolling_tok_s_milli, tok_s_milli.max(1));
         }
     }
@@ -38142,18 +38144,37 @@ fn provider_session_throughput_unit(usage: &ReceiptUsage) -> &'static str {
     }
 }
 
+fn provider_session_measured_throughput(
+    output: &ProviderSessionOutput,
+    elapsed: Duration,
+    live_generation_tok_s: Option<f64>,
+) -> Option<f64> {
+    let output_tokens = output.usage.output_tokens();
+    if output_tokens == 1 {
+        return None;
+    }
+    if output_tokens > 1 {
+        return live_generation_tok_s.filter(|value| value.is_finite() && *value > 0.0);
+    }
+    let units = provider_session_throughput_units(&output.usage);
+    if units == 0 {
+        return None;
+    }
+    let per_second = units as f64 / elapsed.as_secs_f64().max(0.001);
+    per_second.is_finite().then_some(per_second)
+}
+
 fn provider_session_quality_value(
     output: &ProviderSessionOutput,
     elapsed: Duration,
     first_ttft_ms: Option<u64>,
+    measured_throughput: Option<f64>,
 ) -> Value {
     let elapsed_ms = duration_millis_u64(elapsed).max(1);
-    let throughput_units = provider_session_throughput_units(&output.usage);
-    let throughput = throughput_units as f64 * 1000.0 / elapsed_ms as f64;
     json!({
         "ttft_ms": first_ttft_ms.unwrap_or(elapsed_ms),
         "compute_ms": elapsed_ms,
-        "throughput": throughput,
+        "throughput": measured_throughput,
         "unit": provider_session_throughput_unit(&output.usage),
     })
 }
@@ -38170,11 +38191,9 @@ impl ProviderRequestLoadGuard {
         self.started
     }
 
-    fn finish_with_output(&mut self, output: &ProviderSessionOutput) {
-        self.load.record_turn_result(
-            self.started.elapsed(),
-            provider_session_throughput_units(&output.usage),
-        );
+    fn finish_with_output(&mut self, measured_throughput: Option<f64>) {
+        self.load
+            .record_turn_result(self.started.elapsed(), measured_throughput);
         self.finish();
     }
 
@@ -50396,7 +50415,7 @@ async fn handle_provider_session_frame(
                 validate_provider_session_output(terms, &body, &output)?;
                 Ok(output)
             });
-            let output = match response {
+            let (output, measured_throughput) = match response {
                 Ok(output) => {
                     if live_stream
                         .as_ref()
@@ -50406,7 +50425,14 @@ async fn handle_provider_session_frame(
                         heartbeat_load
                             .record_ttft_ms(duration_millis_u64(request_started.elapsed()));
                     }
-                    request_load.finish_with_output(&output);
+                    let measured_throughput = provider_session_measured_throughput(
+                        &output,
+                        request_started.elapsed(),
+                        live_stream
+                            .as_ref()
+                            .and_then(ProviderSessionLiveStream::measured_generation_tok_s),
+                    );
+                    request_load.finish_with_output(measured_throughput);
                     if let Some(stream) = live_stream.as_mut() {
                         if let Err(err) = stream.finish() {
                             let err_text = format!("{err:#}");
@@ -50450,7 +50476,7 @@ async fn handle_provider_session_frame(
                             return Ok(());
                         }
                     }
-                    output
+                    (output, measured_throughput)
                 }
                 Err(err) => {
                     request_load.finish();
@@ -50504,6 +50530,7 @@ async fn handle_provider_session_frame(
                 live_stream
                     .as_ref()
                     .and_then(|stream| stream.first_ttft_ms()),
+                measured_throughput,
             );
             let live_stream_state = live_stream.and_then(ProviderSessionLiveStream::into_state);
             provider_session_debug(format!(
@@ -50678,6 +50705,8 @@ struct ProviderSessionLiveStream<'a> {
     receipt_seq: u64,
     last_checkpoint_tokens: u64,
     first_ttft_ms: Option<u64>,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
     delivered_tokens: u64,
     prompt_tokens: u64,
     streamed_any: bool,
@@ -50874,6 +50903,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
             receipt_seq: 1,
             last_checkpoint_tokens: 0,
             first_ttft_ms: None,
+            first_token_at: None,
+            last_token_at: None,
             delivered_tokens: 0,
             prompt_tokens: 0,
             streamed_any: false,
@@ -50884,11 +50915,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
 
     fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
         self.prompt_tokens = prompt_tokens;
+        let token_at = Instant::now();
         if self.first_ttft_ms.is_none() {
             let ttft_ms = duration_millis_u64(self.request_started.elapsed()).max(1);
             self.first_ttft_ms = Some(ttft_ms);
+            self.first_token_at = Some(token_at);
             self.heartbeat_load.record_ttft_ms(ttft_ms);
         }
+        self.last_token_at = Some(token_at);
         provider_session_debug(format!(
             "live buffering token #{} for session {} request {}",
             self.delivered_tokens, self.active.session_id, self.request_id
@@ -50957,6 +50991,22 @@ impl<'a> ProviderSessionLiveStream<'a> {
 
     fn first_ttft_ms(&self) -> Option<u64> {
         self.first_ttft_ms
+    }
+
+    fn measured_generation_tok_s(&self) -> Option<f64> {
+        let token_intervals = self.delivered_tokens.checked_sub(1)?;
+        if token_intervals == 0 {
+            return None;
+        }
+        let elapsed = self
+            .last_token_at?
+            .checked_duration_since(self.first_token_at?)?;
+        let elapsed_seconds = elapsed.as_secs_f64();
+        if elapsed_seconds <= 0.0 {
+            return None;
+        }
+        let tok_s = token_intervals as f64 / elapsed_seconds;
+        (tok_s.is_finite() && tok_s > 0.0).then_some(tok_s)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -68996,7 +69046,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(busy.ttft_ms, 0);
 
         load.record_ttft_ms(125);
-        load.record_turn_result(Duration::from_millis(500), 10);
+        load.record_turn_result(Duration::from_millis(500), Some(20.0));
+        load.record_turn_result(Duration::from_secs(30), None);
         request.finish();
 
         let measured = load.snapshot(4);
@@ -69074,6 +69125,53 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let embedding = ReceiptUsage::text(128, 0);
         assert_eq!(provider_session_throughput_units(&embedding), 128);
         assert_eq!(provider_session_throughput_unit(&embedding), "input_tok_s");
+    }
+
+    #[test]
+    fn provider_text_throughput_excludes_prefill_and_ignores_one_token_turns() {
+        let output = ProviderSessionOutput {
+            content: "ok".to_owned(),
+            tools: Vec::new(),
+            embeddings: None,
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 60_003,
+            completion_tokens: 1,
+            token_ids: vec![1],
+            usage: ReceiptUsage::text(60_003, 1),
+            usage_attribution: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            provider_session_measured_throughput(&output, Duration::from_secs(30), None),
+            None
+        );
+        assert_eq!(
+            provider_session_measured_throughput(&output, Duration::from_secs(30), Some(22.5)),
+            None
+        );
+
+        let generated = ProviderSessionOutput {
+            completion_tokens: 32,
+            token_ids: (0..32).collect(),
+            usage: ReceiptUsage::text(60_003, 32),
+            ..output.clone()
+        };
+        assert_eq!(
+            provider_session_measured_throughput(&generated, Duration::from_secs(30), Some(22.5)),
+            Some(22.5)
+        );
+
+        let embedding = ProviderSessionOutput {
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::text(1_000, 0),
+            ..output
+        };
+        assert_eq!(
+            provider_session_measured_throughput(&embedding, Duration::from_secs(2), None),
+            Some(500.0)
+        );
     }
 
     #[test]

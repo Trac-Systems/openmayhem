@@ -7,7 +7,6 @@ fail() {
 }
 
 command -v dotnet >/dev/null 2>&1 || fail "missing required command: dotnet"
-command -v flock >/dev/null 2>&1 || fail "missing required command: flock"
 command -v sha256sum >/dev/null 2>&1 || fail "missing required command: sha256sum"
 
 dotnet_version="$(dotnet --version)"
@@ -791,8 +790,27 @@ source_hash="$({ cat "$csproj"; printf '\n--PROGRAM--\n'; cat "$program"; } | sh
 build_stamp="$helper_root/build-source.sha256"
 helper="$helper_root/bin/Release/$target_framework/MayhemTpm2Verify"
 
-exec 9>"$helper_root/build.lock"
-flock -w 600 9 || fail "timed out waiting for another TPM verifier build"
+lock_dir=""
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$helper_root/build.lock"
+  flock -w 600 9 || fail "timed out waiting for another TPM verifier build"
+else
+  lock_dir="$helper_root/build.lock.d"
+  attempts=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    owner_pid="$(cat "$lock_dir/owner-pid" 2>/dev/null || true)"
+    if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
+      rm -f "$lock_dir/owner-pid"
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 600 ] || fail "timed out waiting for another TPM verifier build"
+    sleep 1
+  done
+  printf '%s\n' "$$" >"$lock_dir/owner-pid"
+  trap 'rm -f "$lock_dir/owner-pid"; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
+fi
 stamp_hash=""
 if [ -f "$build_stamp" ]; then
   stamp_hash="$(tr -d '\r\n' <"$build_stamp")"
@@ -805,6 +823,12 @@ if [ "$stamp_hash" != "$source_hash" ] || [ ! -x "$helper" ]; then
   printf '%s\n' "$source_hash" >"$stamp_tmp"
   mv "$stamp_tmp" "$build_stamp"
 fi
-flock -u 9
+if [ -n "$lock_dir" ]; then
+  rm -f "$lock_dir/owner-pid"
+  rmdir "$lock_dir" 2>/dev/null || true
+  trap - EXIT HUP INT TERM
+else
+  flock -u 9
+fi
 
 exec "$helper"

@@ -11767,7 +11767,8 @@ impl DirectSessionWatchdog {
     fn throughput_floor_violation(&self, output_tokens: u64, now_millis: u64) -> Option<f64> {
         let min_tok_s = self.min_tok_s?;
         self.first_delta_at_millis?;
-        if output_tokens == 0 {
+        let token_intervals = output_tokens.checked_sub(1)?;
+        if token_intervals == 0 {
             return None;
         }
         let first_delta_at_millis = self.first_delta_at_millis?;
@@ -11775,7 +11776,7 @@ impl DirectSessionWatchdog {
         if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS {
             return None;
         }
-        let tok_s = output_tokens as f64 * 1000.0 / elapsed_millis as f64;
+        let tok_s = token_intervals as f64 * 1000.0 / elapsed_millis as f64;
         (tok_s < min_tok_s).then_some(tok_s)
     }
 }
@@ -11820,13 +11821,14 @@ fn generated_tokens_per_second(
     first_delta_at_millis: u64,
     completed_at_millis: u64,
 ) -> Option<f64> {
-    if output_tokens == 0 {
+    let token_intervals = output_tokens.checked_sub(1)?;
+    if token_intervals == 0 {
         return None;
     }
     let elapsed_millis = completed_at_millis
         .saturating_sub(first_delta_at_millis)
         .max(1);
-    let tok_s = output_tokens as f64 * 1000.0 / elapsed_millis as f64;
+    let tok_s = token_intervals as f64 * 1000.0 / elapsed_millis as f64;
     tok_s.is_finite().then_some(tok_s)
 }
 
@@ -18925,19 +18927,12 @@ fn observation_sample_from_success(
     elapsed: Duration,
 ) -> ProviderObservationSample {
     let elapsed_millis = duration_millis_u64(elapsed).max(1);
-    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     ProviderObservationSample {
         ttft_ms: result
             .quality
             .map(|quality| quality.ttft_ms)
             .unwrap_or(elapsed_millis),
-        tok_s: result
-            .quality
-            .and_then(|quality| quality.tok_s)
-            .or_else(|| {
-                Some(result.output.usage.completion_tokens as f64 / elapsed_seconds)
-                    .filter(|tok_s| tok_s.is_finite() && *tok_s >= 0.0)
-            }),
+        tok_s: result.quality.and_then(|quality| quality.tok_s),
         error: false,
     }
 }
@@ -25875,8 +25870,15 @@ mod tests {
         watchdog.record_delta(100);
         assert_eq!(watchdog.throughput_floor_violation(1, 999), None);
         assert_eq!(watchdog.throughput_floor_violation(1, 1_000), None);
-        assert_eq!(watchdog.throughput_floor_violation(1, 1_100), Some(1.0));
-        assert_eq!(watchdog.throughput_floor_violation(5, 1_000), None);
+        assert_eq!(watchdog.throughput_floor_violation(1, 10_000), None);
+        assert_eq!(watchdog.throughput_floor_violation(2, 1_100), Some(1.0));
+        assert_eq!(watchdog.throughput_floor_violation(6, 1_000), None);
+    }
+
+    #[test]
+    fn generation_throughput_uses_token_intervals_and_ignores_one_token_turns() {
+        assert_eq!(generated_tokens_per_second(1, 100, 10_000), None);
+        assert_eq!(generated_tokens_per_second(6, 100, 1_100), Some(5.0));
     }
 
     #[test]
