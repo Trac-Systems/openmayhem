@@ -135,6 +135,7 @@ class DirectSession extends Feature {
       maxFrameBytes: this.maxFrameBytes,
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
+      receiveRateBurstBytes: this._receiveRateBurstBytes(),
       sendDrainTimeoutMs: this.sendDrainTimeoutMs,
       connectMaxWaitMs: this.connectMaxWaitMs,
       connectPollMs: this.connectPollMs,
@@ -687,7 +688,7 @@ class DirectSession extends Feature {
       channel,
       message: null,
       sendLimiter: this._newLimiter(),
-      receiveLimiter: this._newLimiter(),
+      receiveLimiter: this._newReceiveLimiter(),
       drainWaiters: new Set(),
       closed: false,
     };
@@ -789,11 +790,23 @@ class DirectSession extends Feature {
     return decodedJsonByteLength(frame) ?? b4a.byteLength(JSON.stringify(frame), 'utf8');
   }
 
-  _newLimiter() {
+  _newLimiter(capacity = this.rateBurstBytes) {
     return {
-      tokens: this.rateBurstBytes,
+      capacity,
+      tokens: capacity,
       lastRefill: Date.now(),
     };
+  }
+
+  _newReceiveLimiter() {
+    return this._newLimiter(this._receiveRateBurstBytes());
+  }
+
+  _receiveRateBurstBytes() {
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this.rateBurstBytes + this.maxFrameBytes
+    );
   }
 
   _checkRate(limiter, bytes) {
@@ -802,7 +815,10 @@ class DirectSession extends Feature {
     const elapsedMs = now - limiter.lastRefill;
     if (elapsedMs > 0) {
       const refill = (elapsedMs / 1000) * this.rateBytesPerSecond;
-      limiter.tokens = Math.min(this.rateBurstBytes, limiter.tokens + refill);
+      limiter.tokens = Math.min(
+        limiter.capacity ?? this.rateBurstBytes,
+        limiter.tokens + refill
+      );
       limiter.lastRefill = now;
     }
     if (bytes > limiter.tokens) return false;

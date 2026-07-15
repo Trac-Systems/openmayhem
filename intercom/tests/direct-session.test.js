@@ -52,6 +52,7 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.maxFrameBytes, 256 * 1024);
   assert.equal(stats.rateBytesPerSecond, 1_000_000);
   assert.equal(stats.rateBurstBytes, 1_000_000);
+  assert.equal(stats.receiveRateBurstBytes, 1_000_000 + (256 * 1024));
   assert.equal(stats.sendDrainTimeoutMs, 0);
   assert.equal(stats.connectMaxWaitMs, 120_000);
   assert.equal(stats.connectPollMs, 100);
@@ -79,6 +80,7 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
   assert.equal(configured.stats().maxFrameBytes, 4096);
   assert.equal(configured.stats().rateBytesPerSecond, 2_000_000);
   assert.equal(configured.stats().rateBurstBytes, 3_000_000);
+  assert.equal(configured.stats().receiveRateBurstBytes, 3_004_096);
   assert.equal(configured.stats().sendDrainTimeoutMs, 12_000);
   assert.equal(configured.stats().connectMaxWaitMs, 600_000);
   assert.equal(configured.stats().connectPollMs, 250);
@@ -182,6 +184,20 @@ test('DirectSession sender throttles a valid multi-frame payload instead of reje
 
   await directSession._acquireSendRate(session, 100);
   await assert.doesNotReject(directSession._acquireSendRate(session, 100));
+});
+
+test('DirectSession receiver tolerates one frame of transport jitter without weakening sustained rate', () => {
+  const directSession = new DirectSession({}, {
+    maxFrameBytes: 64,
+    rateBytesPerSecond: 1,
+    rateBurstBytes: 128,
+  });
+  const receiveLimiter = directSession._newReceiveLimiter();
+
+  assert.equal(receiveLimiter.capacity, 192);
+  assert.equal(directSession._checkRate(receiveLimiter, 128), true);
+  assert.equal(directSession._checkRate(receiveLimiter, 64), true);
+  assert.equal(directSession._checkRate(receiveLimiter, 1), false);
 });
 
 test('DirectSession send failure closes and reclaims only the failed session', async () => {

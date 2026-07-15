@@ -2074,6 +2074,53 @@ pub fn endpoint_contract_fingerprint(contract: &EndpointFamilyContract) -> Strin
     blake3::hash(&encoded).to_hex().to_string()
 }
 
+/// Hashes the semantic JSON value while remaining stable across JavaScript relays.
+/// JavaScript serializes integral JSON numbers such as `1.0` as `1`; those values
+/// must compare equally without making changed integers or non-integral values equal.
+#[must_use]
+pub fn endpoint_request_fingerprint(request: &Value) -> String {
+    let canonical = javascript_roundtrip_stable_value(request);
+    blake3::hash(canonical.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn javascript_roundtrip_stable_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(javascript_roundtrip_stable_value)
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                stable.insert(key.clone(), javascript_roundtrip_stable_value(value));
+            }
+            Value::Object(stable)
+        }
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                return Value::Number(number.clone());
+            }
+            let Some(float) = number.as_f64() else {
+                return Value::Number(number.clone());
+            };
+            if float == 0.0 {
+                Value::Number(0.into())
+            } else if float.fract() == 0.0 && float.abs() <= 9_007_199_254_740_991.0 {
+                Value::Number((float as i64).into())
+            } else {
+                Value::Number(number.clone())
+            }
+        }
+        value => value.clone(),
+    }
+}
+
 pub fn validate_endpoint_request(
     contract: &EndpointFamilyContract,
     request: &Value,
@@ -2311,6 +2358,46 @@ fn validate_nested_endpoint_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_request_fingerprint_survives_javascript_number_serialization() {
+        let rust_shape = serde_json::from_str::<Value>(
+            r#"{"cfg_scale":1.0,"shift":3.0,"nested":{"epsilon":1e-6,"zero":-0.0}}"#,
+        )
+        .unwrap();
+        let javascript_shape = serde_json::from_str::<Value>(
+            r#"{"nested":{"zero":0,"epsilon":0.000001},"shift":3,"cfg_scale":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            endpoint_request_fingerprint(&rust_shape),
+            endpoint_request_fingerprint(&javascript_shape)
+        );
+        assert_eq!(
+            endpoint_request_fingerprint(&rust_shape),
+            blake3::hash(
+                javascript_roundtrip_stable_value(&javascript_shape)
+                    .to_string()
+                    .as_bytes()
+            )
+            .to_hex()
+            .to_string(),
+            "the normalized sender hash remains compatible with the existing receiver hash"
+        );
+    }
+
+    #[test]
+    fn endpoint_request_fingerprint_detects_numeric_value_changes() {
+        assert_ne!(
+            endpoint_request_fingerprint(&json!({"seed": 9_007_199_254_740_993_u64})),
+            endpoint_request_fingerprint(&json!({"seed": 9_007_199_254_740_992_u64}))
+        );
+        assert_ne!(
+            endpoint_request_fingerprint(&json!({"cfg_scale": 1.5})),
+            endpoint_request_fingerprint(&json!({"cfg_scale": 1.500_000_1}))
+        );
+    }
 
     #[test]
     fn every_endpoint_template_has_complete_typed_specs() {

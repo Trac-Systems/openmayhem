@@ -1876,7 +1876,9 @@ pub fn normalize_endpoint_request_for_provider(
     Ok(EndpointRequestNormalization {
         endpoint_family: contract.family.clone(),
         contract_fingerprint: mayhem_proto::endpoint_contract_fingerprint(contract),
-        normalized_request_fingerprint: stable_value_hash(&normalized_request),
+        normalized_request_fingerprint: mayhem_proto::endpoint_request_fingerprint(
+            &normalized_request,
+        ),
         normalized_request,
     })
 }
@@ -11297,7 +11299,7 @@ fn seal_direct_session_request_body(
         "schema_version": 1,
         "endpoint_family": endpoint_family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(&contract_request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
     Ok(sealed)
@@ -25300,19 +25302,23 @@ fn image_generation_prompt_text(request: &ImageGenerationRequest) -> String {
 }
 
 fn image_generation_prompt_hash(request: &ImageGenerationRequest) -> String {
-    stable_value_hash(&direct_session_image_generation_request_body(request))
+    let transport = direct_session_image_generation_request_body(request);
+    mayhem_proto::endpoint_request_fingerprint(&image_generation_contract_request(
+        request, &transport,
+    ))
 }
 
 fn audio_speech_prompt_hash(request: &AudioSpeechRequest) -> String {
-    stable_value_hash(&direct_session_audio_speech_request_body(request))
+    let transport = direct_session_audio_speech_request_body(request);
+    mayhem_proto::endpoint_request_fingerprint(&audio_speech_contract_request(request, &transport))
 }
 
 fn audio_transcription_prompt_hash(request: &AudioTranscriptionRequest) -> String {
-    stable_value_hash(&direct_session_audio_transcription_request_body(request))
+    mayhem_proto::endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn artifact_generation_prompt_hash(request: &ArtifactGenerationRequest) -> String {
-    stable_value_hash(&request.contract_request)
+    mayhem_proto::endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn validate_image_generation_request(
@@ -26053,6 +26059,14 @@ mod tests {
             json!("b64_json")
         );
         assert!(normalized.normalized_request.get("size").is_none());
+        let mut request =
+            serde_json::from_value::<ImageGenerationRequest>(normalized.normalized_request.clone())
+                .unwrap();
+        request.endpoint_request = Some(normalized.normalized_request.clone());
+        assert_eq!(
+            image_generation_prompt_hash(&request),
+            normalized.normalized_request_fingerprint
+        );
 
         let explicit = normalize_endpoint_request_for_provider(
             &contract,

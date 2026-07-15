@@ -13297,7 +13297,7 @@ fn catalog_endpoint_calibration_seal(
         "schema_version": 1,
         "endpoint_family": contract.family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(request),
         "transport_request_fingerprint": transport_fingerprint,
     });
     Ok(transport)
@@ -52346,9 +52346,35 @@ fn provider_session_au_owed(active: &ActiveProviderSession, usage: &ReceiptUsage
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
+    let endpoint_family = body
+        .get("mayhem_contract")
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    if endpoint_family.is_some_and(provider_receipt_binds_contract_request) {
+        return mayhem_proto::endpoint_request_fingerprint(
+            body.get("contract_request").unwrap_or(body),
+        );
+    }
     blake3::hash(provider_session_prompt_text(body).as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
+    matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+            | mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    )
 }
 
 fn provider_session_prompt_text(body: &Value) -> String {
@@ -53852,7 +53878,17 @@ fn provider_session_spend_reservation_value(
 }
 
 fn spend_reservation_evidence(value: &Value) -> Value {
-    json!({
+    let mut voucher = stable_json_value(value.get("voucher").unwrap_or(&Value::Null));
+    if let Value::Object(voucher) = &mut voucher {
+        if voucher
+            .get("required_specialities")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            voucher.remove("required_specialities");
+        }
+    }
+    let mut evidence = json!({
         "contract_version": value.get("contract_version").cloned().unwrap_or(Value::Null),
         "session_id": value.get("session_id").cloned().unwrap_or(Value::Null),
         "epoch": value.get("epoch").cloned().unwrap_or(Value::Null),
@@ -53865,12 +53901,20 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
         "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
         "required_modalities": value.get("required_modalities").cloned().unwrap_or(Value::Null),
-        "required_specialities": value.get("required_specialities").cloned().unwrap_or(Value::Null),
         "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
         "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
         "max_spend_au": value.get("max_spend_au").cloned().unwrap_or(Value::Null),
-        "voucher": stable_json_value(value.get("voucher").unwrap_or(&Value::Null)),
-    })
+        "voucher": voucher,
+    });
+    if value
+        .get("required_specialities")
+        .and_then(Value::as_object)
+        .is_some_and(|specialities| !specialities.is_empty())
+    {
+        evidence["required_specialities"] =
+            stable_json_value(value.get("required_specialities").unwrap());
+    }
+    evidence
 }
 
 fn spend_reservation_message(value: &Value) -> String {
@@ -54389,7 +54433,7 @@ fn provider_verify_endpoint_request<'a>(
         .and_then(Value::as_str)
         .context("provider request missing normalized request fingerprint")?;
     ensure!(
-        declared_request_fingerprint == stable_value_hash(request),
+        declared_request_fingerprint == mayhem_proto::endpoint_request_fingerprint(request),
         "provider normalized request fingerprint mismatch"
     );
     let mut transport = transport_body.clone();
@@ -54548,7 +54592,7 @@ fn provider_seal_local_contract_request(
         "schema_version": 1,
         "endpoint_family": family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(&request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&request),
         "transport_request_fingerprint": transport_fingerprint,
     });
     Ok(transport)
@@ -65723,6 +65767,21 @@ mod tests {
         assert!(message.starts_with("mayhem-spend-reservation-v1"));
         assert!(message.contains("\"max_spend_au\":\"1000\""));
         assert!(!message.contains("provider_sig"));
+        assert!(
+            !message.contains("required_specialities"),
+            "empty speciality maps must use the contract's omitted canonical form"
+        );
+
+        let mut specialised = value.clone();
+        specialised["required_specialities"] = json!({ "reasoning_effort": ["high"] });
+        specialised["voucher"]["required_specialities"] = json!({ "reasoning_effort": ["high"] });
+        assert_eq!(
+            spend_reservation_message(&specialised)
+                .matches("required_specialities")
+                .count(),
+            2,
+            "non-empty speciality maps remain bound in both reservation and voucher evidence"
+        );
 
         let key = spend_reservation_feature_key(&value).unwrap();
         assert!(key.starts_with(&format!(
@@ -67289,6 +67348,41 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(explicit["steps"], 9);
         assert_eq!(explicit["cfg_scale"], 0.0);
         assert_eq!(explicit["seed"], 11);
+    }
+
+    #[test]
+    fn provider_accepts_semantically_equal_javascript_image_numbers() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let body = json!({
+            "kind": "image_generation",
+            "model": model.model_id,
+            "prompt": "a glass observatory",
+            "steps": 8,
+            "cfg_scale": 1.0,
+            "shift": 3.0,
+            "seed": 424242,
+            "response_format": "b64_json"
+        });
+        let mut sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+
+        // JSON.parse/stringify in the SC bridge removes the redundant decimal suffix.
+        sealed["contract_request"]["cfg_scale"] = json!(1);
+        sealed["contract_request"]["shift"] = json!(3);
+
+        provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+        assert_eq!(
+            provider_session_prompt_hash(&sealed),
+            sealed["mayhem_contract"]["normalized_request_fingerprint"]
+                .as_str()
+                .unwrap()
+        );
     }
 
     #[test]
