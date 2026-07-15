@@ -94,6 +94,7 @@ class ScBridge extends Feature {
     this.key = 'sc-bridge';
     this.sidechannel = null;
     this.directSession = null;
+    this.inferenceRelay = null;
     this.server = null;
     this.started = false;
     this.clients = new Set();
@@ -142,6 +143,16 @@ class ScBridge extends Feature {
 
   attachDirectSession(directSession) {
     this.directSession = directSession;
+  }
+
+  attachInferenceRelay(inferenceRelay) {
+    this.inferenceRelay = inferenceRelay;
+  }
+
+  async _connectSessionPeer(remote, waitMs) {
+    const relay = this.inferenceRelay;
+    if (relay?.connectPeer) return relay.connectPeer(this.directSession, remote, waitMs);
+    return this.directSession.connectPeer(remote, waitMs);
   }
 
   _broadcastToClient(client, payload) {
@@ -248,6 +259,7 @@ class ScBridge extends Feature {
       remote: event?.remote ?? null,
       direct: event?.direct === true,
       relayed: event?.relayed === true,
+      relay: event?.relay ?? null,
       frame: event?.frame ?? null,
       ts: Date.now(),
     };
@@ -278,6 +290,7 @@ class ScBridge extends Feature {
       remote: event?.remote ?? null,
       direct: event?.direct === true,
       relayed: event?.relayed === true,
+      relay: event?.relay ?? null,
       reason: event?.reason ?? 'Direct session closed.',
       locally_initiated: event?.locally_initiated === true,
       transport_error: event?.transport_error ?? null,
@@ -294,6 +307,7 @@ class ScBridge extends Feature {
       }
       this._broadcastToClient(client, payload);
     }
+    this.inferenceRelay?.releaseRelay?.(payload.remote);
   }
 
   _localPeerKey() {
@@ -521,8 +535,7 @@ class ScBridge extends Feature {
           });
           return;
         }
-        this.directSession
-          .connectPeer(remote, waitMs)
+        this._connectSessionPeer(remote, waitMs)
           .then((peer) => reply({ type: 'peer_connected', ...peer }))
           .catch((err) => {
             sendError(err?.message ? `Peer connect failed: ${err.message}` : 'Peer connect failed.');
@@ -645,6 +658,7 @@ class ScBridge extends Feature {
             return;
           }
           const result = this.directSession.close(message.remote, message.session_id);
+          this.inferenceRelay?.releaseRelay?.(message.remote);
           this._untrackClientSession(client, message.remote, message.session_id);
           reply({ type: 'session_closed', ...result });
         } catch (err) {
@@ -657,7 +671,11 @@ class ScBridge extends Feature {
           sendError('Direct session feature not ready.');
           return;
         }
-        reply({ type: 'session_stats', ...this.directSession.stats() });
+        reply({
+          type: 'session_stats',
+          ...this.directSession.stats(),
+          inference_relay: this.inferenceRelay?.stats?.() ?? null,
+        });
         return;
       }
       case 'send': {
@@ -838,7 +856,13 @@ class ScBridge extends Feature {
           sendError('Info not available.');
           return;
         }
-        reply({ type: 'info', info: this.info });
+        reply({
+          type: 'info',
+          info: {
+            ...this.info,
+            inferenceRelay: this.inferenceRelay?.stats?.() ?? null,
+          },
+        });
         return;
       }
       default:
@@ -1063,6 +1087,7 @@ class ScBridge extends Feature {
         entryChannel: this.sidechannel?.entryChannel ?? null,
         filter: this.defaultFilterRaw || '',
         requiresAuth: this.requireAuth,
+        inferenceRelay: this.inferenceRelay?.stats?.() ?? null,
       };
       this._broadcastToClient(client, hello);
 

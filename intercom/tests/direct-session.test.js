@@ -66,6 +66,32 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.sessionCount, 0);
 });
 
+test('DirectSession reports a relay route without changing frame semantics', () => {
+  const connection = {};
+  const directSession = new DirectSession({}, {
+    transportInfo: (candidate, candidateRemote) => ({
+      direct: candidate !== connection,
+      relayed: candidate === connection,
+      relay: candidateRemote === remote ? localPeer : null,
+    }),
+  });
+
+  assert.deepEqual(directSession._peerInfo(remote, true, connection), {
+    remote,
+    connected: true,
+    direct: false,
+    relayed: true,
+    relay: localPeer,
+  });
+  assert.deepEqual(directSession._peerInfo(remote, true, {}), {
+    remote,
+    connected: true,
+    direct: true,
+    relayed: false,
+    relay: null,
+  });
+});
+
 test('DirectSession accepts explicit mx/s limiter config and ignores unsafe values', () => {
   const configured = new DirectSession({}, {
     maxFrameBytes: 4096,

@@ -68,7 +68,7 @@ use base64::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use image::ImageReader;
-use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
+use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 #[cfg(test)]
 use mayhem_proto::chunk_json_payload;
 use mayhem_proto::{
@@ -9798,6 +9798,10 @@ impl ScBridgeGatewaySessionBackend {
     }
 }
 
+fn sc_bridge_session_transport_valid(opened: &Value) -> bool {
+    sc_bridge_session_transport(opened).is_ok()
+}
+
 impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     fn name(&self) -> &str {
         "sc-bridge-direct-session"
@@ -9920,11 +9924,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "hedge session {} was not direct/non-relayed",
+                "hedge session {} did not open an authenticated direct-or-relayed transport",
                 invocation.session_id
             )));
         }
@@ -9975,11 +9977,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "session {} was not opened as a direct non-relayed channel",
+                "session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -10166,11 +10166,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "embedding session {} was not opened as a direct non-relayed channel",
+                "embedding session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -10318,11 +10316,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "image session {} was not opened as a direct non-relayed channel",
+                "image session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -10470,11 +10466,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "audio speech session {} was not opened as a direct non-relayed channel",
+                "audio speech session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -10612,11 +10606,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "audio transcription session {} was not opened as a direct non-relayed channel",
+                "audio transcription session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -10754,11 +10746,9 @@ impl ScBridgeGatewaySessionBackend {
                     request.output_modality, invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "{} generation session {} was not opened as a direct non-relayed channel",
+                "{} generation session {} did not open an authenticated direct-or-relayed channel",
                 request.output_modality, invocation.session_id
             )));
         }
@@ -15921,14 +15911,12 @@ async fn open_live_direct_chat_session(
                 invocation.session_id, provider, direct_peer
             ))
         })?;
-    if opened.get("direct").and_then(Value::as_bool) != Some(true)
-        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-    {
+    if !sc_bridge_session_transport_valid(&opened) {
         let _ = bridge
             .session_close(direct_peer, &invocation.session_id)
             .await;
         return Err(GatewaySessionError::retryable(format!(
-            "session {} was not opened as a direct non-relayed channel",
+            "session {} did not open an authenticated direct-or-relayed channel",
             invocation.session_id
         )));
     }
@@ -16164,11 +16152,9 @@ async fn reopen_direct_session_and_replay_open(
                 "reopening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
             ))
         })?;
-    if opened.get("direct").and_then(Value::as_bool) != Some(true)
-        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-    {
+    if !sc_bridge_session_transport_valid(&opened) {
         return Err(GatewaySessionError::transport_closed(format!(
-            "reopened session {session_id} was not a direct non-relayed channel"
+            "reopened session {session_id} did not open an authenticated direct-or-relayed channel"
         )));
     }
     bridge
@@ -25953,6 +25939,28 @@ mod tests {
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
+
+    #[test]
+    fn sc_bridge_accepts_exactly_one_authenticated_transport_kind() {
+        assert!(sc_bridge_session_transport_valid(&json!({
+            "direct": true,
+            "relayed": false
+        })));
+        assert!(sc_bridge_session_transport_valid(&json!({
+            "direct": false,
+            "relayed": true,
+            "relay": "a".repeat(64)
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({
+            "direct": false,
+            "relayed": false
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({
+            "direct": true,
+            "relayed": true
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({})));
+    }
 
     #[test]
     fn hf_chat_normalization_does_not_invent_openai_metadata() {

@@ -27,11 +27,12 @@ use mayhem_gateway::{
     ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
-    catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, EndpointAttributeSpec,
-    EndpointSpecialityMapping, EndpointSpecialityTarget, EndpointValueType,
-    ModelSpecialityDescriptor, ModelSpecialityLevel, ReceiptBody, ReceiptUsage, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    catalog_enclave_id, endpoint_request_fingerprint, receipt_signing_bytes,
+    CatalogEnclaveIdentity, EndpointAttributeSpec, EndpointSpecialityMapping,
+    EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor, ModelSpecialityLevel,
+    ReceiptBody, ReceiptUsage, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use std::{
@@ -2109,7 +2110,12 @@ async fn automatic_audio_fingerprint_probe_records_pass() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(bytes.starts_with(b"RIFF"));
-    assert_eq!(state.receipts().len(), 2);
+    assert_eq!(
+        state.receipts().len(),
+        2,
+        "automatic audio probe state: {:?}",
+        state.probes()
+    );
     let probes = state.probes();
     assert_eq!(probes.len(), 1);
     let probe = &probes[0];
@@ -3724,6 +3730,9 @@ fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
 }
 
 fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
+    if let Some(endpoint_request) = &request.endpoint_request {
+        return endpoint_request_fingerprint(endpoint_request);
+    }
     let mut body = json!({
         "kind": "image_generation",
         "model": &request.model,
@@ -3781,7 +3790,7 @@ fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
             body[name] = value;
         }
     }
-    stable_value_hash_for_test(&body)
+    endpoint_contract_hash_for_test(body)
 }
 
 fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
@@ -3798,42 +3807,48 @@ fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
 }
 
 fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
-    stable_value_hash_for_test(&json!({
+    if let Some(endpoint_request) = &request.endpoint_request {
+        return endpoint_request_fingerprint(endpoint_request);
+    }
+    let mut body = json!({
         "kind": "audio_speech",
         "model": &request.model,
         "input": &request.input,
         "response_format": request.response_format.as_deref().unwrap_or("wav"),
         "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH),
-        "voice": request.voice.as_deref(),
-        "speed": request.speed,
-        "instructions": request.instructions,
-        "stream_format": request.stream_format,
-    }))
+    });
+    for (name, value) in [
+        ("voice", request.voice.as_ref().map(|value| json!(value))),
+        ("speed", request.speed.map(|value| json!(value))),
+        (
+            "instructions",
+            request.instructions.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "stream_format",
+            request.stream_format.as_ref().map(|value| json!(value)),
+        ),
+    ] {
+        if let Some(value) = value {
+            body[name] = value;
+        }
+    }
+    endpoint_contract_hash_for_test(body)
+}
+
+fn endpoint_contract_hash_for_test(mut transport_body: Value) -> String {
+    if let Some(body) = transport_body.as_object_mut() {
+        body.remove("kind");
+        body.remove("endpoint_family");
+        body.remove("mayhem_contract");
+        body.remove("contract_request");
+        body.remove("specialities");
+    }
+    endpoint_request_fingerprint(&transport_body)
 }
 
 fn audio_transcription_prompt_hash_for_test(request: &AudioTranscriptionRequest) -> String {
-    stable_value_hash_for_test(&json!({
-        "kind": "audio_transcription",
-        "model": &request.model,
-        "audio": {
-            "encoding": "hex",
-            "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
-            "filename": request.filename.as_deref().unwrap_or("audio.wav"),
-            "data": hex::encode(&request.audio),
-        },
-        "audio_seconds": wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
-        "response_format": request.response_format.as_deref().unwrap_or("json"),
-        "endpoint_family": &request.endpoint_family,
-        "language": request.language.as_deref(),
-        "prompt": request.prompt.as_deref(),
-        "temperature": request.temperature,
-        "timestamp_granularities": if request.timestamp_granularities.is_empty() {
-            Value::Null
-        } else {
-            json!(&request.timestamp_granularities)
-        },
-        "stream": request.stream,
-    }))
+    endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
@@ -3866,31 +3881,6 @@ fn wav_duration_seconds_ceil_for_test(bytes: &[u8]) -> Option<u64> {
     let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as u64;
     let byte_rate = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
     Some(data_len.div_ceil(byte_rate).max(1))
-}
-
-fn stable_value_hash_for_test(value: &Value) -> String {
-    blake3::hash(stable_json_value_for_test(value).to_string().as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-fn stable_json_value_for_test(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(stable_json_value_for_test).collect()),
-        Value::Object(map) => {
-            let mut stable = serde_json::Map::new();
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (key, value) in entries {
-                if value.is_null() {
-                    continue;
-                }
-                stable.insert(key.clone(), stable_json_value_for_test(value));
-            }
-            Value::Object(stable)
-        }
-        other => other.clone(),
-    }
 }
 
 fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {

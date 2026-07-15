@@ -21,6 +21,7 @@ import MayhemProtocol from '../contract/protocol.js';
 import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
+import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
@@ -721,6 +722,85 @@ const directSessionMaxSessionsPerConnection = Number.parseInt(
   10
 );
 
+const inferenceRelayServe = parseBool(
+  flagValue('inference-relay-serve', env.MAYHEM_INFERENCE_RELAY_SERVE || ''),
+  false
+);
+const inferenceRelayPeers = parseCsvList(
+  flagValue('inference-relay-peers', env.MAYHEM_INFERENCE_RELAY_PEERS || '')
+) || [];
+const inferenceRelayForce = parseBool(
+  flagValue('inference-relay-force', env.MAYHEM_INFERENCE_RELAY_FORCE || ''),
+  false
+);
+const inferenceRelayDirectWaitMs = parseInteger(
+  flagValue('inference-relay-direct-wait-ms', env.MAYHEM_INFERENCE_RELAY_DIRECT_WAIT_MS || ''),
+  15_000
+);
+const inferenceRelayWaitMs = parseInteger(
+  flagValue('inference-relay-wait-ms', env.MAYHEM_INFERENCE_RELAY_WAIT_MS || ''),
+  45_000
+);
+const inferenceRelayMaxClients = parseInteger(
+  flagValue('inference-relay-max-clients', env.MAYHEM_INFERENCE_RELAY_MAX_CLIENTS || ''),
+  256
+);
+const inferenceRelayMaxPendingPairs = parseInteger(
+  flagValue(
+    'inference-relay-max-pending-pairs',
+    env.MAYHEM_INFERENCE_RELAY_MAX_PENDING_PAIRS || ''
+  ),
+  512
+);
+const inferenceRelayMaxActivePairs = parseInteger(
+  flagValue(
+    'inference-relay-max-active-pairs',
+    env.MAYHEM_INFERENCE_RELAY_MAX_ACTIVE_PAIRS || ''
+  ),
+  128
+);
+const inferenceRelayMaxBytesPerLink = parseInteger(
+  flagValue(
+    'inference-relay-max-bytes-per-link',
+    env.MAYHEM_INFERENCE_RELAY_MAX_BYTES_PER_LINK || ''
+  ),
+  512 * 1024 * 1024
+);
+const inferenceRelayRateBytesPerSecond = parseInteger(
+  flagValue(
+    'inference-relay-rate-bytes-per-second',
+    env.MAYHEM_INFERENCE_RELAY_RATE_BYTES_PER_SECOND || ''
+  ),
+  32 * 1024 * 1024
+);
+const inferenceRelayRateBurstBytes = parseInteger(
+  flagValue(
+    'inference-relay-rate-burst-bytes',
+    env.MAYHEM_INFERENCE_RELAY_RATE_BURST_BYTES || ''
+  ),
+  64 * 1024 * 1024
+);
+const inferenceRelayIdleTimeoutMs = parseInteger(
+  flagValue(
+    'inference-relay-idle-timeout-ms',
+    env.MAYHEM_INFERENCE_RELAY_IDLE_TIMEOUT_MS || ''
+  ),
+  120_000
+);
+if (
+  inferenceRelayDirectWaitMs <= 0
+  || inferenceRelayWaitMs <= 0
+  || inferenceRelayMaxClients <= 0
+  || inferenceRelayMaxPendingPairs <= 0
+  || inferenceRelayMaxActivePairs <= 0
+  || inferenceRelayMaxBytesPerLink <= 0
+  || inferenceRelayRateBytesPerSecond <= 0
+  || inferenceRelayRateBurstBytes <= 0
+  || inferenceRelayIdleTimeoutMs <= 0
+) {
+  throw new Error('Inference relay limits and timeouts must be positive.');
+}
+
 const scBridgeEnabled = parseBool(
   (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
   false
@@ -1083,11 +1163,34 @@ if (scBridgeEnabled) {
   const portDisplay = Number.isSafeInteger(scBridgePort) ? scBridgePort : 49222;
   console.log('SC-Bridge:', `ws://${scBridgeHost}:${portDisplay}`);
 }
+if (inferenceRelayServe || inferenceRelayPeers.length > 0) {
+  console.log('Inference relay service:', inferenceRelayServe ? 'enabled' : 'disabled');
+  console.log('Inference relay peers:', inferenceRelayPeers.join(', ') || '(none)');
+  console.log('Inference relay direct-first:', !inferenceRelayForce);
+}
 if (rpcEnabled) {
   console.log('RPC:', `http://${rpcHost}:${rpcPort}/v1`);
 }
 console.log('================================================================');
 console.log('');
+
+const inferenceRelay = new InferenceRelay(peer, {
+  serve: inferenceRelayServe,
+  relays: inferenceRelayPeers,
+  forceRelay: inferenceRelayForce,
+  debug: directSessionDebug,
+  directWaitMs: inferenceRelayDirectWaitMs,
+  relayWaitMs: inferenceRelayWaitMs,
+  maxClients: inferenceRelayMaxClients,
+  maxPendingPairs: inferenceRelayMaxPendingPairs,
+  maxActivePairs: inferenceRelayMaxActivePairs,
+  maxBytesPerLink: inferenceRelayMaxBytesPerLink,
+  rateBytesPerSecond: inferenceRelayRateBytesPerSecond,
+  rateBurstBytes: inferenceRelayRateBurstBytes,
+  idleTimeoutMs: inferenceRelayIdleTimeoutMs,
+});
+await inferenceRelay.start();
+peer.inferenceRelay = inferenceRelay;
 
 let scBridge = null;
 if (scBridgeEnabled) {
@@ -1166,6 +1269,7 @@ const directSession = new DirectSession(peer, {
   maxSessionsPerConnection: Number.isSafeInteger(directSessionMaxSessionsPerConnection)
     ? directSessionMaxSessionsPerConnection
     : undefined,
+  transportInfo: (connection, remote) => inferenceRelay.connectionTransport(connection, remote),
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
     : null,
@@ -1220,6 +1324,7 @@ peer.sidechannel = sidechannel;
 if (scBridge) {
   scBridge.attachSidechannel(sidechannel);
   scBridge.attachDirectSession(directSession);
+  scBridge.attachInferenceRelay(inferenceRelay);
   scBridge.start();
   peer.scBridge = scBridge;
 }
@@ -1253,6 +1358,12 @@ if (keepAlive) {
     if (msbDirectPeerTimer) clearInterval(msbDirectPeerTimer);
     try {
       rpcServer?.close?.();
+    } catch (_e) {}
+    try {
+      scBridge?.stop?.();
+    } catch (_e) {}
+    try {
+      await inferenceRelay.stop();
     } catch (_e) {}
     try {
       await peer.close?.();

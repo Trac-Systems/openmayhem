@@ -8,7 +8,12 @@
       "address_prefix": "trac",
       "network_id": 918,
       "bootstrap": "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685",
-      "channel": "0000trac0network0msb0mainnet0000"
+      "channel": "0000trac0network0msb0mainnet0000",
+      "direct_peers": [
+        "2a8ccdeb077a84cf555ff0c1a068f40fa025e0229f9085b19bebbc8f5a65b00c",
+        "08019b10edc930eb5feab8b921ed3402de801a1f15937455c1a6fb46b5fca2e9",
+        "29de5dbddce25b036aa07350c5d11be48d6b238f7ab169bc97cde815c75685b5"
+      ]
     },
     "subnet": {
       "channel": "mayhem-router-subnet",
@@ -29,7 +34,10 @@
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
       ]
-    }
+    },
+    "inference_relays": [
+      "98118758e6a13ad1d831ed0d9438968910040e06560f23ed0c4e0b54b31f0e02"
+    ]
   },
   "startup": {
     "runtime": "pear",

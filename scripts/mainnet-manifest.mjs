@@ -19,6 +19,11 @@ const officialDht = [
   'node2.hyperdht.org:49737',
   'node3.hyperdht.org:49737',
 ];
+const officialMsbDirectPeers = [
+  '2a8ccdeb077a84cf555ff0c1a068f40fa025e0229f9085b19bebbc8f5a65b00c',
+  '08019b10edc930eb5feab8b921ed3402de801a1f15937455c1a6fb46b5fca2e9',
+  '29de5dbddce25b036aa07350c5d11be48d6b238f7ab169bc97cde815c75685b5',
+];
 
 function usage() {
   console.log(`Usage: node scripts/mainnet-manifest.mjs [--manifest PATH] [--allow-placeholders] [--json] [--no-commands]
@@ -244,15 +249,38 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
   requireString(add, manifest.launch_id, 'launch_id');
 
   if (requireObject(add, manifest.network, 'network')) {
-    requireOnlyKeys(add, manifest.network, 'network', ['name', 'denom', 'msb', 'subnet', 'dht']);
+    requireOnlyKeys(add, manifest.network, 'network', [
+      'name',
+      'denom',
+      'msb',
+      'subnet',
+      'dht',
+      'inference_relays',
+    ]);
     requireLiteral(add, manifest.network.name, 'mainnet', 'network.name');
     requireLiteral(add, manifest.network.denom, 'au_usd', 'network.denom');
     if (requireObject(add, manifest.network.msb, 'network.msb')) {
-      requireOnlyKeys(add, manifest.network.msb, 'network.msb', ['address_prefix', 'network_id', 'bootstrap', 'channel']);
+      requireOnlyKeys(add, manifest.network.msb, 'network.msb', [
+        'address_prefix',
+        'network_id',
+        'bootstrap',
+        'channel',
+        'direct_peers',
+      ]);
       requireLiteral(add, manifest.network.msb.address_prefix, 'trac', 'network.msb.address_prefix');
       requireLiteral(add, manifest.network.msb.network_id, 918, 'network.msb.network_id');
       requireLiteral(add, manifest.network.msb.bootstrap, 'acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685', 'network.msb.bootstrap');
       requireLiteral(add, manifest.network.msb.channel, '0000trac0network0msb0mainnet0000', 'network.msb.channel');
+      requireStringArray(add, manifest.network.msb.direct_peers, 'network.msb.direct_peers', 1);
+      if (Array.isArray(manifest.network.msb.direct_peers)) {
+        const directPeers = manifest.network.msb.direct_peers;
+        directPeers.forEach((peer, index) => {
+          requireString(add, peer, `network.msb.direct_peers[${index}]`, pubkey64);
+        });
+        if (directPeers.join(',') !== officialMsbDirectPeers.join(',')) {
+          add('error', 'network.msb.direct_peers must be the canonical Mayhem MSB replication set');
+        }
+      }
     }
     if (requireObject(add, manifest.network.subnet, 'network.subnet')) {
       requireOnlyKeys(add, manifest.network.subnet, 'network.subnet', ['channel', 'bootstrap']);
@@ -269,6 +297,16 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireOnlyKeys(add, manifest.network.dht, 'network.dht', ['peer_bootstrap', 'msb_bootstrap']);
       requireOfficialDht(add, manifest.network.dht.peer_bootstrap, 'network.dht.peer_bootstrap');
       requireOfficialDht(add, manifest.network.dht.msb_bootstrap, 'network.dht.msb_bootstrap');
+    }
+    requireStringArray(add, manifest.network.inference_relays, 'network.inference_relays', 1);
+    if (Array.isArray(manifest.network.inference_relays)) {
+      const relays = manifest.network.inference_relays;
+      relays.forEach((relay, index) => {
+        requireString(add, relay, `network.inference_relays[${index}]`, pubkey64);
+      });
+      if (new Set(relays.map((relay) => relay.toLowerCase())).size !== relays.length) {
+        add('error', 'network.inference_relays must contain unique public keys');
+      }
     }
   }
 
@@ -399,6 +437,7 @@ function buildCommands(manifest) {
   const dht = network.dht || {};
   const peerDht = commaList(dht.peer_bootstrap);
   const msbDht = commaList(dht.msb_bootstrap);
+  const inferenceRelays = commaList(network.inference_relays);
   return {
     start_intercom: [
       'set -a',
@@ -406,7 +445,7 @@ function buildCommands(manifest) {
       'set +a',
       'pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"',
       'cd intercom',
-      `"$pear_runtime" run . --network mainnet --peer-store-name ${sh(startup.peer_store_name)} --msb-store-name ${sh(startup.msb_store_name)} --msb-bootstrap ${sh(msb.bootstrap)} --msb-channel ${sh(msb.channel)} --subnet-channel ${sh(subnet.channel)} --subnet-bootstrap ${sh(subnet.bootstrap)} --sc-bridge 1 --sc-bridge-host 127.0.0.1 --sc-bridge-port 49222 --sc-bridge-token "$${startup.sc_bridge_token_env || 'MAYHEM_SC_BRIDGE_TOKEN'}" --rpc 1 --rpc-host 127.0.0.1 --rpc-port 49223${peerDht ? ` --peer-dht-bootstrap ${sh(peerDht)}` : ''}${msbDht ? ` --msb-dht-bootstrap ${sh(msbDht)}` : ''}`,
+      `"$pear_runtime" run . --network mainnet --peer-store-name ${sh(startup.peer_store_name)} --msb-store-name ${sh(startup.msb_store_name)} --msb-bootstrap ${sh(msb.bootstrap)} --msb-channel ${sh(msb.channel)} --subnet-channel ${sh(subnet.channel)} --subnet-bootstrap ${sh(subnet.bootstrap)} --sc-bridge 1 --sc-bridge-host 127.0.0.1 --sc-bridge-port 49222 --sc-bridge-token "$${startup.sc_bridge_token_env || 'MAYHEM_SC_BRIDGE_TOKEN'}" --rpc 1 --rpc-host 127.0.0.1 --rpc-port 49223${peerDht ? ` --peer-dht-bootstrap ${sh(peerDht)}` : ''}${msbDht ? ` --msb-dht-bootstrap ${sh(msbDht)}` : ''}${inferenceRelays ? ` --inference-relay-peers ${sh(inferenceRelays)}` : ''}`,
     ],
     read_state: [
       'curl -sf http://127.0.0.1:49223/v1/health',

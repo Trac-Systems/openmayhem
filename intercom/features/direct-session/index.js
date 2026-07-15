@@ -112,6 +112,9 @@ class DirectSession extends Feature {
     this.lastConnectAttempt = null;
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
     this.onClose = typeof config.onClose === 'function' ? config.onClose : null;
+    this.transportInfo = typeof config.transportInfo === 'function'
+      ? config.transportInfo
+      : null;
   }
 
   start() {
@@ -148,12 +151,11 @@ class DirectSession extends Feature {
       maxSessionsPerConnection: this.maxSessionsPerConnection,
       sessionCount: this.sessions.size,
       sessions: Array.from(this.sessions.values()).map((session) => ({
+        ...this._transportInfo(session.connection, session.remote),
         session_id: session.sessionId,
         channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
         remote: session.remote,
         opened: session.channel?.opened === true,
-        direct: true,
-        relayed: false,
       })),
       connections: Array.from(this.connectionHealth.values()).map((health) => ({
         remote: this._remoteKey(health.connection),
@@ -234,7 +236,7 @@ class DirectSession extends Feature {
             attempt.state = 'connected';
             attempt.verified = true;
             attempt.completed_at = Date.now();
-            return this._peerInfo(normalizedRemote, true);
+            return this._peerInfo(normalizedRemote, true, connection);
           }
           continue;
         }
@@ -253,7 +255,7 @@ class DirectSession extends Feature {
           attempt.state = 'connected';
           attempt.verified = true;
           attempt.completed_at = Date.now();
-          return this._peerInfo(normalizedRemote, true);
+          return this._peerInfo(normalizedRemote, true, connection);
         } catch (error) {
           attempt.error = error?.message ?? String(error);
           probed.add(connection);
@@ -276,7 +278,7 @@ class DirectSession extends Feature {
             `[direct-session] using unverified (legacy health) connection to ${normalizedRemote}`
           );
         }
-        return this._peerInfo(normalizedRemote, true);
+        return this._peerInfo(normalizedRemote, true, fallback);
       }
       await new Promise((resolve) => setTimeout(resolve, this.connectPollMs));
     }
@@ -633,12 +635,34 @@ class DirectSession extends Feature {
     return normalizeKeyHex(connection?.remotePublicKey);
   }
 
-  _peerInfo(remote, connected) {
+  _peerInfo(remote, connected, connection = null) {
     return {
       remote,
       connected,
+      ...this._transportInfo(connection, remote, connected),
+    };
+  }
+
+  _transportInfo(connection, remote, connected = true) {
+    if (this.transportInfo) {
+      try {
+        const info = this.transportInfo(connection, remote);
+        if (info && typeof info === 'object') {
+          const relayed = info.relayed === true;
+          return {
+            direct: connected === true && !relayed,
+            relayed: connected === true && relayed,
+            relay: relayed && typeof info.relay === 'string' ? info.relay : null,
+          };
+        }
+      } catch (error) {
+        this._reportEventError('transport classification', error);
+      }
+    }
+    return {
       direct: connected === true,
       relayed: false,
+      relay: null,
     };
   }
 
@@ -729,13 +753,13 @@ class DirectSession extends Feature {
     }
     if (this.onFrame) {
       try {
+        const transport = this._transportInfo(session.connection, session.remote);
         const result = this.onFrame({
           session_id: session.sessionId,
           channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
           protocol: SESSION_PROTOCOL,
           remote: session.remote,
-          direct: true,
-          relayed: false,
+          ...transport,
           frame,
         });
         if (result && typeof result.catch === 'function') {
@@ -882,13 +906,13 @@ class DirectSession extends Feature {
     if (this.sessions.get(key) === session) this.sessions.delete(key);
     if (emitClose && this.onClose) {
       try {
+        const transport = this._transportInfo(session.connection, session.remote);
         const result = this.onClose({
           session_id: session.sessionId,
           channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
           protocol: SESSION_PROTOCOL,
           remote: session.remote,
-          direct: true,
-          relayed: false,
+          ...transport,
           reason: transportError
             ? `${closeReason} Transport: ${transportError.code || 'ERROR'} ${transportError.message}`
             : closeReason,
@@ -954,12 +978,11 @@ class DirectSession extends Feature {
 
   _sessionInfo(session) {
     return {
+      ...this._transportInfo(session.connection, session.remote),
       session_id: session.sessionId,
       channel: `${SESSION_CHANNEL_PREFIX}${session.sessionId}`,
       protocol: SESSION_PROTOCOL,
       remote: session.remote,
-      direct: true,
-      relayed: false,
       opened: session.channel?.opened === true,
     };
   }

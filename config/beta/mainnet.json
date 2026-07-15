@@ -34,7 +34,10 @@
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
       ]
-    }
+    },
+    "inference_relays": [
+      "98118758e6a13ad1d831ed0d9438968910040e06560f23ed0c4e0b54b31f0e02"
+    ]
   },
   "startup": {
     "runtime": "pear",

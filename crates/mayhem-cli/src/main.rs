@@ -171,6 +171,7 @@ struct MainnetManifestNetwork {
     msb: MainnetManifestMsb,
     subnet: MainnetManifestSubnet,
     dht: MainnetManifestDht,
+    inference_relays: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -25961,6 +25962,22 @@ fn validate_mainnet_manifest(manifest: &MainnetManifest) -> Result<()> {
         "mainnet manifest must pin the complete official HyperDHT bootstrap set"
     );
     ensure!(
+        !manifest.network.inference_relays.is_empty()
+            && manifest
+                .network
+                .inference_relays
+                .iter()
+                .all(|relay| is_hex_len(relay, 64))
+            && manifest
+                .network
+                .inference_relays
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == manifest.network.inference_relays.len(),
+        "mainnet manifest inference relays must be unique 32-byte public keys"
+    );
+    ensure!(
         is_hex_len(&manifest.contract.admin_peer_pubkey, 64),
         "mainnet manifest admin key is invalid"
     );
@@ -26122,6 +26139,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             manifest.network.dht.msb_bootstrap.join(","),
             "--msb-direct-peer".to_owned(),
             manifest.network.msb.direct_peers.join(","),
+            "--inference-relay-peers".to_owned(),
+            manifest.network.inference_relays.join(","),
         ]);
     }
     peer_args.extend([
@@ -76138,6 +76157,12 @@ State initialization...
             .eq(MAINNET_MSB_DIRECT_PEERS));
         assert_eq!(manifest.network.dht.peer_bootstrap.len(), 5);
         assert_eq!(manifest.network.dht.msb_bootstrap.len(), 5);
+        assert_eq!(manifest.network.inference_relays.len(), 1);
+        assert!(manifest
+            .network
+            .inference_relays
+            .iter()
+            .all(|relay| is_hex_len(relay, 64)));
         assert_eq!(manifest.payments.directory_min_version, 3);
         assert_eq!(manifest.payments.tap.chain_id, MAINNET_TAP_CHAIN_ID);
         assert_eq!(
@@ -76184,6 +76209,12 @@ State initialization...
         assert!(text.contains("--peer-dht-bootstrap"));
         assert!(text.contains("--msb-dht-bootstrap"));
         assert!(text.contains("--msb-direct-peer"));
+        assert!(text.contains("--inference-relay-peers"));
+        assert!(manifest
+            .network
+            .inference_relays
+            .iter()
+            .all(|relay| text.contains(relay)));
         assert!(MAINNET_MSB_DIRECT_PEERS
             .iter()
             .all(|peer| text.contains(peer)));
