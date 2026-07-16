@@ -19,6 +19,20 @@ const CENT_AU = 10_000_000_000_000_000n;
 const au = (value) => value.toString();
 const cents = (value) => value.toString();
 
+test('MayhemContract fiat dust feature key matches the Rust terminal fixture', async () => {
+  const identity = await makeIdentity();
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(identity.wallet) } }, {});
+  assert.equal(
+    await contract.fiatDustSweepFeatureKey({
+      op: 'fiat_dust_sweep',
+      provider: '11'.repeat(32),
+      epoch: 7,
+      at: 25_200,
+    }),
+    `settle/fiat-dust/${'11'.repeat(32)}/7/c18df170b5420344c89886d3aeef42f3f9064e29b92c66da4e503245f076f78d`
+  );
+});
+
 async function setupFiatSettlementContract({
   providerSpecs = [
     { target: 'acct_provider_one', currency: 'eur', gross_au: au(200n * CENT_AU) },
@@ -421,7 +435,7 @@ test('MayhemContract fiatSettlement holds providers without admin Stripe payout 
   assert.equal(heldProvider.last_settlement_stripe_ref ?? null, null);
 });
 
-test('MayhemContract fiatSettlement leaves sub-cent dust unpaid instead of marking it transferred', async () => {
+test('MayhemContract pays departed providers then deterministically sweeps only terminal fiat dust', async () => {
   const ctx = await setupFiatSettlementContract({
     providerSpecs: [
       {
@@ -441,6 +455,10 @@ test('MayhemContract fiatSettlement leaves sub-cent dust unpaid instead of marki
   assert.equal(settlement.outputs[0].amount_minor, '85');
   assert.equal(settlement.outputs[0].au, au(85n * CENT_AU));
 
+  const providerKey = `prov/${ctx.providers[0].identity.publicKey}`;
+  const departedProvider = (await ctx.storage.get(providerKey)).value;
+  await ctx.storage.put(providerKey, { ...departedProvider, status: 'inactive', enclaves: [] });
+
   const settled = await executeFiatSettlementFeature(
     ctx.contract,
     ctx.storage,
@@ -453,6 +471,110 @@ test('MayhemContract fiatSettlement leaves sub-cent dust unpaid instead of marki
   assert.equal(earning.total_au, au(85n * CENT_AU + 1n));
   assert.equal(earning.paid_cum_au, au(85n * CENT_AU));
   assert.equal(BigInt(earning.total_au) - BigInt(earning.paid_cum_au), 1n);
+
+  const sweepValue = {
+    op: 'fiat_dust_sweep',
+    provider: ctx.providers[0].identity.publicKey,
+    epoch: 1,
+    at: 90_001,
+  };
+  const sweepKey = await ctx.contract.fiatDustSweepFeatureKey(sweepValue);
+
+  await ctx.storage.put(providerKey, {
+    ...departedProvider,
+    status: 'inactive',
+    enclaves: ['canonical-enclave'],
+  });
+  const beforeActiveEnclaveAttempt = ctx.storage.snapshotBytes();
+  const activeEnclaveResult = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    sweepKey,
+    sweepValue,
+    ctx.admin.publicKey
+  );
+  const activeEnclave = activeEnclaveResult ?? ctx.contract._mayhemLastFeatureResult;
+  assert.match(activeEnclave.message, /no active enclaves/i);
+  assert.equal(ctx.storage.snapshotBytes(), beforeActiveEnclaveAttempt);
+
+  await ctx.storage.put(providerKey, { ...departedProvider, status: 'inactive', enclaves: [] });
+  const earningKey = `earn/fiat/${ctx.providers[0].identity.publicKey}`;
+  await ctx.storage.put(earningKey, {
+    ...earning,
+    held_au: '1',
+    holdbacks: [{ epoch: 1, au: '1', locked_epochs: 0 }],
+  });
+  const providerDisputeKey = `disp/provider-open/${ctx.providers[0].identity.publicKey}`;
+  await ctx.storage.put(providerDisputeKey, {
+    provider: ctx.providers[0].identity.publicKey,
+    count: 1,
+  });
+  const beforeHeldAttempt = ctx.storage.snapshotBytes();
+  const heldResult = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    sweepKey,
+    sweepValue,
+    ctx.admin.publicKey
+  );
+  const held = heldResult ?? ctx.contract._mayhemLastFeatureResult;
+  assert.match(held.message, /earnings are held/i);
+  assert.equal(ctx.storage.snapshotBytes(), beforeHeldAttempt);
+  await ctx.storage.del(providerDisputeKey);
+  await ctx.storage.put(earningKey, earning);
+
+  const beforeUnauthorized = ctx.storage.snapshotBytes();
+  const unauthorizedResult = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    sweepKey,
+    sweepValue,
+    ctx.outsider.publicKey
+  );
+  const unauthorized = unauthorizedResult ?? ctx.contract._mayhemLastFeatureResult;
+  assert.match(unauthorized.message, /admin required/i);
+  assert.equal(ctx.storage.snapshotBytes(), beforeUnauthorized);
+
+  const sweptResult = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    sweepKey,
+    sweepValue,
+    ctx.admin.publicKey
+  );
+  const swept = sweptResult ?? ctx.contract._mayhemLastFeatureResult;
+  assert.deepEqual(swept, {
+    ok: true,
+    op: 'fiatDustSweep',
+    provider: ctx.providers[0].identity.publicKey,
+    epoch: 1,
+    dust_au: '1',
+    idempotent: false,
+  });
+  const finalEarning = (await ctx.storage.get(`earn/fiat/${ctx.providers[0].identity.publicKey}`)).value;
+  assert.equal(finalEarning.total_au, au(85n * CENT_AU));
+  assert.equal(finalEarning.paid_cum_au, au(85n * CENT_AU));
+  assert.equal(finalEarning.fiat_dust_swept_cum_au, '1');
+  const fee = (await ctx.storage.get('fee/fiat/cum')).value;
+  assert.equal(fee.cum_au, au(15n * CENT_AU + 1n));
+  assert.equal(fee.swept_cum_au, au(15n * CENT_AU));
+  assert.equal((await ctx.storage.get(`settle/fiat-dust/${ctx.providers[0].identity.publicKey}/1`)).value.dust_au, '1');
+
+  const replayResult = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    sweepKey,
+    sweepValue,
+    ctx.admin.publicKey
+  );
+  const replay = replayResult ?? ctx.contract._mayhemLastFeatureResult;
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.dust_au, '1');
 });
 
 test('MayhemContract fiatSettlement uses the active admin max_fiat_settlement_outputs param', async () => {

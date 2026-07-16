@@ -15,6 +15,9 @@ const rulesHash = 'a9'.repeat(32);
 const enclaveId = 'b9'.repeat(32);
 const binaryHash = 'c9'.repeat(32);
 const modelId = 'mayhem/auditor-canary-model';
+const challengeApplyHash = 'e'.repeat(64);
+const catalogHash = '8'.repeat(64);
+const canaryPromptIds = ['dev-arithmetic-json', 'dev-tool-shape'];
 
 const providerRegistration = {
   op: 'register_provider',
@@ -105,6 +108,7 @@ async function setupAuditorContract() {
           set_id: 'canary-dev-v1',
           url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
           hash: 'b'.repeat(64),
+          prompt_ids: ['dev-arithmetic-json', 'dev-tool-shape'],
         }],
       },
       sender: admin.publicKey,
@@ -115,7 +119,35 @@ async function setupAuditorContract() {
     assert.equal(result.ok, true, result.message);
   }
 
+  await seedCanaryChallenge(contract, storage, provider, auditor);
+
   return { admin, provider, auditor, storage, contract };
+}
+
+async function seedCanaryChallenge(contract, storage, provider, auditor) {
+  await storage.put('epoch/apply/state', {
+    updated_epoch: 0,
+    updated_at: null,
+    last_apply_hash: challengeApplyHash,
+    pending_epoch: null,
+  });
+  const challengeSeed = await contract.opaqueHash('mayhem-canary-challenge-v1', {
+    challenge_epoch: 0,
+    challenge_apply_hash: challengeApplyHash,
+    probe_epoch: 1,
+    auditor: auditor.publicKey,
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    canary_set: 'canary-dev-v1',
+    catalog_hash: catalogHash,
+  });
+  const selectedIndex = Number(BigInt(`0x${challengeSeed}`) % BigInt(canaryPromptIds.length));
+  auditor.canaryChallenge = {
+    canary_prompt_id: canaryPromptIds[selectedIndex],
+    challenge_epoch: 0,
+    challenge_apply_hash: challengeApplyHash,
+    challenge_seed: challengeSeed,
+  };
 }
 
 const canaryProbe = (provider, auditor, overrides = {}, options = {}) => {
@@ -129,6 +161,7 @@ const canaryProbe = (provider, auditor, overrides = {}, options = {}) => {
     epoch: 1,
     at: 10_000,
     canary_set: 'canary-dev-v1',
+    ...auditor.canaryChallenge,
     verification_method: 'token_fingerprint',
     match_bps: 9_700,
     pass: true,
@@ -322,6 +355,22 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   );
   assert.match(unpublishedCanary.message, /not published/i);
 
+  const wrongPromptId = canaryPromptIds.find(
+    (promptId) => promptId !== auditor.canaryChallenge.canary_prompt_id
+  );
+  const wrongPrompt = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, {
+      probe_id: 'canary-wrong-prompt',
+      canary_prompt_id: wrongPromptId,
+    }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(wrongPrompt.message, /prompt does not match/i);
+
   assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
   assert.equal(await storage.get('ev/probe/canary-forged'), null);
   assert.equal(await storage.get('ev/probe/canary-fabricated-failure'), null);
@@ -344,6 +393,13 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
       provider: provider.publicKey,
       epoch: 1,
       pass_count: 1,
+      auditors: [auditor.publicKey],
+      probes: [{
+        auditor: auditor.publicKey,
+        probe_id: 'canary-good',
+        evidence_hash: 'd'.repeat(64),
+        challenge_seed: auditor.canaryChallenge.challenge_seed,
+      }],
       last_probe_id: 'canary-good',
       last_evidence_hash: 'd'.repeat(64),
       updated_at: makeTxKey(9),
@@ -423,6 +479,161 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   const updatedAuditor = await storage.get(`auditor/${auditor.publicKey}`);
   assert.equal(updatedAuditor.value.submitted_probes, 3);
   assert.equal(updatedAuditor.value.successful_probes, 2);
+});
+
+test('MayhemContract requires distinct active auditors and revokes colluding passes', async () => {
+  const { admin, provider, auditor, storage, contract } = await setupAuditorContract();
+  const secondAuditor = await makeIdentity();
+
+  const secondConsent = await execute(
+    contract,
+    storage,
+    'consent',
+    {
+      op: 'consent',
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(secondAuditor.wallet, 1, rulesHash),
+    },
+    secondAuditor.publicKey,
+    20
+  );
+  assert.equal(secondConsent.ok, true, secondConsent.message);
+
+  for (const [identity, txNo] of [[auditor, 21], [secondAuditor, 22]]) {
+    const registered = await execute(
+      contract,
+      storage,
+      'auditorRegister',
+      {
+        op: 'auditor_register',
+        auditor: identity.publicKey,
+        registered_at_seconds: 0,
+      },
+      admin.publicKey,
+      txNo
+    );
+    assert.equal(registered.ok, true, registered.message);
+  }
+
+  const firstPass = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'distinct-pass-a' }),
+    auditor.publicKey,
+    23
+  );
+  assert.equal(firstPass.ok, true, firstPass.message);
+
+  const reputationBeforeDuplicate = (await storage.get(`ev/rep/head/${provider.publicKey}`)).value;
+  const duplicate = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'duplicate-pass-a' }),
+    auditor.publicKey,
+    24
+  );
+  assert.match(duplicate.message, /already supplied a canary pass/i);
+  assert.deepEqual(
+    (await storage.get(`ev/rep/head/${provider.publicKey}`)).value,
+    reputationBeforeDuplicate
+  );
+  assert.equal(await storage.get('ev/probe/duplicate-pass-a'), null);
+
+  const earning = {
+    held_au: '1000',
+    holdbacks: [{ epoch: 1, au: '1000' }],
+  };
+  const params = {
+    canary_probe_holdback_bps: 10_000,
+    canary_probe_release_min_passes: 2,
+  };
+  contract.storage = storage;
+  let gate;
+  try {
+    gate = await contract.probeGateForEarning(provider.publicKey, earning, params);
+  } finally {
+    contract.storage = null;
+  }
+  assert.equal(gate.passed_epochs.has(1), false);
+
+  await seedCanaryChallenge(contract, storage, provider, secondAuditor);
+  const secondPass = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, secondAuditor, {
+      probe_id: 'distinct-pass-b',
+      evidence_hash: 'f'.repeat(64),
+    }),
+    secondAuditor.publicKey,
+    25
+  );
+  assert.equal(secondPass.ok, true, secondPass.message);
+  assert.equal(secondPass.probe_pass_record.pass_count, 2);
+
+  contract.storage = storage;
+  try {
+    gate = await contract.probeGateForEarning(provider.publicKey, earning, params);
+  } finally {
+    contract.storage = null;
+  }
+  assert.equal(gate.passed_epochs.has(1), true);
+
+  const slashValue = {
+    op: 'auditor_slash',
+    auditor: auditor.publicKey,
+    provider: provider.publicKey,
+    probe_id: 'distinct-pass-a',
+    epoch: 1,
+    reason: 'collusion',
+    evidence_hash: '7'.repeat(64),
+    at: 10_001,
+  };
+  const unauthorized = await execute(
+    contract,
+    storage,
+    'auditorSlash',
+    slashValue,
+    provider.publicKey,
+    26
+  );
+  assert.match(unauthorized.message, /admin/i);
+
+  const slashed = await execute(
+    contract,
+    storage,
+    'auditorSlash',
+    slashValue,
+    admin.publicKey,
+    27
+  );
+  assert.equal(slashed.ok, true, slashed.message);
+  assert.equal((await storage.get(`auditor/${auditor.publicKey}`)).value.status, 'slashed');
+  assert.equal(
+    (await storage.get(`probe/pass/${provider.publicKey}/1`)).value.pass_count,
+    1
+  );
+
+  contract.storage = storage;
+  try {
+    gate = await contract.probeGateForEarning(provider.publicKey, earning, params);
+  } finally {
+    contract.storage = null;
+  }
+  assert.equal(gate.passed_epochs.has(1), false);
+
+  const reregister = await execute(
+    contract,
+    storage,
+    'auditorRegister',
+    { op: 'auditor_register', auditor: auditor.publicKey, registered_at_seconds: 0 },
+    admin.publicKey,
+    28
+  );
+  assert.match(reregister.message, /slashed/i);
 });
 
 test('MayhemContract keeps provider and auditor keys separate', async () => {
@@ -512,6 +723,7 @@ test('MayhemContract auditor probe log replays deterministically', async () => {
   };
 
   async function applyScenario(ctx) {
+    await seedCanaryChallenge(ctx.contract, ctx.storage, ctx.provider, ctx.auditor);
     for (const op of [
       {
         type: 'setRules',
@@ -589,6 +801,7 @@ test('MayhemContract auditor probe log replays deterministically', async () => {
             set_id: 'canary-dev-v1',
             url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
             hash: 'b'.repeat(64),
+            prompt_ids: ['dev-arithmetic-json', 'dev-tool-shape'],
           }],
         },
         sender: ctx.admin.publicKey,

@@ -526,28 +526,23 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     chain_id: 61_000,
     epoch: 1,
     at: 1_800,
-    ...tapWatcherEvidence(),
+    ...tapWatcherEvidence({ confirmation_policy: 'finalized-tag' }),
   };
 
   const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
-  const missingEvidence = await executeDepositFeature(
-    ctx.contract,
-    ctx.storage,
-    {
-      op: 'tap_deposit',
-      who: buyer,
-      tap_wei: oneTnkE18,
-      eth_tx_hash: `0x${'d'.repeat(64)}`,
-      log_index: 1,
-      block_number: 124,
-      pool_address: pool,
-      chain_id: 61_000,
-      epoch: 1,
-      at: 1_800,
-    },
-    ctx.admin.publicKey
-  );
+  const missingEvidence = await ctx.contract.depositFeatureKey({
+    op: 'tap_deposit',
+    who: buyer,
+    tap_wei: oneTnkE18,
+    eth_tx_hash: `0x${'d'.repeat(64)}`,
+    log_index: 1,
+    block_number: 124,
+    pool_address: pool,
+    chain_id: 61_000,
+    epoch: 1,
+    at: 1_800,
+  });
   assert.match(missingEvidence.message, /missing block_hash/i);
   const badEventSignature = await executeDepositFeature(
     ctx.contract,
@@ -592,7 +587,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     },
     ctx.admin.publicKey
   );
-  assert.match(finalizedTag.message, /Fresh TAP rate oracle required/i);
+  assert.match(finalizedTag.message, /confirmation depth below minimum/i);
 
   const rate = await executeRateFeature(
     ctx.contract,
@@ -641,7 +636,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(confirmed.rate_ts, 1_000);
   assert.equal(confirmed.deposit_root.length, 64);
 
-  const seenKey = `dep/tap/${ethTxHash}/0`;
+  const seenKey = `dep/tap/61000/${pool}/${ethTxHash}/0/0x${'b'.repeat(64)}`;
   assert.deepEqual((await ctx.storage.get(seenKey)).value, {
     rail: 'tap',
     who: ctx.user.publicKey,
@@ -659,7 +654,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     chain_id: 61_000,
     finalized_block_number: 135,
     confirmation_depth: 12,
-    confirmation_policy: 'depth-12',
+    confirmation_policy: 'finalized-tag',
     event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
     watcher_id: TAP_DEPOSIT_WATCHER_ID,
     epoch: 1,
@@ -1019,4 +1014,24 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
 
   const frozenDeposit = await depositIntent(ctx, 'memo-frozen', 5);
   assert.match(frozenDeposit.message, /frozen/i);
+});
+
+test('MayhemContract conversion rounding never over-credits deposits or underpays TNK settlement', async () => {
+  const identity = await makeIdentity();
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(identity.wallet) } }, {});
+  const atomic = 999_999_999_999_999_999n;
+  const rate = 1_234_567_890_123_456_789n;
+
+  const tnkCredit = BigInt(contract.tnkE18ToAu(atomic, rate.toString()));
+  assert.ok(tnkCredit * 1_000_000_000_000_000_000n <= atomic * rate);
+  assert.ok((tnkCredit + 1n) * 1_000_000_000_000_000_000n > atomic * rate);
+
+  const tapCredit = BigInt(contract.tapWeiToAu(atomic, rate.toString()));
+  assert.ok(tapCredit * 1_000_000_000_000_000_000n <= atomic * rate);
+  assert.ok((tapCredit + 1n) * 1_000_000_000_000_000_000n > atomic * rate);
+
+  const payoutAu = 987_654_321_987_654_321n;
+  const payoutAtomic = contract.auToTnkE18Ceil(payoutAu.toString(), rate.toString());
+  assert.ok(payoutAtomic * rate >= payoutAu * 1_000_000_000_000_000_000n);
+  assert.ok((payoutAtomic - 1n) * rate < payoutAu * 1_000_000_000_000_000_000n);
 });

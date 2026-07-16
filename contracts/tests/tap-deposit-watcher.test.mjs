@@ -13,6 +13,7 @@ import {
   scanTapDeposits,
   TAP_DEPOSIT_EVENT_SIGNATURE,
   TAP_DEPOSIT_WATCHER_ID,
+  tapDepositKey,
   tapDepositStateMatches,
   tapWeiToAu,
 } from '../scripts/tap-deposit-watcher.mjs';
@@ -133,6 +134,10 @@ test('tap deposit watcher helpers compute policy au and verify replay-safe state
   };
 
   assert.equal(tapWeiToAu(deposit.tap_wei, deposit.tap_usd_au), '2000000000000000000');
+  assert.equal(
+    tapDepositKey(deposit),
+    `${CHAIN_ID}/${deposit.pool_address}/${deposit.eth_tx_hash}/0/${deposit.block_hash}`
+  );
   assert.equal(tapDepositStateMatches(deposit, {
     epoch: 9,
     seen: { ...deposit, who: canonicalWho, ethereum_address: deposit.who },
@@ -231,5 +236,56 @@ test('tap deposit watcher refuses unsafe shallow depth scans', async () => {
       poolAddress: poolAddr,
     }),
     /to-block must be at least 12 confirmations deep/
+  );
+});
+
+test('tap deposit watcher keeps a 12-block gap behind the finalized reference', async () => {
+  const queries = [];
+  const provider = {
+    async send(method, args) {
+      assert.equal(method, 'eth_getBlockByNumber');
+      assert.deepEqual(args, ['finalized', false]);
+      return { number: '0x64' };
+    },
+  };
+  const poolAddress = '0x2222222222222222222222222222222222222222';
+  const pool = {
+    runner: { provider },
+    filters: { Deposit: () => 'deposit-filter' },
+    async queryFilter(_filter, from, to) {
+      queries.push([from, to]);
+      return [{
+        args: { buyer: '0x1111111111111111111111111111111111111111', amount: U(1) },
+        index: 0,
+        blockNumber: 88,
+        blockHash: `0x${'b'.repeat(64)}`,
+        transactionHash: `0x${'a'.repeat(64)}`,
+        address: poolAddress,
+      }];
+    },
+  };
+
+  const scan = await scanTapDeposits({
+    pool,
+    fromBlock: 0,
+    blockTag: 'finalized',
+    chainId: CHAIN_ID,
+    poolAddress,
+  });
+  assert.deepEqual(queries, [[0, 88]]);
+  assert.equal(scan.to, 88);
+  assert.equal(scan.deposits[0].confirmation_depth, 12);
+  assert.equal(scan.deposits[0].confirmation_policy, 'finalized-tag');
+
+  await assert.rejects(
+    () => scanTapDeposits({
+      pool,
+      fromBlock: 0,
+      toBlock: 89,
+      blockTag: 'finalized',
+      chainId: CHAIN_ID,
+      poolAddress,
+    }),
+    /12 blocks behind the finalized reference/
   );
 });

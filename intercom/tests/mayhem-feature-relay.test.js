@@ -555,7 +555,7 @@ test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
   };
   const value = {
     op: 'spend_reserve',
-    contract_version: 8,
+    contract_version: 9,
     session_id: voucher.session_id,
     epoch: Number.MAX_SAFE_INTEGER,
     at: Number.MAX_SAFE_INTEGER,

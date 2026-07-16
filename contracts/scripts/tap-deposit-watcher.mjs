@@ -151,7 +151,12 @@ export function tapDepositFromLog(log, {
 }
 
 export function tapDepositKey(deposit) {
-  return `${deposit.eth_tx_hash}/${deposit.log_index}`;
+  const chainId = parsePositiveInt(deposit.chain_id, 'chain_id');
+  const poolAddress = normalizeAddress(deposit.pool_address, 'pool_address');
+  const ethTxHash = normalizeTxHash(deposit.eth_tx_hash);
+  const logIndex = parseNonNegativeInt(deposit.log_index, 'log_index');
+  const blockHash = normalizeBlockHash(deposit.block_hash);
+  return `${chainId}/${poolAddress}/${ethTxHash}/${logIndex}/${blockHash}`;
 }
 
 export function buildAdminCommandArgs(deposit, {
@@ -284,6 +289,8 @@ export function tapDepositStateMatches(deposit, {
     && seen?.ethereum_address === deposit.who
     && seen?.tap_wei === deposit.tap_wei
     && seen?.block_hash === deposit.block_hash
+    && Number(seen?.chain_id) === Number(deposit.chain_id)
+    && seen?.pool_address === deposit.pool_address
     && Number(seen?.finalized_block_number) === Number(deposit.finalized_block_number)
     && Number(seen?.confirmation_depth) === Number(deposit.confirmation_depth)
     && seen?.confirmation_policy === deposit.confirmation_policy
@@ -359,19 +366,27 @@ async function safeToBlock(provider, { toBlock, confirmations = 12, blockTag }) 
   if (blockTag === 'finalized') {
     const block = await provider.send('eth_getBlockByNumber', ['finalized', false]);
     if (!block || block.number == null) throw new Error('finalized block tag unavailable from RPC');
-    const safeTo = Number(block.number);
-    return { safeTo, referenceBlock: safeTo, finalizedPolicy: true };
+    const referenceBlock = Number(block.number);
+    const maxSafe = Math.max(-1, referenceBlock - MIN_TAP_CONFIRMATIONS);
+    if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
+      const explicit = parseNonNegativeInt(toBlock, '--to-block');
+      if (explicit > maxSafe) {
+        throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} blocks behind the finalized reference`);
+      }
+      return { safeTo: explicit, referenceBlock, finalizedPolicy: true };
+    }
+    return { safeTo: maxSafe, referenceBlock, finalizedPolicy: true };
   }
   const head = Number(await provider.send('eth_blockNumber', []));
   const depth = parseNonNegativeInt(confirmations, '--confirmations', 12);
   if (depth < MIN_TAP_CONFIRMATIONS) {
-    throw new Error(`--confirmations must be at least ${MIN_TAP_CONFIRMATIONS} unless --block-tag finalized is used`);
+    throw new Error(`--confirmations must be at least ${MIN_TAP_CONFIRMATIONS}`);
   }
   const maxSafe = Math.max(-1, head - depth);
   if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
     const explicit = parseNonNegativeInt(toBlock, '--to-block');
     if (explicit > maxSafe) {
-      throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} confirmations deep unless --block-tag finalized is used`);
+      throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} confirmations deep`);
     }
     return { safeTo: explicit, referenceBlock: head, finalizedPolicy: false };
   }

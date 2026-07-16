@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 8;
+export const CONTRACT_VERSION = 9;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -48,6 +48,8 @@ const MAX_OPERATOR_FEE_BPS = 1_500;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 3;
 const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
 const DEFAULT_DISPUTE_TIMEOUT_EPOCHS = 168;
+const DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER = 8;
+const DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS = 2_500;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
@@ -73,6 +75,11 @@ const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 const MSB_TRANSFER_EVIDENCE_VERSION = 1;
 const STRIPE_TRANSFER_EVIDENCE_VERSION = 1;
+const REPUTATION_HALF_LIFE_SECONDS = 14 * DAY_SECONDS;
+const REPUTATION_KAPPA = 25;
+const REPUTATION_RAW_NANO_SCALE = 1_000_000_000n;
+const REPUTATION_DECAY_PICO_SCALE = 1_000_000_000_000n;
+const REPUTATION_RAW_NANO_PER_MILLI = 1_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -83,7 +90,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   auditor_min_age_seconds: { default: 30 * DAY_SECONDS, min: 0, max: 10 * 365 * DAY_SECONDS },
   canary_match_min_bps: { default: 9_000, min: 0, max: 10_000 },
   canary_probe_holdback_bps: { default: 0, min: 0, max: 10_000 },
-  canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
+  canary_probe_release_min_passes: { default: 2, min: 0, max: 1_000_000 },
   probe_reward_au: { default: FIVE_MILLI_USD_AU, min: ZERO_AU, money: true },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   fraud_slash_bps: { default: DEFAULT_FRAUD_SLASH_BPS, min: 0, max: 10_000 },
@@ -94,6 +101,8 @@ const PARAM_DEFINITIONS = Object.freeze({
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
   dispute_deposit_au: { default: DEFAULT_DISPUTE_DEPOSIT_AU, min: '1', money: true },
   dispute_timeout_epochs: { default: DEFAULT_DISPUTE_TIMEOUT_EPOCHS, min: 1, max: 1_000_000 },
+  max_open_disputes_per_opener: { default: DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER, min: 1, max: 1_000 },
+  dispute_opener_fault_forfeit_bps: { default: DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS, min: 1, max: 9_999 },
   payout_min_au: { default: ONE_USD_AU, min: ZERO_AU, money: true },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
@@ -138,6 +147,8 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'fee_bps',
   'dispute_deposit_au',
   'dispute_timeout_epochs',
+  'max_open_disputes_per_opener',
+  'dispute_opener_fault_forfeit_bps',
   'payout_min_au',
   'price_min_bps',
   'price_max_bps',
@@ -179,10 +190,11 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'seed_perceptual_hash',
   'attestation_of_compute',
 ]);
+const AUDITOR_SLASH_REASONS = new Set(['collusion', 'false_report']);
 const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
-const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
+const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit', 'partial_forfeit']);
 const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'price'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
@@ -472,6 +484,10 @@ export const probeResultEvidence = (value, auditor) => ({
   enclave_id: value.enclave_id,
   binary_hash: value.binary_hash,
   canary_set: value.canary_set,
+  canary_prompt_id: value.canary_prompt_id,
+  challenge_epoch: value.challenge_epoch,
+  challenge_apply_hash: value.challenge_apply_hash,
+  challenge_seed: value.challenge_seed,
   verification_method: value.verification_method,
   session_receipt_hash: value.session_receipt_hash,
   evidence_hash: value.evidence_hash,
@@ -842,6 +858,8 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
+        att_tier: { type: 'number', integer: true, min: 1, max: 3 },
+        attestation_head: { type: 'string', min: 64, max: 64 },
         hardware_fingerprint: { type: 'string', min: 1, max: 128, optional: true },
         device_key: { type: 'string', min: 1, max: 128, optional: true },
       },
@@ -976,6 +994,21 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('auditorSlash', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        auditor: { type: 'string', min: 64, max: 64 },
+        provider: { type: 'string', min: 64, max: 64 },
+        probe_id: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 0 },
+        reason: { type: 'string', min: 1, max: 64 },
+        evidence_hash: { type: 'string', min: 64, max: 64 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
     this.addSchema('probeResult', {
       value: {
         $$strict: true,
@@ -989,6 +1022,10 @@ class MayhemContract extends Contract {
         epoch: { type: 'number', integer: true, min: 0 },
         at: { type: 'number', integer: true, min: 0 },
         canary_set: { type: 'string', min: 1, max: 128, optional: true },
+        canary_prompt_id: { type: 'string', min: 1, max: 128, optional: true },
+        challenge_epoch: { type: 'number', integer: true, min: 0, optional: true },
+        challenge_apply_hash: { type: 'string', min: 64, max: 64, optional: true },
+        challenge_seed: { type: 'string', min: 64, max: 64, optional: true },
         verification_method: { type: 'string', min: 1, max: 64, optional: true },
         match_bps: { type: 'number', integer: true, min: 0, max: 10_000, optional: true },
         pass: { type: 'boolean', optional: true },
@@ -1043,11 +1080,11 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         rail: { type: 'string', min: 1, max: 16 },
-        session_id: { type: 'string', min: 1, max: 128 },
+        session_id: { type: 'string', min: 64, max: 64 },
         reason: { type: 'string', min: 1, max: 64 },
-        provider: { type: 'string', min: 1, max: 128, optional: true },
+        provider: { type: 'string', min: 64, max: 64 },
         counterparty: { type: 'string', min: 1, max: 128, optional: true },
-        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        enclave_id: { type: 'string', min: 64, max: 64 },
         epoch: { type: 'number', integer: true, min: 0, optional: true },
         at: { type: 'number', integer: true, min: 0 },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
@@ -1214,6 +1251,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'fiat_dust_sweep') {
+      const result = await this.applyFiatDustSweepFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     if (value.op === 'anchor_reputation') {
       const result = await this.applyReputationAnchorFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -1371,6 +1413,8 @@ class MayhemContract extends Contract {
           intent.provider,
           intent.enclave_id,
           key,
+          intent.att_tier,
+          intent.attestation_head,
           intent.hardware_fingerprint ?? null,
           intent.device_key ?? null,
           {
@@ -1665,6 +1709,20 @@ class MayhemContract extends Contract {
     this.tx = key;
     try {
       return await this.fiatSettlement();
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyFiatDustSweepFeature(key, value) {
+    const expectedKey = await this.fiatDustSweepFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.fiatDustSweep();
     } finally {
       this.tx = previousTx;
     }
@@ -2078,6 +2136,52 @@ class MayhemContract extends Contract {
 
   spendHoldKey(user, rail, epoch) {
     return `hold/${rail}/${user}/${epoch}`;
+  }
+
+  disputeOpenCountKey(opener) {
+    return `disp/open/${opener}`;
+  }
+
+  providerOpenDisputeCountKey(provider) {
+    return `disp/provider-open/${provider}`;
+  }
+
+  async disputeOpenCount(key) {
+    const record = await this.get(key);
+    const count = record?.count ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      return new Error('Invalid open dispute count.');
+    }
+    return count;
+  }
+
+  async providerHasOpenDispute(provider) {
+    const count = await this.disputeOpenCount(this.providerOpenDisputeCountKey(provider));
+    if (count instanceof Error) return count;
+    return count > 0;
+  }
+
+  async closeDisputeCounts(dispute) {
+    const openerKey = this.disputeOpenCountKey(dispute.opened_by);
+    const providerKey = this.providerOpenDisputeCountKey(dispute.provider);
+    const openerCount = await this.disputeOpenCount(openerKey);
+    if (openerCount instanceof Error) return openerCount;
+    const providerCount = await this.disputeOpenCount(providerKey);
+    if (providerCount instanceof Error) return providerCount;
+    if (openerCount < 1 || providerCount < 1) {
+      return new Error('Open dispute count underflow.');
+    }
+    await this.put(openerKey, {
+      opener: dispute.opened_by,
+      count: openerCount - 1,
+      updated_at: this.tx,
+    });
+    await this.put(providerKey, {
+      provider: dispute.provider,
+      count: providerCount - 1,
+      updated_at: this.tx,
+    });
+    return null;
   }
 
   earningKey(provider, rail) {
@@ -2838,7 +2942,17 @@ class MayhemContract extends Contract {
 
   async joinEnclave() {
     const shapeError = this.validateExactCommandValue(
-      ['op', 'enclave_id', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver'],
+      [
+        'op',
+        'enclave_id',
+        'att_tier',
+        'attestation_head',
+        'served_ctx',
+        'served_modalities',
+        'served_specialities',
+        'ctx_bracket',
+        'ctx_bracket_table_ver',
+      ],
       'join_enclave',
       ['hardware_fingerprint', 'device_key']
     );
@@ -2849,6 +2963,8 @@ class MayhemContract extends Contract {
       this.address,
       this.value.enclave_id,
       this.tx,
+      this.value.att_tier,
+      this.value.attestation_head,
       this.value.hardware_fingerprint ?? null,
       this.value.device_key ?? null,
       {
@@ -2865,6 +2981,8 @@ class MayhemContract extends Contract {
     providerId,
     enclaveId,
     stamp,
+    attTier,
+    attestationHead,
     hardwareFingerprint = null,
     deviceKey = null,
     serveTerms = null
@@ -2873,6 +2991,12 @@ class MayhemContract extends Contract {
     if (consentError) return consentError;
     const providerError = await this.requireProvider(providerId);
     if (providerError) return providerError;
+    if (!Number.isSafeInteger(attTier) || attTier < 1 || attTier > MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER) {
+      return new Error('Invalid provider attestation tier.');
+    }
+    if (!this.isHexBytes(attestationHead, 32)) {
+      return new Error('Invalid provider attestation head.');
+    }
     if (hardwareFingerprint !== null && !this.isHexBytes(hardwareFingerprint, 32)) {
       return new Error('Invalid provider hardware fingerprint.');
     }
@@ -2897,17 +3021,23 @@ class MayhemContract extends Contract {
     );
     if (priceError) return priceError;
     const minTierPolicy = await this.enclaveMinTierPolicy(enclave);
-    if (enclave.att_tier < minTierPolicy.min_att_tier) {
+    if (attTier !== enclave.att_tier) {
       return new Error(
-        `Enclave now requires minimum attestation tier ${minTierPolicy.min_att_tier}; lower-tier providers finish in-flight work and held earnings settle on the normal schedule.`
+        `Provider attestation tier ${attTier} does not match enclave tier ${enclave.att_tier}.`
+      );
+    }
+    const provider = await this.get(`prov/${providerId}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    const effectiveTier = provider.kyb?.status === 'verified' ? 4 : attTier;
+    if (effectiveTier < minTierPolicy.min_att_tier) {
+      return new Error(
+        `Enclave now requires minimum attestation tier ${minTierPolicy.min_att_tier}; provider proved tier ${effectiveTier}.`
       );
     }
 
     const key = `serve/${providerId}/${enclaveId}`;
     const existing = await this.get(key);
     if (existing && existing.status === 'active') return new Error('Provider already serving enclave.');
-    const provider = await this.get(`prov/${providerId}`);
-    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
     if (deviceKey !== null) {
       const deviceBan = await this.get(`ban/device/${deviceKey}`);
       if (deviceBan?.status === 'banned') return new Error('Provider device key is banned.');
@@ -2929,6 +3059,9 @@ class MayhemContract extends Contract {
       enclave_id: enclaveId,
       model_id: enclave.model_id,
       status: 'active',
+      att_tier: attTier,
+      effective_att_tier: effectiveTier,
+      attestation_head: attestationHead.toLowerCase(),
       ...(normalizedServeTerms ?? {}),
       ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
       ...(deviceKey !== null ? { device_key: deviceKey } : {}),
@@ -3457,8 +3590,26 @@ class MayhemContract extends Contract {
     if (!head || head.head !== this.value.events_head) {
       return new Error('Reputation events head mismatch.');
     }
-    if (this.value.successful_sessions < (provider.probation?.successful_sessions ?? 0)) {
-      return new Error('Successful sessions must not decrease.');
+    const fold = await this.get(`ev/rep/fold/${this.value.provider}`);
+    if (
+      !fold ||
+      fold.events_head !== head.head ||
+      fold.event_count !== head.count
+    ) {
+      return new Error('Reputation fold state mismatch.');
+    }
+    if (this.value.epoch < fold.max_epoch) {
+      return new Error('Reputation anchor epoch precedes an event.');
+    }
+    const expected = this.reputationFoldAt(fold, this.value.folded_at);
+    if (expected instanceof Error) return expected;
+    if (
+      this.value.r_bps !== expected.r_bps ||
+      this.value.raw_milli !== expected.raw_milli ||
+      this.value.successful_sessions !== expected.successful_sessions ||
+      (this.value.provenance_violation === true) !== expected.provenance_violation
+    ) {
+      return new Error('Reputation anchor does not match the contract fold.');
     }
 
     const params = await this.activeParamsAt(this.value.folded_at, [
@@ -3546,6 +3697,7 @@ class MayhemContract extends Contract {
     const key = `auditor/${target}`;
     const existing = await this.get(key);
     if (existing?.status === 'active') return new Error('Auditor already registered.');
+    if (existing?.status === 'slashed') return new Error('Auditor is slashed.');
 
     const record = {
       auditor: target,
@@ -3561,6 +3713,97 @@ class MayhemContract extends Contract {
     await this.put(key, record);
     console.log('mayhem auditorRegister', record);
     return { ok: true, op: 'auditorRegister', auditor: target };
+  }
+
+  async auditorSlash() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (this.value.op !== 'auditor_slash') return new Error('Invalid auditor slash op.');
+    if (!this.isHexBytes(this.value.auditor, 32)) return new Error('Invalid auditor slash target.');
+    if (!this.isHexBytes(this.value.provider, 32)) return new Error('Invalid auditor slash provider.');
+    if (!this.isSafeKeyPart(this.value.probe_id)) return new Error('Invalid auditor slash probe id.');
+    if (!AUDITOR_SLASH_REASONS.has(this.value.reason)) return new Error('Unsupported auditor slash reason.');
+    if (!this.isHexBytes(this.value.evidence_hash, 32)) return new Error('Invalid auditor slash evidence hash.');
+
+    const auditorKey = `auditor/${this.value.auditor}`;
+    const auditor = await this.get(auditorKey);
+    if (!auditor) return new Error('Auditor not found.');
+    if (auditor.status === 'slashed') return new Error('Auditor is already slashed.');
+    if (auditor.status !== 'active') return new Error('Auditor is not active.');
+    const probeKey = `ev/probe/${this.value.probe_id}`;
+    const probe = await this.get(probeKey);
+    if (!probe || probe.probe_kind !== 'canary') return new Error('Canary probe not found.');
+    if (
+      probe.auditor !== this.value.auditor ||
+      probe.provider !== this.value.provider ||
+      probe.epoch !== this.value.epoch ||
+      probe.pass !== true
+    ) {
+      return new Error('Auditor slash evidence does not match the passing probe.');
+    }
+    if (probe.status === 'slashed') return new Error('Canary probe is already slashed.');
+    const slashKey = `ev/auditor-slash/${this.value.auditor}/${this.value.probe_id}`;
+    if ((await this.get(slashKey)) !== null) return new Error('Auditor slash already recorded.');
+
+    const passKey = `probe/pass/${this.value.provider}/${this.value.epoch}`;
+    const passRecord = await this.get(passKey);
+    if (!passRecord || !Array.isArray(passRecord.probes)) {
+      return new Error('Canary pass record not found.');
+    }
+    const remaining = passRecord.probes.filter((entry) => !(
+      entry.auditor === this.value.auditor && entry.probe_id === this.value.probe_id
+    ));
+    if (remaining.length === passRecord.probes.length) {
+      return new Error('Canary pass record does not contain the slashed probe.');
+    }
+    const falseReports = this.safeAddCount(auditor.false_reports ?? 0, 1, 'auditor false report count');
+    if (falseReports instanceof Error) return falseReports;
+    const slash = {
+      auditor: this.value.auditor,
+      provider: this.value.provider,
+      probe_id: this.value.probe_id,
+      epoch: this.value.epoch,
+      reason: this.value.reason,
+      evidence_hash: this.value.evidence_hash.toLowerCase(),
+      reward_forfeited_au: probe.probe_reward_au ?? ZERO_AU,
+      slashed_at_seconds: this.value.at,
+      slashed_at: this.tx,
+      slashed_by: this.address,
+      slashed_by_role: 'admin',
+    };
+    await this.put(passKey, {
+      ...passRecord,
+      pass_count: remaining.length,
+      auditors: remaining.map((entry) => entry.auditor),
+      probes: remaining,
+      last_slash_evidence_hash: slash.evidence_hash,
+      updated_at: this.tx,
+    });
+    await this.put(probeKey, {
+      ...probe,
+      status: 'slashed',
+      collusion_evidence_hash: slash.evidence_hash,
+      slashed_at: this.tx,
+    });
+    await this.put(auditorKey, {
+      ...auditor,
+      status: 'slashed',
+      false_reports: falseReports,
+      slash_reason: this.value.reason,
+      slash_evidence_hash: slash.evidence_hash,
+      slashed_at: this.tx,
+      slashed_by: this.address,
+      updated_at: this.tx,
+    });
+    await this.put(slashKey, slash);
+    console.log('mayhem auditorSlash', slash);
+    return {
+      ok: true,
+      op: 'auditorSlash',
+      auditor: this.value.auditor,
+      probe_id: this.value.probe_id,
+      evidence_hash: slash.evidence_hash,
+    };
   }
 
   async probeResult() {
@@ -3594,6 +3837,12 @@ class MayhemContract extends Contract {
     const pass = this.probePass(this.value, params);
     if (this.value.pass !== undefined && this.value.pass !== pass) {
       return new Error('Probe pass flag does not match contract threshold.');
+    }
+    if (this.value.probe_kind === 'canary' && pass) {
+      const passRecord = await this.get(`probe/pass/${this.value.provider}/${this.value.epoch}`);
+      if (passRecord?.auditors?.includes(this.address)) {
+        return new Error('Auditor already supplied a canary pass for this provider epoch.');
+      }
     }
 
     const reputationEvent = await this.appendReputationEvent({
@@ -3654,6 +3903,10 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       at: this.value.at,
       canary_set: this.value.canary_set ?? null,
+      canary_prompt_id: this.value.canary_prompt_id ?? null,
+      challenge_epoch: this.value.challenge_epoch ?? null,
+      challenge_apply_hash: this.value.challenge_apply_hash ?? null,
+      challenge_seed: this.value.challenge_seed ?? null,
       verification_method: this.value.verification_method ?? null,
       binary_hash: this.value.binary_hash ?? null,
       match_bps: this.value.match_bps ?? null,
@@ -3670,7 +3923,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/probe/${this.value.probe_id}`, record);
     let probePassRecord = null;
     if (this.value.probe_kind === 'canary' && pass) {
-      probePassRecord = await this.recordCanaryProbePass(this.value);
+      probePassRecord = await this.recordCanaryProbePass(this.value, this.address);
       if (probePassRecord instanceof Error) return probePassRecord;
     }
     await this.put(`auditor/${this.address}`, {
@@ -3885,11 +4138,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(providerRecord, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         current,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const totalAu = this.safeAddAu(refreshed.total_au, deltaAu);
@@ -4054,7 +4310,7 @@ class MayhemContract extends Contract {
       await this.put(this.feeCumKey(rail), feeRecord);
       await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
     }
-    await this.put('epoch/apply/state', this.nextEpochApplyState({
+    const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: this.value.epoch,
       page,
@@ -4062,7 +4318,14 @@ class MayhemContract extends Contract {
       applyHash,
       epochSeconds: params.epoch_seconds,
       reservationDebitTotals,
-    }));
+    });
+    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
+    if (previousChallengeError) return previousChallengeError;
+    await this.put('epoch/apply/state', nextApplyState);
+    if (lastPage) {
+      const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
+      if (challengeError) return challengeError;
+    }
     if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: this.value.epoch,
@@ -4205,14 +4468,19 @@ class MayhemContract extends Contract {
       sealed_at: this.tx,
     };
     await this.put(key, record);
-    await this.put('epoch/apply/state', this.nextEpochApplyState({
+    const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: this.value.epoch,
       page: 0,
       lastPage: true,
       applyHash: sealHash,
       epochSeconds: params.epoch_seconds,
-    }));
+    });
+    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
+    if (previousChallengeError) return previousChallengeError;
+    await this.put('epoch/apply/state', nextApplyState);
+    const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
+    if (challengeError) return challengeError;
     const result = {
       ok: true,
       op: 'epochSealEmpty',
@@ -4469,11 +4737,51 @@ class MayhemContract extends Contract {
     const params = await this.activeParamsAt(this.value.at, [
       'dispute_deposit_au',
       'dispute_timeout_epochs',
+      'max_open_disputes_per_opener',
     ]);
     const depositAu = params.dispute_deposit_au;
     if (this.compareAu(balance.au, depositAu) < 0) return new Error('Insufficient balance for dispute deposit.');
     const applyState = await this.epochApplyStateRecord();
     const disputeEpoch = this.value.epoch ?? applyState.updated_epoch;
+    if (disputeEpoch > applyState.updated_epoch) {
+      return new Error('Dispute epoch cannot exceed the latest applied epoch.');
+    }
+    const hold = await this.normalizeSpendHoldRecord(
+      (await this.get(this.spendHoldKey(this.address, rail, disputeEpoch))) ?? null,
+      this.address,
+      rail,
+      disputeEpoch
+    );
+    if (hold instanceof Error) return hold;
+    const linkedSession = hold.sessions.find((session) => session.session_id === this.value.session_id.toLowerCase());
+    if (!linkedSession) {
+      return new Error('Dispute must reference an opener-linked spend reservation.');
+    }
+    const sessionDisputeKey = `disp/session/${this.address}/${linkedSession.session_id}`;
+    if ((await this.get(sessionDisputeKey)) !== null) {
+      return new Error('Session already has a dispute from this opener.');
+    }
+    if (linkedSession.provider !== this.value.provider.toLowerCase()) {
+      return new Error('Dispute provider does not match the linked session.');
+    }
+    if (linkedSession.enclave_id !== this.value.enclave_id.toLowerCase()) {
+      return new Error('Dispute enclave does not match the linked session.');
+    }
+    if (
+      this.value.counterparty !== undefined &&
+      this.value.counterparty.toLowerCase() !== linkedSession.provider
+    ) {
+      return new Error('Dispute counterparty does not match the linked session provider.');
+    }
+    const openerCountKey = this.disputeOpenCountKey(this.address);
+    const openerOpenCount = await this.disputeOpenCount(openerCountKey);
+    if (openerOpenCount instanceof Error) return openerOpenCount;
+    if (openerOpenCount >= params.max_open_disputes_per_opener) {
+      return new Error('Open dispute limit reached.');
+    }
+    const providerCountKey = this.providerOpenDisputeCountKey(linkedSession.provider);
+    const providerOpenCount = await this.disputeOpenCount(providerCountKey);
+    if (providerOpenCount instanceof Error) return providerOpenCount;
     const expiresAfterEpoch = disputeEpoch + params.dispute_timeout_epochs;
     if (!Number.isSafeInteger(expiresAfterEpoch)) return new Error('Dispute timeout epoch overflow.');
 
@@ -4497,11 +4805,13 @@ class MayhemContract extends Contract {
       status: 'open',
       rail,
       opened_by: this.address,
-      session_id: this.value.session_id,
+      session_id: linkedSession.session_id,
       reason: this.value.reason,
-      provider: this.value.provider ?? null,
-      counterparty: this.value.counterparty ?? null,
-      enclave_id: this.value.enclave_id ?? null,
+      provider: linkedSession.provider,
+      counterparty: this.value.counterparty?.toLowerCase() ?? linkedSession.provider,
+      enclave_id: linkedSession.enclave_id,
+      reservation_key: this.spendHoldKey(this.address, rail, disputeEpoch),
+      reservation_voucher_hash: linkedSession.voucher_hash,
       epoch: disputeEpoch,
       at: this.value.at,
       evidence_hash: this.value.evidence_hash ?? null,
@@ -4517,7 +4827,23 @@ class MayhemContract extends Contract {
 
     await this.put(this.balanceKey(this.address, rail), nextBalance);
     await this.put(`disp/${disputeId}`, record);
+    await this.put(sessionDisputeKey, {
+      opener: this.address,
+      session_id: linkedSession.session_id,
+      dispute_id: disputeId,
+      opened_at: this.tx,
+    });
     await this.put('disp/next', { next: disputeId + 1, updated_at: this.tx });
+    await this.put(openerCountKey, {
+      opener: this.address,
+      count: openerOpenCount + 1,
+      updated_at: this.tx,
+    });
+    await this.put(providerCountKey, {
+      provider: linkedSession.provider,
+      count: providerOpenCount + 1,
+      updated_at: this.tx,
+    });
     console.log('mayhem dispute', record);
     return {
       ok: true,
@@ -4558,12 +4884,46 @@ class MayhemContract extends Contract {
       return new Error('Only provider_fault disputes may slash a provider.');
     }
 
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch > dispute.expires_after_epoch) {
+      return new Error('Dispute resolution window has closed; expire the dispute.');
+    }
+    if (
+      this.value.outcome === 'opener_fault' &&
+      this.value.deposit_action !== 'partial_forfeit'
+    ) {
+      return new Error('Opener-fault disputes require a partial deposit forfeit.');
+    }
+    if (
+      this.value.outcome !== 'opener_fault' &&
+      this.value.deposit_action === 'partial_forfeit'
+    ) {
+      return new Error('Partial deposit forfeit is reserved for opener-fault disputes.');
+    }
+
     let depositRefundedAu = ZERO_AU;
     let depositForfeitedAu = ZERO_AU;
     const rail = this.normalizeLedgerRail(dispute.rail, 'dispute rail');
     if (rail instanceof Error) return rail;
     if (this.value.deposit_action === 'refund') {
       depositRefundedAu = dispute.deposit_au;
+    } else if (this.value.deposit_action === 'forfeit') {
+      depositForfeitedAu = dispute.deposit_au;
+    } else {
+      const params = await this.activeParamsAt(this.value.at, [
+        'dispute_opener_fault_forfeit_bps',
+      ]);
+      const deposit = this.parseAu(dispute.deposit_au, 'dispute deposit', { allowZero: false });
+      if (deposit instanceof Error) return deposit;
+      if (deposit < 2n) return new Error('Dispute deposit is too small to split.');
+      let forfeited = (deposit * BigInt(params.dispute_opener_fault_forfeit_bps)) / 10_000n;
+      if (forfeited < 1n) forfeited = 1n;
+      if (forfeited >= deposit) forfeited = deposit - 1n;
+      depositForfeitedAu = this.canonicalAu(forfeited);
+      depositRefundedAu = this.safeSubAu(dispute.deposit_au, depositForfeitedAu);
+      if (depositRefundedAu instanceof Error) return depositRefundedAu;
+    }
+    if (this.compareAu(depositRefundedAu, ZERO_AU) > 0) {
       const balance = await this.balanceRecord(dispute.opened_by, rail);
       if (balance instanceof Error) return balance;
       const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by, rail);
@@ -4577,8 +4937,8 @@ class MayhemContract extends Contract {
         updated_epoch: Math.max(balance.updated_epoch, dispute.epoch ?? 0),
         updated_at: this.tx,
       });
-    } else {
-      depositForfeitedAu = dispute.deposit_au;
+    }
+    if (this.compareAu(depositForfeitedAu, ZERO_AU) > 0) {
       const fee = await this.feeCumRecord(rail);
       if (fee instanceof Error) return fee;
       const feeError = this.guardianValidateFeeRecord(fee, rail);
@@ -4651,6 +5011,8 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     };
     resolved.resolution_hash = await this.opaqueHash('mayhem-dispute-resolution-v1', resolved);
+    const countError = await this.closeDisputeCounts(dispute);
+    if (countError) return countError;
     await this.put(key, resolved);
     console.log('mayhem disputeResolve', resolved);
     return {
@@ -4716,6 +5078,8 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     };
     expired.expiry_hash = await this.opaqueHash('mayhem-dispute-expiry-v1', expired);
+    const countError = await this.closeDisputeCounts(dispute);
+    if (countError) return countError;
     await this.put(this.balanceKey(dispute.opened_by, rail), nextBalance);
     await this.put(key, expired);
     console.log('mayhem disputeExpire', expired);
@@ -5104,11 +5468,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(output.provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         earning,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const payable = this.safeSubAu(
@@ -5394,6 +5761,7 @@ class MayhemContract extends Contract {
     if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
     const numerator = amount * TNK_E18;
     const denominator = rate;
+    // Payout conversion rounds up so the provider is never underpaid in TNK atomic units.
     return (numerator + denominator - 1n) / denominator;
   }
 
@@ -5528,9 +5896,6 @@ class MayhemContract extends Contract {
       const stripeRef = transfers[outputIndex].ref;
       const provider = await this.get(`prov/${output.provider}`);
       if (!provider) return new Error('Provider not found.');
-      if (provider.status !== 'active' && provider.status !== 'banned') {
-        return new Error('Fiat settlement provider status is not payable.');
-      }
       const payout = provider.payouts?.stripe;
       const payoutError = await this.requireAdminSetPayoutTarget(provider, 'stripe');
       if (payoutError) return payoutError;
@@ -5552,11 +5917,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(output.provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         earning,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const payable = this.safeSubAu(
@@ -5657,6 +6025,156 @@ class MayhemContract extends Contract {
       stripe_transfers: transfers,
       transfer_root: this.value.transfer_root,
     };
+  }
+
+  async fiatDustSweep() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateFiatDustSweepValue(this.value);
+    if (shapeError) return shapeError;
+
+    const recordKey = `settle/fiat-dust/${this.value.provider}/${this.value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      return {
+        ok: true,
+        op: 'fiatDustSweep',
+        provider: existing.provider,
+        epoch: existing.epoch,
+        dust_au: existing.dust_au,
+        idempotent: true,
+      };
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch !== this.value.epoch) {
+      return new Error('Fiat dust sweep epoch must equal the latest applied epoch.');
+    }
+    const provider = await this.get(`prov/${this.value.provider}`);
+    if (!provider) return new Error('Provider not found.');
+    if (!Array.isArray(provider.enclaves)) return new Error('Invalid provider enclave state.');
+    if (provider.enclaves.length > 0) {
+      return new Error('Fiat dust sweep requires a provider with no active enclaves.');
+    }
+
+    const params = await this.activeParamsAt(this.value.at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const earning = await this.earningRecord(this.value.provider, 'fiat');
+    if (earning instanceof Error) return earning;
+    const earningError = this.guardianValidateEarningRecord(earning, this.value.provider, 'fiat');
+    if (earningError) return earningError;
+    const probeGate = await this.probeGateForEarning(this.value.provider, earning, params);
+    if (probeGate instanceof Error) return probeGate;
+    const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+    if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+    const disputeGate = await this.providerHasOpenDispute(this.value.provider);
+    if (disputeGate instanceof Error) return disputeGate;
+    const refreshed = this.refreshEarningHoldback(
+      earning,
+      this.value.epoch,
+      lockedEarningEpochs,
+      probeGate,
+      disputeGate
+    );
+    if (refreshed instanceof Error) return refreshed;
+    if (!this.isZeroAu(refreshed.held_au)) {
+      return new Error('Fiat dust cannot be swept while provider earnings are held.');
+    }
+    const unpaid = this.safeSubAu(refreshed.total_au, refreshed.paid_cum_au);
+    if (unpaid instanceof Error) return unpaid;
+    const unpaidValue = this.parseAu(unpaid, 'Fiat unpaid provider earnings');
+    if (unpaidValue instanceof Error) return unpaidValue;
+    const dustValue = unpaidValue % FIAT_MINOR_AU;
+    if (dustValue === 0n) return new Error('Provider has no fiat dust to sweep.');
+    const dustAu = this.canonicalAu(dustValue);
+    const totalAu = this.safeSubAu(refreshed.total_au, dustAu);
+    if (totalAu instanceof Error) return totalAu;
+    const dustSweptCumAu = this.safeAddAu(refreshed.fiat_dust_swept_cum_au ?? ZERO_AU, dustAu);
+    if (dustSweptCumAu instanceof Error) return dustSweptCumAu;
+    const nextEarning = {
+      ...refreshed,
+      total_au: totalAu,
+      fiat_dust_swept_cum_au: dustSweptCumAu,
+      updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_fiat_dust_sweep_epoch: this.value.epoch,
+      last_fiat_dust_sweep_at: this.tx,
+    };
+    const nextEarningError = this.guardianValidateEarningRecord(
+      nextEarning,
+      this.value.provider,
+      'fiat'
+    );
+    if (nextEarningError) return nextEarningError;
+
+    const fee = await this.feeCumRecord('fiat');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'fiat');
+    if (feeError) return feeError;
+    const cumAu = this.safeAddAu(fee.cum_au, dustAu);
+    if (cumAu instanceof Error) return cumAu;
+    const settledCumAu = this.safeAddAu(fee.settled_cum_au ?? fee.cum_au, dustAu);
+    if (settledCumAu instanceof Error) return settledCumAu;
+    const nextFee = {
+      ...fee,
+      cum_au: cumAu,
+      settled_cum_au: settledCumAu,
+      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_fiat_dust_sweep_at: this.tx,
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
+    if (nextFeeError) return nextFeeError;
+
+    const record = {
+      type: 'fiat_dust_sweep',
+      provider: this.value.provider,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      dust_au: dustAu,
+      provider_total_before_au: refreshed.total_au,
+      provider_total_after_au: totalAu,
+      provider_paid_cum_au: refreshed.paid_cum_au,
+      destination: 'operator_fee',
+      swept_by: this.address,
+      swept_by_role: 'admin',
+      swept_at: this.tx,
+    };
+    await this.put(this.earningKey(this.value.provider, 'fiat'), nextEarning);
+    await this.put(this.feeCumKey('fiat'), nextFee);
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'fiatDustSweep',
+      provider: this.value.provider,
+      epoch: this.value.epoch,
+      dust_au: dustAu,
+      idempotent: false,
+    };
+  }
+
+  validateFiatDustSweepValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'provider', 'epoch', 'at'],
+      'Fiat dust sweep'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'fiat_dust_sweep') return new Error('Invalid fiat dust sweep op.');
+    if (!this.isHexBytes(value.provider, 32) || value.provider !== value.provider.toLowerCase()) {
+      return new Error('Invalid fiat dust sweep provider.');
+    }
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
+      return new Error('Invalid fiat dust sweep epoch.');
+    }
+    if (!Number.isSafeInteger(value.at) || value.at < 0) {
+      return new Error('Invalid fiat dust sweep timestamp.');
+    }
+    return null;
   }
 
   validateFiatSettlementValue(value) {
@@ -6127,7 +6645,7 @@ class MayhemContract extends Contract {
     const blockHash = this.value.block_hash.toLowerCase();
     const poolAddress = this.value.pool_address.toLowerCase();
     const eventSignature = this.value.event_signature.toLowerCase();
-    const seenKey = `dep/tap/${ethTxHash}/${this.value.log_index}`;
+    const seenKey = `dep/tap/${this.tapDepositIdentity(this.value)}`;
     const existing = await this.get(seenKey);
     if (existing !== null) {
       return {
@@ -6306,7 +6824,7 @@ class MayhemContract extends Contract {
       return new Error('Invalid TAP deposit block number.');
     }
     if (!this.isEthHexBytes(value.block_hash, 32)) return new Error('Invalid TAP deposit block hash.');
-    if (!this.isSafeKeyPart(value.pool_address)) return new Error('Invalid TAP pool address.');
+    if (!this.isEthHexBytes(value.pool_address, 20)) return new Error('Invalid TAP pool address.');
     if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) return new Error('Invalid TAP chain id.');
     if (!Number.isSafeInteger(value.finalized_block_number) || value.finalized_block_number < value.block_number) {
       return new Error('Invalid TAP finalized block number.');
@@ -6318,10 +6836,10 @@ class MayhemContract extends Contract {
       return new Error('TAP confirmation depth does not match finalized block.');
     }
     if (!this.isSafeKeyPart(value.confirmation_policy)) return new Error('Invalid TAP confirmation policy.');
+    if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
+      return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
+    }
     if (value.confirmation_policy !== 'finalized-tag') {
-      if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
-        return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
-      }
       if (value.confirmation_policy !== `depth-${value.confirmation_depth}`) {
         return new Error('TAP confirmation policy must match the confirmed depth or use finalized-tag.');
       }
@@ -6942,6 +7460,8 @@ class MayhemContract extends Contract {
                 'provider',
                 'enclave_id',
                 'nonce',
+                'att_tier',
+                'attestation_head',
                 'served_ctx',
                 'served_modalities',
                 'served_specialities',
@@ -6952,7 +7472,19 @@ class MayhemContract extends Contract {
               ]
             : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
-      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver']
+      ? [
+          'op',
+          'provider',
+          'enclave_id',
+          'nonce',
+          'att_tier',
+          'attestation_head',
+          'served_ctx',
+          'served_modalities',
+          'served_specialities',
+          'ctx_bracket',
+          'ctx_bracket_table_ver',
+        ]
       : allowed;
     const allowedSet = new Set(allowed);
     const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
@@ -7007,6 +7539,15 @@ class MayhemContract extends Contract {
     }
     if (hasOwn(intent, 'device_key') && !this.isHexBytes(intent.device_key, 32)) {
       return new Error('Invalid provider device key.');
+    }
+    if (
+      hasOwn(intent, 'att_tier') &&
+      (!Number.isSafeInteger(intent.att_tier) || intent.att_tier < 1 || intent.att_tier > MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER)
+    ) {
+      return new Error('Invalid provider attestation tier.');
+    }
+    if (hasOwn(intent, 'attestation_head') && !this.isHexBytes(intent.attestation_head, 32)) {
+      return new Error('Invalid provider attestation head.');
     }
     if (hasOwn(intent, 'rails')) {
       const rails = this.normalizeProviderAcceptedRails(intent.rails);
@@ -7509,7 +8050,7 @@ class MayhemContract extends Contract {
   validateCatalogCanaryRef(entry) {
     const shapeError = this.validateExactObjectKeys(
       entry,
-      ['set_id', 'url', 'hash'],
+      ['set_id', 'url', 'hash', 'prompt_ids'],
       'catalog canary ref'
     );
     if (shapeError) return shapeError;
@@ -7517,6 +8058,15 @@ class MayhemContract extends Contract {
     if (!this.isHttpsUrl(entry.url)) return new Error('Catalog canary URL must be HTTPS.');
     if (!this.isHexBytes(entry.hash, 32)) {
       return new Error('Catalog canary hash must be a 32-byte hex BLAKE3 hash.');
+    }
+    if (!Array.isArray(entry.prompt_ids) || entry.prompt_ids.length < 1 || entry.prompt_ids.length > 1_024) {
+      return new Error('Catalog canary prompt_ids must be a non-empty bounded array.');
+    }
+    const promptIds = new Set();
+    for (const promptId of entry.prompt_ids) {
+      if (!this.isSafeKeyPart(promptId)) return new Error('Invalid catalog canary prompt id.');
+      if (promptIds.has(promptId)) return new Error('Duplicate catalog canary prompt id.');
+      promptIds.add(promptId);
     }
     return null;
   }
@@ -8153,6 +8703,8 @@ class MayhemContract extends Contract {
 
   marketPriceParamKeys() {
     return [
+      'price_min_bps',
+      'price_max_bps',
       'market_target_utilization_bps',
       'market_ema_alpha_bps',
       'market_gain_bps',
@@ -8282,6 +8834,44 @@ class MayhemContract extends Contract {
     return this.normalizeRateMap(stepped);
   }
 
+  clampRateMapBounds(priceRateMap, referenceRateMap, params) {
+    const priceByUnit = this.rateMapByUnit(priceRateMap);
+    const referenceByUnit = this.rateMapByUnit(referenceRateMap);
+    if (priceByUnit.size !== referenceByUnit.size) {
+      return new Error('Market price rate_map units must match model reference rate_map units.');
+    }
+    const bounded = [];
+    for (const entry of priceRateMap) {
+      const reference = referenceByUnit.get(entry.unit);
+      const price = this.parseAu(entry.per_unit_au, 'market price per_unit_au');
+      const referencePrice = this.parseAu(
+        reference?.per_unit_au,
+        'market reference per_unit_au',
+        { allowZero: false }
+      );
+      if (
+        price instanceof Error ||
+        referencePrice instanceof Error ||
+        !Number.isSafeInteger(entry.granularity) ||
+        entry.granularity <= 0 ||
+        !Number.isSafeInteger(reference?.granularity) ||
+        reference.granularity <= 0
+      ) {
+        return new Error('Invalid market price rate_map bounds.');
+      }
+      const denominator = BigInt(reference.granularity) * 10_000n;
+      const scaledReference = referencePrice * BigInt(entry.granularity);
+      const lowerNumerator = scaledReference * BigInt(params.price_min_bps);
+      const upperNumerator = scaledReference * BigInt(params.price_max_bps);
+      const lower = (lowerNumerator + denominator - 1n) / denominator;
+      const upper = upperNumerator / denominator;
+      if (lower > upper) return new Error(`Model reference bounds cannot represent unit ${entry.unit}.`);
+      const clamped = price < lower ? lower : (price > upper ? upper : price);
+      bounded.push({ ...entry, per_unit_au: this.canonicalAu(clamped) });
+    }
+    return this.normalizeRateMap(bounded);
+  }
+
   priceTermsEqual(left, right) {
     return (
       stableJson(left.rate_map) === stableJson(right.rate_map) &&
@@ -8315,6 +8905,8 @@ class MayhemContract extends Contract {
       if (!seed || seed.set_by_role !== 'admin') {
         return new Error('Market price requires an admin seed.');
       }
+      const modelRef = await this.get(`modelref/${enclave.model_id}`);
+      if (!modelRef) return new Error('Market price model reference not found.');
 
       const activeSupply = usage.provider_count;
       const previousMarket = current.market && typeof current.market === 'object'
@@ -8350,6 +8942,8 @@ class MayhemContract extends Contract {
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       if (nextTerms.per_req_au instanceof Error) return nextTerms.per_req_au;
       if (nextTerms.min_session_au instanceof Error) return nextTerms.min_session_au;
+      nextTerms.rate_map = this.clampRateMapBounds(nextTerms.rate_map, modelRef.rate_map, marketParams);
+      if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       const latest = this.priceLatestEntry(schedule);
       const record = {
         enclave_id: current.enclave_id,
@@ -8678,6 +9272,10 @@ class MayhemContract extends Contract {
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
       if (typeof value.pass !== 'boolean') return new Error('Canary probe requires pass.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+      if (!value.canary_prompt_id) return new Error('Canary probe requires canary_prompt_id.');
+      if (value.challenge_epoch === undefined) return new Error('Canary probe requires challenge_epoch.');
+      if (!value.challenge_apply_hash) return new Error('Canary probe requires challenge_apply_hash.');
+      if (!value.challenge_seed) return new Error('Canary probe requires challenge_seed.');
       if (!value.verification_method) return new Error('Canary probe requires verification_method.');
       if (!PROBE_VERIFICATION_METHODS.has(value.verification_method)) {
         return new Error('Unsupported canary verification_method.');
@@ -8692,6 +9290,14 @@ class MayhemContract extends Contract {
       }
       if (!this.isHexBytes(value.evidence_hash, 32)) return new Error('Invalid canary evidence hash.');
       if (!this.isHexBytes(value.auditor_sig, 64)) return new Error('Invalid canary auditor signature.');
+      if (!this.isSafeKeyPart(value.canary_prompt_id)) return new Error('Invalid canary prompt id.');
+      if (!Number.isSafeInteger(value.challenge_epoch) || value.challenge_epoch < 0) {
+        return new Error('Invalid canary challenge epoch.');
+      }
+      if (!this.isHexBytes(value.challenge_apply_hash, 32)) {
+        return new Error('Invalid canary challenge apply hash.');
+      }
+      if (!this.isHexBytes(value.challenge_seed, 32)) return new Error('Invalid canary challenge seed.');
     }
     return null;
   }
@@ -9142,6 +9748,9 @@ class MayhemContract extends Contract {
       return new Error('Canary probe binary_hash is not approved for enclave.');
     }
 
+    const challengeError = await this.requireCanaryChallenge(value, auditor);
+    if (challengeError) return challengeError;
+
     if (!this.verifyProbeResultSignature(auditor, value)) {
       return new Error('Invalid canary auditor signature.');
     }
@@ -9159,12 +9768,47 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async requireCanaryChallenge(value, auditor) {
+    if (value.epoch !== value.challenge_epoch + 1) {
+      return new Error('Canary probe epoch must immediately follow its challenge epoch.');
+    }
+    const anchor = await this.canaryChallengeAnchor(value.challenge_epoch);
+    if (!anchor) return new Error('Canary challenge epoch is not anchored.');
+    if (anchor.apply_hash !== value.challenge_apply_hash.toLowerCase()) {
+      return new Error('Canary challenge apply hash mismatch.');
+    }
+    const catalog = await this.get('catalog/current');
+    const canary = catalog?.canaries?.find((entry) => entry.set_id === value.canary_set);
+    if (!canary) return new Error('Published canary challenge set not found.');
+    const expectedSeed = await this.opaqueHash('mayhem-canary-challenge-v1', {
+      challenge_epoch: value.challenge_epoch,
+      challenge_apply_hash: anchor.apply_hash,
+      probe_epoch: value.epoch,
+      auditor,
+      provider: value.provider,
+      enclave_id: value.enclave_id,
+      canary_set: value.canary_set,
+      catalog_hash: catalog.catalog_hash,
+    });
+    if (expectedSeed !== value.challenge_seed.toLowerCase()) {
+      return new Error('Canary challenge seed mismatch.');
+    }
+    const selectedIndex = Number(BigInt(`0x${expectedSeed}`) % BigInt(canary.prompt_ids.length));
+    if (value.canary_prompt_id !== canary.prompt_ids[selectedIndex]) {
+      return new Error('Canary prompt does not match the unpredictable challenge selection.');
+    }
+    return null;
+  }
+
   validateDisputeOpen(value) {
     const rail = this.normalizeLedgerRail(value.rail, 'dispute rail');
     if (rail instanceof Error) return rail;
-    if (!this.isSafeKeyPart(value.session_id)) return new Error('Invalid dispute session id.');
+    if (!this.isHexBytes(value.session_id, 32)) return new Error('Invalid dispute session id.');
     if (!this.isSafeKeyPart(value.reason)) return new Error('Invalid dispute reason.');
-    for (const key of ['provider', 'counterparty', 'enclave_id']) {
+    for (const key of ['provider', 'enclave_id']) {
+      if (!this.isHexBytes(value[key], 32)) return new Error(`Invalid dispute ${key}.`);
+    }
+    for (const key of ['counterparty']) {
       if (value[key] !== undefined && !this.isSafeKeyPart(value[key])) {
         return new Error(`Invalid dispute ${key}.`);
       }
@@ -9554,15 +10198,29 @@ class MayhemContract extends Contract {
     return Math.max(providerHoldback, params.challenge_epochs ?? 0);
   }
 
-  async recordCanaryProbePass(value) {
+  async recordCanaryProbePass(value, auditor) {
     const key = `probe/pass/${value.provider}/${value.epoch}`;
     const current = await this.get(key);
-    const passCount = this.safeAddCount(current?.pass_count ?? 0, 1, 'canary pass count');
-    if (passCount instanceof Error) return passCount;
+    const auditors = current?.auditors ?? [];
+    const probes = current?.probes ?? [];
+    if (!Array.isArray(auditors) || !Array.isArray(probes) || auditors.length !== probes.length) {
+      return new Error('Invalid canary pass record.');
+    }
+    if (auditors.includes(auditor)) {
+      return new Error('Auditor already supplied a canary pass for this provider epoch.');
+    }
+    const next = [...probes, {
+      auditor,
+      probe_id: value.probe_id,
+      evidence_hash: value.evidence_hash,
+      challenge_seed: value.challenge_seed,
+    }].sort((left, right) => compareCodepoint(left.auditor, right.auditor));
     const record = {
       provider: value.provider,
       epoch: value.epoch,
-      pass_count: passCount,
+      pass_count: next.length,
+      auditors: next.map((entry) => entry.auditor),
+      probes: next,
       last_probe_id: value.probe_id,
       last_evidence_hash: value.evidence_hash ?? null,
       updated_at: this.tx,
@@ -9578,7 +10236,7 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(holdbackBps) || holdbackBps < 0 || holdbackBps > 10_000) {
       return new Error('Invalid canary probe holdback bps.');
     }
-    if (!Number.isSafeInteger(requiredPasses) || requiredPasses < 0) {
+    if (!Number.isSafeInteger(requiredPasses) || requiredPasses < 2) {
       return new Error('Invalid canary probe release threshold.');
     }
     const holdbacks = this.normalizeHoldbackBuckets(earning);
@@ -9586,7 +10244,15 @@ class MayhemContract extends Contract {
     const passedEpochs = new Set();
     for (const epoch of [...new Set(holdbacks.map((bucket) => bucket.epoch))]) {
       const passRecord = await this.get(`probe/pass/${provider}/${epoch}`);
-      if ((passRecord?.pass_count ?? 0) >= requiredPasses) {
+      const distinctAuditors = new Set(passRecord?.auditors ?? []);
+      let activeAuditors = 0;
+      for (const auditor of distinctAuditors) {
+        if ((await this.get(`auditor/${auditor}`))?.status === 'active') activeAuditors += 1;
+      }
+      if (
+        distinctAuditors.size === (passRecord?.pass_count ?? 0) &&
+        activeAuditors >= requiredPasses
+      ) {
         passedEpochs.add(epoch);
       }
     }
@@ -9668,7 +10334,7 @@ class MayhemContract extends Contract {
     return total;
   }
 
-  refreshEarningHoldback(record, currentEpoch, lockedEpochs, probeGate = null) {
+  refreshEarningHoldback(record, currentEpoch, lockedEpochs, probeGate = null, disputeGate = false) {
     if (!Number.isSafeInteger(currentEpoch) || currentEpoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
@@ -9683,7 +10349,7 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(bucketLockedEpochs) || bucketLockedEpochs < 0) {
         return new Error('Guardian monotonic epoch invariant failed.');
       }
-      if (bucket.epoch + bucketLockedEpochs > currentEpoch) {
+      if (disputeGate || bucket.epoch + bucketLockedEpochs > currentEpoch) {
         kept.push(bucket);
         continue;
       }
@@ -11333,6 +11999,51 @@ class MayhemContract extends Contract {
     };
   }
 
+  async rememberCanaryChallengeAnchor(state) {
+    if (
+      !state ||
+      !Number.isSafeInteger(state.updated_epoch) ||
+      state.updated_epoch < 1 ||
+      !this.isHexBytes(state.last_apply_hash, 32) ||
+      (state.pending_epoch ?? null) !== null
+    ) {
+      return null;
+    }
+    const key = `epoch/challenge/${state.updated_epoch}`;
+    const record = {
+      epoch: state.updated_epoch,
+      apply_hash: state.last_apply_hash.toLowerCase(),
+      recorded_at: this.tx,
+    };
+    const existing = await this.get(key);
+    if (existing !== null) {
+      if (existing.epoch !== record.epoch || existing.apply_hash !== record.apply_hash) {
+        return new Error('Canary challenge anchor conflict.');
+      }
+      return null;
+    }
+    await this.put(key, record);
+    return null;
+  }
+
+  async canaryChallengeAnchor(epoch) {
+    const historical = await this.get(`epoch/challenge/${epoch}`);
+    if (historical) return historical;
+    const current = await this.epochApplyStateRecord();
+    if (
+      current.updated_epoch === epoch &&
+      this.isHexBytes(current.last_apply_hash, 32) &&
+      (current.pending_epoch ?? null) === null
+    ) {
+      return {
+        epoch,
+        apply_hash: current.last_apply_hash.toLowerCase(),
+        recorded_at: current.updated_at,
+      };
+    }
+    return null;
+  }
+
   parseTnkE18(value) {
     if (typeof value !== 'string' || !/^[0-9]+$/.test(value)) {
       return new Error('tnk_e18 must be a decimal integer string.');
@@ -11379,12 +12090,14 @@ class MayhemContract extends Contract {
   tnkE18ToAu(tnkE18, tnkUsdAu) {
     const rate = this.parseAu(tnkUsdAu, 'TNK/USD atto-rate', { allowZero: false });
     if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
+    // Deposit conversion rounds down so credited AU never exceeds received TNK value.
     return this.canonicalAu((tnkE18 * rate) / TNK_E18);
   }
 
   tapWeiToAu(tapWei, tapUsdAu) {
     const rate = this.parseAu(tapUsdAu, 'TAP/USD policy rate', { allowZero: false });
     if (rate instanceof Error) return new Error('Invalid TAP/USD policy rate.');
+    // Deposit conversion rounds down so credited AU never exceeds received TAP value.
     return this.canonicalAu((tapWei * rate) / TAP_WEI);
   }
 
@@ -11597,6 +12310,32 @@ class MayhemContract extends Contract {
     return `tap/account-by-address/${chainId}/${poolAddress.toLowerCase()}/${ethereumAddress.toLowerCase()}`;
   }
 
+  tapDepositIdentity(value) {
+    return [
+      value.chain_id,
+      value.pool_address.toLowerCase(),
+      value.eth_tx_hash.toLowerCase(),
+      value.log_index,
+      value.block_hash.toLowerCase(),
+    ].join('/');
+  }
+
+  validateTapDepositIdentity(value) {
+    for (const key of ['chain_id', 'pool_address', 'eth_tx_hash', 'log_index', 'block_hash']) {
+      if (!hasOwn(value, key)) return new Error(`TAP deposit is missing ${key}.`);
+    }
+    if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) {
+      return new Error('Invalid TAP chain id.');
+    }
+    if (!this.isEthHexBytes(value.pool_address, 20)) return new Error('Invalid TAP pool address.');
+    if (!this.isEthHexBytes(value.eth_tx_hash, 32)) return new Error('Invalid Ethereum tx hash.');
+    if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
+      return new Error('Invalid TAP deposit log index.');
+    }
+    if (!this.isEthHexBytes(value.block_hash, 32)) return new Error('Invalid TAP deposit block hash.');
+    return null;
+  }
+
   async depositFeatureKey(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Deposit feature value must be an object.');
@@ -11618,11 +12357,9 @@ class MayhemContract extends Contract {
       return `dep/tnk/${value.memo_hash}/${digest}`;
     }
     if (value.op === 'tap_deposit') {
-      if (!this.isSafeKeyPart(value.eth_tx_hash)) return new Error('Invalid Ethereum tx hash.');
-      if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
-        return new Error('Invalid TAP deposit log index.');
-      }
-      return `dep/tap/${value.eth_tx_hash.toLowerCase()}/${value.log_index}/${digest}`;
+      const validationError = this.validateTapDepositIdentity(value);
+      if (validationError) return validationError;
+      return `dep/tap/${this.tapDepositIdentity(value)}`;
     }
     if (value.op === 'fiat_deposit') {
       if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
@@ -11686,6 +12423,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `settle/fiat/${value.epoch}/${digest}`;
+  }
+
+  async fiatDustSweepFeatureKey(value) {
+    const validationError = this.validateFiatDustSweepValue(value);
+    if (validationError) return validationError;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-fiat-dust-sweep-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `settle/fiat-dust/${value.provider}/${value.epoch}/${digest}`;
   }
 
   async reputationAnchorFeatureKey(value) {
@@ -11765,6 +12515,9 @@ class MayhemContract extends Contract {
       recorded_by: this.address,
     };
     const head = await this.reputationEventHead(currentHead?.head ?? null, body);
+    const foldKey = `ev/rep/fold/${event.provider}`;
+    const fold = this.advanceReputationFold(await this.get(foldKey), body, head);
+    if (fold instanceof Error) return fold;
     const record = {
       ...body,
       head,
@@ -11778,7 +12531,177 @@ class MayhemContract extends Contract {
 
     await this.put(key, record);
     await this.put(headKey, headRecord);
+    await this.put(foldKey, fold);
     return record;
+  }
+
+  parseSignedDecimal(value, label) {
+    if (typeof value !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(value)) {
+      return new Error(`${label} must be a canonical signed decimal string.`);
+    }
+    return BigInt(value);
+  }
+
+  roundSignedRatio(value, divisor) {
+    if (typeof value !== 'bigint' || typeof divisor !== 'bigint' || divisor <= 0n) {
+      return new Error('Invalid signed ratio.');
+    }
+    const negative = value < 0n;
+    const absolute = negative ? -value : value;
+    const rounded = (absolute + divisor / 2n) / divisor;
+    return negative ? -rounded : rounded;
+  }
+
+  quantizePositiveReputation(value, scale, label) {
+    const scaled = value * Number(scale);
+    if (!Number.isFinite(scaled) || scaled < 0 || !Number.isSafeInteger(Math.floor(scaled + 0.5))) {
+      return new Error(`Invalid ${label}.`);
+    }
+    return BigInt(Math.floor(scaled + 0.5));
+  }
+
+  decayReputationRawNano(rawNano, fromSeconds, toSeconds) {
+    if (
+      typeof rawNano !== 'bigint' ||
+      !Number.isSafeInteger(fromSeconds) ||
+      !Number.isSafeInteger(toSeconds) ||
+      fromSeconds < 0 ||
+      toSeconds < fromSeconds
+    ) {
+      return new Error('Invalid reputation decay range.');
+    }
+    if (fromSeconds === toSeconds || rawNano === 0n) return rawNano;
+    const decay = 2 ** (-(toSeconds - fromSeconds) / REPUTATION_HALF_LIFE_SECONDS);
+    const decayPico = this.quantizePositiveReputation(
+      decay,
+      REPUTATION_DECAY_PICO_SCALE,
+      'reputation decay'
+    );
+    if (decayPico instanceof Error) return decayPico;
+    return this.roundSignedRatio(
+      rawNano * decayPico,
+      REPUTATION_DECAY_PICO_SCALE
+    );
+  }
+
+  reputationEventRawNano(event) {
+    let scoreQuarters = null;
+    let weightedAu = null;
+    if (event.kind === 'session_ok') {
+      scoreQuarters = 4n;
+      weightedAu = event.paid_au;
+    } else if (event.kind === 'session_partial') {
+      scoreQuarters = 1n;
+      weightedAu = event.paid_au;
+    } else if (event.kind === 'session_fail') {
+      scoreQuarters = -16n;
+      weightedAu = event.max_spend_au;
+    }
+    if (scoreQuarters !== null) {
+      const amount = this.parseAu(weightedAu, 'reputation weighted amount');
+      if (amount instanceof Error) return amount;
+      const weight = Math.log10(1 + Number(amount));
+      const weightNano = this.quantizePositiveReputation(
+        weight,
+        REPUTATION_RAW_NANO_SCALE,
+        'reputation paid weight'
+      );
+      if (weightNano instanceof Error) return weightNano;
+      return this.roundSignedRatio(weightNano * scoreQuarters, 4n);
+    }
+    const fixedScores = {
+      probe_ok: 500_000_000n,
+      probe_fail: -6_000_000_000n,
+      uptime_tick: 100_000_000n,
+      underdelivery: -6_000_000_000n,
+      dispute_lost: -20_000_000_000n,
+      provenance_violation: 0n,
+    };
+    return fixedScores[event.kind] ?? new Error('Unsupported reputation event kind.');
+  }
+
+  advanceReputationFold(current, event, eventsHead) {
+    if (!Number.isSafeInteger(event.at) || event.at < 0) {
+      return new Error('Invalid reputation event time.');
+    }
+    if (!Number.isSafeInteger(event.epoch) || event.epoch < 0) {
+      return new Error('Invalid reputation event epoch.');
+    }
+    let rawNano = 0n;
+    let foldAt = event.at;
+    let successfulSessions = 0;
+    let provenanceViolation = false;
+    let eventCount = 0;
+    let maxEpoch = 0;
+    if (current !== null) {
+      rawNano = this.parseSignedDecimal(current.raw_nano, 'reputation raw_nano');
+      if (rawNano instanceof Error) return rawNano;
+      if (
+        !Number.isSafeInteger(current.at) || current.at < 0 ||
+        !Number.isSafeInteger(current.successful_sessions) || current.successful_sessions < 0 ||
+        !Number.isSafeInteger(current.event_count) || current.event_count < 0 ||
+        !Number.isSafeInteger(current.max_epoch) || current.max_epoch < 0 ||
+        typeof current.provenance_violation !== 'boolean'
+      ) {
+        return new Error('Invalid reputation fold state.');
+      }
+      foldAt = Math.max(current.at, event.at);
+      rawNano = this.decayReputationRawNano(rawNano, current.at, foldAt);
+      if (rawNano instanceof Error) return rawNano;
+      successfulSessions = current.successful_sessions;
+      provenanceViolation = current.provenance_violation;
+      eventCount = current.event_count;
+      maxEpoch = current.max_epoch;
+    }
+    let contribution = this.reputationEventRawNano(event);
+    if (contribution instanceof Error) return contribution;
+    contribution = this.decayReputationRawNano(contribution, event.at, foldAt);
+    if (contribution instanceof Error) return contribution;
+    const nextSuccessfulSessions = this.safeAddCount(
+      successfulSessions,
+      event.kind === 'session_ok' ? 1 : 0,
+      'successful reputation session count'
+    );
+    if (nextSuccessfulSessions instanceof Error) return nextSuccessfulSessions;
+    const nextEventCount = this.safeAddCount(eventCount, 1, 'reputation event count');
+    if (nextEventCount instanceof Error) return nextEventCount;
+    return {
+      provider: event.provider,
+      raw_nano: (rawNano + contribution).toString(),
+      at: foldAt,
+      max_epoch: Math.max(maxEpoch, event.epoch),
+      successful_sessions: nextSuccessfulSessions,
+      provenance_violation: provenanceViolation || event.kind === 'provenance_violation',
+      event_count: nextEventCount,
+      events_head: eventsHead,
+      updated_at: this.tx,
+    };
+  }
+
+  reputationFoldAt(fold, foldedAt) {
+    if (!Number.isSafeInteger(foldedAt) || foldedAt < fold.at) {
+      return new Error('Reputation folded_at precedes the latest event.');
+    }
+    const rawNano = this.parseSignedDecimal(fold.raw_nano, 'reputation raw_nano');
+    if (rawNano instanceof Error) return rawNano;
+    const decayed = this.decayReputationRawNano(rawNano, fold.at, foldedAt);
+    if (decayed instanceof Error) return decayed;
+    const rawMilliValue = this.roundSignedRatio(decayed, REPUTATION_RAW_NANO_PER_MILLI);
+    if (rawMilliValue instanceof Error) return rawMilliValue;
+    const rawMilli = Number(rawMilliValue);
+    if (!Number.isSafeInteger(rawMilli)) return new Error('Reputation raw_milli overflow.');
+    const raw = rawMilli / 1_000;
+    const r = 1 / (1 + Math.exp(-raw / REPUTATION_KAPPA));
+    const rBps = Math.floor(r * 10_000 + 0.5);
+    if (!Number.isSafeInteger(rBps) || rBps < 0 || rBps > 10_000) {
+      return new Error('Invalid folded reputation score.');
+    }
+    return {
+      raw_milli: rawMilli,
+      r_bps: rBps,
+      successful_sessions: fold.successful_sessions,
+      provenance_violation: fold.provenance_violation,
+    };
   }
 
   isSafeKeyPart(value) {

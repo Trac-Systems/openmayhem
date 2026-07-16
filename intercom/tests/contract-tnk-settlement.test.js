@@ -523,6 +523,8 @@ test('MayhemContract tnkSettlement releases clean-exit provider earnings after h
     {
       op: 'join_enclave',
       enclave_id: cleanExitEnclaveId,
+      att_tier: 1,
+      attestation_head: 'd'.repeat(64),
       served_ctx: 8192,
       served_modalities: ['text'],
       served_specialities: {},
