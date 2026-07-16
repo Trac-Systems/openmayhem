@@ -6,6 +6,16 @@ fail() {
   exit 1
 }
 
+if ! command -v dotnet >/dev/null 2>&1; then
+  if [ -n "${DOTNET_ROOT:-}" ] && [ -x "$DOTNET_ROOT/dotnet" ]; then
+    PATH="$DOTNET_ROOT:$PATH"
+    export DOTNET_ROOT PATH
+  elif [ -n "${HOME:-}" ] && [ -x "$HOME/.dotnet/dotnet" ]; then
+    DOTNET_ROOT="$HOME/.dotnet"
+    PATH="$DOTNET_ROOT:$PATH"
+    export DOTNET_ROOT PATH
+  fi
+fi
 command -v dotnet >/dev/null 2>&1 || fail "missing required command: dotnet"
 command -v sha256sum >/dev/null 2>&1 || fail "missing required command: sha256sum"
 
