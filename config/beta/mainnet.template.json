@@ -147,6 +147,8 @@
       "chain_id": 1,
       "token_address": "<0x-canonical-TAP-token-address>",
       "pool_address": "<MayhemInferencePool-mainnet-address-after-C5>",
+      "governance_signer": "<0x-independent-TAP-governance-signer>",
+      "governance_delay_seconds": 3600,
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
       "participant_rpc_policy": "public-only",
       "operator_oracle": {

@@ -371,6 +371,8 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
         'chain_id',
         'token_address',
         'pool_address',
+        'governance_signer',
+        'governance_delay_seconds',
         'deployment_file_env',
         'participant_rpc_policy',
         'operator_oracle',
@@ -380,6 +382,8 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireLiteral(add, manifest.payments.tap.chain_id, 1, 'payments.tap.chain_id');
       requireString(add, manifest.payments.tap.token_address, 'payments.tap.token_address', ethAddress);
       requireString(add, manifest.payments.tap.pool_address, 'payments.tap.pool_address', ethAddress);
+      requireString(add, manifest.payments.tap.governance_signer, 'payments.tap.governance_signer', ethAddress);
+      requireLiteral(add, manifest.payments.tap.governance_delay_seconds, 3600, 'payments.tap.governance_delay_seconds');
       requireLiteral(add, manifest.payments.tap.deployment_file_env, 'MAYHEM_TAP_DEPLOYMENT_FILE', 'payments.tap.deployment_file_env');
       requireLiteral(add, manifest.payments.tap.participant_rpc_policy, 'public-only', 'payments.tap.participant_rpc_policy');
       if (requireObject(add, manifest.payments.tap.operator_oracle, 'payments.tap.operator_oracle')) {

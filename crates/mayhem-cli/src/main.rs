@@ -126,7 +126,7 @@ const MAINNET_MSB_DIRECT_PEERS: [&str; 3] = [
 ];
 const MAINNET_TAP_CHAIN_ID: u64 = 1;
 const MAINNET_TAP_TOKEN_ADDRESS: &str = "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454";
-const MAINNET_TAP_POOL_ADDRESS: &str = "0x9B254d37C28Fb5893F46513a61925eDC2F300615";
+const MAINNET_TAP_POOL_ADDRESS: &str = "0xcFEA9A256F1F96269D848cABF1eCb00fD2DD6a28";
 const MAINNET_TNK_TREASURY_ADDRESS: &str =
     "trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh";
 const MAINNET_MANIFEST_JSON: &str = include_str!("../../../config/beta/mainnet.json");

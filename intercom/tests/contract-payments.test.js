@@ -15,7 +15,7 @@ const paymentConfig = (overrides = {}) => ({
   tap: {
     chain_id: 1,
     token_address: '0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454',
-    pool_address: '0x9B254d37C28Fb5893F46513a61925eDC2F300615',
+    pool_address: '0xcFEA9A256F1F96269D848cABF1eCb00fD2DD6a28',
   },
   tnk: {
     network: 'mainnet',
@@ -50,7 +50,7 @@ test('admin publishes one complete canonical payment directory', async () => {
     tap: {
       chain_id: 1,
       token_address: '0x5e7f6e008c6d9d7ad4c7eb75bd4ce62864cc7454',
-      pool_address: '0x9b254d37c28fb5893f46513a61925edc2f300615',
+      pool_address: '0xcfea9a256f1f96269d848cabf1ecb00fd2dd6a28',
     },
     tnk: {
       network: 'mainnet',
