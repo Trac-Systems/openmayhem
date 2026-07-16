@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 9;
+export const CONTRACT_VERSION = 10;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -16,7 +16,6 @@ const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
-const TAP_RATE_SOURCES = new Set(['uniswap-v2', 'config', 'stale']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
 const PROVIDER_LIFECYCLE_OPS = new Set([
   'register_provider',
@@ -1231,7 +1230,7 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (['tnk_deposit', 'tap_deposit', 'fiat_deposit', 'fiat_chargeback'].includes(value.op)) {
+    if (['tnk_deposit', 'tap_deposit', 'tap_deposit_reversal', 'fiat_deposit', 'fiat_chargeback'].includes(value.op)) {
       const result = await this.applyDepositCreditFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
@@ -1662,6 +1661,7 @@ class MayhemContract extends Contract {
     try {
       if (value.op === 'tnk_deposit') return await this.tnkDeposit();
       if (value.op === 'tap_deposit') return await this.tapDeposit();
+      if (value.op === 'tap_deposit_reversal') return await this.tapDepositReversal();
       if (value.op === 'fiat_deposit') return await this.fiatDeposit();
       if (value.op === 'fiat_chargeback') return await this.fiatChargeback();
       return;
@@ -5131,7 +5131,6 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const shapeError = this.validateTapRateOracleValue(this.value);
     if (shapeError) return shapeError;
-    if (!TAP_RATE_SOURCES.has(this.value.source)) return new Error('Unsupported TAP rate source.');
 
     const current = await this.get('tap/rate/latest');
     if (current && this.value.ts < current.ts) {
@@ -5185,7 +5184,8 @@ class MayhemContract extends Contract {
     if (rate instanceof Error) {
       return new Error('Invalid TAP/USD atto-rate.');
     }
-    if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
+    if (typeof value.source !== 'string'
+      || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.source)) {
       return new Error('Invalid TAP rate source.');
     }
     if (!Number.isSafeInteger(value.ts) || value.ts < 0) {
@@ -6839,6 +6839,9 @@ class MayhemContract extends Contract {
     if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
       return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
     }
+    if (value.chain_id === 1 && value.confirmation_policy !== 'finalized-tag') {
+      return new Error('Ethereum mainnet TAP deposits require finalized-tag policy.');
+    }
     if (value.confirmation_policy !== 'finalized-tag') {
       if (value.confirmation_policy !== `depth-${value.confirmation_depth}`) {
         return new Error('TAP confirmation policy must match the confirmed depth or use finalized-tag.');
@@ -6853,6 +6856,228 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TAP deposit timestamp.');
     const tapWei = this.parseTapWei(value.tap_wei);
     if (tapWei instanceof Error) return tapWei;
+    return null;
+  }
+
+  async tapDepositReversal() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateTapDepositReversalValue(this.value);
+    if (shapeError) return shapeError;
+
+    const depositSeenKey = `dep/tap/${this.tapDepositIdentity(this.value)}`;
+    const depositSeen = await this.get(depositSeenKey);
+    if (depositSeen === null) return new Error('TAP deposit event not found.');
+    if (depositSeen.block_number !== this.value.block_number) {
+      return new Error('TAP reversal block number does not match credited event.');
+    }
+    const reversalSeenKey = `${depositSeenKey}/reversal`;
+    const existing = await this.get(reversalSeenKey);
+    if (existing !== null) {
+      return {
+        ok: true,
+        op: 'tapDepositReversal',
+        duplicate: true,
+        who: existing.who,
+        au: ZERO_AU,
+        reversed_au: existing.au,
+        clawback_au: ZERO_AU,
+        credited_clawback_au: existing.clawback_au,
+        network_absorbed_au: ZERO_AU,
+        credited_network_absorbed_au: existing.network_absorbed_au,
+        frozen: existing.frozen,
+        epoch: existing.epoch,
+      };
+    }
+    if (depositSeen.reversed === true) return new Error('TAP deposit is already reversed.');
+
+    const who = depositSeen.who;
+    const au = this.normalizeAu(depositSeen.au, 'credited TAP deposit amount', { allowZero: false });
+    if (au instanceof Error) return au;
+    const balance = await this.balanceRecord(who, 'tap');
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, who, 'tap');
+    if (balanceError) return balanceError;
+    const clawbackAu = this.compareAu(balance.au, au) < 0 ? balance.au : au;
+    const networkAbsorbedAu = this.safeSubAu(au, clawbackAu);
+    if (networkAbsorbedAu instanceof Error) return networkAbsorbedAu;
+    const nextAu = this.safeSubAu(balance.au, clawbackAu);
+    if (nextAu instanceof Error) return nextAu;
+    const frozen = !this.isZeroAu(networkAbsorbedAu);
+
+    const leaf = await this.depositLeafHash({
+      rail: 'tap',
+      user_hash: await this.opaqueHash('deposit-user', who),
+      ethereum_address_hash: await this.opaqueHash(
+        'deposit-ethereum-account',
+        depositSeen.ethereum_address
+      ),
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      chain_id: this.value.chain_id,
+      pool_address_hash: await this.opaqueHash('deposit-pool', this.value.pool_address),
+      eth_tx_hash: this.value.eth_tx_hash,
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      block_hash: this.value.block_hash,
+      reconciliation_from_block: this.value.reconciliation_from_block,
+      reconciliation_to_block: this.value.reconciliation_to_block,
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_policy: this.value.confirmation_policy,
+      watcher_id: this.value.watcher_id,
+      reason: this.value.reason,
+      reversed: true,
+    });
+    const depositRoot = await this.nextDepositReversalRoot({
+      epoch: this.value.epoch,
+      leaf,
+      disputedAu: au,
+      clawbackAu,
+      absorbedAu: networkAbsorbedAu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
+    const reversalSeen = {
+      rail: 'tap',
+      who,
+      ethereum_address: depositSeen.ethereum_address,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      chain_id: this.value.chain_id,
+      pool_address: this.value.pool_address.toLowerCase(),
+      eth_tx_hash: this.value.eth_tx_hash.toLowerCase(),
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      block_hash: this.value.block_hash.toLowerCase(),
+      reconciliation_from_block: this.value.reconciliation_from_block,
+      reconciliation_to_block: this.value.reconciliation_to_block,
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_policy: this.value.confirmation_policy,
+      watcher_id: this.value.watcher_id,
+      reason: this.value.reason,
+      frozen,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      reversed_at: this.tx,
+      reversed_by: this.address,
+      reversed_by_role: 'admin',
+    };
+    let freezeRecord = null;
+    if (frozen) {
+      const existingFrozen = await this.get(`frozen/${who}`);
+      const disputedAuCum = this.safeAddAu(existingFrozen?.disputed_au_cum ?? ZERO_AU, au);
+      if (disputedAuCum instanceof Error) return disputedAuCum;
+      const clawbackAuCum = this.safeAddAu(existingFrozen?.clawback_au_cum ?? ZERO_AU, clawbackAu);
+      if (clawbackAuCum instanceof Error) return clawbackAuCum;
+      const absorbedAuCum = this.safeAddAu(
+        existingFrozen?.network_absorbed_au_cum ?? ZERO_AU,
+        networkAbsorbedAu
+      );
+      if (absorbedAuCum instanceof Error) return absorbedAuCum;
+      freezeRecord = {
+        user: who,
+        status: 'frozen',
+        reason: 'tap_deposit_reorg_shortfall',
+        rail: 'tap',
+        first_frozen_at: existingFrozen?.first_frozen_at ?? this.tx,
+        first_frozen_at_seconds: existingFrozen?.first_frozen_at_seconds ?? this.value.at,
+        updated_at: this.tx,
+        updated_at_seconds: this.value.at,
+        updated_epoch: Math.max(existingFrozen?.updated_epoch ?? 0, this.value.epoch),
+        dispute_count: (existingFrozen?.dispute_count ?? 0) + 1,
+        disputed_au_cum: disputedAuCum,
+        clawback_au_cum: clawbackAuCum,
+        network_absorbed_au_cum: absorbedAuCum,
+        last_tap_deposit_identity: this.tapDepositIdentity(this.value),
+      };
+    }
+
+    await this.put(this.balanceKey(who, 'tap'), {
+      ...balance,
+      au: nextAu,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_deposit_reversal_rail: 'tap',
+      last_deposit_reversal_at: this.tx,
+    });
+    await this.put(depositSeenKey, {
+      ...depositSeen,
+      reversed: true,
+      reversed_au: au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      reversed_at: this.tx,
+      reversed_at_seconds: this.value.at,
+      reversed_epoch: this.value.epoch,
+    });
+    await this.put(reversalSeenKey, reversalSeen);
+    if (freezeRecord) await this.put(`frozen/${who}`, freezeRecord);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    return {
+      ok: true,
+      op: 'tapDepositReversal',
+      duplicate: false,
+      who,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      frozen,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
+    };
+  }
+
+  validateTapDepositReversalValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'chain_id',
+        'pool_address',
+        'eth_tx_hash',
+        'log_index',
+        'block_number',
+        'block_hash',
+        'reconciliation_from_block',
+        'reconciliation_to_block',
+        'finalized_block_number',
+        'confirmation_policy',
+        'watcher_id',
+        'reason',
+        'epoch',
+        'at',
+      ],
+      'TAP deposit reversal'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tap_deposit_reversal') return new Error('Invalid TAP deposit reversal op.');
+    const identityError = this.validateTapDepositIdentity(value);
+    if (identityError) return identityError;
+    if (!Number.isSafeInteger(value.block_number) || value.block_number < 0) {
+      return new Error('Invalid TAP reversal block number.');
+    }
+    if (!Number.isSafeInteger(value.reconciliation_from_block)
+      || value.reconciliation_from_block > value.block_number) {
+      return new Error('Invalid TAP reversal reconciliation start.');
+    }
+    if (!Number.isSafeInteger(value.reconciliation_to_block)
+      || value.reconciliation_to_block < value.block_number) {
+      return new Error('Invalid TAP reversal reconciliation end.');
+    }
+    if (!Number.isSafeInteger(value.finalized_block_number)
+      || value.finalized_block_number - value.reconciliation_to_block < MIN_TAP_CONFIRMATION_DEPTH) {
+      return new Error('TAP reversal is not sufficiently behind the finalized reference.');
+    }
+    if (value.confirmation_policy !== 'finalized-tag') {
+      return new Error('TAP reversal requires finalized-tag policy.');
+    }
+    if (value.watcher_id !== TAP_DEPOSIT_WATCHER_ID) return new Error('TAP watcher id mismatch.');
+    if (value.reason !== 'canonical_event_missing') return new Error('Invalid TAP reversal reason.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid TAP reversal epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TAP reversal timestamp.');
     return null;
   }
 
@@ -12360,6 +12585,11 @@ class MayhemContract extends Contract {
       const validationError = this.validateTapDepositIdentity(value);
       if (validationError) return validationError;
       return `dep/tap/${this.tapDepositIdentity(value)}`;
+    }
+    if (value.op === 'tap_deposit_reversal') {
+      const validationError = this.validateTapDepositReversalValue(value);
+      if (validationError) return validationError;
+      return `dep/tap/${this.tapDepositIdentity(value)}/reversal`;
     }
     if (value.op === 'fiat_deposit') {
       if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');

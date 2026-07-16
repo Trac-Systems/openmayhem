@@ -5,9 +5,13 @@ import {
   DEFAULT_USDT_ADDRESS,
   buildAdminCommand,
   buildAdminCommandArgs,
+  counterfactualCumulativePrices,
   decimalUsdToAu,
+  deviationWithinBps,
+  medianInteger,
   parsePinnedTapUsdAu,
   readTapUsdAuFromDex,
+  readTapUsdTwapFromDex,
   resetTapPriceCacheForTest,
   resolveTapUsdRate,
   rpcUrlCandidates,
@@ -31,6 +35,22 @@ function fakePool({
     token0: async () => token0,
     token1: async () => token1,
     getReserves: async () => [reserve0, reserve1, 0],
+  };
+}
+
+function fakeTwap({
+  tapUsdAu = '2500000000000000000',
+  spotTapUsdAu = tapUsdAu,
+} = {}) {
+  return {
+    tap_usd_au: tapUsdAu,
+    spot_tap_usd_au: spotTapUsdAu,
+    pool_address: POOL,
+    start_block: 50,
+    end_block: 200,
+    start_timestamp: 600,
+    end_timestamp: 2_400,
+    window_seconds: 1_800,
   };
 }
 
@@ -75,79 +95,121 @@ test('TAP DEX reader maps either Uniswap token order', async () => {
   assert.equal(reverse.tap_usd_au, '2500000000000000000');
 });
 
-test('TAP rate resolver caches DEX reads and falls back safely', async () => {
+test('TAP TWAP reader uses finalized cumulative prices and normalizes token decimals', async () => {
+  const provider = {
+    async send(method, [tag, includeTransactions]) {
+      assert.equal(method, 'eth_getBlockByNumber');
+      assert.equal(includeTransactions, false);
+      const number = tag === 'finalized' ? 200 : Number(BigInt(tag));
+      return {
+        number: `0x${number.toString(16)}`,
+        timestamp: `0x${(number * 12).toString(16)}`,
+      };
+    },
+  };
+  const pool = {
+    token0: async () => TAP,
+    token1: async () => DEFAULT_USDT_ADDRESS,
+    getReserves: async () => [U18(100), U6(250), 0],
+    price0CumulativeLast: async () => 0n,
+    price1CumulativeLast: async () => 0n,
+  };
+  const twap = await readTapUsdTwapFromDex({
+    provider,
+    poolAddress: POOL,
+    tapAddress: TAP,
+    windowSeconds: 1_800,
+    poolFactory: () => pool,
+  });
+  assert.equal(twap.tap_usd_au, '2499999999999999999');
+  assert.equal(twap.spot_tap_usd_au, '2500000000000000000');
+  assert.equal(twap.start_block, 50);
+  assert.equal(twap.end_block, 200);
+  assert.equal(twap.window_seconds, 1_800);
+
+  const wrapped = counterfactualCumulativePrices({
+    price0Cumulative: 0,
+    price1Cumulative: 0,
+    reserve0: 1,
+    reserve1: 2,
+    blockTimestampLast: 0xfffffff0,
+    blockTimestamp: 5,
+  });
+  assert.equal(wrapped.block_timestamp, 5);
+  assert.equal(wrapped.price0_cumulative > 0n, true);
+  assert.equal(medianInteger([10, 14]).toString(), '12');
+  assert.equal(deviationWithinBps(110, 100, 1_000), true);
+  assert.equal(deviationWithinBps(111, 100, 1_000), false);
+});
+
+test('TAP rate resolver caches two-source TWAP medians and fails closed when live sources disappear', async () => {
   resetTapPriceCacheForTest();
   let calls = 0;
   const first = await resolveTapUsdRate({
-    rpcUrl: 'http://eth.local',
+    rpcUrls: 'https://provider-a.example/rpc https://provider-b.example/rpc',
     chainId: 1,
     tapAddress: TAP,
-    providerFactory: () => ({}),
-    poolFactory: () => {
+    hardFloorAu: '1000000000000000',
+    hardCeilingAu: '10000000000000000000',
+    providerFactory: (url) => ({ url }),
+    priceReader: async () => {
       calls += 1;
-      return fakePool();
+      return fakeTwap();
     },
     nowMs: () => 1_000,
     nowSeconds: () => 10,
     ttlMs: 1_000,
   });
-  assert.equal(first.source, 'uniswap-v2');
+  assert.equal(first.source, 'uniswap-v2-twap-median');
   assert.equal(first.tap_usd_au, '2500000000000000000');
-  assert.equal(calls, 1);
+  assert.equal(first.rpc_sources.length, 2);
+  assert.equal(calls, 2);
 
   const cached = await resolveTapUsdRate({
-    rpcUrl: 'http://eth.local',
+    rpcUrls: 'https://provider-a.example/rpc https://provider-b.example/rpc',
     chainId: 1,
     tapAddress: TAP,
-    providerFactory: () => ({}),
-    poolFactory: () => {
+    hardFloorAu: '1000000000000000',
+    hardCeilingAu: '10000000000000000000',
+    priceReader: async () => {
       calls += 1;
-      return fakePool();
+      return fakeTwap();
     },
     nowMs: () => 1_500,
     nowSeconds: () => 11,
     ttlMs: 1_000,
   });
-  assert.equal(cached.source, 'uniswap-v2');
+  assert.equal(cached.source, 'uniswap-v2-twap-median');
   assert.equal(cached.cache_hit, true);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 
-  const stale = await resolveTapUsdRate({
-    rpcUrl: 'http://eth.local',
-    chainId: 1,
-    tapAddress: TAP,
-    providerFactory: () => ({}),
-    poolFactory: () => ({
-      token0: async () => { throw new Error('rpc down'); },
-      token1: async () => DEFAULT_USDT_ADDRESS,
-      getReserves: async () => [U18(1), U6(1), 0],
+  await assert.rejects(
+    resolveTapUsdRate({
+      rpcUrls: 'https://provider-a.example/rpc https://provider-b.example/rpc',
+      chainId: 1,
+      tapAddress: TAP,
+      hardFloorAu: '1000000000000000',
+      hardCeilingAu: '10000000000000000000',
+      priceReader: async () => { throw new Error('rpc down'); },
+      nowMs: () => 3_000,
+      nowSeconds: () => 30,
+      ttlMs: 1_000,
     }),
-    nowMs: () => 3_000,
-    nowSeconds: () => 30,
-    ttlMs: 1_000,
-    timeoutMs: 50,
-  });
-  assert.equal(stale.source, 'stale');
-  assert.equal(stale.tap_usd_au, '2500000000000000000');
-  assert.equal(stale.stale_from_ts, 10);
-  assert.match(stale.failures[0].error, /rpc down/);
+    /source quorum unavailable/,
+  );
 
   resetTapPriceCacheForTest();
   const config = await resolveTapUsdRate({
-    rpcUrl: 'http://eth.local',
+    rpcUrls: 'https://provider-a.example/rpc https://provider-b.example/rpc',
     chainId: 1,
     tapAddress: TAP,
     fallbackUsd: '0.125',
-    providerFactory: () => ({}),
-    poolFactory: () => ({
-      token0: async () => { throw new Error('rpc down'); },
-      token1: async () => DEFAULT_USDT_ADDRESS,
-      getReserves: async () => [U18(1), U6(1), 0],
-    }),
+    hardFloorAu: '1000000000000000',
+    hardCeilingAu: '10000000000000000000',
+    priceReader: async () => { throw new Error('rpc down'); },
     nowMs: () => 4_000,
     nowSeconds: () => 40,
     ttlMs: 1_000,
-    timeoutMs: 50,
   });
   assert.equal(config.source, 'config');
   assert.equal(config.tap_usd_au, '125000000000000000');
@@ -164,35 +226,35 @@ test('TAP rate resolver caches DEX reads and falls back safely', async () => {
   assert.equal(noRpc.tap_usd_au, '55000000000000000');
 });
 
-test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async () => {
+test('TAP rate resolver requires quorum, medianizes independent RPCs, and redacts failures', async () => {
   resetTapPriceCacheForTest();
   assert.deepEqual(rpcUrlCandidates({
-    rpcUrl: 'https://mainnet.infura.io/v3/a',
-    fallbackRpcUrls: 'https://example.quiknode.pro/b, https://mainnet.infura.io/v3/a',
+    rpcUrl: 'https://provider-a.example/rpc',
+    fallbackRpcUrls: 'https://provider-b.example/rpc, https://provider-a.example/rpc',
   }), [
-    'https://mainnet.infura.io/v3/a',
-    'https://example.quiknode.pro/b',
+    'https://provider-a.example/rpc',
+    'https://provider-b.example/rpc',
   ]);
 
   const used = [];
   const rate = await resolveTapUsdRate({
-    rpcUrl: 'https://mainnet.infura.io/v3/primary-placeholder',
-    fallbackRpcUrls: 'https://example.quiknode.pro/fallback-secret',
+    rpcUrl: 'https://provider-a.example/private-token',
+    fallbackRpcUrls: 'https://provider-b.example/private-token https://provider-c.example/private-token',
     chainId: 1,
     tapAddress: TAP,
+    hardFloorAu: '1000000000000000',
+    hardCeilingAu: '10000000000000000000',
     providerFactory: (url) => {
       used.push(url);
       return { url };
     },
-    poolFactory: (_address, _abi, provider) => {
-      if (provider.url.includes('infura')) {
-        return {
-          token0: async () => { throw new Error(`down ${provider.url}`); },
-          token1: async () => DEFAULT_USDT_ADDRESS,
-          getReserves: async () => [U18(1), U6(1), 0],
-        };
+    priceReader: async ({ provider }) => {
+      if (provider.url.includes('provider-a')) {
+        throw new Error(`down ${provider.url}`);
       }
-      return fakePool();
+      return provider.url.includes('provider-b')
+        ? fakeTwap({ tapUsdAu: '2400000000000000000', spotTapUsdAu: '2500000000000000000' })
+        : fakeTwap({ tapUsdAu: '2600000000000000000', spotTapUsdAu: '2500000000000000000' });
     },
     nowMs: () => 7_000,
     nowSeconds: () => 70,
@@ -200,16 +262,80 @@ test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async 
   });
 
   assert.deepEqual(used, [
-    'https://mainnet.infura.io/v3/primary-placeholder',
-    'https://example.quiknode.pro/fallback-secret',
+    'https://provider-a.example/private-token',
+    'https://provider-b.example/private-token',
+    'https://provider-c.example/private-token',
   ]);
-  assert.equal(rate.source, 'uniswap-v2');
-  assert.equal(rate.rpc_source, 'example.quiknode.pro');
+  assert.equal(rate.source, 'uniswap-v2-twap-median');
   assert.equal(rate.tap_usd_au, '2500000000000000000');
+  assert.deepEqual(rate.rpc_sources, ['provider-b.example', 'provider-c.example']);
   assert.equal(rate.failures.length, 1);
-  assert.equal(rate.failures[0].rpc_source, 'mainnet.infura.io');
-  assert.doesNotMatch(rate.failures[0].error, /primary-placeholder/);
-  assert.match(rate.failures[0].error, /https:\/\/<redacted>/);
+  assert.equal(rate.failures[0].rpc_source, 'provider-a.example');
+  assert.doesNotMatch(rate.failures[0].error, /private-token/);
+  assert.match(rate.failures[0].error, /https:\/\/provider-a\.example\/\.\.\./);
+});
+
+test('TAP rate resolver enforces spot deviation and hard bounds before publication', async () => {
+  const base = {
+    rpcUrls: 'https://one.example/rpc https://two.example/rpc',
+    chainId: 1,
+    tapAddress: TAP,
+    hardFloorAu: '1000000000000000000',
+    hardCeilingAu: '10000000000000000000',
+    minimumSources: 2,
+    maxDeviationBps: 1_000,
+    providerFactory: (url) => ({ url }),
+    ttlMs: 1,
+  };
+
+  resetTapPriceCacheForTest();
+  await assert.rejects(
+    resolveTapUsdRate({
+      ...base,
+      priceReader: async () => fakeTwap({
+        tapUsdAu: '2500000000000000000',
+        spotTapUsdAu: '4000000000000000000',
+      }),
+      nowMs: () => 1_000,
+    }),
+    /spot price.*deviation band/i,
+  );
+
+  resetTapPriceCacheForTest();
+  await assert.rejects(
+    resolveTapUsdRate({
+      ...base,
+      priceReader: async () => fakeTwap({ tapUsdAu: '500000000000000000' }),
+      nowMs: () => 2_000,
+    }),
+    /outside.*hard price bounds/i,
+  );
+});
+
+test('TAP rate resolver consults public RPCs only when private quorum is unavailable', async () => {
+  resetTapPriceCacheForTest();
+  const used = [];
+  const rate = await resolveTapUsdRate({
+    rpcUrls: 'https://private-one.example/rpc https://private-two.example/rpc',
+    publicFallbackRpcUrls: 'https://public-one.example/rpc https://public-two.example/rpc',
+    chainId: 1,
+    tapAddress: TAP,
+    hardFloorAu: '1000000000000000',
+    hardCeilingAu: '10000000000000000000',
+    providerFactory: (url) => ({ url }),
+    priceReader: async ({ provider }) => {
+      used.push(provider.url);
+      if (provider.url.includes('private-two')) throw new Error('private RPC unavailable');
+      return fakeTwap();
+    },
+    nowMs: () => 3_000,
+    nowSeconds: () => 30,
+    ttlMs: 1,
+  });
+  assert.equal(rate.source, 'uniswap-v2-twap-median');
+  assert.equal(used.includes('https://public-one.example/rpc'), true);
+  assert.equal(used.includes('https://public-two.example/rpc'), false);
+  assert.equal(rate.observations.filter((item) => item.public_fallback).length, 1);
 });
 
 test('TAP rate watcher builds redacted admin commands and verifies state shape', () => {
@@ -258,7 +384,7 @@ test('TAP rate watcher refuses non-live mainnet fallback unless explicitly allow
       nowMs: () => 10_000,
       nowSeconds: () => 100,
     }),
-    /Refusing to post non-mainnet-live TAP price/
+    /Refusing to use a non-live TAP price for a mainnet submission/
   );
 
   resetTapPriceCacheForTest();
@@ -272,4 +398,17 @@ test('TAP rate watcher refuses non-live mainnet fallback unless explicitly allow
   });
   assert.equal(allowed.source, 'config');
   assert.equal(allowed.tap_usd_au, '50000000000000000');
+
+  resetTapPriceCacheForTest();
+  await assert.rejects(
+    runOnce({
+      chainId: 1,
+      fallbackUsd: '0.05',
+      requireLiveMainnetPrice: false,
+      submit: true,
+      nowMs: () => 12_000,
+      nowSeconds: () => 120,
+    }),
+    /pinned fallback prices are dry-run only/,
+  );
 });

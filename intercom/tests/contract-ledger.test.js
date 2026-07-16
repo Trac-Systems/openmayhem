@@ -513,7 +513,7 @@ test('MayhemProtocol keeps rate oracle updates off the paid tx route', () => {
     { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
     { op: 'rate_oracle', tnk_usd_au: '50000000000000000', source: 'gate-spot', ts: 3_600 },
     { op: 'rate_oracle', tnk_usd_au: '51000000000000000', source: 'mexc-spot', ts: 5_400 },
-    { op: 'tap_rate_oracle', tap_usd_au: '50000000000000000', source: 'uniswap-v2', ts: 3_600 },
+    { op: 'tap_rate_oracle', tap_usd_au: '50000000000000000', source: 'uniswap-v2-twap-median', ts: 3_600 },
     { op: 'tap_rate_oracle', tap_usd_au: '52000000000000000', source: 'config', ts: 5_400 },
   ];
 
@@ -528,7 +528,7 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
     commands.push({ op: 'epoch_commit', epoch, at: epoch * 3_600, roots: {}, totals: {} });
     commands.push(makeEpochApply(epoch, `user-${epoch}`, `provider-${epoch}`, 1_000 + epoch));
     commands.push({ op: 'rate_oracle', tnk_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'gate-spot', ts: epoch * 3_600 });
-    commands.push({ op: 'tap_rate_oracle', tap_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'uniswap-v2', ts: epoch * 3_600 });
+    commands.push({ op: 'tap_rate_oracle', tap_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'uniswap-v2-twap-median', ts: epoch * 3_600 });
 
     for (let i = 0; i < 4; i += 1) {
       commands.push({

@@ -372,8 +372,8 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
         'token_address',
         'pool_address',
         'deployment_file_env',
-        'eth_rpc_env',
-        'eth_rpc_fallbacks_env',
+        'participant_rpc_policy',
+        'operator_oracle',
         'max_epoch_delta_wei',
         'operator_address',
       ]);
@@ -381,8 +381,37 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireString(add, manifest.payments.tap.token_address, 'payments.tap.token_address', ethAddress);
       requireString(add, manifest.payments.tap.pool_address, 'payments.tap.pool_address', ethAddress);
       requireLiteral(add, manifest.payments.tap.deployment_file_env, 'MAYHEM_TAP_DEPLOYMENT_FILE', 'payments.tap.deployment_file_env');
-      requireLiteral(add, manifest.payments.tap.eth_rpc_env, 'MAYHEM_TAP_ETH_RPC', 'payments.tap.eth_rpc_env');
-      requireLiteral(add, manifest.payments.tap.eth_rpc_fallbacks_env, 'MAYHEM_TAP_ETH_RPC_FALLBACKS', 'payments.tap.eth_rpc_fallbacks_env');
+      requireLiteral(add, manifest.payments.tap.participant_rpc_policy, 'public-only', 'payments.tap.participant_rpc_policy');
+      if (requireObject(add, manifest.payments.tap.operator_oracle, 'payments.tap.operator_oracle')) {
+        const oracle = manifest.payments.tap.operator_oracle;
+        requireOnlyKeys(add, oracle, 'payments.tap.operator_oracle', [
+          'method',
+          'private_rpc_env',
+          'private_rpc_fallbacks_env',
+          'public_fallbacks_env',
+          'interval_seconds',
+          'twap_window_seconds',
+          'minimum_sources',
+          'max_deviation_bps',
+          'hard_floor_au',
+          'hard_ceiling_au',
+        ]);
+        requireLiteral(add, oracle.method, 'uniswap-v2-twap-median', 'payments.tap.operator_oracle.method');
+        requireLiteral(add, oracle.private_rpc_env, 'MAYHEM_TAP_ETH_RPC', 'payments.tap.operator_oracle.private_rpc_env');
+        requireLiteral(add, oracle.private_rpc_fallbacks_env, 'MAYHEM_TAP_ETH_RPC_FALLBACKS', 'payments.tap.operator_oracle.private_rpc_fallbacks_env');
+        requireLiteral(add, oracle.public_fallbacks_env, 'MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS', 'payments.tap.operator_oracle.public_fallbacks_env');
+        requireLiteral(add, oracle.interval_seconds, 1800, 'payments.tap.operator_oracle.interval_seconds');
+        requireLiteral(add, oracle.twap_window_seconds, 1800, 'payments.tap.operator_oracle.twap_window_seconds');
+        requireLiteral(add, oracle.minimum_sources, 2, 'payments.tap.operator_oracle.minimum_sources');
+        requireLiteral(add, oracle.max_deviation_bps, 2000, 'payments.tap.operator_oracle.max_deviation_bps');
+        requirePositiveDecimalString(add, oracle.hard_floor_au, 'payments.tap.operator_oracle.hard_floor_au');
+        requirePositiveDecimalString(add, oracle.hard_ceiling_au, 'payments.tap.operator_oracle.hard_ceiling_au');
+        if (/^[0-9]+$/.test(oracle.hard_floor_au ?? '')
+          && /^[0-9]+$/.test(oracle.hard_ceiling_au ?? '')
+          && BigInt(oracle.hard_floor_au) >= BigInt(oracle.hard_ceiling_au)) {
+          add('error', 'payments.tap.operator_oracle hard floor must be below hard ceiling');
+        }
+      }
       requirePositiveDecimalString(add, manifest.payments.tap.max_epoch_delta_wei, 'payments.tap.max_epoch_delta_wei');
       requireString(add, manifest.payments.tap.operator_address, 'payments.tap.operator_address', ethAddress);
     }

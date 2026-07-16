@@ -16,6 +16,7 @@ const SCRIPT = fileURLToPath(new URL('../scripts/tap-owner-op.mjs', import.meta.
 const DEPLOYER_KEY = `0x${'55'.repeat(32)}`;
 const OWNER_KEY = `0x${'66'.repeat(32)}`;
 const NOT_OWNER_KEY = `0x${'77'.repeat(32)}`;
+const GOVERNANCE_KEY = `0x${'88'.repeat(32)}`;
 const GANACHE_BALANCE = ethers.toBeHex(ethers.parseEther('100'));
 const U = (n) => ethers.parseUnits(String(n), 18);
 
@@ -46,10 +47,10 @@ function runNode(args, options = {}) {
   });
 }
 
-test('TAP owner op dry-runs setMaxEpochDelta and refuses non-owner broadcast', async (t) => {
+test('TAP owner op cross-signs, proposes, and executes maxEpochDelta changes', async (t) => {
   const server = Ganache.server({
     logging: { quiet: true },
-    chain: { chainId: 61_003 },
+    chain: { chainId: 61_000 },
     wallet: {
       lock: true,
       accounts: [
@@ -74,28 +75,34 @@ test('TAP owner op dry-runs setMaxEpochDelta and refuses non-owner broadcast', a
   t.after(() => { if (provider.destroy) provider.destroy(); });
   const deployer = new ethers.NonceManager(new ethers.Wallet(DEPLOYER_KEY, provider));
   const owner = new ethers.Wallet(OWNER_KEY, provider);
+  const governance = new ethers.Wallet(GOVERNANCE_KEY, provider);
   const art = compileAll();
   const token = await new ethers.ContractFactory(art.MockTTAP.abi, art.MockTTAP.bytecode, deployer).deploy();
   await token.waitForDeployment();
-  const { pool, poolAddr } = await deployPoolWithToken(
-    deployer,
-    await token.getAddress(),
-    await owner.getAddress(),
-    U(500),
-    art
-  );
+  const { pool, poolAddr } = await deployPoolWithToken(deployer, await token.getAddress(), {
+    ownerAddr: await owner.getAddress(),
+    governanceSigner: await governance.getAddress(),
+    governanceDelay: 0n,
+    maxEpochDelta: U(500),
+    art,
+  });
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-tap-owner-op-'));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const ownerKeyFile = path.join(tmp, 'owner.json');
+  const governanceKeyFile = path.join(tmp, 'governance.json');
+  const notOwnerKeyFile = path.join(tmp, 'not-owner.json');
   fs.writeFileSync(ownerKeyFile, JSON.stringify({ address: await owner.getAddress(), privateKey: OWNER_KEY }, null, 2));
+  fs.writeFileSync(governanceKeyFile, JSON.stringify({ address: await governance.getAddress(), privateKey: GOVERNANCE_KEY }, null, 2));
+  fs.writeFileSync(notOwnerKeyFile, JSON.stringify({ privateKey: NOT_OWNER_KEY }, null, 2));
   const baseArgs = [
     SCRIPT,
-    'set-max-epoch-delta',
+    'propose-max-epoch-delta',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
     '--max-epoch-delta', U(250).toString(),
     '--owner-key-file', ownerKeyFile,
+    '--governance-key-file', governanceKeyFile,
     '--json',
   ];
 
@@ -104,6 +111,7 @@ test('TAP owner op dry-runs setMaxEpochDelta and refuses non-owner broadcast', a
   const dryReport = JSON.parse(dryRun.stdout);
   assert.equal(dryReport.submitted, false);
   assert.equal(dryReport.signer_is_owner, true);
+  assert.equal(dryReport.signer_is_governance, true);
   assert.equal(dryReport.current_max_epoch_delta_wei, U(500).toString());
   assert.equal(dryReport.new_max_epoch_delta_wei, U(250).toString());
   assert.equal(dryReport.simulation.static_call_ok, true);
@@ -115,16 +123,33 @@ test('TAP owner op dry-runs setMaxEpochDelta and refuses non-owner broadcast', a
   assert.equal(confirm.status, 0, confirm.stderr);
   const confirmReport = JSON.parse(confirm.stdout);
   assert.equal(confirmReport.submitted, true);
-  assert.equal(confirmReport.after_max_epoch_delta_wei, U(250).toString());
+  assert.equal(confirmReport.after_max_epoch_delta_wei, U(500).toString());
+  assert.equal((await pool.maxEpochDelta()).toString(), U(500).toString());
+
+  const executeArgs = [
+    SCRIPT,
+    'execute-max-epoch-delta',
+    '--eth-rpc', rpc,
+    '--pool', poolAddr,
+    '--owner-key-file', ownerKeyFile,
+    '--json',
+  ];
+  const executeDryRun = await runNode(executeArgs);
+  assert.equal(executeDryRun.status, 0, executeDryRun.stderr);
+  assert.equal(JSON.parse(executeDryRun.stdout).simulation.ok, true);
+  const execute = await runNode([...executeArgs, '--confirm']);
+  assert.equal(execute.status, 0, execute.stderr);
+  assert.equal(JSON.parse(execute.stdout).after_max_epoch_delta_wei, U(250).toString());
   assert.equal((await pool.maxEpochDelta()).toString(), U(250).toString());
 
   const notOwner = await runNode([
     SCRIPT,
-    'set-max-epoch-delta',
+    'propose-max-epoch-delta',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
     '--max-epoch-delta', U(100).toString(),
-    '--owner-private-key', NOT_OWNER_KEY,
+    '--owner-key-file', notOwnerKeyFile,
+    '--governance-key-file', governanceKeyFile,
     '--json',
   ]);
   assert.equal(notOwner.status, 0, notOwner.stderr);
@@ -135,11 +160,12 @@ test('TAP owner op dry-runs setMaxEpochDelta and refuses non-owner broadcast', a
 
   const notOwnerConfirm = await runNode([
     SCRIPT,
-    'set-max-epoch-delta',
+    'propose-max-epoch-delta',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
     '--max-epoch-delta', U(100).toString(),
-    '--owner-private-key', NOT_OWNER_KEY,
+    '--owner-key-file', notOwnerKeyFile,
+    '--governance-key-file', governanceKeyFile,
     '--json',
     '--confirm',
   ]);

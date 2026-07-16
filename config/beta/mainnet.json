@@ -148,8 +148,19 @@
       "token_address": "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454",
       "pool_address": "0x9B254d37C28Fb5893F46513a61925eDC2F300615",
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
-      "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
-      "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+      "participant_rpc_policy": "public-only",
+      "operator_oracle": {
+        "method": "uniswap-v2-twap-median",
+        "private_rpc_env": "MAYHEM_TAP_ETH_RPC",
+        "private_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+        "public_fallbacks_env": "MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS",
+        "interval_seconds": 1800,
+        "twap_window_seconds": 1800,
+        "minimum_sources": 2,
+        "max_deviation_bps": 2000,
+        "hard_floor_au": "1000000000000000",
+        "hard_ceiling_au": "10000000000000000000"
+      },
       "max_epoch_delta_wei": "10000000000000000000000",
       "operator_address": "0x3F9404848cc6E13Bdd9a59150Aa8D26481566acd"
     },

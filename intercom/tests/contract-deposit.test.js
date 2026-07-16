@@ -575,6 +575,18 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     ctx.admin.publicKey
   );
   assert.match(mismatchedPolicy.message, /confirmation policy must match/i);
+  const mainnetDepthPolicy = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...value,
+      chain_id: 1,
+      eth_tx_hash: `0x${'3'.repeat(64)}`,
+      confirmation_policy: 'depth-12',
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(mainnetDepthPolicy.message, /mainnet TAP deposits require finalized-tag/i);
   const finalizedTag = await executeDepositFeature(
     ctx.contract,
     ctx.storage,
@@ -595,7 +607,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     {
       op: 'tap_rate_oracle',
       tap_usd_au: '2000000000000000000',
-      source: 'uniswap-v2',
+      source: 'uniswap-v2-twap-median',
       ts: 1_000,
     },
     ctx.admin.publicKey,
@@ -644,7 +656,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     tap_wei: oneTnkE18,
     tap_usd_au: '2000000000000000000',
     rate_ts: 1_000,
-    rate_source: 'uniswap-v2',
+    rate_source: 'uniswap-v2-twap-median',
     au: '2000000000000000000',
     eth_tx_hash: ethTxHash,
     log_index: 0,
@@ -672,7 +684,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     updated_at: confirmedKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
-    last_deposit_rate_source: 'uniswap-v2',
+    last_deposit_rate_source: 'uniswap-v2-twap-median',
     last_deposit_tap_usd_au: '2000000000000000000',
   });
   const root = (await ctx.storage.get('ev/dep/1')).value;
@@ -689,7 +701,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     {
       op: 'tap_rate_oracle',
       tap_usd_au: '2100000000000000000',
-      source: 'uniswap-v2',
+      source: 'uniswap-v2-twap-median',
       ts: value.at + 1,
     },
     ctx.admin.publicKey,
@@ -707,6 +719,103 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     '2000000000000000000'
   );
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
+
+  const reversal = {
+    op: 'tap_deposit_reversal',
+    chain_id: value.chain_id,
+    pool_address: value.pool_address,
+    eth_tx_hash: value.eth_tx_hash,
+    log_index: value.log_index,
+    block_number: value.block_number,
+    block_hash: value.block_hash,
+    reconciliation_from_block: 100,
+    reconciliation_to_block: 123,
+    finalized_block_number: 135,
+    confirmation_policy: 'finalized-tag',
+    watcher_id: TAP_DEPOSIT_WATCHER_ID,
+    reason: 'canonical_event_missing',
+    epoch: 1,
+    at: 1_901,
+  };
+  const nonAdminReversal = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    reversal,
+    ctx.outsider.publicKey
+  );
+  assert.match(nonAdminReversal.message, /admin required/i);
+  const reversed = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    reversal,
+    ctx.admin.publicKey
+  );
+  assert.equal(reversed.ok, true, reversed.message);
+  assert.equal(reversed.op, 'tapDepositReversal');
+  assert.equal(reversed.duplicate, false);
+  assert.equal(reversed.au, '2000000000000000000');
+  assert.equal(reversed.clawback_au, '2000000000000000000');
+  assert.equal(reversed.network_absorbed_au, '0');
+  assert.equal(reversed.frozen, false);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au, '0');
+  assert.equal(await ctx.storage.get(`frozen/${ctx.user.publicKey}`), null);
+
+  const reversalReplay = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    reversal,
+    ctx.admin.publicKey
+  );
+  assert.equal(reversalReplay.ok, true, reversalReplay.message);
+  assert.equal(reversalReplay.duplicate, true);
+  assert.equal(reversalReplay.au, '0');
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au, '0');
+
+  const replacement = {
+    ...value,
+    eth_tx_hash: `0x${'3'.repeat(64)}`,
+    block_number: 124,
+    block_hash: `0x${'4'.repeat(64)}`,
+    finalized_block_number: 136,
+    at: 1_902,
+  };
+  const replacementCredit = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    replacement,
+    ctx.admin.publicKey
+  );
+  assert.equal(replacementCredit.ok, true, replacementCredit.message);
+  assert.equal(replacementCredit.au, '2100000000000000000');
+  const replacementBalanceKey = `bal/${ctx.user.publicKey}/tap`;
+  await ctx.storage.put(replacementBalanceKey, {
+    ...(await ctx.storage.get(replacementBalanceKey)).value,
+    au: '500000000000000000',
+  });
+  const replacementReversal = {
+    ...reversal,
+    eth_tx_hash: replacement.eth_tx_hash,
+    block_number: replacement.block_number,
+    block_hash: replacement.block_hash,
+    reconciliation_to_block: 124,
+    finalized_block_number: 136,
+    at: 1_903,
+  };
+  const shortfall = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    replacementReversal,
+    ctx.admin.publicKey
+  );
+  assert.equal(shortfall.ok, true, shortfall.message);
+  assert.equal(shortfall.clawback_au, '500000000000000000');
+  assert.equal(shortfall.network_absorbed_au, '1600000000000000000');
+  assert.equal(shortfall.frozen, true);
+  assert.equal((await ctx.storage.get(replacementBalanceKey)).value.au, '0');
+  assert.equal(
+    (await ctx.storage.get(`frozen/${ctx.user.publicKey}`)).value.reason,
+    'tap_deposit_reorg_shortfall'
+  );
 });
 
 test('MayhemContract fiatDeposit credits au_usd and folds root-only evidence', async () => {

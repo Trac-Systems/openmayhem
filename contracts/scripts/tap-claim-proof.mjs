@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 import { distribution } from './merkle.mjs';
+import { safeErrorMessage } from './safe-output.mjs';
 import {
   POOL_SETTLEMENT_ABI,
   settlementDistributionEntries,
@@ -62,31 +63,36 @@ function sameRoot(a, b) {
   return String(a).toLowerCase() === String(b).toLowerCase();
 }
 
-async function maybePoolState(pool, account) {
+async function maybePoolState(pool, account, rootEpoch) {
   if (!pool) {
     return {
       chain_epoch: null,
       chain_root: null,
+      root_epoch: rootEpoch ?? null,
       claimed_wei: 0n,
       root_matches_chain: null,
     };
   }
+  if (!Number.isSafeInteger(rootEpoch) || rootEpoch <= 0) {
+    throw new Error('settlement epoch must be a positive safe integer');
+  }
   const [chainEpoch, chainRoot, claimedWei] = await Promise.all([
     pool.epoch(),
-    pool.merkleRoot(),
+    pool.merkleRootAtEpoch(rootEpoch),
     pool.claimed(account),
   ]);
   return {
     chain_epoch: Number(chainEpoch),
     chain_root: chainRoot,
+    root_epoch: rootEpoch,
     claimed_wei: claimedWei,
     root_matches_chain: null,
   };
 }
 
-function copyPasteClaimCall({ account, cumulativeWei, proof }) {
+function copyPasteClaimCall({ epoch, account, cumulativeWei, proof }) {
   const proofArgs = proof.map((item) => shellQuote(item)).join(' ');
-  return `account=${shellQuote(account)} cumulative=${shellQuote(cumulativeWei)} proof=(${proofArgs})`;
+  return `root_epoch=${shellQuote(epoch)} account=${shellQuote(account)} cumulative=${shellQuote(cumulativeWei)} proof=(${proofArgs})`;
 }
 
 export async function claimProofForAccount({
@@ -97,20 +103,24 @@ export async function claimProofForAccount({
   const normalized = normalizeAddress(account, 'claim account');
   const entries = settlementDistributionEntries(settlement, 'settlement');
   const rootFromReport = settlement?.root ?? null;
-  const epochFromReport = settlement?.epoch ?? null;
+  const epochFromReport = Number(settlement?.epoch);
+  if (!Number.isSafeInteger(epochFromReport) || epochFromReport <= 0) {
+    throw new Error('settlement epoch must be a positive safe integer');
+  }
   const dist = entries.length > 0 ? distribution(entries) : null;
   const rebuiltRoot = dist?.root ?? null;
   const root = rootFromReport ?? rebuiltRoot;
   const rootMatchesReport = rootFromReport ? sameRoot(rebuiltRoot, rootFromReport) : true;
   const mine = entries.find((entry) => entry.account === normalized) ?? null;
-  const chain = await maybePoolState(pool, normalized);
+  const chain = await maybePoolState(pool, normalized, epochFromReport);
   const rootMatchesChain = chain.chain_root ? sameRoot(root, chain.chain_root) : null;
 
   if (!mine || !dist) {
     return {
       claimable: false,
       account: normalized,
-      epoch: chain.chain_epoch ?? epochFromReport,
+      epoch: epochFromReport,
+      chain_epoch: chain.chain_epoch,
       root,
       chain_root: chain.chain_root,
       cumulative: null,
@@ -138,7 +148,8 @@ export async function claimProofForAccount({
   return {
     claimable,
     account: normalized,
-    epoch: chain.chain_epoch ?? epochFromReport,
+    epoch: epochFromReport,
+    chain_epoch: chain.chain_epoch,
     root,
     chain_root: chain.chain_root,
     cumulative: mine.amount.toString(),
@@ -151,6 +162,7 @@ export async function claimProofForAccount({
     root_matches_chain: rootMatchesChain,
     reason,
     copy_paste_claim_args: copyPasteClaimCall({
+      epoch: epochFromReport,
       account: normalized,
       cumulativeWei: mine.amount.toString(),
       proof,
@@ -208,7 +220,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
-    console.error(error?.stack || error?.message || String(error));
+    console.error(safeErrorMessage(error));
     process.exit(1);
   });
 }

@@ -95,7 +95,7 @@ const rateOracle = (overrides = {}) => ({
 const tapRateOracle = (overrides = {}) => ({
   op: 'tap_rate_oracle',
   tap_usd_au: '2000000000000000000',
-  source: 'uniswap-v2',
+  source: 'uniswap-v2-twap-median',
   ts: 1_000,
   ...overrides,
 });
@@ -243,13 +243,15 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   );
   assert.match(nonAdmin.message, /admin required/i);
 
-  const badSource = await executeRateFeature(
-    contract,
-    storage,
-    tapRateOracle({ source: 'provider-quote' }),
-    admin.publicKey,
+  await assert.rejects(
+    executeRateFeature(
+      contract,
+      storage,
+      tapRateOracle({ source: 'provider quote' }),
+      admin.publicKey,
+    ),
+    /invalid TAP rate source/i,
   );
-  assert.match(badSource.message, /unsupported TAP rate source/i);
 
   const firstValue = tapRateOracle();
   const firstKey = await rateFeatureKey(contract, firstValue);
@@ -258,12 +260,12 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     ok: true,
     op: 'tapRateOracle',
     ts: 1_000,
-    source: 'uniswap-v2',
+    source: 'uniswap-v2-twap-median',
   });
   assert.deepEqual((await storage.get('tap/rate/latest')).value, {
     denom: 'tap_usd_au',
     tap_usd_au: '2000000000000000000',
-    source: 'uniswap-v2',
+    source: 'uniswap-v2-twap-median',
     ts: 1_000,
     updated_at: firstKey,
     posted_by: admin.publicKey,
@@ -330,7 +332,7 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     updated_at: freshTapKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
-    last_deposit_rate_source: 'uniswap-v2',
+    last_deposit_rate_source: 'uniswap-v2-twap-median',
     last_deposit_tap_usd_au: '2000000000000000000',
   });
 });

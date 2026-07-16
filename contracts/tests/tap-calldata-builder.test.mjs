@@ -38,8 +38,8 @@ async function localPool(accounts = 5) {
   });
   const provider = new ethers.BrowserProvider(ganache);
   const operator = await provider.getSigner(0);
-  const { token, pool, tokenAddr, poolAddr } = await deployPool(operator);
-  return { provider, operator, token, pool, tokenAddr, poolAddr };
+  const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
+  return { provider, operator, token, pool, tokenAddr, poolAddr, governanceWallet };
 }
 
 async function localPoolWithKnownKeys({ poorBuyerEth = '0' } = {}) {
@@ -56,8 +56,8 @@ async function localPoolWithKnownKeys({ poorBuyerEth = '0' } = {}) {
   });
   const provider = new ethers.BrowserProvider(ganache);
   const operator = await provider.getSigner(0);
-  const { token, pool, tokenAddr, poolAddr } = await deployPool(operator);
-  return { provider, operator, token, pool, tokenAddr, poolAddr };
+  const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
+  return { provider, operator, token, pool, tokenAddr, poolAddr, governanceWallet };
 }
 
 test('deposit calldata executes approve plus deposit from buyer wallet', async () => {
@@ -162,7 +162,7 @@ test('local wallet TAP deposit refuses insufficient gas before approval', async 
 });
 
 test('claim calldata executes MayhemInferencePool.claim from provider wallet', async () => {
-  const { provider, operator, token, pool, poolAddr } = await localPool();
+  const { provider, operator, token, pool, poolAddr, governanceWallet } = await localPool();
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const providerAccount = await providerA.getAddress();
@@ -183,6 +183,7 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operator.getAddress(),
     post: true,
   });
@@ -192,6 +193,7 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
     pool,
   });
   const claimIntent = buildTapClaimCalldata({
+    rootEpoch: proof.epoch,
     account: proof.account,
     cumulativeWei: proof.cumulative_wei,
     proof: proof.proof,
@@ -211,7 +213,7 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
 });
 
 test('local wallet TAP claim simulates, then confirms from the provider wallet', async () => {
-  const { provider, operator, token, pool, poolAddr } = await localPoolWithKnownKeys();
+  const { provider, operator, token, pool, poolAddr, governanceWallet } = await localPoolWithKnownKeys();
   const providerWallet = new ethers.Wallet(BUYER_KEY, provider);
   const providerAccount = await providerWallet.getAddress();
   await (await token.mint(await operator.getAddress(), U('3'))).wait();
@@ -230,6 +232,7 @@ test('local wallet TAP claim simulates, then confirms from the provider wallet',
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operator.getAddress(),
     post: true,
   });
@@ -243,6 +246,7 @@ test('local wallet TAP claim simulates, then confirms from the provider wallet',
     privateKey: BUYER_KEY,
     provider,
     account: providerAccount,
+    rootEpoch: proof.epoch,
     cumulativeWei: proof.cumulative_wei,
     proof: proof.proof,
     pool: poolAddr,
@@ -261,6 +265,7 @@ test('local wallet TAP claim simulates, then confirms from the provider wallet',
     privateKey: BUYER_KEY,
     provider,
     account: providerAccount,
+    rootEpoch: proof.epoch,
     cumulativeWei: proof.cumulative_wei,
     proof: proof.proof,
     pool: poolAddr,

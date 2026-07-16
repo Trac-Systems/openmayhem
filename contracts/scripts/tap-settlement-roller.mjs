@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 import { distribution } from './merkle.mjs';
+import { signRootProposal } from './pool-governance.mjs';
+import { safeErrorMessage } from './safe-output.mjs';
 import {
+  TAP_GOVERNANCE_SIGNER_ENV,
   TAP_ROLLER_SIGNER_ENV,
   walletFromEnv,
 } from './signer-env.mjs';
@@ -18,7 +21,6 @@ export const TAP_WEI = 1_000_000_000_000_000_000n;
 export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
-export const BURN_BPS = 1_000n;
 const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
 const SIGNING_MESSAGE_VERSION = 2;
@@ -26,12 +28,18 @@ const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export const POOL_SETTLEMENT_ABI = [
-  'function setRoot(bytes32 newRoot, uint256 newEpoch, uint256 newCumulativeSpent)',
+  'function proposeRoot(bytes32 newRoot, uint256 newEpoch, uint256 newCumulativeSpent, bytes governanceSignature)',
+  'function executeRoot()',
+  'function governanceNonce() view returns (uint256)',
+  'function governanceDelay() view returns (uint64)',
+  'function governanceSigner() view returns (address)',
+  'function pendingRoot() view returns (bytes32 merkleRoot, uint256 newEpoch, uint256 newCumulativeSpent, uint256 previousEpoch, uint256 previousCumulativeSpent, uint256 nonce, uint64 executeAfter)',
   'function epoch() view returns (uint256)',
   'function cumulativeSpent() view returns (uint256)',
   'function totalDeposited() view returns (uint256)',
   'function maxEpochDelta() view returns (uint256)',
   'function merkleRoot() view returns (bytes32)',
+  'function merkleRootAtEpoch(uint256 rootEpoch) view returns (bytes32)',
   'function claimed(address account) view returns (uint256)',
   'function operatorClaimable() view returns (uint256)',
   'function operatorWithdrawn() view returns (uint256)',
@@ -42,6 +50,7 @@ export const POOL_SETTLEMENT_ABI = [
 ];
 const POOL_SETTLEMENT_INTERFACE = new ethers.Interface(POOL_SETTLEMENT_ABI);
 export const TAP_ROLLER_SIGNER_ENVS = [TAP_ROLLER_SIGNER_ENV];
+export const TAP_GOVERNANCE_SIGNER_ENVS = [TAP_GOVERNANCE_SIGNER_ENV];
 
 export function tapRollerWallet(provider, env = process.env) {
   return walletFromEnv(provider, {
@@ -51,19 +60,40 @@ export function tapRollerWallet(provider, env = process.env) {
   });
 }
 
-function errorMessage(error) {
-  return error?.shortMessage || error?.reason || error?.message || String(error);
+export function tapGovernanceWallet(provider, env = process.env) {
+  return walletFromEnv(provider, {
+    env,
+    names: TAP_GOVERNANCE_SIGNER_ENVS,
+    label: 'independent TAP governance private key',
+  });
 }
 
-export function encodeSetRootCalldata({
+function errorMessage(error) {
+  return safeErrorMessage(error);
+}
+
+export function encodeProposeRootCalldata({
   root,
   epoch,
   cumulativeSpentWei,
+  governanceSignature,
 } = {}) {
-  if (!root) throw new Error('Missing setRoot root');
-  const safeEpoch = parseNonNegativeInt(epoch, 'setRoot epoch');
-  const spent = parseBigIntString(cumulativeSpentWei, 'setRoot cumulative spent wei');
-  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('setRoot', [root, BigInt(safeEpoch), spent]);
+  if (!root) throw new Error('Missing proposeRoot root');
+  const safeEpoch = parseNonNegativeInt(epoch, 'proposeRoot epoch');
+  const spent = parseBigIntString(cumulativeSpentWei, 'proposeRoot cumulative spent wei');
+  if (!/^0x[0-9a-fA-F]+$/.test(String(governanceSignature ?? ''))) {
+    throw new Error('Missing proposeRoot governance signature');
+  }
+  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('proposeRoot', [
+    root,
+    BigInt(safeEpoch),
+    spent,
+    governanceSignature,
+  ]);
+}
+
+export function encodeExecuteRootCalldata() {
+  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('executeRoot');
 }
 
 export function encodeWithdrawOperatorCalldata({
@@ -661,7 +691,23 @@ export function buildTapSettlement({
 
   applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
 
-  const providers = sortedDistributionEntries(perProvider);
+  let providers = sortedDistributionEntries(perProvider);
+  const providerCapWei = (cumulativeSpentWei * PROVIDER_BPS) / BPS;
+  let providerClaimedWei = providers.reduce((sum, entry) => sum + entry.amount, 0n);
+  if (providerClaimedWei > providerCapWei) {
+    throw new Error('provider distribution exceeds 75% TAP settlement cap');
+  }
+  const providerDustWei = providerCapWei - providerClaimedWei;
+  let providerDustRecipient = null;
+  if (providerDustWei > 0n) {
+    if (providers.length === 0) {
+      throw new Error('provider rounding remainder has no provider destination');
+    }
+    providerDustRecipient = providers[0].account;
+    addWei(perProvider, providerDustRecipient, providerDustWei);
+    providers = sortedDistributionEntries(perProvider);
+    providerClaimedWei = providerCapWei;
+  }
   const refunds = sortedDistributionEntries(perBuyerRefund);
   const combined = new Map();
   for (const entry of providers) addWei(combined, entry.account, entry.amount);
@@ -697,13 +743,8 @@ export function buildTapSettlement({
       leaf: dist.leafFor(entry.account),
     },
   ]));
-  const providerClaimedWei = providers.reduce((sum, entry) => sum + entry.amount, 0n);
   const buyerRefundWei = refunds.reduce((sum, entry) => sum + entry.amount, 0n);
   const totalClaimedWei = entries.reduce((sum, entry) => sum + entry.amount, 0n);
-  const providerCapWei = (cumulativeSpentWei * PROVIDER_BPS) / BPS;
-  if (providerClaimedWei > providerCapWei) {
-    throw new Error('provider distribution exceeds 75% TAP settlement cap');
-  }
 
   return {
     posted: false,
@@ -720,6 +761,8 @@ export function buildTapSettlement({
     buyer_refund_wei: buyerRefundWei.toString(),
     total_claimed_wei: totalClaimedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
+    provider_dust_wei: providerDustWei.toString(),
+    provider_dust_recipient: providerDustRecipient,
     root: dist.root,
     entries: entries.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
     providers: providers.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
@@ -739,23 +782,44 @@ export async function guardianScreenSettlement({
   return guardianPreSignReport({ settlement, pool, epoch, previous });
 }
 
-export async function dryRunSetRoot({
+export async function dryRunProposeRoot({
   writablePool,
   root,
   epoch,
   cumulativeSpentWei,
+  governanceSignature,
 } = {}) {
-  if (!writablePool?.setRoot) throw new Error('Missing writable pool contract');
-  const safeEpoch = parseNonNegativeInt(epoch, 'setRoot epoch');
-  const spent = parseBigIntString(cumulativeSpentWei, 'setRoot cumulative spent wei');
+  if (!writablePool?.proposeRoot) throw new Error('Missing writable pool contract');
+  const safeEpoch = parseNonNegativeInt(epoch, 'proposeRoot epoch');
+  const spent = parseBigIntString(cumulativeSpentWei, 'proposeRoot cumulative spent wei');
   const out = { ok: false, static_call_ok: false, gas_estimate: null };
   try {
-    if (writablePool.setRoot.staticCall) {
-      await writablePool.setRoot.staticCall(root, safeEpoch, spent);
+    if (writablePool.proposeRoot.staticCall) {
+      await writablePool.proposeRoot.staticCall(root, safeEpoch, spent, governanceSignature);
       out.static_call_ok = true;
     }
-    if (writablePool.setRoot.estimateGas) {
-      out.gas_estimate = (await writablePool.setRoot.estimateGas(root, safeEpoch, spent)).toString();
+    if (writablePool.proposeRoot.estimateGas) {
+      out.gas_estimate = (
+        await writablePool.proposeRoot.estimateGas(root, safeEpoch, spent, governanceSignature)
+      ).toString();
+    }
+    out.ok = true;
+    return out;
+  } catch (error) {
+    return { ...out, error: errorMessage(error) };
+  }
+}
+
+export async function dryRunExecuteRoot({ writablePool } = {}) {
+  if (!writablePool?.executeRoot) throw new Error('Missing writable pool contract');
+  const out = { ok: false, static_call_ok: false, gas_estimate: null };
+  try {
+    if (writablePool.executeRoot.staticCall) {
+      await writablePool.executeRoot.staticCall();
+      out.static_call_ok = true;
+    }
+    if (writablePool.executeRoot.estimateGas) {
+      out.gas_estimate = (await writablePool.executeRoot.estimateGas()).toString();
     }
     out.ok = true;
     return out;
@@ -927,7 +991,7 @@ export async function guardianPreSignReport({
 
   const providerCapWei = bpsOf(cumulativeSpentWei, PROVIDER_BPS);
   const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
-  const burnCapWei = bpsOf(cumulativeSpentWei, BURN_BPS);
+  const burnCapWei = cumulativeSpentWei - providerCapWei - operatorCapWei;
   const providerOwedWei = providerEntries.reduce((sum, entry) => sum + entry.amount, 0n);
   if (providerOwedWei > providerCapWei + PROVIDER_CAP_TOLERANCE_WEI) {
     reasons.push('provider owed > 75% spent cap');
@@ -957,6 +1021,30 @@ export async function guardianPreSignReport({
   };
 }
 
+function pendingRootRecord(value) {
+  const executeAfter = BigInt(value?.executeAfter ?? value?.[6] ?? 0);
+  if (executeAfter === 0n) return null;
+  return {
+    merkle_root: String(value?.merkleRoot ?? value?.[0]).toLowerCase(),
+    epoch: Number(value?.newEpoch ?? value?.[1]),
+    cumulative_spent_wei: BigInt(value?.newCumulativeSpent ?? value?.[2]).toString(),
+    previous_epoch: Number(value?.previousEpoch ?? value?.[3]),
+    previous_cumulative_spent_wei: BigInt(value?.previousCumulativeSpent ?? value?.[4]).toString(),
+    nonce: BigInt(value?.nonce ?? value?.[5]).toString(),
+    execute_after: Number(executeAfter),
+  };
+}
+
+async function poolTimestamp(pool, blockTag = 'latest') {
+  const provider = pool?.runner?.provider;
+  if (!provider) throw new Error('Pool contract has no provider');
+  const block = await provider.getBlock(blockTag);
+  if (!block || !Number.isSafeInteger(Number(block.timestamp))) {
+    throw new Error('Could not read latest Ethereum block timestamp');
+  }
+  return Number(block.timestamp);
+}
+
 export async function rollTapSettlement({
   bundle,
   receipts,
@@ -970,6 +1058,7 @@ export async function rollTapSettlement({
   holdbackEpochs,
   pool,
   ownerSigner,
+  governanceSigner,
   operatorAddress,
   epoch,
   post = true,
@@ -987,6 +1076,7 @@ export async function rollTapSettlement({
     holdbackEpochs,
   });
   if (!settlement.root) return settlement;
+
   const expectedRoot = String(settlement.root).toLowerCase();
   const expectedSpentWei = parseBigIntString(
     settlement.cumulative_spent_wei,
@@ -995,16 +1085,20 @@ export async function rollTapSettlement({
   let chainEpoch = null;
   let chainSpentWei = null;
   let chainRoot = null;
+  let pendingRoot = null;
   let rootAlreadyPosted = false;
   if (pool) {
-    chainEpoch = Number(await pool.epoch());
-    chainSpentWei = parseBigIntString(await pool.cumulativeSpent(), 'pool cumulative spent wei');
-    chainRoot = await poolRootOrNull(pool);
+    [chainEpoch, chainSpentWei, chainRoot, pendingRoot] = await Promise.all([
+      pool.epoch().then(Number),
+      pool.cumulativeSpent().then((value) => parseBigIntString(value, 'pool cumulative spent wei')),
+      poolRootOrNull(pool),
+      pool.pendingRoot().then(pendingRootRecord),
+    ]);
     rootAlreadyPosted = (
-      chainEpoch > 0 &&
-      chainSpentWei === expectedSpentWei &&
-      chainRoot === expectedRoot &&
-      (epoch === undefined || parseNonNegativeInt(epoch, 'setRoot epoch') === chainEpoch)
+      chainEpoch > 0
+      && chainSpentWei === expectedSpentWei
+      && chainRoot === expectedRoot
+      && (epoch === undefined || parseNonNegativeInt(epoch, 'root epoch') === chainEpoch)
     );
   }
 
@@ -1033,26 +1127,108 @@ export async function rollTapSettlement({
   if (!screen.ok) {
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }
-  const setRootCalldata = encodeSetRootCalldata({
-    root: settlement.root,
-    epoch: screen.epoch,
-    cumulativeSpentWei: settlement.cumulative_spent_wei,
-  });
-  let signingAddress = null;
-  if (ownerSigner?.getAddress) {
-    signingAddress = normalizeAddress(await ownerSigner.getAddress(), 'signing address');
+
+  if (pendingRoot && (
+    pendingRoot.merkle_root !== expectedRoot
+    || pendingRoot.epoch !== screen.epoch
+    || pendingRoot.cumulative_spent_wei !== expectedSpentWei.toString()
+  )) {
+    return {
+      ...settlement,
+      posted: false,
+      blocked: true,
+      reasons: ['a different cross-signed TAP root is pending execution'],
+      epoch: screen.epoch,
+      pending_root: pendingRoot,
+      screen,
+    };
   }
-  let writable = null;
-  let setRootDryRun = null;
+
+  const signingAddress = ownerSigner?.getAddress
+    ? normalizeAddress(await ownerSigner.getAddress(), 'owner signing address')
+    : null;
+  const governanceSigningAddress = governanceSigner?.getAddress
+    ? normalizeAddress(await governanceSigner.getAddress(), 'governance signing address')
+    : null;
+  const writable = pool && ownerSigner
+    ? (pool.connect ? pool.connect(ownerSigner) : pool)
+    : null;
+  let governanceSignature = null;
+  let proposeRootCalldata = null;
+  let proposeRootDryRun = null;
+  let executeRootDryRun = null;
+
+  if (pool && !rootAlreadyPosted && !pendingRoot) {
+    if (!ownerSigner) throw new Error('Missing TAP settlement owner signer');
+    if (!governanceSigner) throw new Error('Missing independent TAP governance signer');
+    governanceSignature = await signRootProposal({
+      signer: governanceSigner,
+      pool,
+      merkleRoot: settlement.root,
+      newEpoch: screen.epoch,
+      newCumulativeSpent: expectedSpentWei,
+    });
+    proposeRootCalldata = encodeProposeRootCalldata({
+      root: settlement.root,
+      epoch: screen.epoch,
+      cumulativeSpentWei: expectedSpentWei,
+      governanceSignature,
+    });
+    proposeRootDryRun = await dryRunProposeRoot({
+      writablePool: writable,
+      root: settlement.root,
+      epoch: screen.epoch,
+      cumulativeSpentWei: expectedSpentWei,
+      governanceSignature,
+    });
+    if (!proposeRootDryRun.ok) {
+      return {
+        ...settlement,
+        posted: false,
+        blocked: true,
+        reasons: [`proposeRoot dry-run failed: ${proposeRootDryRun.error}`],
+        epoch: screen.epoch,
+        signing_address: signingAddress,
+        governance_signing_address: governanceSigningAddress,
+        propose_root_calldata: proposeRootCalldata,
+        propose_root_dry_run: proposeRootDryRun,
+        screen,
+      };
+    }
+  } else if (rootAlreadyPosted) {
+    proposeRootDryRun = {
+      ok: true,
+      skipped: true,
+      reason: 'exact settlement root already confirmed on-chain',
+    };
+  } else if (pendingRoot) {
+    proposeRootDryRun = {
+      ok: true,
+      skipped: true,
+      reason: 'exact cross-signed root already pending',
+    };
+    if (await poolTimestamp(pool) >= pendingRoot.execute_after) {
+      executeRootDryRun = await dryRunExecuteRoot({ writablePool: writable ?? pool });
+    } else {
+      executeRootDryRun = {
+        ok: false,
+        awaiting_governance_delay: true,
+        execute_after: pendingRoot.execute_after,
+      };
+    }
+  }
+
   let operatorFee = null;
   let burn = null;
-  if (pool && ownerSigner) {
-    writable = pool.connect ? pool.connect(ownerSigner) : pool;
-    const operatorWithdrawn = pool.operatorWithdrawn ? await pool.operatorWithdrawn() : 0n;
+  if (pool) {
+    const operatorWithdrawn = await pool.operatorWithdrawn();
     const operatorCapWei = bpsOf(expectedSpentWei, OPERATOR_BPS);
-    const predictedClaimableWei = operatorCapWei > operatorWithdrawn ? operatorCapWei - operatorWithdrawn : 0n;
-    const totalBurned = pool.totalBurned ? await pool.totalBurned() : 0n;
-    const burnCapWei = bpsOf(expectedSpentWei, BURN_BPS);
+    const predictedClaimableWei = operatorCapWei > operatorWithdrawn
+      ? operatorCapWei - operatorWithdrawn
+      : 0n;
+    const providerCapWei = bpsOf(expectedSpentWei, PROVIDER_BPS);
+    const burnCapWei = expectedSpentWei - providerCapWei - operatorCapWei;
+    const totalBurned = await pool.totalBurned();
     const predictedBurnWei = burnCapWei > totalBurned ? burnCapWei - totalBurned : 0n;
     const destination = operatorAddress
       ? normalizeAddress(operatorAddress, 'operator fee address')
@@ -1084,71 +1260,51 @@ export async function rollTapSettlement({
         reasons: ['operator fee destination is required for TAP auto-withdraw'],
         epoch: screen.epoch,
         signing_address: signingAddress,
-        set_root_calldata: setRootCalldata,
-        operator_fee: operatorFee,
-        burn,
-        screen,
-      };
-    }
-    setRootDryRun = rootAlreadyPosted
-      ? {
-          ok: true,
-          static_call_ok: false,
-          gas_estimate: null,
-          skipped: true,
-          reason: 'exact settlement root already confirmed on-chain',
-        }
-      : await dryRunSetRoot({
-          writablePool: writable,
-          root: settlement.root,
-          epoch: screen.epoch,
-          cumulativeSpentWei: settlement.cumulative_spent_wei,
-        });
-    if (!setRootDryRun.ok) {
-      return {
-        ...settlement,
-        posted: false,
-        blocked: true,
-        reasons: [`setRoot dry-run failed: ${setRootDryRun.error}`],
-        epoch: screen.epoch,
-        signing_address: signingAddress,
-        set_root_calldata: setRootCalldata,
-        set_root_dry_run: setRootDryRun,
+        governance_signing_address: governanceSigningAddress,
+        propose_root_calldata: proposeRootCalldata,
+        propose_root_dry_run: proposeRootDryRun,
+        pending_root: pendingRoot,
         operator_fee: operatorFee,
         burn,
         screen,
       };
     }
   }
-  let tx = null;
+
+  let proposalTx = null;
+  let executionTx = null;
+  let proposalBlockNumber = null;
   let rootConfirmed = rootAlreadyPosted;
   if (post && pool) {
     if (!ownerSigner) throw new Error('Missing TAP settlement owner signer for broadcast');
-    if (!writable) writable = pool.connect ? pool.connect(ownerSigner) : pool;
-    if (!rootAlreadyPosted) {
-      const sent = await writable.setRoot(settlement.root, screen.epoch, expectedSpentWei);
-      await sent.wait();
-      tx = sent.hash;
-      const confirmedEpoch = Number(await pool.epoch());
-      const confirmedSpentWei = parseBigIntString(await pool.cumulativeSpent(), 'confirmed cumulative spent wei');
-      const confirmedRoot = await poolRootOrNull(pool);
-      rootConfirmed = (
-        confirmedEpoch === screen.epoch &&
-        confirmedSpentWei === expectedSpentWei &&
-        confirmedRoot === expectedRoot
+    if (!writable) throw new Error('Missing writable TAP pool');
+    if (!rootAlreadyPosted && !pendingRoot) {
+      const sent = await writable.proposeRoot(
+        settlement.root,
+        screen.epoch,
+        expectedSpentWei,
+        governanceSignature
       );
-      if (!rootConfirmed) {
+      const receipt = await sent.wait();
+      proposalTx = sent.hash;
+      proposalBlockNumber = receipt?.blockNumber ?? null;
+      pendingRoot = pendingRootRecord(await pool.pendingRoot());
+      if (!pendingRoot
+        || pendingRoot.merkle_root !== expectedRoot
+        || pendingRoot.epoch !== screen.epoch
+        || pendingRoot.cumulative_spent_wei !== expectedSpentWei.toString()) {
         return {
           ...settlement,
-          posted: true,
-          root_confirmed: false,
+          posted: false,
           blocked: true,
-          reasons: ['setRoot transaction did not produce the exact expected on-chain state'],
+          reasons: ['proposeRoot transaction did not create the exact expected pending root'],
           epoch: screen.epoch,
-          tx,
+          proposal_tx: proposalTx,
           signing_address: signingAddress,
-          set_root_calldata: setRootCalldata,
-          set_root_dry_run: setRootDryRun,
+          governance_signing_address: governanceSigningAddress,
+          propose_root_calldata: proposeRootCalldata,
+          propose_root_dry_run: proposeRootDryRun,
+          pending_root: pendingRoot,
           operator_fee: operatorFee,
           burn,
           screen,
@@ -1156,27 +1312,83 @@ export async function rollTapSettlement({
       }
     }
 
-    if (operatorFee) {
-      const claimable = pool.operatorClaimable ? await pool.operatorClaimable() : 0n;
+    if (!rootAlreadyPosted && pendingRoot) {
+      const now = await poolTimestamp(pool, proposalBlockNumber ?? 'latest');
+      if (now < pendingRoot.execute_after) {
+        return {
+          ...settlement,
+          posted: false,
+          root_proposed: true,
+          root_pending: true,
+          root_confirmed: false,
+          awaiting_governance_delay: true,
+          execute_after: pendingRoot.execute_after,
+          epoch: screen.epoch,
+          proposal_tx: proposalTx,
+          signing_address: signingAddress,
+          governance_signing_address: governanceSigningAddress,
+          propose_root_calldata: proposeRootCalldata,
+          propose_root_dry_run: proposeRootDryRun,
+          execute_root_calldata: encodeExecuteRootCalldata(),
+          execute_root_dry_run: executeRootDryRun,
+          pending_root: pendingRoot,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
+      executeRootDryRun = await dryRunExecuteRoot({ writablePool: writable });
+      if (!executeRootDryRun.ok) {
+        return {
+          ...settlement,
+          posted: false,
+          blocked: true,
+          reasons: [`executeRoot dry-run failed: ${executeRootDryRun.error}`],
+          epoch: screen.epoch,
+          proposal_tx: proposalTx,
+          execute_root_calldata: encodeExecuteRootCalldata(),
+          execute_root_dry_run: executeRootDryRun,
+          pending_root: pendingRoot,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
+      const sent = await writable.executeRoot();
+      await sent.wait();
+      executionTx = sent.hash;
+      const [confirmedEpoch, confirmedSpentWei, confirmedRoot] = await Promise.all([
+        pool.epoch().then(Number),
+        pool.cumulativeSpent().then((value) => parseBigIntString(value, 'confirmed cumulative spent wei')),
+        poolRootOrNull(pool),
+      ]);
+      rootConfirmed = (
+        confirmedEpoch === screen.epoch
+        && confirmedSpentWei === expectedSpentWei
+        && confirmedRoot === expectedRoot
+      );
+      if (!rootConfirmed) {
+        return {
+          ...settlement,
+          posted: false,
+          root_proposed: true,
+          root_confirmed: false,
+          blocked: true,
+          reasons: ['executeRoot transaction did not produce the exact expected on-chain state'],
+          epoch: screen.epoch,
+          proposal_tx: proposalTx,
+          execution_tx: executionTx,
+          operator_fee: operatorFee,
+          burn,
+          screen,
+        };
+      }
+    }
+
+    if (rootConfirmed && operatorFee) {
+      const claimable = await pool.operatorClaimable();
       operatorFee.actual_claimable_wei = claimable.toString();
       if (claimable > 0n) {
-        if (!operatorFee.destination) {
-          return {
-            ...settlement,
-            posted: Boolean(tx),
-            root_confirmed: rootConfirmed,
-            blocked: true,
-            reasons: ['operator fee destination is required for TAP auto-withdraw'],
-            epoch: screen.epoch,
-            tx,
-            signing_address: signingAddress,
-            set_root_calldata: setRootCalldata,
-            set_root_dry_run: setRootDryRun,
-            operator_fee: operatorFee,
-            burn,
-            screen,
-          };
-        }
         operatorFee.calldata = encodeWithdrawOperatorCalldata({
           to: operatorFee.destination,
           amountWei: claimable,
@@ -1189,15 +1401,13 @@ export async function rollTapSettlement({
         if (!operatorFee.dry_run.ok) {
           return {
             ...settlement,
-            posted: Boolean(tx),
+            posted: rootConfirmed,
             root_confirmed: rootConfirmed,
             blocked: true,
             reasons: [`withdrawOperator dry-run failed: ${operatorFee.dry_run.error}`],
             epoch: screen.epoch,
-            tx,
-            signing_address: signingAddress,
-            set_root_calldata: setRootCalldata,
-            set_root_dry_run: setRootDryRun,
+            proposal_tx: proposalTx,
+            execution_tx: executionTx,
             operator_fee: operatorFee,
             burn,
             screen,
@@ -1208,21 +1418,19 @@ export async function rollTapSettlement({
         operatorFee.tx = feeSent.hash;
         operatorFee.auto_sent = true;
       }
-      const remainingFee = pool.operatorClaimable ? await pool.operatorClaimable() : 0n;
+      const remainingFee = await pool.operatorClaimable();
       operatorFee.remaining_claimable_wei = remainingFee.toString();
       operatorFee.completed = remainingFee === 0n;
       if (!operatorFee.completed) {
         return {
           ...settlement,
-          posted: Boolean(tx),
+          posted: rootConfirmed,
           root_confirmed: rootConfirmed,
           blocked: true,
           reasons: ['operator fee remained claimable after auto-withdraw'],
           epoch: screen.epoch,
-          tx,
-          signing_address: signingAddress,
-          set_root_calldata: setRootCalldata,
-          set_root_dry_run: setRootDryRun,
+          proposal_tx: proposalTx,
+          execution_tx: executionTx,
           operator_fee: operatorFee,
           burn,
           screen,
@@ -1230,23 +1438,21 @@ export async function rollTapSettlement({
       }
     }
 
-    if (burn) {
-      const claimable = pool.burnClaimable ? await pool.burnClaimable() : 0n;
+    if (rootConfirmed && burn) {
+      const claimable = await pool.burnClaimable();
       burn.actual_claimable_wei = claimable.toString();
       if (claimable > 0n) {
         burn.dry_run = await dryRunBurn({ writablePool: writable });
         if (!burn.dry_run.ok) {
           return {
             ...settlement,
-            posted: Boolean(tx),
+            posted: rootConfirmed,
             root_confirmed: rootConfirmed,
             blocked: true,
             reasons: [`burn dry-run failed: ${burn.dry_run.error}`],
             epoch: screen.epoch,
-            tx,
-            signing_address: signingAddress,
-            set_root_calldata: setRootCalldata,
-            set_root_dry_run: setRootDryRun,
+            proposal_tx: proposalTx,
+            execution_tx: executionTx,
             operator_fee: operatorFee,
             burn,
             screen,
@@ -1257,22 +1463,20 @@ export async function rollTapSettlement({
         burn.tx = burnSent.hash;
         burn.auto_sent = true;
       }
-      const remainingBurn = pool.burnClaimable ? await pool.burnClaimable() : 0n;
+      const remainingBurn = await pool.burnClaimable();
       burn.remaining_claimable_wei = remainingBurn.toString();
-      burn.total_burned_wei = pool.totalBurned ? (await pool.totalBurned()).toString() : null;
+      burn.total_burned_wei = (await pool.totalBurned()).toString();
       burn.completed = remainingBurn === 0n;
       if (!burn.completed) {
         return {
           ...settlement,
-          posted: Boolean(tx),
+          posted: rootConfirmed,
           root_confirmed: rootConfirmed,
           blocked: true,
           reasons: ['TAP burn remained claimable after automatic burn'],
           epoch: screen.epoch,
-          tx,
-          signing_address: signingAddress,
-          set_root_calldata: setRootCalldata,
-          set_root_dry_run: setRootDryRun,
+          proposal_tx: proposalTx,
+          execution_tx: executionTx,
           operator_fee: operatorFee,
           burn,
           screen,
@@ -1280,16 +1484,24 @@ export async function rollTapSettlement({
       }
     }
   }
+
   return {
     ...settlement,
-    posted: Boolean(tx),
+    posted: rootConfirmed && !rootAlreadyPosted,
+    root_proposed: Boolean(proposalTx || pendingRoot),
     root_confirmed: rootConfirmed,
     root_already_posted: rootAlreadyPosted,
+    root_pending: Boolean(pendingRoot && !rootConfirmed),
     epoch: screen.epoch,
-    tx,
+    proposal_tx: proposalTx,
+    execution_tx: executionTx,
     signing_address: signingAddress,
-    set_root_calldata: setRootCalldata,
-    set_root_dry_run: setRootDryRun,
+    governance_signing_address: governanceSigningAddress,
+    propose_root_calldata: proposeRootCalldata,
+    propose_root_dry_run: proposeRootDryRun,
+    execute_root_calldata: pendingRoot && !rootConfirmed ? encodeExecuteRootCalldata() : null,
+    execute_root_dry_run: executeRootDryRun,
+    pending_root: pendingRoot && !rootConfirmed ? pendingRoot : null,
     operator_fee: operatorFee,
     burn,
     screen,
@@ -1595,14 +1807,19 @@ async function main() {
   const json = boolArg(args.json, false);
   let pool = null;
   let ownerSigner = null;
+  let governanceSigner = null;
   let signerEnvName = null;
+  let governanceSignerEnvName = null;
   if (confirm || ethRpc || poolAddress) {
     if (!ethRpc) throw new Error('Missing --eth-rpc or MAYHEM_TAP_ETH_RPC.');
     if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
     cliEthProvider = new ethers.JsonRpcProvider(ethRpc);
     const signer = tapRollerWallet(cliEthProvider);
+    const governance = tapGovernanceWallet(cliEthProvider);
     ownerSigner = signer.wallet;
+    governanceSigner = governance.wallet;
     signerEnvName = signer.envName;
+    governanceSignerEnvName = governance.envName;
     pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, cliEthProvider);
   }
 
@@ -1618,11 +1835,13 @@ async function main() {
     holdbackEpochs: 0,
     pool,
     ownerSigner,
+    governanceSigner,
     operatorAddress,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
     post: confirm,
   });
   if (signerEnvName) report.signer_env = signerEnvName;
+  if (governanceSignerEnvName) report.governance_signer_env = governanceSignerEnvName;
   report.tap_rate_lock = tapRateLock;
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
@@ -1661,9 +1880,12 @@ async function main() {
     console.log('[tap:settlement] epoch:', report.epoch ?? 'none');
     console.log('[tap:settlement] cumulative_spent_wei:', report.cumulative_spent_wei);
     if (report.signing_address) console.log('[tap:settlement] signing_address:', report.signing_address);
-    if (report.set_root_calldata) console.log('[tap:settlement] setRoot calldata:', report.set_root_calldata);
-    if (report.set_root_dry_run) {
-      console.log('[tap:settlement] setRoot dry-run:', JSON.stringify(report.set_root_dry_run));
+    if (report.propose_root_calldata) console.log('[tap:settlement] proposeRoot calldata:', report.propose_root_calldata);
+    if (report.propose_root_dry_run) {
+      console.log('[tap:settlement] proposeRoot dry-run:', JSON.stringify(report.propose_root_dry_run));
+    }
+    if (report.execute_root_dry_run) {
+      console.log('[tap:settlement] executeRoot dry-run:', JSON.stringify(report.execute_root_dry_run));
     }
     console.log('[tap:settlement] posted:', report.posted);
     if (report.blocked) console.log('[tap:settlement] blocked:', report.reasons.join('; '));
@@ -1684,7 +1906,7 @@ async function main() {
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
     if (cliEthProvider?.destroy) cliEthProvider.destroy();
-    console.error(error?.stack || error?.message || String(error));
+    console.error(safeErrorMessage(error));
     process.exit(1);
   });
 }

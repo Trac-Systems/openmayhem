@@ -656,6 +656,8 @@ enum AdminCommands {
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
     TapDeposit(AdminTapDepositArgs),
+    /// Reverse a credited TAP event that disappeared from the finalized canonical chain.
+    TapDepositReversal(AdminTapDepositReversalArgs),
     /// Confirm a fiat checkout deposit into the canonical credit ledger.
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
@@ -3358,17 +3360,15 @@ impl AdminRateSource {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminTapRateSource {
-    UniswapV2,
+    UniswapV2TwapMedian,
     Config,
-    Stale,
 }
 
 impl AdminTapRateSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::UniswapV2 => "uniswap-v2",
+            Self::UniswapV2TwapMedian => "uniswap-v2-twap-median",
             Self::Config => "config",
-            Self::Stale => "stale",
         }
     }
 }
@@ -4664,6 +4664,54 @@ struct AdminTapDepositArgs {
 
     #[arg(long)]
     watcher_id: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTapDepositReversalArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    eth_tx_hash: String,
+
+    #[arg(long)]
+    log_index: u64,
+
+    #[arg(long)]
+    block_number: u64,
+
+    #[arg(long)]
+    block_hash: String,
+
+    #[arg(long)]
+    pool_address: String,
+
+    #[arg(long)]
+    chain_id: u64,
+
+    #[arg(long)]
+    reconciliation_from_block: u64,
+
+    #[arg(long)]
+    reconciliation_to_block: u64,
+
+    #[arg(long)]
+    finalized_block_number: u64,
+
+    #[arg(long, default_value = "finalized-tag")]
+    confirmation_policy: String,
+
+    #[arg(long, default_value = "tap-deposit-watcher-v1")]
+    watcher_id: String,
+
+    #[arg(long, default_value = "canonical_event_missing")]
+    reason: String,
 
     #[arg(long)]
     epoch: u64,
@@ -18038,6 +18086,14 @@ async fn admin(command: AdminCommands) -> Result<()> {
             )
             .await;
         }
+        AdminCommands::TapDepositReversal(args) => {
+            return run_admin_deposit_feature(
+                &args.tx,
+                "tapDepositReversal",
+                admin_tap_deposit_reversal_payload(args),
+            )
+            .await;
+        }
         AdminCommands::FiatDeposit(args) => {
             return run_admin_deposit_feature(
                 &args.tx,
@@ -19739,6 +19795,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::FiatDustSweep(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::TapDeposit(args) => &args.tx,
+        AdminCommands::TapDepositReversal(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::PayoutConfirm(args) => &args.tx,
@@ -19842,6 +19899,10 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
+        AdminCommands::TapDepositReversal(args) => Ok((
+            "tapDepositReversal",
+            admin_tap_deposit_reversal_payload(args),
+        )),
         AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
         AdminCommands::FiatChargeback(args) => {
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
@@ -21769,6 +21830,26 @@ fn admin_tap_deposit_payload(args: &AdminTapDepositArgs) -> Value {
     })
 }
 
+fn admin_tap_deposit_reversal_payload(args: &AdminTapDepositReversalArgs) -> Value {
+    json!({
+        "op": "tap_deposit_reversal",
+        "chain_id": args.chain_id,
+        "pool_address": &args.pool_address,
+        "eth_tx_hash": &args.eth_tx_hash,
+        "log_index": args.log_index,
+        "block_number": args.block_number,
+        "block_hash": &args.block_hash,
+        "reconciliation_from_block": args.reconciliation_from_block,
+        "reconciliation_to_block": args.reconciliation_to_block,
+        "finalized_block_number": args.finalized_block_number,
+        "confirmation_policy": &args.confirmation_policy,
+        "watcher_id": &args.watcher_id,
+        "reason": &args.reason,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
 fn admin_fiat_deposit_payload(args: &AdminFiatDepositArgs) -> Result<Value> {
     if args.fiat_amount_minor == 0 {
         bail!("fiat deposits require positive --fiat-amount-minor");
@@ -21946,7 +22027,7 @@ fn deposit_feature_key(value: &Value) -> Result<String> {
                 .context("tnk_deposit feature missing memo_hash")?;
             Ok(format!("dep/tnk/{memo_hash}/{digest}"))
         }
-        "tap_deposit" => {
+        "tap_deposit" | "tap_deposit_reversal" => {
             let chain_id = value
                 .get("chain_id")
                 .and_then(Value::as_u64)
@@ -21974,7 +22055,11 @@ fn deposit_feature_key(value: &Value) -> Result<String> {
                 log_index,
                 block_hash,
             )?;
-            Ok(identity)
+            if op == "tap_deposit_reversal" {
+                Ok(format!("{identity}/reversal"))
+            } else {
+                Ok(identity)
+            }
         }
         "fiat_deposit" => {
             let ext_ref_hash = value
@@ -28704,7 +28789,7 @@ fn validate_tap_rate(rate: &CanonicalTapRate, admin: &str) -> Result<()> {
     );
     ensure!(rate.tap_usd_au > 0, "TAP/USD rate must be positive");
     ensure!(
-        matches!(rate.source.as_str(), "uniswap-v2" | "config" | "stale"),
+        matches!(rate.source.as_str(), "uniswap-v2-twap-median" | "config"),
         "unsupported TAP/USD rate source {}",
         rate.source
     );
@@ -62368,7 +62453,7 @@ mod tests {
         let tap_rate_payload = admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
             tx: test_admin_tx_args(),
             tap_usd_au: 50_000_000_000_000_000,
-            source: AdminTapRateSource::UniswapV2,
+            source: AdminTapRateSource::UniswapV2TwapMedian,
             ts: 3_600,
         });
         assert_eq!(
@@ -62376,7 +62461,7 @@ mod tests {
             json!({
                 "op": "tap_rate_oracle",
                 "tap_usd_au": "50000000000000000",
-                "source": "uniswap-v2",
+                "source": "uniswap-v2-twap-median",
                 "ts": 3_600,
             })
         );
@@ -62391,7 +62476,7 @@ mod tests {
             admin_command_payload(&AdminCommands::TapRateOracle(AdminTapRateOracleArgs {
                 tx: test_admin_tx_args(),
                 tap_usd_au: 50_000_000_000_000_000,
-                source: AdminTapRateSource::UniswapV2,
+                source: AdminTapRateSource::UniswapV2TwapMedian,
                 ts: 3_600,
             }))
             .unwrap_err()
@@ -62674,6 +62759,53 @@ mod tests {
                 "epoch": 7,
                 "at": 25_200,
             })
+        );
+
+        let reversal = AdminTapDepositReversalArgs {
+            tx: test_admin_tx_args(),
+            eth_tx_hash: format!("0x{}", "ab".repeat(32)),
+            log_index: 0,
+            block_number: 123,
+            block_hash: format!("0x{}", "cd".repeat(32)),
+            pool_address: "0x0000000000000000000000000000000000000abc".to_owned(),
+            chain_id: 61_000,
+            reconciliation_from_block: 100,
+            reconciliation_to_block: 123,
+            finalized_block_number: 135,
+            confirmation_policy: "finalized-tag".to_owned(),
+            watcher_id: "tap-deposit-watcher-v1".to_owned(),
+            reason: "canonical_event_missing".to_owned(),
+            epoch: 7,
+            at: 25_201,
+        };
+        let reversal_payload = admin_tap_deposit_reversal_payload(&reversal);
+        assert_eq!(
+            reversal_payload,
+            json!({
+                "op": "tap_deposit_reversal",
+                "chain_id": 61_000,
+                "pool_address": "0x0000000000000000000000000000000000000abc",
+                "eth_tx_hash": format!("0x{}", "ab".repeat(32)),
+                "log_index": 0,
+                "block_number": 123,
+                "block_hash": format!("0x{}", "cd".repeat(32)),
+                "reconciliation_from_block": 100,
+                "reconciliation_to_block": 123,
+                "finalized_block_number": 135,
+                "confirmation_policy": "finalized-tag",
+                "watcher_id": "tap-deposit-watcher-v1",
+                "reason": "canonical_event_missing",
+                "epoch": 7,
+                "at": 25_201,
+            })
+        );
+        assert_eq!(
+            deposit_feature_key(&reversal_payload).unwrap(),
+            format!(
+                "dep/tap/61000/0x0000000000000000000000000000000000000abc/0x{}/0/0x{}/reversal",
+                "ab".repeat(32),
+                "cd".repeat(32),
+            )
         );
 
         assert_eq!(

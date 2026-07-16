@@ -12,11 +12,12 @@ import { ethers } from 'ethers';
 
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
+import { signRootProposal } from '../scripts/pool-governance.mjs';
 import {
   buildTapSettlement,
   encodeBurnCalldata,
-  encodeSetRootCalldata,
   encodeWithdrawOperatorCalldata,
+  POOL_SETTLEMENT_ABI,
   guardianPreSignReport,
   auToTapWei,
   providerShareWei,
@@ -133,7 +134,7 @@ test('TAP settlement rate lock survives oracle updates and rejects a different b
             value: {
               denom: 'tap_usd_au',
               tap_usd_au: TAP_USD_AU,
-              source: 'uniswap-v2',
+              source: 'uniswap-v2-twap-median',
               ts: 3_600,
               updated_at: rateKey,
               posted_by: admin,
@@ -211,7 +212,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
   const providerA = await provider.getSigner(2);
   const providerB = await provider.getSigner(3);
   const operatorTreasury = await provider.getSigner(4);
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(10))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
@@ -238,6 +239,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
@@ -275,6 +277,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
   assert.equal(await pool.burnClaimable(), 0n);
 
   await (await pool.connect(providerA).claim(
+    rolled.epoch,
     providerAccounts[providerAId.publicKeyHex],
     claimA,
     rolled.proofs[providerAccounts[providerAId.publicKeyHex].toLowerCase()].proof
@@ -293,7 +296,7 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const operatorTreasury = await provider.getSigner(3);
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(10))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
@@ -317,6 +320,7 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
@@ -339,11 +343,13 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
   assert.equal(rolled.root, expectedDist.root);
 
   await (await pool.connect(providerA).claim(
+    rolled.epoch,
     providerAccount,
     providerClaim,
     rolled.proofs[providerAccount.toLowerCase()].proof
   )).wait();
   await (await pool.connect(buyer).claim(
+    rolled.epoch,
     buyerAccount,
     buyerRefund,
     rolled.proofs[buyerAccount.toLowerCase()].proof
@@ -363,7 +369,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const operatorTreasury = await provider.getSigner(3);
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
   await (await token.mint(await buyer.getAddress(), U(5))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
   await (await pool.connect(buyer).deposit(U(5))).wait();
@@ -408,6 +414,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
@@ -421,6 +428,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
@@ -443,7 +451,7 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
   const buyer = await provider.getSigner(1);
   const providerSigner = await provider.getSigner(2);
   const operatorTreasury = await provider.getSigner(3);
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
   await (await token.mint(await buyer.getAddress(), U(5))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
   await (await pool.connect(buyer).deposit(U(5))).wait();
@@ -461,7 +469,20 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
   });
-  await (await pool.setRoot(settlement.root, 1, BigInt(settlement.cumulative_spent_wei))).wait();
+  const governanceSignature = await signRootProposal({
+    signer: governanceWallet,
+    pool,
+    merkleRoot: settlement.root,
+    newEpoch: 1,
+    newCumulativeSpent: BigInt(settlement.cumulative_spent_wei),
+  });
+  await (await pool.proposeRoot(
+    settlement.root,
+    1,
+    BigInt(settlement.cumulative_spent_wei),
+    governanceSignature
+  )).wait();
+  await (await pool.executeRoot()).wait();
   assert((await pool.operatorClaimable()) > 0n);
   assert((await pool.burnClaimable()) > 0n);
 
@@ -473,6 +494,7 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
@@ -480,7 +502,7 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
   assert.equal(resumed.posted, false);
   assert.equal(resumed.root_confirmed, true);
   assert.equal(resumed.root_already_posted, true);
-  assert.equal(resumed.set_root_dry_run.skipped, true);
+  assert.equal(resumed.propose_root_dry_run.skipped, true);
   assert.equal(resumed.operator_fee.auto_sent, true);
   assert.equal(resumed.operator_fee.completed, true);
   assert.equal(resumed.burn.auto_sent, true);
@@ -709,7 +731,7 @@ test('guardian pre-sign screen halts invariant violations', async () => {
 test('TAP settlement CLI dry-runs and broadcasts with env key against a locked JSON-RPC node', async (t) => {
   const server = Ganache.server({
     logging: { quiet: true },
-    chain: { chainId: 61_001 },
+    chain: { chainId: 61_000 },
     wallet: {
       lock: true,
       accounts: [
@@ -738,7 +760,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   const buyer = new ethers.Wallet(BUYER_KEY, provider);
   const providerSigner = new ethers.Wallet(PROVIDER_KEY, provider);
   const operatorTreasury = ethers.Wallet.createRandom().connect(provider);
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(10))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
@@ -760,7 +782,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     ['tap/rate/latest', {
       denom: 'tap_usd_au',
       tap_usd_au: String(TAP_USD_AU),
-      source: 'uniswap-v2',
+      source: 'uniswap-v2-twap-median',
       ts: 3_600,
       updated_at: `rate/tap/3600/${'bb'.repeat(32)}`,
       posted_by: admin,
@@ -801,16 +823,22 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   ];
   const baseEnv = { ...process.env };
   delete baseEnv.MAYHEM_TAP_ROLLER_PRIVATE_KEY;
+  delete baseEnv.MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY;
+  const signingEnv = {
+    ...baseEnv,
+    MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY,
+    MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY: governanceWallet.privateKey,
+  };
   const localPolicyOverride = await runNode([...baseArgs, '--challenge-epochs', '1'], {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
-    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+    env: signingEnv,
   });
   assert.notEqual(localPolicyOverride.status, 0);
   assert.match(localPolicyOverride.stderr, /active admin ledger state/);
 
   const rawRateOverride = await runNode([...baseArgs, '--tap-usd-au', TAP_USD_AU], {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
-    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+    env: signingEnv,
   });
   assert.notEqual(rawRateOverride.status, 0);
   assert.match(rawRateOverride.stderr, /not supported.*rate-lock/i);
@@ -824,7 +852,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
 
   const dryRun = await runNode(baseArgs, {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
-    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+    env: signingEnv,
   });
   assert.equal(dryRun.status, 0, dryRun.stderr);
   const report = JSON.parse(dryRun.stdout);
@@ -833,14 +861,17 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(report.tap_rate_lock.epoch, 1);
   assert.equal(report.signer_env, 'MAYHEM_TAP_ROLLER_PRIVATE_KEY');
   assert.equal(report.signing_address, (await operator.getAddress()).toLowerCase());
-  assert.equal(report.set_root_dry_run.ok, true);
-  assert.equal(report.set_root_dry_run.static_call_ok, true);
-  assert.match(report.set_root_dry_run.gas_estimate, /^[0-9]+$/);
-  assert.equal(report.set_root_calldata, encodeSetRootCalldata({
-    root: report.root,
-    epoch: report.epoch,
-    cumulativeSpentWei: report.cumulative_spent_wei,
-  }));
+  assert.equal(report.governance_signer_env, 'MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY');
+  assert.equal(report.governance_signing_address, governanceWallet.address.toLowerCase());
+  assert.equal(report.propose_root_dry_run.ok, true);
+  assert.equal(report.propose_root_dry_run.static_call_ok, true);
+  assert.match(report.propose_root_dry_run.gas_estimate, /^[0-9]+$/);
+  const proposal = new ethers.Interface(POOL_SETTLEMENT_ABI)
+    .decodeFunctionData('proposeRoot', report.propose_root_calldata);
+  assert.equal(proposal.newRoot.toLowerCase(), report.root.toLowerCase());
+  assert.equal(proposal.newEpoch, BigInt(report.epoch));
+  assert.equal(proposal.newCumulativeSpent, BigInt(report.cumulative_spent_wei));
+  assert.match(proposal.governanceSignature, /^0x[0-9a-f]+$/i);
   assert.equal(report.operator_fee.destination, (await operatorTreasury.getAddress()).toLowerCase());
   assert.equal(report.operator_fee.predicted_claimable_wei, (auToTapWei(usdAu(1), TAP_USD_AU) * 1500n / 10_000n).toString());
   assert.equal(report.operator_fee.calldata, encodeWithdrawOperatorCalldata({
@@ -864,12 +895,13 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
 
   const confirmed = await runNode([...baseArgs, '--confirm'], {
     cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
-    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+    env: signingEnv,
   });
   assert.equal(confirmed.status, 0, confirmed.stderr);
   const posted = JSON.parse(confirmed.stdout);
-  assert.equal(posted.posted, true);
-  assert.match(posted.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(posted.posted, true, JSON.stringify(posted));
+  assert.match(posted.proposal_tx, /^0x[0-9a-f]{64}$/i);
+  assert.match(posted.execution_tx, /^0x[0-9a-f]{64}$/i);
   assert.equal(posted.signing_address, (await operator.getAddress()).toLowerCase());
   assert.equal(posted.operator_fee.auto_sent, true);
   assert.match(posted.operator_fee.tx, /^0x[0-9a-f]{64}$/i);

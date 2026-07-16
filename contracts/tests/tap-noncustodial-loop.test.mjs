@@ -35,7 +35,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
   const providerA = await provider.getSigner(2);
   const buyerAddress = await buyer.getAddress();
   const providerAccount = await providerA.getAddress();
-  const { token, pool, tokenAddr, poolAddr } = await deployPool(operator);
+  const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(buyerAddress, U(3))).wait();
   const depositIntent = buildTapDepositCalldata({
@@ -63,6 +63,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
     challengeEpochs: 1,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     post: true,
   });
   assert.equal(immature.posted, false);
@@ -82,6 +83,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
     challengeEpochs: 1,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operator.getAddress(),
     post: true,
   });
@@ -97,6 +99,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
   });
   assert.equal(proof.claimable, true);
   const claimIntent = buildTapClaimCalldata({
+    rootEpoch: proof.epoch,
     account: proof.account,
     cumulativeWei: proof.cumulative_wei,
     proof: proof.proof,

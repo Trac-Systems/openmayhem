@@ -328,7 +328,7 @@ const buildAdminOnlyRateFeatureAttempts = () => [
   {
     op: 'tap_rate_oracle',
     tap_usd_au: '2000000000000000000',
-    source: 'uniswap-v2',
+    source: 'uniswap-v2-twap-median',
     ts: 3_600,
   },
 ];

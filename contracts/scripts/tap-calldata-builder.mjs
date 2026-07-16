@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 import { ADDRESSES_FILE } from './paths.mjs';
+import { safeErrorMessage } from './safe-output.mjs';
 import { claimProofForAccount } from './tap-claim-proof.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -18,7 +19,7 @@ export const TAP_TOKEN_CALLDATA_ABI = [
 
 export const TAP_POOL_CALLDATA_ABI = [
   'function deposit(uint256 amount)',
-  'function claim(address account, uint256 cumulativeAmount, bytes32[] proof)',
+  'function claim(uint256 rootEpoch, address account, uint256 cumulativeAmount, bytes32[] proof)',
   'function claimed(address account) view returns (uint256)',
 ];
 
@@ -422,6 +423,7 @@ function parseProof(value) {
 }
 
 export function buildTapClaimCalldata({
+  rootEpoch,
   account,
   cumulativeWei,
   proof,
@@ -432,12 +434,14 @@ export function buildTapClaimCalldata({
   env,
 } = {}) {
   const addresses = resolveTapAddresses({ token, pool, chainId, addressesFile, env });
+  const epoch = parseNonNegativeInt(rootEpoch, 'root epoch');
+  if (epoch === null || epoch <= 0) throw new Error('root epoch must be positive');
   const claimAccount = normalizeAddress(account, 'claim account');
   const cumulative = parseWei(cumulativeWei, 'cumulative wei');
   const proofItems = parseProof(proof);
   const transaction = {
     to: addresses.pool,
-    data: poolIface.encodeFunctionData('claim', [claimAccount, cumulative, proofItems]),
+    data: poolIface.encodeFunctionData('claim', [epoch, claimAccount, cumulative, proofItems]),
     value: '0x0',
   };
   return {
@@ -450,6 +454,7 @@ export function buildTapClaimCalldata({
     pool: addresses.pool,
     token: addresses.token,
     account: claimAccount,
+    root_epoch: epoch,
     cumulative_wei: cumulative.toString(),
     proof: proofItems,
     transaction,
@@ -463,6 +468,7 @@ export async function executeTapClaim({
   privateKey,
   ethRpc,
   account,
+  rootEpoch,
   cumulativeWei,
   proof,
   pool,
@@ -474,6 +480,8 @@ export async function executeTapClaim({
   env = process.env,
 } = {}) {
   const addresses = resolveTapAddresses({ token, pool, chainId, addressesFile, env });
+  const epoch = parseNonNegativeInt(rootEpoch, 'root epoch');
+  if (epoch === null || epoch <= 0) throw new Error('root epoch must be positive');
   const claimAccount = normalizeAddress(account, 'claim account');
   const cumulative = parseWei(cumulativeWei, 'cumulative wei');
   const proofItems = parseProof(proof);
@@ -504,6 +512,7 @@ export async function executeTapClaim({
   }
 
   const simulation = await simulateContractStep(poolContract.claim, [
+    epoch,
     claimAccount,
     cumulative,
     proofItems,
@@ -541,6 +550,7 @@ export async function executeTapClaim({
     pool: addresses.pool,
     token: addresses.token,
     account: claimAccount,
+    root_epoch: epoch,
     cumulative_wei: cumulative.toString(),
     previously_claimed_wei: alreadyClaimed.toString(),
     claimable_wei: (cumulative - alreadyClaimed).toString(),
@@ -555,7 +565,7 @@ export async function executeTapClaim({
   };
   if (!confirm) return report;
 
-  const tx = await poolContract.claim(claimAccount, cumulative, proofItems);
+  const tx = await poolContract.claim(epoch, claimAccount, cumulative, proofItems);
   const receipt = await tx.wait();
   report.transaction = {
     step: 'claim',
@@ -598,7 +608,7 @@ function replayCommand(args, kind, report) {
     out.push('--from', report.from, '--amount-wei', report.amount_wei);
     out.push('--token', report.token, '--pool', report.pool);
   } else {
-    out.push('--account', report.account, '--cumulative-wei', report.cumulative_wei);
+    out.push('--root-epoch', String(report.root_epoch), '--account', report.account, '--cumulative-wei', report.cumulative_wei);
     out.push('--proof', JSON.stringify(report.proof), '--pool', report.pool);
     out.push('--token', report.token);
   }
@@ -644,6 +654,7 @@ async function main() {
       : await claimFromSettlement(args);
     const claim = {
       ...common,
+      rootEpoch: args['root-epoch'] ?? proof?.epoch,
       account: args.account || args.provider || args.address || proof?.account,
       cumulativeWei: args['cumulative-wei'] ?? args.cumulative ?? proof?.cumulative_wei ?? proof?.cumulative,
       proof: args.proof ?? proof?.proof,
@@ -716,7 +727,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
-    console.error(error?.stack || error?.message || String(error));
+    console.error(safeErrorMessage(error));
     process.exit(1);
   });
 }
