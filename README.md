@@ -223,7 +223,7 @@ What people actually use it for:
 | **A developer** | A drop-in OpenAI-compatible endpoint on `127.0.0.1`. Point your existing SDK, agent framework, or app at it and nothing else changes. One balance covers chat, embeddings, vision, images, and speech. |
 | **An agent builder** | The engine room for agentic loops. Small-to-mid instruct models are what agents run on now — tool calls, JSON mode, multi-step loops, thousands of calls a day — and that's precisely the class a market of consumer GPUs serves at prices retail can't touch. Per-request headers let every call in the loop pick its own price ceiling, context floor, or trust tier; embeddings and speech ride on the same balance. |
 | **A team or household** | One funded gateway, shared. Everyone gets their own token with its own budget and rate limit, and you see who spent what. |
-| **Privacy-sensitive work** | `--min-att-tier 3` routes only to confidential-compute providers, where your prompts are cryptographically unreadable to the machine's operator. It's a hard filter, never downgraded. For identity instead of privacy, `--require-kyb` routes only to verified businesses. |
+| **Privacy-sensitive work** | Inspect route evidence for the confidential-compute property you need. `--min-att-tier 3` is a hard numeric filter, but tiers are not privacy supersets: a Tier 4 identity route can satisfy that minimum without providing Tier 3 prompt confidentiality. For verified business identity, use `--require-kyb`. |
 | **Someone who distrusts pricing pages** | Every price on this network is published with the formula and inputs that produced it. Recompute it yourself; you'll get the same number. |
 
 ### Start, look around
@@ -331,7 +331,7 @@ mayhem up --max-price-au 500000000000     # same thing for one run only (beats t
 **Discovery filters (see what qualifies before you spend):**
 
 ```bash
-mayhem models --gateway --min-att-tier 3  # Tier-3 markets; inspect routes/status before use
+mayhem models --gateway --min-att-tier 3  # Numeric tier 3+ markets; inspect protection evidence before use
 mayhem models --gateway --require-kyb     # only identity-verified businesses
 mayhem models --gateway --quant int4      # filter by quantization
 ```
@@ -556,7 +556,7 @@ Every model × tier is an independent market. The admin seeds a starting price o
 
 Prices are quoted separately for input and output tokens, in dollars per million. Embeddings bill per input token. Image generation bills per image and per step, scaled by resolution. Audio has its own metered units.
 
-Every epoch's price is published with its derivation: the seed, the measured utilization, the public constants, and the settled work behind them. Run the formula yourself and you get the same number. `mayhem price show` prints it, the dashboards render it, and every model gets a financial-style price chart (candles and volume, built from real epoch prices) on the user and provider dashboards. A newly opened market is visible immediately even at zero routes; it remains unroutable until an eligible provider joins.
+Every epoch's price is published with its derivation: the seed, the measured utilization, the public constants, and the settled work behind them. Run the formula yourself and you get the same number. `mayhem price show` prints the derivation, while the dashboard's bounded Markets workspace shows the current catalog reference price and supply facts without inventing historical intervals. A newly opened market is visible immediately even at zero routes; it remains unroutable until an eligible provider joins.
 
 Context is part of the deal too. Providers advertise the context window they serve; the network verifies it with targeted probes and it's guaranteed for the duration of your session. Larger context brackets clear at their own prices, and a `min-ctx` filter routes you only to providers with the headroom you need. When every provider is busy, an opt-in `--max-wait` holds your request for the next free slot instead of failing it.
 
@@ -617,11 +617,14 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 
 | Dashboard | Path | Shows |
 |-----------|------|-------|
-| User | `/mayhem/dashboard` | balance, sessions, spend history, gateway status, catalog |
-| Provider | `/mayhem/dashboard/provider` | enclave status, live sessions, earnings, reputation, holdback |
-| Network explorer | `/mayhem/dashboard/network` | every model and provider: abilities, tiers, rails, live prices with derivations, availability |
+| User | `/mayhem/dashboard` | gateway readiness, model choice, Playground, receipts, balance, connection setup |
+| Provider | `/mayhem/dashboard/provider` | serving routes, preparation progress, current capacity, canonical earnings, reputation |
+| Network explorer | `/mayhem/dashboard/network` | bounded model, provider, market, route-activity, and evidence snapshots |
 
-All figures come from live contract and heartbeat state. Nothing is made up; a model with no live provider shows as unavailable.
+Production figures come from the current catalog, contract, ledger, gateway records, or provider heartbeats, with freshness and unavailable states kept explicit. Workbench fixtures are labelled and isolated from production data.
+
+For dashboard UI work without starting the full stack, use the isolated fixture
+[dashboard workbench](crates/mayhem-gateway/DASHBOARD_WORKBENCH.md).
 
 ## How the money is secured
 

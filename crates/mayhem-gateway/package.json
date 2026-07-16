@@ -3,9 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:openai-sdk": "node tests/openai-sdk-smoke.mjs"
+    "test:openai-sdk": "node tests/openai-sdk-smoke.mjs",
+    "test:dashboard-browser": "node tests/dashboard-browser-smoke.mjs"
   },
   "devDependencies": {
-    "openai": "^6.45.0"
+    "@axe-core/playwright": "^4.12.1",
+    "openai": "^6.45.0",
+    "playwright": "^1.61.1"
   }
 }

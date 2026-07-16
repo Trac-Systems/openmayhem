@@ -27153,31 +27153,86 @@ async fn run_gateway_ledger_watcher(
     config: GatewayLedgerWatcherConfig,
 ) -> Result<()> {
     let rpc = PeerRpcClient::new(&config.rpc_url).context("creating gateway ledger watcher RPC")?;
-    let mut last_error = None;
+    let mut last_payment_error = None;
+    let mut last_earnings_error = None;
     loop {
-        let refresh = async {
+        let payment_refresh = async {
             let balance =
                 read_user_balance_au(&rpc, &config.wallet_public_key, &config.rail).await?;
             let payments =
                 canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
             Result::<_, anyhow::Error>::Ok((balance, payments))
-        }
-        .await;
-        match refresh {
+        };
+        let earnings_refresh = read_gateway_provider_earnings(&rpc, &config.wallet_public_key);
+        let (payment_refresh, earnings_refresh) = tokio::join!(payment_refresh, earnings_refresh);
+
+        match payment_refresh {
             Ok((balance, payments)) => {
                 state.update_ledger_payment_state(balance, payments);
-                last_error = None;
+                last_payment_error = None;
             }
             Err(err) => {
                 let message = format!("{err:#}");
-                if last_error.as_deref() != Some(message.as_str()) {
-                    eprintln!("Gateway ledger watcher retrying: {message}");
-                    last_error = Some(message);
+                if last_payment_error.as_deref() != Some(message.as_str()) {
+                    eprintln!("Gateway ledger payment watcher retrying: {message}");
+                    last_payment_error = Some(message);
+                }
+            }
+        }
+        match earnings_refresh {
+            Ok(provider_earnings) => {
+                state.update_provider_earnings(provider_earnings);
+                last_earnings_error = None;
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                state.mark_provider_earnings_refresh_error(message.clone());
+                if last_earnings_error.as_deref() != Some(message.as_str()) {
+                    eprintln!("Gateway provider earnings watcher retrying: {message}");
+                    last_earnings_error = Some(message);
                 }
             }
         }
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn read_gateway_provider_earnings(rpc: &PeerRpcClient, provider: &str) -> Result<Vec<Value>> {
+    let [fiat, tap, tnk] = PROVIDER_ACCEPTED_RAIL_ORDER;
+    let (fiat, tap, tnk) = tokio::try_join!(
+        read_gateway_provider_earning(rpc, provider, fiat),
+        read_gateway_provider_earning(rpc, provider, tap),
+        read_gateway_provider_earning(rpc, provider, tnk),
+    )?;
+    Ok([fiat, tap, tnk].into_iter().flatten().collect())
+}
+
+async fn read_gateway_provider_earning(
+    rpc: &PeerRpcClient,
+    provider: &str,
+    rail: &str,
+) -> Result<Option<Value>> {
+    let key = format!("earn/{rail}/{provider}");
+    let Some(value) = read_state_value(rpc, &key).await? else {
+        return Ok(None);
+    };
+    let record: LedgerEarningRecord = serde_json::from_value(value)
+        .with_context(|| format!("parsing local provider earning record {key}"))?;
+    ensure!(
+        record.provider == provider,
+        "local provider earning record {key} names provider {} instead of {provider}",
+        record.provider
+    );
+    ensure!(
+        record.rail == rail,
+        "local provider earning record {key} names rail {} instead of {rail}",
+        record.rail
+    );
+    let view = earning_view(record)
+        .with_context(|| format!("validating local provider earning record {key}"))?;
+    Ok(Some(serde_json::to_value(view).with_context(|| {
+        format!("serializing local provider earning record {key}")
+    })?))
 }
 
 const DEFAULT_GATEWAY_CATALOG_REFRESH_MILLIS: u64 = 60_000;
@@ -27801,16 +27856,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             });
         }
         let model_count = models.len();
-        let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
-            .await?
-            .into_iter()
-            .map(earning_view)
-            .map(|view| {
-                view.and_then(|view| {
-                    serde_json::to_value(view).context("serializing provider earning view")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let provider_earnings = read_gateway_provider_earnings(&rpc, &wallet.public_key).await?;
         let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
             Some(&home),
             args.sc_bridge_url.as_deref(),
@@ -27860,6 +27906,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             GatewayState::from_models(models)
                 .with_canary_registry(canary_registry)
                 .with_provider_earnings(provider_earnings)
+                .with_local_provider_id(wallet.public_key.clone())
                 .with_hidden_update_models(hidden_update_models)
                 .with_failover_policy(failover_policy)
                 .with_epoch_seconds(gateway_epoch_seconds)
@@ -27936,7 +27983,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     );
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
-    let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
+    let dashboard_browser_idle_timeout_seconds = state.dashboard_session_expires_in().as_secs();
     let report = json!({
         "ok": true,
         "home": home,
@@ -27945,7 +27992,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "openai_base_url": openai_base_url,
         "dashboard_url": dashboard_url,
         "provider_dashboard_url": provider_dashboard_url,
-        "dashboard_session_expires_in_seconds": dashboard_session_expires_in_seconds,
+        "dashboard_browser_idle_timeout_seconds": dashboard_browser_idle_timeout_seconds,
         "source": source,
         "backend": backend,
         "epoch_seconds": state.epoch_seconds(),
@@ -28001,7 +28048,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         if let Some(notice) = shared_gateway_notice {
             println!("{notice}");
         }
-        println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
+        println!(
+            "Dashboard browser idle timeout: {dashboard_browser_idle_timeout_seconds}s (the copy/paste URL remains valid while this gateway runs)."
+        );
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
             println!("Backend: local OpenAI-shape smoke backend (unbillable dev output).");
@@ -39614,6 +39663,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     ));
     write_provider_load_progress_stage(&args, "selected admin enclave", "select", "complete", 100);
 
+    let result: Result<()> = async {
     provider_log(
         &args,
         &format!(
@@ -40043,6 +40093,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     }
 
     Ok(())
+    }
+    .await;
+    if let Err(error) = &result {
+        write_provider_load_progress_failure(&args, error);
+    }
+    result
 }
 
 struct ProviderReadContext {
@@ -42951,6 +43007,8 @@ struct ProviderLoadProgressReport<'a> {
     label: &'a str,
     phase: &'a str,
     status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
     position: Option<u64>,
     total: Option<u64>,
     percent: Option<u64>,
@@ -43005,6 +43063,18 @@ fn write_provider_load_progress(
     position: Option<u64>,
     total: Option<u64>,
 ) -> Result<()> {
+    write_provider_load_progress_report(ctx, label, phase, status, position, total, None)
+}
+
+fn write_provider_load_progress_report(
+    ctx: &ProviderLoadProgressContext,
+    label: &str,
+    phase: &str,
+    status: &str,
+    position: Option<u64>,
+    total: Option<u64>,
+    error: Option<&str>,
+) -> Result<()> {
     let percent = provider_load_progress_percent(position, total);
     let updated_at_ms = unix_epoch_millis().unwrap_or(0);
     let report = ProviderLoadProgressReport {
@@ -43016,12 +43086,77 @@ fn write_provider_load_progress(
         label,
         phase,
         status,
+        error,
         position,
         total,
         percent,
         updated_at_ms,
     };
     write_json_file(&ctx.path(), &report)
+}
+
+fn write_provider_load_progress_failure(args: &ProviderStartArgs, error: &anyhow::Error) {
+    let Some(ctx) = args.load_progress.as_ref() else {
+        return;
+    };
+    let current = read_json_file(&ctx.path()).unwrap_or(Value::Null);
+    let label = current
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("provider start");
+    let phase = current
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("prepare");
+    let position = current.get("position").and_then(Value::as_u64);
+    let total = current.get("total").and_then(Value::as_u64);
+    let detail = provider_load_progress_error_detail(ctx, error);
+    let _ = write_provider_load_progress_report(
+        ctx,
+        label,
+        phase,
+        "error",
+        position,
+        total,
+        Some(&detail),
+    );
+}
+
+fn provider_load_progress_error_detail(
+    ctx: &ProviderLoadProgressContext,
+    error: &anyhow::Error,
+) -> String {
+    let mut detail = error
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if let Some(home) = ctx.dir.parent().and_then(Path::to_str) {
+        detail = detail.replace(home, "$MAYHEM_HOME");
+    }
+    let detail = detail
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with("sk-") || part.starts_with("Bearer") {
+                "[redacted]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let detail = detail.chars().take(240).collect::<String>();
+    if detail.is_empty() {
+        "Provider start failed; inspect the CLI output.".to_owned()
+    } else {
+        detail
+    }
 }
 
 fn provider_load_progress_percent(position: Option<u64>, total: Option<u64>) -> Option<u64> {
@@ -57992,6 +58127,84 @@ mod tests {
 
         assert_eq!(added, vec!["mx/room/new"]);
         assert_eq!(removed, vec!["mx/room/old"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_provider_earnings_read_only_exact_local_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_server = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            for _ in 0..PROVIDER_ACCEPTED_RAIL_ORDER.len() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "peer RPC mock request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                captured_server.lock().unwrap().push(request.clone());
+                let rail = PROVIDER_ACCEPTED_RAIL_ORDER
+                    .into_iter()
+                    .find(|rail| request.contains(*rail))
+                    .unwrap();
+                let body = if rail == "tap" {
+                    json!({"value": null})
+                } else {
+                    json!({
+                        "value": {
+                            "provider": "provider-local",
+                            "rail": rail,
+                            "denom": "au_usd",
+                            "total_au": "100",
+                            "held_au": "10",
+                            "paid_cum_au": "20",
+                            "updated_epoch": 7
+                        }
+                    })
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
+        let earnings = read_gateway_provider_earnings(&rpc, "provider-local")
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(earnings.len(), 2);
+        assert!(earnings
+            .iter()
+            .all(|entry| entry["provider"] == "provider-local"));
+        assert_eq!(
+            earnings
+                .iter()
+                .filter_map(|entry| entry["rail"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["fiat", "tnk"])
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), PROVIDER_ACCEPTED_RAIL_ORDER.len());
+        assert!(requests.iter().all(|request| request.contains("key=earn")));
+        assert!(requests.iter().all(|request| !request.contains("prefix=")));
+        assert!(requests.iter().all(|request| !request.contains("limit=")));
+        for rail in PROVIDER_ACCEPTED_RAIL_ORDER {
+            assert!(requests.iter().any(|request| request.contains(rail)));
+        }
     }
 
     #[test]
@@ -74329,7 +74542,57 @@ State initialization...
         assert_eq!(value["phase"], "download");
         assert_eq!(value["status"], "running");
         assert_eq!(value["percent"], 50);
+        assert!(value.get("error").is_none());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_load_progress_records_sanitized_terminal_failure() {
+        let home = env::temp_dir().join(format!(
+            "mayhem-provider-progress-failure-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let ctx = ProviderLoadProgressContext {
+            dir: home.join("provider-load-progress"),
+            provider: "aa".repeat(32),
+            model_id: "mayhem/test-model".to_owned(),
+            enclave_id: "bb".repeat(32),
+            artifact: "gguf-q4_k_m".to_owned(),
+        };
+        let mut args = provider_start_args_for_local_run_display(&home);
+        args.load_progress = Some(ctx.clone());
+        write_provider_load_progress(
+            &ctx,
+            "verify catalog artifact",
+            "verify",
+            "running",
+            Some(2),
+            Some(4),
+        )
+        .expect("write running progress");
+
+        let error = anyhow!(
+            "preflight failed at {} with sk-supersecret\nretry refused",
+            home.display()
+        );
+        write_provider_load_progress_failure(&args, &error);
+
+        let value = read_json_file(&ctx.path()).expect("read failure progress");
+        assert_eq!(value["label"], "verify catalog artifact");
+        assert_eq!(value["phase"], "verify");
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["position"], 2);
+        assert_eq!(value["total"], 4);
+        assert_eq!(value["percent"], 50);
+        let detail = value["error"].as_str().expect("failure detail");
+        assert!(detail.contains("preflight failed at $MAYHEM_HOME"));
+        assert!(detail.contains("retry refused"));
+        assert!(!detail.contains(&home.display().to_string()));
+        assert!(!detail.contains("sk-supersecret"));
+        assert!(!detail.contains('\n'));
+        assert!(!detail.contains('\r'));
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
