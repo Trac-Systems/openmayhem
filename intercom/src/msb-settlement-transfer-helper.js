@@ -296,6 +296,7 @@ export async function executeJournaledSettlementTransfer({
     before_balance: journal.before_balance,
     validator_connections: preflight.validators,
     confirmed_length: confirmedLength,
+    observed_signed_length: msb.state.getSignedLength(),
     recovered,
     rebroadcast,
     journal_file: journalFile,

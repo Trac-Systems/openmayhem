@@ -3,8 +3,9 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
+import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 7;
+export const CONTRACT_VERSION = 8;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -70,6 +71,8 @@ const USD_AU = 1_000_000_000_000_000_000n;
 const FIAT_MINOR_AU = 10_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
+const MSB_TRANSFER_EVIDENCE_VERSION = 1;
+const STRIPE_TRANSFER_EVIDENCE_VERSION = 1;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -601,6 +604,7 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
+        ver: { type: 'number', integer: true, min: 1 },
         fiat: { type: 'any' },
         tap: { type: 'any' },
         tnk: { type: 'any' },
@@ -4826,6 +4830,149 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async canonicalTnkPaymentConfig() {
+    const payments = await this.get('payments/current');
+    if (!payments || payments.set_by_role !== 'admin' || !payments.tnk) {
+      return new Error('Canonical TNK payment config required.');
+    }
+    if (!['mainnet', 'testnet1'].includes(payments.tnk.network)) {
+      return new Error('Canonical TNK payment network is invalid.');
+    }
+    if (!this.isSafeKeyPart(payments.tnk.treasury_address)) {
+      return new Error('Canonical TNK treasury address is invalid.');
+    }
+    return payments.tnk;
+  }
+
+  msbAddressForPublicKey(publicKey, network) {
+    if (!this.isHexBytes(publicKey, 32)) return new Error('Invalid MSB owner public key.');
+    const prefix = network === 'mainnet'
+      ? 'trac'
+      : network === 'testnet1'
+        ? 'testtrac'
+        : null;
+    if (!prefix) return new Error('Invalid MSB network.');
+    const address = PeerWallet.encodeBech32mSafe(prefix, b4a.from(publicKey, 'hex'));
+    return typeof address === 'string' && address.length > 0
+      ? address
+      : new Error('Unable to derive MSB owner address.');
+  }
+
+  normalizeMsbTransferEvidence(value, label = 'MSB transfer evidence') {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'schema_version',
+        'network',
+        'tx_hash',
+        'confirmed_length',
+        'observed_signed_length',
+        'from',
+        'to',
+        'amount_e18',
+      ],
+      label
+    );
+    if (shapeError) return shapeError;
+    if (value.schema_version !== MSB_TRANSFER_EVIDENCE_VERSION) {
+      return new Error(`${label} schema version is invalid.`);
+    }
+    if (!['mainnet', 'testnet1'].includes(value.network)) {
+      return new Error(`${label} network is invalid.`);
+    }
+    if (!this.isHexBytes(value.tx_hash, 32) || value.tx_hash !== value.tx_hash.toLowerCase()) {
+      return new Error(`${label} transaction hash is invalid.`);
+    }
+    if (!Number.isSafeInteger(value.confirmed_length) || value.confirmed_length < 1) {
+      return new Error(`${label} confirmed length is invalid.`);
+    }
+    if (
+      !Number.isSafeInteger(value.observed_signed_length) ||
+      value.observed_signed_length < value.confirmed_length
+    ) {
+      return new Error(`${label} observed signed length is invalid.`);
+    }
+    if (!this.isSafeKeyPart(value.from) || !this.isSafeKeyPart(value.to)) {
+      return new Error(`${label} address is invalid.`);
+    }
+    const amount = this.parseTnkE18(value.amount_e18);
+    if (amount instanceof Error) return new Error(`${label} amount is invalid.`);
+    return {
+      schema_version: MSB_TRANSFER_EVIDENCE_VERSION,
+      network: value.network,
+      tx_hash: value.tx_hash,
+      confirmed_length: value.confirmed_length,
+      observed_signed_length: value.observed_signed_length,
+      from: value.from,
+      to: value.to,
+      amount_e18: amount.toString(),
+    };
+  }
+
+  msbTransferSeenKey(evidence) {
+    return `rail/seen/msb/${evidence.network}/${evidence.tx_hash}`;
+  }
+
+  normalizeStripeTransferEvidence(value, label = 'Stripe settlement evidence') {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'schema_version',
+        'kind',
+        'ref',
+        'destination',
+        'currency',
+        'amount_minor',
+        'transfer_group',
+      ],
+      label
+    );
+    if (shapeError) return shapeError;
+    if (value.schema_version !== STRIPE_TRANSFER_EVIDENCE_VERSION) {
+      return new Error(`${label} schema version is invalid.`);
+    }
+    if (!['stripe_transfer', 'platform_balance'].includes(value.kind)) {
+      return new Error(`${label} kind is invalid.`);
+    }
+    if (!this.isSafeKeyPart(value.ref) || !this.isSafeKeyPart(value.destination)) {
+      return new Error(`${label} reference or destination is invalid.`);
+    }
+    if (value.kind === 'stripe_transfer' && !value.ref.startsWith('tr_')) {
+      return new Error(`${label} requires a Stripe transfer id.`);
+    }
+    if (value.kind === 'platform_balance' && !value.ref.startsWith('platform_balance:')) {
+      return new Error(`${label} platform balance reference is invalid.`);
+    }
+    const currency = this.normalizeFiatCurrency(value.currency);
+    if (currency instanceof Error) return currency;
+    const amountMinor = this.normalizeFiatMinor(value.amount_minor);
+    if (amountMinor instanceof Error) return amountMinor;
+    if (
+      value.kind === 'stripe_transfer' &&
+      (typeof value.transfer_group !== 'string' || !this.isSafeKeyPart(value.transfer_group))
+    ) {
+      return new Error(`${label} transfer group is invalid.`);
+    }
+    if (value.kind === 'platform_balance' && value.transfer_group !== null) {
+      return new Error(`${label} platform balance transfer group must be null.`);
+    }
+    return {
+      schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
+      kind: value.kind,
+      ref: value.ref,
+      destination: value.destination,
+      currency,
+      amount_minor: amountMinor,
+      transfer_group: value.transfer_group,
+    };
+  }
+
+  stripeTransferSeenKey(evidence) {
+    return evidence.kind === 'stripe_transfer'
+      ? `rail/seen/stripe/${evidence.ref}`
+      : null;
+  }
+
   async tnkSettlement() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -4840,6 +4987,33 @@ class MayhemContract extends Contract {
     if (outputs instanceof Error) return outputs;
     if (stableJson(outputs) !== stableJson(this.value.outputs)) {
       return new Error('TNK settlement outputs must be canonical.');
+    }
+    const transfers = this.value.msb_transfers.map((entry) => (
+      this.normalizeMsbTransferEvidence(entry, 'TNK settlement MSB transfer evidence')
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(this.value.msb_transfers)) {
+      return new Error('TNK settlement MSB transfers must be canonical.');
+    }
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (
+      this.value.network !== payment.network ||
+      this.value.treasury_from !== payment.treasury_address
+    ) {
+      return new Error('TNK settlement source does not match canonical payment config.');
+    }
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      if (
+        transfer.network !== this.value.network ||
+        transfer.from !== this.value.treasury_from ||
+        transfer.to !== output.to ||
+        transfer.amount_e18 !== output.tnk_e18
+      ) {
+        return new Error('TNK settlement MSB transfer does not match output.');
+      }
     }
     const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_au);
     if (totals instanceof Error) return totals;
@@ -4864,7 +5038,7 @@ class MayhemContract extends Contract {
       return new Error('TNK settlement transfer root does not match outputs.');
     }
 
-    const record = this.tnkSettlementRecord(outputs);
+    const record = this.tnkSettlementRecord(outputs, transfers);
     const key = `settle/tnk/${this.value.epoch}`;
     const existing = await this.get(key);
     if (existing) {
@@ -4875,7 +5049,7 @@ class MayhemContract extends Contract {
           epoch: this.value.epoch,
           rail: 'tnk',
           idempotent: true,
-          msb_tx_hashes: this.value.msb_tx_hashes,
+          msb_transfers: transfers,
         };
       }
       return new Error('TNK settlement already exists for epoch.');
@@ -4887,6 +5061,12 @@ class MayhemContract extends Contract {
       applyState.last_apply_hash !== this.value.epoch_apply_hash
     ) {
       return new Error('TNK settlement epoch apply hash does not match current state.');
+    }
+
+    for (const transfer of transfers) {
+      if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
+        return new Error('TNK settlement MSB transfer was already consumed by Mayhem.');
+      }
     }
 
     const rate = await this.guardianRequireHistoricalTnkRate(this.value, this.value.at);
@@ -4947,7 +5127,7 @@ class MayhemContract extends Contract {
         paid_cum_au: paidCumAu,
         updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
         last_settlement_epoch: this.value.epoch,
-        last_settlement_msb_tx_hash: this.value.msb_tx_hashes[outputIndex],
+        last_settlement_msb_tx_hash: transfers[outputIndex].tx_hash,
       };
       const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'tnk');
       if (nextError) return nextError;
@@ -4982,7 +5162,7 @@ class MayhemContract extends Contract {
       updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
       last_settlement_epoch: this.value.epoch,
       last_settlement_msb_tx_hash: operatorOutputIndex >= 0
-        ? this.value.msb_tx_hashes[operatorOutputIndex]
+        ? transfers[operatorOutputIndex].tx_hash
         : (fee.last_settlement_msb_tx_hash ?? null),
     };
     const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
@@ -4991,6 +5171,16 @@ class MayhemContract extends Contract {
     for (const earning of earningUpdates) {
       await this.put(this.earningKey(earning.provider, 'tnk'), earning);
     }
+    for (const [index, transfer] of transfers.entries()) {
+      await this.put(this.msbTransferSeenKey(transfer), {
+        rail: 'tnk',
+        purpose: 'settlement',
+        epoch: this.value.epoch,
+        output_index: index,
+        transfer_root: this.value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
     await this.put(this.feeCumKey('tnk'), nextFee);
     await this.put(key, record);
     console.log('mayhem tnkSettlement', {
@@ -4998,7 +5188,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_tx_hashes: transfers.map((entry) => entry.tx_hash),
     });
     return {
       ok: true,
@@ -5009,7 +5199,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_transfers: transfers,
       transfer_root: this.value.transfer_root,
     };
   }
@@ -5029,7 +5219,7 @@ class MayhemContract extends Contract {
         'rate_tnk_usd_au',
         'rate_source',
         'rate_ts',
-        'msb_tx_hashes',
+        'msb_transfers',
         'transfer_root',
         'provider_count',
         'provider_au',
@@ -5049,16 +5239,20 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(value.treasury_from)) return new Error('Invalid TNK treasury address.');
     if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid TNK operator address.');
     if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid TNK settlement apply hash.');
-    if (!Array.isArray(value.msb_tx_hashes) || value.msb_tx_hashes.length === 0) {
-      return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+    if (!Array.isArray(value.msb_transfers) || value.msb_transfers.length === 0) {
+      return new Error('TNK settlement requires one confirmed MSB transfer per output.');
     }
     const seenTxHashes = new Set();
-    for (const hash of value.msb_tx_hashes) {
-      if (!this.isHexBytes(hash, 32)) {
-        return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+    for (const entry of value.msb_transfers) {
+      const transfer = this.normalizeMsbTransferEvidence(
+        entry,
+        'TNK settlement MSB transfer evidence'
+      );
+      if (transfer instanceof Error) return transfer;
+      if (seenTxHashes.has(transfer.tx_hash)) {
+        return new Error('Duplicate TNK settlement MSB tx hash.');
       }
-      if (seenTxHashes.has(hash)) return new Error('Duplicate TNK settlement MSB tx hash.');
-      seenTxHashes.add(hash);
+      seenTxHashes.add(transfer.tx_hash);
     }
     if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid TNK settlement transfer root.');
     const rateTnkUsdAu = this.normalizeAu(value.rate_tnk_usd_au, 'TNK settlement rate', { allowZero: false });
@@ -5084,8 +5278,8 @@ class MayhemContract extends Contract {
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('TNK settlement outputs are required.');
     }
-    if (value.msb_tx_hashes.length !== value.outputs.length) {
-      return new Error('TNK settlement MSB tx hash count must match outputs.');
+    if (value.msb_transfers.length !== value.outputs.length) {
+      return new Error('TNK settlement MSB transfer count must match outputs.');
     }
     return null;
   }
@@ -5207,7 +5401,7 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-tnk-settlement-transfer-root-v1', outputs);
   }
 
-  tnkSettlementRecord(outputs) {
+  tnkSettlementRecord(outputs, transfers) {
     return {
       type: 'tnk_settlement',
       op: 'tnk_settlement',
@@ -5222,7 +5416,7 @@ class MayhemContract extends Contract {
       rate_tnk_usd_au: this.value.rate_tnk_usd_au,
       rate_source: this.value.rate_source,
       rate_ts: this.value.rate_ts,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_transfers: transfers,
       transfer_root: this.value.transfer_root,
       provider_count: this.value.provider_count,
       provider_au: this.value.provider_au,
@@ -5248,6 +5442,28 @@ class MayhemContract extends Contract {
     if (stableJson(outputs) !== stableJson(this.value.outputs)) {
       return new Error('Fiat settlement outputs must be canonical.');
     }
+    const transfers = this.value.stripe_transfers.map((entry) => (
+      this.normalizeStripeTransferEvidence(entry, 'Fiat settlement Stripe evidence')
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(this.value.stripe_transfers)) {
+      return new Error('Fiat settlement Stripe evidence must be canonical.');
+    }
+    const expectedTransferGroup = `mayhem_fiat_epoch_${this.value.epoch}_${this.value.epoch_apply_hash.slice(0, 16)}`;
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      const expectedKind = output.role === 'provider' ? 'stripe_transfer' : 'platform_balance';
+      if (
+        transfer.kind !== expectedKind ||
+        transfer.destination !== output.to ||
+        transfer.currency !== output.currency ||
+        transfer.amount_minor !== output.amount_minor ||
+        (expectedKind === 'stripe_transfer' && transfer.transfer_group !== expectedTransferGroup)
+      ) {
+        return new Error('Fiat settlement Stripe evidence does not match output.');
+      }
+    }
     const totals = this.fiatSettlementTotals(outputs);
     if (totals instanceof Error) return totals;
     if (totals.provider_count !== this.value.provider_count) {
@@ -5268,7 +5484,7 @@ class MayhemContract extends Contract {
       return new Error('Fiat settlement transfer root does not match outputs.');
     }
 
-    const record = this.fiatSettlementRecord(outputs);
+    const record = this.fiatSettlementRecord(outputs, transfers);
     const key = `settle/fiat/${this.value.epoch}`;
     const existing = await this.get(key);
     if (existing) {
@@ -5279,7 +5495,7 @@ class MayhemContract extends Contract {
           epoch: this.value.epoch,
           rail: 'fiat',
           idempotent: true,
-          stripe_refs: this.value.stripe_refs,
+          stripe_transfers: transfers,
         };
       }
       return new Error('Fiat settlement already exists for epoch.');
@@ -5293,6 +5509,13 @@ class MayhemContract extends Contract {
       return new Error('Fiat settlement epoch apply hash does not match current state.');
     }
 
+    for (const transfer of transfers) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (seenKey && (await this.get(seenKey)) !== null) {
+        return new Error('Stripe transfer was already consumed by Mayhem.');
+      }
+    }
+
     const params = await this.activeParamsAt(this.value.at, [
       'holdback_epochs',
       'challenge_epochs',
@@ -5302,10 +5525,7 @@ class MayhemContract extends Contract {
     const earningUpdates = [];
     for (const [outputIndex, output] of outputs.entries()) {
       if (output.role !== 'provider') continue;
-      const stripeRef = this.value.stripe_refs[outputIndex];
-      if (!stripeRef.startsWith('tr_')) {
-        return new Error('Fiat provider settlement requires a Stripe transfer id.');
-      }
+      const stripeRef = transfers[outputIndex].ref;
       const provider = await this.get(`prov/${output.provider}`);
       if (!provider) return new Error('Provider not found.');
       if (provider.status !== 'active' && provider.status !== 'banned') {
@@ -5394,7 +5614,7 @@ class MayhemContract extends Contract {
       updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
       last_settlement_epoch: this.value.epoch,
       last_settlement_stripe_ref: operatorOutputIndex >= 0
-        ? this.value.stripe_refs[operatorOutputIndex]
+        ? transfers[operatorOutputIndex].ref
         : (fee.last_settlement_stripe_ref ?? null),
     };
     const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
@@ -5403,6 +5623,18 @@ class MayhemContract extends Contract {
     for (const earning of earningUpdates) {
       await this.put(this.earningKey(earning.provider, 'fiat'), earning);
     }
+    for (const [index, transfer] of transfers.entries()) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (!seenKey) continue;
+      await this.put(seenKey, {
+        rail: 'fiat',
+        purpose: 'settlement',
+        epoch: this.value.epoch,
+        output_index: index,
+        transfer_root: this.value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
     await this.put(this.feeCumKey('fiat'), nextFee);
     await this.put(key, record);
     console.log('mayhem fiatSettlement', {
@@ -5410,7 +5642,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      stripe_refs: this.value.stripe_refs,
+      stripe_refs: transfers.map((entry) => entry.ref),
     });
     return {
       ok: true,
@@ -5422,7 +5654,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      stripe_refs: this.value.stripe_refs,
+      stripe_transfers: transfers,
       transfer_root: this.value.transfer_root,
     };
   }
@@ -5438,7 +5670,7 @@ class MayhemContract extends Contract {
         'processor',
         'operator_to',
         'epoch_apply_hash',
-        'stripe_refs',
+        'stripe_transfers',
         'transfer_root',
         'provider_count',
         'provider_au',
@@ -5456,14 +5688,18 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid fiat settlement timestamp.');
     if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid fiat operator target.');
     if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid fiat settlement apply hash.');
-    if (!Array.isArray(value.stripe_refs) || value.stripe_refs.length === 0) {
-      return new Error('Fiat settlement requires one Stripe reference per output.');
+    if (!Array.isArray(value.stripe_transfers) || value.stripe_transfers.length === 0) {
+      return new Error('Fiat settlement requires one confirmed Stripe evidence record per output.');
     }
     const seenRefs = new Set();
-    for (const ref of value.stripe_refs) {
-      if (!this.isSafeKeyPart(ref)) return new Error('Invalid fiat settlement Stripe reference.');
-      if (seenRefs.has(ref)) return new Error('Duplicate fiat settlement Stripe reference.');
-      seenRefs.add(ref);
+    for (const entry of value.stripe_transfers) {
+      const transfer = this.normalizeStripeTransferEvidence(
+        entry,
+        'Fiat settlement Stripe evidence'
+      );
+      if (transfer instanceof Error) return transfer;
+      if (seenRefs.has(transfer.ref)) return new Error('Duplicate fiat settlement Stripe reference.');
+      seenRefs.add(transfer.ref);
     }
     if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid fiat settlement transfer root.');
     if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
@@ -5479,8 +5715,8 @@ class MayhemContract extends Contract {
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('Fiat settlement outputs are required.');
     }
-    if (value.stripe_refs.length !== value.outputs.length) {
-      return new Error('Fiat settlement Stripe reference count must match outputs.');
+    if (value.stripe_transfers.length !== value.outputs.length) {
+      return new Error('Fiat settlement Stripe evidence count must match outputs.');
     }
     return null;
   }
@@ -5610,7 +5846,7 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-fiat-settlement-transfer-root-v1', outputs);
   }
 
-  fiatSettlementRecord(outputs) {
+  fiatSettlementRecord(outputs, transfers) {
     return {
       type: 'fiat_settlement',
       op: 'fiat_settlement',
@@ -5621,7 +5857,7 @@ class MayhemContract extends Contract {
       processor: 'stripe',
       operator_to: this.value.operator_to,
       epoch_apply_hash: this.value.epoch_apply_hash,
-      stripe_refs: this.value.stripe_refs,
+      stripe_transfers: transfers,
       transfer_root: this.value.transfer_root,
       provider_count: this.value.provider_count,
       provider_au: this.value.provider_au,
@@ -5643,14 +5879,27 @@ class MayhemContract extends Contract {
     const quotedRate = this.normalizeAu(this.value.rate_tnk_usd_au, 'TNK quoted rate', { allowZero: false });
     if (quotedRate instanceof Error) return quotedRate;
 
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (this.value.treasury_address !== payment.treasury_address) {
+      return new Error('TNK deposit intent treasury does not match canonical payment config.');
+    }
+    const msbFrom = this.msbAddressForPublicKey(this.address, payment.network);
+    if (msbFrom instanceof Error) return msbFrom;
+
     const key = `dep/pending/${this.value.memo_hash}`;
     if ((await this.get(key)) !== null) return new Error('TNK deposit memo already pending.');
+    if ((await this.get(`dep/tnk-credited/${this.value.memo_hash}`)) !== null) {
+      return new Error('TNK deposit memo already credited.');
+    }
 
     const record = {
       memo_hash: this.value.memo_hash,
       user: this.address,
       status: 'pending',
       requested_at: this.tx,
+      msb_network: payment.network,
+      msb_from: msbFrom,
       treasury_address: this.value.treasury_address,
       tnk_e18: this.value.tnk_e18,
       quoted_au: quotedAu,
@@ -5670,7 +5919,44 @@ class MayhemContract extends Contract {
   async tnkDeposit() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    const shapeError = this.validateExactObjectKeys(
+      this.value,
+      ['op', 'memo_hash', 'msb_transfer', 'epoch', 'at'],
+      'TNK deposit credit'
+    );
+    if (shapeError) return shapeError;
+    if (this.value.op !== 'tnk_deposit') return new Error('Invalid TNK deposit credit op.');
     if (!this.isSafeKeyPart(this.value.memo_hash)) return new Error('Invalid deposit memo hash.');
+    if (!Number.isSafeInteger(this.value.epoch) || this.value.epoch < 1) {
+      return new Error('Invalid TNK deposit epoch.');
+    }
+    if (!Number.isSafeInteger(this.value.at) || this.value.at < 0) {
+      return new Error('Invalid TNK deposit timestamp.');
+    }
+
+    const transfer = this.normalizeMsbTransferEvidence(
+      this.value.msb_transfer,
+      'TNK deposit MSB transfer evidence'
+    );
+    if (transfer instanceof Error) return transfer;
+    const creditedKey = `dep/tnk-credited/${this.value.memo_hash}`;
+    const existingCredit = await this.get(creditedKey);
+    if (existingCredit) {
+      if (stableJson(existingCredit.msb_transfer) !== stableJson(transfer)) {
+        return new Error('TNK deposit memo already credited by a different MSB transfer.');
+      }
+      return {
+        ok: true,
+        op: 'tnkDeposit',
+        who: existingCredit.user,
+        au: existingCredit.au,
+        epoch: existingCredit.epoch,
+        deposit_root: existingCredit.deposit_root,
+        rate_ts: existingCredit.rate_ts,
+        msb_tx_hash: transfer.tx_hash,
+        idempotent: true,
+      };
+    }
 
     const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
@@ -5678,7 +5964,27 @@ class MayhemContract extends Contract {
     const pending = await this.get(pendingKey);
     if (!pending || pending.status !== 'pending') return new Error('Pending TNK deposit intent not found.');
 
-    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (
+      pending.msb_network !== payment.network ||
+      pending.treasury_address !== payment.treasury_address
+    ) {
+      return new Error('Pending TNK deposit no longer matches canonical payment config.');
+    }
+    if (
+      transfer.network !== payment.network ||
+      transfer.from !== pending.msb_from ||
+      transfer.to !== payment.treasury_address
+    ) {
+      return new Error('TNK deposit MSB transfer identity does not match pending intent.');
+    }
+    const transferSeenKey = this.msbTransferSeenKey(transfer);
+    if ((await this.get(transferSeenKey)) !== null) {
+      return new Error('MSB transfer already consumed by Mayhem.');
+    }
+
+    const tnkE18 = this.parseTnkE18(transfer.amount_e18);
     if (tnkE18 instanceof Error) return tnkE18;
     const pendingTnkE18 = this.parseTnkE18(pending.tnk_e18);
     if (pendingTnkE18 instanceof Error) return pendingTnkE18;
@@ -5703,8 +6009,7 @@ class MayhemContract extends Contract {
       memo_hash: this.value.memo_hash,
       user_hash: await this.opaqueHash('deposit-user', pending.user),
       au,
-      tnk_e18: this.value.tnk_e18,
-      msb_tx_hash: this.value.msb_tx_hash,
+      msb_transfer: transfer,
       rate_ts: rate.ts,
       treasury_address_hash: await this.opaqueHash('deposit-treasury', pending.treasury_address),
       quoted_au: pending.quoted_au,
@@ -5727,11 +6032,31 @@ class MayhemContract extends Contract {
     };
     await this.put(this.balanceKey(pending.user, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    await this.put(creditedKey, {
+      rail: 'tnk',
+      memo_hash: this.value.memo_hash,
+      user: pending.user,
+      au,
+      epoch: this.value.epoch,
+      rate_ts: rate.ts,
+      deposit_root: depositRoot.merkle_root,
+      msb_transfer: transfer,
+      credited_at: this.tx,
+    });
+    await this.put(transferSeenKey, {
+      rail: 'tnk',
+      purpose: 'deposit',
+      memo_hash: this.value.memo_hash,
+      user: pending.user,
+      amount_e18: transfer.amount_e18,
+      consumed_at: this.tx,
+    });
     await this.del(pendingKey);
     console.log('mayhem tnkDeposit', {
       who: pending.user,
       au,
-      tnk_e18: this.value.tnk_e18,
+      tnk_e18: transfer.amount_e18,
+      msb_tx_hash: transfer.tx_hash,
       rate_ts: rate.ts,
       epoch: this.value.epoch,
     });
@@ -5743,6 +6068,8 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
+      msb_tx_hash: transfer.tx_hash,
+      idempotent: false,
     };
   }
 

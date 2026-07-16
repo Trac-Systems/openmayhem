@@ -19,6 +19,7 @@ import {
 
 const rulesHash = '6'.repeat(64);
 const oneTnkE18 = '1000000000000000000';
+const treasury = `testtrac1${'1'.repeat(40)}`;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
@@ -43,6 +44,22 @@ async function setupRateContract() {
       txNo: 1,
     },
     {
+      type: 'setPayments',
+      value: {
+        op: 'set_payments',
+        ver: 1,
+        fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+        tap: {
+          chain_id: 61_000,
+          token_address: `0x${'1'.repeat(40)}`,
+          pool_address: `0x${'2'.repeat(40)}`,
+        },
+        tnk: { network: 'testnet1', treasury_address: treasury },
+      },
+      sender: admin.publicKey,
+      txNo: 2,
+    },
+    {
       type: 'consent',
       value: {
         op: 'consent',
@@ -51,13 +68,13 @@ async function setupRateContract() {
         sig: signConsent(provider.wallet, 1, rulesHash),
       },
       sender: provider.publicKey,
-      txNo: 2,
+      txNo: 3,
     },
     {
       type: 'registerProvider',
       value: providerRegistration,
       sender: provider.publicKey,
-      txNo: 3,
+      txNo: 4,
     },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
@@ -87,7 +104,7 @@ async function tnkDepositIntent(contract, storage, user, memoHash, overrides = {
   const intent = {
     op: 'deposit_tnk',
     memo_hash: memoHash,
-    treasury_address: 'testtrac1treasury',
+    treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
@@ -107,14 +124,23 @@ async function tnkDepositIntent(contract, storage, user, memoHash, overrides = {
   );
 }
 
-const tnkDepositConfirm = (memoHash, overrides = {}) => ({
+const tnkDepositConfirm = (contract, user, memoHash, overrides = {}) => ({
   op: 'tnk_deposit',
   memo_hash: memoHash,
-  tnk_e18: oneTnkE18,
-  msb_tx_hash: 'd'.repeat(64),
+  msb_transfer: {
+    schema_version: 1,
+    network: 'testnet1',
+    tx_hash: 'd'.repeat(64),
+    confirmed_length: 100,
+    observed_signed_length: 112,
+    from: contract.msbAddressForPublicKey(user.publicKey, 'testnet1'),
+    to: treasury,
+    amount_e18: oneTnkE18,
+    ...(overrides.msb_transfer ?? {}),
+  },
   epoch: 1,
   at: 1_900,
-  ...overrides,
+  ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'msb_transfer')),
 });
 
 test('MayhemContract rateOracle feature is admin controlled and monotonic', async () => {
@@ -317,7 +343,7 @@ test('MayhemContract refuses TNK deposit credits when the rate is stale', async 
   const staleDeposit = await executeDepositFeature(
     contract,
     storage,
-    tnkDepositConfirm('stale-deposit', { at: 3_701 }),
+    tnkDepositConfirm(contract, user, 'stale-deposit', { at: 3_701 }),
     admin.publicKey
   );
   assert.match(staleDeposit.message, /rate oracle is stale/i);
@@ -346,7 +372,9 @@ test('MayhemContract refuses TNK deposit credits when the rate is stale', async 
   );
   assert.equal(intent.ok, true, intent.message);
 
-  const freshTnkValue = tnkDepositConfirm('fresh-deposit', { msb_tx_hash: 'f'.repeat(64) });
+  const freshTnkValue = tnkDepositConfirm(contract, user, 'fresh-deposit', {
+    msb_transfer: { tx_hash: 'f'.repeat(64) },
+  });
   const freshTnkKey = await depositFeatureKey(contract, freshTnkValue);
   const freshDeposit = await executeDepositFeature(
     contract,
@@ -401,7 +429,10 @@ test('MayhemContract rate staleness follows scheduled params', async () => {
   const staleByScheduledParam = await executeDepositFeature(
     contract,
     storage,
-    tnkDepositConfirm('scheduled-stale', { msb_tx_hash: '2'.repeat(64), at: 86_461 }),
+    tnkDepositConfirm(contract, user, 'scheduled-stale', {
+      msb_transfer: { tx_hash: '2'.repeat(64) },
+      at: 86_461,
+    }),
     admin.publicKey
   );
   assert.match(staleByScheduledParam.message, /rate oracle is stale/i);

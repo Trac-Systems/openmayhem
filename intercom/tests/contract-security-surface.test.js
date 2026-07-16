@@ -273,8 +273,16 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
   {
     op: 'tnk_deposit',
     memo_hash: 'memo-security',
-    tnk_e18: '1000000000000000000',
-    msb_tx_hash: 'msb-security',
+    msb_transfer: {
+      schema_version: 1,
+      network: 'testnet1',
+      tx_hash: '1'.repeat(64),
+      confirmed_length: 10,
+      observed_signed_length: 12,
+      from: 'testtrac1sender',
+      to: 'testtrac1treasury',
+      amount_e18: '1000000000000000000',
+    },
     epoch: 1,
     at: 3_600,
   },

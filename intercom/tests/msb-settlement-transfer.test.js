@@ -32,6 +32,7 @@ function makeMsb({ accept = false } = {}) {
       getFee: () => bigIntTo16ByteBuffer(decimalStringToBigInt('0.001')),
       getIndexerSequenceState: async () => 'c'.repeat(64),
       getSigned: async (hash) => (state.confirmed && hash === txHash ? Buffer.from('confirmed') : null),
+      getSignedLength: () => 48,
       getTransactionConfirmedLength: async (hash) => (
         state.confirmed && hash === txHash ? 42 : null
       ),
@@ -117,6 +118,7 @@ test('journaled MSB settlement retries the exact prepared transaction after inte
   assert.equal(recovered.recovered, true);
   assert.equal(recovered.rebroadcast, true);
   assert.equal(recovered.confirmed_length, 42);
+  assert.equal(recovered.observed_signed_length, 48);
   assert.equal(JSON.parse(fs.readFileSync(journalFile, 'utf8')).status, 'confirmed');
 
   const replay = await executeJournaledSettlementTransfer(

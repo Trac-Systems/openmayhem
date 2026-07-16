@@ -4447,10 +4447,6 @@ struct AdminTnkSettlementArgs {
     #[arg(long)]
     submit_transfer: bool,
 
-    /// Use already-broadcast 64-hex MSB transfer hashes for evidence, in output order.
-    #[arg(long = "msb-tx-hash", value_delimiter = ',')]
-    msb_tx_hashes: Vec<String>,
-
     /// Maximum seconds to wait for MSB account sync and validator connection.
     #[arg(long, default_value_t = 180)]
     msb_transfer_timeout_seconds: u64,
@@ -4485,10 +4481,6 @@ struct AdminFiatSettlementArgs {
     #[arg(long)]
     at: Option<u64>,
 
-    /// Operator/platform Stripe balance reference for retained fiat fees.
-    #[arg(long)]
-    operator_stripe_ref: Option<String>,
-
     /// Operator/platform target recorded for retained fiat fees.
     #[arg(long, default_value = "platform_balance")]
     operator_stripe_account: String,
@@ -4500,10 +4492,6 @@ struct AdminFiatSettlementArgs {
     /// Broadcast provider Stripe Connect transfers. Requires --submit.
     #[arg(long)]
     submit_transfer: bool,
-
-    /// Use already-created Stripe references in output order; provider refs must be tr_*.
-    #[arg(long = "stripe-ref", value_delimiter = ',')]
-    stripe_refs: Vec<String>,
 
     /// File with STRIPE_SECRET_KEY/MAYHEM_STRIPE_SECRET_KEY. Defaults to .mayhem-local/secrets/stripe.txt when present.
     #[arg(long, value_name = "PATH")]
@@ -4537,6 +4525,26 @@ struct AdminTnkDepositArgs {
 
     #[arg(long)]
     msb_tx_hash: String,
+
+    /// Canonical MSB network observed by the embedded read-only watcher.
+    #[arg(long)]
+    msb_network: String,
+
+    /// Confirmed transfer sender returned by the embedded MSB reader.
+    #[arg(long)]
+    msb_from: String,
+
+    /// Confirmed transfer recipient returned by the embedded MSB reader.
+    #[arg(long)]
+    msb_to: String,
+
+    /// Signed MSB length at which the transfer was confirmed.
+    #[arg(long)]
+    msb_confirmed_length: u64,
+
+    /// MSB signed length observed by the watcher when it submitted evidence.
+    #[arg(long)]
+    msb_observed_signed_length: u64,
 
     #[arg(long)]
     epoch: u64,
@@ -5692,12 +5700,15 @@ struct MsbTransferOutput {
     tx_hash: String,
     before_balance: String,
     validator_connections: u64,
+    confirmed_length: Option<u64>,
+    observed_signed_length: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct MsbSettlementTransferOutput {
     to: String,
     amount: String,
+    amount_e18: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -20990,9 +21001,6 @@ fn admin_fiat_settlement_payload(args: &AdminFiatSettlementArgs) -> Result<Value
 }
 
 async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
-    if args.submit_transfer && !args.msb_tx_hashes.is_empty() {
-        bail!("pass only one of --submit-transfer or --msb-tx-hash");
-    }
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
     }
@@ -21022,12 +21030,6 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
     let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
     let manifest_path = tnk_settlement_manifest_path(&home, &network, epoch);
-    let provided_msb_tx_hashes = args
-        .msb_tx_hashes
-        .iter()
-        .map(|hash| validate_msb_tx_hash(hash))
-        .collect::<Result<Vec<_>>>()?;
-
     let mut plan = build_tnk_settlement_plan(
         &rpc,
         epoch,
@@ -21035,11 +21037,6 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         &network,
         &treasury_address,
         &operator_tnk_address,
-        if provided_msb_tx_hashes.is_empty() {
-            None
-        } else {
-            Some(provided_msb_tx_hashes.as_slice())
-        },
         args.submit_transfer.then_some(manifest_path.as_path()),
     )
     .await?;
@@ -21059,16 +21056,16 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hashes")
+            .get("msb_transfers")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
         && args.tx.submit
         && !args.submit_transfer
     {
-        bail!("--submit requires one --msb-tx-hash per output or --submit-transfer for TNK settlement evidence");
+        bail!("--submit requires --submit-transfer so the embedded MSB reader can confirm every TNK settlement output");
     }
 
-    let mut msb_transfers = Vec::new();
+    let mut msb_transfer_results = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
         let manifest = settlement_manifest
             .as_ref()
@@ -21099,7 +21096,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             );
         }
         let (stores_directory, store_name) = msb_store_from_keypair_path(keypair_path)?;
-        let mut hashes = Vec::with_capacity(plan.msb_outputs.len());
+        let mut evidence = Vec::with_capacity(plan.msb_outputs.len());
         for (index, output) in plan.msb_outputs.iter().enumerate() {
             let operation_id = tnk_settlement_output_operation_id(manifest, index, output);
             let journal_path = tnk_settlement_output_journal_path(manifest_path, &operation_id)?;
@@ -21139,24 +21136,42 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                     index + 1
                 );
             }
-            hashes.push(transfer.tx_hash.clone());
-            msb_transfers.push(json!({
+            let confirmed_length = transfer
+                .confirmed_length
+                .context("embedded MSB reader did not return the confirmed transfer length")?;
+            let observed_signed_length = transfer
+                .observed_signed_length
+                .context("embedded MSB reader did not return its observed signed length")?;
+            if confirmed_length == 0 || observed_signed_length < confirmed_length {
+                bail!("embedded MSB reader returned invalid transfer confirmation evidence");
+            }
+            evidence.push(json!({
+                "schema_version": 1,
+                "network": network,
+                "tx_hash": transfer.tx_hash.clone(),
+                "confirmed_length": confirmed_length,
+                "observed_signed_length": observed_signed_length,
+                "from": transfer.from.clone(),
+                "to": transfer.to.clone(),
+                "amount_e18": output.amount_e18.clone(),
+            }));
+            msb_transfer_results.push(json!({
                 "output_index": index,
                 "operation_id": operation_id,
                 "journal_file": journal_path,
                 "transfer": transfer,
             }));
         }
-        plan.payload["msb_tx_hashes"] = json!(hashes);
+        plan.payload["msb_transfers"] = json!(evidence);
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hashes")
+            .get("msb_transfers")
             .and_then(Value::as_array)
-            .is_some_and(|hashes| hashes.len() == plan.msb_outputs.len() && !hashes.is_empty())
+            .is_some_and(|items| items.len() == plan.msb_outputs.len() && !items.is_empty())
     {
         Some(json!({
             "feature": "mayhem",
@@ -21178,8 +21193,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             bail!("TNK settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
-        let expected_hashes = settlement_report
-            .get("msb_tx_hashes")
+        let expected_transfers = settlement_report
+            .get("msb_transfers")
             .cloned()
             .unwrap_or(Value::Null);
         let expected_root = settlement_report
@@ -21188,7 +21203,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .unwrap_or(Value::Null);
         settlement_state = Some(
             wait_for_state(&rpc, &format!("settle/tnk/{epoch}"), |value| {
-                value.get("msb_tx_hashes") == Some(&expected_hashes)
+                value.get("msb_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             })
@@ -21292,7 +21307,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         "feature": feature,
         "feature_result": feature_result,
         "settlement_state": settlement_state,
-        "msb_transfers": msb_transfers,
+        "msb_transfers": msb_transfer_results,
         "msb_outputs": plan.msb_outputs,
         "skipped_providers": plan.skipped_providers,
         "copy_paste": {
@@ -21320,9 +21335,6 @@ async fn run_admin_fiat_settlement_feature(args: &AdminFiatSettlementArgs) -> Re
 }
 
 async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
-    if args.submit_transfer && !args.stripe_refs.is_empty() {
-        bail!("pass only one of --submit-transfer or --stripe-ref");
-    }
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
     }
@@ -21342,44 +21354,28 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         bail!("--epoch must be positive");
     }
     let at = args.at.unwrap_or(now_unix_seconds()?);
-    let operator_to =
-        normalize_fiat_settlement_ref(&args.operator_stripe_account, "operator Stripe account")?;
+    let operator_to = args.operator_stripe_account.trim().to_owned();
+    if !is_safe_key_part(&operator_to) {
+        bail!("operator Stripe account is not contract-safe");
+    }
     let operator_currency = normalize_admin_fiat_currency(&args.operator_currency)?;
-    let provided_refs = args
-        .stripe_refs
-        .iter()
-        .map(|value| normalize_fiat_settlement_ref(value, "Stripe reference"))
-        .collect::<Result<Vec<_>>>()?;
-
     let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let mut plan = build_fiat_settlement_plan(
-        &rpc,
-        epoch,
-        at,
-        &operator_to,
-        &operator_currency,
-        args.operator_stripe_ref.as_deref(),
-        if provided_refs.is_empty() {
-            None
-        } else {
-            Some(provided_refs.as_slice())
-        },
-    )
-    .await?;
+    let mut plan =
+        build_fiat_settlement_plan(&rpc, epoch, at, &operator_to, &operator_currency).await?;
 
     if plan.already_settled.is_none()
         && plan
             .payload
-            .get("stripe_refs")
+            .get("stripe_transfers")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
         && args.tx.submit
         && !args.submit_transfer
     {
-        bail!("--submit requires one --stripe-ref per output or --submit-transfer for provider Stripe transfer evidence");
+        bail!("--submit requires --submit-transfer so every provider payout is retrieved and verified from Stripe");
     }
 
     let mut stripe_transfers = Vec::new();
@@ -21403,7 +21399,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             stripe_transfer_runtime_is_mainnet()?,
         )?;
         let client = reqwest::Client::new();
-        let mut refs = Vec::with_capacity(plan.stripe_outputs.len());
+        let mut evidence = Vec::with_capacity(plan.stripe_outputs.len());
         for (index, output) in plan.stripe_outputs.iter().enumerate() {
             if output.role == "provider" {
                 let account = stripe_connect_payout_status(
@@ -21478,30 +21474,42 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         index + 1
                     );
                 }
-                refs.push(transfer.id.clone());
+                evidence.push(json!({
+                    "schema_version": 1,
+                    "kind": "stripe_transfer",
+                    "ref": transfer.id.clone(),
+                    "destination": transfer.destination.clone(),
+                    "currency": transfer.currency.clone(),
+                    "amount_minor": transfer.amount_minor.to_string(),
+                    "transfer_group": transfer.transfer_group.clone(),
+                }));
                 stripe_transfers.push(json!({
                     "output_index": index,
                     "account": account,
                     "transfer": transfer,
                 }));
             } else {
-                refs.push(operator_fiat_settlement_ref(
-                    args.operator_stripe_ref.as_deref(),
-                    epoch,
-                    &plan.epoch_apply_hash,
-                )?);
+                evidence.push(json!({
+                    "schema_version": 1,
+                    "kind": "platform_balance",
+                    "ref": operator_fiat_settlement_ref(epoch, &plan.epoch_apply_hash),
+                    "destination": output.to,
+                    "currency": output.currency,
+                    "amount_minor": output.amount_minor.to_string(),
+                    "transfer_group": null,
+                }));
             }
         }
-        plan.payload["stripe_refs"] = json!(refs);
+        plan.payload["stripe_transfers"] = json!(evidence);
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("stripe_refs")
+            .get("stripe_transfers")
             .and_then(Value::as_array)
-            .is_some_and(|refs| refs.len() == plan.stripe_outputs.len() && !refs.is_empty())
+            .is_some_and(|items| items.len() == plan.stripe_outputs.len() && !items.is_empty())
     {
         Some(json!({
             "feature": "mayhem",
@@ -21523,8 +21531,8 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             bail!("fiat settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
-        let expected_refs = settlement_report
-            .get("stripe_refs")
+        let expected_transfers = settlement_report
+            .get("stripe_transfers")
             .cloned()
             .unwrap_or(Value::Null);
         let expected_root = settlement_report
@@ -21533,7 +21541,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .unwrap_or(Value::Null);
         settlement_state = Some(
             wait_for_state(&rpc, &format!("settle/fiat/{epoch}"), |value| {
-                value.get("stripe_refs") == Some(&expected_refs)
+                value.get("stripe_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             })
@@ -21654,8 +21662,16 @@ fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     json!({
         "op": "tnk_deposit",
         "memo_hash": &args.memo_hash,
-        "tnk_e18": &args.tnk_e18,
-        "msb_tx_hash": &args.msb_tx_hash,
+        "msb_transfer": {
+            "schema_version": 1,
+            "network": &args.msb_network,
+            "tx_hash": &args.msb_tx_hash,
+            "confirmed_length": args.msb_confirmed_length,
+            "observed_signed_length": args.msb_observed_signed_length,
+            "from": &args.msb_from,
+            "to": &args.msb_to,
+            "amount_e18": &args.tnk_e18,
+        },
         "epoch": args.epoch,
         "at": args.at,
     })
@@ -22341,12 +22357,12 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
     if !report["already_settled"].is_null() {
         println!("Already settled: true");
-        let hashes = report["already_settled"]["msb_tx_hashes"]
+        let transfers = report["already_settled"]["msb_transfers"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0);
-        if hashes > 0 {
-            println!("MSB tx hashes: {hashes}");
+        if transfers > 0 {
+            println!("Confirmed MSB transfers: {transfers}");
         }
         return Ok(());
     }
@@ -22370,19 +22386,19 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
             "Transfer root: {}",
             settlement["transfer_root"].as_str().unwrap_or("")
         );
-        if let Some(hashes) = settlement["msb_tx_hashes"].as_array() {
-            if hashes.is_empty() {
-                println!("MSB tx hashes: pending (dry plan only)");
+        if let Some(transfers) = settlement["msb_transfers"].as_array() {
+            if transfers.is_empty() {
+                println!("Confirmed MSB transfers: pending (dry plan only)");
             } else {
-                println!("MSB tx hashes: {}", hashes.len());
-                for (index, hash) in hashes.iter().enumerate() {
-                    if let Some(hash) = hash.as_str() {
+                println!("Confirmed MSB transfers: {}", transfers.len());
+                for (index, transfer) in transfers.iter().enumerate() {
+                    if let Some(hash) = transfer.get("tx_hash").and_then(Value::as_str) {
                         println!("  {}: {}", index + 1, hash);
                     }
                 }
             }
         } else {
-            println!("MSB tx hashes: pending (dry plan only)");
+            println!("Confirmed MSB transfers: pending (dry plan only)");
         }
     }
     println!(
@@ -22435,12 +22451,12 @@ fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
     if !report["already_settled"].is_null() {
         println!("Already settled: true");
-        let refs = report["already_settled"]["stripe_refs"]
+        let transfers = report["already_settled"]["stripe_transfers"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0);
-        if refs > 0 {
-            println!("Stripe refs: {refs}");
+        if transfers > 0 {
+            println!("Confirmed Stripe records: {transfers}");
         }
         return Ok(());
     }
@@ -22460,19 +22476,19 @@ fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
             "Transfer root: {}",
             settlement["transfer_root"].as_str().unwrap_or("")
         );
-        if let Some(refs) = settlement["stripe_refs"].as_array() {
-            if refs.is_empty() {
-                println!("Stripe refs: pending (dry plan only)");
+        if let Some(transfers) = settlement["stripe_transfers"].as_array() {
+            if transfers.is_empty() {
+                println!("Confirmed Stripe records: pending (dry plan only)");
             } else {
-                println!("Stripe refs: {}", refs.len());
-                for (index, reference) in refs.iter().enumerate() {
-                    if let Some(reference) = reference.as_str() {
+                println!("Confirmed Stripe records: {}", transfers.len());
+                for (index, transfer) in transfers.iter().enumerate() {
+                    if let Some(reference) = transfer.get("ref").and_then(Value::as_str) {
                         println!("  {}: {}", index + 1, reference);
                     }
                 }
             }
         } else {
-            println!("Stripe refs: pending (dry plan only)");
+            println!("Confirmed Stripe records: pending (dry plan only)");
         }
     }
     println!(
@@ -24453,9 +24469,11 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         shell_single_quote(&intent_feature_json)
     ));
     let admin_confirm_command = format!(
-        "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
+        "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --msb-network {} --msb-from <confirmed-from> --msb-to {} --msb-confirmed-length <confirmed-length> --msb-observed-signed-length <signed-length> --epoch <epoch> --at <unix-seconds>",
         shell_single_quote(&memo_hash),
-        tnk_e18
+        tnk_e18,
+        shell_single_quote(&msb_network),
+        shell_single_quote(&treasury_address),
     );
 
     emit_tnk_handoff(
@@ -33774,26 +33792,18 @@ fn resolve_tnk_treasury_keypair_path(explicit: Option<&Path>) -> Result<Option<P
         .transpose()
 }
 
-fn validate_msb_tx_hash(value: &str) -> Result<String> {
-    let value = value.trim().to_ascii_lowercase();
-    if !is_hex_len(&value, 64) {
-        bail!("MSB transaction hash must be 64 hex characters");
-    }
-    Ok(value)
-}
-
 fn tnk_settlement_manifest_value(
     plan: &TnkSettlementPlan,
     epoch: u64,
     network: &str,
     treasury_address: &str,
 ) -> Result<Value> {
-    let msb_tx_hashes = plan
+    let msb_transfers = plan
         .payload
-        .get("msb_tx_hashes")
+        .get("msb_transfers")
         .and_then(Value::as_array)
-        .context("TNK settlement plan missing msb_tx_hashes")?;
-    if !msb_tx_hashes.is_empty() {
+        .context("TNK settlement plan missing msb_transfers")?;
+    if !msb_transfers.is_empty() {
         bail!("TNK settlement manifest must be created before MSB transfers");
     }
     let transfer_root = plan
@@ -33881,11 +33891,11 @@ fn read_tnk_settlement_manifest(
     if payload.get("epoch").and_then(Value::as_u64) != Some(epoch) {
         bail!("TNK settlement manifest frozen payload has a different epoch");
     }
-    let hashes = payload
-        .get("msb_tx_hashes")
+    let transfers = payload
+        .get("msb_transfers")
         .and_then(Value::as_array)
-        .context("TNK settlement manifest frozen payload missing msb_tx_hashes")?;
-    if !hashes.is_empty() {
+        .context("TNK settlement manifest frozen payload missing msb_transfers")?;
+    if !transfers.is_empty() {
         bail!("TNK settlement manifest frozen payload must predate MSB transfers");
     }
     for field in ["epoch_apply_hash", "transfer_root"] {
@@ -34004,7 +34014,7 @@ fn tnk_settlement_output_operation_id(
         "transfer_root": manifest.get("transfer_root"),
         "output_index": output_index,
         "to": output.to,
-        "amount": output.amount,
+        "amount_e18": output.amount_e18,
     }))
 }
 
@@ -34022,7 +34032,6 @@ async fn build_tnk_settlement_plan(
     network: &str,
     treasury_address: &str,
     operator_tnk_address: &str,
-    msb_tx_hashes: Option<&[String]>,
     manifest_path: Option<&Path>,
 ) -> Result<TnkSettlementPlan> {
     for (label, value) in [
@@ -34183,16 +34192,6 @@ async fn build_tnk_settlement_plan(
     }
 
     let totals = tnk_settlement_output_totals(&outputs)?;
-    let provided_msb_tx_hashes = msb_tx_hashes
-        .map(|hashes| hashes.to_vec())
-        .unwrap_or_default();
-    if !provided_msb_tx_hashes.is_empty() && provided_msb_tx_hashes.len() != outputs.len() {
-        bail!(
-            "TNK settlement requires one --msb-tx-hash per output: got {}, expected {}",
-            provided_msb_tx_hashes.len(),
-            outputs.len()
-        );
-    }
     let transfer_root = stable_value_hash(&json!({
         "domain": "mayhem-tnk-settlement-transfer-root-v1",
         "value": outputs,
@@ -34209,7 +34208,7 @@ async fn build_tnk_settlement_plan(
         "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
         "rate_ts": rate_ts,
-        "msb_tx_hashes": provided_msb_tx_hashes,
+        "msb_transfers": [],
         "transfer_root": transfer_root,
         "provider_count": totals.provider_count,
         "provider_au": money_au_json(totals.provider_au),
@@ -34251,6 +34250,7 @@ fn msb_outputs_from_tnk_settlement_payload(
                     .context("settlement output missing recipient")?
                     .to_owned(),
                 amount: tnk_e18_to_decimal(tnk_e18),
+                amount_e18: tnk_e18.to_string(),
             })
         })
         .collect()
@@ -34644,8 +34644,6 @@ async fn build_fiat_settlement_plan(
     at: u64,
     operator_to: &str,
     operator_currency: &str,
-    operator_ref: Option<&str>,
-    stripe_refs: Option<&[String]>,
 ) -> Result<FiatSettlementPlan> {
     if !is_safe_key_part(operator_to) {
         bail!("operator Stripe account is not contract-safe");
@@ -34761,25 +34759,6 @@ async fn build_fiat_settlement_plan(
             au: operator_fee_au,
         });
     }
-    let provided_refs = stripe_refs.map(|refs| refs.to_vec()).unwrap_or_default();
-    if !provided_refs.is_empty() && provided_refs.len() != outputs.len() {
-        bail!(
-            "fiat settlement requires one --stripe-ref per output: got {}, expected {}",
-            provided_refs.len(),
-            outputs.len()
-        );
-    }
-    if provided_refs.is_empty()
-        && operator_ref.is_some()
-        && !outputs.iter().any(|output| output.role == "operator_fee")
-    {
-        bail!("--operator-stripe-ref was provided but the settlement has no operator fee output");
-    }
-    let refs = if provided_refs.is_empty() {
-        Vec::new()
-    } else {
-        validate_fiat_settlement_refs(&outputs, provided_refs)?
-    };
     let output_values = fiat_settlement_output_values(&outputs);
     let transfer_root = stable_value_hash(&json!({
         "domain": "mayhem-fiat-settlement-transfer-root-v1",
@@ -34794,7 +34773,7 @@ async fn build_fiat_settlement_plan(
         "processor": "stripe",
         "operator_to": operator_to,
         "epoch_apply_hash": epoch_apply_hash,
-        "stripe_refs": refs,
+        "stripe_transfers": [],
         "transfer_root": transfer_root,
         "provider_count": totals.provider_count,
         "provider_au": money_au_json(totals.provider_au),
@@ -34999,14 +34978,6 @@ fn fiat_provider_payout_target(
     Ok((addr.to_owned(), currency))
 }
 
-fn normalize_fiat_settlement_ref(value: &str, label: &str) -> Result<String> {
-    let value = value.trim();
-    if !is_safe_key_part(value) {
-        bail!("{label} is not contract-safe");
-    }
-    Ok(value.to_owned())
-}
-
 fn stripe_transfer_idempotency_key(
     epoch: u64,
     provider: &str,
@@ -35028,40 +34999,11 @@ fn stripe_transfer_idempotency_key(
     ))
 }
 
-fn operator_fiat_settlement_ref(
-    override_ref: Option<&str>,
-    epoch: u64,
-    epoch_apply_hash: &str,
-) -> Result<String> {
-    if let Some(value) = override_ref {
-        return normalize_fiat_settlement_ref(value, "operator Stripe reference");
-    }
-    Ok(format!(
+fn operator_fiat_settlement_ref(epoch: u64, epoch_apply_hash: &str) -> String {
+    format!(
         "platform_balance:{epoch}:{}",
         epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
-    ))
-}
-
-fn validate_fiat_settlement_refs(
-    outputs: &[FiatSettlementOutput],
-    refs: Vec<String>,
-) -> Result<Vec<String>> {
-    if refs.len() != outputs.len() {
-        bail!("fiat settlement Stripe reference count must match outputs");
-    }
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::with_capacity(refs.len());
-    for (output, reference) in outputs.iter().zip(refs.iter()) {
-        let reference = normalize_fiat_settlement_ref(reference, "Stripe reference")?;
-        if !seen.insert(reference.clone()) {
-            bail!("duplicate fiat settlement Stripe reference");
-        }
-        if output.role == "provider" && !reference.starts_with("tr_") {
-            bail!("provider Stripe references must be transfer ids starting with tr_");
-        }
-        normalized.push(reference);
-    }
-    Ok(normalized)
+    )
 }
 
 fn stripe_api_base_url(override_url: Option<&str>) -> Result<String> {
@@ -62013,7 +61955,16 @@ mod tests {
             "rate_tnk_usd_au": "50000000000000000",
             "rate_source": "gate-spot",
             "rate_ts": 25_200,
-            "msb_tx_hashes": ["b".repeat(64)],
+            "msb_transfers": [{
+                "schema_version": 1,
+                "network": "testnet1",
+                "tx_hash": "b".repeat(64),
+                "confirmed_length": 10,
+                "observed_signed_length": 12,
+                "from": "testtrac1treasury",
+                "to": "testtrac1operator",
+                "amount_e18": "1000000000000000000"
+            }],
             "transfer_root": "c".repeat(64),
             "provider_count": 0,
             "provider_au": "0",
@@ -62040,7 +61991,6 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -62070,7 +62020,6 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -62088,7 +62037,26 @@ mod tests {
             "processor": "stripe",
             "operator_to": "platform_balance",
             "epoch_apply_hash": "a".repeat(64),
-            "stripe_refs": ["tr_test_provider", "platform_balance:7:fee"],
+            "stripe_transfers": [
+                {
+                    "schema_version": 1,
+                    "kind": "stripe_transfer",
+                    "ref": "tr_test_provider",
+                    "destination": "acct_provider",
+                    "currency": "usd",
+                    "amount_minor": "85",
+                    "transfer_group": format!("mayhem_fiat_epoch_7_{}", &"a".repeat(64)[..16])
+                },
+                {
+                    "schema_version": 1,
+                    "kind": "platform_balance",
+                    "ref": "platform_balance:7:fee",
+                    "destination": "platform_balance",
+                    "currency": "eur",
+                    "amount_minor": "15",
+                    "transfer_group": null
+                }
+            ],
             "transfer_root": "c".repeat(64),
             "provider_count": 1,
             "provider_au": "850000000000000000",
@@ -62119,11 +62087,9 @@ mod tests {
                 settlement_file: None,
                 epoch: None,
                 at: None,
-                operator_stripe_ref: None,
                 operator_stripe_account: "platform_balance".to_owned(),
                 operator_currency: "eur".to_owned(),
                 submit_transfer: false,
-                stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
                 stripe_transfer_max_attempts: 4,
@@ -62148,11 +62114,9 @@ mod tests {
                 settlement_file: None,
                 epoch: None,
                 at: None,
-                operator_stripe_ref: None,
                 operator_stripe_account: "platform_balance".to_owned(),
                 operator_currency: "eur".to_owned(),
                 submit_transfer: false,
-                stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
                 stripe_transfer_max_attempts: 4,
@@ -62169,14 +62133,27 @@ mod tests {
                 memo_hash: "memo".to_owned(),
                 tnk_e18: "1000000000000000000".to_owned(),
                 msb_tx_hash: "msb".to_owned(),
+                msb_network: "testnet1".to_owned(),
+                msb_from: "testtrac1from".to_owned(),
+                msb_to: "testtrac1to".to_owned(),
+                msb_confirmed_length: 10,
+                msb_observed_signed_length: 12,
                 epoch: 1,
                 at: 3_600,
             }),
             json!({
                 "op": "tnk_deposit",
                 "memo_hash": "memo",
-                "tnk_e18": "1000000000000000000",
-                "msb_tx_hash": "msb",
+                "msb_transfer": {
+                    "schema_version": 1,
+                    "network": "testnet1",
+                    "tx_hash": "msb",
+                    "confirmed_length": 10,
+                    "observed_signed_length": 12,
+                    "from": "testtrac1from",
+                    "to": "testtrac1to",
+                    "amount_e18": "1000000000000000000"
+                },
                 "epoch": 1,
                 "at": 3_600,
             })
@@ -62284,7 +62261,7 @@ mod tests {
     }
 
     #[test]
-    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_validate_refs() {
+    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_bind_platform_balance() {
         assert_eq!(
             fiat_whole_minor_au(FIAT_MINOR_AU_CLI * 85 + 1),
             FIAT_MINOR_AU_CLI * 85
@@ -62292,45 +62269,10 @@ mod tests {
         assert_eq!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85).unwrap(), 85);
         assert!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85 + 1).is_err());
 
-        let outputs = vec![
-            FiatSettlementOutput {
-                role: "provider".to_owned(),
-                provider: Some("aa".repeat(32)),
-                to: "acct_provider".to_owned(),
-                currency: "usd".to_owned(),
-                amount_minor: 85,
-                au: FIAT_MINOR_AU_CLI * 85,
-            },
-            FiatSettlementOutput {
-                role: "operator_fee".to_owned(),
-                provider: None,
-                to: "platform_balance".to_owned(),
-                currency: "eur".to_owned(),
-                amount_minor: 15,
-                au: FIAT_MINOR_AU_CLI * 15,
-            },
-        ];
         assert_eq!(
-            validate_fiat_settlement_refs(
-                &outputs,
-                vec![
-                    "tr_test_provider".to_owned(),
-                    "platform_balance:7:fee".to_owned()
-                ]
-            )
-            .unwrap(),
-            vec!["tr_test_provider", "platform_balance:7:fee"]
+            operator_fiat_settlement_ref(7, &"ab".repeat(32)),
+            format!("platform_balance:7:{}", &"ab".repeat(32)[..16])
         );
-        assert!(validate_fiat_settlement_refs(
-            &outputs,
-            vec![
-                "pi_not_transfer".to_owned(),
-                "platform_balance:7:fee".to_owned()
-            ]
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("tr_"));
     }
 
     #[test]
@@ -62868,7 +62810,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 7);
+        assert_eq!(CONTRACT_VERSION, 8);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
     }
@@ -71783,7 +71725,7 @@ State initialization...
                 "rate_tnk_usd_au": "50000000000000000",
                 "rate_source": "gate-spot",
                 "rate_ts": 90_000,
-                "msb_tx_hashes": [],
+                "msb_transfers": [],
                 "transfer_root": transfer_root,
                 "provider_count": 1,
                 "provider_au": "62500000000000000",
@@ -71795,6 +71737,7 @@ State initialization...
             msb_outputs: vec![MsbSettlementTransferOutput {
                 to: "testtrac1provider".to_owned(),
                 amount: "1.25".to_owned(),
+                amount_e18: "1250000000000000000".to_owned(),
             }],
             skipped_providers: Vec::new(),
             already_settled: None,

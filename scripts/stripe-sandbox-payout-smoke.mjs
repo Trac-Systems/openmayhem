@@ -1057,7 +1057,7 @@ async function main() {
     assert.equal(recovered.report.stripe_transfers[0].transfer.recovered, true);
     assert.equal(recovered.report.stripe_transfers[0].transfer.id, transfersAfterFailure[0].id);
     const settlement = (await harness.storage.get(`settle/fiat/${epoch}`))?.value;
-    assert.equal(settlement?.stripe_refs?.[0], transfersAfterFailure[0].id);
+    assert.equal(settlement?.stripe_transfers?.[0]?.ref, transfersAfterFailure[0].id);
     assert.equal(settlement?.epoch_apply_hash, applyState.last_apply_hash);
 
     const settledSnapshot = harness.storage.snapshotBytes();

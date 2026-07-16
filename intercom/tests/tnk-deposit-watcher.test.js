@@ -65,6 +65,8 @@ test('tnk deposit watcher matches quoted pending intents by user-derived MSB sen
     transfers,
     treasuryAddress: treasury,
     addressPrefix: 'testtrac',
+    network: 'testnet1',
+    observedSignedLength: 54,
   });
 
   assert.equal(skipped.length, 0);
@@ -72,16 +74,71 @@ test('tnk deposit watcher matches quoted pending intents by user-derived MSB sen
     {
       memo_hash: 'memo-a',
       user: pubkey,
-      from: sender,
-      treasury_address: treasury,
-      tnk_e18: '1000000000000000000',
-      msb_tx_hash: 'a'.repeat(64),
-      confirmed_length: 42,
+      msb_transfer: {
+        schema_version: 1,
+        network: 'testnet1',
+        tx_hash: 'a'.repeat(64),
+        confirmed_length: 42,
+        observed_signed_length: 54,
+        from: sender,
+        to: treasury,
+        amount_e18: '1000000000000000000',
+      },
       quoted_au: '50000000000000000',
       rate_tnk_usd_au: '50000000000000000',
       rate_source: 'gate-spot',
     },
   ]);
+});
+
+test('tnk deposit watcher refuses evidence without a valid embedded MSB observation', () => {
+  const pendingEntries = pendingEntriesFromState([{
+    value: {
+      memo_hash: 'memo-unconfirmed',
+      user: pubkey,
+      status: 'pending',
+      treasury_address: treasury,
+      tnk_e18: '1000000000000000000',
+      quoted_au: '50000000000000000',
+      rate_tnk_usd_au: '50000000000000000',
+      rate_source: 'gate-spot',
+    },
+  }]);
+  const transfer = {
+    hash: 'f'.repeat(64),
+    from: sender,
+    to: treasury,
+    tnk_e18: '1000000000000000000',
+    confirmed_length: null,
+  };
+
+  assert.throws(() => matchPendingTransfers({
+    pendingEntries,
+    transfers: [transfer],
+    treasuryAddress: treasury,
+    addressPrefix: 'testtrac',
+    network: 'devnet',
+    observedSignedLength: 54,
+  }), /mainnet or testnet1/i);
+  assert.throws(() => matchPendingTransfers({
+    pendingEntries,
+    transfers: [transfer],
+    treasuryAddress: treasury,
+    addressPrefix: 'testtrac',
+    network: 'testnet1',
+    observedSignedLength: 0,
+  }), /positive observed signed length/i);
+
+  const unmatched = matchPendingTransfers({
+    pendingEntries,
+    transfers: [transfer],
+    treasuryAddress: treasury,
+    addressPrefix: 'testtrac',
+    network: 'testnet1',
+    observedSignedLength: 54,
+  });
+  assert.equal(unmatched.matches.length, 0);
+  assert.match(unmatched.skipped[0].reason, /no finalized matching/i);
 });
 
 test('tnk deposit watcher skips unquoted intents because canonical intents must be quoted', () => {
@@ -92,6 +149,7 @@ test('tnk deposit watcher skips unquoted intents because canonical intents must 
         memo_hash: 'memo-unquoted',
         user: pubkey,
         status: 'pending',
+        treasury_address: treasury,
       },
     },
   ]);
@@ -110,6 +168,8 @@ test('tnk deposit watcher skips unquoted intents because canonical intents must 
     transfers,
     treasuryAddress: treasury,
     addressPrefix: 'testtrac',
+    network: 'testnet1',
+    observedSignedLength: 55,
   });
   assert.equal(strict.matches.length, 0);
   assert.match(strict.skipped[0].reason, /no quoted TNK amount/i);
@@ -130,6 +190,8 @@ test('tnk deposit watcher skips unquoted intents because canonical intents must 
     transfers,
     treasuryAddress: treasury,
     addressPrefix: 'testtrac',
+    network: 'testnet1',
+    observedSignedLength: 55,
   });
   assert.equal(amountOnly.matches.length, 0);
   assert.match(amountOnly.skipped[0].reason, /no quoted au_usd/i);
@@ -158,8 +220,16 @@ test('tnk deposit watcher normalizes MSB transfer details and redacts password f
   const command = buildAdminCommand(
     {
       memo_hash: 'memo-c',
-      tnk_e18: transfer.tnk_e18,
-      msb_tx_hash: transfer.hash,
+      msb_transfer: {
+        schema_version: 1,
+        network: 'testnet1',
+        tx_hash: transfer.hash,
+        confirmed_length: transfer.confirmed_length,
+        observed_signed_length: 55,
+        from: transfer.from,
+        to: transfer.to,
+        amount_e18: transfer.tnk_e18,
+      },
     },
     {
       mayhemBin: 'mayhem',
@@ -183,6 +253,10 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
     memo_hash: 'memo-a',
     user: pubkey,
     quoted_au: '50000000000000000',
+    msb_transfer: {
+      network: 'testnet1',
+      tx_hash: 'a'.repeat(64),
+    },
   };
   const state = {
     pending: null,
@@ -198,6 +272,11 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
       count: 1,
       au_total: '50000000000000000',
     },
+    credited: {
+      memo_hash: 'memo-a',
+      msb_transfer: { tx_hash: 'a'.repeat(64) },
+    },
+    transferSeen: { purpose: 'deposit', memo_hash: 'memo-a' },
   };
   assert.equal(depositStateMatches(match, { ...state, epoch: 7 }), true);
   assert.equal(depositStateMatches(match, {
@@ -224,6 +303,12 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
       if (raw.includes('bal%2F')) {
         return { ok: true, status: 200, json: async () => ({ value: state.balance }) };
       }
+      if (raw.includes('dep%2Ftnk-credited')) {
+        return { ok: true, status: 200, json: async () => ({ value: state.credited }) };
+      }
+      if (raw.includes('rail%2Fseen%2Fmsb')) {
+        return { ok: true, status: 200, json: async () => ({ value: state.transferSeen }) };
+      }
       return { ok: true, status: 200, json: async () => ({ value: state.depositRoot }) };
     },
   });
@@ -232,6 +317,8 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
   assert.deepEqual(seenKeys.sort(), [
     `bal/${pubkey}/tnk`,
     'dep/pending/memo-a',
+    'dep/tnk-credited/memo-a',
     'ev/dep/7',
+    `rail/seen/msb/testnet1/${'a'.repeat(64)}`,
   ].sort());
 });

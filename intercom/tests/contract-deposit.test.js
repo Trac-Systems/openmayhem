@@ -20,6 +20,7 @@ import {
 const rulesHash = '5'.repeat(64);
 const oneTnkE18 = '1000000000000000000';
 const halfTnkE18 = '500000000000000000';
+const treasury = `testtrac1${'1'.repeat(40)}`;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
@@ -54,6 +55,26 @@ async function setupDepositContract(identities = null) {
     1
   );
   assert.equal(rules.ok, true, rules.message);
+
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: { network: 'testnet1', treasury_address: treasury },
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(payments.ok, true, payments.message);
 
   return { admin, user, outsider, storage, contract };
 }
@@ -92,7 +113,7 @@ async function setRate(ctx) {
 
 async function depositIntent(ctx, memoHash, txNo, extra = {}) {
   const quoted = {
-    treasury_address: 'testtrac1treasury',
+    treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
@@ -114,12 +135,31 @@ async function depositIntent(ctx, memoHash, txNo, extra = {}) {
   return await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.user.publicKey);
 }
 
-async function confirmDeposit(ctx, memoHash, tnkE18, msbTxHash, txNo, epoch = 1, sender = ctx.admin.publicKey) {
+async function confirmDeposit(
+  ctx,
+  memoHash,
+  tnkE18,
+  msbTxHash,
+  txNo,
+  epoch = 1,
+  sender = ctx.admin.publicKey,
+  transferOverrides = {}
+) {
+  const from = ctx.contract.msbAddressForPublicKey(ctx.user.publicKey, 'testnet1');
   const value = {
     op: 'tnk_deposit',
     memo_hash: memoHash,
-    tnk_e18: tnkE18,
-    msb_tx_hash: msbTxHash,
+    msb_transfer: {
+      schema_version: 1,
+      network: 'testnet1',
+      tx_hash: msbTxHash,
+      confirmed_length: 100,
+      observed_signed_length: 112,
+      from,
+      to: treasury,
+      amount_e18: tnkE18,
+      ...transferOverrides,
+    },
     epoch,
     at: 1_500,
   };
@@ -148,7 +188,9 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     user: ctx.user.publicKey,
     status: 'pending',
     requested_at: ctx.lastDepositIntentKey,
-    treasury_address: 'testtrac1treasury',
+    msb_network: 'testnet1',
+    msb_from: ctx.contract.msbAddressForPublicKey(ctx.user.publicKey, 'testnet1'),
+    treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
@@ -203,8 +245,27 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     updated_at: confirmedKey,
   });
 
+  const credited = (await ctx.storage.get('dep/tnk-credited/memo-a')).value;
+  assert.equal(credited.msb_transfer.tx_hash, 'c'.repeat(64));
+  assert.equal(
+    (await ctx.storage.get(`rail/seen/msb/testnet1/${'c'.repeat(64)}`)).value.purpose,
+    'deposit'
+  );
+
   const replay = await confirmDeposit(ctx, 'memo-a', oneTnkE18, 'c'.repeat(64), 10);
-  assert.match(replay.message, /intent not found/i);
+  assert.equal(replay.ok, true, replay.message);
+  assert.equal(replay.idempotent, true);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '2000000000000000000');
+
+  const reopenedMemo = await depositIntent(ctx, 'memo-a', 11);
+  assert.match(reopenedMemo.message, /already credited/i);
+
+  const secondIntent = await depositIntent(ctx, 'memo-b', 12);
+  assert.equal(secondIntent.ok, true, secondIntent.message);
+  const reusedTransfer = await confirmDeposit(ctx, 'memo-b', oneTnkE18, 'c'.repeat(64), 13);
+  assert.match(reusedTransfer.message, /already consumed/i);
+  assert.notEqual(await ctx.storage.get('dep/pending/memo-b'), null);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '2000000000000000000');
 });
 
 test('MayhemContract stores canonical TNK quote fields and enforces them', async () => {
@@ -212,8 +273,13 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
   await consentUser(ctx, 2);
   await setRate(ctx, 3);
 
-  const intent = await depositIntent(ctx, 'memo-quoted', 4, {
-    treasury_address: 'testtrac1treasury',
+  const wrongTreasury = await depositIntent(ctx, 'memo-wrong-treasury', 4, {
+    treasury_address: `testtrac1${'9'.repeat(40)}`,
+  });
+  assert.match(wrongTreasury.message, /treasury does not match canonical/i);
+
+  const intent = await depositIntent(ctx, 'memo-quoted', 5, {
+    treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
@@ -225,18 +291,82 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
     user: ctx.user.publicKey,
     status: 'pending',
     requested_at: ctx.lastDepositIntentKey,
-    treasury_address: 'testtrac1treasury',
+    msb_network: 'testnet1',
+    msb_from: ctx.contract.msbAddressForPublicKey(ctx.user.publicKey, 'testnet1'),
+    treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
   });
 
-  const wrongAmount = await confirmDeposit(ctx, 'memo-quoted', halfTnkE18, 'd'.repeat(64), 5);
+  const bareHash = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      op: 'tnk_deposit',
+      memo_hash: 'memo-quoted',
+      msb_tx_hash: '3'.repeat(64),
+      epoch: 1,
+      at: 1_500,
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(bareHash.message, /does not accept fields|missing msb_transfer/i);
+
+  const wrongNetwork = await confirmDeposit(
+    ctx,
+    'memo-quoted',
+    oneTnkE18,
+    '4'.repeat(64),
+    6,
+    1,
+    ctx.admin.publicKey,
+    { network: 'mainnet' }
+  );
+  assert.match(wrongNetwork.message, /identity does not match/i);
+
+  const wrongSender = await confirmDeposit(
+    ctx,
+    'memo-quoted',
+    oneTnkE18,
+    '5'.repeat(64),
+    7,
+    1,
+    ctx.admin.publicKey,
+    { from: `testtrac1${'8'.repeat(40)}` }
+  );
+  assert.match(wrongSender.message, /identity does not match/i);
+
+  const wrongReceiver = await confirmDeposit(
+    ctx,
+    'memo-quoted',
+    oneTnkE18,
+    '6'.repeat(64),
+    8,
+    1,
+    ctx.admin.publicKey,
+    { to: `testtrac1${'7'.repeat(40)}` }
+  );
+  assert.match(wrongReceiver.message, /identity does not match/i);
+
+  const unconfirmed = await confirmDeposit(
+    ctx,
+    'memo-quoted',
+    oneTnkE18,
+    '7'.repeat(64),
+    9,
+    1,
+    ctx.admin.publicKey,
+    { confirmed_length: 0 }
+  );
+  assert.match(unconfirmed.message, /confirmed length is invalid/i);
+
+  const wrongAmount = await confirmDeposit(ctx, 'memo-quoted', halfTnkE18, 'd'.repeat(64), 10);
   assert.match(wrongAmount.message, /amount does not match/i);
   assert.notEqual(await ctx.storage.get('dep/pending/memo-quoted'), null);
 
-  const confirmed = await confirmDeposit(ctx, 'memo-quoted', oneTnkE18, 'e'.repeat(64), 6);
+  const confirmed = await confirmDeposit(ctx, 'memo-quoted', oneTnkE18, 'e'.repeat(64), 11);
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(await ctx.storage.get('dep/pending/memo-quoted'), null);
