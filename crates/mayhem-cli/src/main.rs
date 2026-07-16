@@ -49038,6 +49038,11 @@ async fn serve_provider_sessions(
                         .clone()
                         .or_else(|| engine_watchdog_reject.clone())
                         .or_else(|| engine_recovery.rejection());
+                    let event_belongs_to_process = provider_session_event_belongs_to_process(
+                        &event,
+                        &sessions,
+                        &terms,
+                    );
                     if let Err(err) = handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
@@ -49063,17 +49068,25 @@ async fn serve_provider_sessions(
                         provider_session_debug(format!(
                             "session {event_session_id} failed without stopping provider serving: {err:#}"
                         ));
-                        if is_hex_len(&event_remote, 64) && is_hex_len(&event_session_id, 64) {
+                        let owns_session = sessions
+                            .get(&event_session_id)
+                            .is_some_and(|active| active.remote == event_remote);
+                        if event_belongs_to_process
+                            && is_hex_len(&event_remote, 64)
+                            && is_hex_len(&event_session_id, 64)
+                        {
                             let _ = bridge
                                 .session_close(&event_remote, &event_session_id)
                                 .await;
                         }
-                        discard_provider_session_state(
-                            &mut sessions,
-                            &mut pending_requests,
-                            &mut pending_payloads,
-                            &event_session_id,
-                        );
+                        if owns_session {
+                            discard_provider_session_state(
+                                &mut sessions,
+                                &mut pending_requests,
+                                &mut pending_payloads,
+                                &event_session_id,
+                            );
+                        }
                         heartbeat_load.set_active_sessions(sessions.len());
                     }
                 }
@@ -50293,6 +50306,12 @@ async fn handle_provider_session_frame(
         .and_then(Value::as_str)
         .filter(|frame_type| !frame_type.is_empty() && frame_type.len() <= 64)
         .context("provider session frame has invalid type")?;
+    if !provider_session_event_belongs_to_process(&event, sessions, terms) {
+        provider_session_debug(format!(
+            "ignoring unowned provider session frame {frame_type} for {session_id} from {remote} on the shared SC-Bridge"
+        ));
+        return Ok(());
+    }
     match frame_type {
         "s.open" => {
             if let Some(existing) = sessions.get(&session_id) {
@@ -50333,9 +50352,8 @@ async fn handle_provider_session_frame(
             }
             if !provider_session_open_targets_enclave(&frame, terms) {
                 provider_session_debug(format!(
-                    "refusing s.open for session {session_id} from {remote}: frame targets a different enclave"
+                    "ignoring s.open for session {session_id} from {remote}: frame targets a different enclave"
                 ));
-                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             }
             provider_session_debug(format!(
@@ -51049,6 +51067,30 @@ async fn handle_provider_session_frame(
         }
     }
     Ok(())
+}
+
+fn provider_session_event_belongs_to_process(
+    event: &Value,
+    sessions: &HashMap<String, ActiveProviderSession>,
+    terms: &ProviderSessionTerms,
+) -> bool {
+    let Some(session_id) = event.get("session_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(remote) = event.get("remote").and_then(Value::as_str) else {
+        return false;
+    };
+    if sessions
+        .get(session_id)
+        .is_some_and(|active| active.remote == remote)
+    {
+        return true;
+    }
+    let Some(frame) = event.get("frame") else {
+        return false;
+    };
+    frame.get("t").and_then(Value::as_str) == Some("s.open")
+        && provider_session_open_targets_enclave(frame, terms)
 }
 
 async fn open_provider_direct_session(
@@ -66078,6 +66120,84 @@ mod tests {
             provider_session_replay_decision(&active, &open_frame).unwrap(),
             ProviderSessionReplayDecision::Pending
         );
+    }
+
+    #[test]
+    fn provider_session_demultiplexes_shared_bridge_by_enclave_and_ownership() {
+        let terms = test_provider_session_terms();
+        let session_id = "aa".repeat(32);
+        let remote = "22".repeat(32);
+        let sessions = HashMap::new();
+        let open = test_session_open_frame(&terms);
+        let open_event = json!({
+            "type": "session_frame",
+            "session_id": session_id,
+            "remote": remote,
+            "frame": open,
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &open_event,
+            &sessions,
+            &terms
+        ));
+
+        let mut other_enclave_open = open_event.clone();
+        other_enclave_open["frame"]["enclave_id"] = json!("33".repeat(32));
+        assert!(!provider_session_event_belongs_to_process(
+            &other_enclave_open,
+            &sessions,
+            &terms
+        ));
+
+        for frame_type in [
+            "s.accept",
+            "s.reject",
+            "s.delta",
+            "s.receipt",
+            "s.error",
+            "s.close",
+        ] {
+            let unrelated = json!({
+                "type": "session_frame",
+                "session_id": "aa".repeat(32),
+                "remote": "22".repeat(32),
+                "frame": {
+                    "t": frame_type,
+                    "session_id": "aa".repeat(32),
+                },
+            });
+            assert!(
+                !provider_session_event_belongs_to_process(&unrelated, &sessions, &terms),
+                "unowned {frame_type} must not let a co-located provider close a buyer session"
+            );
+        }
+
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.remote = "22".repeat(32);
+        let mut owned_sessions = HashMap::new();
+        owned_sessions.insert("aa".repeat(32), active);
+        let owned_request = json!({
+            "type": "session_frame",
+            "session_id": "aa".repeat(32),
+            "remote": "22".repeat(32),
+            "frame": {
+                "t": "s.req",
+                "session_id": "aa".repeat(32),
+            },
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &owned_request,
+            &owned_sessions,
+            &terms
+        ));
+
+        let mut wrong_remote = owned_request;
+        wrong_remote["remote"] = json!("44".repeat(32));
+        assert!(!provider_session_event_belongs_to_process(
+            &wrong_remote,
+            &owned_sessions,
+            &terms
+        ));
     }
 
     #[test]
