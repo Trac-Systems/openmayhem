@@ -1750,6 +1750,93 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
 }
 
 #[tokio::test]
+async fn image_job_reconnect_retrieves_once_without_rebilling_or_idempotency_conflicts() {
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
+        .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "recover this image",
+        "n": 1,
+        "size": "64x64",
+        "steps": 3,
+        "response_format": "b64_json"
+    });
+    let (status, headers, _) = raw_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/v1/images/generations",
+        Some(request.clone()),
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let job_id = headers["x-mayhem-job-id"]
+        .to_str()
+        .expect("job id header")
+        .to_owned();
+    assert_eq!(state.receipts().len(), 1);
+
+    let job_uri = format!("/v1/jobs/{job_id}");
+    let (job_status, job) = json_request(app.clone(), Method::GET, &job_uri, json!({})).await;
+    assert_eq!(job_status, StatusCode::OK, "{job}");
+    assert_eq!(job["status"], "completed");
+    assert_eq!(job["endpoint_family"], "openai_image_generations");
+    let artifact_uri = job["artifacts"][0]["content_url"]
+        .as_str()
+        .expect("artifact content URL")
+        .to_owned();
+
+    let result_uri = format!("{job_uri}/result");
+    let (result_status, result) =
+        json_request(app.clone(), Method::GET, &result_uri, json!({})).await;
+    assert_eq!(result_status, StatusCode::OK, "{result}");
+    assert_eq!(result["result"]["kind"], "image");
+    assert_eq!(result["result"]["usage"][USAGE_IMAGE], 1);
+
+    let (artifact_status, artifact_headers, artifact) =
+        raw_request(app.clone(), Method::GET, &artifact_uri, None).await;
+    assert_eq!(artifact_status, StatusCode::OK);
+    assert_eq!(artifact_headers["content-type"], "image/png");
+    assert_eq!(artifact, b"\x89PNG mayhem image");
+    assert_eq!(state.receipts().len(), 1, "retrieval must never bill");
+
+    let (replay_status, replay) = json_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/v1/images/generations",
+        request,
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["id"], job_id);
+    assert_eq!(replay["status"], "completed");
+    assert_eq!(state.receipts().len(), 1, "idempotent replay must not bill");
+
+    let (conflict_status, conflict) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/images/generations",
+        json!({
+            "model": "admin/image-fixture",
+            "prompt": "a different request",
+            "n": 1,
+            "size": "64x64",
+            "steps": 3,
+            "response_format": "b64_json"
+        }),
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict}");
+    assert!(conflict["error"]["message"]
+        .as_str()
+        .expect("conflict message")
+        .contains("different request"));
+}
+
+#[tokio::test]
 async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
     let expected_image = png_average_hash_fixture(false);
     let substituted_image = png_average_hash_fixture(true);

@@ -60,9 +60,9 @@ use mayhem_enclave::{
     DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
-    ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
-    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
+    EngineBackend, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
+    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
     MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
@@ -13230,6 +13230,7 @@ fn catalog_endpoint_calibration_execute(
         &sealed,
         None,
         Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+        &CancellationToken::new(),
     )
     .map_err(|error| format!("executing provider request: {error:#}"))?;
     let response = catalog_endpoint_calibration_response(&contract.family, request, &output)
@@ -17183,10 +17184,14 @@ fn calibrate_token_canary_prompt_with_speciality(
     let max_tokens = request.max_new_tokens;
     let mut token_ids = Vec::new();
     let output = backend
-        .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
-            token_ids.push(chunk.token_id);
-            Ok(())
-        })
+        .generate(
+            request,
+            &mut |chunk: mayhem_engine::TokenChunk| {
+                token_ids.push(chunk.token_id);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating canary prompt {}", prompt.id))?;
     if token_ids.is_empty() {
         bail!("canary prompt {} produced no tokens", prompt.id);
@@ -17238,10 +17243,14 @@ fn calibrate_image_perceptual_hash_prompt(
     request.flow_shift = prompt.shift;
     let mut artifacts = Vec::new();
     backend
-        .generate_image(request, &mut |chunk: ArtifactChunk| {
-            artifacts.push(chunk);
-            Ok(())
-        })
+        .generate_image(
+            request,
+            &mut |chunk: ArtifactChunk| {
+                artifacts.push(chunk);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating image canary prompt {}", prompt.id))?;
     let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
     let artifact = artifacts
@@ -17298,7 +17307,10 @@ fn calibrate_embedding_cosine_prompt(
     let input = canary_prompt_text(prompt)?;
     let input_bytes = u64::try_from(input.len()).unwrap_or(u64::MAX);
     let output = backend
-        .embed(mayhem_engine::EmbeddingRequest::new(input))
+        .embed(
+            mayhem_engine::EmbeddingRequest::new(input),
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
     let vector = output
         .embeddings
@@ -17352,7 +17364,7 @@ fn calibrate_transcript_match_prompt(
     let audio_bytes = u64::try_from(request.audio.len()).unwrap_or(u64::MAX);
     let measured_audio_seconds = wav_duration_seconds_ceil(&request.audio).unwrap_or(1);
     let output = backend
-        .transcribe(request)
+        .transcribe(request, &CancellationToken::new())
         .with_context(|| format!("transcribing canary prompt {}", prompt.id))?;
     if output.text.trim().is_empty() {
         bail!(
@@ -17410,10 +17422,14 @@ fn calibrate_audio_fingerprint_prompt(
     };
     let mut artifacts = Vec::new();
     let speech = backend
-        .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
-            artifacts.push(chunk);
-            Ok(())
-        })
+        .synthesize_speech(
+            request,
+            &mut |chunk: ArtifactChunk| {
+                artifacts.push(chunk);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("synthesizing TTS canary prompt {}", prompt.id))?;
     let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
     let artifact = artifacts
@@ -27991,17 +28007,21 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             min_tok_s: session_config.min_tok_s,
         };
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
+        let state = GatewayState::from_models(models)
+            .with_canary_registry(canary_registry)
+            .with_provider_earnings(provider_earnings)
+            .with_hidden_update_models(hidden_update_models)
+            .with_failover_policy(failover_policy)
+            .with_epoch_seconds(gateway_epoch_seconds)
+            .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
+            .with_receipt_user_seed(user_seed)
+            .with_job_store_dir(home.join("gateway-jobs"))
+            .map_err(anyhow::Error::msg)
+            .context("opening encrypted gateway job vault")?
+            .with_receipt_balance_au(balance_au)
+            .with_session_backend(Arc::new(backend));
         (
-            GatewayState::from_models(models)
-                .with_canary_registry(canary_registry)
-                .with_provider_earnings(provider_earnings)
-                .with_hidden_update_models(hidden_update_models)
-                .with_failover_policy(failover_policy)
-                .with_epoch_seconds(gateway_epoch_seconds)
-                .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
-                .with_receipt_user_seed(user_seed)
-                .with_receipt_balance_au(balance_au)
-                .with_session_backend(Arc::new(backend)),
+            state,
             catalog_source,
             Some(model_count),
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
@@ -37472,6 +37492,7 @@ struct ProviderLoadSnapshot {
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
     accepting_new: bool,
+    modality_at_capacity: bool,
     modality_active_items: BTreeMap<String, u32>,
 }
 
@@ -37486,6 +37507,7 @@ impl Default for ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         }
     }
@@ -37511,6 +37533,7 @@ impl ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         }
     }
@@ -37527,10 +37550,12 @@ struct ProviderHeartbeatLoad {
     stop: Arc<AtomicBool>,
     modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
     modality_max_inflight_items: Arc<BTreeMap<String, u64>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0);
         Self {
             active_slots: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
@@ -37541,6 +37566,7 @@ impl Default for ProviderHeartbeatLoad {
             stop: Arc::new(AtomicBool::new(false)),
             modality_active_items: Arc::new(BTreeMap::new()),
             modality_max_inflight_items: Arc::new(BTreeMap::new()),
+            changes,
         }
     }
 }
@@ -37570,7 +37596,27 @@ impl ProviderHeartbeatLoad {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
         let session_capacity = u64::from(max_sessions);
-        let free_slots = session_capacity.saturating_sub(active_slots);
+        let modality_active_items = self
+            .modality_active_items
+            .iter()
+            .map(|(modality, active)| {
+                (
+                    modality.clone(),
+                    u32::try_from(active.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let modality_at_capacity = modality_active_items.iter().any(|(modality, active)| {
+            self.modality_max_inflight_items
+                .get(modality)
+                .is_some_and(|limit| *limit > 0 && u64::from(*active) >= *limit)
+        });
+        let session_at_capacity = max_sessions > 0 && active_slots >= session_capacity;
+        let free_slots = if modality_at_capacity {
+            0
+        } else {
+            session_capacity.saturating_sub(active_slots)
+        };
         let engine_backlog = active_requests.saturating_sub(session_capacity);
         let rolling_turn_ms = self.rolling_turn_ms.load(Ordering::Relaxed);
         let est_wait_ms = if engine_backlog > 0 && rolling_turn_ms > 0 {
@@ -37590,23 +37636,19 @@ impl ProviderHeartbeatLoad {
             est_wait_ms,
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
-            accepting_new: self.accepting_new.load(Ordering::Relaxed),
-            modality_active_items: self
-                .modality_active_items
-                .iter()
-                .map(|(modality, active)| {
-                    (
-                        modality.clone(),
-                        u32::try_from(active.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-                    )
-                })
-                .collect(),
+            accepting_new: self.accepting_new.load(Ordering::Relaxed)
+                && !session_at_capacity
+                && !modality_at_capacity,
+            modality_at_capacity,
+            modality_active_items,
         }
     }
 
     fn set_active_sessions(&self, sessions: usize) {
         let active = u64::try_from(sessions).unwrap_or(u64::MAX);
-        self.active_slots.store(active, Ordering::Relaxed);
+        if self.active_slots.swap(active, Ordering::AcqRel) != active {
+            self.notify_change();
+        }
     }
 
     fn begin_request(
@@ -37617,10 +37659,16 @@ impl ProviderHeartbeatLoad {
         for (modality, item_count) in &modality_items {
             let Some(counter) = self.modality_active_items.get(modality) else {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!("provider has no live capacity counter for {modality}");
             };
             let Some(limit) = self.modality_max_inflight_items.get(modality).copied() else {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!("provider has no in-flight capacity limit for {modality}");
             };
             let item_count = u64::from(*item_count);
@@ -37631,6 +37679,9 @@ impl ProviderHeartbeatLoad {
                 .is_ok();
             if !reserved_ok {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!(
                     "provider {modality} capacity is full; request needs {item_count} item(s), limit {limit}"
                 );
@@ -37638,6 +37689,7 @@ impl ProviderHeartbeatLoad {
             reserved.push((modality.clone(), item_count));
         }
         self.active_requests.fetch_add(1, Ordering::Relaxed);
+        self.notify_change();
         Ok(ProviderRequestLoadGuard {
             load: self.clone(),
             modality_items,
@@ -37664,7 +37716,9 @@ impl ProviderHeartbeatLoad {
     }
 
     fn set_accepting_new(&self, accepting_new: bool) {
-        self.accepting_new.store(accepting_new, Ordering::Relaxed);
+        if self.accepting_new.swap(accepting_new, Ordering::AcqRel) != accepting_new {
+            self.notify_change();
+        }
     }
 
     fn is_accepting_new(&self) -> bool {
@@ -37682,6 +37736,7 @@ impl ProviderHeartbeatLoad {
             .map(|(modality, count)| (modality.clone(), u64::from(*count)))
             .collect::<Vec<_>>();
         self.release_modality_items(&reserved);
+        self.notify_change();
     }
 
     fn release_modality_items(&self, reserved: &[(String, u64)]) {
@@ -37709,11 +37764,22 @@ impl ProviderHeartbeatLoad {
     }
 
     fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if !self.stop.swap(true, Ordering::AcqRel) {
+            self.notify_change();
+        }
     }
 
     fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self) {
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -38536,14 +38602,16 @@ trait ProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput>;
     fn respond_streaming(
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
         _stream: Option<&mut ProviderSessionLiveStream<'_>>,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
-        self.respond(terms, body)
+        self.respond(terms, body, cancellation)
     }
 }
 
@@ -38558,7 +38626,9 @@ impl ProviderSessionResponder for DeterministicProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
+        cancellation.check().context("provider request cancelled")?;
         Ok(provider_session_response(terms, body))
     }
 }
@@ -38580,6 +38650,7 @@ impl ProviderSessionResponder for UnavailableProviderSessionResponder {
         &mut self,
         _terms: &ProviderSessionTerms,
         _body: &Value,
+        _cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         bail!("{}", self.reason)
     }
@@ -38610,6 +38681,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response_with_sampling(
             self.backend.as_mut(),
@@ -38618,6 +38690,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             &terms.sampling,
             body,
             None,
+            cancellation,
         )
     }
 
@@ -38626,6 +38699,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         terms: &ProviderSessionTerms,
         body: &Value,
         stream: Option<&mut ProviderSessionLiveStream<'_>>,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response_with_sampling(
             self.backend.as_mut(),
@@ -38634,6 +38708,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             &terms.sampling,
             body,
             stream,
+            cancellation,
         )
     }
 }
@@ -48314,7 +48389,11 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "identity_anchor": identity_anchor,
             "accepting_new": load.accepting_new,
-            "sat": provider_saturation(load.active_slots, max_sessions),
+            "sat": if load.modality_at_capacity {
+                1.0
+            } else {
+                provider_saturation(load.active_slots, max_sessions)
+            },
             "slots": {
                 "active": load.active_slots,
                 "active_requests": load.active_requests,
@@ -48456,7 +48535,9 @@ async fn run_provider_session_heartbeat_connection(
     let mut seq = 0_u64;
     let mut join_rooms = true;
     let mut heartbeat_cache_updated_at = None::<Instant>;
+    let mut load_changes = ctx.load.subscribe_changes();
     while !ctx.load.is_stopped() {
+        load_changes.borrow_and_update();
         let round_started = Instant::now();
         let sent = timeout(
             ctx.bridge_operation_timeout,
@@ -48505,7 +48586,16 @@ async fn run_provider_session_heartbeat_connection(
         // the lag is reported even without session debug enabled.
         let round_elapsed = round_started.elapsed();
         match ctx.heartbeat_interval.checked_sub(round_elapsed) {
-            Some(remaining) => sleep(remaining).await,
+            Some(remaining) => {
+                tokio::select! {
+                    _ = sleep(remaining) => {}
+                    changed = load_changes.changed() => {
+                        if changed.is_err() {
+                            bail!("provider heartbeat load-change channel closed");
+                        }
+                    }
+                }
+            }
             None => eprintln!(
                 "warning: provider heartbeat pipeline is behind: seq {} took {}ms against a {}ms interval; sending the next beat immediately",
                 seq.saturating_sub(1),
@@ -48957,6 +49047,9 @@ async fn serve_provider_sessions(
                         &mut protection,
                         &terms,
                         &runtime,
+                        &sc_bridge_url,
+                        &sc_bridge_token,
+                        session_bridge_operation_deadline,
                         responder.as_mut(),
                         &mut engine_recovery,
                         session_reject,
@@ -49142,6 +49235,95 @@ async fn reconnect_provider_session_bridge(
                 delay = (delay * 2).min(max_delay);
             }
         }
+    }
+}
+
+struct ProviderSessionLivenessMonitor {
+    cancellation: CancellationToken,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl ProviderSessionLivenessMonitor {
+    async fn start(
+        sc_bridge_url: &str,
+        sc_bridge_token: &str,
+        session_id: &str,
+        remote: &str,
+        operation_deadline: Option<Duration>,
+    ) -> Result<Self> {
+        let mut bridge = ScBridgeClient::connect(
+            ScBridgeConfig::new(sc_bridge_url, sc_bridge_token.to_owned())?
+                .with_operation_deadline(operation_deadline),
+        )
+        .await
+        .context("connecting the provider session liveness monitor to SC-Bridge")?;
+        let subscription = bridge
+            .session_subscribe([session_id])
+            .await
+            .context("subscribing the provider session liveness monitor")?;
+        ensure!(
+            subscription
+                .get("session_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(session_id))),
+            "SC-Bridge did not confirm the provider session liveness subscription"
+        );
+
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let session_id = session_id.to_owned();
+        let remote = remote.to_owned();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => return Ok(()),
+                    event = bridge.next_session_event_for(&session_id, None) => {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => {
+                                task_cancellation.cancel();
+                                return Err(anyhow!(error))
+                                    .context("provider session liveness stream stopped");
+                            }
+                        };
+                        if event.get("remote").and_then(Value::as_str) != Some(remote.as_str()) {
+                            continue;
+                        }
+                        let transport_closed = event.get("type").and_then(Value::as_str)
+                            == Some("session_closed");
+                        let peer_closed = event
+                            .get("frame")
+                            .and_then(|frame| frame.get("t"))
+                            .and_then(Value::as_str)
+                            == Some("s.close");
+                        if transport_closed || peer_closed {
+                            task_cancellation.cancel();
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            cancellation,
+            stop: Some(stop),
+            task,
+        })
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.task
+            .await
+            .context("provider session liveness monitor task panicked")?
     }
 }
 
@@ -50071,6 +50253,9 @@ async fn handle_provider_session_frame(
     protection: &mut ProviderProtectionState,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
+    sc_bridge_url: &str,
+    sc_bridge_token: &str,
+    bridge_operation_deadline: Option<Duration>,
     responder: &mut dyn ProviderSessionResponder,
     engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
@@ -50537,6 +50722,19 @@ async fn handle_provider_session_frame(
                 }
             };
             let request_started = request_load.started();
+            let liveness = ProviderSessionLivenessMonitor::start(
+                sc_bridge_url,
+                sc_bridge_token,
+                &active.session_id,
+                &active.remote,
+                bridge_operation_deadline,
+            )
+            .await
+            .context("starting in-session provider peer liveness")?;
+            let cancellation = liveness.cancellation();
+            if provider_session_client_disconnect_requested(bridge, &active).await? {
+                cancellation.cancel();
+            }
             let mut live_stream = responder.supports_live_text_streaming().then(|| {
                 ProviderSessionLiveStream::new(
                     bridge,
@@ -50550,10 +50748,28 @@ async fn handle_provider_session_frame(
                 )
             });
             let response = contain_provider_request(|| {
-                let output = responder.respond_streaming(terms, &body, live_stream.as_mut())?;
+                let output = responder.respond_streaming(
+                    terms,
+                    &body,
+                    live_stream.as_mut(),
+                    &cancellation,
+                )?;
+                cancellation
+                    .check()
+                    .context("provider request cancelled before response publication")?;
                 validate_provider_session_output(terms, &body, &output)?;
                 Ok(output)
             });
+            let response = match liveness.stop().await {
+                Ok(()) => response,
+                Err(error) if response.is_ok() => Err(error),
+                Err(error) => {
+                    provider_session_debug(format!(
+                        "provider session liveness monitor also failed after engine failure: {error:#}"
+                    ));
+                    response
+                }
+            };
             let (output, measured_throughput) = match response {
                 Ok(output) => {
                     if live_stream
@@ -50619,6 +50835,49 @@ async fn handle_provider_session_frame(
                 }
                 Err(err) => {
                     request_load.finish();
+                    let err_text = format!("{err:#}");
+                    if cancellation.is_cancelled()
+                        && !err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT)
+                    {
+                        if let Some(reason) = provider_engine_component_failure(responder, &err) {
+                            heartbeat_load.set_accepting_new(false);
+                            provider_session_debug(format!(
+                                "provider engine component stopped while cancelling session {session_id}; scheduling isolated reload: {reason}"
+                            ));
+                            engine_recovery.mark_failed(reason);
+                        }
+                        let (usage, receipt_seq) = live_stream
+                            .as_ref()
+                            .map(|stream| stream.cancellation_receipt_state())
+                            .unwrap_or_else(|| (ReceiptUsage::default(), 1));
+                        match settle_cancelled_provider_session(
+                            bridge,
+                            &active,
+                            request_id,
+                            terms,
+                            &body,
+                            usage,
+                            receipt_seq,
+                            runtime.runtime_keypair,
+                        )
+                        .await
+                        {
+                            Ok(receipt) => {
+                                protection.record_usage(
+                                    &receipt.body.usage,
+                                    receipt.body.au_owed_cum,
+                                );
+                            }
+                            Err(settlement_error) => provider_session_debug(format!(
+                                "client-disconnect settlement failed for session {session_id}: {settlement_error:#}"
+                            )),
+                        }
+                        sessions.remove(&session_id);
+                        pending_requests.remove(&session_id);
+                        remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                        heartbeat_load.set_active_sessions(sessions.len());
+                        return Ok(());
+                    }
                     if let Some(reason) = provider_engine_component_failure(responder, &err) {
                         heartbeat_load.set_accepting_new(false);
                         provider_session_debug(format!(
@@ -50626,7 +50885,6 @@ async fn handle_provider_session_frame(
                         ));
                         engine_recovery.mark_failed(reason);
                     }
-                    let err_text = format!("{err:#}");
                     if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
                         provider_session_debug(format!(
                             "client disconnected after partial receipt for session {session_id} request {request_id}"
@@ -50896,6 +51154,7 @@ struct ProviderReasoningOutputFilter {
 }
 
 impl ProviderReasoningOutputFilter {
+    #[cfg(test)]
     fn new(mode: ProviderReasoningOutputMode) -> Self {
         Self::with_delimiters(mode, PROVIDER_QWEN_REASONING_DELIMITERS)
     }
@@ -51148,6 +51407,15 @@ impl<'a> ProviderSessionLiveStream<'a> {
         (tok_s.is_finite() && tok_s > 0.0).then_some(tok_s)
     }
 
+    fn cancellation_receipt_state(&self) -> (ReceiptUsage, u64) {
+        let usage = if self.last_checkpoint_tokens == 0 {
+            ReceiptUsage::default()
+        } else {
+            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_tokens)
+        };
+        (usage, self.receipt_seq)
+    }
+
     fn finish(&mut self) -> Result<()> {
         self.flush_pending_delta()?;
         self.poll_client_disconnect()
@@ -51281,6 +51549,46 @@ impl<'a> ProviderSessionLiveStream<'a> {
             prompt_tokens: self.prompt_tokens,
         })
     }
+}
+
+async fn settle_cancelled_provider_session(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    terms: &ProviderSessionTerms,
+    body: &Value,
+    usage: ReceiptUsage,
+    receipt_seq: u64,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    let receipt = provider_session_receipt_for_usage(
+        terms,
+        active,
+        body,
+        usage,
+        receipt_seq,
+        true,
+        runtime_keypair,
+    )
+    .context("building cancelled provider session receipt")?;
+    send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "client_disconnect")
+        .await?;
+    wait_for_provider_receipt_ack(
+        bridge,
+        active,
+        &receipt,
+        provider_session_receipt_ack_timeout(active),
+    )
+    .await
+    .context("waiting for cancelled provider session receipt ack")?;
+    send_provider_session_close(
+        bridge,
+        &active.remote,
+        &active.session_id,
+        "client_disconnect_settled",
+    )
+    .await?;
+    Ok(receipt)
 }
 
 async fn send_provider_session_output(
@@ -52811,7 +53119,7 @@ fn provider_modality_self_test(
     let mut reports = Vec::new();
     for case in cases {
         let output = responder
-            .respond(terms, &case.body)
+            .respond(terms, &case.body, &CancellationToken::new())
             .with_context(|| format!("functional modality canary {} failed", case.prompt_id))?;
         validate_provider_canary_self_test_output(&ctx.selected.model, &output).with_context(
             || {
@@ -54698,6 +55006,7 @@ fn provider_reasoning_level_disabled(level: &str, value: &Value) -> bool {
         })
 }
 
+#[cfg(test)]
 fn provider_reasoning_visible_output(text: &str, mode: ProviderReasoningOutputMode) -> String {
     provider_reasoning_visible_output_with_delimiters(
         text,
@@ -54767,6 +55076,7 @@ fn provider_engine_session_response(
         &catalog::CatalogSamplingProfile::default(),
         &sealed,
         live_stream,
+        &CancellationToken::new(),
     )
 }
 
@@ -54777,6 +55087,7 @@ fn provider_engine_session_response_with_sampling(
     sampling: &catalog::CatalogSamplingProfile,
     body: &Value,
     live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
+    cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
     provider_engine_session_response_with_sampling_bounded(
         backend,
@@ -54786,6 +55097,7 @@ fn provider_engine_session_response_with_sampling(
         body,
         live_stream,
         None,
+        cancellation,
     )
 }
 
@@ -54797,7 +55109,9 @@ fn provider_engine_session_response_with_sampling_bounded(
     body: &Value,
     mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
     output_token_cap: Option<u32>,
+    cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
+    cancellation.check().context("provider request cancelled")?;
     let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
     let endpoint_family = verified.family;
     let request_body = verified.request;
@@ -54810,7 +55124,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             provider_audio_transcription_request_from_body(endpoint_family, request_body, body)?;
         let audio_seconds = request.audio_seconds;
         let output = backend
-            .transcribe(request.engine)
+            .transcribe(request.engine, cancellation)
             .context("transcribing provider session audio with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: output.text,
@@ -54835,10 +55149,14 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("audio_speech input character count overflowed u64")?;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .synthesize_speech(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("synthesizing provider session speech with mayhem-engine")?;
         let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
         if artifacts.is_empty() {
@@ -54869,10 +55187,14 @@ fn provider_engine_session_response_with_sampling_bounded(
         let height = request.height;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .generate_image(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .generate_image(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("generating provider session image artifact with mayhem-engine")?;
         ensure!(
             output.image_count == image_count && u64::from(output.steps) == steps,
@@ -54912,10 +55234,14 @@ fn provider_engine_session_response_with_sampling_bounded(
         let requested_frames = request.frame_count;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .generate_video(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .generate_video(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("generating provider session video artifact with mayhem-engine")?;
         ensure!(
             output.duration_seconds > 0 && output.frame_count > 0,
@@ -54970,17 +55296,25 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut artifact_chunks = Vec::new();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
-                .generate_music(request, &mut |chunk: ArtifactChunk| {
-                    artifact_chunks.push(chunk);
-                    Ok(())
-                })
+                .generate_music(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifact_chunks.push(chunk);
+                        Ok(())
+                    },
+                    cancellation,
+                )
                 .context("generating provider session music artifact with mayhem-engine")?
         } else {
             backend
-                .generate_audio(request, &mut |chunk: ArtifactChunk| {
-                    artifact_chunks.push(chunk);
-                    Ok(())
-                })
+                .generate_audio(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifact_chunks.push(chunk);
+                        Ok(())
+                    },
+                    cancellation,
+                )
                 .context("generating provider session audio artifact with mayhem-engine")?
         };
         ensure!(
@@ -55037,7 +55371,10 @@ fn provider_engine_session_response_with_sampling_bounded(
             .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
             .transpose()?;
         let output = backend
-            .embed(mayhem_engine::EmbeddingRequest { inputs, dimensions })
+            .embed(
+                mayhem_engine::EmbeddingRequest { inputs, dimensions },
+                cancellation,
+            )
             .context("generating provider session embeddings with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
@@ -55107,6 +55444,7 @@ fn provider_engine_session_response_with_sampling_bounded(
                 artifact_chunks.push(chunk);
                 Ok(())
             },
+            cancellation,
         )
         .context("generating provider session response with mayhem-engine")?;
     if tool_mode.is_none() {
@@ -58378,6 +58716,7 @@ mod tests {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn mayhem_engine::TokenSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
             let level = request
                 .speciality_parameters
@@ -58484,6 +58823,7 @@ mod tests {
             &mut self,
             request: GenerateRequest,
             _sink: &mut dyn mayhem_engine::TokenSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
             self.last_request = Some(request);
             Ok(self.output.clone())
@@ -58494,8 +58834,9 @@ mod tests {
             request: GenerateRequest,
             token_sink: &mut dyn mayhem_engine::TokenSink,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
-            let output = self.generate(request, token_sink)?;
+            let output = self.generate(request, token_sink, cancellation)?;
             for chunk in self.artifact_chunks.clone() {
                 artifact_sink.on_artifact_chunk(chunk)?;
             }
@@ -58505,6 +58846,7 @@ mod tests {
         fn embed(
             &mut self,
             request: mayhem_engine::EmbeddingRequest,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
             self.last_embedding_request = Some(request);
             Ok(self.embedding_output.clone())
@@ -58514,6 +58856,7 @@ mod tests {
             &mut self,
             request: EngineImageGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::ImageGenerationOutput> {
             self.image_generation_calls = self.image_generation_calls.saturating_add(1);
             let output = mayhem_engine::ImageGenerationOutput {
@@ -58539,6 +58882,7 @@ mod tests {
         fn transcribe(
             &mut self,
             request: EngineAudioTranscriptionRequest,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::AudioTranscriptionOutput> {
             self.last_transcription_request = Some(request);
             Ok(self.transcription_output.clone())
@@ -58548,6 +58892,7 @@ mod tests {
             &mut self,
             request: SpeechRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::SpeechOutput> {
             self.last_speech_request = Some(request);
             for chunk in self.artifact_chunks.clone() {
@@ -58562,6 +58907,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -58579,6 +58925,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -58596,6 +58943,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -66353,6 +66701,35 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn cancelled_provider_receipt_charges_locked_minimum_for_zero_usage() {
+        let mut terms = test_provider_session_terms();
+        terms.per_req_au = 11;
+        terms.min_session_au = 37;
+        let active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &json!({
+                "mayhem_contract": {
+                    "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                },
+                "contract_request": {"prompt": "cancelled render"},
+            }),
+            ReceiptUsage::default(),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .expect("cancelled receipt");
+
+        assert!(receipt.body.final_receipt);
+        assert_eq!(receipt.body.usage, ReceiptUsage::default());
+        assert_eq!(receipt.body.locked_per_req_au, 11);
+        assert_eq!(receipt.body.locked_min_session_au, 37);
+        assert_eq!(receipt.body.au_owed_cum, 37);
+    }
+
+    #[test]
     fn gateway_startup_report_accepts_balance_above_json_u64_limit() {
         let max = MoneyAu::MAX;
         let public_key = "ab".repeat(32);
@@ -67273,6 +67650,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &catalog::CatalogSamplingProfile::default(),
             &sealed,
             None,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(production.last_request.unwrap().max_new_tokens, 262_144);
@@ -67286,6 +67664,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &sealed,
             None,
             Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -67333,6 +67712,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &model.sampling,
                 &sealed,
                 None,
+                &CancellationToken::new(),
             )
             .unwrap_or_else(|error| panic!("{} translate: {error:#}", prompt.id));
             covered.extend(modalities);
@@ -67818,6 +68198,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &model.sampling,
             &sealed,
             None,
+            &CancellationToken::new(),
         )
         .unwrap();
 
@@ -69213,6 +69594,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &mut self,
                 _terms: &ProviderSessionTerms,
                 _body: &Value,
+                _cancellation: &CancellationToken,
             ) -> Result<ProviderSessionOutput> {
                 bail!("injected engine child failure")
             }
@@ -69630,9 +70012,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_load_tracks_live_active_slots() {
         let load = ProviderHeartbeatLoad::default();
+        let mut changes = load.subscribe_changes();
         assert_eq!(load.snapshot(0), ProviderLoadSnapshot::default());
         assert_eq!(load.snapshot(8), ProviderLoadSnapshot::idle(8));
+        assert!(!changes.has_changed().unwrap());
         load.set_active_sessions(2);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
         assert_eq!(
             load.snapshot(4),
             ProviderLoadSnapshot {
@@ -69644,10 +70030,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 ttft_ms: 0,
                 measured_tok_s_milli: None,
                 accepting_new: true,
+                modality_at_capacity: false,
                 modality_active_items: BTreeMap::new(),
             }
         );
         load.set_accepting_new(false);
+        assert!(changes.has_changed().unwrap());
         assert!(!load.snapshot(4).accepting_new);
         assert!(!load.is_stopped());
         load.stop();
@@ -69714,14 +70102,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let first = load
             .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
             .unwrap();
-        assert_eq!(load.snapshot(4).modality_active_items["image"], 1);
+        let busy = load.snapshot(4);
+        assert_eq!(busy.modality_active_items["image"], 1);
+        assert!(busy.modality_at_capacity);
+        assert!(!busy.accepting_new);
+        assert_eq!(busy.free_slots, 0);
         let err = match load.begin_request(BTreeMap::from([("image".to_owned(), 1)])) {
             Ok(_) => panic!("a held image slot must refuse another image"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("image capacity is full"));
         drop(first);
-        assert_eq!(load.snapshot(4).modality_active_items["image"], 0);
+        let idle = load.snapshot(4);
+        assert_eq!(idle.modality_active_items["image"], 0);
+        assert!(!idle.modality_at_capacity);
+        assert!(idle.accepting_new);
+        assert_eq!(idle.free_slots, 4);
 
         let released = load
             .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
@@ -70027,6 +70423,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         };
 

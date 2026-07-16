@@ -6,7 +6,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use mayhem_engine::{
-    verify_artifact, EngineBackend, GenerateRequest, LoadConfig, ModelArtifact, VllmBackend,
+    verify_artifact, CancellationToken, EngineBackend, GenerateRequest, LoadConfig, ModelArtifact,
+    VllmBackend,
 };
 
 const RUN_ENV: &str = "MAYHEM_RUN_VLLM_TESTS";
@@ -59,10 +60,14 @@ fn vllm_checkpoint_smoke_loads_tokenizes_streams_and_generates() -> TestResult {
     let mut chunks = Vec::new();
     let mut request = GenerateRequest::new("Reply with the single word OK.").with_max_new_tokens(8);
     request.temperature = Some(0.0);
-    let output = backend.generate(request, &mut |chunk| {
-        chunks.push(chunk);
-        Ok(())
-    })?;
+    let output = backend.generate(
+        request,
+        &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        },
+        &CancellationToken::new(),
+    )?;
     assert!(!chunks.is_empty(), "vLLM emitted no streaming token chunks");
     assert!(!output.text.trim().is_empty(), "vLLM returned empty text");
     assert!(output.usage.prompt_tokens > 0);

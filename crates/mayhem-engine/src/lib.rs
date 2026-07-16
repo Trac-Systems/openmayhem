@@ -4,6 +4,10 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,6 +20,8 @@ pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_UBATCH_SIZE: u32 = 512;
 pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
+#[cfg(any(feature = "mlx", feature = "vllm", feature = "trt-llm"))]
+const WORKER_STDOUT_QUEUE_CAPACITY: usize = 64;
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
@@ -37,6 +43,8 @@ pub enum EngineError {
     },
     #[error("invalid engine config: {0}")]
     InvalidConfig(String),
+    #[error("engine request cancelled")]
+    Cancelled,
     #[error("model has not been loaded")]
     NotLoaded,
     #[error("prompt has {prompt_tokens} tokens, leaving no room in ctx_size={ctx_size}")]
@@ -87,6 +95,95 @@ pub enum EngineError {
     #[cfg(feature = "llama-cpp")]
     #[error("llama.cpp grammar error: {0}")]
     LlamaGrammar(#[from] llama_cpp_2::GrammarError),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(EngineError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn run_command_cancellable<F>(
+    command: &mut std::process::Command,
+    cancellation: &CancellationToken,
+    map_io_error: F,
+) -> Result<std::process::Output>
+where
+    F: Fn(std::io::Error) -> EngineError + Copy,
+{
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::Duration;
+
+    cancellation.check()?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(map_io_error)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| map_io_error(std::io::Error::other("opening child stdout failed")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| map_io_error(std::io::Error::other("opening child stderr failed")))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let status = loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(EngineError::Cancelled);
+        }
+        match child.try_wait().map_err(map_io_error)? {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| map_io_error(std::io::Error::other("child stdout reader panicked")))?
+        .map_err(map_io_error)?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| map_io_error(std::io::Error::other("child stderr reader panicked")))?
+        .map_err(map_io_error)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -982,16 +1079,22 @@ pub trait EngineBackend {
         &mut self,
         request: GenerateRequest,
         sink: &mut dyn TokenSink,
+        cancellation: &CancellationToken,
     ) -> Result<GenerateOutput>;
     fn generate_with_artifacts(
         &mut self,
         request: GenerateRequest,
         token_sink: &mut dyn TokenSink,
         _artifact_sink: &mut dyn ArtifactSink,
+        cancellation: &CancellationToken,
     ) -> Result<GenerateOutput> {
-        self.generate(request, token_sink)
+        self.generate(request, token_sink, cancellation)
     }
-    fn embed(&mut self, _request: EmbeddingRequest) -> Result<EmbeddingOutput> {
+    fn embed(
+        &mut self,
+        _request: EmbeddingRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<EmbeddingOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support embeddings",
             self.backend_id()
@@ -1001,6 +1104,7 @@ pub trait EngineBackend {
         &mut self,
         _request: ImageGenerationRequest,
         _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
     ) -> Result<ImageGenerationOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support image generation",
@@ -1010,6 +1114,7 @@ pub trait EngineBackend {
     fn transcribe(
         &mut self,
         _request: AudioTranscriptionRequest,
+        _cancellation: &CancellationToken,
     ) -> Result<AudioTranscriptionOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support audio transcription",
@@ -1020,6 +1125,7 @@ pub trait EngineBackend {
         &mut self,
         _request: SpeechRequest,
         _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
     ) -> Result<SpeechOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support speech synthesis",
@@ -1030,6 +1136,7 @@ pub trait EngineBackend {
         &mut self,
         _request: MediaGenerationRequest,
         _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
     ) -> Result<MediaGenerationOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support video generation",
@@ -1040,6 +1147,7 @@ pub trait EngineBackend {
         &mut self,
         _request: MediaGenerationRequest,
         _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
     ) -> Result<MediaGenerationOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support general audio generation",
@@ -1050,6 +1158,7 @@ pub trait EngineBackend {
         &mut self,
         _request: MediaGenerationRequest,
         _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
     ) -> Result<MediaGenerationOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support music generation",
@@ -1842,10 +1951,10 @@ mod whisper_cpp_backend {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        validate_load_config, verify_artifact, wav_duration_seconds_ceil,
+        run_command_cancellable, validate_load_config, verify_artifact, wav_duration_seconds_ceil,
         whisper_ggml_payload_path, ArtifactFormat, AudioTranscriptionOutput,
-        AudioTranscriptionRequest, EngineBackend, EngineError, GenerateOutput, GenerateRequest,
-        LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
+        AudioTranscriptionRequest, CancellationToken, EngineBackend, EngineError, GenerateOutput,
+        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
     };
 
     static WHISPER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1918,6 +2027,7 @@ mod whisper_cpp_backend {
             &mut self,
             _request: GenerateRequest,
             _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
             Err(EngineError::InvalidConfig(
                 "whisper.cpp backend transcribes audio; use transcribe".to_owned(),
@@ -1927,7 +2037,9 @@ mod whisper_cpp_backend {
         fn transcribe(
             &mut self,
             request: AudioTranscriptionRequest,
+            cancellation: &CancellationToken,
         ) -> Result<AudioTranscriptionOutput> {
+            cancellation.check()?;
             if request.audio.is_empty() {
                 return Err(EngineError::InvalidConfig(
                     "audio transcription input cannot be empty".to_owned(),
@@ -1959,8 +2071,8 @@ mod whisper_cpp_backend {
             if let Some(prompt) = request.prompt.as_deref().filter(|value| !value.is_empty()) {
                 command.arg("--prompt").arg(prompt);
             }
-            let output = command.output().map_err(|err| {
-                EngineError::WhisperCpp(format!("starting {} failed: {err}", self.binary.display()))
+            let output = run_command_cancellable(&mut command, cancellation, |err| {
+                EngineError::WhisperCpp(format!("running {} failed: {err}", self.binary.display()))
             })?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -2037,10 +2149,11 @@ mod piper_backend {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        piper_voice_model_path, piper_voice_paths, validate_load_config, verify_artifact,
-        wav_duration_seconds_ceil, ArtifactChunk, ArtifactFormat, ArtifactSink, EngineBackend,
-        EngineError, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, PiperVoicePaths,
-        Result, SpeechOutput, SpeechRequest, TokenSink, Tokenization,
+        piper_voice_model_path, piper_voice_paths, run_command_cancellable, validate_load_config,
+        verify_artifact, wav_duration_seconds_ceil, ArtifactChunk, ArtifactFormat, ArtifactSink,
+        CancellationToken, EngineBackend, EngineError, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, PiperVoicePaths, Result, SpeechOutput, SpeechRequest, TokenSink,
+        Tokenization,
     };
 
     static PIPER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2120,6 +2233,7 @@ mod piper_backend {
             &mut self,
             _request: GenerateRequest,
             _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
             Err(EngineError::InvalidConfig(
                 "piper backend synthesizes speech; use synthesize_speech".to_owned(),
@@ -2130,7 +2244,9 @@ mod piper_backend {
             &mut self,
             request: SpeechRequest,
             artifact_sink: &mut dyn ArtifactSink,
+            cancellation: &CancellationToken,
         ) -> Result<SpeechOutput> {
+            cancellation.check()?;
             if request.input.trim().is_empty() {
                 return Err(EngineError::InvalidConfig(
                     "speech synthesis input cannot be empty".to_owned(),
@@ -2180,8 +2296,8 @@ mod piper_backend {
                 let length_scale = (1.0 / speed).clamp(0.25, 4.0);
                 command.arg("--length-scale").arg(length_scale.to_string());
             }
-            let output = command.output().map_err(|err| {
-                EngineError::Piper(format!("starting {} failed: {err}", self.binary.display()))
+            let output = run_command_cancellable(&mut command, cancellation, |err| {
+                EngineError::Piper(format!("running {} failed: {err}", self.binary.display()))
             })?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -2259,9 +2375,9 @@ mod stable_diffusion_cpp_backend {
 
     use super::{
         stable_diffusion_payload_path, validate_load_config, verify_artifact, ArtifactChunk,
-        ArtifactFormat, ArtifactSink, EngineBackend, EngineError, GenerateOutput, GenerateRequest,
-        ImageGenerationOutput, ImageGenerationRequest, LoadConfig, LoadedModelInfo, Result,
-        TokenSink, Tokenization, DEFAULT_SEED,
+        ArtifactFormat, ArtifactSink, CancellationToken, EngineBackend, EngineError,
+        GenerateOutput, GenerateRequest, ImageGenerationOutput, ImageGenerationRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenSink, Tokenization, DEFAULT_SEED,
     };
 
     const SERVER_CAPTURE_LIMIT: usize = 16 * 1024;
@@ -2555,6 +2671,7 @@ mod stable_diffusion_cpp_backend {
             &mut self,
             _request: GenerateRequest,
             _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
             Err(EngineError::InvalidConfig(
                 "stable-diffusion.cpp backend emits image artifacts; use generate_with_artifacts"
@@ -2566,7 +2683,9 @@ mod stable_diffusion_cpp_backend {
             &mut self,
             request: ImageGenerationRequest,
             artifact_sink: &mut dyn ArtifactSink,
+            cancellation: &CancellationToken,
         ) -> Result<ImageGenerationOutput> {
+            cancellation.check()?;
             request.validate()?;
             let config = self.config()?.clone();
             if request.prompt.contains("sd_cpp_extra_args") {
@@ -2635,14 +2754,21 @@ mod stable_diffusion_cpp_backend {
                 );
             }
             let encoded_body = serde_json::to_vec(&body)?;
-            let response = http_request(
+            let response = match http_request(
                 address,
                 "POST",
                 "/sdapi/v1/txt2img",
                 Some(&encoded_body),
                 max_image_response_bytes(image_count, width, height)?,
                 None,
-            )?;
+                Some(cancellation),
+            ) {
+                Err(EngineError::Cancelled) => {
+                    self.stop_server();
+                    return Err(EngineError::Cancelled);
+                }
+                response => response?,
+            };
             if !(200..300).contains(&response.status) {
                 return Err(EngineError::StableDiffusionCpp(format!(
                     "sd-server returned HTTP {}: {}",
@@ -2666,6 +2792,7 @@ mod stable_diffusion_cpp_backend {
                 )));
             }
             for (image_index, image) in images.iter().enumerate() {
+                cancellation.check()?;
                 let encoded = image.as_str().ok_or_else(|| {
                     EngineError::StableDiffusionCpp(format!(
                         "sd-server image {} is not base64 text",
@@ -2800,6 +2927,7 @@ mod stable_diffusion_cpp_backend {
             None,
             HEALTH_RESPONSE_LIMIT,
             Some(Duration::from_secs(1)),
+            None,
         ) else {
             return false;
         };
@@ -2862,7 +2990,9 @@ mod stable_diffusion_cpp_backend {
         body: Option<&[u8]>,
         body_limit: usize,
         read_timeout: Option<Duration>,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<HttpResponse> {
+        check_http_cancellation(cancellation)?;
         let mut stream =
             TcpStream::connect_timeout(&address, Duration::from_millis(250)).map_err(|err| {
                 EngineError::StableDiffusionCpp(format!(
@@ -2870,19 +3000,24 @@ mod stable_diffusion_cpp_backend {
                 ))
             })?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(read_timeout)?;
+        stream.set_read_timeout(
+            cancellation
+                .map(|_| Duration::from_millis(25))
+                .or(read_timeout),
+        )?;
+        stream.set_write_timeout(cancellation.map(|_| Duration::from_millis(25)))?;
         let body = body.unwrap_or_default();
-        write!(
-            stream,
+        let headers = format!(
             "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
-        )?;
-        stream.write_all(body)?;
-        stream.flush()?;
+        );
+        write_all_cancellable(&mut stream, headers.as_bytes(), cancellation)?;
+        write_all_cancellable(&mut stream, body, cancellation)?;
+        flush_cancellable(&mut stream, cancellation)?;
 
         let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
-        if reader.read_line(&mut status_line)? == 0 {
+        if read_line_cancellable(&mut reader, &mut status_line, cancellation)? == 0 {
             return Err(EngineError::StableDiffusionCpp(
                 "local sd-server closed without an HTTP response".to_owned(),
             ));
@@ -2903,7 +3038,7 @@ mod stable_diffusion_cpp_backend {
         let mut chunked = false;
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
+            if read_line_cancellable(&mut reader, &mut line, cancellation)? == 0 {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server closed inside HTTP headers".to_owned(),
                 ));
@@ -2935,7 +3070,7 @@ mod stable_diffusion_cpp_backend {
         }
 
         let body = if chunked {
-            read_chunked_body(&mut reader, body_limit)?
+            read_chunked_body(&mut reader, body_limit, cancellation)?
         } else if let Some(content_length) = content_length {
             if content_length > body_limit {
                 return Err(EngineError::StableDiffusionCpp(format!(
@@ -2943,13 +3078,10 @@ mod stable_diffusion_cpp_backend {
                 )));
             }
             let mut body = vec![0_u8; content_length];
-            reader.read_exact(&mut body)?;
+            read_exact_cancellable(&mut reader, &mut body, cancellation)?;
             body
         } else {
-            let mut body = Vec::new();
-            reader
-                .take((body_limit as u64).saturating_add(1))
-                .read_to_end(&mut body)?;
+            let body = read_to_end_cancellable(&mut reader, body_limit, cancellation)?;
             if body.len() > body_limit {
                 return Err(EngineError::StableDiffusionCpp(format!(
                     "local sd-server response exceeds the {body_limit}-byte bound"
@@ -2960,11 +3092,15 @@ mod stable_diffusion_cpp_backend {
         Ok(HttpResponse { status, body })
     }
 
-    fn read_chunked_body<R: BufRead>(reader: &mut R, body_limit: usize) -> Result<Vec<u8>> {
+    fn read_chunked_body<R: BufRead>(
+        reader: &mut R,
+        body_limit: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
+            if read_line_cancellable(reader, &mut line, cancellation)? == 0 {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server closed inside a chunked response".to_owned(),
                 ));
@@ -2982,7 +3118,10 @@ mod stable_diffusion_cpp_backend {
             if size == 0 {
                 loop {
                     line.clear();
-                    if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+                    if read_line_cancellable(reader, &mut line, cancellation)? == 0
+                        || line == "\r\n"
+                        || line == "\n"
+                    {
                         break;
                     }
                 }
@@ -2995,9 +3134,9 @@ mod stable_diffusion_cpp_backend {
             }
             let start = body.len();
             body.resize(start + size, 0);
-            reader.read_exact(&mut body[start..])?;
+            read_exact_cancellable(reader, &mut body[start..], cancellation)?;
             let mut terminator = [0_u8; 2];
-            reader.read_exact(&mut terminator)?;
+            read_exact_cancellable(reader, &mut terminator, cancellation)?;
             if terminator != *b"\r\n" {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server returned an invalid chunk terminator".to_owned(),
@@ -3005,6 +3144,119 @@ mod stable_diffusion_cpp_backend {
             }
         }
         Ok(body)
+    }
+
+    fn check_http_cancellation(cancellation: Option<&CancellationToken>) -> Result<()> {
+        cancellation.map(CancellationToken::check).unwrap_or(Ok(()))
+    }
+
+    fn retry_cancellable_read(
+        error: &std::io::Error,
+        cancellation: Option<&CancellationToken>,
+    ) -> bool {
+        cancellation.is_some()
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    }
+
+    fn read_line_cancellable<R: BufRead>(
+        reader: &mut R,
+        line: &mut String,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<usize> {
+        loop {
+            check_http_cancellation(cancellation)?;
+            match reader.read_line(line) {
+                Ok(read) => return Ok(read),
+                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn write_all_cancellable<W: Write>(
+        writer: &mut W,
+        mut bytes: &[u8],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
+        while !bytes.is_empty() {
+            check_http_cancellation(cancellation)?;
+            match writer.write(bytes) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "local sd-server request stopped accepting bytes",
+                    )
+                    .into())
+                }
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_cancellable<W: Write>(
+        writer: &mut W,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
+        loop {
+            check_http_cancellation(cancellation)?;
+            match writer.flush() {
+                Ok(()) => return Ok(()),
+                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn read_exact_cancellable<R: Read>(
+        reader: &mut R,
+        mut bytes: &mut [u8],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
+        while !bytes.is_empty() {
+            check_http_cancellation(cancellation)?;
+            match reader.read(bytes) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "local sd-server response ended early",
+                    )
+                    .into())
+                }
+                Ok(read) => bytes = &mut bytes[read..],
+                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_to_end_cancellable<R: Read>(
+        reader: &mut R,
+        body_limit: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        let mut chunk = [0_u8; 16 * 1024];
+        loop {
+            check_http_cancellation(cancellation)?;
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(body),
+                Ok(read) => {
+                    body.extend_from_slice(&chunk[..read]);
+                    if body.len() > body_limit {
+                        return Ok(body);
+                    }
+                }
+                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn response_snippet(body: &[u8]) -> String {
@@ -3026,7 +3278,9 @@ mod stable_diffusion_tests {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
 
     use base64::{engine::general_purpose, Engine as _};
 
@@ -3073,10 +3327,14 @@ mod stable_diffusion_tests {
         request.scheduler = Some("discrete".to_owned());
         let mut artifacts = Vec::new();
         backend
-            .generate_image(request, &mut |chunk| {
-                artifacts.push(chunk);
-                Ok(())
-            })
+            .generate_image(
+                request,
+                &mut |chunk| {
+                    artifacts.push(chunk);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         server.join().unwrap();
@@ -3148,10 +3406,14 @@ mod stable_diffusion_tests {
         request.seed = Some(7);
         let mut artifacts = Vec::new();
         let output = backend
-            .generate_image(request, &mut |chunk| {
-                artifacts.push(chunk);
-                Ok(())
-            })
+            .generate_image(
+                request,
+                &mut |chunk| {
+                    artifacts.push(chunk);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         server.join().unwrap();
@@ -3180,9 +3442,129 @@ mod stable_diffusion_tests {
             "hello <sd_cpp_extra_args>{\"sample_params\":{}}</sd_cpp_extra_args>",
         );
         let error = backend
-            .generate_image(request, &mut NoopArtifactSink)
+            .generate_image(request, &mut NoopArtifactSink, &CancellationToken::new())
             .unwrap_err();
         assert!(error.to_string().contains("control tags"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_diffusion_cpp_cancellation_closes_blocked_request() {
+        let root = std::env::temp_dir().join(format!(
+            "mayhem-engine-sd-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.safetensors");
+        fs::write(&model, stable_empty_safetensors()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_started_tx, request_started_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request_body(&mut stream);
+            request_started_tx.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+
+        let mut backend = StableDiffusionCppBackend::with_ready_server(
+            LoadConfig::stable_diffusion_checkpoint(&model),
+            address,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let peer_cancellation = cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            request_started_rx
+                .recv()
+                .expect("request reaches sd-server");
+            peer_cancellation.cancel();
+        });
+        let mut request = ImageGenerationRequest::new("cancel this render");
+        request.width = 64;
+        request.height = 64;
+        request.steps = 9;
+
+        let started = Instant::now();
+        let error = backend
+            .generate_image(request, &mut NoopArtifactSink, &cancellation)
+            .expect_err("cancelled render must stop");
+        cancel_thread.join().expect("cancel thread");
+        server.join().expect("server sees request close");
+        assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!backend.component_healthy());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_diffusion_cpp_cancellation_interrupts_blocked_request_upload() {
+        let root = std::env::temp_dir().join(format!(
+            "mayhem-engine-sd-upload-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.safetensors");
+        fs::write(&model, stable_empty_safetensors()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let mut buffered = [0_u8; 16 * 1024];
+            loop {
+                if stream.read(&mut buffered).unwrap() == 0 {
+                    break;
+                }
+            }
+        });
+
+        let cancellation = CancellationToken::new();
+        let peer_cancellation = cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            accepted_rx.recv().expect("sd-server accepts request");
+            thread::sleep(Duration::from_millis(50));
+            peer_cancellation.cancel();
+        });
+        let mut backend = StableDiffusionCppBackend::with_ready_server(
+            LoadConfig::stable_diffusion_checkpoint(&model),
+            address,
+        )
+        .unwrap();
+        let mut request = ImageGenerationRequest::new("x".repeat(16 * 1024 * 1024));
+        request.width = 64;
+        request.height = 64;
+        request.steps = 9;
+
+        let started = Instant::now();
+        let error = backend
+            .generate_image(request, &mut NoopArtifactSink, &cancellation)
+            .expect_err("cancelled request upload must stop");
+        cancel_thread.join().expect("cancel thread");
+        server.join().expect("server sees request close");
+        assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!backend.component_healthy());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3209,10 +3591,14 @@ mod stable_diffusion_tests {
 
         let mut artifacts = Vec::new();
         backend
-            .generate_image(request, &mut |chunk| {
-                artifacts.push(chunk);
-                Ok(())
-            })
+            .generate_image(
+                request,
+                &mut |chunk| {
+                    artifacts.push(chunk);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert_eq!(artifacts.len(), 1);
@@ -3335,12 +3721,15 @@ printf 'hello mayhem\n' > "$out.txt"
         let mut backend = WhisperCppBackend::with_binary(&whisper_cli);
         backend.load(LoadConfig::whisper_ggml(&model)).unwrap();
         let output = backend
-            .transcribe(AudioTranscriptionRequest {
-                audio: tiny_wav_bytes(32_000),
-                content_type: Some("audio/wav".to_owned()),
-                language: Some("en".to_owned()),
-                prompt: None,
-            })
+            .transcribe(
+                AudioTranscriptionRequest {
+                    audio: tiny_wav_bytes(32_000),
+                    content_type: Some("audio/wav".to_owned()),
+                    language: Some("en".to_owned()),
+                    prompt: None,
+                },
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert_eq!(output.text, "hello mayhem");
@@ -3401,6 +3790,7 @@ cp "{}" "$out"
                     artifacts.push(chunk);
                     Ok(())
                 },
+                &CancellationToken::new(),
             )
             .unwrap();
 
@@ -3431,12 +3821,15 @@ cp "{}" "$out"
         let mut backend = WhisperCppBackend::with_binary(binary);
         backend.load(LoadConfig::whisper_ggml(model)).unwrap();
         let output = backend
-            .transcribe(AudioTranscriptionRequest {
-                audio: fs::read(audio).unwrap(),
-                content_type: Some("audio/wav".to_owned()),
-                language: Some("en".to_owned()),
-                prompt: None,
-            })
+            .transcribe(
+                AudioTranscriptionRequest {
+                    audio: fs::read(audio).unwrap(),
+                    content_type: Some("audio/wav".to_owned()),
+                    language: Some("en".to_owned()),
+                    prompt: None,
+                },
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert!(
@@ -3475,6 +3868,7 @@ cp "{}" "$out"
                     artifacts.push(chunk);
                     Ok(())
                 },
+                &CancellationToken::new(),
             )
             .unwrap();
 
@@ -3527,10 +3921,10 @@ mod llama_cpp_backend {
 
     use super::{
         tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
-        EmbeddingOutput, EmbeddingRequest, EngineBackend, EngineError, FinishReason,
-        GenerateOutput, GenerateRequest, GenerateSpecialityTarget, GrammarSpec, LoadConfig,
-        LoadedModelInfo, MediaInput, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
-        DEFAULT_SEED, MTMD_MEDIA_MARKER,
+        CancellationToken, EmbeddingOutput, EmbeddingRequest, EngineBackend, EngineError,
+        FinishReason, GenerateOutput, GenerateRequest, GenerateSpecialityTarget, GrammarSpec,
+        LoadConfig, LoadedModelInfo, MediaInput, Result, TokenChunk, TokenSink, Tokenization,
+        UsageCounters, DEFAULT_SEED, MTMD_MEDIA_MARKER,
     };
     use std::collections::VecDeque;
     use std::ffi::CString;
@@ -3693,7 +4087,9 @@ mod llama_cpp_backend {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
+            cancellation.check()?;
             request.validate_sampling()?;
             let mut request = request;
             apply_llama_speciality_parameters(&mut request)?;
@@ -3705,7 +4101,7 @@ mod llama_cpp_backend {
                 });
             }
             if !request.media.is_empty() {
-                return self.generate_multimodal(request, sink);
+                return self.generate_multimodal(request, sink, cancellation);
             }
 
             let config = self.config()?.clone();
@@ -3732,6 +4128,7 @@ mod llama_cpp_backend {
             let mut batch = LlamaBatch::new(batch_capacity, 1);
             let last_prompt_index = prompt_tokens.len().saturating_sub(1);
             for range in batch_ranges {
+                cancellation.check()?;
                 batch.clear();
                 for index in range {
                     batch.add(
@@ -3744,6 +4141,7 @@ mod llama_cpp_backend {
                     )?;
                 }
                 ctx.decode(&mut batch)?;
+                cancellation.check()?;
             }
 
             let mut sampler = make_sampler(model, &request)?;
@@ -3756,6 +4154,7 @@ mod llama_cpp_backend {
             })?;
 
             while completion_tokens < request.max_new_tokens {
+                cancellation.check()?;
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
                 if model.is_eog_token(token) && !request.ignore_eos {
                     stop_stream.finish(sink)?;
@@ -3789,7 +4188,9 @@ mod llama_cpp_backend {
                 batch.add(token, next_pos, &[0], true)?;
                 next_pos = next_pos.saturating_add(1);
                 ctx.decode(&mut batch)?;
+                cancellation.check()?;
             }
+            cancellation.check()?;
             stop_stream.finish(sink)?;
 
             let mut usage = UsageCounters::new(prompt_tokens.len() as u32, completion_tokens);
@@ -3802,7 +4203,12 @@ mod llama_cpp_backend {
             })
         }
 
-        fn embed(&mut self, request: EmbeddingRequest) -> Result<EmbeddingOutput> {
+        fn embed(
+            &mut self,
+            request: EmbeddingRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<EmbeddingOutput> {
+            cancellation.check()?;
             if request.inputs.is_empty() {
                 return Err(EngineError::InvalidConfig(
                     "embedding request must include at least one input".to_owned(),
@@ -3823,6 +4229,7 @@ mod llama_cpp_backend {
             let mut prompt_tokens = 0_u32;
 
             for input in &request.inputs {
+                cancellation.check()?;
                 let input_tokens = model.str_to_token(input, AddBos::Always)?;
                 if input_tokens.len() >= config.ctx_size as usize {
                     return Err(EngineError::PromptTooLong {
@@ -3852,7 +4259,9 @@ mod llama_cpp_backend {
                         index == last_prompt_index,
                     )?;
                 }
+                cancellation.check()?;
                 ctx.encode(&mut batch)?;
+                cancellation.check()?;
                 let mut embedding = ctx.embeddings_seq_ith(0)?.to_vec();
                 if let Some(dimensions) = request.dimensions {
                     if dimensions > embedding.len() {
@@ -3879,7 +4288,9 @@ mod llama_cpp_backend {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
+            cancellation.check()?;
             let image_token_budget = llama_mtmd_image_token_budget(&request)?;
             self.ensure_mtmd_image_token_budget(image_token_budget)?;
             let config = self.config()?.clone();
@@ -3896,6 +4307,7 @@ mod llama_cpp_backend {
             let ctx_params = llama_context_params(&config, ctx_size);
             let mut ctx = model.new_context(&self.backend, ctx_params)?;
             let bitmaps = media_bitmaps(mtmd, &request.media)?;
+            cancellation.check()?;
             let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
             let marker_count = request.prompt.matches(MTMD_MEDIA_MARKER).count();
             if marker_count != bitmap_refs.len() {
@@ -3918,6 +4330,7 @@ mod llama_cpp_backend {
                 .map_err(|err| {
                     EngineError::InvalidConfig(format!("llama.cpp mtmd tokenization failed: {err}"))
                 })?;
+            cancellation.check()?;
             let prompt_tokens = chunks.total_tokens();
             let prompt_positions = chunks.total_positions();
             if prompt_positions >= i32::try_from(ctx.n_ctx()).unwrap_or(i32::MAX) {
@@ -3938,6 +4351,7 @@ mod llama_cpp_backend {
                 .map_err(|err| {
                     EngineError::InvalidConfig(format!("llama.cpp mtmd prompt eval failed: {err}"))
                 })?;
+            cancellation.check()?;
 
             let mut sampler = make_sampler(model, &request)?;
             let mut decoder = UTF_8.new_decoder();
@@ -3947,6 +4361,7 @@ mod llama_cpp_backend {
             let mut batch = LlamaBatch::new(1, 1);
 
             while completion_tokens < request.max_new_tokens {
+                cancellation.check()?;
                 let token = sampler.sample(&ctx, -1);
                 if model.is_eog_token(token) && !request.ignore_eos {
                     stop_stream.finish(sink)?;
@@ -3980,7 +4395,9 @@ mod llama_cpp_backend {
                 batch.add(token, next_pos, &[0], true)?;
                 next_pos = next_pos.saturating_add(1);
                 ctx.decode(&mut batch)?;
+                cancellation.check()?;
             }
+            cancellation.check()?;
             stop_stream.finish(sink)?;
 
             let mut usage = UsageCounters::new(prompt_tokens as u32, completion_tokens);
@@ -4523,9 +4940,9 @@ mod llama_cpp_backend {
 mod mlx_backend {
     use super::{
         attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
-        ArtifactFormat, EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest,
-        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
-        WorkerContainment,
+        ArtifactFormat, CancellationToken, EngineBackend, EngineError, FinishReason,
+        GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk,
+        TokenSink, Tokenization, UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -4536,6 +4953,9 @@ mod mlx_backend {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     const WORKER: &str = include_str!("mlx_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_MLX_PYTHON";
@@ -4572,7 +4992,7 @@ mod mlx_backend {
         where
             T: DeserializeOwned,
         {
-            self.call_streaming(op, payload, &mut |_| Ok(()))
+            self.call_streaming(op, payload, &mut |_| Ok(()), None)
         }
 
         fn call_streaming<T>(
@@ -4580,6 +5000,7 @@ mod mlx_backend {
             op: &str,
             payload: Value,
             sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+            cancellation: Option<&CancellationToken>,
         ) -> Result<T>
         where
             T: DeserializeOwned,
@@ -4598,9 +5019,17 @@ mod mlx_backend {
                 .as_mut()
                 .ok_or_else(|| EngineError::Mlx("failed to start MLX backend worker".to_owned()))?;
             worker.send(id, op, payload)?;
+            let mut cancel_sent = false;
+            let mut sink_error = None;
 
             loop {
-                let message = worker.read_message()?;
+                if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancel_sent {
+                    worker.send(id, "cancel", json!({ "request_id": id }))?;
+                    cancel_sent = true;
+                }
+                let Some(message) = worker.read_message(Duration::from_millis(25))? else {
+                    continue;
+                };
                 if message.id != id {
                     return Err(EngineError::Mlx(format!(
                         "worker response id {} did not match request id {id}",
@@ -4612,8 +5041,21 @@ mod mlx_backend {
                     let chunk = message.chunk.ok_or_else(|| {
                         EngineError::Mlx("worker token message missing chunk".to_owned())
                     })?;
-                    sink(chunk)?;
+                    if !cancel_sent && sink_error.is_none() {
+                        if let Err(error) = sink(chunk) {
+                            worker.send(id, "cancel", json!({ "request_id": id }))?;
+                            cancel_sent = true;
+                            sink_error = Some(error);
+                        }
+                    }
                     continue;
+                }
+
+                if let Some(error) = sink_error {
+                    return Err(error);
+                }
+                if cancel_sent || message.cancelled {
+                    return Err(EngineError::Cancelled);
                 }
 
                 if message.ok.unwrap_or(false) {
@@ -4692,7 +5134,9 @@ mod mlx_backend {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
+            cancellation.check()?;
             request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
@@ -4703,9 +5147,12 @@ mod mlx_backend {
             }
             self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
 
-            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
-                sink.on_token(chunk)
-            })
+            self.call_streaming(
+                "generate",
+                serde_json::to_value(request)?,
+                &mut |chunk| sink.on_token(chunk),
+                Some(cancellation),
+            )
         }
     }
 
@@ -4728,13 +5175,16 @@ mod mlx_backend {
         error: Option<String>,
         #[serde(default)]
         chunk: Option<TokenChunk>,
+        #[serde(default)]
+        cancelled: bool,
     }
 
     struct MlxWorker {
         child: Child,
         _containment: WorkerContainment,
         stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
+        stdout_rx: Option<Receiver<WorkerRead>>,
+        reader: Option<JoinHandle<()>>,
     }
 
     impl MlxWorker {
@@ -4770,11 +5220,14 @@ mod mlx_backend {
                 attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
                     EngineError::Mlx(format!("applying worker containment failed: {err}"))
                 })?;
+            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
+            let reader = thread::spawn(move || read_mlx_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
                 _containment: containment,
                 stdin,
-                stdout: BufReader::new(stdout),
+                stdout_rx: Some(stdout_rx),
+                reader: Some(reader),
             })
         }
 
@@ -4790,15 +5243,63 @@ mod mlx_backend {
             Ok(())
         }
 
-        fn read_message(&mut self) -> Result<WorkerMessage> {
+        fn read_message(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
+            let read = match self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Mlx("MLX backend worker stdout reader is closed".to_owned())
+                })?
+                .recv_timeout(wait)
+            {
+                Ok(read) => read,
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EngineError::Mlx(
+                        "MLX backend worker stdout reader stopped".to_owned(),
+                    ))
+                }
+            };
+            let line = match read {
+                WorkerRead::Line(line) => line,
+                WorkerRead::Eof => {
+                    return Err(EngineError::Mlx(
+                        "MLX backend worker exited before replying".to_owned(),
+                    ))
+                }
+                WorkerRead::Error(error) => return Err(EngineError::Mlx(error)),
+            };
+            Ok(Some(serde_json::from_str(line.trim_end())?))
+        }
+    }
+
+    enum WorkerRead {
+        Line(String),
+        Eof,
+        Error(String),
+    }
+
+    fn read_mlx_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
+        let mut stdout = BufReader::new(stdout);
+        loop {
             let mut line = String::new();
-            let read = self.stdout.read_line(&mut line)?;
-            if read == 0 {
-                return Err(EngineError::Mlx(
-                    "MLX backend worker exited before replying".to_owned(),
-                ));
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(WorkerRead::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(WorkerRead::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(WorkerRead::Error(format!(
+                        "reading MLX backend worker stdout failed: {error}"
+                    )));
+                    return;
+                }
             }
-            Ok(serde_json::from_str(line.trim_end())?)
         }
     }
 
@@ -4851,8 +5352,12 @@ mod mlx_backend {
     impl Drop for MlxWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
+            self.stdout_rx.take();
             let _ = self.child.kill();
             let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 
@@ -4868,6 +5373,99 @@ mod mlx_backend {
     fn default_message_kind() -> String {
         "response".to_owned()
     }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn mlx_cancellation_keeps_worker_aligned_for_next_request() {
+            let root = env::temp_dir().join(format!(
+                "mayhem-mlx-cancel-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).expect("python dir");
+            fs::create_dir_all(model.parent().expect("model parent")).expect("model dir");
+            fs::write(
+                &python,
+                r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+read first_generate
+read first_cancel
+printf '%s\n' '{"id":2,"type":"response","cancelled":true}'
+read second_generate
+printf '%s\n' '{"id":3,"type":"token","chunk":{"index":0,"token_id":11,"text":"second"}}'
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+"#,
+            )
+            .expect("fake worker");
+            fs::write(&model, safetensors_fixture()).expect("model fixture");
+            let mut permissions = fs::metadata(&python).expect("metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&python, permissions).expect("chmod fake worker");
+
+            let mut backend = MlxBackend::with_python(&python).expect("backend");
+            let mut config = LoadConfig::mlx_safetensors(&model);
+            config.ctx_size = 4096;
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).expect("load");
+
+            let cancellation = CancellationToken::new();
+            let peer_cancellation = cancellation.clone();
+            let cancel_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                peer_cancellation.cancel();
+            });
+            let started = Instant::now();
+            let error = backend
+                .generate(
+                    GenerateRequest::new("first"),
+                    &mut |_| Ok(()),
+                    &cancellation,
+                )
+                .expect_err("first request cancels");
+            cancel_thread.join().expect("cancel thread");
+            assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(backend.component_healthy());
+
+            let mut chunks = Vec::new();
+            let output = backend
+                .generate(
+                    GenerateRequest::new("second"),
+                    &mut |chunk| {
+                        chunks.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
+                .expect("next request remains aligned");
+            assert_eq!(output.text, "second");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, "second");
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        fn safetensors_fixture() -> Vec<u8> {
+            let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[0_u8; 4]);
+            bytes
+        }
+    }
 }
 
 #[cfg(feature = "vllm")]
@@ -4875,9 +5473,9 @@ mod vllm_backend {
     use super::{
         attach_worker_containment, engine_worker_command, select_runtime_compatible_cuda_home,
         validate_load_config, verify_artifact, vllm_safetensors_payload_path, ArtifactFormat,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
-        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
-        WorkerContainment,
+        CancellationToken, EngineBackend, EngineError, FinishReason, GenerateOutput,
+        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization,
+        UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -4890,7 +5488,7 @@ mod vllm_backend {
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const WORKER: &str = include_str!("vllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_VLLM_PYTHON";
@@ -4934,7 +5532,7 @@ mod vllm_backend {
         where
             T: DeserializeOwned,
         {
-            self.call_streaming(op, payload, &mut |_| Ok(()))
+            self.call_streaming(op, payload, &mut |_| Ok(()), None)
         }
 
         fn call_streaming<T>(
@@ -4942,6 +5540,7 @@ mod vllm_backend {
             op: &str,
             payload: Value,
             sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+            cancellation: Option<&CancellationToken>,
         ) -> Result<T>
         where
             T: DeserializeOwned,
@@ -4961,17 +5560,36 @@ mod vllm_backend {
             })?;
             worker.send(id, op, payload)?;
             let mut sink_error = None;
+            let mut cancel_sent = false;
+            let mut last_progress = Instant::now();
 
             loop {
                 let message = if op == "load" {
-                    worker.read_load_message()
+                    worker.read_load_message().map(Some)
                 } else {
-                    worker.read_message()
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancel_sent {
+                        worker.send(id, "cancel", json!({ "request_id": id }))?;
+                        cancel_sent = true;
+                    }
+                    if let Some(timeout) = worker.request_timeout {
+                        if last_progress.elapsed() >= timeout {
+                            worker.terminate();
+                            return Err(sink_error.unwrap_or_else(|| {
+                                EngineError::Vllm(format!(
+                                    "vLLM backend worker stalled for {}s without a response",
+                                    timeout.as_secs()
+                                ))
+                            }));
+                        }
+                    }
+                    worker.read_message_poll(Duration::from_millis(25))
                 };
                 let message = match message {
-                    Ok(message) => message,
+                    Ok(Some(message)) => message,
+                    Ok(None) => continue,
                     Err(err) => return Err(sink_error.unwrap_or(err)),
                 };
+                last_progress = Instant::now();
                 if message.id < id {
                     continue;
                 }
@@ -4988,6 +5606,8 @@ mod vllm_backend {
                     })?;
                     if sink_error.is_none() {
                         if let Err(err) = sink(chunk) {
+                            worker.send(id, "cancel", json!({ "request_id": id }))?;
+                            cancel_sent = true;
                             sink_error = Some(err);
                         }
                     }
@@ -4996,6 +5616,9 @@ mod vllm_backend {
 
                 if let Some(err) = sink_error {
                     return Err(err);
+                }
+                if cancel_sent || message.cancelled {
+                    return Err(EngineError::Cancelled);
                 }
 
                 if message.ok.unwrap_or(false) {
@@ -5099,7 +5722,9 @@ mod vllm_backend {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
+            cancellation.check()?;
             request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
@@ -5110,9 +5735,12 @@ mod vllm_backend {
             }
             self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
 
-            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
-                sink.on_token(chunk)
-            })
+            self.call_streaming(
+                "generate",
+                serde_json::to_value(request)?,
+                &mut |chunk| sink.on_token(chunk),
+                Some(cancellation),
+            )
         }
     }
 
@@ -5137,13 +5765,15 @@ mod vllm_backend {
         error: Option<String>,
         #[serde(default)]
         chunk: Option<TokenChunk>,
+        #[serde(default)]
+        cancelled: bool,
     }
 
     struct VllmWorker {
         child: Child,
         _containment: WorkerContainment,
         stdin: ChildStdin,
-        stdout_rx: Receiver<WorkerRead>,
+        stdout_rx: Option<Receiver<WorkerRead>>,
         reader: Option<JoinHandle<()>>,
         request_timeout: Option<Duration>,
         terminated: bool,
@@ -5191,13 +5821,13 @@ mod vllm_backend {
                 attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
                     EngineError::Vllm(format!("applying worker containment failed: {err}"))
                 })?;
-            let (stdout_tx, stdout_rx) = mpsc::channel();
+            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
             let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
                 _containment: containment,
                 stdin,
-                stdout_rx,
+                stdout_rx: Some(stdout_rx),
                 reader: Some(reader),
                 request_timeout,
                 terminated: false,
@@ -5216,9 +5846,17 @@ mod vllm_backend {
             Ok(())
         }
 
+        #[cfg(test)]
         fn read_message(&mut self) -> Result<WorkerMessage> {
             let read = match self.request_timeout {
-                Some(request_timeout) => match self.stdout_rx.recv_timeout(request_timeout) {
+                Some(request_timeout) => match self
+                    .stdout_rx
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
+                    })?
+                    .recv_timeout(request_timeout)
+                {
                     Ok(read) => read,
                     Err(RecvTimeoutError::Timeout) => {
                         self.terminate();
@@ -5233,17 +5871,48 @@ mod vllm_backend {
                         ));
                     }
                 },
-                None => self.stdout_rx.recv().map_err(|_| {
-                    EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
-                })?,
+                None => self
+                    .stdout_rx
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
+                    })?
+                    .recv()
+                    .map_err(|_| {
+                        EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
+                    })?,
             };
             Self::decode_read(read)
         }
 
+        fn read_message_poll(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
+            match self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
+                })?
+                .recv_timeout(wait)
+            {
+                Ok(read) => Self::decode_read(read).map(Some),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => Err(EngineError::Vllm(
+                    "vLLM backend worker stdout reader stopped".to_owned(),
+                )),
+            }
+        }
+
         fn read_load_message(&mut self) -> Result<WorkerMessage> {
-            let read = self.stdout_rx.recv().map_err(|_| {
-                EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
-            })?;
+            let read = self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
+                })?
+                .recv()
+                .map_err(|_| {
+                    EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
+                })?;
             Self::decode_read(read)
         }
 
@@ -5275,7 +5944,7 @@ mod vllm_backend {
         Error(String),
     }
 
-    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::Sender<WorkerRead>) {
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
         let mut stdout = BufReader::new(stdout);
         loop {
             let mut line = String::new();
@@ -5522,6 +6191,7 @@ mod vllm_backend {
     impl Drop for VllmWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
+            self.stdout_rx.take();
             if wait_for_child_exit(&mut self.child, Duration::from_secs(3)) {
                 self.terminated = true;
             } else {
@@ -5803,16 +6473,101 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
                 Err(EngineError::InvalidConfig("client disconnected".to_owned()))
             };
             let err = backend
-                .generate(GenerateRequest::new("first"), &mut disconnected)
+                .generate(
+                    GenerateRequest::new("first"),
+                    &mut disconnected,
+                    &CancellationToken::new(),
+                )
                 .expect_err("first stream sink disconnects");
             assert!(err.to_string().contains("client disconnected"));
 
             let mut chunks = Vec::new();
             let output = backend
-                .generate(GenerateRequest::new("second"), &mut |chunk| {
-                    chunks.push(chunk);
-                    Ok(())
-                })
+                .generate(
+                    GenerateRequest::new("second"),
+                    &mut |chunk| {
+                        chunks.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
+                .expect("next request remains aligned");
+            assert_eq!(output.text, "second");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, "second");
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_cancellation_aborts_request_and_keeps_worker_aligned() {
+            let root = env::temp_dir().join(format!(
+                "mayhem-vllm-cancel-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            fs::write(
+                &python,
+                r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+read first_generate
+read first_cancel
+printf '%s\n' '{"id":2,"type":"response","cancelled":true}'
+read second_generate
+printf '%s\n' '{"id":3,"type":"token","chunk":{"index":0,"token_id":11,"text":"second"}}'
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+"#,
+            )
+            .unwrap();
+            fs::write(&model, safetensors_fixture()).unwrap();
+            let mut permissions = fs::metadata(&python).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&python, permissions).unwrap();
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+
+            let cancellation = CancellationToken::new();
+            let peer_cancellation = cancellation.clone();
+            let cancel_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                peer_cancellation.cancel();
+            });
+            let started = Instant::now();
+            let error = backend
+                .generate(
+                    GenerateRequest::new("first"),
+                    &mut |_| Ok(()),
+                    &cancellation,
+                )
+                .expect_err("first request cancels");
+            cancel_thread.join().expect("cancel thread");
+            assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(backend.component_healthy());
+
+            let mut chunks = Vec::new();
+            let output = backend
+                .generate(
+                    GenerateRequest::new("second"),
+                    &mut |chunk| {
+                        chunks.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
                 .expect("next request remains aligned");
             assert_eq!(output.text, "second");
             assert_eq!(chunks.len(), 1);
@@ -5968,9 +6723,9 @@ fi
 mod trt_llm_backend {
     use super::{
         attach_worker_containment, engine_worker_command, select_runtime_compatible_cuda_home,
-        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
-        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
-        TokenChunk, TokenSink, Tokenization, UsageCounters, WorkerContainment,
+        validate_load_config, verify_artifact, ArtifactFormat, CancellationToken, EngineBackend,
+        EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo,
+        Result, TokenChunk, TokenSink, Tokenization, UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -5983,7 +6738,7 @@ mod trt_llm_backend {
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const WORKER: &str = include_str!("trtllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
@@ -6024,7 +6779,7 @@ mod trt_llm_backend {
         where
             T: DeserializeOwned,
         {
-            self.call_streaming(op, payload, &mut |_| Ok(()))
+            self.call_streaming(op, payload, &mut |_| Ok(()), None)
         }
 
         fn call_streaming<T>(
@@ -6032,6 +6787,7 @@ mod trt_llm_backend {
             op: &str,
             payload: Value,
             sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+            cancellation: Option<&CancellationToken>,
         ) -> Result<T>
         where
             T: DeserializeOwned,
@@ -6050,13 +6806,31 @@ mod trt_llm_backend {
                 EngineError::TrtLlm("failed to start TensorRT-LLM backend worker".to_owned())
             })?;
             worker.send(id, op, payload)?;
+            let mut last_progress = Instant::now();
 
             loop {
                 let message = if op == "load" {
-                    worker.read_load_message()?
+                    Some(worker.read_load_message()?)
                 } else {
-                    worker.read_message()?
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        worker.terminate();
+                        return Err(EngineError::Cancelled);
+                    }
+                    if let Some(timeout) = worker.request_timeout {
+                        if last_progress.elapsed() >= timeout {
+                            worker.terminate();
+                            return Err(EngineError::TrtLlm(format!(
+                                "TensorRT-LLM backend worker stalled for {}s without a response",
+                                timeout.as_secs()
+                            )));
+                        }
+                    }
+                    worker.read_message_poll(Duration::from_millis(25))?
                 };
+                let Some(message) = message else {
+                    continue;
+                };
+                last_progress = Instant::now();
                 if message.id != id {
                     return Err(EngineError::TrtLlm(format!(
                         "worker response id {} did not match request id {id}",
@@ -6068,7 +6842,10 @@ mod trt_llm_backend {
                     let chunk = message.chunk.ok_or_else(|| {
                         EngineError::TrtLlm("worker token message missing chunk".to_owned())
                     })?;
-                    sink(chunk)?;
+                    if let Err(error) = sink(chunk) {
+                        worker.terminate();
+                        return Err(error);
+                    }
                     continue;
                 }
 
@@ -6160,7 +6937,9 @@ mod trt_llm_backend {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
+            cancellation.check()?;
             request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
@@ -6171,9 +6950,12 @@ mod trt_llm_backend {
             }
             self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
 
-            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
-                sink.on_token(chunk)
-            })
+            self.call_streaming(
+                "generate",
+                serde_json::to_value(request)?,
+                &mut |chunk| sink.on_token(chunk),
+                Some(cancellation),
+            )
         }
     }
 
@@ -6204,7 +6986,7 @@ mod trt_llm_backend {
         child: Child,
         _containment: WorkerContainment,
         stdin: ChildStdin,
-        stdout_rx: Receiver<WorkerRead>,
+        stdout_rx: Option<Receiver<WorkerRead>>,
         reader: Option<JoinHandle<()>>,
         request_timeout: Option<Duration>,
         terminated: bool,
@@ -6252,13 +7034,13 @@ mod trt_llm_backend {
                 attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
                     EngineError::TrtLlm(format!("applying worker containment failed: {err}"))
                 })?;
-            let (stdout_tx, stdout_rx) = mpsc::channel();
+            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
             let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
                 _containment: containment,
                 stdin,
-                stdout_rx,
+                stdout_rx: Some(stdout_rx),
                 reader: Some(reader),
                 request_timeout,
                 terminated: false,
@@ -6277,9 +7059,19 @@ mod trt_llm_backend {
             Ok(())
         }
 
+        #[cfg(test)]
         fn read_message(&mut self) -> Result<WorkerMessage> {
             let read = match self.request_timeout {
-                Some(request_timeout) => match self.stdout_rx.recv_timeout(request_timeout) {
+                Some(request_timeout) => match self
+                    .stdout_rx
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::TrtLlm(
+                            "TensorRT-LLM backend worker stdout reader is closed".to_owned(),
+                        )
+                    })?
+                    .recv_timeout(request_timeout)
+                {
                     Ok(read) => read,
                     Err(RecvTimeoutError::Timeout) => {
                         self.terminate();
@@ -6294,19 +7086,58 @@ mod trt_llm_backend {
                         ));
                     }
                 },
-                None => self.stdout_rx.recv().map_err(|_| {
-                    EngineError::TrtLlm(
-                        "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
-                    )
-                })?,
+                None => self
+                    .stdout_rx
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::TrtLlm(
+                            "TensorRT-LLM backend worker stdout reader is closed".to_owned(),
+                        )
+                    })?
+                    .recv()
+                    .map_err(|_| {
+                        EngineError::TrtLlm(
+                            "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
+                        )
+                    })?,
             };
             Self::decode_read(read)
         }
 
+        fn read_message_poll(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
+            match self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker stdout reader is closed".to_owned(),
+                    )
+                })?
+                .recv_timeout(wait)
+            {
+                Ok(read) => Self::decode_read(read).map(Some),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => Err(EngineError::TrtLlm(
+                    "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
+                )),
+            }
+        }
+
         fn read_load_message(&mut self) -> Result<WorkerMessage> {
-            let read = self.stdout_rx.recv().map_err(|_| {
-                EngineError::TrtLlm("TensorRT-LLM backend worker stdout reader stopped".to_owned())
-            })?;
+            let read = self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker stdout reader is closed".to_owned(),
+                    )
+                })?
+                .recv()
+                .map_err(|_| {
+                    EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
+                    )
+                })?;
             Self::decode_read(read)
         }
 
@@ -6338,7 +7169,7 @@ mod trt_llm_backend {
         Error(String),
     }
 
-    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::Sender<WorkerRead>) {
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
         let mut stdout = BufReader::new(stdout);
         loop {
             let mut line = String::new();
@@ -6547,6 +7378,7 @@ mod trt_llm_backend {
     impl Drop for TrtLlmWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
+            self.stdout_rx.take();
             if wait_for_child_exit(&mut self.child, Duration::from_secs(3)) {
                 self.terminated = true;
             } else {
@@ -6622,6 +7454,7 @@ mod trt_llm_backend {
     #[cfg(unix)]
     mod tests {
         use super::*;
+        use crate::ModelArtifact;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
@@ -6666,6 +7499,59 @@ mod trt_llm_backend {
                 Some(Duration::from_secs(600))
             );
             assert!(request_timeout_from(Some("later")).is_err());
+        }
+
+        #[test]
+        fn trt_worker_cancellation_terminates_inflight_generation() {
+            let root = env::temp_dir().join(format!(
+                "mayhem-cancel-trt-worker-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let path = root.join("bin/python");
+            let nvcc = root.join("lib/python3.12/site-packages/nvidia/cu13/bin/nvcc");
+            fs::create_dir_all(path.parent().expect("python parent")).expect("python dir");
+            fs::create_dir_all(nvcc.parent().expect("nvcc parent")).expect("CUDA dir");
+            fs::write(&path, "#!/bin/sh\nread -r request\nexec sleep 30\n")
+                .expect("write fake worker");
+            fs::write(&nvcc, "#!/bin/sh\nexit 0\n").expect("write fake nvcc");
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&path, perms).expect("chmod fake worker");
+
+            let mut backend = TrtLlmBackend::with_python(&path).expect("backend");
+            backend.loaded = Some(LoadedModelInfo {
+                backend: "trt-llm".to_owned(),
+                artifact: ModelArtifact::trt_llm_checkpoint(root.join("checkpoint")),
+                ctx_size: 2048,
+                n_ctx_train: 2048,
+                n_vocab: 1,
+            });
+            let cancellation = CancellationToken::new();
+            let cancel_from_peer = cancellation.clone();
+            let cancel_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                cancel_from_peer.cancel();
+            });
+
+            let started = Instant::now();
+            let error = backend
+                .call_streaming::<Value>(
+                    "generate",
+                    json!({}),
+                    &mut |_| Ok(()),
+                    Some(&cancellation),
+                )
+                .expect_err("cancelled generation must stop");
+            cancel_thread.join().expect("cancel thread");
+            assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(!backend.component_healthy());
+
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]
@@ -6865,6 +7751,7 @@ mod tests {
             &mut self,
             request: GenerateRequest,
             _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
             Ok(GenerateOutput {
                 text: request.prompt,
@@ -6877,6 +7764,28 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-engine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_child_command_kills_inflight_process() {
+        use std::time::{Duration, Instant};
+
+        let cancellation = CancellationToken::new();
+        let peer_cancellation = cancellation.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            peer_cancellation.cancel();
+        });
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+
+        let started = Instant::now();
+        let error = run_command_cancellable(&mut command, &cancellation, EngineError::Io)
+            .expect_err("cancelled child must stop");
+        cancel_thread.join().expect("cancel thread");
+        assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -6896,6 +7805,7 @@ mod tests {
                     artifact_chunks.push(chunk);
                     Ok(())
                 },
+                &CancellationToken::new(),
             )
             .unwrap();
 

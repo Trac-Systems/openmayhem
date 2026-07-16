@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mayhem_engine::{
-    verify_artifact, EmbeddingRequest, EngineBackend, GenerateRequest, GrammarSpec,
-    LlamaCppBackend, LoadConfig, MediaInput, ModelArtifact, ToolSpec, MTMD_MEDIA_MARKER,
+    verify_artifact, CancellationToken, EmbeddingRequest, EngineBackend, EngineError,
+    GenerateRequest, GrammarSpec, LlamaCppBackend, LoadConfig, MediaInput, ModelArtifact, ToolSpec,
+    MTMD_MEDIA_MARKER,
 };
 use serde_json::json;
 
@@ -64,6 +65,7 @@ fn gguf_dev_model_smoke_generates_and_constrains_tool_call() -> TestResult {
             chunks.push(chunk);
             Ok(())
         },
+        &CancellationToken::new(),
     )?;
     assert!(!chunks.is_empty(), "streaming sink received no tokens");
     assert!(!output.text.trim().is_empty(), "model returned empty text");
@@ -81,6 +83,7 @@ fn gguf_dev_model_smoke_generates_and_constrains_tool_call() -> TestResult {
                 tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
             }),
         &mut |_chunk| Ok(()),
+        &CancellationToken::new(),
     )?;
     let parsed: serde_json::Value =
         serde_json::from_str(constrained.text.trim()).unwrap_or_else(|err| {
@@ -93,6 +96,38 @@ fn gguf_dev_model_smoke_generates_and_constrains_tool_call() -> TestResult {
     assert!(
         parsed["arguments"].is_object(),
         "tool arguments must be a JSON object: {parsed}"
+    );
+
+    let cancellation = CancellationToken::new();
+    let cancel_from_sink = cancellation.clone();
+    let mut cancelled_chunks = 0_usize;
+    let mut cancellable = GenerateRequest::new(
+        "Continue with a long numbered list of distinct short words without stopping.",
+    )
+    .with_max_new_tokens(128);
+    cancellable.ignore_eos = true;
+    let error = backend
+        .generate(
+            cancellable,
+            &mut |_chunk| {
+                cancelled_chunks += 1;
+                cancel_from_sink.cancel();
+                Ok(())
+            },
+            &cancellation,
+        )
+        .expect_err("llama.cpp generation must stop after cancellation");
+    assert!(matches!(error, EngineError::Cancelled), "{error}");
+    assert_eq!(cancelled_chunks, 1, "cancellation exceeded one decode step");
+
+    let recovered = backend.generate(
+        GenerateRequest::new("Reply with ok.").with_max_new_tokens(8),
+        &mut |_chunk| Ok(()),
+        &CancellationToken::new(),
+    )?;
+    assert!(
+        !recovered.text.trim().is_empty(),
+        "llama.cpp backend did not remain usable after cancellation"
     );
 
     Ok(())
@@ -112,14 +147,28 @@ fn gguf_embedding_model_smoke_returns_semantic_vectors() -> TestResult {
     config.batch_size = 128;
     config.ubatch_size = 128;
     config.threads = Some(4);
+    config.gpu_layers = optional_positive_u32(GPU_LAYERS_ENV)?;
     let info = backend.load(config)?;
     assert_eq!(info.artifact.path, model_path);
 
-    let output = backend.embed(EmbeddingRequest::many([
-        "a cat sits on a soft blanket",
-        "a kitten rests on a warm blanket",
-        "corporate debt refinancing terms",
-    ]))?;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = backend
+        .embed(
+            EmbeddingRequest::many(["cancel this embedding request"]),
+            &cancellation,
+        )
+        .expect_err("llama.cpp embedding must honor cancellation");
+    assert!(matches!(error, EngineError::Cancelled), "{error}");
+
+    let output = backend.embed(
+        EmbeddingRequest::many([
+            "a cat sits on a soft blanket",
+            "a kitten rests on a warm blanket",
+            "corporate debt refinancing terms",
+        ]),
+        &CancellationToken::new(),
+    )?;
     assert_eq!(output.embeddings.len(), 3);
     assert!(output
         .embeddings
@@ -158,6 +207,7 @@ fn gguf_vision_model_smoke_describes_real_image() -> TestResult {
     config.batch_size = 512;
     config.ubatch_size = 512;
     config.threads = Some(4);
+    config.gpu_layers = optional_positive_u32(GPU_LAYERS_ENV)?;
     let info = backend.load(config)?;
     assert_eq!(info.artifact.path, model_path);
 
@@ -176,7 +226,30 @@ fn gguf_vision_model_smoke_describes_real_image() -> TestResult {
         fps: None,
     });
 
-    let output = backend.generate(request, &mut |_chunk| Ok(()))?;
+    let cancellation = CancellationToken::new();
+    let cancel_from_sink = cancellation.clone();
+    let mut cancelled_chunks = 0_usize;
+    let mut cancellable = request.clone();
+    cancellable.max_new_tokens = 128;
+    cancellable.ignore_eos = true;
+    let error = backend
+        .generate(
+            cancellable,
+            &mut |_chunk| {
+                cancelled_chunks += 1;
+                cancel_from_sink.cancel();
+                Ok(())
+            },
+            &cancellation,
+        )
+        .expect_err("llama.cpp multimodal generation must stop after cancellation");
+    assert!(matches!(error, EngineError::Cancelled), "{error}");
+    assert_eq!(
+        cancelled_chunks, 1,
+        "multimodal cancellation exceeded one decode step"
+    );
+
+    let output = backend.generate(request, &mut |_chunk| Ok(()), &CancellationToken::new())?;
     eprintln!("vision output={:?}", output.text);
     assert!(
         !output.text.trim().is_empty(),

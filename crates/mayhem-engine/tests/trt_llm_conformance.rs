@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "llama-cpp")]
 use mayhem_engine::LlamaCppBackend;
 use mayhem_engine::{
-    verify_artifact, EngineBackend, GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig,
-    ModelArtifact, ToolSpec, TrtLlmBackend,
+    verify_artifact, CancellationToken, EngineBackend, GenerateOutput, GenerateRequest,
+    GrammarSpec, LoadConfig, ModelArtifact, ToolSpec, TrtLlmBackend,
 };
 use serde_json::json;
 
@@ -80,6 +80,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
             chunks.push(chunk);
             Ok(())
         },
+        &CancellationToken::new(),
     )?;
     assert!(!chunks.is_empty(), "streaming sink received no tokens");
     assert!(!output.text.trim().is_empty(), "model returned empty text");
@@ -93,6 +94,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
                     tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
                 }),
             &mut |_chunk| Ok(()),
+            &CancellationToken::new(),
         )
         .expect_err("TensorRT-LLM must not fake grammar-constrained tool calls");
     assert!(
@@ -110,6 +112,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
             canary_chunks.push(chunk);
             Ok(())
         },
+        &CancellationToken::new(),
     )?;
     assert_usage(&canary);
     assert!(!canary_chunks.is_empty(), "canary produced no token chunks");
@@ -304,6 +307,7 @@ fn timed_generate<B: EngineBackend>(
             .with_max_new_tokens(max_new_tokens)
             .with_ignore_eos(ignore_eos),
         &mut |_chunk| Ok(()),
+        &CancellationToken::new(),
     )?;
     Ok((output, start.elapsed()))
 }
@@ -356,7 +360,7 @@ fn timed_generate_batch_sequential<B: EngineBackend>(
     let start = Instant::now();
     let mut outputs = Vec::with_capacity(requests.len());
     for request in requests {
-        outputs.push(backend.generate(request, &mut |_chunk| Ok(()))?);
+        outputs.push(backend.generate(request, &mut |_chunk| Ok(()), &CancellationToken::new())?);
     }
     Ok((outputs, start.elapsed()))
 }
