@@ -44,8 +44,23 @@ class MockSwarm extends EventEmitter {
       },
     };
     this.connections = new Set();
+    const tracked = new Map();
+    this._allConnections = {
+      get: (key) => tracked.get(b4a.isBuffer(key) ? b4a.toString(key, 'hex') : key),
+      add: (connection) => tracked.set(
+        b4a.toString(connection.remotePublicKey, 'hex'),
+        connection
+      ),
+      delete: (connection) => {
+        const key = b4a.toString(connection.remotePublicKey, 'hex');
+        if (tracked.get(key) === connection) tracked.delete(key);
+      },
+    };
     this.peers = new Map();
     this.relayThrough = null;
+    this.server = new EventEmitter();
+    this.server.firewall = () => false;
+    this.server._relayConnection = () => {};
   }
 }
 
@@ -66,7 +81,11 @@ test('targeted relay connections rotate official peers without changing global s
   const swarm = new MockSwarm();
   const original = () => null;
   swarm.relayThrough = original;
-  const directSession = { explicitPeers: new Set() };
+  const directSession = {
+    explicitPeers: new Set(),
+    suspendReconnect: () => {},
+    resumeReconnect: () => {},
+  };
   const relay = new InferenceRelay(mockPeer(swarm), { relays: [relayA, relayB] });
   await relay.start();
 
@@ -89,7 +108,11 @@ test('targeted relay connections rotate official peers without changing global s
 
 test('targeted fallback rotates past an offline official relay', async () => {
   const swarm = new MockSwarm({ relayOutcomes: ['error', 'open'] });
-  const directSession = { explicitPeers: new Set() };
+  const directSession = {
+    explicitPeers: new Set(),
+    suspendReconnect: () => {},
+    resumeReconnect: () => {},
+  };
   const relay = new InferenceRelay(mockPeer(swarm), {
     relays: [relayA, relayB],
     relayWaitMs: 100,
@@ -116,6 +139,8 @@ test('all official relays offline fails once within the total bound before sessi
   let admittedSessions = 0;
   const directSession = {
     explicitPeers: new Set(),
+    suspendReconnect() {},
+    resumeReconnect() {},
     async connectPeer() {
       directAttempts += 1;
       throw new Error('direct unavailable');
@@ -196,7 +221,12 @@ test('relay release waits for the final active session then restores direct-firs
   const connection = new EventEmitter();
   connection.remotePublicKey = b4a.from(remote, 'hex');
   connection.destroyed = false;
-  connection.destroy = () => { connection.destroyed = true; };
+  connection.closed = false;
+  connection.destroy = () => {
+    connection.destroyed = true;
+    connection.closed = true;
+    connection.emit('close');
+  };
   swarm.connections.add(connection);
   swarm.peers.set(remote, { forceRelaying: true, attempts: 0 });
   const peer = mockPeer(swarm);
@@ -305,6 +335,8 @@ test('relay policy retries peer connection before any session frame exists', asy
   let attempts = 0;
   const directSession = {
     explicitPeers: new Set(),
+    suspendReconnect() {},
+    resumeReconnect() {},
     async connectPeer(_remote, waitMs) {
       waits.push(waitMs);
       attempts += 1;
@@ -348,4 +380,115 @@ test('relay policy leaves a successful direct transport alone', async () => {
   assert.equal(connected.direct, true);
   assert.equal(peerInfo.forceRelaying, false);
   assert.equal(relay.stats().counters.forced_fallbacks, 0);
+});
+
+test('relay fallback owns the tracked connection until release and blocks a late direct race', async () => {
+  const swarm = new MockSwarm();
+  const directAttempt = new EventEmitter();
+  directAttempt.remotePublicKey = b4a.from(remote, 'hex');
+  directAttempt.destroyed = false;
+  directAttempt.destroy = (error) => {
+    directAttempt.error = error;
+    directAttempt.destroyed = true;
+    directAttempt.emit('close');
+  };
+  swarm._allConnections.add(directAttempt);
+  const suspended = [];
+  const resumed = [];
+  const directSession = {
+    explicitPeers: new Set([remote]),
+    suspendReconnect: (peer) => suspended.push(peer),
+    resumeReconnect: (peer) => {
+      assert.equal(swarm._allConnections.get(remote), undefined);
+      assert.equal(swarm.connections.has(relayConnection), false);
+      resumed.push(peer);
+    },
+  };
+  const relay = new InferenceRelay(mockPeer(swarm), { relays: [relayA] });
+  await relay.start();
+
+  relay.requestRelay(remote);
+  const connected = await relay._connectViaRelay(directSession, remote);
+  const relayConnection = swarm.relayAttempts[0].connection;
+
+  assert.equal(connected.relayed, true);
+  assert.equal(directAttempt.destroyed, true);
+  assert.match(directAttempt.error.message, /superseded/);
+  assert.deepEqual(suspended, [remote]);
+  assert.equal(swarm._allConnections.get(remote), relayConnection);
+  assert.equal(swarm.connections.has(relayConnection), true);
+
+  relay.releaseRelay(remote);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(swarm._allConnections.get(remote), undefined);
+  assert.deepEqual(resumed, [remote]);
+  await relay.stop();
+});
+
+test('official inbound relay suppresses provider reconnect until the relay ownership ends', async () => {
+  const swarm = new MockSwarm();
+  const reconnecting = [];
+  swarm.peers.set(remote, {
+    reconnect: (enabled) => reconnecting.push(enabled),
+  });
+  const suspended = [];
+  const resumed = [];
+  const peer = mockPeer(swarm);
+  peer.directSession = {
+    sessions: new Map(),
+    suspendReconnect: (key) => suspended.push(key),
+    resumeReconnect: (key) => resumed.push(key),
+  };
+  const relay = new InferenceRelay(peer, {
+    relays: [relayA],
+    inboundReleaseGraceMs: 1,
+  });
+  await relay.start();
+
+  const directAttempt = new EventEmitter();
+  directAttempt.remotePublicKey = b4a.from(remote, 'hex');
+  directAttempt.destroyed = false;
+  directAttempt.destroy = (error) => {
+    directAttempt.destroyed = true;
+    directAttempt.error = error;
+  };
+  swarm._allConnections.add(directAttempt);
+  swarm.connections.add(directAttempt);
+
+  assert.equal(swarm.server.firewall(
+    b4a.from(remote, 'hex'),
+    { relayThrough: { publicKey: b4a.from(relayA, 'hex') } }
+  ), false);
+  const unrelatedDirect = new EventEmitter();
+  unrelatedDirect.remotePublicKey = b4a.from(remote, 'hex');
+  unrelatedDirect.rawStream = {};
+  swarm.server.emit('connection', unrelatedDirect);
+  assert.equal(relay.connectionTransport(unrelatedDirect).relayed, false);
+
+  const relayRawStream = {};
+  swarm.server._relayConnection(
+    { rawStream: relayRawStream },
+    null,
+    { relayThrough: { publicKey: b4a.from(relayA, 'hex') } },
+    null
+  );
+  const connection = new EventEmitter();
+  connection.remotePublicKey = b4a.from(remote, 'hex');
+  connection.rawStream = relayRawStream;
+  swarm.server.emit('connection', connection);
+
+  assert.equal(relay.connectionTransport(connection).relayed, true);
+  assert.equal(relay.connectionTransport(connection).relay, relayA);
+  assert.equal(directAttempt.destroyed, true);
+  assert.match(directAttempt.error.message, /inbound relay/);
+  assert.equal(swarm.connections.has(directAttempt), false);
+  assert.equal(swarm._allConnections.get(remote), undefined);
+  assert.deepEqual(reconnecting, [false, false]);
+  assert.deepEqual(suspended, [remote, remote]);
+
+  connection.emit('close');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(reconnecting, [false, false, true]);
+  assert.deepEqual(resumed, [remote]);
+  await relay.stop();
 });

@@ -11,6 +11,7 @@ const DEFAULT_RATE_BYTES_PER_SECOND = 32 * 1024 * 1024;
 const DEFAULT_RATE_BURST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
+const DEFAULT_INBOUND_RELEASE_GRACE_MS = 1_000;
 
 const normalizeKey = (value) => {
   const key = b4a.isBuffer(value)
@@ -94,6 +95,10 @@ class InferenceRelay extends Feature {
       DEFAULT_SWEEP_INTERVAL_MS,
       50
     );
+    this.inboundReleaseGraceMs = positiveInteger(
+      config.inboundReleaseGraceMs,
+      DEFAULT_INBOUND_RELEASE_GRACE_MS
+    );
 
     this.server = null;
     this.sessions = new Map();
@@ -102,8 +107,16 @@ class InferenceRelay extends Feature {
     this.outboundRelayConnections = new Set();
     this.relayConnections = new Map();
     this.relayConnects = new Map();
+    this.relayOwners = new Map();
     this.connectionRoutes = new WeakMap();
     this.forcedPeers = new Set();
+    this.inboundRelays = new Map();
+    this.inboundRelayStreams = new WeakMap();
+    this.originalServerFirewall = null;
+    this.wrappedServerFirewall = null;
+    this.originalServerRelayConnection = null;
+    this.wrappedServerRelayConnection = null;
+    this.onServerConnection = (connection) => this._claimInboundRelay(connection);
     this.relayCursor = 0;
     this.sweepTimer = null;
     this.onConnection = (connection, peerInfo) => this._handleConnection(connection, peerInfo);
@@ -131,6 +144,7 @@ class InferenceRelay extends Feature {
       throw new Error('InferenceRelay requires an initialized peer swarm.');
     }
     try {
+      this._installInboundRelayTracking(swarm);
       if (this.serve) {
         if (!this.RelayServer) {
           const relayModule = await import('blind-relay');
@@ -168,6 +182,7 @@ class InferenceRelay extends Feature {
       if (this.sweepTimer) clearInterval(this.sweepTimer);
       this.sweepTimer = null;
       swarm.off?.('connection', this.onConnection);
+      this._removeInboundRelayTracking();
       this.server = null;
       throw error;
     }
@@ -179,6 +194,7 @@ class InferenceRelay extends Feature {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.sweepTimer = null;
     this.peer?.swarm?.off?.('connection', this.onConnection);
+    this._removeInboundRelayTracking();
     for (const connection of this.outboundRelayConnections) {
       connection.on?.('error', () => {});
       connection.destroy?.(new Error('Inference relay stopped.'));
@@ -186,6 +202,11 @@ class InferenceRelay extends Feature {
     this.outboundRelayConnections.clear();
     this.relayConnections.clear();
     this.relayConnects.clear();
+    for (const [remote, directSession] of this.relayOwners) {
+      directSession?.resumeReconnect?.(remote, false);
+    }
+    this.relayOwners.clear();
+    this.forcedPeers.clear();
     for (const state of this.streams.values()) {
       state.stream.on('error', () => {});
       state.stream.destroy(new Error('Inference relay stopped.'));
@@ -253,6 +274,9 @@ class InferenceRelay extends Feature {
     const key = normalizeKey(remote);
     if (!key) return;
     this.forcedPeers.delete(key);
+    const directSession = this.relayOwners.get(key) || this.peer?.directSession;
+    directSession?.resumeReconnect?.(key);
+    this.relayOwners.delete(key);
   }
 
   releaseRelay(remote) {
@@ -263,12 +287,37 @@ class InferenceRelay extends Feature {
         .some((session) => session.remote === key && session.closed !== true);
       if (stillActive) return;
       if (!this.forcedPeers.has(key)) return;
-      this.clearRelayRequest(key);
-      this.counters.relay_releases += 1;
-      for (const connection of this.peer?.swarm?.connections || []) {
+      const swarm = this.peer?.swarm;
+      const directSession = this.relayOwners.get(key) || this.peer?.directSession;
+      const relayConnections = new Set();
+      const ownedConnection = this.relayConnections.get(key);
+      if (ownedConnection) relayConnections.add(ownedConnection);
+      for (const connection of swarm?.connections || []) {
         if (normalizeKey(connection?.remotePublicKey) !== key) continue;
         if (this.connectionRoutes.get(connection)?.relayed !== true) continue;
+        relayConnections.add(connection);
+      }
+      this.forcedPeers.delete(key);
+      this.relayOwners.delete(key);
+      let pendingCloses = relayConnections.size;
+      const resumeDirect = () => {
+        if (pendingCloses > 0 && --pendingCloses > 0) return;
+        directSession?.resumeReconnect?.(key);
+        this.counters.relay_releases += 1;
+      };
+      if (pendingCloses === 0) {
+        resumeDirect();
+        return;
+      }
+      for (const connection of relayConnections) {
+        this.outboundRelayConnections.delete(connection);
+        swarm?.connections?.delete?.(connection);
+        swarm?._allConnections?.delete?.(connection);
+        if (this.relayConnections.get(key) === connection) {
+          this.relayConnections.delete(key);
+        }
         connection.on?.('error', () => {});
+        connection.once?.('close', resumeDirect);
         connection.destroy?.(new Error('Relay session complete; returning to direct-first mode.'));
       }
     }, 0);
@@ -390,6 +439,8 @@ class InferenceRelay extends Feature {
   async _connectViaRelayUnchecked(directSession, remote) {
     const deadline = Date.now() + this.relayWaitMs;
     let lastError = null;
+    this.relayOwners.set(remote, directSession);
+    directSession?.suspendReconnect?.(remote);
     for (let index = 0; index < this.relays.length; index += 1) {
       const relay = this.relays[(this.relayCursor + index) % this.relays.length];
       const relaysLeft = this.relays.length - index;
@@ -422,6 +473,19 @@ class InferenceRelay extends Feature {
       keyPair: swarm.keyPair,
       relayThrough: b4a.from(relay, 'hex'),
     });
+    const trackedConnections = swarm._allConnections;
+    if (
+      !trackedConnections
+      || typeof trackedConnections.get !== 'function'
+      || typeof trackedConnections.add !== 'function'
+      || typeof trackedConnections.delete !== 'function'
+    ) {
+      connection.on?.('error', () => {});
+      connection.destroy?.(new Error('Peer connection registry is unavailable.'));
+      throw new Error('Peer connection registry is unavailable for safe relay fallback.');
+    }
+    const priorConnection = trackedConnections.get(b4a.from(remote, 'hex'));
+    trackedConnections.add(connection);
     this.outboundRelayConnections.add(connection);
     this.connectionRoutes.set(connection, { relayed: true, relay });
     let connectionError = null;
@@ -462,10 +526,15 @@ class InferenceRelay extends Feature {
       });
     } catch (error) {
       this.outboundRelayConnections.delete(connection);
+      trackedConnections.delete(connection);
       connection.destroy?.(error);
       throw error;
     }
 
+    if (priorConnection && priorConnection !== connection) {
+      priorConnection.on?.('error', () => {});
+      priorConnection.destroy?.(new Error('Direct attempt superseded by official relay fallback.'));
+    }
     this.relayConnections.set(remote, connection);
     directSession?.explicitPeers?.add?.(remote);
     swarm.connections?.add?.(connection);
@@ -480,6 +549,7 @@ class InferenceRelay extends Feature {
       }
       this.outboundRelayConnections.delete(connection);
       swarm.connections?.delete?.(connection);
+      trackedConnections.delete(connection);
       if (this.relayConnections.get(remote) === connection) {
         this.relayConnections.delete(remote);
       }
@@ -498,6 +568,150 @@ class InferenceRelay extends Feature {
       relayed: true,
       relay,
     };
+  }
+
+  _installInboundRelayTracking(swarm) {
+    if (!this.hasFallback()) return;
+    const server = swarm?.server;
+    if (
+      !server
+      || typeof server.firewall !== 'function'
+      || typeof server._relayConnection !== 'function'
+      || typeof server.prependListener !== 'function'
+    ) {
+      throw new Error('Peer transport cannot track official inbound relay ownership.');
+    }
+    this.originalServerFirewall = server.firewall;
+    this.wrappedServerFirewall = (remotePublicKey, payload, address) => {
+      const blocked = this.originalServerFirewall(remotePublicKey, payload, address);
+      if (blocked === false) this._trackInboundRelayHandshake(remotePublicKey, payload);
+      return blocked;
+    };
+    server.firewall = this.wrappedServerFirewall;
+    this.originalServerRelayConnection = server._relayConnection;
+    this.wrappedServerRelayConnection = (handshake, relayThrough, payload, noise) => {
+      const relay = normalizeKey(relayThrough)
+        || normalizeKey(payload?.relayThrough?.publicKey);
+      if (relay && this.relays.includes(relay) && handshake?.rawStream) {
+        this.inboundRelayStreams.set(handshake.rawStream, { relay });
+      }
+      return this.originalServerRelayConnection.call(
+        server,
+        handshake,
+        relayThrough,
+        payload,
+        noise
+      );
+    };
+    server._relayConnection = this.wrappedServerRelayConnection;
+    server.prependListener('connection', this.onServerConnection);
+  }
+
+  _removeInboundRelayTracking() {
+    const server = this.peer?.swarm?.server;
+    if (server) {
+      server.off?.('connection', this.onServerConnection);
+      if (server.firewall === this.wrappedServerFirewall && this.originalServerFirewall) {
+        server.firewall = this.originalServerFirewall;
+      }
+      if (
+        server._relayConnection === this.wrappedServerRelayConnection
+        && this.originalServerRelayConnection
+      ) {
+        server._relayConnection = this.originalServerRelayConnection;
+      }
+    }
+    this.originalServerFirewall = null;
+    this.wrappedServerFirewall = null;
+    this.originalServerRelayConnection = null;
+    this.wrappedServerRelayConnection = null;
+    for (const [remote, state] of this.inboundRelays) {
+      for (const pending of state.pending) clearTimeout(pending.timer);
+      if (state.releaseTimer) clearTimeout(state.releaseTimer);
+      this._resumePeerReconnect(remote, false);
+    }
+    this.inboundRelays.clear();
+  }
+
+  _trackInboundRelayHandshake(remotePublicKey, payload) {
+    const remote = normalizeKey(remotePublicKey);
+    const relay = normalizeKey(payload?.relayThrough?.publicKey);
+    if (!remote || !relay || !this.relays.includes(relay)) return false;
+    const state = this._inboundRelayState(remote);
+    if (state.releaseTimer) {
+      clearTimeout(state.releaseTimer);
+      state.releaseTimer = null;
+    }
+    const pending = { relay, timer: null };
+    pending.timer = setTimeout(() => {
+      const index = state.pending.indexOf(pending);
+      if (index !== -1) state.pending.splice(index, 1);
+      this._scheduleInboundReconnect(remote, state);
+    }, this.relayWaitMs);
+    pending.timer.unref?.();
+    state.pending.push(pending);
+    this._suspendPeerReconnect(remote);
+    return true;
+  }
+
+  _claimInboundRelay(connection) {
+    const remote = normalizeKey(connection?.remotePublicKey);
+    const streamRoute = this.inboundRelayStreams.get(connection?.rawStream);
+    const state = remote ? this.inboundRelays.get(remote) : null;
+    if (!state || !streamRoute || state.pending.length === 0) return false;
+    const pendingIndex = state.pending.findIndex(
+      (candidate) => candidate.relay === streamRoute.relay
+    );
+    if (pendingIndex === -1) return false;
+    const [pending] = state.pending.splice(pendingIndex, 1);
+    clearTimeout(pending.timer);
+    state.connections.add(connection);
+    this.connectionRoutes.set(connection, { relayed: true, relay: pending.relay });
+    this._suspendPeerReconnect(remote);
+    const swarm = this.peer?.swarm;
+    const existing = swarm?._allConnections?.get?.(connection.remotePublicKey);
+    if (existing && existing !== connection) {
+      swarm._allConnections.delete?.(existing);
+      swarm.connections?.delete?.(existing);
+      existing.on?.('error', () => {});
+      existing.destroy?.(new Error('Direct attempt superseded by official inbound relay.'));
+    }
+    connection.once?.('close', () => {
+      state.connections.delete(connection);
+      this._scheduleInboundReconnect(remote, state);
+    });
+    return true;
+  }
+
+  _inboundRelayState(remote) {
+    let state = this.inboundRelays.get(remote);
+    if (state) return state;
+    state = { pending: [], connections: new Set(), releaseTimer: null };
+    this.inboundRelays.set(remote, state);
+    return state;
+  }
+
+  _suspendPeerReconnect(remote) {
+    const peerInfo = this.peer?.swarm?.peers?.get?.(remote);
+    peerInfo?.reconnect?.(false);
+    this.peer?.directSession?.suspendReconnect?.(remote);
+  }
+
+  _resumePeerReconnect(remote, reconnect = true) {
+    const peerInfo = this.peer?.swarm?.peers?.get?.(remote);
+    peerInfo?.reconnect?.(true);
+    this.peer?.directSession?.resumeReconnect?.(remote, reconnect);
+  }
+
+  _scheduleInboundReconnect(remote, state) {
+    if (state.pending.length > 0 || state.connections.size > 0 || state.releaseTimer) return;
+    state.releaseTimer = setTimeout(() => {
+      state.releaseTimer = null;
+      if (state.pending.length > 0 || state.connections.size > 0) return;
+      this.inboundRelays.delete(remote);
+      this._resumePeerReconnect(remote);
+    }, this.inboundReleaseGraceMs);
+    state.releaseTimer.unref?.();
   }
 
   _createBoundedStream(options) {

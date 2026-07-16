@@ -780,3 +780,31 @@ test('DirectSession re-arms a pinned peer after its retired connection closes', 
   assert.deepEqual(joined, [remote]);
   assert.equal(directSession._rejoinExplicitPeer('ff'.repeat(32)), false);
 });
+
+test('DirectSession suspends only the relayed peer reconnect intent and resumes it', () => {
+  const left = [];
+  const joined = [];
+  const reconnecting = [];
+  const directSession = new DirectSession({
+    swarm: {
+      leavePeer: (key) => left.push(b4a.toString(key, 'hex')),
+      joinPeer: (key) => joined.push(b4a.toString(key, 'hex')),
+      peers: new Map([[remote, { reconnect: (enabled) => reconnecting.push(enabled) }]]),
+    },
+  });
+  directSession.explicitPeers.add(remote);
+
+  assert.equal(directSession.suspendReconnect(remote), true);
+  assert.deepEqual(left, [remote]);
+  assert.deepEqual(reconnecting, [false]);
+  assert.deepEqual(joined, []);
+  assert.equal(directSession._rejoinExplicitPeer(remote), false);
+  assert.deepEqual(directSession.stats().reconnectSuspended, [remote]);
+
+  assert.equal(directSession.resumeReconnect(remote), true);
+  assert.deepEqual(left, [remote, remote]);
+  assert.deepEqual(joined, [remote]);
+  assert.deepEqual(reconnecting, [false, true]);
+  assert.deepEqual(directSession.stats().reconnectSuspended, []);
+  assert.equal(directSession.resumeReconnect(remote), false);
+});

@@ -107,6 +107,7 @@ class DirectSession extends Feature {
     this.connectionErrors = new WeakMap();
     this.connectionHealth = new Map();
     this.explicitPeers = new Set();
+    this.reconnectSuspended = new Set();
     this.verifiedPeers = new Set();
     this.healthNonce = 0;
     this.lastConnectAttempt = null;
@@ -149,6 +150,7 @@ class DirectSession extends Feature {
       healthTimeoutMs: this.healthTimeoutMs,
       maxSessions: this.maxSessions,
       maxSessionsPerConnection: this.maxSessionsPerConnection,
+      reconnectSuspended: Array.from(this.reconnectSuspended),
       sessionCount: this.sessions.size,
       sessions: Array.from(this.sessions.values()).map((session) => ({
         ...this._transportInfo(session.connection, session.remote),
@@ -334,6 +336,25 @@ class DirectSession extends Feature {
     return { session_id: normalizedSession, remote: normalizedRemote, closed: true };
   }
 
+  suspendReconnect(remote) {
+    const normalizedRemote = this._normalizeRemote(remote);
+    if (!normalizedRemote) throw new Error('Invalid remote peer key.');
+    this.reconnectSuspended.add(normalizedRemote);
+    const swarm = this.peer?.swarm;
+    swarm?.peers?.get?.(normalizedRemote)?.reconnect?.(false);
+    swarm?.leavePeer?.(b4a.from(normalizedRemote, 'hex'));
+    return true;
+  }
+
+  resumeReconnect(remote, reconnect = true) {
+    const normalizedRemote = this._normalizeRemote(remote);
+    if (!normalizedRemote) throw new Error('Invalid remote peer key.');
+    const resumed = this.reconnectSuspended.delete(normalizedRemote);
+    this.peer?.swarm?.peers?.get?.(normalizedRemote)?.reconnect?.(true);
+    if (resumed && reconnect) this._rejoinExplicitPeer(normalizedRemote);
+    return resumed;
+  }
+
   _normalizeRemote(remote) {
     const normalized = normalizeKeyHex(remote);
     return normalized && /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
@@ -382,6 +403,7 @@ class DirectSession extends Feature {
     if (
       !remote
       || !this.explicitPeers.has(remote)
+      || this.reconnectSuspended.has(remote)
       || typeof this.peer?.swarm?.joinPeer !== 'function'
     ) {
       return false;
