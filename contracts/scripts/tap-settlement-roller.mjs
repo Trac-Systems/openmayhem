@@ -28,6 +28,7 @@ const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export const POOL_SETTLEMENT_ABI = [
+  'function token() view returns (address)',
   'function proposeRoot(bytes32 newRoot, uint256 newEpoch, uint256 newCumulativeSpent, bytes governanceSignature)',
   'function executeRoot()',
   'function governanceNonce() view returns (uint256)',
@@ -1615,7 +1616,34 @@ function settlementBundleSha256(bundle) {
   return crypto.createHash('sha256').update(stableJson(bundle)).digest('hex');
 }
 
-function tapRateRecordToLock(rate, bundle, admin) {
+function canonicalTapPaymentScope(payments, admin) {
+  if (!isObject(payments) || payments.denom !== 'au_usd') {
+    throw new Error('confirmed payments/current is missing or invalid');
+  }
+  if (!isHexBytes(admin, 32)
+    || String(payments.set_by ?? '').toLowerCase() !== admin.toLowerCase()
+    || payments.set_by_role !== 'admin') {
+    throw new Error('payments/current was not posted by the current admin');
+  }
+  const chainId = parsePositiveInt(payments.tap?.chain_id, 'payments/current.tap.chain_id');
+  const tokenAddress = normalizeAddress(
+    payments.tap?.token_address,
+    'payments/current.tap.token_address'
+  );
+  const poolAddress = normalizeAddress(
+    payments.tap?.pool_address,
+    'payments/current.tap.pool_address'
+  );
+  const paymentConfigVer = parsePositiveInt(payments.ver, 'payments/current.ver');
+  return {
+    chain_id: chainId,
+    token_address: tokenAddress,
+    pool_address: poolAddress,
+    payment_config_ver: paymentConfigVer,
+  };
+}
+
+function tapRateRecordToLock(rate, bundle, admin, paymentScope) {
   const epoch = parsePositiveInt(bundle?.epoch, 'settlement bundle epoch');
   if (!isObject(rate) || rate.denom !== 'tap_usd_au') {
     throw new Error('confirmed tap/rate/latest is missing or invalid');
@@ -1646,21 +1674,26 @@ function tapRateRecordToLock(rate, bundle, admin) {
     rate_record_key: rateRecordKey,
     posted_by: rate.posted_by.toLowerCase(),
     posted_by_role: 'admin',
+    ...paymentScope,
   };
 }
 
-function validateTapRateLock(lock, bundle) {
+function validateTapRateLock(lock, bundle, paymentScope) {
   if (!isObject(lock)) throw new Error('TAP settlement rate lock must be an object');
   const expectedKeys = [
     'bundle_sha256',
+    'chain_id',
     'denom',
     'epoch',
+    'payment_config_ver',
+    'pool_address',
     'posted_by',
     'posted_by_role',
     'rate_record_key',
     'rate_ts',
     'source',
     'tap_usd_au',
+    'token_address',
     'type',
   ];
   const actualKeys = Object.keys(lock).sort();
@@ -1688,6 +1721,18 @@ function validateTapRateLock(lock, bundle) {
   }
   if (typeof lock.source !== 'string' || !lock.source || lock.source.length > 64) {
     throw new Error('TAP settlement rate lock source is invalid');
+  }
+  const lockedScope = {
+    chain_id: parsePositiveInt(lock.chain_id, 'TAP settlement rate lock chain_id'),
+    token_address: normalizeAddress(lock.token_address, 'TAP settlement rate lock token_address'),
+    pool_address: normalizeAddress(lock.pool_address, 'TAP settlement rate lock pool_address'),
+    payment_config_ver: parsePositiveInt(
+      lock.payment_config_ver,
+      'TAP settlement rate lock payment_config_ver'
+    ),
+  };
+  if (stableJson(lockedScope) !== stableJson(paymentScope)) {
+    throw new Error('TAP settlement rate lock does not match the canonical payment pool');
   }
   return lock;
 }
@@ -1719,15 +1764,29 @@ export async function resolveTapSettlementRate({
     throw new Error('TAP settlement requires --tap-rate-lock <path>');
   }
   const lockPath = path.resolve(tapRateLockPath);
-  if (fs.existsSync(lockPath)) {
-    return validateTapRateLock(readJson(lockPath, 'TAP settlement rate lock'), bundle);
-  }
-  const [rate, admin] = await Promise.all([
-    readContractStateValue(peerRpcUrl, 'tap/rate/latest', { confirmed: true, fetchImpl }),
+  const [payments, admin] = await Promise.all([
+    readContractStateValue(peerRpcUrl, 'payments/current', { confirmed: true, fetchImpl }),
     readContractStateValue(peerRpcUrl, 'admin', { confirmed: true, fetchImpl }),
   ]);
-  createRateLockFile(lockPath, tapRateRecordToLock(rate, bundle, admin));
-  return validateTapRateLock(readJson(lockPath, 'TAP settlement rate lock'), bundle);
+  const paymentScope = canonicalTapPaymentScope(payments, admin);
+  if (fs.existsSync(lockPath)) {
+    return validateTapRateLock(
+      readJson(lockPath, 'TAP settlement rate lock'),
+      bundle,
+      paymentScope
+    );
+  }
+  const rate = await readContractStateValue(
+    peerRpcUrl,
+    'tap/rate/latest',
+    { confirmed: true, fetchImpl }
+  );
+  createRateLockFile(lockPath, tapRateRecordToLock(rate, bundle, admin, paymentScope));
+  return validateTapRateLock(
+    readJson(lockPath, 'TAP settlement rate lock'),
+    bundle,
+    paymentScope
+  );
 }
 
 function buildReplayCommand({
@@ -1787,6 +1846,10 @@ async function main() {
   const priorPath = args.prior;
   const prior = priorPath ? readJson(path.resolve(priorPath), 'prior settlement') : null;
   const peerRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
+  const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
+  const poolAddress = args.pool || process.env.MAYHEM_TAP_POOL_ADDRESS;
+  const operatorAddress = args['operator-address'] || process.env.MAYHEM_TAP_OPERATOR_ADDRESS;
+  if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
   const providerAccounts = await resolveProviderAccountsFromLedger({ bundle, peerRpcUrl });
   const epochPolicy = await resolveTapSettlementEpochPolicy({
     peerRpcUrl,
@@ -1797,12 +1860,12 @@ async function main() {
     tapRateLockPath,
     peerRpcUrl,
   });
+  if (normalizeAddress(poolAddress, 'TAP pool address') !== tapRateLock.pool_address) {
+    throw new Error('Configured TAP pool does not match the canonical payment pool');
+  }
   const tapUsdAu = tapRateLock.tap_usd_au;
   const ledgerFeeBps = args['ledger-fee-bps'];
 
-  const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
-  const poolAddress = args.pool || process.env.MAYHEM_TAP_POOL_ADDRESS;
-  const operatorAddress = args['operator-address'] || process.env.MAYHEM_TAP_OPERATOR_ADDRESS;
   const confirm = boolArg(args.confirm, false);
   const json = boolArg(args.json, false);
   let pool = null;
@@ -1821,6 +1884,16 @@ async function main() {
     signerEnvName = signer.envName;
     governanceSignerEnvName = governance.envName;
     pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, cliEthProvider);
+    const [network, poolToken] = await Promise.all([
+      cliEthProvider.getNetwork(),
+      pool.token(),
+    ]);
+    if (network.chainId !== BigInt(tapRateLock.chain_id)) {
+      throw new Error('Ethereum RPC chain does not match the canonical TAP payment chain');
+    }
+    if (normalizeAddress(poolToken, 'TAP pool token') !== tapRateLock.token_address) {
+      throw new Error('TAP pool token does not match the canonical payment token');
+    }
   }
 
   const report = await rollTapSettlement({

@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 10;
+export const CONTRACT_VERSION = 11;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -1307,6 +1307,11 @@ class MayhemContract extends Contract {
     if (!this.verifyTapAccountEthereumSignature(normalized)) {
       return new Error('Invalid TAP account Ethereum signature.');
     }
+    const poolError = await this.requireCanonicalTapPool(
+      normalized.chain_id,
+      normalized.pool_address
+    );
+    if (poolError) return poolError;
 
     const bindingKey = this.tapAccountBindingKey(
       normalized.user,
@@ -5208,6 +5213,57 @@ class MayhemContract extends Contract {
     return payments.tnk;
   }
 
+  async canonicalTapPaymentConfig({ optional = false } = {}) {
+    const payments = await this.get('payments/current');
+    if (!payments && optional) return null;
+    if (!payments || payments.set_by_role !== 'admin' || !payments.tap) {
+      return new Error('Canonical TAP payment config required.');
+    }
+    if (!Number.isSafeInteger(payments.tap.chain_id) || payments.tap.chain_id < 1) {
+      return new Error('Canonical TAP chain id is invalid.');
+    }
+    if (!this.isEthHexBytes(payments.tap.pool_address, 20)) {
+      return new Error('Canonical TAP pool address is invalid.');
+    }
+    return {
+      chain_id: payments.tap.chain_id,
+      pool_address: payments.tap.pool_address.toLowerCase(),
+    };
+  }
+
+  async requireCanonicalTapPool(chainId, poolAddress) {
+    const tap = await this.canonicalTapPaymentConfig();
+    if (tap instanceof Error) return tap;
+    if (
+      chainId !== tap.chain_id ||
+      typeof poolAddress !== 'string' ||
+      poolAddress.toLowerCase() !== tap.pool_address
+    ) {
+      return new Error('TAP operation does not match the canonical payment pool.');
+    }
+    return null;
+  }
+
+  guardianValidateTapScope(record, amountFields, label) {
+    const hasChain = record.chain_id !== undefined && record.chain_id !== null;
+    const hasPool = record.pool_address !== undefined && record.pool_address !== null;
+    if (!hasChain && !hasPool) {
+      for (const field of amountFields) {
+        if (this.compareAu(record[field] ?? ZERO_AU, ZERO_AU) !== 0) {
+          return new Error(`Guardian TAP ${label} scope invariant failed.`);
+        }
+      }
+      return null;
+    }
+    if (!Number.isSafeInteger(record.chain_id) || record.chain_id < 1) {
+      return new Error(`Guardian TAP ${label} chain invariant failed.`);
+    }
+    if (!this.isEthHexBytes(record.pool_address, 20)) {
+      return new Error(`Guardian TAP ${label} pool invariant failed.`);
+    }
+    return null;
+  }
+
   msbAddressForPublicKey(publicKey, network) {
     if (!this.isHexBytes(publicKey, 32)) return new Error('Invalid MSB owner public key.');
     const prefix = network === 'mainnet'
@@ -6639,6 +6695,11 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const shapeError = this.validateTapDepositValue(this.value);
     if (shapeError) return shapeError;
+    const poolError = await this.requireCanonicalTapPool(
+      this.value.chain_id,
+      this.value.pool_address
+    );
+    if (poolError) return poolError;
 
     const ethereumAddress = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
@@ -6864,6 +6925,11 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const shapeError = this.validateTapDepositReversalValue(this.value);
     if (shapeError) return shapeError;
+    const poolError = await this.requireCanonicalTapPool(
+      this.value.chain_id,
+      this.value.pool_address
+    );
+    if (poolError) return poolError;
 
     const depositSeenKey = `dep/tap/${this.tapDepositIdentity(this.value)}`;
     const depositSeen = await this.get(depositSeenKey);
@@ -10216,6 +10282,10 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
       return new Error('Guardian balance epoch invariant failed.');
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(record, ['au'], 'balance');
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -10254,6 +10324,14 @@ class MayhemContract extends Contract {
         return new Error('Guardian earnings conservation invariant failed.');
       }
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(
+        record,
+        ['total_au', 'held_au', 'paid_cum_au'],
+        'earning'
+      );
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -10285,6 +10363,14 @@ class MayhemContract extends Contract {
     ) {
       return new Error('Guardian conservation invariant failed.');
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(
+        record,
+        ['cum_au', 'swept_cum_au', 'settled_cum_au'],
+        'fee'
+      );
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -10307,6 +10393,10 @@ class MayhemContract extends Contract {
     const expectedBps = record.rail === 'tap' ? TAP_BURN_BPS : 0;
     if (record.burn_bps !== expectedBps) {
       return new Error('Guardian burn policy invariant failed.');
+    }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(record, ['cum_au'], 'burn');
+      if (scopeError) return scopeError;
     }
     return null;
   }
@@ -12162,20 +12252,39 @@ class MayhemContract extends Contract {
   async balanceRecord(user, rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'balance rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.balanceKey(user, normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.balanceKey(user, normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       user,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
+      ...(tap ?? {}),
     };
   }
 
   async earningRecord(provider, rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'earning rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.earningKey(provider, normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.earningKey(provider, normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       provider,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
@@ -12184,13 +12293,23 @@ class MayhemContract extends Contract {
       paid_cum_au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
+      ...(tap ?? {}),
     };
   }
 
   async feeCumRecord(rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'fee rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.feeCumKey(normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.feeCumKey(normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       cum_au: ZERO_AU,
@@ -12199,13 +12318,23 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       last_fee_bps: null,
+      ...(tap ?? {}),
     };
   }
 
   async burnCumRecord(rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'burn rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.burnCumKey(normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.burnCumKey(normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       cum_au: ZERO_AU,
@@ -12213,6 +12342,7 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       burn_bps: normalizedRail === 'tap' ? TAP_BURN_BPS : 0,
+      ...(tap ?? {}),
     };
   }
 

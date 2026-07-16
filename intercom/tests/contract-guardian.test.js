@@ -60,6 +60,26 @@ async function setupGuardianContract() {
     assert.equal(result.ok, true, result.message);
   }
 
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: { network: 'testnet1', treasury_address: `testtrac1${'1'.repeat(40)}` },
+    },
+    admin.publicKey,
+    100_000
+  );
+  assert.equal(payments.ok, true, payments.message);
+
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
   return { admin, provider, user, storage, contract };
 }
@@ -136,4 +156,69 @@ test('MayhemContract guardian halts epochApply on negative balances', async () =
   );
   assert.match(result.message, /guardian non-negative balance/i);
   assert.equal(storage.snapshotBytes(), before);
+});
+
+test('MayhemContract guardian requires pool scope for every nonzero TAP monetary record', async () => {
+  const contract = new MayhemContract({}, {});
+  const balance = {
+    user: '1'.repeat(64),
+    rail: 'tap',
+    denom: 'au_usd',
+    au: '1',
+    updated_epoch: 0,
+    updated_at: null,
+  };
+  assert.match(
+    contract.guardianValidateBalanceRecord(balance, balance.user, 'tap').message,
+    /TAP balance scope invariant/i
+  );
+  assert.equal(
+    contract.guardianValidateBalanceRecord({ ...balance, au: '0' }, balance.user, 'tap'),
+    null
+  );
+
+  const earning = {
+    provider: '2'.repeat(64),
+    rail: 'tap',
+    denom: 'au_usd',
+    total_au: '1',
+    held_au: '1',
+    paid_cum_au: '0',
+    updated_epoch: 0,
+    updated_at: null,
+  };
+  assert.match(
+    contract.guardianValidateEarningRecord(earning, earning.provider, 'tap').message,
+    /TAP earning scope invariant/i
+  );
+
+  const fee = {
+    rail: 'tap',
+    denom: 'au_usd',
+    cum_au: '1',
+    swept_cum_au: '0',
+    settled_cum_au: '1',
+    updated_epoch: 0,
+    updated_at: null,
+    last_apply_hash: null,
+    last_fee_bps: 1_500,
+  };
+  assert.match(
+    contract.guardianValidateFeeRecord(fee, 'tap').message,
+    /TAP fee scope invariant/i
+  );
+
+  const burn = {
+    rail: 'tap',
+    denom: 'au_usd',
+    cum_au: '1',
+    updated_epoch: 0,
+    updated_at: null,
+    last_apply_hash: null,
+    burn_bps: 1_000,
+  };
+  assert.match(
+    contract.guardianValidateBurnRecord(burn, 'tap').message,
+    /TAP burn scope invariant/i
+  );
 });

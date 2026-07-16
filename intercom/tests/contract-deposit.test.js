@@ -424,7 +424,7 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
     op: 'tap_account_bind',
     user: ctx.user.publicKey,
     ethereum_address: ethereum.address,
-    chain_id: 1,
+    chain_id: 61_000,
     pool_address: pool,
   };
   const valid = signTapAccountBinding(ctx.user.wallet, ethereum, unsigned);
@@ -443,6 +443,17 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
     ctx.admin.publicKey
   );
   assert.match(badEthereum.message, /Ethereum signature/i);
+  const retiredPool = signTapAccountBinding(ctx.user.wallet, ethereum, {
+    ...unsigned,
+    pool_address: '0x3333333333333333333333333333333333333333',
+  });
+  const wrongPool = await executeTapAccountBindingFeature(
+    ctx.contract,
+    ctx.storage,
+    retiredPool,
+    ctx.admin.publicKey
+  );
+  assert.match(wrongPool.message, /canonical payment pool/i);
 
   await ctx.storage.put(`bal/${ethereum.address}/tap`, {
     user: ethereum.address,
@@ -451,6 +462,8 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
     au: '86018945004270602',
     updated_epoch: 1,
     updated_at: makeTxKey(4),
+    chain_id: 61_000,
+    pool_address: pool,
   });
   const bindingFeatureKey = await ctx.contract.tapAccountBindingFeatureKey(valid);
   const bound = await executeTapAccountBindingFeature(
@@ -476,7 +489,7 @@ test('MayhemContract dual-signs TAP account bindings and claims pre-binding cred
     bindingFeatureKey
   );
   assert.equal(
-    (await ctx.storage.get(`tap/account/1/${pool}/${ctx.user.publicKey}`)).value.bound_at,
+    (await ctx.storage.get(`tap/account/61000/${pool}/${ctx.user.publicKey}`)).value.bound_at,
     bindingFeatureKey
   );
 
@@ -531,6 +544,17 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
 
   const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
+  const wrongPool = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...value,
+      pool_address: '0x3333333333333333333333333333333333333333',
+      eth_tx_hash: `0x${'9'.repeat(64)}`,
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(wrongPool.message, /canonical payment pool/i);
   const missingEvidence = await ctx.contract.depositFeatureKey({
     op: 'tap_deposit',
     who: buyer,
@@ -682,6 +706,8 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     au: '2000000000000000000',
     updated_epoch: 1,
     updated_at: confirmedKey,
+    chain_id: 61_000,
+    pool_address: pool,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2-twap-median',
@@ -720,6 +746,26 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   );
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 
+  const rotated = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 2,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'3'.repeat(40)}`,
+      },
+      tnk: { network: 'testnet1', treasury_address: treasury },
+    },
+    ctx.admin.publicKey,
+    90
+  );
+  assert.equal(rotated.ok, true, rotated.message);
+
   const reversal = {
     op: 'tap_deposit_reversal',
     chain_id: value.chain_id,
@@ -737,6 +783,33 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     epoch: 1,
     at: 1_901,
   };
+  const retiredPoolReversal = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    reversal,
+    ctx.admin.publicKey
+  );
+  assert.match(retiredPoolReversal.message, /canonical payment pool/i);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tap`)).value.au, '2000000000000000000');
+  const restored = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 3,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: pool,
+      },
+      tnk: { network: 'testnet1', treasury_address: treasury },
+    },
+    ctx.admin.publicKey,
+    91
+  );
+  assert.equal(restored.ok, true, restored.message);
   const nonAdminReversal = await executeDepositFeature(
     ctx.contract,
     ctx.storage,

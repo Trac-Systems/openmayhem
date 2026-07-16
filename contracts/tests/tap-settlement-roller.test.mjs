@@ -121,6 +121,9 @@ test('TAP settlement rate lock survives oracle updates and rejects a different b
   const admin = 'aa'.repeat(32);
   const rateKey = `rate/tap/3600/${'bb'.repeat(32)}`;
   const bundle = { epoch: 1, receipts: [] };
+  const poolAddress = '0x1111111111111111111111111111111111111111';
+  const tokenAddress = '0x2222222222222222222222222222222222222222';
+  let canonicalPoolAddress = poolAddress;
   let fetches = 0;
   const fetchImpl = async (url) => {
     fetches += 1;
@@ -129,6 +132,21 @@ test('TAP settlement rate lock survives oracle updates and rejects a different b
       ok: true,
       async json() {
         if (key === 'admin') return { value: admin };
+        if (key === 'payments/current') {
+          return {
+            value: {
+              denom: 'au_usd',
+              ver: 4,
+              tap: {
+                chain_id: 1,
+                token_address: tokenAddress,
+                pool_address: canonicalPoolAddress,
+              },
+              set_by: admin,
+              set_by_role: 'admin',
+            },
+          };
+        }
         if (key === 'tap/rate/latest') {
           return {
             value: {
@@ -155,18 +173,32 @@ test('TAP settlement rate lock survives oracle updates and rejects a different b
   });
   assert.equal(first.tap_usd_au, TAP_USD_AU);
   assert.equal(first.rate_record_key, rateKey);
-  assert.equal(fetches, 2);
+  assert.equal(first.chain_id, 1);
+  assert.equal(first.token_address, tokenAddress);
+  assert.equal(first.pool_address, poolAddress);
+  assert.equal(first.payment_config_ver, 4);
+  assert.equal(fetches, 3);
   assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
 
   const replay = await resolveTapSettlementRate({
     bundle,
     tapRateLockPath: lockPath,
     peerRpcUrl: 'http://127.0.0.1:1/v1',
-    fetchImpl: async () => {
-      throw new Error('a replay must never refetch mutable tap/rate/latest');
-    },
+    fetchImpl,
   });
   assert.deepEqual(replay, first);
+  assert.equal(fetches, 5);
+  canonicalPoolAddress = '0x3333333333333333333333333333333333333333';
+  await assert.rejects(
+    resolveTapSettlementRate({
+      bundle,
+      tapRateLockPath: lockPath,
+      peerRpcUrl: 'http://127.0.0.1:1/v1',
+      fetchImpl,
+    }),
+    /does not match the canonical payment pool/
+  );
+  canonicalPoolAddress = poolAddress;
   await assert.rejects(
     resolveTapSettlementRate({
       bundle: { epoch: 1, receipts: [{ changed: true }] },
@@ -777,6 +809,17 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   const admin = 'aa'.repeat(32);
   const ledgerState = new Map([
     ['admin', admin],
+    ['payments/current', {
+      denom: 'au_usd',
+      ver: 1,
+      tap: {
+        chain_id: 61_000,
+        token_address: await token.getAddress(),
+        pool_address: poolAddr,
+      },
+      set_by: admin,
+      set_by_role: 'admin',
+    }],
     ['epoch/apply/state', { updated_epoch: 7 }],
     ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
     ['tap/rate/latest', {
@@ -859,6 +902,8 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(report.posted, false);
   assert.equal(report.tap_rate_lock.tap_usd_au, TAP_USD_AU);
   assert.equal(report.tap_rate_lock.epoch, 1);
+  assert.equal(report.tap_rate_lock.chain_id, 61_000);
+  assert.equal(report.tap_rate_lock.pool_address, poolAddr.toLowerCase());
   assert.equal(report.signer_env, 'MAYHEM_TAP_ROLLER_PRIVATE_KEY');
   assert.equal(report.signing_address, (await operator.getAddress()).toLowerCase());
   assert.equal(report.governance_signer_env, 'MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY');

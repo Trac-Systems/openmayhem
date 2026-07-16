@@ -51,6 +51,10 @@ const seededBalance = (user, au, rail = 'fiat') => ({
   au: auString(au),
   updated_epoch: 0,
   updated_at: null,
+  ...(rail === 'tap' ? {
+    chain_id: 61_000,
+    pool_address: `0x${'2'.repeat(40)}`,
+  } : {}),
 });
 
 const paymentKeys = (storage) =>
@@ -136,6 +140,26 @@ async function setupLedgerContract(identities = null) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: { network: 'testnet1', treasury_address: `testtrac1${'1'.repeat(40)}` },
+    },
+    admin.publicKey,
+    100_000
+  );
+  assert.equal(payments.ok, true, payments.message);
 
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
   return { admin, provider, provider2, user, outsider, storage, contract };

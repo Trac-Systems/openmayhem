@@ -205,7 +205,7 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   const { admin, user, outsider, storage, contract } = await setupRateContract();
   const ethereum = makeEthereumIdentity();
   const buyer = ethereum.address;
-  const pool = '0x4444444444444444444444444444444444444444';
+  const pool = `0x${'2'.repeat(40)}`;
   const tapDeposit = {
     op: 'tap_deposit',
     who: buyer,
@@ -334,6 +334,8 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2-twap-median',
     last_deposit_tap_usd_au: '2000000000000000000',
+    chain_id: 61_000,
+    pool_address: pool,
   });
 });
 

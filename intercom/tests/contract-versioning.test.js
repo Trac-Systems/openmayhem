@@ -28,7 +28,7 @@ const versioningLockedRateMap = [
 ];
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 10);
+  assert.equal(CONTRACT_VERSION, 11);
   assert.deepEqual(signingMessageVersions(), [2]);
   assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 8);
 });

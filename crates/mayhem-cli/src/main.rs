@@ -28199,8 +28199,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 )
             })?;
         let balance_au = read_user_balance_au(&rpc, &wallet.public_key, args.rail.as_str()).await?;
-        let payment_directory =
-            canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
+        let payment_state = read_canonical_payment_state(&rpc).await?;
+        let payment_directory = canonical_payment_state_json(&payment_state)?;
         let (models, blocked_version_gates) = match catalog_doc.as_ref() {
             Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
             None => (models, Vec::new()),
@@ -28241,6 +28241,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
             .await?
             .into_iter()
+            .filter(|record| earning_matches_current_payment_scope(record, &payment_state.payments))
             .map(earning_view)
             .map(|view| {
                 view.and_then(|view| {
@@ -28673,17 +28674,8 @@ async fn models(args: ModelsArgs) -> Result<()> {
 
 async fn read_canonical_payment_state(rpc: &PeerRpcClient) -> Result<CanonicalPaymentState> {
     let observed_at = unix_epoch_seconds()?;
-    let admin = read_state_value(rpc, "admin")
-        .await?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .context("contract admin is not initialized")?
-        .to_ascii_lowercase();
-    let payments_value = read_state_value(rpc, "payments/current").await?.context(
-        "canonical payments/current is missing; the admin must publish all payment rails",
-    )?;
-    let payments: CanonicalPayments = serde_json::from_value(payments_value)
-        .context("canonical payments/current has an invalid schema")?;
-    validate_canonical_payments(&payments, &admin)?;
+    let payments = read_canonical_payments(rpc).await?;
+    let admin = payments.set_by.to_ascii_lowercase();
 
     let tap_rate: CanonicalTapRate = serde_json::from_value(
         read_state_value(rpc, "tap/rate/latest")
@@ -28715,6 +28707,21 @@ async fn read_canonical_payment_state(rpc: &PeerRpcClient) -> Result<CanonicalPa
         rate_staleness_seconds,
         observed_at,
     })
+}
+
+async fn read_canonical_payments(rpc: &PeerRpcClient) -> Result<CanonicalPayments> {
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("contract admin is not initialized")?
+        .to_ascii_lowercase();
+    let payments_value = read_state_value(rpc, "payments/current").await?.context(
+        "canonical payments/current is missing; the admin must publish all payment rails",
+    )?;
+    let payments: CanonicalPayments = serde_json::from_value(payments_value)
+        .context("canonical payments/current has an invalid schema")?;
+    validate_canonical_payments(&payments, &admin)?;
+    Ok(payments)
 }
 
 fn validate_canonical_payments(payments: &CanonicalPayments, admin: &str) -> Result<()> {
@@ -29205,6 +29212,8 @@ async fn reputation(args: ReputationArgs) -> Result<()> {
             provider: provider.clone(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 0,
             held_au: 0,
             paid_cum_au: 0,
@@ -33438,14 +33447,20 @@ async fn payouts(args: PayoutsArgs) -> Result<()> {
 async fn earnings(args: EarningsArgs) -> Result<()> {
     let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let payments = read_canonical_payments(&rpc).await?;
     let records = if let Some(provider) = &args.provider {
         read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
             .await?
             .into_iter()
             .filter(|record| record.provider == *provider)
+            .filter(|record| earning_matches_current_payment_scope(record, &payments))
             .collect::<Vec<_>>()
     } else {
-        read_prefix_values(&rpc, "earn/").await?
+        read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+            .await?
+            .into_iter()
+            .filter(|record| earning_matches_current_payment_scope(record, &payments))
+            .collect()
     };
     let mut views = records
         .into_iter()
@@ -36567,19 +36582,45 @@ async fn read_user_balance_au(rpc: &PeerRpcClient, who: &str, rail: &str) -> Res
 
 async fn read_balance_record(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<Value> {
     let value = read_state_value(rpc, &format!("bal/{who}/{rail}")).await?;
-    normalize_balance_record(who, rail, value)
+    let tap = if rail == "tap" {
+        Some(read_canonical_payments(rpc).await?.tap)
+    } else {
+        None
+    };
+    normalize_balance_record(who, rail, value, tap.as_ref())
 }
 
-fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Result<Value> {
+fn normalize_balance_record(
+    who: &str,
+    rail: &str,
+    value: Option<Value>,
+    tap: Option<&CanonicalTapRail>,
+) -> Result<Value> {
+    let value = if let Some(tap) = tap {
+        value.filter(|record| {
+            record.get("chain_id").and_then(Value::as_u64) == Some(tap.chain_id)
+                && record
+                    .get("pool_address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|pool| pool.eq_ignore_ascii_case(&tap.pool_address))
+        })
+    } else {
+        value
+    };
     let mut record = value.unwrap_or_else(|| {
-        json!({
+        let mut record = json!({
             "user": who,
             "rail": rail,
             "denom": "au_usd",
             "au": money_au_json(0),
             "updated_epoch": 0,
             "updated_at": null,
-        })
+        });
+        if let Some(tap) = tap {
+            record["chain_id"] = Value::Number(tap.chain_id.into());
+            record["pool_address"] = Value::String(tap.pool_address.to_ascii_lowercase());
+        }
+        record
     });
     let object = record
         .as_object_mut()
@@ -37445,6 +37486,10 @@ struct LedgerEarningRecord {
     provider: String,
     rail: String,
     denom: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_address: Option<String>,
     #[serde(with = "mayhem_proto::decimal_u128")]
     total_au: MoneyAu,
     #[serde(with = "mayhem_proto::decimal_u128")]
@@ -37467,6 +37512,18 @@ struct LedgerEarningRecord {
     last_settlement_epoch: Option<u64>,
     #[serde(default)]
     last_settlement_msb_tx_hash: Option<String>,
+}
+
+fn earning_matches_current_payment_scope(
+    record: &LedgerEarningRecord,
+    payments: &CanonicalPayments,
+) -> bool {
+    record.rail != "tap"
+        || (record.chain_id == Some(payments.tap.chain_id)
+            && record
+                .pool_address
+                .as_deref()
+                .is_some_and(|pool| pool.eq_ignore_ascii_case(&payments.tap.pool_address)))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63419,7 +63476,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 9);
+        assert_eq!(CONTRACT_VERSION, 11);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
     }
@@ -71791,6 +71848,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider: "provider-a".to_owned(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 10_000,
             held_au: 2_500,
             paid_cum_au: 3_000,
@@ -71822,6 +71881,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider: "bad-provider".to_owned(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             holdbacks: Vec::new(),
             updated_epoch: 0,
             updated_at: None,
@@ -71937,7 +71998,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn balance_record_defaults_missing_contract_key_to_zero_au_usd() {
-        let record = normalize_balance_record("user", "tnk", None).unwrap();
+        let record = normalize_balance_record("user", "tnk", None, None).unwrap();
 
         assert_eq!(record["user"], "user");
         assert_eq!(record["rail"], "tnk");
@@ -71960,6 +72021,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "updated_epoch": 3,
                 "updated_at": 7
             })),
+            None,
         )
         .unwrap();
         assert_eq!(record["au"], "42");
@@ -71967,27 +72029,60 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "provider_coin", "au": "1" }))
+            Some(json!({ "user": "user", "denom": "provider_coin", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "other", "denom": "au_usd", "au": "1" }))
+            Some(json!({ "user": "other", "denom": "au_usd", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "rail": "tap", "denom": "au_usd", "au": "1" }))
+            Some(json!({ "user": "user", "rail": "tap", "denom": "au_usd", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "au_usd" }))
+            Some(json!({ "user": "user", "denom": "au_usd" })),
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn tap_balance_record_ignores_credit_backed_by_a_retired_pool() {
+        let current = CanonicalTapRail {
+            chain_id: 1,
+            token_address: "0x1111111111111111111111111111111111111111".to_owned(),
+            pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+        };
+        let record = normalize_balance_record(
+            "user",
+            "tap",
+            Some(json!({
+                "user": "user",
+                "rail": "tap",
+                "denom": "au_usd",
+                "au": "48000000000000000000",
+                "chain_id": 1,
+                "pool_address": "0x3333333333333333333333333333333333333333",
+                "updated_epoch": 9,
+                "updated_at": "old-pool"
+            })),
+            Some(&current),
+        )
+        .unwrap();
+
+        assert_eq!(record["au"], "0");
+        assert_eq!(record["chain_id"], 1);
+        assert_eq!(record["pool_address"], current.pool_address);
     }
 
     #[test]
@@ -72510,6 +72605,8 @@ State initialization...
             provider: "11".repeat(32),
             rail: "tnk".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 10_000,
             held_au: 4_000,
             paid_cum_au: 1_000,

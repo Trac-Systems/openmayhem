@@ -47,6 +47,12 @@ const seededBalance = (user, au, rail = 'fiat') => ({
   au: auString(au),
   updated_epoch: 0,
   updated_at: null,
+  ...(rail === 'tap'
+    ? {
+        chain_id: 61_000,
+        pool_address: `0x${'2'.repeat(40)}`,
+      }
+    : {}),
 });
 
 const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_au;
@@ -1021,6 +1027,28 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
     10
   );
   assert.equal(tapRails.ok, true, tapRails.message);
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: {
+        network: 'testnet1',
+        treasury_address: `testtrac1${'1'.repeat(40)}`,
+      },
+    },
+    admin.publicKey,
+    11
+  );
+  assert.equal(payments.ok, true, payments.message);
 
   await storage.put(`bal/${fiatUser.publicKey}/fiat`, seededBalance(fiatUser.publicKey, 2_000_000, 'fiat'));
   await storage.put(`bal/${tapUser.publicKey}/tap`, seededBalance(tapUser.publicKey, 2_000_000, 'tap'));

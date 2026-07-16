@@ -152,3 +152,97 @@ test('payment directory is admin-only and rejects local or incomplete discovery'
   assert.match(badTap.message, /invalid TAP chain id/i);
   assert.equal(await storage.get('payments/current'), null);
 });
+
+test('rotating the canonical TAP pool isolates every pool-backed monetary record', async () => {
+  const { admin, storage, contract } = await setup();
+  const oldPool = paymentConfig().tap.pool_address.toLowerCase();
+  const newPool = '0x1111111111111111111111111111111111111111';
+  const user = '2'.repeat(64);
+  const provider = '3'.repeat(64);
+
+  const first = await execute(contract, storage, 'setPayments', paymentConfig(), admin.publicKey, 1);
+  assert.equal(first.ok, true, first.message);
+  await storage.put(`bal/${user}/tap`, {
+    user,
+    rail: 'tap',
+    denom: 'au_usd',
+    au: '48000000000000000000',
+    updated_epoch: 7,
+    updated_at: 'old-balance',
+    chain_id: 1,
+    pool_address: oldPool,
+  });
+  await storage.put(`earn/tap/${provider}`, {
+    provider,
+    rail: 'tap',
+    denom: 'au_usd',
+    total_au: '750',
+    held_au: '250',
+    paid_cum_au: '500',
+    updated_epoch: 7,
+    updated_at: 'old-earning',
+    chain_id: 1,
+    pool_address: oldPool,
+  });
+  await storage.put('fee/tap/cum', {
+    rail: 'tap',
+    denom: 'au_usd',
+    cum_au: '150',
+    swept_cum_au: '100',
+    updated_epoch: 7,
+    updated_at: 'old-fee',
+    last_apply_hash: '4'.repeat(64),
+    last_fee_bps: 1_500,
+    chain_id: 1,
+    pool_address: oldPool,
+  });
+  await storage.put('burn/tap/cum', {
+    rail: 'tap',
+    denom: 'au_usd',
+    cum_au: '100',
+    updated_epoch: 7,
+    updated_at: 'old-burn',
+    last_apply_hash: '4'.repeat(64),
+    burn_bps: 1_000,
+    chain_id: 1,
+    pool_address: oldPool,
+  });
+
+  contract.storage = storage;
+  assert.equal((await contract.balanceRecord(user, 'tap')).au, '48000000000000000000');
+  assert.equal((await contract.earningRecord(provider, 'tap')).total_au, '750');
+  assert.equal((await contract.feeCumRecord('tap')).cum_au, '150');
+  assert.equal((await contract.burnCumRecord('tap')).cum_au, '100');
+  contract.storage = null;
+
+  const rotated = await execute(
+    contract,
+    storage,
+    'setPayments',
+    paymentConfig({
+      ver: 2,
+      tap: { ...paymentConfig().tap, pool_address: newPool },
+    }),
+    admin.publicKey,
+    2
+  );
+  assert.equal(rotated.ok, true, rotated.message);
+
+  contract.storage = storage;
+  assert.deepEqual(await contract.balanceRecord(user, 'tap'), {
+    user,
+    rail: 'tap',
+    denom: 'au_usd',
+    au: '0',
+    updated_epoch: 0,
+    updated_at: null,
+    chain_id: 1,
+    pool_address: newPool,
+  });
+  assert.equal((await contract.earningRecord(provider, 'tap')).total_au, '0');
+  assert.equal((await contract.feeCumRecord('tap')).cum_au, '0');
+  assert.equal((await contract.burnCumRecord('tap')).cum_au, '0');
+  contract.storage = null;
+  assert.equal((await storage.get(`bal/${user}/tap`)).value.au, '48000000000000000000');
+  assert.equal((await storage.get(`earn/tap/${provider}`)).value.total_au, '750');
+});
