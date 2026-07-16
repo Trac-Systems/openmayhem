@@ -36,8 +36,8 @@ use crate::{
         GatewayJobStatus, GatewayJobStore, StoredGatewayJob, StoredGatewayJobSummary,
     },
     pricing::{
-        normalize_rate_map, priced_usage_au, rate_gate_basis_au, text_generation_rate_map,
-        usage_units_au, RateMapEntry,
+        cancellation_settlement_usage, normalize_rate_map, priced_usage_au, rate_gate_basis_au,
+        text_generation_rate_map, usage_units_au, RateMapEntry,
     },
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
@@ -15670,6 +15670,17 @@ async fn record_cancelled_direct_session_receipt(
             "receipt co-signing refused; cancelled session paused",
         ));
     }
+    let expected_usage = cancellation_settlement_usage(
+        &invocation.spend_voucher.body.locked_rate_map,
+        invocation.spend_voucher.body.locked_per_req_au,
+        invocation.spend_voucher.body.locked_min_session_au,
+        &expected_usage,
+    )
+    .ok_or_else(|| {
+        GatewaySessionError::new(
+            "admin-locked price schedule has no nonzero fixed fee or billable cancellation quantum",
+        )
+    })?;
     let au_owed_cum = calculate_locked_au_owed(invocation, &expected_usage);
     if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
         return Err(GatewaySessionError::new(
@@ -29594,13 +29605,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_disconnects_settle_the_minimum_once_per_session() {
+    async fn repeated_variable_only_disconnects_settle_one_quantum_once_per_session() {
         let model = test_model();
         let recorder = GatewayReceiptRecorder {
             receipts: Arc::new(Mutex::new(Vec::new())),
             access_control: Arc::new(GatewayAccessControl::disabled()),
         };
-        let usage = ReceiptUsage::default();
+        let cancellation_usage = ReceiptUsage::from_units([(USAGE_STEP, 1)]);
+        let rate_map = vec![RateMapEntry {
+            unit: USAGE_STEP.to_owned(),
+            per_unit_au: 37,
+            granularity: 5,
+        }];
         let prompt_hash = blake3_hex(b"cancelled render");
         let provider = verifying_key_hex(&test_provider_seed());
         let receipt_for = |invocation: &GatewaySessionInvocation| {
@@ -29622,9 +29638,9 @@ mod tests {
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
-                usage: usage.clone(),
+                usage: cancellation_usage.clone(),
                 usage_attribution: BTreeMap::new(),
-                au_owed_cum: calculate_locked_au_owed(invocation, &usage),
+                au_owed_cum: calculate_locked_au_owed(invocation, &cancellation_usage),
                 prompt_hash: prompt_hash.clone(),
                 ts: 123,
             };
@@ -29636,8 +29652,9 @@ mod tests {
         };
 
         let mut first = test_invocation();
-        first.spend_voucher.body.locked_per_req_au = 11;
-        first.spend_voucher.body.locked_min_session_au = 37;
+        first.spend_voucher.body.locked_rate_map = rate_map.clone();
+        first.spend_voucher.body.locked_per_req_au = 0;
+        first.spend_voucher.body.locked_min_session_au = 0;
         first.receipt_recorder = recorder.clone();
         let first_receipt = receipt_for(&first);
         record_cancelled_direct_session_receipt(
@@ -29646,7 +29663,7 @@ mod tests {
             &first_receipt,
             &provider,
             prompt_hash.clone(),
-            usage.clone(),
+            ReceiptUsage::default(),
             1,
         )
         .await
@@ -29657,7 +29674,7 @@ mod tests {
             &first_receipt,
             &provider,
             prompt_hash.clone(),
-            usage.clone(),
+            ReceiptUsage::default(),
             1,
         )
         .await
@@ -29666,8 +29683,9 @@ mod tests {
         let mut second = test_invocation();
         second.session_id = "bb".repeat(32);
         second.spend_voucher.body.session_id = second.session_id.clone();
-        second.spend_voucher.body.locked_per_req_au = 11;
-        second.spend_voucher.body.locked_min_session_au = 37;
+        second.spend_voucher.body.locked_rate_map = rate_map;
+        second.spend_voucher.body.locked_per_req_au = 0;
+        second.spend_voucher.body.locked_min_session_au = 0;
         second.receipt_recorder = recorder.clone();
         let second_receipt = receipt_for(&second);
         record_cancelled_direct_session_receipt(
@@ -29676,7 +29694,7 @@ mod tests {
             &second_receipt,
             &provider,
             prompt_hash,
-            usage,
+            ReceiptUsage::default(),
             1,
         )
         .await
@@ -29686,7 +29704,10 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert!(receipts
             .iter()
-            .all(|receipt| receipt.receipt.body.au_owed_cum == 37));
+            .all(|receipt| receipt.receipt.body.au_owed_cum == 8));
+        assert!(receipts.iter().all(|receipt| {
+            receipt.receipt.body.usage == ReceiptUsage::from_units([(USAGE_STEP, 1)])
+        }));
         assert_ne!(
             receipts[0].receipt.body.session_id,
             receipts[1].receipt.body.session_id

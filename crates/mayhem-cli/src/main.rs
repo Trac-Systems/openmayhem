@@ -67,8 +67,9 @@ use mayhem_engine::{
     SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
-    audio_fingerprint, embedding_vector_fingerprint, fold_reputation, heartbeat_signing_payload,
-    image_average_hash_hex, normalize_canary_transcript, normalize_rate_map,
+    audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
+    fold_reputation, heartbeat_signing_payload, image_average_hash_hex,
+    normalize_canary_transcript, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
@@ -51603,13 +51604,12 @@ async fn settle_cancelled_provider_session(
     receipt_seq: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    let receipt = provider_session_receipt_for_usage(
+    let receipt = provider_cancelled_session_receipt(
         terms,
         active,
         body,
         usage,
         receipt_seq,
-        true,
         runtime_keypair,
     )
     .context("building cancelled provider session receipt")?;
@@ -51631,6 +51631,34 @@ async fn settle_cancelled_provider_session(
     )
     .await?;
     Ok(receipt)
+}
+
+fn provider_cancelled_session_receipt(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    metered_usage: ReceiptUsage,
+    receipt_seq: u64,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    let usage = cancellation_settlement_usage(
+        &active.locked_rate_map,
+        active.locked_per_req_au,
+        active.locked_min_session_au,
+        &metered_usage,
+    )
+    .context(
+        "admin-locked price schedule has no nonzero fixed fee or billable cancellation quantum",
+    )?;
+    provider_session_receipt_for_usage(
+        terms,
+        active,
+        body,
+        usage,
+        receipt_seq,
+        true,
+        runtime_keypair,
+    )
 }
 
 async fn send_provider_session_output(
@@ -66826,7 +66854,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         terms.per_req_au = 11;
         terms.min_session_au = 37;
         let active = test_active_provider_session(&terms, vec!["image".to_owned()]);
-        let receipt = provider_session_receipt_for_usage(
+        let receipt = provider_cancelled_session_receipt(
             &terms,
             &active,
             &json!({
@@ -66837,7 +66865,6 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
             ReceiptUsage::default(),
             1,
-            true,
             &RuntimeKeypair::from_seed([9; 32]),
         )
         .expect("cancelled receipt");
@@ -66847,6 +66874,46 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(receipt.body.locked_per_req_au, 11);
         assert_eq!(receipt.body.locked_min_session_au, 37);
         assert_eq!(receipt.body.au_owed_cum, 37);
+    }
+
+    #[test]
+    fn cancelled_provider_receipt_charges_signed_quantum_for_variable_only_price() {
+        let mut terms = test_provider_session_terms();
+        terms.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_au: 2_499_999_999_999_999,
+                granularity: 36,
+            },
+        ];
+        terms.per_req_au = 0;
+        terms.min_session_au = 0;
+        let active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        let receipt = provider_cancelled_session_receipt(
+            &terms,
+            &active,
+            &json!({
+                "mayhem_contract": {
+                    "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                },
+                "contract_request": {"prompt": "cancelled render"},
+            }),
+            ReceiptUsage::default(),
+            1,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .expect("variable-only cancelled receipt");
+
+        assert_eq!(
+            receipt.body.usage,
+            ReceiptUsage::from_units([(USAGE_STEP, 1)])
+        );
+        assert_eq!(receipt.body.au_owed_cum, 69_444_444_444_445);
     }
 
     #[test]
