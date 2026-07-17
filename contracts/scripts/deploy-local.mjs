@@ -12,11 +12,21 @@ import {
   walletFromEnv,
 } from './signer-env.mjs';
 
-/** Deploy ONLY the MayhemInferencePool bound to an EXISTING token (no mock). Public deployments should call this
- *  with canonical TAP. `maxEpochDelta` is the C1 per-epoch spend cap (0 = disabled). */
-export async function deployPoolWithToken(signer, tokenAddr, ownerAddr, maxEpochDelta = 0n, art = compileAll()) {
+/** Deploy ONLY the MayhemInferencePool bound to an EXISTING token (no mock). */
+export async function deployPoolWithToken(signer, tokenAddr, {
+  ownerAddr,
+  governanceSigner,
+  governanceDelay = 0n,
+  maxEpochDelta = 0n,
+  art = compileAll(),
+} = {}) {
   const owner = ownerAddr || (await signer.getAddress());
-  const pool = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, signer).deploy(tokenAddr, owner, maxEpochDelta);
+  const governance = governanceSigner || ethers.Wallet.createRandom().address;
+  const pool = await new ethers.ContractFactory(
+    art.MayhemInferencePool.abi,
+    art.MayhemInferencePool.bytecode,
+    signer
+  ).deploy(tokenAddr, owner, governance, governanceDelay, maxEpochDelta);
   await pool.waitForDeployment();
   return { pool, poolAddr: await pool.getAddress(), art };
 }
@@ -24,13 +34,25 @@ export async function deployPoolWithToken(signer, tokenAddr, ownerAddr, maxEpoch
 /** Deploy both contracts with `signer`; pool owner defaults to the signer. `maxEpochDelta` is the C1
  *  per-epoch spend cap (0 = disabled, the local default; set a real ceiling for public networks). Local/test only:
  *  deploys a MockTTAP. Public deployments must bind deployPoolWithToken() to canonical TAP. */
-export async function deployPool(signer, ownerAddr, maxEpochDelta = 0n) {
+export async function deployPool(signer, {
+  ownerAddr,
+  governanceWallet = ethers.Wallet.createRandom(),
+  governanceDelay = 0n,
+  maxEpochDelta = 0n,
+} = {}) {
   const art = compileAll();
   const token = await new ethers.ContractFactory(art.MockTTAP.abi, art.MockTTAP.bytecode, signer).deploy();
   await token.waitForDeployment();
   const tokenAddr = await token.getAddress();
-  const { pool, poolAddr } = await deployPoolWithToken(signer, tokenAddr, ownerAddr, maxEpochDelta, art);
-  return { token, pool, tokenAddr, poolAddr, art };
+  const connectedGovernanceWallet = governanceWallet.connect(signer.provider);
+  const { pool, poolAddr } = await deployPoolWithToken(signer, tokenAddr, {
+    ownerAddr,
+    governanceSigner: await connectedGovernanceWallet.getAddress(),
+    governanceDelay,
+    maxEpochDelta,
+    art,
+  });
+  return { token, pool, tokenAddr, poolAddr, art, governanceWallet: connectedGovernanceWallet };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -44,9 +66,31 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const signer = new ethers.NonceManager(wallet);
     // C1: a real per-epoch spend cap can be set via MAYHEM_TAP_MAX_EPOCH_DELTA (wei); 0 locally.
     const maxEpochDelta = process.env.MAYHEM_TAP_MAX_EPOCH_DELTA ? BigInt(process.env.MAYHEM_TAP_MAX_EPOCH_DELTA) : 0n;
-    const { tokenAddr, poolAddr } = await deployPool(signer, undefined, maxEpochDelta);
+    const governancePrivateKey = process.env.MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(String(governancePrivateKey ?? '').trim())) {
+      throw new Error('Missing MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY for local deployment');
+    }
+    const governanceWallet = new ethers.Wallet(String(governancePrivateKey).trim());
+    const governanceDelay = process.env.MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS
+      ? BigInt(process.env.MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS)
+      : 0n;
+    const { tokenAddr, poolAddr } = await deployPool(signer, {
+      governanceWallet,
+      governanceDelay,
+      maxEpochDelta,
+    });
     const net = await provider.getNetwork();
-    const out = { pool: poolAddr, token: tokenAddr, deployer: await signer.getAddress(), signerEnv: envName, chainId: Number(net.chainId), rpc, maxEpochDelta: maxEpochDelta.toString() };
+    const out = {
+      pool: poolAddr,
+      token: tokenAddr,
+      deployer: await signer.getAddress(),
+      governanceSigner: governanceWallet.address,
+      governanceDelay: governanceDelay.toString(),
+      signerEnv: envName,
+      chainId: Number(net.chainId),
+      rpc,
+      maxEpochDelta: maxEpochDelta.toString(),
+    };
     mkdirSync(dirname(ADDRESSES_FILE), { recursive: true });
     writeFileSync(ADDRESSES_FILE, JSON.stringify(out, null, 2) + '\n');
     console.log('deployed ->', ADDRESSES_FILE, '\n', out);

@@ -1089,18 +1089,32 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     for (const [index, provider] of manifest.seed_providers.entries()) {
       const prefix = `seed_providers[${index}]`;
       if (!requireObject(add, provider, prefix)) continue;
-      requireOnlyKeys(add, provider, prefix, ['provider_pubkey', 'payout', 'joins']);
+      requireOnlyKeys(add, provider, prefix, ['provider_pubkey', 'payouts', 'joins']);
       requireString(add, provider.provider_pubkey, `${prefix}.provider_pubkey`, pubkey64);
       if (provider.submitted_models !== undefined || provider.created_rooms !== undefined || provider.created_enclaves !== undefined) {
         add('error', `${prefix} must not contain provider-created models, rooms, or enclaves`);
       }
-      if (requireObject(add, provider.payout, `${prefix}.payout`)) {
-        requireOnlyKeys(add, provider.payout, `${prefix}.payout`, ['admin_approved', 'method', 'addr']);
-        requireLiteral(add, provider.payout.admin_approved, true, `${prefix}.payout.admin_approved`);
-        if (!['tnk', 'stripe'].includes(provider.payout.method)) {
-          add('error', `${prefix}.payout.method must be tnk or stripe`);
+      if (requireObject(add, provider.payouts, `${prefix}.payouts`)) {
+        const methods = Object.keys(provider.payouts);
+        if (methods.length === 0) add('error', `${prefix}.payouts must not be empty`);
+        for (const [method, payout] of Object.entries(provider.payouts)) {
+          const payoutPrefix = `${prefix}.payouts.${method}`;
+          if (!['tnk', 'tap', 'stripe'].includes(method)) {
+            add('error', `${payoutPrefix} must be tnk, tap, or stripe`);
+            continue;
+          }
+          if (!requireObject(add, payout, payoutPrefix)) continue;
+          requireOnlyKeys(add, payout, payoutPrefix, ['admin_approved', 'addr', 'currency']);
+          requireLiteral(add, payout.admin_approved, true, `${payoutPrefix}.admin_approved`);
+          requireString(add, payout.addr, `${payoutPrefix}.addr`);
+          if (method === 'stripe') {
+            if (!['usd', 'eur'].includes(payout.currency)) {
+              add('error', `${payoutPrefix}.currency must be usd or eur`);
+            }
+          } else if (payout.currency !== undefined) {
+            add('error', `${payoutPrefix}.currency is only valid for stripe`);
+          }
         }
-        requireString(add, provider.payout.addr, `${prefix}.payout.addr`);
       }
       if (requireArray(add, provider.joins, `${prefix}.joins`, 1)) {
         for (const [joinIndex, join] of provider.joins.entries()) {
@@ -1275,12 +1289,15 @@ async function buildCommands(manifest) {
   }
 
   for (const provider of manifest.seed_providers || []) {
-    adminPayoutTxs.push(txCommand({
-      op: 'set_provider_payout',
-      provider: provider.provider_pubkey,
-      payout_addr: provider.payout?.addr,
-      payout_method: provider.payout?.method,
-    }));
+    for (const [method, payout] of Object.entries(provider.payouts || {})) {
+      adminPayoutTxs.push(txCommand({
+        op: 'set_provider_payout',
+        provider: provider.provider_pubkey,
+        payout_addr: payout.addr,
+        payout_method: method,
+        ...(payout.currency ? { payout_currency: payout.currency } : {}),
+      }));
+    }
     for (const join of provider.joins || []) {
       providerLifecycleCommands.push(`# provider ${provider.provider_pubkey}: run from this provider wallet; submits free signed Mayhem Feature records`);
       const roomIds = [];

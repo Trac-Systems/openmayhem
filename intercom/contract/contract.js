@@ -3,8 +3,9 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
+import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 7;
+export const CONTRACT_VERSION = 12;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -15,7 +16,6 @@ const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
-const TAP_RATE_SOURCES = new Set(['uniswap-v2', 'config', 'stale']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
 const PROVIDER_LIFECYCLE_OPS = new Set([
   'register_provider',
@@ -47,6 +47,8 @@ const MAX_OPERATOR_FEE_BPS = 1_500;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 3;
 const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
 const DEFAULT_DISPUTE_TIMEOUT_EPOCHS = 168;
+const DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER = 8;
+const DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS = 2_500;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
@@ -55,7 +57,7 @@ const MIN_TAP_CONFIRMATION_DEPTH = 12;
 const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 9;
 const CTX_BRACKET_TABLE_VERSION = 1;
 const CTX_BRACKETS = Object.freeze([
   { id: 'le8k', max_ctx: 8_192 },
@@ -70,6 +72,13 @@ const USD_AU = 1_000_000_000_000_000_000n;
 const FIAT_MINOR_AU = 10_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
+const MSB_TRANSFER_EVIDENCE_VERSION = 1;
+const STRIPE_TRANSFER_EVIDENCE_VERSION = 1;
+const REPUTATION_HALF_LIFE_SECONDS = 14 * DAY_SECONDS;
+const REPUTATION_KAPPA = 25;
+const REPUTATION_RAW_NANO_SCALE = 1_000_000_000n;
+const REPUTATION_DECAY_PICO_SCALE = 1_000_000_000_000n;
+const REPUTATION_RAW_NANO_PER_MILLI = 1_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -80,7 +89,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   auditor_min_age_seconds: { default: 30 * DAY_SECONDS, min: 0, max: 10 * 365 * DAY_SECONDS },
   canary_match_min_bps: { default: 9_000, min: 0, max: 10_000 },
   canary_probe_holdback_bps: { default: 0, min: 0, max: 10_000 },
-  canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
+  canary_probe_release_min_passes: { default: 2, min: 0, max: 1_000_000 },
   probe_reward_au: { default: FIVE_MILLI_USD_AU, min: ZERO_AU, money: true },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   fraud_slash_bps: { default: DEFAULT_FRAUD_SLASH_BPS, min: 0, max: 10_000 },
@@ -91,6 +100,8 @@ const PARAM_DEFINITIONS = Object.freeze({
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
   dispute_deposit_au: { default: DEFAULT_DISPUTE_DEPOSIT_AU, min: '1', money: true },
   dispute_timeout_epochs: { default: DEFAULT_DISPUTE_TIMEOUT_EPOCHS, min: 1, max: 1_000_000 },
+  max_open_disputes_per_opener: { default: DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER, min: 1, max: 1_000 },
+  dispute_opener_fault_forfeit_bps: { default: DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS, min: 1, max: 9_999 },
   payout_min_au: { default: ONE_USD_AU, min: ZERO_AU, money: true },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
@@ -135,6 +146,8 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'fee_bps',
   'dispute_deposit_au',
   'dispute_timeout_epochs',
+  'max_open_disputes_per_opener',
+  'dispute_opener_fault_forfeit_bps',
   'payout_min_au',
   'price_min_bps',
   'price_max_bps',
@@ -176,10 +189,11 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'seed_perceptual_hash',
   'attestation_of_compute',
 ]);
+const AUDITOR_SLASH_REASONS = new Set(['collusion', 'false_report']);
 const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
-const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
+const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit', 'partial_forfeit']);
 const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'price'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
@@ -357,6 +371,10 @@ const canonicalSpendVoucherBody = (body) => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const canonical = {
     session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
     rail: body.rail,
     enclave_id: body.enclave_id,
     price_ver: body.price_ver,
@@ -383,6 +401,10 @@ const canonicalReceiptBody = (body) => {
   const canonical = {
     schema_version: body.schema_version,
     session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
     seq: body.seq,
     final: body.final,
     rail: body.rail,
@@ -469,6 +491,10 @@ export const probeResultEvidence = (value, auditor) => ({
   enclave_id: value.enclave_id,
   binary_hash: value.binary_hash,
   canary_set: value.canary_set,
+  canary_prompt_id: value.canary_prompt_id,
+  challenge_epoch: value.challenge_epoch,
+  challenge_apply_hash: value.challenge_apply_hash,
+  challenge_seed: value.challenge_seed,
   verification_method: value.verification_method,
   session_receipt_hash: value.session_receipt_hash,
   evidence_hash: value.evidence_hash,
@@ -545,6 +571,7 @@ class MayhemContract extends Contract {
   constructor(protocol, options = {}) {
     super(protocol, options);
     const self = this;
+    this._mayhemApplyStage = null;
 
     this.addFeature('mayhem_feature', async function () {
       return await self.mayhemFeature();
@@ -601,6 +628,7 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
+        ver: { type: 'number', integer: true, min: 1 },
         fiat: { type: 'any' },
         tap: { type: 'any' },
         tnk: { type: 'any' },
@@ -838,6 +866,8 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
+        att_tier: { type: 'number', integer: true, min: 1, max: 3 },
+        attestation_head: { type: 'string', min: 64, max: 64 },
         hardware_fingerprint: { type: 'string', min: 1, max: 128, optional: true },
         device_key: { type: 'string', min: 1, max: 128, optional: true },
       },
@@ -972,6 +1002,21 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('auditorSlash', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        auditor: { type: 'string', min: 64, max: 64 },
+        provider: { type: 'string', min: 64, max: 64 },
+        probe_id: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 0 },
+        reason: { type: 'string', min: 1, max: 64 },
+        evidence_hash: { type: 'string', min: 64, max: 64 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
     this.addSchema('probeResult', {
       value: {
         $$strict: true,
@@ -985,6 +1030,10 @@ class MayhemContract extends Contract {
         epoch: { type: 'number', integer: true, min: 0 },
         at: { type: 'number', integer: true, min: 0 },
         canary_set: { type: 'string', min: 1, max: 128, optional: true },
+        canary_prompt_id: { type: 'string', min: 1, max: 128, optional: true },
+        challenge_epoch: { type: 'number', integer: true, min: 0, optional: true },
+        challenge_apply_hash: { type: 'string', min: 64, max: 64, optional: true },
+        challenge_seed: { type: 'string', min: 64, max: 64, optional: true },
         verification_method: { type: 'string', min: 1, max: 64, optional: true },
         match_bps: { type: 'number', integer: true, min: 0, max: 10_000, optional: true },
         pass: { type: 'boolean', optional: true },
@@ -1039,11 +1088,11 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         rail: { type: 'string', min: 1, max: 16 },
-        session_id: { type: 'string', min: 1, max: 128 },
+        session_id: { type: 'string', min: 64, max: 64 },
         reason: { type: 'string', min: 1, max: 64 },
-        provider: { type: 'string', min: 1, max: 128, optional: true },
+        provider: { type: 'string', min: 64, max: 64 },
         counterparty: { type: 'string', min: 1, max: 128, optional: true },
-        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        enclave_id: { type: 'string', min: 64, max: 64 },
         epoch: { type: 'number', integer: true, min: 0, optional: true },
         at: { type: 'number', integer: true, min: 0 },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
@@ -1180,23 +1229,28 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    const isRateFeature = value.op === 'rate_oracle' || value.op === 'tap_rate_oracle';
+    if (isRateFeature) this._mayhemApplyStage = 'rate:require-admin';
     const adminError = await this.requireAdmin(this.address);
     if (adminError) {
+      if (isRateFeature) this._mayhemApplyStage = null;
       this._mayhemLastFeatureResult = adminError;
       return adminError;
     }
+    if (isRateFeature) this._mayhemApplyStage = 'rate:admin-verified';
     if (value.op === 'epoch_apply') {
       const result = await this.applyEpochApplyFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (['tnk_deposit', 'tap_deposit', 'fiat_deposit', 'fiat_chargeback'].includes(value.op)) {
+    if (['tnk_deposit', 'tap_deposit', 'tap_deposit_reversal', 'fiat_deposit', 'fiat_chargeback'].includes(value.op)) {
       const result = await this.applyDepositCreditFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
     if (value.op === 'rate_oracle' || value.op === 'tap_rate_oracle') {
       const result = await this.applyRateOracleFeature(key, value);
+      this._mayhemApplyStage = null;
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1207,6 +1261,11 @@ class MayhemContract extends Contract {
     }
     if (value.op === 'fiat_settlement') {
       const result = await this.applyFiatSettlementFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'fiat_dust_sweep') {
+      const result = await this.applyFiatDustSweepFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1262,6 +1321,11 @@ class MayhemContract extends Contract {
     if (!this.verifyTapAccountEthereumSignature(normalized)) {
       return new Error('Invalid TAP account Ethereum signature.');
     }
+    const poolError = await this.requireCanonicalTapPool(
+      normalized.chain_id,
+      normalized.pool_address
+    );
+    if (poolError) return poolError;
 
     const bindingKey = this.tapAccountBindingKey(
       normalized.user,
@@ -1367,6 +1431,8 @@ class MayhemContract extends Contract {
           intent.provider,
           intent.enclave_id,
           key,
+          intent.att_tier,
+          intent.attestation_head,
           intent.hardware_fingerprint ?? null,
           intent.device_key ?? null,
           {
@@ -1614,6 +1680,7 @@ class MayhemContract extends Contract {
     try {
       if (value.op === 'tnk_deposit') return await this.tnkDeposit();
       if (value.op === 'tap_deposit') return await this.tapDeposit();
+      if (value.op === 'tap_deposit_reversal') return await this.tapDepositReversal();
       if (value.op === 'fiat_deposit') return await this.fiatDeposit();
       if (value.op === 'fiat_chargeback') return await this.fiatChargeback();
       return;
@@ -1623,6 +1690,7 @@ class MayhemContract extends Contract {
   }
 
   async applyRateOracleFeature(key, value) {
+    this._mayhemApplyStage = 'rate:key';
     const expectedKey = await this.rateFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
     if (key !== expectedKey) return;
@@ -1630,6 +1698,7 @@ class MayhemContract extends Contract {
     const previousTx = this.tx;
     this.tx = key;
     try {
+      this._mayhemApplyStage = 'rate:dispatch';
       if (value.op === 'rate_oracle') return await this.rateOracle();
       if (value.op === 'tap_rate_oracle') return await this.tapRateOracle();
       return;
@@ -1661,6 +1730,20 @@ class MayhemContract extends Contract {
     this.tx = key;
     try {
       return await this.fiatSettlement();
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyFiatDustSweepFeature(key, value) {
+    const expectedKey = await this.fiatDustSweepFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.fiatDustSweep();
     } finally {
       this.tx = previousTx;
     }
@@ -2019,7 +2102,7 @@ class MayhemContract extends Contract {
 
     const record = {
       provider: providerId,
-      payout: null,
+      payouts: {},
       accepted_rails: ['fiat'],
       accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
       accepted_rails_set_by: providerId,
@@ -2074,6 +2157,52 @@ class MayhemContract extends Contract {
 
   spendHoldKey(user, rail, epoch) {
     return `hold/${rail}/${user}/${epoch}`;
+  }
+
+  disputeOpenCountKey(opener) {
+    return `disp/open/${opener}`;
+  }
+
+  providerOpenDisputeCountKey(provider) {
+    return `disp/provider-open/${provider}`;
+  }
+
+  async disputeOpenCount(key) {
+    const record = await this.get(key);
+    const count = record?.count ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      return new Error('Invalid open dispute count.');
+    }
+    return count;
+  }
+
+  async providerHasOpenDispute(provider) {
+    const count = await this.disputeOpenCount(this.providerOpenDisputeCountKey(provider));
+    if (count instanceof Error) return count;
+    return count > 0;
+  }
+
+  async closeDisputeCounts(dispute) {
+    const openerKey = this.disputeOpenCountKey(dispute.opened_by);
+    const providerKey = this.providerOpenDisputeCountKey(dispute.provider);
+    const openerCount = await this.disputeOpenCount(openerKey);
+    if (openerCount instanceof Error) return openerCount;
+    const providerCount = await this.disputeOpenCount(providerKey);
+    if (providerCount instanceof Error) return providerCount;
+    if (openerCount < 1 || providerCount < 1) {
+      return new Error('Open dispute count underflow.');
+    }
+    await this.put(openerKey, {
+      opener: dispute.opened_by,
+      count: openerCount - 1,
+      updated_at: this.tx,
+    });
+    await this.put(providerKey, {
+      provider: dispute.provider,
+      count: providerCount - 1,
+      updated_at: this.tx,
+    });
+    return null;
   }
 
   earningKey(provider, rail) {
@@ -2139,15 +2268,23 @@ class MayhemContract extends Contract {
     const record = await this.get(key);
     if (!record) return new Error('Provider not found.');
 
+    const payoutTargets = record.payouts ?? {};
+    if (typeof payoutTargets !== 'object' || Array.isArray(payoutTargets)) {
+      return new Error('Invalid provider payout targets.');
+    }
+    const { payout: _discardedPayout, ...currentRecord } = record;
     const updated = {
-      ...record,
-      payout: {
-        addr: this.value.payout_addr,
-        method: this.value.payout_method,
-        ...(payoutCurrency ? { currency: payoutCurrency } : {}),
-        set_by: this.address,
-        set_by_role: 'admin',
-        set_at: this.tx,
+      ...currentRecord,
+      payouts: {
+        ...payoutTargets,
+        [this.value.payout_method]: {
+          addr: this.value.payout_addr,
+          method: this.value.payout_method,
+          ...(payoutCurrency ? { currency: payoutCurrency } : {}),
+          set_by: this.address,
+          set_by_role: 'admin',
+          set_at: this.tx,
+        },
       },
       updated_at: this.tx,
     };
@@ -2826,7 +2963,17 @@ class MayhemContract extends Contract {
 
   async joinEnclave() {
     const shapeError = this.validateExactCommandValue(
-      ['op', 'enclave_id', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver'],
+      [
+        'op',
+        'enclave_id',
+        'att_tier',
+        'attestation_head',
+        'served_ctx',
+        'served_modalities',
+        'served_specialities',
+        'ctx_bracket',
+        'ctx_bracket_table_ver',
+      ],
       'join_enclave',
       ['hardware_fingerprint', 'device_key']
     );
@@ -2837,6 +2984,8 @@ class MayhemContract extends Contract {
       this.address,
       this.value.enclave_id,
       this.tx,
+      this.value.att_tier,
+      this.value.attestation_head,
       this.value.hardware_fingerprint ?? null,
       this.value.device_key ?? null,
       {
@@ -2853,6 +3002,8 @@ class MayhemContract extends Contract {
     providerId,
     enclaveId,
     stamp,
+    attTier,
+    attestationHead,
     hardwareFingerprint = null,
     deviceKey = null,
     serveTerms = null
@@ -2861,6 +3012,12 @@ class MayhemContract extends Contract {
     if (consentError) return consentError;
     const providerError = await this.requireProvider(providerId);
     if (providerError) return providerError;
+    if (!Number.isSafeInteger(attTier) || attTier < 1 || attTier > MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER) {
+      return new Error('Invalid provider attestation tier.');
+    }
+    if (!this.isHexBytes(attestationHead, 32)) {
+      return new Error('Invalid provider attestation head.');
+    }
     if (hardwareFingerprint !== null && !this.isHexBytes(hardwareFingerprint, 32)) {
       return new Error('Invalid provider hardware fingerprint.');
     }
@@ -2885,17 +3042,23 @@ class MayhemContract extends Contract {
     );
     if (priceError) return priceError;
     const minTierPolicy = await this.enclaveMinTierPolicy(enclave);
-    if (enclave.att_tier < minTierPolicy.min_att_tier) {
+    if (attTier !== enclave.att_tier) {
       return new Error(
-        `Enclave now requires minimum attestation tier ${minTierPolicy.min_att_tier}; lower-tier providers finish in-flight work and held earnings settle on the normal schedule.`
+        `Provider attestation tier ${attTier} does not match enclave tier ${enclave.att_tier}.`
+      );
+    }
+    const provider = await this.get(`prov/${providerId}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    const effectiveTier = provider.kyb?.status === 'verified' ? 4 : attTier;
+    if (effectiveTier < minTierPolicy.min_att_tier) {
+      return new Error(
+        `Enclave now requires minimum attestation tier ${minTierPolicy.min_att_tier}; provider proved tier ${effectiveTier}.`
       );
     }
 
     const key = `serve/${providerId}/${enclaveId}`;
     const existing = await this.get(key);
     if (existing && existing.status === 'active') return new Error('Provider already serving enclave.');
-    const provider = await this.get(`prov/${providerId}`);
-    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
     if (deviceKey !== null) {
       const deviceBan = await this.get(`ban/device/${deviceKey}`);
       if (deviceBan?.status === 'banned') return new Error('Provider device key is banned.');
@@ -2917,6 +3080,9 @@ class MayhemContract extends Contract {
       enclave_id: enclaveId,
       model_id: enclave.model_id,
       status: 'active',
+      att_tier: attTier,
+      effective_att_tier: effectiveTier,
+      attestation_head: attestationHead.toLowerCase(),
       ...(normalizedServeTerms ?? {}),
       ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
       ...(deviceKey !== null ? { device_key: deviceKey } : {}),
@@ -3445,8 +3611,26 @@ class MayhemContract extends Contract {
     if (!head || head.head !== this.value.events_head) {
       return new Error('Reputation events head mismatch.');
     }
-    if (this.value.successful_sessions < (provider.probation?.successful_sessions ?? 0)) {
-      return new Error('Successful sessions must not decrease.');
+    const fold = await this.get(`ev/rep/fold/${this.value.provider}`);
+    if (
+      !fold ||
+      fold.events_head !== head.head ||
+      fold.event_count !== head.count
+    ) {
+      return new Error('Reputation fold state mismatch.');
+    }
+    if (this.value.epoch < fold.max_epoch) {
+      return new Error('Reputation anchor epoch precedes an event.');
+    }
+    const expected = this.reputationFoldAt(fold, this.value.folded_at);
+    if (expected instanceof Error) return expected;
+    if (
+      this.value.r_bps !== expected.r_bps ||
+      this.value.raw_milli !== expected.raw_milli ||
+      this.value.successful_sessions !== expected.successful_sessions ||
+      (this.value.provenance_violation === true) !== expected.provenance_violation
+    ) {
+      return new Error('Reputation anchor does not match the contract fold.');
     }
 
     const params = await this.activeParamsAt(this.value.folded_at, [
@@ -3534,6 +3718,7 @@ class MayhemContract extends Contract {
     const key = `auditor/${target}`;
     const existing = await this.get(key);
     if (existing?.status === 'active') return new Error('Auditor already registered.');
+    if (existing?.status === 'slashed') return new Error('Auditor is slashed.');
 
     const record = {
       auditor: target,
@@ -3549,6 +3734,97 @@ class MayhemContract extends Contract {
     await this.put(key, record);
     console.log('mayhem auditorRegister', record);
     return { ok: true, op: 'auditorRegister', auditor: target };
+  }
+
+  async auditorSlash() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (this.value.op !== 'auditor_slash') return new Error('Invalid auditor slash op.');
+    if (!this.isHexBytes(this.value.auditor, 32)) return new Error('Invalid auditor slash target.');
+    if (!this.isHexBytes(this.value.provider, 32)) return new Error('Invalid auditor slash provider.');
+    if (!this.isSafeKeyPart(this.value.probe_id)) return new Error('Invalid auditor slash probe id.');
+    if (!AUDITOR_SLASH_REASONS.has(this.value.reason)) return new Error('Unsupported auditor slash reason.');
+    if (!this.isHexBytes(this.value.evidence_hash, 32)) return new Error('Invalid auditor slash evidence hash.');
+
+    const auditorKey = `auditor/${this.value.auditor}`;
+    const auditor = await this.get(auditorKey);
+    if (!auditor) return new Error('Auditor not found.');
+    if (auditor.status === 'slashed') return new Error('Auditor is already slashed.');
+    if (auditor.status !== 'active') return new Error('Auditor is not active.');
+    const probeKey = `ev/probe/${this.value.probe_id}`;
+    const probe = await this.get(probeKey);
+    if (!probe || probe.probe_kind !== 'canary') return new Error('Canary probe not found.');
+    if (
+      probe.auditor !== this.value.auditor ||
+      probe.provider !== this.value.provider ||
+      probe.epoch !== this.value.epoch ||
+      probe.pass !== true
+    ) {
+      return new Error('Auditor slash evidence does not match the passing probe.');
+    }
+    if (probe.status === 'slashed') return new Error('Canary probe is already slashed.');
+    const slashKey = `ev/auditor-slash/${this.value.auditor}/${this.value.probe_id}`;
+    if ((await this.get(slashKey)) !== null) return new Error('Auditor slash already recorded.');
+
+    const passKey = `probe/pass/${this.value.provider}/${this.value.epoch}`;
+    const passRecord = await this.get(passKey);
+    if (!passRecord || !Array.isArray(passRecord.probes)) {
+      return new Error('Canary pass record not found.');
+    }
+    const remaining = passRecord.probes.filter((entry) => !(
+      entry.auditor === this.value.auditor && entry.probe_id === this.value.probe_id
+    ));
+    if (remaining.length === passRecord.probes.length) {
+      return new Error('Canary pass record does not contain the slashed probe.');
+    }
+    const falseReports = this.safeAddCount(auditor.false_reports ?? 0, 1, 'auditor false report count');
+    if (falseReports instanceof Error) return falseReports;
+    const slash = {
+      auditor: this.value.auditor,
+      provider: this.value.provider,
+      probe_id: this.value.probe_id,
+      epoch: this.value.epoch,
+      reason: this.value.reason,
+      evidence_hash: this.value.evidence_hash.toLowerCase(),
+      reward_forfeited_au: probe.probe_reward_au ?? ZERO_AU,
+      slashed_at_seconds: this.value.at,
+      slashed_at: this.tx,
+      slashed_by: this.address,
+      slashed_by_role: 'admin',
+    };
+    await this.put(passKey, {
+      ...passRecord,
+      pass_count: remaining.length,
+      auditors: remaining.map((entry) => entry.auditor),
+      probes: remaining,
+      last_slash_evidence_hash: slash.evidence_hash,
+      updated_at: this.tx,
+    });
+    await this.put(probeKey, {
+      ...probe,
+      status: 'slashed',
+      collusion_evidence_hash: slash.evidence_hash,
+      slashed_at: this.tx,
+    });
+    await this.put(auditorKey, {
+      ...auditor,
+      status: 'slashed',
+      false_reports: falseReports,
+      slash_reason: this.value.reason,
+      slash_evidence_hash: slash.evidence_hash,
+      slashed_at: this.tx,
+      slashed_by: this.address,
+      updated_at: this.tx,
+    });
+    await this.put(slashKey, slash);
+    console.log('mayhem auditorSlash', slash);
+    return {
+      ok: true,
+      op: 'auditorSlash',
+      auditor: this.value.auditor,
+      probe_id: this.value.probe_id,
+      evidence_hash: slash.evidence_hash,
+    };
   }
 
   async probeResult() {
@@ -3582,6 +3858,12 @@ class MayhemContract extends Contract {
     const pass = this.probePass(this.value, params);
     if (this.value.pass !== undefined && this.value.pass !== pass) {
       return new Error('Probe pass flag does not match contract threshold.');
+    }
+    if (this.value.probe_kind === 'canary' && pass) {
+      const passRecord = await this.get(`probe/pass/${this.value.provider}/${this.value.epoch}`);
+      if (passRecord?.auditors?.includes(this.address)) {
+        return new Error('Auditor already supplied a canary pass for this provider epoch.');
+      }
     }
 
     const reputationEvent = await this.appendReputationEvent({
@@ -3642,6 +3924,10 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       at: this.value.at,
       canary_set: this.value.canary_set ?? null,
+      canary_prompt_id: this.value.canary_prompt_id ?? null,
+      challenge_epoch: this.value.challenge_epoch ?? null,
+      challenge_apply_hash: this.value.challenge_apply_hash ?? null,
+      challenge_seed: this.value.challenge_seed ?? null,
       verification_method: this.value.verification_method ?? null,
       binary_hash: this.value.binary_hash ?? null,
       match_bps: this.value.match_bps ?? null,
@@ -3658,7 +3944,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/probe/${this.value.probe_id}`, record);
     let probePassRecord = null;
     if (this.value.probe_kind === 'canary' && pass) {
-      probePassRecord = await this.recordCanaryProbePass(this.value);
+      probePassRecord = await this.recordCanaryProbePass(this.value, this.address);
       if (probePassRecord instanceof Error) return probePassRecord;
     }
     await this.put(`auditor/${this.address}`, {
@@ -3873,11 +4159,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(providerRecord, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         current,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const totalAu = this.safeAddAu(refreshed.total_au, deltaAu);
@@ -4042,7 +4331,7 @@ class MayhemContract extends Contract {
       await this.put(this.feeCumKey(rail), feeRecord);
       await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
     }
-    await this.put('epoch/apply/state', this.nextEpochApplyState({
+    const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: this.value.epoch,
       page,
@@ -4050,7 +4339,14 @@ class MayhemContract extends Contract {
       applyHash,
       epochSeconds: params.epoch_seconds,
       reservationDebitTotals,
-    }));
+    });
+    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
+    if (previousChallengeError) return previousChallengeError;
+    await this.put('epoch/apply/state', nextApplyState);
+    if (lastPage) {
+      const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
+      if (challengeError) return challengeError;
+    }
     if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: this.value.epoch,
@@ -4193,14 +4489,19 @@ class MayhemContract extends Contract {
       sealed_at: this.tx,
     };
     await this.put(key, record);
-    await this.put('epoch/apply/state', this.nextEpochApplyState({
+    const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: this.value.epoch,
       page: 0,
       lastPage: true,
       applyHash: sealHash,
       epochSeconds: params.epoch_seconds,
-    }));
+    });
+    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
+    if (previousChallengeError) return previousChallengeError;
+    await this.put('epoch/apply/state', nextApplyState);
+    const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
+    if (challengeError) return challengeError;
     const result = {
       ok: true,
       op: 'epochSealEmpty',
@@ -4457,11 +4758,51 @@ class MayhemContract extends Contract {
     const params = await this.activeParamsAt(this.value.at, [
       'dispute_deposit_au',
       'dispute_timeout_epochs',
+      'max_open_disputes_per_opener',
     ]);
     const depositAu = params.dispute_deposit_au;
     if (this.compareAu(balance.au, depositAu) < 0) return new Error('Insufficient balance for dispute deposit.');
     const applyState = await this.epochApplyStateRecord();
     const disputeEpoch = this.value.epoch ?? applyState.updated_epoch;
+    if (disputeEpoch > applyState.updated_epoch) {
+      return new Error('Dispute epoch cannot exceed the latest applied epoch.');
+    }
+    const hold = await this.normalizeSpendHoldRecord(
+      (await this.get(this.spendHoldKey(this.address, rail, disputeEpoch))) ?? null,
+      this.address,
+      rail,
+      disputeEpoch
+    );
+    if (hold instanceof Error) return hold;
+    const linkedSession = hold.sessions.find((session) => session.session_id === this.value.session_id.toLowerCase());
+    if (!linkedSession) {
+      return new Error('Dispute must reference an opener-linked spend reservation.');
+    }
+    const sessionDisputeKey = `disp/session/${this.address}/${linkedSession.session_id}`;
+    if ((await this.get(sessionDisputeKey)) !== null) {
+      return new Error('Session already has a dispute from this opener.');
+    }
+    if (linkedSession.provider !== this.value.provider.toLowerCase()) {
+      return new Error('Dispute provider does not match the linked session.');
+    }
+    if (linkedSession.enclave_id !== this.value.enclave_id.toLowerCase()) {
+      return new Error('Dispute enclave does not match the linked session.');
+    }
+    if (
+      this.value.counterparty !== undefined &&
+      this.value.counterparty.toLowerCase() !== linkedSession.provider
+    ) {
+      return new Error('Dispute counterparty does not match the linked session provider.');
+    }
+    const openerCountKey = this.disputeOpenCountKey(this.address);
+    const openerOpenCount = await this.disputeOpenCount(openerCountKey);
+    if (openerOpenCount instanceof Error) return openerOpenCount;
+    if (openerOpenCount >= params.max_open_disputes_per_opener) {
+      return new Error('Open dispute limit reached.');
+    }
+    const providerCountKey = this.providerOpenDisputeCountKey(linkedSession.provider);
+    const providerOpenCount = await this.disputeOpenCount(providerCountKey);
+    if (providerOpenCount instanceof Error) return providerOpenCount;
     const expiresAfterEpoch = disputeEpoch + params.dispute_timeout_epochs;
     if (!Number.isSafeInteger(expiresAfterEpoch)) return new Error('Dispute timeout epoch overflow.');
 
@@ -4485,11 +4826,13 @@ class MayhemContract extends Contract {
       status: 'open',
       rail,
       opened_by: this.address,
-      session_id: this.value.session_id,
+      session_id: linkedSession.session_id,
       reason: this.value.reason,
-      provider: this.value.provider ?? null,
-      counterparty: this.value.counterparty ?? null,
-      enclave_id: this.value.enclave_id ?? null,
+      provider: linkedSession.provider,
+      counterparty: this.value.counterparty?.toLowerCase() ?? linkedSession.provider,
+      enclave_id: linkedSession.enclave_id,
+      reservation_key: this.spendHoldKey(this.address, rail, disputeEpoch),
+      reservation_voucher_hash: linkedSession.voucher_hash,
       epoch: disputeEpoch,
       at: this.value.at,
       evidence_hash: this.value.evidence_hash ?? null,
@@ -4505,7 +4848,23 @@ class MayhemContract extends Contract {
 
     await this.put(this.balanceKey(this.address, rail), nextBalance);
     await this.put(`disp/${disputeId}`, record);
+    await this.put(sessionDisputeKey, {
+      opener: this.address,
+      session_id: linkedSession.session_id,
+      dispute_id: disputeId,
+      opened_at: this.tx,
+    });
     await this.put('disp/next', { next: disputeId + 1, updated_at: this.tx });
+    await this.put(openerCountKey, {
+      opener: this.address,
+      count: openerOpenCount + 1,
+      updated_at: this.tx,
+    });
+    await this.put(providerCountKey, {
+      provider: linkedSession.provider,
+      count: providerOpenCount + 1,
+      updated_at: this.tx,
+    });
     console.log('mayhem dispute', record);
     return {
       ok: true,
@@ -4546,12 +4905,46 @@ class MayhemContract extends Contract {
       return new Error('Only provider_fault disputes may slash a provider.');
     }
 
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch > dispute.expires_after_epoch) {
+      return new Error('Dispute resolution window has closed; expire the dispute.');
+    }
+    if (
+      this.value.outcome === 'opener_fault' &&
+      this.value.deposit_action !== 'partial_forfeit'
+    ) {
+      return new Error('Opener-fault disputes require a partial deposit forfeit.');
+    }
+    if (
+      this.value.outcome !== 'opener_fault' &&
+      this.value.deposit_action === 'partial_forfeit'
+    ) {
+      return new Error('Partial deposit forfeit is reserved for opener-fault disputes.');
+    }
+
     let depositRefundedAu = ZERO_AU;
     let depositForfeitedAu = ZERO_AU;
     const rail = this.normalizeLedgerRail(dispute.rail, 'dispute rail');
     if (rail instanceof Error) return rail;
     if (this.value.deposit_action === 'refund') {
       depositRefundedAu = dispute.deposit_au;
+    } else if (this.value.deposit_action === 'forfeit') {
+      depositForfeitedAu = dispute.deposit_au;
+    } else {
+      const params = await this.activeParamsAt(this.value.at, [
+        'dispute_opener_fault_forfeit_bps',
+      ]);
+      const deposit = this.parseAu(dispute.deposit_au, 'dispute deposit', { allowZero: false });
+      if (deposit instanceof Error) return deposit;
+      if (deposit < 2n) return new Error('Dispute deposit is too small to split.');
+      let forfeited = (deposit * BigInt(params.dispute_opener_fault_forfeit_bps)) / 10_000n;
+      if (forfeited < 1n) forfeited = 1n;
+      if (forfeited >= deposit) forfeited = deposit - 1n;
+      depositForfeitedAu = this.canonicalAu(forfeited);
+      depositRefundedAu = this.safeSubAu(dispute.deposit_au, depositForfeitedAu);
+      if (depositRefundedAu instanceof Error) return depositRefundedAu;
+    }
+    if (this.compareAu(depositRefundedAu, ZERO_AU) > 0) {
       const balance = await this.balanceRecord(dispute.opened_by, rail);
       if (balance instanceof Error) return balance;
       const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by, rail);
@@ -4565,8 +4958,8 @@ class MayhemContract extends Contract {
         updated_epoch: Math.max(balance.updated_epoch, dispute.epoch ?? 0),
         updated_at: this.tx,
       });
-    } else {
-      depositForfeitedAu = dispute.deposit_au;
+    }
+    if (this.compareAu(depositForfeitedAu, ZERO_AU) > 0) {
       const fee = await this.feeCumRecord(rail);
       if (fee instanceof Error) return fee;
       const feeError = this.guardianValidateFeeRecord(fee, rail);
@@ -4639,6 +5032,8 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     };
     resolved.resolution_hash = await this.opaqueHash('mayhem-dispute-resolution-v1', resolved);
+    const countError = await this.closeDisputeCounts(dispute);
+    if (countError) return countError;
     await this.put(key, resolved);
     console.log('mayhem disputeResolve', resolved);
     return {
@@ -4704,6 +5099,8 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     };
     expired.expiry_hash = await this.opaqueHash('mayhem-dispute-expiry-v1', expired);
+    const countError = await this.closeDisputeCounts(dispute);
+    if (countError) return countError;
     await this.put(this.balanceKey(dispute.opened_by, rail), nextBalance);
     await this.put(key, expired);
     console.log('mayhem disputeExpire', expired);
@@ -4720,12 +5117,14 @@ class MayhemContract extends Contract {
   }
 
   async rateOracle() {
+    this._mayhemApplyStage = 'rate:contract:require-admin';
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     const shapeError = this.validateRateOracleValue(this.value);
     if (shapeError) return shapeError;
     if (!RATE_SOURCES.has(this.value.source)) return new Error('Unsupported rate source.');
 
+    this._mayhemApplyStage = 'rate:contract:read-latest';
     const current = await this.get('rate/latest');
     if (current && this.value.ts < current.ts) {
       return new Error('Rate timestamp must not decrease.');
@@ -4740,23 +5139,29 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    this._mayhemApplyStage = 'rate:contract:read-history';
     const history = await this.get(this.tx);
     if (history && stableJson(history) !== stableJson(record)) {
       return new Error('TNK rate oracle history collision.');
     }
-    if (!history) await this.put(this.tx, record);
+    if (!history) {
+      this._mayhemApplyStage = 'rate:contract:write-history';
+      await this.put(this.tx, record);
+    }
+    this._mayhemApplyStage = 'rate:contract:write-latest';
     await this.put('rate/latest', record);
     console.log('mayhem rateOracle', record);
     return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
   }
 
   async tapRateOracle() {
+    this._mayhemApplyStage = 'rate:contract:require-admin';
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     const shapeError = this.validateTapRateOracleValue(this.value);
     if (shapeError) return shapeError;
-    if (!TAP_RATE_SOURCES.has(this.value.source)) return new Error('Unsupported TAP rate source.');
 
+    this._mayhemApplyStage = 'rate:contract:read-latest';
     const current = await this.get('tap/rate/latest');
     if (current && this.value.ts < current.ts) {
       return new Error('TAP rate timestamp must not decrease.');
@@ -4771,6 +5176,7 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    this._mayhemApplyStage = 'rate:contract:write-latest';
     await this.put('tap/rate/latest', record);
     console.log('mayhem tapRateOracle', record);
     return { ok: true, op: 'tapRateOracle', ts: record.ts, source: record.source };
@@ -4809,13 +5215,208 @@ class MayhemContract extends Contract {
     if (rate instanceof Error) {
       return new Error('Invalid TAP/USD atto-rate.');
     }
-    if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
+    if (typeof value.source !== 'string'
+      || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.source)) {
       return new Error('Invalid TAP rate source.');
     }
     if (!Number.isSafeInteger(value.ts) || value.ts < 0) {
       return new Error('Invalid TAP rate timestamp.');
     }
     return null;
+  }
+
+  async canonicalTnkPaymentConfig() {
+    const payments = await this.get('payments/current');
+    if (!payments || payments.set_by_role !== 'admin' || !payments.tnk) {
+      return new Error('Canonical TNK payment config required.');
+    }
+    if (!['mainnet', 'testnet1'].includes(payments.tnk.network)) {
+      return new Error('Canonical TNK payment network is invalid.');
+    }
+    if (!this.isSafeKeyPart(payments.tnk.treasury_address)) {
+      return new Error('Canonical TNK treasury address is invalid.');
+    }
+    return payments.tnk;
+  }
+
+  async canonicalTapPaymentConfig({ optional = false } = {}) {
+    const payments = await this.get('payments/current');
+    if (!payments && optional) return null;
+    if (!payments || payments.set_by_role !== 'admin' || !payments.tap) {
+      return new Error('Canonical TAP payment config required.');
+    }
+    if (!Number.isSafeInteger(payments.tap.chain_id) || payments.tap.chain_id < 1) {
+      return new Error('Canonical TAP chain id is invalid.');
+    }
+    if (!this.isEthHexBytes(payments.tap.pool_address, 20)) {
+      return new Error('Canonical TAP pool address is invalid.');
+    }
+    return {
+      chain_id: payments.tap.chain_id,
+      pool_address: payments.tap.pool_address.toLowerCase(),
+    };
+  }
+
+  async requireCanonicalTapPool(chainId, poolAddress) {
+    const tap = await this.canonicalTapPaymentConfig();
+    if (tap instanceof Error) return tap;
+    if (
+      chainId !== tap.chain_id ||
+      typeof poolAddress !== 'string' ||
+      poolAddress.toLowerCase() !== tap.pool_address
+    ) {
+      return new Error('TAP operation does not match the canonical payment pool.');
+    }
+    return null;
+  }
+
+  guardianValidateTapScope(record, amountFields, label) {
+    const hasChain = record.chain_id !== undefined && record.chain_id !== null;
+    const hasPool = record.pool_address !== undefined && record.pool_address !== null;
+    if (!hasChain && !hasPool) {
+      for (const field of amountFields) {
+        if (this.compareAu(record[field] ?? ZERO_AU, ZERO_AU) !== 0) {
+          return new Error(`Guardian TAP ${label} scope invariant failed.`);
+        }
+      }
+      return null;
+    }
+    if (!Number.isSafeInteger(record.chain_id) || record.chain_id < 1) {
+      return new Error(`Guardian TAP ${label} chain invariant failed.`);
+    }
+    if (!this.isEthHexBytes(record.pool_address, 20)) {
+      return new Error(`Guardian TAP ${label} pool invariant failed.`);
+    }
+    return null;
+  }
+
+  msbAddressForPublicKey(publicKey, network) {
+    if (!this.isHexBytes(publicKey, 32)) return new Error('Invalid MSB owner public key.');
+    const prefix = network === 'mainnet'
+      ? 'trac'
+      : network === 'testnet1'
+        ? 'testtrac'
+        : null;
+    if (!prefix) return new Error('Invalid MSB network.');
+    const address = PeerWallet.encodeBech32mSafe(prefix, b4a.from(publicKey, 'hex'));
+    return typeof address === 'string' && address.length > 0
+      ? address
+      : new Error('Unable to derive MSB owner address.');
+  }
+
+  normalizeMsbTransferEvidence(value, label = 'MSB transfer evidence') {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'schema_version',
+        'network',
+        'tx_hash',
+        'confirmed_length',
+        'observed_signed_length',
+        'from',
+        'to',
+        'amount_e18',
+      ],
+      label
+    );
+    if (shapeError) return shapeError;
+    if (value.schema_version !== MSB_TRANSFER_EVIDENCE_VERSION) {
+      return new Error(`${label} schema version is invalid.`);
+    }
+    if (!['mainnet', 'testnet1'].includes(value.network)) {
+      return new Error(`${label} network is invalid.`);
+    }
+    if (!this.isHexBytes(value.tx_hash, 32) || value.tx_hash !== value.tx_hash.toLowerCase()) {
+      return new Error(`${label} transaction hash is invalid.`);
+    }
+    if (!Number.isSafeInteger(value.confirmed_length) || value.confirmed_length < 1) {
+      return new Error(`${label} confirmed length is invalid.`);
+    }
+    if (
+      !Number.isSafeInteger(value.observed_signed_length) ||
+      value.observed_signed_length < value.confirmed_length
+    ) {
+      return new Error(`${label} observed signed length is invalid.`);
+    }
+    if (!this.isSafeKeyPart(value.from) || !this.isSafeKeyPart(value.to)) {
+      return new Error(`${label} address is invalid.`);
+    }
+    const amount = this.parseTnkE18(value.amount_e18);
+    if (amount instanceof Error) return new Error(`${label} amount is invalid.`);
+    return {
+      schema_version: MSB_TRANSFER_EVIDENCE_VERSION,
+      network: value.network,
+      tx_hash: value.tx_hash,
+      confirmed_length: value.confirmed_length,
+      observed_signed_length: value.observed_signed_length,
+      from: value.from,
+      to: value.to,
+      amount_e18: amount.toString(),
+    };
+  }
+
+  msbTransferSeenKey(evidence) {
+    return `rail/seen/msb/${evidence.network}/${evidence.tx_hash}`;
+  }
+
+  normalizeStripeTransferEvidence(value, label = 'Stripe settlement evidence') {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'schema_version',
+        'kind',
+        'ref',
+        'destination',
+        'currency',
+        'amount_minor',
+        'transfer_group',
+      ],
+      label
+    );
+    if (shapeError) return shapeError;
+    if (value.schema_version !== STRIPE_TRANSFER_EVIDENCE_VERSION) {
+      return new Error(`${label} schema version is invalid.`);
+    }
+    if (!['stripe_transfer', 'platform_balance'].includes(value.kind)) {
+      return new Error(`${label} kind is invalid.`);
+    }
+    if (!this.isSafeKeyPart(value.ref) || !this.isSafeKeyPart(value.destination)) {
+      return new Error(`${label} reference or destination is invalid.`);
+    }
+    if (value.kind === 'stripe_transfer' && !value.ref.startsWith('tr_')) {
+      return new Error(`${label} requires a Stripe transfer id.`);
+    }
+    if (value.kind === 'platform_balance' && !value.ref.startsWith('platform_balance:')) {
+      return new Error(`${label} platform balance reference is invalid.`);
+    }
+    const currency = this.normalizeFiatCurrency(value.currency);
+    if (currency instanceof Error) return currency;
+    const amountMinor = this.normalizeFiatMinor(value.amount_minor);
+    if (amountMinor instanceof Error) return amountMinor;
+    if (
+      value.kind === 'stripe_transfer' &&
+      (typeof value.transfer_group !== 'string' || !this.isSafeKeyPart(value.transfer_group))
+    ) {
+      return new Error(`${label} transfer group is invalid.`);
+    }
+    if (value.kind === 'platform_balance' && value.transfer_group !== null) {
+      return new Error(`${label} platform balance transfer group must be null.`);
+    }
+    return {
+      schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
+      kind: value.kind,
+      ref: value.ref,
+      destination: value.destination,
+      currency,
+      amount_minor: amountMinor,
+      transfer_group: value.transfer_group,
+    };
+  }
+
+  stripeTransferSeenKey(evidence) {
+    return evidence.kind === 'stripe_transfer'
+      ? `rail/seen/stripe/${evidence.ref}`
+      : null;
   }
 
   async tnkSettlement() {
@@ -4832,6 +5433,33 @@ class MayhemContract extends Contract {
     if (outputs instanceof Error) return outputs;
     if (stableJson(outputs) !== stableJson(this.value.outputs)) {
       return new Error('TNK settlement outputs must be canonical.');
+    }
+    const transfers = this.value.msb_transfers.map((entry) => (
+      this.normalizeMsbTransferEvidence(entry, 'TNK settlement MSB transfer evidence')
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(this.value.msb_transfers)) {
+      return new Error('TNK settlement MSB transfers must be canonical.');
+    }
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (
+      this.value.network !== payment.network ||
+      this.value.treasury_from !== payment.treasury_address
+    ) {
+      return new Error('TNK settlement source does not match canonical payment config.');
+    }
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      if (
+        transfer.network !== this.value.network ||
+        transfer.from !== this.value.treasury_from ||
+        transfer.to !== output.to ||
+        transfer.amount_e18 !== output.tnk_e18
+      ) {
+        return new Error('TNK settlement MSB transfer does not match output.');
+      }
     }
     const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_au);
     if (totals instanceof Error) return totals;
@@ -4856,7 +5484,7 @@ class MayhemContract extends Contract {
       return new Error('TNK settlement transfer root does not match outputs.');
     }
 
-    const record = this.tnkSettlementRecord(outputs);
+    const record = this.tnkSettlementRecord(outputs, transfers);
     const key = `settle/tnk/${this.value.epoch}`;
     const existing = await this.get(key);
     if (existing) {
@@ -4867,7 +5495,7 @@ class MayhemContract extends Contract {
           epoch: this.value.epoch,
           rail: 'tnk',
           idempotent: true,
-          msb_tx_hashes: this.value.msb_tx_hashes,
+          msb_transfers: transfers,
         };
       }
       return new Error('TNK settlement already exists for epoch.');
@@ -4879,6 +5507,12 @@ class MayhemContract extends Contract {
       applyState.last_apply_hash !== this.value.epoch_apply_hash
     ) {
       return new Error('TNK settlement epoch apply hash does not match current state.');
+    }
+
+    for (const transfer of transfers) {
+      if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
+        return new Error('TNK settlement MSB transfer was already consumed by Mayhem.');
+      }
     }
 
     const rate = await this.guardianRequireHistoricalTnkRate(this.value, this.value.at);
@@ -4898,12 +5532,13 @@ class MayhemContract extends Contract {
       if (provider.status !== 'active' && provider.status !== 'banned') {
         return new Error('TNK settlement provider status is not payable.');
       }
-      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      const payout = provider.payouts?.tnk;
+      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'tnk');
       if (payoutError) return payoutError;
-      if (provider.payout.method !== 'tnk') {
+      if (payout.method !== 'tnk') {
         return new Error('TNK settlement provider payout target must be TNK.');
       }
-      if (provider.payout.addr !== output.to) {
+      if (payout.addr !== output.to) {
         return new Error('TNK settlement provider payout target mismatch.');
       }
 
@@ -4915,11 +5550,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(output.provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         earning,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const payable = this.safeSubAu(
@@ -4938,7 +5576,7 @@ class MayhemContract extends Contract {
         paid_cum_au: paidCumAu,
         updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
         last_settlement_epoch: this.value.epoch,
-        last_settlement_msb_tx_hash: this.value.msb_tx_hashes[outputIndex],
+        last_settlement_msb_tx_hash: transfers[outputIndex].tx_hash,
       };
       const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'tnk');
       if (nextError) return nextError;
@@ -4973,7 +5611,7 @@ class MayhemContract extends Contract {
       updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
       last_settlement_epoch: this.value.epoch,
       last_settlement_msb_tx_hash: operatorOutputIndex >= 0
-        ? this.value.msb_tx_hashes[operatorOutputIndex]
+        ? transfers[operatorOutputIndex].tx_hash
         : (fee.last_settlement_msb_tx_hash ?? null),
     };
     const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
@@ -4982,6 +5620,16 @@ class MayhemContract extends Contract {
     for (const earning of earningUpdates) {
       await this.put(this.earningKey(earning.provider, 'tnk'), earning);
     }
+    for (const [index, transfer] of transfers.entries()) {
+      await this.put(this.msbTransferSeenKey(transfer), {
+        rail: 'tnk',
+        purpose: 'settlement',
+        epoch: this.value.epoch,
+        output_index: index,
+        transfer_root: this.value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
     await this.put(this.feeCumKey('tnk'), nextFee);
     await this.put(key, record);
     console.log('mayhem tnkSettlement', {
@@ -4989,7 +5637,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_tx_hashes: transfers.map((entry) => entry.tx_hash),
     });
     return {
       ok: true,
@@ -5000,7 +5648,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_transfers: transfers,
       transfer_root: this.value.transfer_root,
     };
   }
@@ -5020,7 +5668,7 @@ class MayhemContract extends Contract {
         'rate_tnk_usd_au',
         'rate_source',
         'rate_ts',
-        'msb_tx_hashes',
+        'msb_transfers',
         'transfer_root',
         'provider_count',
         'provider_au',
@@ -5040,16 +5688,20 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(value.treasury_from)) return new Error('Invalid TNK treasury address.');
     if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid TNK operator address.');
     if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid TNK settlement apply hash.');
-    if (!Array.isArray(value.msb_tx_hashes) || value.msb_tx_hashes.length === 0) {
-      return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+    if (!Array.isArray(value.msb_transfers) || value.msb_transfers.length === 0) {
+      return new Error('TNK settlement requires one confirmed MSB transfer per output.');
     }
     const seenTxHashes = new Set();
-    for (const hash of value.msb_tx_hashes) {
-      if (!this.isHexBytes(hash, 32)) {
-        return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+    for (const entry of value.msb_transfers) {
+      const transfer = this.normalizeMsbTransferEvidence(
+        entry,
+        'TNK settlement MSB transfer evidence'
+      );
+      if (transfer instanceof Error) return transfer;
+      if (seenTxHashes.has(transfer.tx_hash)) {
+        return new Error('Duplicate TNK settlement MSB tx hash.');
       }
-      if (seenTxHashes.has(hash)) return new Error('Duplicate TNK settlement MSB tx hash.');
-      seenTxHashes.add(hash);
+      seenTxHashes.add(transfer.tx_hash);
     }
     if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid TNK settlement transfer root.');
     const rateTnkUsdAu = this.normalizeAu(value.rate_tnk_usd_au, 'TNK settlement rate', { allowZero: false });
@@ -5075,8 +5727,8 @@ class MayhemContract extends Contract {
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('TNK settlement outputs are required.');
     }
-    if (value.msb_tx_hashes.length !== value.outputs.length) {
-      return new Error('TNK settlement MSB tx hash count must match outputs.');
+    if (value.msb_transfers.length !== value.outputs.length) {
+      return new Error('TNK settlement MSB transfer count must match outputs.');
     }
     return null;
   }
@@ -5191,6 +5843,7 @@ class MayhemContract extends Contract {
     if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
     const numerator = amount * TNK_E18;
     const denominator = rate;
+    // Payout conversion rounds up so the provider is never underpaid in TNK atomic units.
     return (numerator + denominator - 1n) / denominator;
   }
 
@@ -5198,7 +5851,7 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-tnk-settlement-transfer-root-v1', outputs);
   }
 
-  tnkSettlementRecord(outputs) {
+  tnkSettlementRecord(outputs, transfers) {
     return {
       type: 'tnk_settlement',
       op: 'tnk_settlement',
@@ -5213,7 +5866,7 @@ class MayhemContract extends Contract {
       rate_tnk_usd_au: this.value.rate_tnk_usd_au,
       rate_source: this.value.rate_source,
       rate_ts: this.value.rate_ts,
-      msb_tx_hashes: this.value.msb_tx_hashes,
+      msb_transfers: transfers,
       transfer_root: this.value.transfer_root,
       provider_count: this.value.provider_count,
       provider_au: this.value.provider_au,
@@ -5239,6 +5892,28 @@ class MayhemContract extends Contract {
     if (stableJson(outputs) !== stableJson(this.value.outputs)) {
       return new Error('Fiat settlement outputs must be canonical.');
     }
+    const transfers = this.value.stripe_transfers.map((entry) => (
+      this.normalizeStripeTransferEvidence(entry, 'Fiat settlement Stripe evidence')
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(this.value.stripe_transfers)) {
+      return new Error('Fiat settlement Stripe evidence must be canonical.');
+    }
+    const expectedTransferGroup = `mayhem_fiat_epoch_${this.value.epoch}_${this.value.epoch_apply_hash.slice(0, 16)}`;
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      const expectedKind = output.role === 'provider' ? 'stripe_transfer' : 'platform_balance';
+      if (
+        transfer.kind !== expectedKind ||
+        transfer.destination !== output.to ||
+        transfer.currency !== output.currency ||
+        transfer.amount_minor !== output.amount_minor ||
+        (expectedKind === 'stripe_transfer' && transfer.transfer_group !== expectedTransferGroup)
+      ) {
+        return new Error('Fiat settlement Stripe evidence does not match output.');
+      }
+    }
     const totals = this.fiatSettlementTotals(outputs);
     if (totals instanceof Error) return totals;
     if (totals.provider_count !== this.value.provider_count) {
@@ -5259,7 +5934,7 @@ class MayhemContract extends Contract {
       return new Error('Fiat settlement transfer root does not match outputs.');
     }
 
-    const record = this.fiatSettlementRecord(outputs);
+    const record = this.fiatSettlementRecord(outputs, transfers);
     const key = `settle/fiat/${this.value.epoch}`;
     const existing = await this.get(key);
     if (existing) {
@@ -5270,7 +5945,7 @@ class MayhemContract extends Contract {
           epoch: this.value.epoch,
           rail: 'fiat',
           idempotent: true,
-          stripe_refs: this.value.stripe_refs,
+          stripe_transfers: transfers,
         };
       }
       return new Error('Fiat settlement already exists for epoch.');
@@ -5284,6 +5959,13 @@ class MayhemContract extends Contract {
       return new Error('Fiat settlement epoch apply hash does not match current state.');
     }
 
+    for (const transfer of transfers) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (seenKey && (await this.get(seenKey)) !== null) {
+        return new Error('Stripe transfer was already consumed by Mayhem.');
+      }
+    }
+
     const params = await this.activeParamsAt(this.value.at, [
       'holdback_epochs',
       'challenge_epochs',
@@ -5293,24 +5975,19 @@ class MayhemContract extends Contract {
     const earningUpdates = [];
     for (const [outputIndex, output] of outputs.entries()) {
       if (output.role !== 'provider') continue;
-      const stripeRef = this.value.stripe_refs[outputIndex];
-      if (!stripeRef.startsWith('tr_')) {
-        return new Error('Fiat provider settlement requires a Stripe transfer id.');
-      }
+      const stripeRef = transfers[outputIndex].ref;
       const provider = await this.get(`prov/${output.provider}`);
       if (!provider) return new Error('Provider not found.');
-      if (provider.status !== 'active' && provider.status !== 'banned') {
-        return new Error('Fiat settlement provider status is not payable.');
-      }
-      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      const payout = provider.payouts?.stripe;
+      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'stripe');
       if (payoutError) return payoutError;
-      if (provider.payout.method !== 'stripe') {
+      if (payout.method !== 'stripe') {
         return new Error('Fiat settlement provider payout target must be Stripe.');
       }
-      if (provider.payout.addr !== output.to) {
+      if (payout.addr !== output.to) {
         return new Error('Fiat settlement provider payout target mismatch.');
       }
-      if (provider.payout.currency !== output.currency) {
+      if (payout.currency !== output.currency) {
         return new Error('Fiat settlement provider payout currency mismatch.');
       }
 
@@ -5322,11 +5999,14 @@ class MayhemContract extends Contract {
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
       if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(output.provider);
+      if (disputeGate instanceof Error) return disputeGate;
       const refreshed = this.refreshEarningHoldback(
         earning,
         this.value.epoch,
         lockedEarningEpochs,
-        probeGate
+        probeGate,
+        disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const payable = this.safeSubAu(
@@ -5384,7 +6064,7 @@ class MayhemContract extends Contract {
       updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
       last_settlement_epoch: this.value.epoch,
       last_settlement_stripe_ref: operatorOutputIndex >= 0
-        ? this.value.stripe_refs[operatorOutputIndex]
+        ? transfers[operatorOutputIndex].ref
         : (fee.last_settlement_stripe_ref ?? null),
     };
     const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
@@ -5393,6 +6073,18 @@ class MayhemContract extends Contract {
     for (const earning of earningUpdates) {
       await this.put(this.earningKey(earning.provider, 'fiat'), earning);
     }
+    for (const [index, transfer] of transfers.entries()) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (!seenKey) continue;
+      await this.put(seenKey, {
+        rail: 'fiat',
+        purpose: 'settlement',
+        epoch: this.value.epoch,
+        output_index: index,
+        transfer_root: this.value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
     await this.put(this.feeCumKey('fiat'), nextFee);
     await this.put(key, record);
     console.log('mayhem fiatSettlement', {
@@ -5400,7 +6092,7 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      stripe_refs: this.value.stripe_refs,
+      stripe_refs: transfers.map((entry) => entry.ref),
     });
     return {
       ok: true,
@@ -5412,9 +6104,159 @@ class MayhemContract extends Contract {
       provider_au: this.value.provider_au,
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
-      stripe_refs: this.value.stripe_refs,
+      stripe_transfers: transfers,
       transfer_root: this.value.transfer_root,
     };
+  }
+
+  async fiatDustSweep() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateFiatDustSweepValue(this.value);
+    if (shapeError) return shapeError;
+
+    const recordKey = `settle/fiat-dust/${this.value.provider}/${this.value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      return {
+        ok: true,
+        op: 'fiatDustSweep',
+        provider: existing.provider,
+        epoch: existing.epoch,
+        dust_au: existing.dust_au,
+        idempotent: true,
+      };
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch !== this.value.epoch) {
+      return new Error('Fiat dust sweep epoch must equal the latest applied epoch.');
+    }
+    const provider = await this.get(`prov/${this.value.provider}`);
+    if (!provider) return new Error('Provider not found.');
+    if (!Array.isArray(provider.enclaves)) return new Error('Invalid provider enclave state.');
+    if (provider.enclaves.length > 0) {
+      return new Error('Fiat dust sweep requires a provider with no active enclaves.');
+    }
+
+    const params = await this.activeParamsAt(this.value.at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const earning = await this.earningRecord(this.value.provider, 'fiat');
+    if (earning instanceof Error) return earning;
+    const earningError = this.guardianValidateEarningRecord(earning, this.value.provider, 'fiat');
+    if (earningError) return earningError;
+    const probeGate = await this.probeGateForEarning(this.value.provider, earning, params);
+    if (probeGate instanceof Error) return probeGate;
+    const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+    if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+    const disputeGate = await this.providerHasOpenDispute(this.value.provider);
+    if (disputeGate instanceof Error) return disputeGate;
+    const refreshed = this.refreshEarningHoldback(
+      earning,
+      this.value.epoch,
+      lockedEarningEpochs,
+      probeGate,
+      disputeGate
+    );
+    if (refreshed instanceof Error) return refreshed;
+    if (!this.isZeroAu(refreshed.held_au)) {
+      return new Error('Fiat dust cannot be swept while provider earnings are held.');
+    }
+    const unpaid = this.safeSubAu(refreshed.total_au, refreshed.paid_cum_au);
+    if (unpaid instanceof Error) return unpaid;
+    const unpaidValue = this.parseAu(unpaid, 'Fiat unpaid provider earnings');
+    if (unpaidValue instanceof Error) return unpaidValue;
+    const dustValue = unpaidValue % FIAT_MINOR_AU;
+    if (dustValue === 0n) return new Error('Provider has no fiat dust to sweep.');
+    const dustAu = this.canonicalAu(dustValue);
+    const totalAu = this.safeSubAu(refreshed.total_au, dustAu);
+    if (totalAu instanceof Error) return totalAu;
+    const dustSweptCumAu = this.safeAddAu(refreshed.fiat_dust_swept_cum_au ?? ZERO_AU, dustAu);
+    if (dustSweptCumAu instanceof Error) return dustSweptCumAu;
+    const nextEarning = {
+      ...refreshed,
+      total_au: totalAu,
+      fiat_dust_swept_cum_au: dustSweptCumAu,
+      updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_fiat_dust_sweep_epoch: this.value.epoch,
+      last_fiat_dust_sweep_at: this.tx,
+    };
+    const nextEarningError = this.guardianValidateEarningRecord(
+      nextEarning,
+      this.value.provider,
+      'fiat'
+    );
+    if (nextEarningError) return nextEarningError;
+
+    const fee = await this.feeCumRecord('fiat');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'fiat');
+    if (feeError) return feeError;
+    const cumAu = this.safeAddAu(fee.cum_au, dustAu);
+    if (cumAu instanceof Error) return cumAu;
+    const settledCumAu = this.safeAddAu(fee.settled_cum_au ?? fee.cum_au, dustAu);
+    if (settledCumAu instanceof Error) return settledCumAu;
+    const nextFee = {
+      ...fee,
+      cum_au: cumAu,
+      settled_cum_au: settledCumAu,
+      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_fiat_dust_sweep_at: this.tx,
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
+    if (nextFeeError) return nextFeeError;
+
+    const record = {
+      type: 'fiat_dust_sweep',
+      provider: this.value.provider,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      dust_au: dustAu,
+      provider_total_before_au: refreshed.total_au,
+      provider_total_after_au: totalAu,
+      provider_paid_cum_au: refreshed.paid_cum_au,
+      destination: 'operator_fee',
+      swept_by: this.address,
+      swept_by_role: 'admin',
+      swept_at: this.tx,
+    };
+    await this.put(this.earningKey(this.value.provider, 'fiat'), nextEarning);
+    await this.put(this.feeCumKey('fiat'), nextFee);
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'fiatDustSweep',
+      provider: this.value.provider,
+      epoch: this.value.epoch,
+      dust_au: dustAu,
+      idempotent: false,
+    };
+  }
+
+  validateFiatDustSweepValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'provider', 'epoch', 'at'],
+      'Fiat dust sweep'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'fiat_dust_sweep') return new Error('Invalid fiat dust sweep op.');
+    if (!this.isHexBytes(value.provider, 32) || value.provider !== value.provider.toLowerCase()) {
+      return new Error('Invalid fiat dust sweep provider.');
+    }
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
+      return new Error('Invalid fiat dust sweep epoch.');
+    }
+    if (!Number.isSafeInteger(value.at) || value.at < 0) {
+      return new Error('Invalid fiat dust sweep timestamp.');
+    }
+    return null;
   }
 
   validateFiatSettlementValue(value) {
@@ -5428,7 +6270,7 @@ class MayhemContract extends Contract {
         'processor',
         'operator_to',
         'epoch_apply_hash',
-        'stripe_refs',
+        'stripe_transfers',
         'transfer_root',
         'provider_count',
         'provider_au',
@@ -5446,14 +6288,18 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid fiat settlement timestamp.');
     if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid fiat operator target.');
     if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid fiat settlement apply hash.');
-    if (!Array.isArray(value.stripe_refs) || value.stripe_refs.length === 0) {
-      return new Error('Fiat settlement requires one Stripe reference per output.');
+    if (!Array.isArray(value.stripe_transfers) || value.stripe_transfers.length === 0) {
+      return new Error('Fiat settlement requires one confirmed Stripe evidence record per output.');
     }
     const seenRefs = new Set();
-    for (const ref of value.stripe_refs) {
-      if (!this.isSafeKeyPart(ref)) return new Error('Invalid fiat settlement Stripe reference.');
-      if (seenRefs.has(ref)) return new Error('Duplicate fiat settlement Stripe reference.');
-      seenRefs.add(ref);
+    for (const entry of value.stripe_transfers) {
+      const transfer = this.normalizeStripeTransferEvidence(
+        entry,
+        'Fiat settlement Stripe evidence'
+      );
+      if (transfer instanceof Error) return transfer;
+      if (seenRefs.has(transfer.ref)) return new Error('Duplicate fiat settlement Stripe reference.');
+      seenRefs.add(transfer.ref);
     }
     if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid fiat settlement transfer root.');
     if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
@@ -5469,8 +6315,8 @@ class MayhemContract extends Contract {
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('Fiat settlement outputs are required.');
     }
-    if (value.stripe_refs.length !== value.outputs.length) {
-      return new Error('Fiat settlement Stripe reference count must match outputs.');
+    if (value.stripe_transfers.length !== value.outputs.length) {
+      return new Error('Fiat settlement Stripe evidence count must match outputs.');
     }
     return null;
   }
@@ -5600,7 +6446,7 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-fiat-settlement-transfer-root-v1', outputs);
   }
 
-  fiatSettlementRecord(outputs) {
+  fiatSettlementRecord(outputs, transfers) {
     return {
       type: 'fiat_settlement',
       op: 'fiat_settlement',
@@ -5611,7 +6457,7 @@ class MayhemContract extends Contract {
       processor: 'stripe',
       operator_to: this.value.operator_to,
       epoch_apply_hash: this.value.epoch_apply_hash,
-      stripe_refs: this.value.stripe_refs,
+      stripe_transfers: transfers,
       transfer_root: this.value.transfer_root,
       provider_count: this.value.provider_count,
       provider_au: this.value.provider_au,
@@ -5633,14 +6479,27 @@ class MayhemContract extends Contract {
     const quotedRate = this.normalizeAu(this.value.rate_tnk_usd_au, 'TNK quoted rate', { allowZero: false });
     if (quotedRate instanceof Error) return quotedRate;
 
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (this.value.treasury_address !== payment.treasury_address) {
+      return new Error('TNK deposit intent treasury does not match canonical payment config.');
+    }
+    const msbFrom = this.msbAddressForPublicKey(this.address, payment.network);
+    if (msbFrom instanceof Error) return msbFrom;
+
     const key = `dep/pending/${this.value.memo_hash}`;
     if ((await this.get(key)) !== null) return new Error('TNK deposit memo already pending.');
+    if ((await this.get(`dep/tnk-credited/${this.value.memo_hash}`)) !== null) {
+      return new Error('TNK deposit memo already credited.');
+    }
 
     const record = {
       memo_hash: this.value.memo_hash,
       user: this.address,
       status: 'pending',
       requested_at: this.tx,
+      msb_network: payment.network,
+      msb_from: msbFrom,
       treasury_address: this.value.treasury_address,
       tnk_e18: this.value.tnk_e18,
       quoted_au: quotedAu,
@@ -5660,7 +6519,44 @@ class MayhemContract extends Contract {
   async tnkDeposit() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    const shapeError = this.validateExactObjectKeys(
+      this.value,
+      ['op', 'memo_hash', 'msb_transfer', 'epoch', 'at'],
+      'TNK deposit credit'
+    );
+    if (shapeError) return shapeError;
+    if (this.value.op !== 'tnk_deposit') return new Error('Invalid TNK deposit credit op.');
     if (!this.isSafeKeyPart(this.value.memo_hash)) return new Error('Invalid deposit memo hash.');
+    if (!Number.isSafeInteger(this.value.epoch) || this.value.epoch < 1) {
+      return new Error('Invalid TNK deposit epoch.');
+    }
+    if (!Number.isSafeInteger(this.value.at) || this.value.at < 0) {
+      return new Error('Invalid TNK deposit timestamp.');
+    }
+
+    const transfer = this.normalizeMsbTransferEvidence(
+      this.value.msb_transfer,
+      'TNK deposit MSB transfer evidence'
+    );
+    if (transfer instanceof Error) return transfer;
+    const creditedKey = `dep/tnk-credited/${this.value.memo_hash}`;
+    const existingCredit = await this.get(creditedKey);
+    if (existingCredit) {
+      if (stableJson(existingCredit.msb_transfer) !== stableJson(transfer)) {
+        return new Error('TNK deposit memo already credited by a different MSB transfer.');
+      }
+      return {
+        ok: true,
+        op: 'tnkDeposit',
+        who: existingCredit.user,
+        au: existingCredit.au,
+        epoch: existingCredit.epoch,
+        deposit_root: existingCredit.deposit_root,
+        rate_ts: existingCredit.rate_ts,
+        msb_tx_hash: transfer.tx_hash,
+        idempotent: true,
+      };
+    }
 
     const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
@@ -5668,7 +6564,27 @@ class MayhemContract extends Contract {
     const pending = await this.get(pendingKey);
     if (!pending || pending.status !== 'pending') return new Error('Pending TNK deposit intent not found.');
 
-    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (
+      pending.msb_network !== payment.network ||
+      pending.treasury_address !== payment.treasury_address
+    ) {
+      return new Error('Pending TNK deposit no longer matches canonical payment config.');
+    }
+    if (
+      transfer.network !== payment.network ||
+      transfer.from !== pending.msb_from ||
+      transfer.to !== payment.treasury_address
+    ) {
+      return new Error('TNK deposit MSB transfer identity does not match pending intent.');
+    }
+    const transferSeenKey = this.msbTransferSeenKey(transfer);
+    if ((await this.get(transferSeenKey)) !== null) {
+      return new Error('MSB transfer already consumed by Mayhem.');
+    }
+
+    const tnkE18 = this.parseTnkE18(transfer.amount_e18);
     if (tnkE18 instanceof Error) return tnkE18;
     const pendingTnkE18 = this.parseTnkE18(pending.tnk_e18);
     if (pendingTnkE18 instanceof Error) return pendingTnkE18;
@@ -5693,8 +6609,7 @@ class MayhemContract extends Contract {
       memo_hash: this.value.memo_hash,
       user_hash: await this.opaqueHash('deposit-user', pending.user),
       au,
-      tnk_e18: this.value.tnk_e18,
-      msb_tx_hash: this.value.msb_tx_hash,
+      msb_transfer: transfer,
       rate_ts: rate.ts,
       treasury_address_hash: await this.opaqueHash('deposit-treasury', pending.treasury_address),
       quoted_au: pending.quoted_au,
@@ -5717,11 +6632,31 @@ class MayhemContract extends Contract {
     };
     await this.put(this.balanceKey(pending.user, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    await this.put(creditedKey, {
+      rail: 'tnk',
+      memo_hash: this.value.memo_hash,
+      user: pending.user,
+      au,
+      epoch: this.value.epoch,
+      rate_ts: rate.ts,
+      deposit_root: depositRoot.merkle_root,
+      msb_transfer: transfer,
+      credited_at: this.tx,
+    });
+    await this.put(transferSeenKey, {
+      rail: 'tnk',
+      purpose: 'deposit',
+      memo_hash: this.value.memo_hash,
+      user: pending.user,
+      amount_e18: transfer.amount_e18,
+      consumed_at: this.tx,
+    });
     await this.del(pendingKey);
     console.log('mayhem tnkDeposit', {
       who: pending.user,
       au,
-      tnk_e18: this.value.tnk_e18,
+      tnk_e18: transfer.amount_e18,
+      msb_tx_hash: transfer.tx_hash,
       rate_ts: rate.ts,
       epoch: this.value.epoch,
     });
@@ -5733,6 +6668,8 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
+      msb_tx_hash: transfer.tx_hash,
+      idempotent: false,
     };
   }
 
@@ -5784,13 +6721,18 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const shapeError = this.validateTapDepositValue(this.value);
     if (shapeError) return shapeError;
+    const poolError = await this.requireCanonicalTapPool(
+      this.value.chain_id,
+      this.value.pool_address
+    );
+    if (poolError) return poolError;
 
     const ethereumAddress = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
     const blockHash = this.value.block_hash.toLowerCase();
     const poolAddress = this.value.pool_address.toLowerCase();
     const eventSignature = this.value.event_signature.toLowerCase();
-    const seenKey = `dep/tap/${ethTxHash}/${this.value.log_index}`;
+    const seenKey = `dep/tap/${this.tapDepositIdentity(this.value)}`;
     const existing = await this.get(seenKey);
     if (existing !== null) {
       return {
@@ -5969,7 +6911,7 @@ class MayhemContract extends Contract {
       return new Error('Invalid TAP deposit block number.');
     }
     if (!this.isEthHexBytes(value.block_hash, 32)) return new Error('Invalid TAP deposit block hash.');
-    if (!this.isSafeKeyPart(value.pool_address)) return new Error('Invalid TAP pool address.');
+    if (!this.isEthHexBytes(value.pool_address, 20)) return new Error('Invalid TAP pool address.');
     if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) return new Error('Invalid TAP chain id.');
     if (!Number.isSafeInteger(value.finalized_block_number) || value.finalized_block_number < value.block_number) {
       return new Error('Invalid TAP finalized block number.');
@@ -5981,10 +6923,13 @@ class MayhemContract extends Contract {
       return new Error('TAP confirmation depth does not match finalized block.');
     }
     if (!this.isSafeKeyPart(value.confirmation_policy)) return new Error('Invalid TAP confirmation policy.');
+    if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
+      return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
+    }
+    if (value.chain_id === 1 && value.confirmation_policy !== 'finalized-tag') {
+      return new Error('Ethereum mainnet TAP deposits require finalized-tag policy.');
+    }
     if (value.confirmation_policy !== 'finalized-tag') {
-      if (value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH) {
-        return new Error(`TAP confirmation depth below minimum ${MIN_TAP_CONFIRMATION_DEPTH}.`);
-      }
       if (value.confirmation_policy !== `depth-${value.confirmation_depth}`) {
         return new Error('TAP confirmation policy must match the confirmed depth or use finalized-tag.');
       }
@@ -5998,6 +6943,233 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TAP deposit timestamp.');
     const tapWei = this.parseTapWei(value.tap_wei);
     if (tapWei instanceof Error) return tapWei;
+    return null;
+  }
+
+  async tapDepositReversal() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateTapDepositReversalValue(this.value);
+    if (shapeError) return shapeError;
+    const poolError = await this.requireCanonicalTapPool(
+      this.value.chain_id,
+      this.value.pool_address
+    );
+    if (poolError) return poolError;
+
+    const depositSeenKey = `dep/tap/${this.tapDepositIdentity(this.value)}`;
+    const depositSeen = await this.get(depositSeenKey);
+    if (depositSeen === null) return new Error('TAP deposit event not found.');
+    if (depositSeen.block_number !== this.value.block_number) {
+      return new Error('TAP reversal block number does not match credited event.');
+    }
+    const reversalSeenKey = `${depositSeenKey}/reversal`;
+    const existing = await this.get(reversalSeenKey);
+    if (existing !== null) {
+      return {
+        ok: true,
+        op: 'tapDepositReversal',
+        duplicate: true,
+        who: existing.who,
+        au: ZERO_AU,
+        reversed_au: existing.au,
+        clawback_au: ZERO_AU,
+        credited_clawback_au: existing.clawback_au,
+        network_absorbed_au: ZERO_AU,
+        credited_network_absorbed_au: existing.network_absorbed_au,
+        frozen: existing.frozen,
+        epoch: existing.epoch,
+      };
+    }
+    if (depositSeen.reversed === true) return new Error('TAP deposit is already reversed.');
+
+    const who = depositSeen.who;
+    const au = this.normalizeAu(depositSeen.au, 'credited TAP deposit amount', { allowZero: false });
+    if (au instanceof Error) return au;
+    const balance = await this.balanceRecord(who, 'tap');
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, who, 'tap');
+    if (balanceError) return balanceError;
+    const clawbackAu = this.compareAu(balance.au, au) < 0 ? balance.au : au;
+    const networkAbsorbedAu = this.safeSubAu(au, clawbackAu);
+    if (networkAbsorbedAu instanceof Error) return networkAbsorbedAu;
+    const nextAu = this.safeSubAu(balance.au, clawbackAu);
+    if (nextAu instanceof Error) return nextAu;
+    const frozen = !this.isZeroAu(networkAbsorbedAu);
+
+    const leaf = await this.depositLeafHash({
+      rail: 'tap',
+      user_hash: await this.opaqueHash('deposit-user', who),
+      ethereum_address_hash: await this.opaqueHash(
+        'deposit-ethereum-account',
+        depositSeen.ethereum_address
+      ),
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      chain_id: this.value.chain_id,
+      pool_address_hash: await this.opaqueHash('deposit-pool', this.value.pool_address),
+      eth_tx_hash: this.value.eth_tx_hash,
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      block_hash: this.value.block_hash,
+      reconciliation_from_block: this.value.reconciliation_from_block,
+      reconciliation_to_block: this.value.reconciliation_to_block,
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_policy: this.value.confirmation_policy,
+      watcher_id: this.value.watcher_id,
+      reason: this.value.reason,
+      reversed: true,
+    });
+    const depositRoot = await this.nextDepositReversalRoot({
+      epoch: this.value.epoch,
+      leaf,
+      disputedAu: au,
+      clawbackAu,
+      absorbedAu: networkAbsorbedAu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
+    const reversalSeen = {
+      rail: 'tap',
+      who,
+      ethereum_address: depositSeen.ethereum_address,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      chain_id: this.value.chain_id,
+      pool_address: this.value.pool_address.toLowerCase(),
+      eth_tx_hash: this.value.eth_tx_hash.toLowerCase(),
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      block_hash: this.value.block_hash.toLowerCase(),
+      reconciliation_from_block: this.value.reconciliation_from_block,
+      reconciliation_to_block: this.value.reconciliation_to_block,
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_policy: this.value.confirmation_policy,
+      watcher_id: this.value.watcher_id,
+      reason: this.value.reason,
+      frozen,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      reversed_at: this.tx,
+      reversed_by: this.address,
+      reversed_by_role: 'admin',
+    };
+    let freezeRecord = null;
+    if (frozen) {
+      const existingFrozen = await this.get(`frozen/${who}`);
+      const disputedAuCum = this.safeAddAu(existingFrozen?.disputed_au_cum ?? ZERO_AU, au);
+      if (disputedAuCum instanceof Error) return disputedAuCum;
+      const clawbackAuCum = this.safeAddAu(existingFrozen?.clawback_au_cum ?? ZERO_AU, clawbackAu);
+      if (clawbackAuCum instanceof Error) return clawbackAuCum;
+      const absorbedAuCum = this.safeAddAu(
+        existingFrozen?.network_absorbed_au_cum ?? ZERO_AU,
+        networkAbsorbedAu
+      );
+      if (absorbedAuCum instanceof Error) return absorbedAuCum;
+      freezeRecord = {
+        user: who,
+        status: 'frozen',
+        reason: 'tap_deposit_reorg_shortfall',
+        rail: 'tap',
+        first_frozen_at: existingFrozen?.first_frozen_at ?? this.tx,
+        first_frozen_at_seconds: existingFrozen?.first_frozen_at_seconds ?? this.value.at,
+        updated_at: this.tx,
+        updated_at_seconds: this.value.at,
+        updated_epoch: Math.max(existingFrozen?.updated_epoch ?? 0, this.value.epoch),
+        dispute_count: (existingFrozen?.dispute_count ?? 0) + 1,
+        disputed_au_cum: disputedAuCum,
+        clawback_au_cum: clawbackAuCum,
+        network_absorbed_au_cum: absorbedAuCum,
+        last_tap_deposit_identity: this.tapDepositIdentity(this.value),
+      };
+    }
+
+    await this.put(this.balanceKey(who, 'tap'), {
+      ...balance,
+      au: nextAu,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_deposit_reversal_rail: 'tap',
+      last_deposit_reversal_at: this.tx,
+    });
+    await this.put(depositSeenKey, {
+      ...depositSeen,
+      reversed: true,
+      reversed_au: au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      reversed_at: this.tx,
+      reversed_at_seconds: this.value.at,
+      reversed_epoch: this.value.epoch,
+    });
+    await this.put(reversalSeenKey, reversalSeen);
+    if (freezeRecord) await this.put(`frozen/${who}`, freezeRecord);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    return {
+      ok: true,
+      op: 'tapDepositReversal',
+      duplicate: false,
+      who,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      frozen,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
+    };
+  }
+
+  validateTapDepositReversalValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'chain_id',
+        'pool_address',
+        'eth_tx_hash',
+        'log_index',
+        'block_number',
+        'block_hash',
+        'reconciliation_from_block',
+        'reconciliation_to_block',
+        'finalized_block_number',
+        'confirmation_policy',
+        'watcher_id',
+        'reason',
+        'epoch',
+        'at',
+      ],
+      'TAP deposit reversal'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tap_deposit_reversal') return new Error('Invalid TAP deposit reversal op.');
+    const identityError = this.validateTapDepositIdentity(value);
+    if (identityError) return identityError;
+    if (!Number.isSafeInteger(value.block_number) || value.block_number < 0) {
+      return new Error('Invalid TAP reversal block number.');
+    }
+    if (!Number.isSafeInteger(value.reconciliation_from_block)
+      || value.reconciliation_from_block > value.block_number) {
+      return new Error('Invalid TAP reversal reconciliation start.');
+    }
+    if (!Number.isSafeInteger(value.reconciliation_to_block)
+      || value.reconciliation_to_block < value.block_number) {
+      return new Error('Invalid TAP reversal reconciliation end.');
+    }
+    if (!Number.isSafeInteger(value.finalized_block_number)
+      || value.finalized_block_number - value.reconciliation_to_block < MIN_TAP_CONFIRMATION_DEPTH) {
+      return new Error('TAP reversal is not sufficiently behind the finalized reference.');
+    }
+    if (value.confirmation_policy !== 'finalized-tag') {
+      return new Error('TAP reversal requires finalized-tag policy.');
+    }
+    if (value.watcher_id !== TAP_DEPOSIT_WATCHER_ID) return new Error('TAP watcher id mismatch.');
+    if (value.reason !== 'canonical_event_missing') return new Error('Invalid TAP reversal reason.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid TAP reversal epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TAP reversal timestamp.');
     return null;
   }
 
@@ -6311,8 +7483,8 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async requireAdminSetPayoutTarget(provider) {
-    const payout = provider?.payout;
+  async requireAdminSetPayoutTarget(provider, method) {
+    const payout = provider?.payouts?.[method];
     if (!payout || typeof payout !== 'object') {
       return new Error('Provider payout target is not set.');
     }
@@ -6605,6 +7777,8 @@ class MayhemContract extends Contract {
                 'provider',
                 'enclave_id',
                 'nonce',
+                'att_tier',
+                'attestation_head',
                 'served_ctx',
                 'served_modalities',
                 'served_specialities',
@@ -6615,7 +7789,19 @@ class MayhemContract extends Contract {
               ]
             : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
-      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'served_modalities', 'served_specialities', 'ctx_bracket', 'ctx_bracket_table_ver']
+      ? [
+          'op',
+          'provider',
+          'enclave_id',
+          'nonce',
+          'att_tier',
+          'attestation_head',
+          'served_ctx',
+          'served_modalities',
+          'served_specialities',
+          'ctx_bracket',
+          'ctx_bracket_table_ver',
+        ]
       : allowed;
     const allowedSet = new Set(allowed);
     const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
@@ -6670,6 +7856,15 @@ class MayhemContract extends Contract {
     }
     if (hasOwn(intent, 'device_key') && !this.isHexBytes(intent.device_key, 32)) {
       return new Error('Invalid provider device key.');
+    }
+    if (
+      hasOwn(intent, 'att_tier') &&
+      (!Number.isSafeInteger(intent.att_tier) || intent.att_tier < 1 || intent.att_tier > MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER)
+    ) {
+      return new Error('Invalid provider attestation tier.');
+    }
+    if (hasOwn(intent, 'attestation_head') && !this.isHexBytes(intent.attestation_head, 32)) {
+      return new Error('Invalid provider attestation head.');
     }
     if (hasOwn(intent, 'rails')) {
       const rails = this.normalizeProviderAcceptedRails(intent.rails);
@@ -7172,7 +8367,7 @@ class MayhemContract extends Contract {
   validateCatalogCanaryRef(entry) {
     const shapeError = this.validateExactObjectKeys(
       entry,
-      ['set_id', 'url', 'hash'],
+      ['set_id', 'url', 'hash', 'prompt_ids'],
       'catalog canary ref'
     );
     if (shapeError) return shapeError;
@@ -7180,6 +8375,15 @@ class MayhemContract extends Contract {
     if (!this.isHttpsUrl(entry.url)) return new Error('Catalog canary URL must be HTTPS.');
     if (!this.isHexBytes(entry.hash, 32)) {
       return new Error('Catalog canary hash must be a 32-byte hex BLAKE3 hash.');
+    }
+    if (!Array.isArray(entry.prompt_ids) || entry.prompt_ids.length < 1 || entry.prompt_ids.length > 1_024) {
+      return new Error('Catalog canary prompt_ids must be a non-empty bounded array.');
+    }
+    const promptIds = new Set();
+    for (const promptId of entry.prompt_ids) {
+      if (!this.isSafeKeyPart(promptId)) return new Error('Invalid catalog canary prompt id.');
+      if (promptIds.has(promptId)) return new Error('Duplicate catalog canary prompt id.');
+      promptIds.add(promptId);
     }
     return null;
   }
@@ -7816,6 +9020,8 @@ class MayhemContract extends Contract {
 
   marketPriceParamKeys() {
     return [
+      'price_min_bps',
+      'price_max_bps',
       'market_target_utilization_bps',
       'market_ema_alpha_bps',
       'market_gain_bps',
@@ -7945,6 +9151,44 @@ class MayhemContract extends Contract {
     return this.normalizeRateMap(stepped);
   }
 
+  clampRateMapBounds(priceRateMap, referenceRateMap, params) {
+    const priceByUnit = this.rateMapByUnit(priceRateMap);
+    const referenceByUnit = this.rateMapByUnit(referenceRateMap);
+    if (priceByUnit.size !== referenceByUnit.size) {
+      return new Error('Market price rate_map units must match model reference rate_map units.');
+    }
+    const bounded = [];
+    for (const entry of priceRateMap) {
+      const reference = referenceByUnit.get(entry.unit);
+      const price = this.parseAu(entry.per_unit_au, 'market price per_unit_au');
+      const referencePrice = this.parseAu(
+        reference?.per_unit_au,
+        'market reference per_unit_au',
+        { allowZero: false }
+      );
+      if (
+        price instanceof Error ||
+        referencePrice instanceof Error ||
+        !Number.isSafeInteger(entry.granularity) ||
+        entry.granularity <= 0 ||
+        !Number.isSafeInteger(reference?.granularity) ||
+        reference.granularity <= 0
+      ) {
+        return new Error('Invalid market price rate_map bounds.');
+      }
+      const denominator = BigInt(reference.granularity) * 10_000n;
+      const scaledReference = referencePrice * BigInt(entry.granularity);
+      const lowerNumerator = scaledReference * BigInt(params.price_min_bps);
+      const upperNumerator = scaledReference * BigInt(params.price_max_bps);
+      const lower = (lowerNumerator + denominator - 1n) / denominator;
+      const upper = upperNumerator / denominator;
+      if (lower > upper) return new Error(`Model reference bounds cannot represent unit ${entry.unit}.`);
+      const clamped = price < lower ? lower : (price > upper ? upper : price);
+      bounded.push({ ...entry, per_unit_au: this.canonicalAu(clamped) });
+    }
+    return this.normalizeRateMap(bounded);
+  }
+
   priceTermsEqual(left, right) {
     return (
       stableJson(left.rate_map) === stableJson(right.rate_map) &&
@@ -7978,6 +9222,8 @@ class MayhemContract extends Contract {
       if (!seed || seed.set_by_role !== 'admin') {
         return new Error('Market price requires an admin seed.');
       }
+      const modelRef = await this.get(`modelref/${enclave.model_id}`);
+      if (!modelRef) return new Error('Market price model reference not found.');
 
       const activeSupply = usage.provider_count;
       const previousMarket = current.market && typeof current.market === 'object'
@@ -8013,6 +9259,8 @@ class MayhemContract extends Contract {
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       if (nextTerms.per_req_au instanceof Error) return nextTerms.per_req_au;
       if (nextTerms.min_session_au instanceof Error) return nextTerms.min_session_au;
+      nextTerms.rate_map = this.clampRateMapBounds(nextTerms.rate_map, modelRef.rate_map, marketParams);
+      if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       const latest = this.priceLatestEntry(schedule);
       const record = {
         enclave_id: current.enclave_id,
@@ -8341,6 +9589,10 @@ class MayhemContract extends Contract {
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
       if (typeof value.pass !== 'boolean') return new Error('Canary probe requires pass.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+      if (!value.canary_prompt_id) return new Error('Canary probe requires canary_prompt_id.');
+      if (value.challenge_epoch === undefined) return new Error('Canary probe requires challenge_epoch.');
+      if (!value.challenge_apply_hash) return new Error('Canary probe requires challenge_apply_hash.');
+      if (!value.challenge_seed) return new Error('Canary probe requires challenge_seed.');
       if (!value.verification_method) return new Error('Canary probe requires verification_method.');
       if (!PROBE_VERIFICATION_METHODS.has(value.verification_method)) {
         return new Error('Unsupported canary verification_method.');
@@ -8355,6 +9607,14 @@ class MayhemContract extends Contract {
       }
       if (!this.isHexBytes(value.evidence_hash, 32)) return new Error('Invalid canary evidence hash.');
       if (!this.isHexBytes(value.auditor_sig, 64)) return new Error('Invalid canary auditor signature.');
+      if (!this.isSafeKeyPart(value.canary_prompt_id)) return new Error('Invalid canary prompt id.');
+      if (!Number.isSafeInteger(value.challenge_epoch) || value.challenge_epoch < 0) {
+        return new Error('Invalid canary challenge epoch.');
+      }
+      if (!this.isHexBytes(value.challenge_apply_hash, 32)) {
+        return new Error('Invalid canary challenge apply hash.');
+      }
+      if (!this.isHexBytes(value.challenge_seed, 32)) return new Error('Invalid canary challenge seed.');
     }
     return null;
   }
@@ -8362,6 +9622,10 @@ class MayhemContract extends Contract {
   async normalizeSpendVoucherForReserve(voucher) {
     const voucherFields = [
       'session_id',
+      'billing_id',
+      'billing_attempt',
+      'billing_prior_usage',
+      'billing_prior_au_owed_cum',
       'rail',
       'enclave_id',
       'price_ver',
@@ -8392,6 +9656,31 @@ class MayhemContract extends Contract {
     const rail = this.normalizeLedgerRail(voucher.rail, 'spend voucher rail');
     if (rail instanceof Error) return rail;
     if (!this.isHexBytes(voucher.session_id, 32)) return new Error('Invalid spend voucher session id.');
+    if (!this.isHexBytes(voucher.billing_id, 32)) return new Error('Invalid spend voucher billing id.');
+    if (!Number.isSafeInteger(voucher.billing_attempt) || voucher.billing_attempt < 0) {
+      return new Error('Invalid spend voucher billing attempt.');
+    }
+    const billingPriorUsage = this.normalizeReceiptUsage(voucher.billing_prior_usage);
+    if (billingPriorUsage instanceof Error) return billingPriorUsage;
+    if (stableJson(billingPriorUsage) !== stableJson(voucher.billing_prior_usage)) {
+      return new Error('Spend voucher billing prior usage must be canonical.');
+    }
+    const billingPriorAuOwedCum = this.normalizeAu(
+      voucher.billing_prior_au_owed_cum,
+      'spend voucher billing prior cumulative amount'
+    );
+    if (billingPriorAuOwedCum instanceof Error) {
+      return new Error('Invalid spend voucher billing prior cumulative amount.');
+    }
+    if (
+      voucher.billing_attempt === 0 &&
+      (Object.keys(billingPriorUsage).length > 0 || !this.isZeroAu(billingPriorAuOwedCum))
+    ) {
+      return new Error('Initial spend voucher billing attempt must have an empty baseline.');
+    }
+    if (this.isZeroAu(billingPriorAuOwedCum) && Object.keys(billingPriorUsage).length > 0) {
+      return new Error('Spend voucher billing prior usage requires a prior cumulative amount.');
+    }
     if (!this.isHexBytes(voucher.enclave_id, 32)) return new Error('Invalid spend voucher enclave id.');
     if (!Number.isSafeInteger(voucher.price_ver) || voucher.price_ver < 1) {
       return new Error('Invalid spend voucher price version.');
@@ -8449,6 +9738,10 @@ class MayhemContract extends Contract {
     if (!this.isHexBytes(voucher.user_sig, 64)) return new Error('Invalid spend voucher user signature.');
     const body = {
       session_id: voucher.session_id.toLowerCase(),
+      billing_id: voucher.billing_id.toLowerCase(),
+      billing_attempt: voucher.billing_attempt,
+      billing_prior_usage: billingPriorUsage,
+      billing_prior_au_owed_cum: billingPriorAuOwedCum,
       rail,
       enclave_id: voucher.enclave_id.toLowerCase(),
       price_ver: voucher.price_ver,
@@ -8610,6 +9903,10 @@ class MayhemContract extends Contract {
       max_spend_au: maxSpendAu,
       voucher: {
         session_id: voucher.body.session_id,
+        billing_id: voucher.body.billing_id,
+        billing_attempt: voucher.body.billing_attempt,
+        billing_prior_usage: voucher.body.billing_prior_usage,
+        billing_prior_au_owed_cum: voucher.body.billing_prior_au_owed_cum,
         rail: voucher.body.rail,
         enclave_id: voucher.body.enclave_id,
         price_ver: voucher.body.price_ver,
@@ -8805,6 +10102,9 @@ class MayhemContract extends Contract {
       return new Error('Canary probe binary_hash is not approved for enclave.');
     }
 
+    const challengeError = await this.requireCanaryChallenge(value, auditor);
+    if (challengeError) return challengeError;
+
     if (!this.verifyProbeResultSignature(auditor, value)) {
       return new Error('Invalid canary auditor signature.');
     }
@@ -8822,12 +10122,47 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async requireCanaryChallenge(value, auditor) {
+    if (value.epoch !== value.challenge_epoch + 1) {
+      return new Error('Canary probe epoch must immediately follow its challenge epoch.');
+    }
+    const anchor = await this.canaryChallengeAnchor(value.challenge_epoch);
+    if (!anchor) return new Error('Canary challenge epoch is not anchored.');
+    if (anchor.apply_hash !== value.challenge_apply_hash.toLowerCase()) {
+      return new Error('Canary challenge apply hash mismatch.');
+    }
+    const catalog = await this.get('catalog/current');
+    const canary = catalog?.canaries?.find((entry) => entry.set_id === value.canary_set);
+    if (!canary) return new Error('Published canary challenge set not found.');
+    const expectedSeed = await this.opaqueHash('mayhem-canary-challenge-v1', {
+      challenge_epoch: value.challenge_epoch,
+      challenge_apply_hash: anchor.apply_hash,
+      probe_epoch: value.epoch,
+      auditor,
+      provider: value.provider,
+      enclave_id: value.enclave_id,
+      canary_set: value.canary_set,
+      catalog_hash: catalog.catalog_hash,
+    });
+    if (expectedSeed !== value.challenge_seed.toLowerCase()) {
+      return new Error('Canary challenge seed mismatch.');
+    }
+    const selectedIndex = Number(BigInt(`0x${expectedSeed}`) % BigInt(canary.prompt_ids.length));
+    if (value.canary_prompt_id !== canary.prompt_ids[selectedIndex]) {
+      return new Error('Canary prompt does not match the unpredictable challenge selection.');
+    }
+    return null;
+  }
+
   validateDisputeOpen(value) {
     const rail = this.normalizeLedgerRail(value.rail, 'dispute rail');
     if (rail instanceof Error) return rail;
-    if (!this.isSafeKeyPart(value.session_id)) return new Error('Invalid dispute session id.');
+    if (!this.isHexBytes(value.session_id, 32)) return new Error('Invalid dispute session id.');
     if (!this.isSafeKeyPart(value.reason)) return new Error('Invalid dispute reason.');
-    for (const key of ['provider', 'counterparty', 'enclave_id']) {
+    for (const key of ['provider', 'enclave_id']) {
+      if (!this.isHexBytes(value[key], 32)) return new Error(`Invalid dispute ${key}.`);
+    }
+    for (const key of ['counterparty']) {
       if (value[key] !== undefined && !this.isSafeKeyPart(value[key])) {
         return new Error(`Invalid dispute ${key}.`);
       }
@@ -9010,6 +10345,10 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
       return new Error('Guardian balance epoch invariant failed.');
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(record, ['au'], 'balance');
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -9048,6 +10387,14 @@ class MayhemContract extends Contract {
         return new Error('Guardian earnings conservation invariant failed.');
       }
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(
+        record,
+        ['total_au', 'held_au', 'paid_cum_au'],
+        'earning'
+      );
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -9079,6 +10426,14 @@ class MayhemContract extends Contract {
     ) {
       return new Error('Guardian conservation invariant failed.');
     }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(
+        record,
+        ['cum_au', 'swept_cum_au', 'settled_cum_au'],
+        'fee'
+      );
+      if (scopeError) return scopeError;
+    }
     return null;
   }
 
@@ -9101,6 +10456,10 @@ class MayhemContract extends Contract {
     const expectedBps = record.rail === 'tap' ? TAP_BURN_BPS : 0;
     if (record.burn_bps !== expectedBps) {
       return new Error('Guardian burn policy invariant failed.');
+    }
+    if (record.rail === 'tap') {
+      const scopeError = this.guardianValidateTapScope(record, ['cum_au'], 'burn');
+      if (scopeError) return scopeError;
     }
     return null;
   }
@@ -9217,15 +10576,29 @@ class MayhemContract extends Contract {
     return Math.max(providerHoldback, params.challenge_epochs ?? 0);
   }
 
-  async recordCanaryProbePass(value) {
+  async recordCanaryProbePass(value, auditor) {
     const key = `probe/pass/${value.provider}/${value.epoch}`;
     const current = await this.get(key);
-    const passCount = this.safeAddCount(current?.pass_count ?? 0, 1, 'canary pass count');
-    if (passCount instanceof Error) return passCount;
+    const auditors = current?.auditors ?? [];
+    const probes = current?.probes ?? [];
+    if (!Array.isArray(auditors) || !Array.isArray(probes) || auditors.length !== probes.length) {
+      return new Error('Invalid canary pass record.');
+    }
+    if (auditors.includes(auditor)) {
+      return new Error('Auditor already supplied a canary pass for this provider epoch.');
+    }
+    const next = [...probes, {
+      auditor,
+      probe_id: value.probe_id,
+      evidence_hash: value.evidence_hash,
+      challenge_seed: value.challenge_seed,
+    }].sort((left, right) => compareCodepoint(left.auditor, right.auditor));
     const record = {
       provider: value.provider,
       epoch: value.epoch,
-      pass_count: passCount,
+      pass_count: next.length,
+      auditors: next.map((entry) => entry.auditor),
+      probes: next,
       last_probe_id: value.probe_id,
       last_evidence_hash: value.evidence_hash ?? null,
       updated_at: this.tx,
@@ -9241,7 +10614,7 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(holdbackBps) || holdbackBps < 0 || holdbackBps > 10_000) {
       return new Error('Invalid canary probe holdback bps.');
     }
-    if (!Number.isSafeInteger(requiredPasses) || requiredPasses < 0) {
+    if (!Number.isSafeInteger(requiredPasses) || requiredPasses < 2) {
       return new Error('Invalid canary probe release threshold.');
     }
     const holdbacks = this.normalizeHoldbackBuckets(earning);
@@ -9249,7 +10622,15 @@ class MayhemContract extends Contract {
     const passedEpochs = new Set();
     for (const epoch of [...new Set(holdbacks.map((bucket) => bucket.epoch))]) {
       const passRecord = await this.get(`probe/pass/${provider}/${epoch}`);
-      if ((passRecord?.pass_count ?? 0) >= requiredPasses) {
+      const distinctAuditors = new Set(passRecord?.auditors ?? []);
+      let activeAuditors = 0;
+      for (const auditor of distinctAuditors) {
+        if ((await this.get(`auditor/${auditor}`))?.status === 'active') activeAuditors += 1;
+      }
+      if (
+        distinctAuditors.size === (passRecord?.pass_count ?? 0) &&
+        activeAuditors >= requiredPasses
+      ) {
         passedEpochs.add(epoch);
       }
     }
@@ -9331,7 +10712,7 @@ class MayhemContract extends Contract {
     return total;
   }
 
-  refreshEarningHoldback(record, currentEpoch, lockedEpochs, probeGate = null) {
+  refreshEarningHoldback(record, currentEpoch, lockedEpochs, probeGate = null, disputeGate = false) {
     if (!Number.isSafeInteger(currentEpoch) || currentEpoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
@@ -9346,7 +10727,7 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(bucketLockedEpochs) || bucketLockedEpochs < 0) {
         return new Error('Guardian monotonic epoch invariant failed.');
       }
-      if (bucket.epoch + bucketLockedEpochs > currentEpoch) {
+      if (disputeGate || bucket.epoch + bucketLockedEpochs > currentEpoch) {
         kept.push(bucket);
         continue;
       }
@@ -10037,6 +11418,10 @@ class MayhemContract extends Contract {
     const body = {
       schema_version: bodySource.schema_version,
       session_id: bodySource.session_id,
+      billing_id: bodySource.billing_id,
+      billing_attempt: bodySource.billing_attempt,
+      billing_prior_usage: cloneValue(bodySource.billing_prior_usage),
+      billing_prior_au_owed_cum: bodySource.billing_prior_au_owed_cum,
       seq: bodySource.seq,
       final: bodySource.final,
       rail: bodySource.rail,
@@ -10092,6 +11477,31 @@ class MayhemContract extends Contract {
       if (typeof body[field] !== 'string' || body[field].length === 0 || body[field].length > 256) {
         return new Error(`Invalid receipt ${field}.`);
       }
+    }
+    if (!this.isHexBytes(body.billing_id, 32)) return new Error('Invalid receipt billing id.');
+    if (!Number.isSafeInteger(body.billing_attempt) || body.billing_attempt < 0) {
+      return new Error('Invalid receipt billing attempt.');
+    }
+    const billingPriorUsage = this.normalizeReceiptUsage(body.billing_prior_usage);
+    if (billingPriorUsage instanceof Error) return billingPriorUsage;
+    if (stableJson(billingPriorUsage) !== stableJson(body.billing_prior_usage)) {
+      return new Error('Receipt billing prior usage must be canonical.');
+    }
+    const billingPriorAuOwedCum = this.normalizeAu(
+      body.billing_prior_au_owed_cum,
+      'receipt billing prior cumulative amount'
+    );
+    if (billingPriorAuOwedCum instanceof Error) {
+      return new Error('Invalid receipt billing prior cumulative amount.');
+    }
+    if (
+      body.billing_attempt === 0 &&
+      (Object.keys(billingPriorUsage).length > 0 || !this.isZeroAu(billingPriorAuOwedCum))
+    ) {
+      return new Error('Initial receipt billing attempt must have an empty baseline.');
+    }
+    if (this.isZeroAu(billingPriorAuOwedCum) && Object.keys(billingPriorUsage).length > 0) {
+      return new Error('Receipt billing prior usage requires a prior cumulative amount.');
     }
     if (!this.isHexBytes(body.user, 32)) return new Error('Invalid receipt user public key.');
     if (!this.isHexBytes(body.provider, 32)) return new Error('Invalid receipt provider public key.');
@@ -10155,11 +11565,13 @@ class MayhemContract extends Contract {
     if (auOwedCum instanceof Error) {
       return new Error('Invalid receipt cumulative amount.');
     }
-    const lockedAu = this.usageAuForLockedTerms(
+    const lockedAu = this.logicalCumulativeAuForLockedTerms(
       body.locked_rate_map,
       lockedPerReqAu,
       lockedMinSessionAu,
-      body.usage
+      billingPriorUsage,
+      billingPriorAuOwedCum,
+      usage
     );
     if (lockedAu instanceof Error) return lockedAu;
     if (this.compareAu(auOwedCum, lockedAu) !== 0) {
@@ -10783,6 +12195,36 @@ class MayhemContract extends Contract {
     return this.maxAu(subtotal, normalizedMinSessionAu);
   }
 
+  receiptUsageDelta(previous, current) {
+    const delta = {};
+    for (const [unit, previousCount] of Object.entries(previous)) {
+      const currentCount = current[unit] ?? 0;
+      if (currentCount < previousCount) return new Error('Receipt cumulative usage regressed.');
+    }
+    for (const [unit, currentCount] of Object.entries(current)) {
+      const count = currentCount - (previous[unit] ?? 0);
+      if (count > 0) delta[unit] = count;
+    }
+    return delta;
+  }
+
+  logicalCumulativeAuForLockedTerms(
+    rateMap,
+    perReqAu,
+    minSessionAu,
+    priorUsage,
+    priorAuOwedCum,
+    currentUsage
+  ) {
+    const delta = this.receiptUsageDelta(priorUsage, currentUsage);
+    if (delta instanceof Error) return delta;
+    const increment = this.isZeroAu(priorAuOwedCum)
+      ? this.usageAuForLockedTerms(rateMap, perReqAu, minSessionAu, delta)
+      : this.usageAuForRateMap(rateMap, delta);
+    if (increment instanceof Error) return increment;
+    return this.safeAddAu(priorAuOwedCum, increment);
+  }
+
   ceilDivBigInt(value, divisor) {
     if (value <= 0n) return 0n;
     return (value + divisor - 1n) / divisor;
@@ -10934,20 +12376,39 @@ class MayhemContract extends Contract {
   async balanceRecord(user, rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'balance rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.balanceKey(user, normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.balanceKey(user, normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       user,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
+      ...(tap ?? {}),
     };
   }
 
   async earningRecord(provider, rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'earning rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.earningKey(provider, normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.earningKey(provider, normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       provider,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
@@ -10956,13 +12417,23 @@ class MayhemContract extends Contract {
       paid_cum_au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
+      ...(tap ?? {}),
     };
   }
 
   async feeCumRecord(rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'fee rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.feeCumKey(normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.feeCumKey(normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       cum_au: ZERO_AU,
@@ -10971,13 +12442,23 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       last_fee_bps: null,
+      ...(tap ?? {}),
     };
   }
 
   async burnCumRecord(rail) {
     const normalizedRail = this.normalizeLedgerRail(rail, 'burn rail');
     if (normalizedRail instanceof Error) return normalizedRail;
-    return (await this.get(this.burnCumKey(normalizedRail))) ?? {
+    const tap = normalizedRail === 'tap'
+      ? await this.canonicalTapPaymentConfig({ optional: true })
+      : null;
+    if (tap instanceof Error) return tap;
+    const current = await this.get(this.burnCumKey(normalizedRail));
+    const scoped = tap === null || (
+      current?.chain_id === tap.chain_id &&
+      current?.pool_address === tap.pool_address
+    ) ? current : null;
+    return scoped ?? {
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       cum_au: ZERO_AU,
@@ -10985,6 +12466,7 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       burn_bps: normalizedRail === 'tap' ? TAP_BURN_BPS : 0,
+      ...(tap ?? {}),
     };
   }
 
@@ -10994,6 +12476,51 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
     };
+  }
+
+  async rememberCanaryChallengeAnchor(state) {
+    if (
+      !state ||
+      !Number.isSafeInteger(state.updated_epoch) ||
+      state.updated_epoch < 1 ||
+      !this.isHexBytes(state.last_apply_hash, 32) ||
+      (state.pending_epoch ?? null) !== null
+    ) {
+      return null;
+    }
+    const key = `epoch/challenge/${state.updated_epoch}`;
+    const record = {
+      epoch: state.updated_epoch,
+      apply_hash: state.last_apply_hash.toLowerCase(),
+      recorded_at: this.tx,
+    };
+    const existing = await this.get(key);
+    if (existing !== null) {
+      if (existing.epoch !== record.epoch || existing.apply_hash !== record.apply_hash) {
+        return new Error('Canary challenge anchor conflict.');
+      }
+      return null;
+    }
+    await this.put(key, record);
+    return null;
+  }
+
+  async canaryChallengeAnchor(epoch) {
+    const historical = await this.get(`epoch/challenge/${epoch}`);
+    if (historical) return historical;
+    const current = await this.epochApplyStateRecord();
+    if (
+      current.updated_epoch === epoch &&
+      this.isHexBytes(current.last_apply_hash, 32) &&
+      (current.pending_epoch ?? null) === null
+    ) {
+      return {
+        epoch,
+        apply_hash: current.last_apply_hash.toLowerCase(),
+        recorded_at: current.updated_at,
+      };
+    }
+    return null;
   }
 
   parseTnkE18(value) {
@@ -11042,12 +12569,14 @@ class MayhemContract extends Contract {
   tnkE18ToAu(tnkE18, tnkUsdAu) {
     const rate = this.parseAu(tnkUsdAu, 'TNK/USD atto-rate', { allowZero: false });
     if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
+    // Deposit conversion rounds down so credited AU never exceeds received TNK value.
     return this.canonicalAu((tnkE18 * rate) / TNK_E18);
   }
 
   tapWeiToAu(tapWei, tapUsdAu) {
     const rate = this.parseAu(tapUsdAu, 'TAP/USD policy rate', { allowZero: false });
     if (rate instanceof Error) return new Error('Invalid TAP/USD policy rate.');
+    // Deposit conversion rounds down so credited AU never exceeds received TAP value.
     return this.canonicalAu((tapWei * rate) / TAP_WEI);
   }
 
@@ -11260,6 +12789,32 @@ class MayhemContract extends Contract {
     return `tap/account-by-address/${chainId}/${poolAddress.toLowerCase()}/${ethereumAddress.toLowerCase()}`;
   }
 
+  tapDepositIdentity(value) {
+    return [
+      value.chain_id,
+      value.pool_address.toLowerCase(),
+      value.eth_tx_hash.toLowerCase(),
+      value.log_index,
+      value.block_hash.toLowerCase(),
+    ].join('/');
+  }
+
+  validateTapDepositIdentity(value) {
+    for (const key of ['chain_id', 'pool_address', 'eth_tx_hash', 'log_index', 'block_hash']) {
+      if (!hasOwn(value, key)) return new Error(`TAP deposit is missing ${key}.`);
+    }
+    if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) {
+      return new Error('Invalid TAP chain id.');
+    }
+    if (!this.isEthHexBytes(value.pool_address, 20)) return new Error('Invalid TAP pool address.');
+    if (!this.isEthHexBytes(value.eth_tx_hash, 32)) return new Error('Invalid Ethereum tx hash.');
+    if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
+      return new Error('Invalid TAP deposit log index.');
+    }
+    if (!this.isEthHexBytes(value.block_hash, 32)) return new Error('Invalid TAP deposit block hash.');
+    return null;
+  }
+
   async depositFeatureKey(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Deposit feature value must be an object.');
@@ -11281,11 +12836,14 @@ class MayhemContract extends Contract {
       return `dep/tnk/${value.memo_hash}/${digest}`;
     }
     if (value.op === 'tap_deposit') {
-      if (!this.isSafeKeyPart(value.eth_tx_hash)) return new Error('Invalid Ethereum tx hash.');
-      if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
-        return new Error('Invalid TAP deposit log index.');
-      }
-      return `dep/tap/${value.eth_tx_hash.toLowerCase()}/${value.log_index}/${digest}`;
+      const validationError = this.validateTapDepositIdentity(value);
+      if (validationError) return validationError;
+      return `dep/tap/${this.tapDepositIdentity(value)}`;
+    }
+    if (value.op === 'tap_deposit_reversal') {
+      const validationError = this.validateTapDepositReversalValue(value);
+      if (validationError) return validationError;
+      return `dep/tap/${this.tapDepositIdentity(value)}/reversal`;
     }
     if (value.op === 'fiat_deposit') {
       if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
@@ -11315,6 +12873,7 @@ class MayhemContract extends Contract {
     } else {
       return new Error('Unsupported rate feature op.');
     }
+    this._mayhemApplyStage = 'rate:key:hash';
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
         domain: 'mayhem-rate-feature-v1',
@@ -11322,6 +12881,7 @@ class MayhemContract extends Contract {
       }))),
       'hex'
     );
+    this._mayhemApplyStage = 'rate:key:hashed';
     return `rate/${kind}/${value.ts}/${digest}`;
   }
 
@@ -11349,6 +12909,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `settle/fiat/${value.epoch}/${digest}`;
+  }
+
+  async fiatDustSweepFeatureKey(value) {
+    const validationError = this.validateFiatDustSweepValue(value);
+    if (validationError) return validationError;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-fiat-dust-sweep-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `settle/fiat-dust/${value.provider}/${value.epoch}/${digest}`;
   }
 
   async reputationAnchorFeatureKey(value) {
@@ -11428,6 +13001,9 @@ class MayhemContract extends Contract {
       recorded_by: this.address,
     };
     const head = await this.reputationEventHead(currentHead?.head ?? null, body);
+    const foldKey = `ev/rep/fold/${event.provider}`;
+    const fold = this.advanceReputationFold(await this.get(foldKey), body, head);
+    if (fold instanceof Error) return fold;
     const record = {
       ...body,
       head,
@@ -11441,7 +13017,177 @@ class MayhemContract extends Contract {
 
     await this.put(key, record);
     await this.put(headKey, headRecord);
+    await this.put(foldKey, fold);
     return record;
+  }
+
+  parseSignedDecimal(value, label) {
+    if (typeof value !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(value)) {
+      return new Error(`${label} must be a canonical signed decimal string.`);
+    }
+    return BigInt(value);
+  }
+
+  roundSignedRatio(value, divisor) {
+    if (typeof value !== 'bigint' || typeof divisor !== 'bigint' || divisor <= 0n) {
+      return new Error('Invalid signed ratio.');
+    }
+    const negative = value < 0n;
+    const absolute = negative ? -value : value;
+    const rounded = (absolute + divisor / 2n) / divisor;
+    return negative ? -rounded : rounded;
+  }
+
+  quantizePositiveReputation(value, scale, label) {
+    const scaled = value * Number(scale);
+    if (!Number.isFinite(scaled) || scaled < 0 || !Number.isSafeInteger(Math.floor(scaled + 0.5))) {
+      return new Error(`Invalid ${label}.`);
+    }
+    return BigInt(Math.floor(scaled + 0.5));
+  }
+
+  decayReputationRawNano(rawNano, fromSeconds, toSeconds) {
+    if (
+      typeof rawNano !== 'bigint' ||
+      !Number.isSafeInteger(fromSeconds) ||
+      !Number.isSafeInteger(toSeconds) ||
+      fromSeconds < 0 ||
+      toSeconds < fromSeconds
+    ) {
+      return new Error('Invalid reputation decay range.');
+    }
+    if (fromSeconds === toSeconds || rawNano === 0n) return rawNano;
+    const decay = 2 ** (-(toSeconds - fromSeconds) / REPUTATION_HALF_LIFE_SECONDS);
+    const decayPico = this.quantizePositiveReputation(
+      decay,
+      REPUTATION_DECAY_PICO_SCALE,
+      'reputation decay'
+    );
+    if (decayPico instanceof Error) return decayPico;
+    return this.roundSignedRatio(
+      rawNano * decayPico,
+      REPUTATION_DECAY_PICO_SCALE
+    );
+  }
+
+  reputationEventRawNano(event) {
+    let scoreQuarters = null;
+    let weightedAu = null;
+    if (event.kind === 'session_ok') {
+      scoreQuarters = 4n;
+      weightedAu = event.paid_au;
+    } else if (event.kind === 'session_partial') {
+      scoreQuarters = 1n;
+      weightedAu = event.paid_au;
+    } else if (event.kind === 'session_fail') {
+      scoreQuarters = -16n;
+      weightedAu = event.max_spend_au;
+    }
+    if (scoreQuarters !== null) {
+      const amount = this.parseAu(weightedAu, 'reputation weighted amount');
+      if (amount instanceof Error) return amount;
+      const weight = Math.log10(1 + Number(amount));
+      const weightNano = this.quantizePositiveReputation(
+        weight,
+        REPUTATION_RAW_NANO_SCALE,
+        'reputation paid weight'
+      );
+      if (weightNano instanceof Error) return weightNano;
+      return this.roundSignedRatio(weightNano * scoreQuarters, 4n);
+    }
+    const fixedScores = {
+      probe_ok: 500_000_000n,
+      probe_fail: -6_000_000_000n,
+      uptime_tick: 100_000_000n,
+      underdelivery: -6_000_000_000n,
+      dispute_lost: -20_000_000_000n,
+      provenance_violation: 0n,
+    };
+    return fixedScores[event.kind] ?? new Error('Unsupported reputation event kind.');
+  }
+
+  advanceReputationFold(current, event, eventsHead) {
+    if (!Number.isSafeInteger(event.at) || event.at < 0) {
+      return new Error('Invalid reputation event time.');
+    }
+    if (!Number.isSafeInteger(event.epoch) || event.epoch < 0) {
+      return new Error('Invalid reputation event epoch.');
+    }
+    let rawNano = 0n;
+    let foldAt = event.at;
+    let successfulSessions = 0;
+    let provenanceViolation = false;
+    let eventCount = 0;
+    let maxEpoch = 0;
+    if (current !== null) {
+      rawNano = this.parseSignedDecimal(current.raw_nano, 'reputation raw_nano');
+      if (rawNano instanceof Error) return rawNano;
+      if (
+        !Number.isSafeInteger(current.at) || current.at < 0 ||
+        !Number.isSafeInteger(current.successful_sessions) || current.successful_sessions < 0 ||
+        !Number.isSafeInteger(current.event_count) || current.event_count < 0 ||
+        !Number.isSafeInteger(current.max_epoch) || current.max_epoch < 0 ||
+        typeof current.provenance_violation !== 'boolean'
+      ) {
+        return new Error('Invalid reputation fold state.');
+      }
+      foldAt = Math.max(current.at, event.at);
+      rawNano = this.decayReputationRawNano(rawNano, current.at, foldAt);
+      if (rawNano instanceof Error) return rawNano;
+      successfulSessions = current.successful_sessions;
+      provenanceViolation = current.provenance_violation;
+      eventCount = current.event_count;
+      maxEpoch = current.max_epoch;
+    }
+    let contribution = this.reputationEventRawNano(event);
+    if (contribution instanceof Error) return contribution;
+    contribution = this.decayReputationRawNano(contribution, event.at, foldAt);
+    if (contribution instanceof Error) return contribution;
+    const nextSuccessfulSessions = this.safeAddCount(
+      successfulSessions,
+      event.kind === 'session_ok' ? 1 : 0,
+      'successful reputation session count'
+    );
+    if (nextSuccessfulSessions instanceof Error) return nextSuccessfulSessions;
+    const nextEventCount = this.safeAddCount(eventCount, 1, 'reputation event count');
+    if (nextEventCount instanceof Error) return nextEventCount;
+    return {
+      provider: event.provider,
+      raw_nano: (rawNano + contribution).toString(),
+      at: foldAt,
+      max_epoch: Math.max(maxEpoch, event.epoch),
+      successful_sessions: nextSuccessfulSessions,
+      provenance_violation: provenanceViolation || event.kind === 'provenance_violation',
+      event_count: nextEventCount,
+      events_head: eventsHead,
+      updated_at: this.tx,
+    };
+  }
+
+  reputationFoldAt(fold, foldedAt) {
+    if (!Number.isSafeInteger(foldedAt) || foldedAt < fold.at) {
+      return new Error('Reputation folded_at precedes the latest event.');
+    }
+    const rawNano = this.parseSignedDecimal(fold.raw_nano, 'reputation raw_nano');
+    if (rawNano instanceof Error) return rawNano;
+    const decayed = this.decayReputationRawNano(rawNano, fold.at, foldedAt);
+    if (decayed instanceof Error) return decayed;
+    const rawMilliValue = this.roundSignedRatio(decayed, REPUTATION_RAW_NANO_PER_MILLI);
+    if (rawMilliValue instanceof Error) return rawMilliValue;
+    const rawMilli = Number(rawMilliValue);
+    if (!Number.isSafeInteger(rawMilli)) return new Error('Reputation raw_milli overflow.');
+    const raw = rawMilli / 1_000;
+    const r = 1 / (1 + Math.exp(-raw / REPUTATION_KAPPA));
+    const rBps = Math.floor(r * 10_000 + 0.5);
+    if (!Number.isSafeInteger(rBps) || rBps < 0 || rBps > 10_000) {
+      return new Error('Invalid folded reputation score.');
+    }
+    return {
+      raw_milli: rawMilli,
+      r_bps: rBps,
+      successful_sessions: fold.successful_sessions,
+      provenance_violation: fold.provenance_violation,
+    };
   }
 
   isSafeKeyPart(value) {

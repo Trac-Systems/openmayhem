@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use mayhem_gateway::MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS;
 use mayhem_proto::{
     default_model_class, EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType,
@@ -236,6 +236,8 @@ pub(crate) struct ConversionRef {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
+    #[serde(default)]
+    pub(crate) stable_diffusion_cpp: Option<mayhem_engine::StableDiffusionCppConfig>,
     pub(crate) source: SourceRef,
     #[serde(default)]
     pub(crate) upstream_source: Option<SourceRef>,
@@ -640,7 +642,7 @@ fn verify_signature_bytes(catalog_bytes: &[u8], signature: &CatalogSignature) ->
     let sig_bytes = hex_to_vec(&signature.sig)?;
     let key = VerifyingKey::from_bytes(&public_key_bytes).context("invalid catalog public key")?;
     let sig = Signature::from_slice(&sig_bytes).context("invalid catalog signature bytes")?;
-    key.verify(catalog_bytes, &sig)
+    key.verify_strict(catalog_bytes, &sig)
         .context("catalog signature verification failed")
 }
 
@@ -736,6 +738,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_model_caps_modalities(model, errors);
     validate_model_modality_assessment(model, errors);
     validate_model_adapter(model, errors);
+    validate_stable_diffusion_endpoint_ranges(model, errors);
     validate_model_specialities(model, errors);
     validate_model_sampling(model, errors);
     let _ = (model.caps.tools, model.caps.json);
@@ -799,6 +802,91 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_price_ref(model, errors);
+}
+
+fn validate_stable_diffusion_endpoint_ranges(model: &CatalogModel, errors: &mut Vec<String>) {
+    for (artifact_name, artifact) in &model.artifacts {
+        let Some(config) = artifact.stable_diffusion_cpp else {
+            continue;
+        };
+        for (family, steps_path, guidance_path) in [
+            (
+                mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                "steps",
+                "cfg_scale",
+            ),
+            (
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+                "parameters.num_inference_steps",
+                "parameters.guidance_scale",
+            ),
+        ] {
+            let Some(contract) = model
+                .adapter
+                .endpoint_families
+                .iter()
+                .find(|contract| contract.family == family)
+            else {
+                continue;
+            };
+            validate_stable_diffusion_mapped_range(
+                &model.model_id,
+                artifact_name,
+                family,
+                steps_path,
+                contract.request_attribute_specs.get(steps_path),
+                f64::from(config.steps_offset),
+                1.0,
+                150.0,
+                errors,
+            );
+            validate_stable_diffusion_mapped_range(
+                &model.model_id,
+                artifact_name,
+                family,
+                guidance_path,
+                contract.request_attribute_specs.get(guidance_path),
+                f64::from(config.guidance_scale_offset),
+                0.0,
+                50.0,
+                errors,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_stable_diffusion_mapped_range(
+    model_id: &str,
+    artifact_name: &str,
+    family: &str,
+    path: &str,
+    spec: Option<&mayhem_proto::EndpointAttributeSpec>,
+    offset: f64,
+    engine_minimum: f64,
+    engine_maximum: f64,
+    errors: &mut Vec<String>,
+) {
+    let Some(spec) = spec else {
+        return;
+    };
+    let Some(minimum) = spec.minimum else {
+        errors.push(format!(
+            "{model_id}/{artifact_name} endpoint family {family} {path} needs a signed minimum"
+        ));
+        return;
+    };
+    let Some(maximum) = spec.maximum else {
+        errors.push(format!(
+            "{model_id}/{artifact_name} endpoint family {family} {path} needs a signed maximum"
+        ));
+        return;
+    };
+    if minimum + offset < engine_minimum || maximum + offset > engine_maximum {
+        errors.push(format!(
+            "{model_id}/{artifact_name} endpoint family {family} {path} range {minimum}..={maximum} with backend offset {offset} exceeds stable-diffusion.cpp range {engine_minimum}..={engine_maximum}"
+        ));
+    }
 }
 
 fn validate_model_sampling(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -2192,6 +2280,7 @@ fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
             errors,
         );
         validate_endpoint_attribute_specs(model, contract, errors);
+        validate_image_endpoint_defaults(model, contract, errors);
         for required in &contract.required_request_attributes {
             if !contract.request_attributes.contains(required) {
                 errors.push(format!(
@@ -2216,6 +2305,109 @@ fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
                 model.model_id, required
             ));
         }
+    }
+}
+
+fn validate_image_endpoint_defaults(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    errors: &mut Vec<String>,
+) {
+    let has_default = |path: &str| {
+        contract
+            .request_attribute_specs
+            .get(path)
+            .and_then(|spec| spec.default.as_ref())
+            .is_some()
+    };
+    let is_required = |path: &str| {
+        contract
+            .required_request_attributes
+            .iter()
+            .any(|required| required == path)
+    };
+    match contract.family.as_str() {
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            let has_size = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "size");
+            let has_width = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "width");
+            let has_height = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "height");
+            if has_width != has_height {
+                errors.push(format!(
+                    "{} endpoint family {} must declare width and height together",
+                    model.model_id, contract.family
+                ));
+            }
+            let width_default = has_default("width");
+            let height_default = has_default("height");
+            if width_default != height_default {
+                errors.push(format!(
+                    "{} endpoint family {} must default width and height together",
+                    model.model_id, contract.family
+                ));
+            }
+            let size_resolution = has_size && (has_default("size") || is_required("size"));
+            let dimension_resolution = has_width
+                && has_height
+                && ((width_default && height_default)
+                    || (is_required("width") && is_required("height")));
+            if size_resolution == dimension_resolution {
+                errors.push(format!(
+                    "{} endpoint family {} must resolve exactly one signed default dimension representation: size or width/height",
+                    model.model_id, contract.family
+                ));
+            }
+            for path in ["n", "steps", "cfg_scale", "response_format"] {
+                if !contract
+                    .request_attributes
+                    .iter()
+                    .any(|declared| declared == path)
+                {
+                    errors.push(format!(
+                        "{} endpoint family {} must declare {}",
+                        model.model_id, contract.family, path
+                    ));
+                } else if !has_default(path) && !is_required(path) {
+                    errors.push(format!(
+                        "{} endpoint family {} requires a signed default for {}",
+                        model.model_id, contract.family, path
+                    ));
+                }
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
+            for path in [
+                "parameters.width",
+                "parameters.height",
+                "parameters.num_inference_steps",
+                "parameters.guidance_scale",
+            ] {
+                if !contract
+                    .request_attributes
+                    .iter()
+                    .any(|declared| declared == path)
+                {
+                    errors.push(format!(
+                        "{} endpoint family {} must declare {}",
+                        model.model_id, contract.family, path
+                    ));
+                } else if !has_default(path) && !is_required(path) {
+                    errors.push(format!(
+                        "{} endpoint family {} requires a signed default for {}",
+                        model.model_id, contract.family, path
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2351,6 +2543,14 @@ fn validate_endpoint_attribute_spec(
     {
         errors.push(format!("{label} has invalid numeric bounds"));
     }
+    if spec
+        .multiple_of
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        errors.push(format!(
+            "{label} multiple_of must be finite and greater than zero"
+        ));
+    }
     if matches!((spec.min_length, spec.max_length), (Some(minimum), Some(maximum)) if minimum > maximum)
     {
         errors.push(format!("{label} has invalid string-length bounds"));
@@ -2371,6 +2571,21 @@ fn validate_endpoint_attribute_spec(
     } else if let (Some(standard_maximum), Some(maximum)) = (standard.maximum, spec.maximum) {
         if maximum > standard_maximum {
             errors.push(format!("{label} widens the task-standard maximum"));
+        }
+    }
+    if let Some(standard_multiple) = standard.multiple_of {
+        match spec.multiple_of {
+            None => errors.push(format!("{label} omits the task-standard multiple_of")),
+            Some(multiple) if multiple.is_finite() && multiple > 0.0 => {
+                let quotient = multiple / standard_multiple;
+                let tolerance = f64::EPSILON * quotient.abs().max(1.0) * 8.0;
+                if (quotient - quotient.round()).abs() > tolerance {
+                    errors.push(format!(
+                        "{label} widens the task-standard multiple_of constraint"
+                    ));
+                }
+            }
+            Some(_) => {}
         }
     }
     if standard.min_length.is_some() && spec.min_length.is_none() {
@@ -2721,6 +2936,32 @@ fn validate_artifact(
                 ));
             }
         }
+    }
+    match (&artifact.stable_diffusion_cpp, artifact.engine.as_str()) {
+        (Some(config), "stable-diffusion.cpp") => {
+            if let Err(error) = config.validate() {
+                errors.push(format!(
+                    "{model_id}/{name} has invalid stable_diffusion_cpp config: {error}"
+                ));
+            }
+            if config.separate_diffusion_model {
+                for required in ["text_encoder", "vae"] {
+                    if !artifact.sidecars.contains_key(required) {
+                        errors.push(format!(
+                            "{model_id}/{name} split stable-diffusion.cpp artifact needs sidecar {required}"
+                        ));
+                    }
+                }
+            }
+        }
+        (None, "stable-diffusion.cpp") => errors.push(format!(
+            "{model_id}/{name} stable-diffusion.cpp artifact must declare stable_diffusion_cpp semantics"
+        )),
+        (Some(_), _) => errors.push(format!(
+            "{model_id}/{name} declares stable_diffusion_cpp config for engine {}",
+            artifact.engine
+        )),
+        (None, _) => {}
     }
     for (sidecar_name, sidecar) in &artifact.sidecars {
         validate_artifact_sidecar(model_id, name, tier, sidecar_name, sidecar, errors);
@@ -3419,6 +3660,27 @@ mod tests {
     }
 
     #[test]
+    fn signature_verification_rejects_low_order_forgery() {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        let bytes = br#"{"schema_version":1}"#;
+        let signature = CatalogSignature {
+            schema_version: 1,
+            alg: "ed25519".to_owned(),
+            signed_path: "catalog/models.json".to_owned(),
+            key_id: "test".to_owned(),
+            public_key: hex_string(&weak_key),
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            sig: hex_string(&weak_signature),
+        };
+
+        verify_signature_bytes(bytes, &signature)
+            .expect_err("low-order catalog signature forgery must fail strict verification");
+    }
+
+    #[test]
     fn hex_parser_rejects_bad_input() {
         assert_eq!(hex_to_vec("00ff").unwrap(), vec![0, 255]);
         assert!(hex_to_vec("0").is_err());
@@ -3709,6 +3971,7 @@ mod tests {
         };
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
+            stable_diffusion_cpp: None,
             source: SourceRef {
                 kind: "huggingface".to_owned(),
                 repo: "admin/model".to_owned(),
@@ -4199,6 +4462,48 @@ mod tests {
         validate_model(&model, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
 
+        let mut offset_model = model.clone();
+        offset_model
+            .artifacts
+            .get_mut("fixture")
+            .unwrap()
+            .stable_diffusion_cpp = Some(mayhem_engine::StableDiffusionCppConfig {
+            separate_diffusion_model: false,
+            guidance_scale_offset: 1,
+            steps_offset: -1,
+        });
+        let mut errors = Vec::new();
+        validate_model(&offset_model, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("steps range 1..=150 with backend offset -1") }));
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("cfg_scale range 0..=50 with backend offset 1") }));
+        for contract in &mut offset_model.adapter.endpoint_families {
+            let (steps, guidance) = match contract.family.as_str() {
+                mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => ("steps", "cfg_scale"),
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => (
+                    "parameters.num_inference_steps",
+                    "parameters.guidance_scale",
+                ),
+                _ => continue,
+            };
+            contract
+                .request_attribute_specs
+                .get_mut(steps)
+                .unwrap()
+                .minimum = Some(2.0);
+            contract
+                .request_attribute_specs
+                .get_mut(guidance)
+                .unwrap()
+                .maximum = Some(49.0);
+        }
+        let mut errors = Vec::new();
+        validate_model(&offset_model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
         let mut missing_step_price = model.clone();
         missing_step_price
             .price_ref_au
@@ -4430,10 +4735,45 @@ mod tests {
             _ => "text",
         };
         let modality_set = vec![output_modality.to_owned()];
-        let endpoint_families = required_endpoint_family_names(model_class, &modality_set)
+        let mut endpoint_families = required_endpoint_family_names(model_class, &modality_set)
             .into_iter()
             .map(|family| endpoint_contract_template(family).unwrap())
-            .collect();
+            .collect::<Vec<_>>();
+        for contract in &mut endpoint_families {
+            match contract.family.as_str() {
+                mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+                    for (path, value) in [
+                        ("n", serde_json::json!(1)),
+                        ("width", serde_json::json!(1024)),
+                        ("height", serde_json::json!(1024)),
+                        ("steps", serde_json::json!(9)),
+                        ("cfg_scale", serde_json::json!(0.0)),
+                        ("response_format", serde_json::json!("b64_json")),
+                    ] {
+                        contract
+                            .request_attribute_specs
+                            .get_mut(path)
+                            .unwrap()
+                            .default = Some(value);
+                    }
+                }
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
+                    for (path, value) in [
+                        ("parameters.width", serde_json::json!(1024)),
+                        ("parameters.height", serde_json::json!(1024)),
+                        ("parameters.num_inference_steps", serde_json::json!(9)),
+                        ("parameters.guidance_scale", serde_json::json!(0.0)),
+                    ] {
+                        contract
+                            .request_attribute_specs
+                            .get_mut(path)
+                            .unwrap()
+                            .default = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
         CatalogModel {
             model_id: model_id.to_owned(),
             model_class: model_class.to_owned(),
@@ -4461,6 +4801,8 @@ mod tests {
                 "fixture".to_owned(),
                 CatalogArtifact {
                     engine: engine.to_owned(),
+                    stable_diffusion_cpp: (engine == "stable-diffusion.cpp")
+                        .then_some(mayhem_engine::StableDiffusionCppConfig::default()),
                     source: SourceRef {
                         kind: "huggingface".to_owned(),
                         repo: "admin/model".to_owned(),

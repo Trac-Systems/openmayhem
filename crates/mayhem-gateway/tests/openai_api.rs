@@ -27,11 +27,12 @@ use mayhem_gateway::{
     ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
-    catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, EndpointAttributeSpec,
-    EndpointSpecialityMapping, EndpointSpecialityTarget, EndpointValueType,
-    ModelSpecialityDescriptor, ModelSpecialityLevel, ReceiptBody, ReceiptUsage, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    catalog_enclave_id, endpoint_request_fingerprint, receipt_signing_bytes,
+    CatalogEnclaveIdentity, EndpointAttributeSpec, EndpointSpecialityMapping,
+    EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor, ModelSpecialityLevel,
+    ReceiptBody, ReceiptUsage, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use std::{
@@ -862,7 +863,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a mayhem_gateway::openai::GatewayHedgeProbeInvocation,
     ) -> mayhem_gateway::openai::GatewayHedgeProbeFuture<'a> {
         Box::pin(async move {
             let provider = invocation
@@ -1771,6 +1772,93 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
 }
 
 #[tokio::test]
+async fn image_job_reconnect_retrieves_once_without_rebilling_or_idempotency_conflicts() {
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
+        .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "recover this image",
+        "n": 1,
+        "size": "64x64",
+        "steps": 3,
+        "response_format": "b64_json"
+    });
+    let (status, headers, _) = raw_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/v1/images/generations",
+        Some(request.clone()),
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let job_id = headers["x-mayhem-job-id"]
+        .to_str()
+        .expect("job id header")
+        .to_owned();
+    assert_eq!(state.receipts().len(), 1);
+
+    let job_uri = format!("/v1/jobs/{job_id}");
+    let (job_status, job) = json_request(app.clone(), Method::GET, &job_uri, json!({})).await;
+    assert_eq!(job_status, StatusCode::OK, "{job}");
+    assert_eq!(job["status"], "completed");
+    assert_eq!(job["endpoint_family"], "openai_image_generations");
+    let artifact_uri = job["artifacts"][0]["content_url"]
+        .as_str()
+        .expect("artifact content URL")
+        .to_owned();
+
+    let result_uri = format!("{job_uri}/result");
+    let (result_status, result) =
+        json_request(app.clone(), Method::GET, &result_uri, json!({})).await;
+    assert_eq!(result_status, StatusCode::OK, "{result}");
+    assert_eq!(result["result"]["kind"], "image");
+    assert_eq!(result["result"]["usage"][USAGE_IMAGE], 1);
+
+    let (artifact_status, artifact_headers, artifact) =
+        raw_request(app.clone(), Method::GET, &artifact_uri, None).await;
+    assert_eq!(artifact_status, StatusCode::OK);
+    assert_eq!(artifact_headers["content-type"], "image/png");
+    assert_eq!(artifact, b"\x89PNG mayhem image");
+    assert_eq!(state.receipts().len(), 1, "retrieval must never bill");
+
+    let (replay_status, replay) = json_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/v1/images/generations",
+        request,
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["id"], job_id);
+    assert_eq!(replay["status"], "completed");
+    assert_eq!(state.receipts().len(), 1, "idempotent replay must not bill");
+
+    let (conflict_status, conflict) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/images/generations",
+        json!({
+            "model": "admin/image-fixture",
+            "prompt": "a different request",
+            "n": 1,
+            "size": "64x64",
+            "steps": 3,
+            "response_format": "b64_json"
+        }),
+        &[("idempotency-key", "image-reconnect-1")],
+    )
+    .await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict}");
+    assert!(conflict["error"]["message"]
+        .as_str()
+        .expect("conflict message")
+        .contains("different request"));
+}
+
+#[tokio::test]
 async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
     let expected_image = png_average_hash_fixture(false);
     let substituted_image = png_average_hash_fixture(true);
@@ -1798,7 +1886,12 @@ async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["mayhem"]["backend"], "test-image-canary-session");
-    assert_eq!(state.receipts().len(), 2);
+    assert_eq!(
+        state.receipts().len(),
+        2,
+        "automatic image probe state: {:?}",
+        state.probes()
+    );
     let seen_requests = requests.lock().expect("image request lock").clone();
     assert_eq!(seen_requests.len(), 2);
     assert_eq!(seen_requests[0].prompt, "a user image");
@@ -2126,7 +2219,12 @@ async fn automatic_audio_fingerprint_probe_records_pass() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(bytes.starts_with(b"RIFF"));
-    assert_eq!(state.receipts().len(), 2);
+    assert_eq!(
+        state.receipts().len(),
+        2,
+        "automatic audio probe state: {:?}",
+        state.probes()
+    );
     let probes = state.probes();
     assert_eq!(probes.len(), 1);
     let probe = &probes[0];
@@ -2821,7 +2919,7 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
     assert_eq!(body["mayhem"]["backend"], "test-hedge-inspect");
     assert_eq!(body["mayhem"]["hedge"]["requested"], true);
     assert_eq!(body["mayhem"]["hedge"]["planned_probe_count"], 2);
@@ -3267,10 +3365,21 @@ fn routed_image_generation_test_model() -> GatewayModel {
         output_modalities: vec!["image".to_owned()],
     };
     model.mayhem.adapter.modality_set = vec!["image".to_owned()];
-    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+    let mut endpoint = mayhem_proto::endpoint_family_contract_template(
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
     )
-    .unwrap()];
+    .unwrap();
+    endpoint
+        .request_attribute_specs
+        .get_mut("cfg_scale")
+        .expect("image template has cfg_scale")
+        .default = Some(json!(1.0));
+    endpoint
+        .request_attribute_specs
+        .get_mut("n")
+        .expect("image template has n")
+        .default = Some(json!(1));
+    model.mayhem.adapter.endpoint_families = vec![endpoint];
     for candidate in &mut model.mayhem.route_candidates {
         candidate.served_modalities = vec!["image".to_owned()];
         candidate.price_ver = 4;
@@ -3539,6 +3648,10 @@ fn signed_image_provider_receipt(
     let body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: invocation.session_id.clone(),
+        billing_id: invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: invocation.spend_voucher.body.billing_attempt,
+        billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),
@@ -3617,6 +3730,10 @@ fn signed_provider_receipt_for_test(
     let body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: invocation.session_id.clone(),
+        billing_id: invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: invocation.spend_voucher.body.billing_attempt,
+        billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),
@@ -3668,6 +3785,13 @@ fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
 }
 
 fn image_resolution_scale_for_test(request: &ImageGenerationRequest) -> u64 {
+    if let Some((width, height)) = request.width.zip(request.height) {
+        return u64::from(width)
+            .saturating_mul(u64::from(height))
+            .max(1)
+            .div_ceil(512 * 512)
+            .max(1);
+    }
     let size = request.size.as_deref().unwrap_or("512x512");
     let Some((width, height)) = size.split_once('x') else {
         return 1;
@@ -3709,6 +3833,9 @@ fn image_cfg_scale_for_test(request: &ImageGenerationRequest) -> f32 {
 }
 
 fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
+    if let Some(dimensions) = request.width.zip(request.height) {
+        return dimensions;
+    }
     let size = request.size.as_deref().unwrap_or("512x512");
     let Some((width, height)) = size.split_once('x') else {
         return (512, 512);
@@ -3720,23 +3847,67 @@ fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
 }
 
 fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
-    stable_value_hash_for_test(&json!({
+    if let Some(endpoint_request) = &request.endpoint_request {
+        return endpoint_request_fingerprint(endpoint_request);
+    }
+    let mut body = json!({
         "kind": "image_generation",
         "model": &request.model,
         "prompt": &request.prompt,
-        "n": request.n.unwrap_or(1).clamp(1, 4),
-        "size": request.size.as_deref().unwrap_or("512x512"),
-        "steps": image_steps_for_test(request),
-        "cfg_scale": image_cfg_scale_for_test(request),
-        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "n": request.n.expect("normalized image count"),
+        "steps": request.steps.expect("normalized image steps"),
+        "cfg_scale": request.cfg_scale.expect("normalized image guidance"),
+        "response_format": request.response_format.as_deref().expect("normalized image response format"),
         "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS),
-        "seed": request.seed,
-        "quality": request.quality,
-        "style": request.style,
-        "negative_prompt": request.negative_prompt,
-        "scheduler": request.scheduler,
-        "user": request.user,
-    }))
+    });
+    let optional = [
+        (
+            "background",
+            request.background.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "moderation",
+            request.moderation.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "output_compression",
+            request.output_compression.map(|value| json!(value)),
+        ),
+        (
+            "output_format",
+            request.output_format.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "partial_images",
+            request.partial_images.map(|value| json!(value)),
+        ),
+        ("size", request.size.as_ref().map(|value| json!(value))),
+        ("width", request.width.map(|value| json!(value))),
+        ("height", request.height.map(|value| json!(value))),
+        ("seed", request.seed.map(|value| json!(value))),
+        (
+            "quality",
+            request.quality.as_ref().map(|value| json!(value)),
+        ),
+        ("style", request.style.as_ref().map(|value| json!(value))),
+        (
+            "negative_prompt",
+            request.negative_prompt.as_ref().map(|value| json!(value)),
+        ),
+        ("shift", request.shift.map(|value| json!(value))),
+        (
+            "scheduler",
+            request.scheduler.as_ref().map(|value| json!(value)),
+        ),
+        ("stream", request.stream.map(|value| json!(value))),
+        ("user", request.user.as_ref().map(|value| json!(value))),
+    ];
+    for (name, value) in optional {
+        if let Some(value) = value {
+            body[name] = value;
+        }
+    }
+    endpoint_contract_hash_for_test(body)
 }
 
 fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
@@ -3753,42 +3924,48 @@ fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
 }
 
 fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
-    stable_value_hash_for_test(&json!({
+    if let Some(endpoint_request) = &request.endpoint_request {
+        return endpoint_request_fingerprint(endpoint_request);
+    }
+    let mut body = json!({
         "kind": "audio_speech",
         "model": &request.model,
         "input": &request.input,
         "response_format": request.response_format.as_deref().unwrap_or("wav"),
         "endpoint_family": request.endpoint_family.as_deref().unwrap_or(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH),
-        "voice": request.voice.as_deref(),
-        "speed": request.speed,
-        "instructions": request.instructions,
-        "stream_format": request.stream_format,
-    }))
+    });
+    for (name, value) in [
+        ("voice", request.voice.as_ref().map(|value| json!(value))),
+        ("speed", request.speed.map(|value| json!(value))),
+        (
+            "instructions",
+            request.instructions.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "stream_format",
+            request.stream_format.as_ref().map(|value| json!(value)),
+        ),
+    ] {
+        if let Some(value) = value {
+            body[name] = value;
+        }
+    }
+    endpoint_contract_hash_for_test(body)
+}
+
+fn endpoint_contract_hash_for_test(mut transport_body: Value) -> String {
+    if let Some(body) = transport_body.as_object_mut() {
+        body.remove("kind");
+        body.remove("endpoint_family");
+        body.remove("mayhem_contract");
+        body.remove("contract_request");
+        body.remove("specialities");
+    }
+    endpoint_request_fingerprint(&transport_body)
 }
 
 fn audio_transcription_prompt_hash_for_test(request: &AudioTranscriptionRequest) -> String {
-    stable_value_hash_for_test(&json!({
-        "kind": "audio_transcription",
-        "model": &request.model,
-        "audio": {
-            "encoding": "hex",
-            "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
-            "filename": request.filename.as_deref().unwrap_or("audio.wav"),
-            "data": hex::encode(&request.audio),
-        },
-        "audio_seconds": wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
-        "response_format": request.response_format.as_deref().unwrap_or("json"),
-        "endpoint_family": &request.endpoint_family,
-        "language": request.language.as_deref(),
-        "prompt": request.prompt.as_deref(),
-        "temperature": request.temperature,
-        "timestamp_granularities": if request.timestamp_granularities.is_empty() {
-            Value::Null
-        } else {
-            json!(&request.timestamp_granularities)
-        },
-        "stream": request.stream,
-    }))
+    endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
@@ -3821,31 +3998,6 @@ fn wav_duration_seconds_ceil_for_test(bytes: &[u8]) -> Option<u64> {
     let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as u64;
     let byte_rate = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
     Some(data_len.div_ceil(byte_rate).max(1))
-}
-
-fn stable_value_hash_for_test(value: &Value) -> String {
-    blake3::hash(stable_json_value_for_test(value).to_string().as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-fn stable_json_value_for_test(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(stable_json_value_for_test).collect()),
-        Value::Object(map) => {
-            let mut stable = serde_json::Map::new();
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (key, value) in entries {
-                if value.is_null() {
-                    continue;
-                }
-                stable.insert(key.clone(), stable_json_value_for_test(value));
-            }
-            Value::Object(stable)
-        }
-        other => other.clone(),
-    }
 }
 
 fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
@@ -3890,6 +4042,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::from([(
@@ -3950,6 +4103,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     size: Some("64x64".to_owned()),
                     steps: Some(1),
                     cfg_scale: Some(1.0),
+                    shift: None,
                     seed: Some(7),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -4007,6 +4161,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -4064,6 +4219,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
@@ -4121,6 +4277,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     size: None,
                     steps: None,
                     cfg_scale: None,
+                    shift: None,
                     seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),

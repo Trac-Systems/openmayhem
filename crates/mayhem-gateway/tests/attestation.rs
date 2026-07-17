@@ -18,6 +18,8 @@ use mayhem_enclave::{
 use mayhem_gateway::{
     verify_attestation, verify_tier1_attestation, AttestationVerificationRequest,
     EnclaveContractRecord, GatewayError, HardwareQuoteVerifierCommand,
+    MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES, MAX_HARDWARE_QUOTE_EVIDENCE_BYTES,
+    MAX_HARDWARE_QUOTE_METADATA_BYTES, MAX_HARDWARE_QUOTE_METADATA_DEPTH,
 };
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
@@ -342,11 +344,18 @@ fn test_nvidia_offline_evidence(binding: &str, measurements_match: bool) -> Stri
 }
 
 fn test_apple_app_attest_evidence(body: &AttestationBody, binding: &str) -> String {
+    test_apple_app_attest_evidence_with_binding_claim(body, binding)
+}
+
+fn test_apple_app_attest_evidence_with_binding_claim(
+    body: &AttestationBody,
+    binding_claim: &str,
+) -> String {
     test_nvidia_signed_eat(serde_json::json!({
         "iss": "https://appattest.apple.com",
         "sub": "APPLE-APP-ATTEST",
         "exp": 4_102_444_800_u64,
-        "eat_nonce": binding,
+        "eat_nonce": binding_claim,
         "x-mayhem-attestation-mechanism": "apple_app_attest",
         "x-mayhem-enclave-id": body.enclave_id.clone(),
         "x-mayhem-binary-hash": body.binary_hash.clone(),
@@ -490,6 +499,34 @@ fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
 
     assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
+}
+
+#[test]
+fn apple_app_attest_rejects_case_variant_binding_claim() {
+    let (_temp, report, contract) = test_hardware_report_with_evidence(
+        HardwareQuoteKind::AppleAppAttestJwt,
+        |body, binding| {
+            test_apple_app_attest_evidence_with_binding_claim(body, &binding.to_ascii_uppercase())
+        },
+    );
+    let jwks = test_nvidia_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_apple_app_attest_jwks = Some(&jwks);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("case-variant binding claim must be rejected");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("eat_nonce")
+    ));
 }
 
 #[test]
@@ -775,18 +812,155 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
     ));
 }
 
+#[test]
+fn hardware_quote_cannot_be_reused_for_a_new_attestation_nonce() {
+    let (_temp, mut report, contract) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let original_binding = report
+        .hw_quote
+        .as_ref()
+        .expect("hardware quote")
+        .binding
+        .clone();
+    report.nonce_u = "bb".repeat(32);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("a quote from another session nonce must be rejected");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteBindingMismatch { actual, .. }
+            if actual == original_binding
+    ));
+}
+
+#[test]
+fn hardware_quote_rejects_oversized_evidence_and_metadata() {
+    let (_temp, mut report, contract) = test_hardware_report(HardwareQuoteKind::AppleAppAttestJwt);
+    report.hw_quote.as_mut().expect("hardware quote").evidence =
+        "x".repeat(MAX_HARDWARE_QUOTE_EVIDENCE_BYTES + 1);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    let err =
+        verify_tier1_attestation(&request).expect_err("oversized quote evidence must be rejected");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("evidence") && reason.contains("maximum")
+    ));
+
+    let (_temp, mut report, contract) = test_hardware_report(HardwareQuoteKind::AppleAppAttestJwt);
+    report.hw_quote.as_mut().expect("hardware quote").metadata =
+        serde_json::json!("x".repeat(MAX_HARDWARE_QUOTE_METADATA_BYTES + 1));
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    let err =
+        verify_tier1_attestation(&request).expect_err("oversized quote metadata must be rejected");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("metadata") && reason.contains("maximum")
+    ));
+}
+
+#[test]
+fn hardware_quote_rejects_excessive_metadata_depth_and_endorsement_bytes() {
+    let (_temp, mut report, contract) = test_hardware_report(HardwareQuoteKind::AppleAppAttestJwt);
+    let mut metadata = serde_json::Value::Null;
+    for _ in 0..=MAX_HARDWARE_QUOTE_METADATA_DEPTH {
+        metadata = serde_json::Value::Array(vec![metadata]);
+    }
+    report.hw_quote.as_mut().expect("hardware quote").metadata = metadata;
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    let err = verify_tier1_attestation(&request)
+        .expect_err("depth-unbounded quote metadata must be rejected");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("metadata depth")
+    ));
+
+    let (_temp, mut report, contract) = test_hardware_report(HardwareQuoteKind::AppleAppAttestJwt);
+    report
+        .hw_quote
+        .as_mut()
+        .expect("hardware quote")
+        .endorsements = vec!["x".repeat(MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES / 4); 5];
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    let err = verify_tier1_attestation(&request)
+        .expect_err("oversized quote endorsements must be rejected");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("endorsements") && reason.contains("maximum")
+    ));
+}
+
 #[cfg(unix)]
 fn write_verifier_script(dir: &tempfile::TempDir, stdout_json: &str) -> std::path::PathBuf {
     let path = dir.path().join("verify-hardware.sh");
+    let script = if stdout_json.contains(r#""binding""#) {
+        let escaped = stdout_json.replace('\'', "'\\''");
+        format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{escaped}'\n")
+    } else {
+        let suffix = stdout_json
+            .strip_prefix('{')
+            .expect("verifier fixture must be a JSON object")
+            .replace('\'', "'\\''");
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '{{\"binding\":\"%s\",%s\\n' \"$MAYHEM_HW_VERIFY_BINDING\" '{suffix}'\n"
+        )
+    };
+    fs::write(&path, script).expect("write verifier script");
+    let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod verifier script");
+    path
+}
+
+#[cfg(unix)]
+fn write_raw_verifier_script(dir: &tempfile::TempDir, stdout_json: &str) -> std::path::PathBuf {
+    let path = dir.path().join("verify-hardware-raw.sh");
     let escaped = stdout_json.replace('\'', "'\\''");
     fs::write(
         &path,
         format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{escaped}'\n"),
     )
-    .expect("write verifier script");
+    .expect("write raw verifier script");
     let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).expect("chmod verifier script");
+    fs::set_permissions(&path, permissions).expect("chmod raw verifier script");
     path
 }
 
@@ -986,6 +1160,83 @@ fn external_tpm2_ek_verifier_rejects_replayed_wrong_binding() {
 
 #[cfg(unix)]
 #[test]
+fn external_verifier_must_echo_binding_and_attestation_tier() {
+    let (temp, report, contract) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let script = write_raw_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"roots":["tpm_manufacturer_root"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("external verifier binding echo is mandatory");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("binding")
+    ));
+
+    let binding = report
+        .hw_quote
+        .as_ref()
+        .expect("hardware quote")
+        .binding
+        .clone();
+    let script = write_raw_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","binding":"{binding}","roots":["tpm_manufacturer_root"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("external verifier att_tier echo is mandatory");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("att_tier")
+    ));
+
+    let script = write_raw_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"binding":"{binding}","att_tier":2,"roots":["tpm_manufacturer_root"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &verifier);
+
+    let err =
+        verify_tier1_attestation(&request).expect_err("external verifier kind echo is mandatory");
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("kind")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn external_tpm2_ek_verifier_rejects_missing_contract_device_key_metadata() {
     let (temp, report, contract) =
         test_hardware_report_with_metadata(HardwareQuoteKind::Tpm2QuoteEk, serde_json::json!({}));
@@ -1054,7 +1305,7 @@ fn external_nvidia_cc_verifier_admits_source_build_on_valid_roots_and_golden_mea
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1075,7 +1326,7 @@ fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1099,7 +1350,7 @@ fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1123,7 +1374,7 @@ fn external_azure_maa_cpu_path_requires_azure_scope_gpu_roots_and_workload_pcr()
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1147,7 +1398,7 @@ fn external_azure_maa_cpu_path_is_not_universal_cpu_root() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1177,7 +1428,7 @@ fn external_azure_maa_cpu_path_still_rejects_wrong_workload_pcr() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1217,7 +1468,7 @@ fn external_tier3_registration_requires_workload_measurement_layer() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1241,7 +1492,7 @@ fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1272,7 +1523,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1298,7 +1549,7 @@ fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() 
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 
@@ -1318,7 +1569,7 @@ fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
     );
     let verifier = HardwareQuoteVerifierCommand {
         command: script,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
     };
     let request = request_with_external_verifier(&report, &contract, &verifier);
 

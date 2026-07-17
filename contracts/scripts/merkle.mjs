@@ -19,33 +19,33 @@ function hashPair(a, b) {
   return ethers.keccak256(ethers.concat([x, y]));
 }
 
-/** Build the layered tree (odd tail carried up - no duplication). */
+/** Build OpenZeppelin's sorted complete-tree heap layout. */
 export function buildTree(leaves) {
   if (!leaves.length) throw new Error('merkle: no leaves');
-  const layers = [leaves.slice()];
-  while (layers[layers.length - 1].length > 1) {
-    const prev = layers[layers.length - 1];
-    const next = [];
-    for (let i = 0; i < prev.length; i += 2) {
-      next.push(i + 1 < prev.length ? hashPair(prev[i], prev[i + 1]) : prev[i]);
-    }
-    layers.push(next);
+  const sorted = leaves.slice().sort((left, right) => (
+    left.toLowerCase().localeCompare(right.toLowerCase())
+  ));
+  const tree = new Array(2 * sorted.length - 1);
+  for (const [index, leaf] of sorted.entries()) {
+    tree[tree.length - 1 - index] = leaf;
   }
-  return layers;
+  for (let index = tree.length - 1 - sorted.length; index >= 0; index -= 1) {
+    tree[index] = hashPair(tree[2 * index + 1], tree[2 * index + 2]);
+  }
+  return tree;
 }
 
-export function rootOf(layers) { return layers[layers.length - 1][0]; }
+export function rootOf(tree) { return tree[0]; }
 
-export function proofOf(layers, index) {
-  const p = [];
+export function proofOf(tree, index) {
+  const proof = [];
   let idx = index;
-  for (let l = 0; l < layers.length - 1; l++) {
-    const layer = layers[l];
-    const sib = idx ^ 1;
-    if (sib < layer.length) p.push(layer[sib]);
-    idx >>= 1;
+  while (idx > 0) {
+    const sibling = idx - (-1) ** (idx % 2);
+    proof.push(tree[sibling]);
+    idx = Math.floor((idx - 1) / 2);
   }
-  return p;
+  return proof;
 }
 
 /**
@@ -53,12 +53,32 @@ export function proofOf(layers, index) {
  * @returns {{root:string, proofFor:(acct:string)=>string[], leafFor:(acct:string)=>string}}
  */
 export function distribution(entries) {
-  const leaves = entries.map((e) => leafHash(e.account, e.amount));
-  const layers = buildTree(leaves);
-  const idx = new Map(entries.map((e, i) => [e.account.toLowerCase(), i]));
+  const indexedLeaves = entries.map((entry) => ({
+    account: entry.account.toLowerCase(),
+    leaf: leafHash(entry.account, entry.amount),
+  }));
+  if (new Set(indexedLeaves.map((entry) => entry.account)).size !== entries.length) {
+    throw new Error('merkle: duplicate account');
+  }
+  const tree = buildTree(indexedLeaves.map((entry) => entry.leaf));
+  const sortedLeaves = indexedLeaves.slice().sort((left, right) => (
+    left.leaf.toLowerCase().localeCompare(right.leaf.toLowerCase())
+  ));
+  const treeIndex = new Map(sortedLeaves.map((entry, index) => (
+    [entry.account, tree.length - index - 1]
+  )));
+  const leafByAccount = new Map(indexedLeaves.map((entry) => [entry.account, entry.leaf]));
   return {
-    root: rootOf(layers),
-    proofFor: (account) => proofOf(layers, idx.get(account.toLowerCase())),
-    leafFor: (account) => leaves[idx.get(account.toLowerCase())],
+    root: rootOf(tree),
+    proofFor: (account) => {
+      const index = treeIndex.get(account.toLowerCase());
+      if (index === undefined) throw new Error('merkle: account not found');
+      return proofOf(tree, index);
+    },
+    leafFor: (account) => {
+      const leaf = leafByAccount.get(account.toLowerCase());
+      if (leaf === undefined) throw new Error('merkle: account not found');
+      return leaf;
+    },
   };
 }

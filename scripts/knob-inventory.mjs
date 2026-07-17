@@ -261,6 +261,8 @@ const contractParamDescriptions = new Map([
   ['fraud_slash_bps', 'Slash percentage for canary mismatch and fraud-proof provider penalties.'],
   ['dispute_lost_slash_bps', 'Slash percentage for provider-fault dispute losses.'],
   ['dispute_timeout_epochs', 'Epochs after which an unresolved dispute bond can be permissionlessly refunded.'],
+  ['max_open_disputes_per_opener', 'Maximum unresolved disputes one opener may hold at once.'],
+  ['dispute_opener_fault_forfeit_bps', 'Share of the opener bond forfeited when a dispute resolves against the opener.'],
   ['new_provider_holdback_epochs', 'Long graduated holdback for providers that have not cleared probation.'],
   ['rate_staleness_seconds', 'Maximum accepted TNK/TAP oracle price age.'],
   ['price_min_bps', 'Admin seed price lower bound versus model reference.'],

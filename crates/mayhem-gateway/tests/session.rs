@@ -187,6 +187,7 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
                     "rid": request_id,
                     "i": idx,
                     "d": chunk,
+                    "reasoning_evidence_delta": "",
                     "tools": null,
                     "fin": null
                 }),
@@ -204,6 +205,7 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
                 "rid": request_id,
                 "i": 3,
                 "d": "",
+                "reasoning_evidence_delta": "",
                 "tools": null,
                 "fin": null,
                 "artifact": {
@@ -229,6 +231,7 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
                 "rid": request_id,
                 "i": 4,
                 "d": "",
+                "reasoning_evidence_delta": "",
                 "tools": null,
                 "fin": "stop",
                 "usage": { "in": 3, "out": 3 },

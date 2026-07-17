@@ -171,6 +171,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
         set_id: 'provider-canary',
         url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/provider-canary.json',
         hash: 'b'.repeat(64),
+        prompt_ids: ['provider-prompt'],
       }],
     },
   ],
@@ -273,8 +274,16 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
   {
     op: 'tnk_deposit',
     memo_hash: 'memo-security',
-    tnk_e18: '1000000000000000000',
-    msb_tx_hash: 'msb-security',
+    msb_transfer: {
+      schema_version: 1,
+      network: 'testnet1',
+      tx_hash: '1'.repeat(64),
+      confirmed_length: 10,
+      observed_signed_length: 12,
+      from: 'testtrac1sender',
+      to: 'testtrac1treasury',
+      amount_e18: '1000000000000000000',
+    },
     epoch: 1,
     at: 3_600,
   },
@@ -285,8 +294,14 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
     eth_tx_hash: `0x${'e'.repeat(64)}`,
     log_index: 0,
     block_number: 123,
+    block_hash: `0x${'f'.repeat(64)}`,
     pool_address: '0x2222222222222222222222222222222222222222',
     chain_id: 61_000,
+    finalized_block_number: 135,
+    confirmation_depth: 12,
+    confirmation_policy: 'finalized-tag',
+    event_signature: '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c',
+    watcher_id: 'tap-deposit-watcher-v1',
     epoch: 1,
     at: 3_600,
   },
@@ -313,7 +328,7 @@ const buildAdminOnlyRateFeatureAttempts = () => [
   {
     op: 'tap_rate_oracle',
     tap_usd_au: '2000000000000000000',
-    source: 'uniswap-v2',
+    source: 'uniswap-v2-twap-median',
     ts: 3_600,
   },
 ];
@@ -423,6 +438,8 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
     {
       op: 'join_enclave',
       enclave_id: enclaveId,
+      att_tier: 1,
+      attestation_head: 'd'.repeat(64),
       served_ctx: 32768,
       served_modalities: ['text'],
       served_specialities: {},
@@ -454,7 +471,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
 
   const providerRecord = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerRecord.value.status, 'active');
-  assert.equal(providerRecord.value.payout, null);
+  assert.deepEqual(providerRecord.value.payouts, {});
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by, admin.publicKey);
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by_role, 'admin');
   assert.equal((await storage.get(`room/${roomId}`)).value.creator, admin.publicKey);

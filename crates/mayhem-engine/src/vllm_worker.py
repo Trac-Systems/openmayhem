@@ -6,7 +6,9 @@ import io
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import wave
 
 
@@ -23,6 +25,60 @@ batch_invariant = False
 kernel_policy = "auto"
 event_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(event_loop)
+request_queue = queue.Queue()
+cancelled_requests = set()
+cancelled_requests_lock = threading.Lock()
+completed_request_id = 0
+
+
+class RequestCancelled(Exception):
+    pass
+
+
+def mark_cancelled(request_id):
+    with cancelled_requests_lock:
+        request_id = int(request_id)
+        if request_id <= completed_request_id:
+            return False
+        cancelled_requests.add(request_id)
+        return True
+
+
+def finish_request(request_id):
+    global completed_request_id
+    with cancelled_requests_lock:
+        completed_request_id = max(completed_request_id, int(request_id))
+        cancelled_requests.difference_update(
+            request_id
+            for request_id in cancelled_requests
+            if request_id <= completed_request_id
+        )
+
+
+def request_cancelled(request_id):
+    with cancelled_requests_lock:
+        return int(request_id) in cancelled_requests
+
+
+def check_cancelled(request_id):
+    if request_cancelled(request_id):
+        raise RequestCancelled("engine request cancelled")
+
+
+async def abort_engine_request(request_id):
+    if engine is None:
+        return
+    abort = getattr(engine, "abort", None)
+    if abort is None:
+        return
+    result = abort(f"mayhem-{int(request_id)}")
+    if inspect.isawaitable(result):
+        await result
+
+
+def schedule_abort(request_id):
+    if mark_cancelled(request_id) and event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(abort_engine_request(request_id), event_loop)
 
 
 def send(message):
@@ -680,6 +736,7 @@ def multimodal_engine_prompt(payload, mm_data, template_kwargs, prompt_suffixes)
 
 
 async def async_handle_generate(request_id, payload):
+    check_cancelled(request_id)
     if engine is None:
         raise RuntimeError("model has not been loaded")
 
@@ -719,6 +776,9 @@ async def async_handle_generate(request_id, payload):
     async for output in engine.generate(
         request_id=f"mayhem-{request_id}", prompt=engine_prompt, sampling_params=sampling_params
     ):
+        if request_cancelled(request_id):
+            await abort_engine_request(request_id)
+            raise RequestCancelled("engine request cancelled")
         output_prompt_ids = getattr(output, "prompt_token_ids", None)
         if output_prompt_ids is not None:
             actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
@@ -753,6 +813,8 @@ async def async_handle_generate(request_id, payload):
                 finish_reason = "stop" if str(reason) == "stop" else "length"
         if getattr(output, "finished", False):
             break
+
+    check_cancelled(request_id)
 
     if completion_tokens == 0 and text:
         completion_tokens = 1
@@ -819,21 +881,51 @@ def handle(request_id, op, payload):
     raise ValueError(f"unknown vLLM worker op {op!r}")
 
 
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    try:
-        request = json.loads(line)
+def read_requests():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as exc:
+            request_queue.put({"id": 0, "op": "invalid", "parse_error": str(exc)})
+            continue
         request_id = int(request.get("id", 0))
+        if str(request.get("op", "")) == "cancel":
+            payload = request.get("payload") or {}
+            schedule_abort(int(payload.get("request_id", request_id)))
+            continue
+        request_queue.put(request)
+    request_queue.put(None)
+
+
+threading.Thread(target=read_requests, name="mayhem-vllm-control", daemon=True).start()
+
+while True:
+    request = request_queue.get()
+    if request is None:
+        break
+    request_id = int(request.get("id", 0))
+    try:
+        if "parse_error" in request:
+            raise ValueError(request["parse_error"])
         result = handle(request_id, str(request.get("op", "")), request.get("payload"))
+        check_cancelled(request_id)
         send({"id": request_id, "type": "response", "ok": True, "result": result})
     except SystemExit:
         raise
+    except RequestCancelled as exc:
+        send(
+            {
+                "id": request_id,
+                "type": "response",
+                "ok": False,
+                "cancelled": True,
+                "error": str(exc),
+            }
+        )
     except Exception as exc:
-        request_id = 0
-        try:
-            request_id = int(json.loads(line).get("id", 0))
-        except Exception:
-            pass
         error = str(exc) or repr(exc) or type(exc).__name__
         send({"id": request_id, "type": "response", "ok": False, "error": error})
+    finally:
+        finish_request(request_id)

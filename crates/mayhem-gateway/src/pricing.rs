@@ -1,5 +1,6 @@
 use mayhem_proto::{
-    MoneyAu, ReceiptUsage, USAGE_CACHED_INPUT_TOKEN, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    MoneyAu, ReceiptUsage, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 
 pub use mayhem_proto::RateMapEntry;
@@ -80,6 +81,74 @@ pub fn priced_usage_au(
     usage_map_au(rate_map, usage)
         .saturating_add(per_req_au)
         .max(min_session_au)
+}
+
+pub fn logical_cumulative_priced_usage_au(
+    rate_map: &[RateMapEntry],
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+    prior_usage: &ReceiptUsage,
+    prior_au_owed_cum: MoneyAu,
+    current_usage: &ReceiptUsage,
+) -> Option<MoneyAu> {
+    if !current_usage.is_monotonic_from(prior_usage) {
+        return None;
+    }
+    if prior_au_owed_cum == 0 && prior_usage != &ReceiptUsage::default() {
+        return None;
+    }
+    let increment = ReceiptUsage::saturating_delta(prior_usage, current_usage);
+    let increment_au = if prior_au_owed_cum == 0 {
+        priced_usage_au(rate_map, per_req_au, min_session_au, &increment)
+    } else {
+        usage_map_au(rate_map, &increment)
+    };
+    prior_au_owed_cum.checked_add(increment_au)
+}
+
+/// Returns the cumulative usage a cancelled, already-dispatched request must settle.
+///
+/// Fixed floors and previously metered work remain authoritative. For a variable-only
+/// schedule with no metered progress yet, both peers derive one deterministic work quantum
+/// from the signed rate map. This bounds a disconnect charge while preventing free repeated
+/// dispatch-and-cancel work.
+pub fn cancellation_settlement_usage(
+    rate_map: &[RateMapEntry],
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+    metered_usage: &ReceiptUsage,
+) -> Option<ReceiptUsage> {
+    if priced_usage_au(rate_map, per_req_au, min_session_au, metered_usage) > 0 {
+        return Some(metered_usage.clone());
+    }
+
+    let rate = rate_map
+        .iter()
+        .filter(|rate| rate.per_unit_au > 0 && rate.granularity > 0)
+        .min_by(|left, right| {
+            cancellation_unit_rank(&left.unit)
+                .cmp(&cancellation_unit_rank(&right.unit))
+                .then_with(|| {
+                    ceil_div_u128(left.per_unit_au, u128::from(left.granularity)).cmp(
+                        &ceil_div_u128(right.per_unit_au, u128::from(right.granularity)),
+                    )
+                })
+                .then_with(|| left.unit.cmp(&right.unit))
+        })?;
+    let usage = ReceiptUsage::from_units([(rate.unit.clone(), 1)]);
+    (priced_usage_au(rate_map, per_req_au, min_session_au, &usage) > 0).then_some(usage)
+}
+
+fn cancellation_unit_rank(unit: &str) -> u8 {
+    match unit {
+        // These are the smallest bounded compute units for their model classes.
+        USAGE_STEP | USAGE_AUDIO_SECOND | USAGE_FRAME => 0,
+        USAGE_INPUT_TOKEN | USAGE_VIDEO_SECOND => 1,
+        USAGE_INPUT_CHARACTER => 2,
+        USAGE_OUTPUT_TOKEN | USAGE_IMAGE => 3,
+        USAGE_CACHED_INPUT_TOKEN => 4,
+        _ => 5,
+    }
 }
 
 pub fn usage_map_au(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> MoneyAu {
@@ -265,6 +334,91 @@ mod tests {
             serde_json::json!({ "audio_second": 3, "input_character": 12 })
         );
         assert_eq!(usage_map_au(&rate_map, &usage), 312);
+    }
+
+    #[test]
+    fn variable_only_cancellation_uses_one_deterministic_work_quantum() {
+        let image_rates = vec![
+            RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_au: 2_499_999_999_999_999,
+                granularity: 36,
+            },
+        ];
+        let usage = cancellation_settlement_usage(&image_rates, 0, 0, &ReceiptUsage::default())
+            .expect("signed image rate map has a cancellation quantum");
+
+        assert_eq!(usage, ReceiptUsage::from_units([(USAGE_STEP, 1)]));
+        assert_eq!(
+            priced_usage_au(&image_rates, 0, 0, &usage),
+            69_444_444_444_445
+        );
+    }
+
+    #[test]
+    fn cancellation_quantum_covers_every_canonical_modality_rate_family() {
+        let rate = |unit: &str, per_unit_au: MoneyAu, granularity: u64| RateMapEntry {
+            unit: unit.to_owned(),
+            per_unit_au,
+            granularity,
+        };
+        let cases = [
+            (
+                vec![
+                    rate(USAGE_OUTPUT_TOKEN, 60, 1_000),
+                    rate(USAGE_CACHED_INPUT_TOKEN, 5, 1_000),
+                    rate(USAGE_INPUT_TOKEN, 20, 1_000),
+                ],
+                USAGE_INPUT_TOKEN,
+            ),
+            (
+                vec![
+                    rate(USAGE_AUDIO_SECOND, 18_000_000_000_000, 1),
+                    rate(USAGE_INPUT_CHARACTER, 1, 1),
+                ],
+                USAGE_AUDIO_SECOND,
+            ),
+            (
+                vec![rate(USAGE_AUDIO_SECOND, 1_000_000_000_000_000, 60)],
+                USAGE_AUDIO_SECOND,
+            ),
+            (
+                vec![
+                    rate(USAGE_VIDEO_SECOND, 5_000_000_000_000_000, 1),
+                    rate(USAGE_FRAME, 5_000_000_000_000_000, 24),
+                ],
+                USAGE_FRAME,
+            ),
+        ];
+
+        for (rate_map, expected_unit) in cases {
+            let usage = cancellation_settlement_usage(&rate_map, 0, 0, &ReceiptUsage::default())
+                .expect("canonical rate map has a cancellation quantum");
+            assert_eq!(usage, ReceiptUsage::from_units([(expected_unit, 1)]));
+            assert!(priced_usage_au(&rate_map, 0, 0, &usage) > 0);
+        }
+    }
+
+    #[test]
+    fn cancellation_preserves_fixed_floors_and_metered_progress() {
+        let text_rates = text_generation_rate_map(20, 60);
+        let empty = ReceiptUsage::default();
+        assert_eq!(
+            cancellation_settlement_usage(&text_rates, 11, 37, &empty),
+            Some(empty)
+        );
+
+        let metered = ReceiptUsage::text(100, 4);
+        assert_eq!(
+            cancellation_settlement_usage(&text_rates, 0, 0, &metered),
+            Some(metered)
+        );
+        assert!(cancellation_settlement_usage(&[], 0, 0, &ReceiptUsage::default()).is_none());
     }
 
     #[test]

@@ -34,7 +34,10 @@
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
       ]
-    }
+    },
+    "inference_relays": [
+      "98118758e6a13ad1d831ed0d9438968910040e06560f23ed0c4e0b54b31f0e02"
+    ]
   },
   "startup": {
     "runtime": "pear",
@@ -85,7 +88,7 @@
       "auditor_min_age_seconds": 2592000,
       "canary_match_min_bps": 9000,
       "canary_probe_holdback_bps": 0,
-      "canary_probe_release_min_passes": 1,
+      "canary_probe_release_min_passes": 2,
       "probe_reward_au": "5000000000000000",
       "uptime_tick_seconds": 21600,
       "fraud_slash_bps": 10000,
@@ -96,6 +99,8 @@
       "fee_bps": 1500,
       "dispute_deposit_au": "1000000000000000000",
       "dispute_timeout_epochs": 168,
+      "max_open_disputes_per_opener": 8,
+      "dispute_opener_fault_forfeit_bps": 2500,
       "payout_min_au": "1000000000000000000",
       "price_min_bps": 1,
       "price_max_bps": 1000000,
@@ -141,10 +146,23 @@
     "tap": {
       "chain_id": 1,
       "token_address": "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454",
-      "pool_address": "0x9B254d37C28Fb5893F46513a61925eDC2F300615",
+      "pool_address": "0xcFEA9A256F1F96269D848cABF1eCb00fD2DD6a28",
+      "governance_signer": "0x199E54a7dfe9DcfD4567Fd635a298e2902d0F8B3",
+      "governance_delay_seconds": 3600,
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
-      "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
-      "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+      "participant_rpc_policy": "public-only",
+      "operator_oracle": {
+        "method": "uniswap-v2-twap-median",
+        "private_rpc_env": "MAYHEM_TAP_ETH_RPC",
+        "private_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+        "public_fallbacks_env": "MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS",
+        "interval_seconds": 1800,
+        "twap_window_seconds": 1800,
+        "minimum_sources": 2,
+        "max_deviation_bps": 2000,
+        "hard_floor_au": "1000000000000000",
+        "hard_ceiling_au": "10000000000000000000"
+      },
       "max_epoch_delta_wei": "10000000000000000000000",
       "operator_address": "0x3F9404848cc6E13Bdd9a59150Aa8D26481566acd"
     },

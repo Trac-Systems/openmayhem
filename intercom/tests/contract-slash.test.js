@@ -16,6 +16,7 @@ const rulesHash = '8'.repeat(64);
 const enclaveId = '7'.repeat(64);
 const modelId = 'mayhem/qwen3.5-4b@q4';
 const DAY_SECONDS = 24 * 60 * 60;
+const canaryPromptIds = ['dev-arithmetic-json', 'dev-tool-shape'];
 
 async function setupSlashContract() {
   const admin = await makeIdentity();
@@ -115,6 +116,7 @@ async function setupProviderServing(ctx) {
         set_id: 'canary-dev-v1',
         url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
         hash: 'b'.repeat(64),
+        prompt_ids: canaryPromptIds,
       }],
     },
     ctx.admin.publicKey,
@@ -135,6 +137,8 @@ async function setupProviderServing(ctx) {
     {
       op: 'join_enclave',
       enclave_id: enclaveId,
+      att_tier: 1,
+      attestation_head: 'd'.repeat(64),
       served_ctx: 32768,
       served_modalities: ['text'],
       served_specialities: {},
@@ -172,7 +176,35 @@ async function setupProviderServing(ctx) {
     8
   );
   assert.equal(joinedRoom.ok, true, joinedRoom.message);
+  await seedCanaryChallenge(ctx, 2, 'e'.repeat(64));
   return room.room_id;
+}
+
+async function seedCanaryChallenge(ctx, challengeEpoch, challengeApplyHash) {
+  await ctx.storage.put('epoch/apply/state', {
+    updated_epoch: challengeEpoch,
+    updated_at: makeTxKey(8),
+    last_apply_hash: challengeApplyHash,
+    pending_epoch: null,
+  });
+  const challengeSeed = await ctx.contract.opaqueHash('mayhem-canary-challenge-v1', {
+    challenge_epoch: challengeEpoch,
+    challenge_apply_hash: challengeApplyHash,
+    probe_epoch: challengeEpoch + 1,
+    auditor: ctx.auditor.publicKey,
+    provider: ctx.provider.publicKey,
+    enclave_id: enclaveId,
+    canary_set: 'canary-dev-v1',
+    catalog_hash: '8'.repeat(64),
+  });
+  ctx.canaryChallenge = {
+    canary_prompt_id: canaryPromptIds[
+      Number(BigInt(`0x${challengeSeed}`) % BigInt(canaryPromptIds.length))
+    ],
+    challenge_epoch: challengeEpoch,
+    challenge_apply_hash: challengeApplyHash,
+    challenge_seed: challengeSeed,
+  };
 }
 
 function signedCanaryProbe(ctx, overrides = {}) {
@@ -186,6 +218,7 @@ function signedCanaryProbe(ctx, overrides = {}) {
     epoch: 3,
     at: 10_800,
     canary_set: 'canary-dev-v1',
+    ...ctx.canaryChallenge,
     verification_method: 'token_fingerprint',
     match_bps: 1_000,
     pass: false,
@@ -371,6 +404,8 @@ test('MayhemContract canary mismatch uses admin-governed fraud_slash_bps', async
     10
   );
   assert.equal(scheduled.ok, true, scheduled.message);
+
+  await seedCanaryChallenge(ctx, 23, 'f'.repeat(64));
 
   const result = await execute(
     ctx.contract,

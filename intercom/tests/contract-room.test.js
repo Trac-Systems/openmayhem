@@ -24,6 +24,8 @@ const providerRegistration = {
 const providerJoinFor = (targetEnclaveId) => ({
   op: 'join_enclave',
   enclave_id: targetEnclaveId,
+  att_tier: 1,
+  attestation_head: 'd'.repeat(64),
   served_ctx: 32768,
   served_modalities: ['text'],
   served_specialities: {},

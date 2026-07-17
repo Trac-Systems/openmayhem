@@ -11,6 +11,85 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 
 const ETHEREUM_DERIVATION_PATH = "m/44'/60'/0'/0/0";
 const ETHEREUM_SIDECAR_VERSION = 1;
+const WALLET_HELPER_SECRET_NAMES = [
+  'password',
+  'new-password',
+  'mnemonic',
+  'ethereum-private-key',
+  'ethereum-mnemonic',
+];
+
+export const walletHelperFlagsWithSecrets = (flags, inherited = {}) => {
+  const secretNames = WALLET_HELPER_SECRET_NAMES;
+  for (const name of secretNames) {
+    if (flags[name] !== undefined) {
+      throw new Error(`Wallet helper secret --${name} must not be passed on argv.`);
+    }
+  }
+  if (!inherited || typeof inherited !== 'object' || Array.isArray(inherited)) {
+    throw new Error('Wallet helper stdin must contain a JSON object.');
+  }
+  const allowed = new Set(secretNames.map((name) => name.replaceAll('-', '_')));
+  const unknown = Object.keys(inherited).filter((name) => !allowed.has(name));
+  if (unknown.length > 0) {
+    throw new Error('Wallet helper stdin contains unsupported fields.');
+  }
+  const merged = { ...flags };
+  for (const name of secretNames) {
+    const jsonName = name.replaceAll('-', '_');
+    const value = inherited[jsonName];
+    if (value !== undefined) {
+      if (typeof value !== 'string') {
+        throw new Error(`Wallet helper secret ${jsonName} must be a string.`);
+      }
+      merged[name] = value;
+    }
+  }
+  return merged;
+};
+
+export const readWalletHelperSecretsFromStdin = async (providedInput = null) => {
+  const input = providedInput ??
+    globalThis.process?.stdin ??
+    (await import('bare-process')).default.stdin;
+  return await new Promise((resolve, reject) => {
+    if (!input || typeof input.on !== 'function') {
+      reject(new Error('Wallet helper requires a secret stdin pipe.'));
+      return;
+    }
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    input.on('data', (chunk) => {
+      if (settled) return;
+      const buffer = typeof chunk === 'string' ? b4a.from(chunk, 'utf8') : chunk;
+      bytes += buffer.length;
+      if (bytes > 1_000_000) {
+        settled = true;
+        input.pause?.();
+        reject(new Error('Wallet helper secret stdin exceeded 1000000 bytes.'));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    input.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    input.on('end', () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const encoded = b4a.toString(b4a.concat(chunks), 'utf8');
+        resolve(JSON.parse(encoded));
+      } catch {
+        reject(new Error('Wallet helper secret stdin must contain valid JSON.'));
+      }
+    });
+    input.resume?.();
+  });
+};
 
 const requireString = (flags, name) => {
   const value = flags[name];
@@ -175,7 +254,8 @@ const importedEthereumAccount = (ethereumPrivateKey, ethereumMnemonic) => {
   return null;
 };
 
-export async function runWalletHelper(flags) {
+export async function runWalletHelper(rawFlags, inheritedSecrets = {}) {
+  const flags = walletHelperFlagsWithSecrets(rawFlags, inheritedSecrets);
   const command = requireString(flags, 'wallet-helper');
   const keypairPath = requireString(flags, 'keypair');
   const password = optionalString(flags, 'password') ?? '';

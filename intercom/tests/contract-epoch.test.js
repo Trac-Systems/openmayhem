@@ -131,6 +131,10 @@ const receiptBundle = (user, provider, overrides = {}) => ({
     {
       schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
       session_id: 'session-epoch-1',
+      billing_id: 'd'.repeat(64),
+      billing_attempt: 0,
+      billing_prior_usage: {},
+      billing_prior_au_owed_cum: '0',
       seq: 1,
       final: true,
       rail: 'fiat',
@@ -215,6 +219,78 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
   assert.equal(imageCanonicalRoll.totals.use_au, '1120');
 });
 
+test('epoch recompute nets one logical bill across provider redispatch attempts', async () => {
+  const { provider: providerA, user } = await setupEpochContract();
+  const providerB = await makeIdentity();
+  const base = receiptBundle(user, providerA).receipts[0];
+  const billingId = '7'.repeat(64);
+  const lockedRateMap = [
+    { unit: 'input_token', per_unit_au: '100', granularity: 1 },
+    { unit: 'output_token', per_unit_au: '50', granularity: 1 },
+  ];
+  const first = {
+    ...base,
+    session_id: 'logical-attempt-a',
+    billing_id: billingId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
+    seq: 1,
+    final: false,
+    provider: providerA.publicKey,
+    locked_rate_map: lockedRateMap,
+    usage: { input_token: 1 },
+    au_owed_cum: '100',
+  };
+  const second = {
+    ...base,
+    session_id: 'logical-attempt-b',
+    billing_id: billingId,
+    billing_attempt: 1,
+    billing_prior_usage: first.usage,
+    billing_prior_au_owed_cum: first.au_owed_cum,
+    seq: 1,
+    final: true,
+    provider: providerB.publicKey,
+    locked_rate_map: lockedRateMap,
+    usage: { input_token: 1, output_token: 2 },
+    au_owed_cum: '200',
+  };
+
+  const roll = await recomputeEpoch(receiptBundle(user, providerA, {
+    receipts: [second, first],
+  }));
+  assert.equal(roll.totals.use_count, 1);
+  assert.equal(roll.totals.use_au, '200');
+  assert.equal(roll.totals.provider_count, 2);
+  assert.deepEqual(
+    Object.fromEntries(roll.earnings.map((entry) => [entry.provider, entry.gross_au])),
+    {
+      [providerA.publicKey]: '100',
+      [providerB.publicKey]: '100',
+    }
+  );
+
+  await assert.rejects(
+    () => recomputeEpoch(receiptBundle(user, providerA, {
+      receipts: [first, { ...second, billing_prior_au_owed_cum: '99' }],
+    })),
+    /redispatch baseline does not match prior logical settlement/
+  );
+  await assert.rejects(
+    () => recomputeEpoch(receiptBundle(user, providerA, {
+      receipts: [first, { ...second, billing_prior_usage: {} }],
+    })),
+    /redispatch baseline does not match prior logical settlement/
+  );
+  await assert.rejects(
+    () => recomputeEpoch(receiptBundle(user, providerB, {
+      receipts: [second],
+    })),
+    /logical billing baseline has no prior signed receipt/
+  );
+});
+
 test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async () => {
   const { provider, user } = await setupEpochContract();
   const base = receiptBundle(user, provider).receipts[0];
@@ -223,6 +299,7 @@ test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async (
     receipts: ['fiat', 'tap', 'tnk'].map((rail, index) => ({
       ...base,
       session_id: `session-${rail}`,
+      billing_id: String(index + 1).repeat(64),
       seq: index + 1,
       rail,
       au_owed_cum: '10000',
@@ -255,6 +332,10 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
   const body = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'session-epoch-1',
+    billing_id: 'd'.repeat(64),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 1,
     final: true,
     rail: 'fiat',

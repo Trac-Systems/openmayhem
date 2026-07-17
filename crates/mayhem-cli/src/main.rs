@@ -17,7 +17,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -34,7 +34,7 @@ use anyhow::anyhow;
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use flate2::read::GzDecoder;
 use hf_hub::progress::{
     DownloadEvent as HfDownloadEvent, ProgressEvent as HfProgressEvent,
@@ -60,15 +60,16 @@ use mayhem_enclave::{
     DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
-    ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
-    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
+    EngineBackend, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
+    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
     MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
-    audio_fingerprint, embedding_vector_fingerprint, fold_reputation, heartbeat_signing_payload,
-    image_average_hash_hex, normalize_canary_transcript, normalize_rate_map,
+    audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
+    heartbeat_signing_payload, image_average_hash_hex, logical_cumulative_priced_usage_au,
+    normalize_canary_transcript, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
@@ -79,10 +80,9 @@ use mayhem_gateway::{
         ScBridgeGatewaySessionConfig, ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS,
         MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
-    priced_usage_au, rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
-    text_rate_per_1k_au, HardwareQuoteVerifierCommand, HeartbeatModalityCapacity,
-    HeartbeatReceiver, ModalityRequestLoad, ProbationCaps, ProbationPolicy, ProviderProbation,
-    RateMapEntry, ReputationEvent, ReputationEventKind,
+    rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
+    HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
+    ModalityRequestLoad, ProviderProbation, RateMapEntry,
     DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
     DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
     MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
@@ -93,23 +93,25 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
-    ctx_bracket_table_at, default_ctx_bracket_schedule, payload_chunk_at, payload_chunk_manifest,
-    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
-    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    ctx_bracket_table_at, default_ctx_bracket_schedule, metered_output_units, payload_chunk_at,
+    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SpendVoucher, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use xet::xet_session::{XetFileInfo, XetSessionBuilder};
@@ -126,7 +128,7 @@ const MAINNET_MSB_DIRECT_PEERS: [&str; 3] = [
 ];
 const MAINNET_TAP_CHAIN_ID: u64 = 1;
 const MAINNET_TAP_TOKEN_ADDRESS: &str = "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454";
-const MAINNET_TAP_POOL_ADDRESS: &str = "0x9B254d37C28Fb5893F46513a61925eDC2F300615";
+const MAINNET_TAP_POOL_ADDRESS: &str = "0xcFEA9A256F1F96269D848cABF1eCb00fD2DD6a28";
 const MAINNET_TNK_TREASURY_ADDRESS: &str =
     "trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh";
 const MAINNET_MANIFEST_JSON: &str = include_str!("../../../config/beta/mainnet.json");
@@ -156,6 +158,19 @@ static HF_XET_LOGGING_INIT: Once = Once::new();
 const MAX_PROVIDER_MODALITY_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PROVIDER_MODALITY_ITEM_UNITS: u64 = 1_000_000_000_000;
 
+fn read_secret_file_arg(value: &str) -> std::result::Result<String, String> {
+    let path = Path::new(value);
+    let mut secret =
+        fs::read_to_string(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
+    if secret.ends_with('\n') {
+        secret.pop();
+        if secret.ends_with('\r') {
+            secret.pop();
+        }
+    }
+    Ok(secret)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct MainnetManifest {
     schema_version: u64,
@@ -171,6 +186,7 @@ struct MainnetManifestNetwork {
     msb: MainnetManifestMsb,
     subnet: MainnetManifestSubnet,
     dht: MainnetManifestDht,
+    inference_relays: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -273,6 +289,8 @@ const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
+const MAYHEMD_CONTROL_TOKEN_FILE: &str = "mayhemd-control-token";
+const MAYHEMD_CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
 const MAYHEMD_RESTART_STABLE_AFTER_MILLIS: u64 = 60_000;
 const MAYHEMD_CRASH_LOOP_THRESHOLD: u64 = 5;
 const DEFAULT_RELEASE_FEED_URL: &str =
@@ -637,6 +655,8 @@ enum AdminCommands {
     },
     /// Accredit an auditor key for probe submission.
     AuditorRegister(AdminAuditorRegisterArgs),
+    /// Slash an auditor for a proven colluding or false canary report.
+    AuditorSlash(AdminAuditorSlashArgs),
     /// Fold real reputation events and anchor rep/<provider> snapshots.
     ReputationAnchor(AdminReputationAnchorArgs),
     /// Post a fresh TNK/USD oracle rate for payment and payout conversions.
@@ -647,10 +667,14 @@ enum AdminCommands {
     TnkSettlement(AdminTnkSettlementArgs),
     /// Record one epoch fiat settlement backed by Stripe Connect transfer evidence.
     FiatSettlement(AdminFiatSettlementArgs),
+    /// Sweep a departed provider's exact sub-minor fiat residual into operator fees.
+    FiatDustSweep(AdminFiatDustSweepArgs),
     /// Confirm a TNK deposit intent into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
     TapDeposit(AdminTapDepositArgs),
+    /// Reverse a credited TAP event that disappeared from the finalized canonical chain.
+    TapDepositReversal(AdminTapDepositReversalArgs),
     /// Confirm a fiat checkout deposit into the canonical credit ledger.
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
@@ -768,8 +792,12 @@ struct WalletLocatorArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password. MAYHEM_WALLET_PASSWORD is also accepted.
+    #[arg(
+        long = "wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     wallet_password: Option<String>,
 }
 
@@ -802,16 +830,30 @@ struct WalletImportArgs {
     #[command(flatten)]
     wallet: WalletLocatorArgs,
 
-    /// BIP-39 mnemonic to import.
-    #[arg(long)]
-    mnemonic: String,
+    /// File containing the BIP-39 mnemonic to import. MAYHEM_WALLET_MNEMONIC is also accepted.
+    #[arg(
+        long = "mnemonic-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
+    mnemonic: Option<String>,
 
-    /// Existing Ethereum private key to store with the local wallet.
-    #[arg(long, conflicts_with = "ethereum_mnemonic")]
+    /// File containing an Ethereum private key to store with the local wallet.
+    #[arg(
+        long = "ethereum-private-key-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg,
+        conflicts_with = "ethereum_mnemonic"
+    )]
     ethereum_private_key: Option<String>,
 
-    /// Existing Ethereum mnemonic to derive and store with the local wallet.
-    #[arg(long, conflicts_with = "ethereum_private_key")]
+    /// File containing an Ethereum mnemonic to derive and store with the local wallet.
+    #[arg(
+        long = "ethereum-mnemonic-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg,
+        conflicts_with = "ethereum_private_key"
+    )]
     ethereum_mnemonic: Option<String>,
 
     /// Overwrite an existing keypair.json.
@@ -828,8 +870,12 @@ struct WalletPasswdArgs {
     #[command(flatten)]
     wallet: WalletLocatorArgs,
 
-    /// New password for the encrypted keypair.json. Empty string removes the password.
-    #[arg(long)]
+    /// File containing the new wallet password. An empty file removes the password.
+    #[arg(
+        long = "new-wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     new_wallet_password: Option<String>,
 
     /// Print a machine-readable password-rotation report.
@@ -950,8 +996,8 @@ struct BalanceArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Public key to inspect. Defaults to the local wallet public key.
@@ -1004,8 +1050,8 @@ struct StatusArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Maximum seconds for gateway HTTP checks.
@@ -1081,8 +1127,8 @@ struct ReputationArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Provider public key. Defaults to the local wallet public key.
@@ -1327,8 +1373,8 @@ struct UpArgs {
     #[arg(long, default_value = "mayhem-up-main")]
     peer_store_name: String,
 
-    /// Mayhem wallet password for gateway/provider signing.
-    #[arg(long)]
+    /// File containing the Mayhem wallet password for gateway/provider signing.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Accept first-run setup defaults in non-interactive terminals.
@@ -1398,8 +1444,8 @@ struct UseArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// SC-Bridge websocket URL for direct provider sessions.
@@ -1684,7 +1730,7 @@ struct AuditorCanaryArgs {
     #[arg(long)]
     gateway_url: Option<String>,
 
-    /// Peer JSON-RPC base URL, including /v1. Required only with --submit.
+    /// Peer JSON-RPC base URL, including /v1. Used to read the finalized challenge and optionally submit.
     #[arg(long)]
     rpc_url: Option<String>,
 
@@ -1696,8 +1742,8 @@ struct AuditorCanaryArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted auditor keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted auditor keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Model id to probe. Defaults to the first gateway model.
@@ -1707,10 +1753,6 @@ struct AuditorCanaryArgs {
     /// Canary set id under catalog/canaries.
     #[arg(long, default_value = "canary-dev-v1")]
     canary_set: String,
-
-    /// Canary prompt id. Defaults to the first prompt in the set.
-    #[arg(long)]
-    prompt_id: Option<String>,
 
     /// Directory containing canary set JSON files.
     #[arg(long, value_name = "PATH")]
@@ -1724,13 +1766,13 @@ struct AuditorCanaryArgs {
     #[arg(long, value_name = "PATH")]
     expected_file: Option<PathBuf>,
 
-    /// Provider public key. Defaults to the provider in the latest gateway receipt.
+    /// Provider public key to challenge.
     #[arg(long)]
-    provider: Option<String>,
+    provider: String,
 
-    /// Admin-created enclave id. Defaults to the enclave in the latest gateway receipt.
+    /// Admin-created enclave id to challenge.
     #[arg(long)]
-    enclave_id: Option<String>,
+    enclave_id: String,
 
     /// Epoch used in the probe_result command.
     #[arg(long)]
@@ -1948,8 +1990,8 @@ struct PayRailArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Idempotency key forwarded when the selected rail supports it.
@@ -2011,8 +2053,8 @@ struct PayTnkArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the free TNK deposit intent feature through peer RPC.
@@ -2022,6 +2064,10 @@ struct PayTnkArgs {
     /// Broadcast the matching MSB transfer from this local wallet. Requires --submit-intent.
     #[arg(long)]
     submit_transfer: bool,
+
+    /// Confirm the pinned TNK destination without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
 
     /// Maximum seconds to wait for MSB account sync and validator connection when --submit-transfer is used.
     #[arg(long, default_value_t = 180)]
@@ -2096,8 +2142,8 @@ struct DepositStatusArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Account to inspect. Defaults to the local Mayhem wallet public key.
@@ -2201,8 +2247,8 @@ struct ParticipantTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted participant keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted participant keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -2569,12 +2615,12 @@ struct SetupArgs {
     #[arg(long, value_enum, default_value_t = WalletMode::Auto)]
     wallet: WalletMode,
 
-    /// BIP-39 mnemonic to import, or to use for deterministic test creation.
-    #[arg(long)]
+    /// File containing a BIP-39 mnemonic to import or use for deterministic test creation.
+    #[arg(long = "mnemonic-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     mnemonic: Option<String>,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Intercom peer store name under <home>/stores.
@@ -2643,8 +2689,8 @@ struct RulesReviewArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
@@ -3053,6 +3099,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long, value_name = "PATH")]
     vision_projector_path: Option<PathBuf>,
 
+    /// Local admin-bound artifact sidecar as NAME=PATH. Repeat for multi-part backends.
+    #[arg(long = "artifact-sidecar", value_name = "NAME=PATH")]
+    artifact_sidecars: Vec<String>,
+
     /// Restrict calibration to one prompt id. Defaults to all prompts in the canary set.
     #[arg(long)]
     prompt_id: Option<String>,
@@ -3353,17 +3403,15 @@ impl AdminRateSource {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminTapRateSource {
-    UniswapV2,
+    UniswapV2TwapMedian,
     Config,
-    Stale,
 }
 
 impl AdminTapRateSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::UniswapV2 => "uniswap-v2",
+            Self::UniswapV2TwapMedian => "uniswap-v2-twap-median",
             Self::Config => "config",
-            Self::Stale => "stale",
         }
     }
 }
@@ -3380,6 +3428,21 @@ enum AdminBanTargetType {
     Device,
     Fingerprint,
     Committer,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminAuditorSlashReason {
+    Collusion,
+    FalseReport,
+}
+
+impl AdminAuditorSlashReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Collusion => "collusion",
+            Self::FalseReport => "false_report",
+        }
+    }
 }
 
 impl AdminBanTargetType {
@@ -3411,8 +3474,8 @@ struct AdminTxArgs {
     #[arg(long, value_name = "PATH")]
     keypair: Option<PathBuf>,
 
-    /// Password for the encrypted admin keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted admin keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -4330,6 +4393,40 @@ struct AdminAuditorRegisterArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminAuditorSlashArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Auditor public key whose passing report was proven false.
+    #[arg(long)]
+    auditor: String,
+
+    /// Provider public key named by the passing report.
+    #[arg(long)]
+    provider: String,
+
+    /// Exact passing canary probe id.
+    #[arg(long)]
+    probe_id: String,
+
+    /// Probe epoch.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Proven misconduct class.
+    #[arg(long, value_enum)]
+    reason: AdminAuditorSlashReason,
+
+    /// BLAKE3 hash of the off-ledger collusion or false-report evidence bundle.
+    #[arg(long)]
+    evidence_hash: String,
+
+    /// Evidence decision timestamp in Unix seconds. Defaults to now.
+    #[arg(long)]
+    at: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
 struct AdminReputationAnchorArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -4425,8 +4522,12 @@ struct AdminTnkSettlementArgs {
     #[arg(long, value_name = "PATH")]
     treasury_keypair: Option<PathBuf>,
 
-    /// Password for the funded treasury keypair. Defaults to MAYHEM_TNK_WALLET_PASSWORD or empty.
-    #[arg(long)]
+    /// File containing the funded treasury keypair password.
+    #[arg(
+        long = "treasury-wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     treasury_wallet_password: Option<String>,
 
     /// Operator/admin TNK address receiving the aggregate TNK operator fee.
@@ -4440,10 +4541,6 @@ struct AdminTnkSettlementArgs {
     /// Broadcast the planned MSB transfers through the local Pear MSB app. Requires --submit.
     #[arg(long)]
     submit_transfer: bool,
-
-    /// Use already-broadcast 64-hex MSB transfer hashes for evidence, in output order.
-    #[arg(long = "msb-tx-hash", value_delimiter = ',')]
-    msb_tx_hashes: Vec<String>,
 
     /// Maximum seconds to wait for MSB account sync and validator connection.
     #[arg(long, default_value_t = 180)]
@@ -4479,10 +4576,6 @@ struct AdminFiatSettlementArgs {
     #[arg(long)]
     at: Option<u64>,
 
-    /// Operator/platform Stripe balance reference for retained fiat fees.
-    #[arg(long)]
-    operator_stripe_ref: Option<String>,
-
     /// Operator/platform target recorded for retained fiat fees.
     #[arg(long, default_value = "platform_balance")]
     operator_stripe_account: String,
@@ -4494,10 +4587,6 @@ struct AdminFiatSettlementArgs {
     /// Broadcast provider Stripe Connect transfers. Requires --submit.
     #[arg(long)]
     submit_transfer: bool,
-
-    /// Use already-created Stripe references in output order; provider refs must be tr_*.
-    #[arg(long = "stripe-ref", value_delimiter = ',')]
-    stripe_refs: Vec<String>,
 
     /// File with STRIPE_SECRET_KEY/MAYHEM_STRIPE_SECRET_KEY. Defaults to .mayhem-local/secrets/stripe.txt when present.
     #[arg(long, value_name = "PATH")]
@@ -4517,6 +4606,24 @@ struct AdminFiatSettlementArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminFiatDustSweepArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Departed provider whose remaining sub-minor fiat earning is being swept.
+    #[arg(long)]
+    provider: String,
+
+    /// Latest applied epoch used to derive and anchor the sweep.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Sweep timestamp in Unix seconds.
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
 struct AdminTnkDepositArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -4531,6 +4638,26 @@ struct AdminTnkDepositArgs {
 
     #[arg(long)]
     msb_tx_hash: String,
+
+    /// Canonical MSB network observed by the embedded read-only watcher.
+    #[arg(long)]
+    msb_network: String,
+
+    /// Confirmed transfer sender returned by the embedded MSB reader.
+    #[arg(long)]
+    msb_from: String,
+
+    /// Confirmed transfer recipient returned by the embedded MSB reader.
+    #[arg(long)]
+    msb_to: String,
+
+    /// Signed MSB length at which the transfer was confirmed.
+    #[arg(long)]
+    msb_confirmed_length: u64,
+
+    /// MSB signed length observed by the watcher when it submitted evidence.
+    #[arg(long)]
+    msb_observed_signed_length: u64,
 
     #[arg(long)]
     epoch: u64,
@@ -4584,6 +4711,54 @@ struct AdminTapDepositArgs {
 
     #[arg(long)]
     watcher_id: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTapDepositReversalArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    eth_tx_hash: String,
+
+    #[arg(long)]
+    log_index: u64,
+
+    #[arg(long)]
+    block_number: u64,
+
+    #[arg(long)]
+    block_hash: String,
+
+    #[arg(long)]
+    pool_address: String,
+
+    #[arg(long)]
+    chain_id: u64,
+
+    #[arg(long)]
+    reconciliation_from_block: u64,
+
+    #[arg(long)]
+    reconciliation_to_block: u64,
+
+    #[arg(long)]
+    finalized_block_number: u64,
+
+    #[arg(long, default_value = "finalized-tag")]
+    confirmation_policy: String,
+
+    #[arg(long, default_value = "tap-deposit-watcher-v1")]
+    watcher_id: String,
+
+    #[arg(long, default_value = "canonical_event_missing")]
+    reason: String,
 
     #[arg(long)]
     epoch: u64,
@@ -4848,8 +5023,8 @@ struct ProviderTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Build and sign provider lifecycle feature records without appending them.
@@ -4875,8 +5050,8 @@ struct ProviderContractTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -4910,8 +5085,8 @@ struct ProviderReadArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Provider public key to inspect. Defaults to the local provider wallet public key.
@@ -4969,8 +5144,8 @@ struct ProviderStripeArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Print a machine-readable report.
@@ -5121,8 +5296,8 @@ struct ProviderDrainArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Restrict drain to one served enclave id. Omit to drain all local provider markets.
@@ -5156,8 +5331,8 @@ struct ProviderEarningsArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Print machine-readable earnings.
@@ -5410,8 +5585,8 @@ struct ProviderStartArgs {
     #[arg(long)]
     sc_bridge_token: Option<String>,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Path to catalog/models.json. Defaults to the repo catalog.
@@ -5592,7 +5767,7 @@ enum WalletMode {
     Auto,
     /// Create a fresh wallet. Fails if keypair.json exists unless --force is used.
     Create,
-    /// Import from --mnemonic. Fails if keypair.json exists unless --force is used.
+    /// Import from a mnemonic file or environment. Fails if keypair.json exists unless --force is used.
     Import,
     /// Reuse an existing keypair.json.
     Reuse,
@@ -5676,6 +5851,40 @@ struct EthereumSignOutput {
     signature: String,
 }
 
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+struct WalletHelperSecrets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mnemonic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ethereum_private_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ethereum_mnemonic: Option<String>,
+}
+
+impl WalletHelperSecrets {
+    fn apply_environment_fallbacks(&mut self) {
+        if self.password.is_none() {
+            self.password = env::var("MAYHEM_WALLET_PASSWORD").ok();
+        }
+        if self.new_password.is_none() {
+            self.new_password = env::var("MAYHEM_NEW_WALLET_PASSWORD").ok();
+        }
+        if self.mnemonic.is_none() {
+            self.mnemonic = env::var("MAYHEM_WALLET_MNEMONIC").ok();
+        }
+        if self.ethereum_private_key.is_none() {
+            self.ethereum_private_key = env::var("MAYHEM_ETHEREUM_PRIVATE_KEY").ok();
+        }
+        if self.ethereum_mnemonic.is_none() {
+            self.ethereum_mnemonic = env::var("MAYHEM_ETHEREUM_MNEMONIC").ok();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct MsbTransferOutput {
     ok: bool,
@@ -5686,12 +5895,15 @@ struct MsbTransferOutput {
     tx_hash: String,
     before_balance: String,
     validator_connections: u64,
+    confirmed_length: Option<u64>,
+    observed_signed_length: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct MsbSettlementTransferOutput {
     to: String,
     amount: String,
+    amount_e18: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5761,6 +5973,7 @@ struct ConfigNetwork {
     gateway_bind: Option<String>,
     gateway_url: Option<String>,
     tnk_treasury_address: Option<String>,
+    admin_peer_pubkey: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6255,13 +6468,26 @@ async fn wallet_import(args: WalletImportArgs) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let mnemonic = args
+        .mnemonic
+        .or_else(|| env::var("MAYHEM_WALLET_MNEMONIC").ok())
+        .context("wallet import requires --mnemonic-file or MAYHEM_WALLET_MNEMONIC")?;
+    let ethereum_private_key = args
+        .ethereum_private_key
+        .or_else(|| env::var("MAYHEM_ETHEREUM_PRIVATE_KEY").ok());
+    let ethereum_mnemonic = args
+        .ethereum_mnemonic
+        .or_else(|| env::var("MAYHEM_ETHEREUM_MNEMONIC").ok());
+    if ethereum_private_key.is_some() && ethereum_mnemonic.is_some() {
+        bail!("set only one of the Ethereum private-key or mnemonic secret inputs");
+    }
     let wallet = create_wallet(
         &keypair_path,
         &password,
-        Some(&args.mnemonic),
+        Some(&mnemonic),
         true,
-        args.ethereum_private_key.as_deref(),
-        args.ethereum_mnemonic.as_deref(),
+        ethereum_private_key.as_deref(),
+        ethereum_mnemonic.as_deref(),
     )
     .await
     .with_context(|| format!("importing wallet {}", keypair_path.display()))?;
@@ -6283,7 +6509,7 @@ async fn wallet_passwd(args: WalletPasswdArgs) -> Result<()> {
         .clone()
         .or_else(|| env::var("MAYHEM_NEW_WALLET_PASSWORD").ok())
         .context(
-            "missing --new-wallet-password (or MAYHEM_NEW_WALLET_PASSWORD); pass an empty string to remove the password",
+            "missing --new-wallet-password-file (or MAYHEM_NEW_WALLET_PASSWORD); use an empty file or empty environment value to remove the password",
         )?;
     let wallet = rotate_wallet_password(&keypair_path, &old_password, &new_password)
         .await
@@ -6368,14 +6594,14 @@ fn print_wallet_backup(wallet: &WalletInfo) {
     if let Some(mnemonic) = wallet.mnemonic.as_deref() {
         println!("Mnemonic: {mnemonic}");
         println!(
-            "Restore command: mayhem wallet import --keypair {} --mnemonic '<mnemonic>'",
+            "Restore command: mayhem wallet import --keypair {} --mnemonic-file <private-mnemonic-file>",
             wallet.keypair_path
         );
     }
     if let Some(private_key) = wallet.ethereum_private_key.as_deref() {
         println!("Ethereum private key: {private_key}");
         println!(
-            "Restore Ethereum key with: mayhem wallet import --keypair {} --mnemonic '<mnemonic>' --ethereum-private-key '<0x-private-key>'",
+            "Restore Ethereum key with: mayhem wallet import --keypair {} --mnemonic-file <private-mnemonic-file> --ethereum-private-key-file <private-key-file>",
             wallet.keypair_path
         );
     }
@@ -9017,7 +9243,7 @@ fn verify_release_manifest_signature(
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("release public key is invalid")?;
     verifying_key
-        .verify(
+        .verify_strict(
             &release_manifest_signing_bytes(manifest_bytes),
             &Signature::from_bytes(&sig_bytes),
         )
@@ -12204,6 +12430,10 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .as_ref()
         .map(|path| absolutize(path.clone()))
         .transpose()?;
+    let artifact_sidecar_paths = catalog_calibration_sidecar_paths(
+        &args.artifact_sidecars,
+        vision_projector_path.as_deref(),
+    )?;
     let report_output = args
         .report_output
         .as_ref()
@@ -12241,10 +12471,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
     verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
-    verify_calibration_vision_projector_matches_catalog(
-        artifact,
-        vision_projector_path.as_deref(),
-    )?;
+    verify_calibration_sidecars_match_catalog(artifact, &artifact_sidecar_paths)?;
     let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
         &model.canary.set_id,
@@ -12285,12 +12512,8 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             Ok::<_, anyhow::Error>(report)
         })
         .transpose()?;
-    let mut backend = catalog_calibration_backend(
-        artifact,
-        &artifact_path,
-        vision_projector_path.as_deref(),
-        &args,
-    )?;
+    let mut backend =
+        catalog_calibration_backend(artifact, &artifact_path, &artifact_sidecar_paths, &args)?;
     let report = if let Some(mut report) = resume_core_report {
         report.endpoint_calibration =
             catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
@@ -13007,11 +13230,19 @@ fn catalog_endpoint_calibration_report(
     prompts: &[CanaryPrompt],
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
     run_endpoint_calibration_matrix(
         &model.adapter.endpoint_families,
         &substitutions,
         |contract, _case, request| {
-            catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)
+            let cache_key = (contract.family.clone(), stable_value_hash(request));
+            if let Some(execution) = execution_cache.get(&cache_key) {
+                return Ok(execution.clone());
+            }
+            let execution =
+                catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)?;
+            execution_cache.insert(cache_key, execution.clone());
+            Ok(execution)
         },
     )
 }
@@ -13220,6 +13451,7 @@ fn catalog_endpoint_calibration_execute(
         &sealed,
         None,
         Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+        &CancellationToken::new(),
     )
     .map_err(|error| format!("executing provider request: {error:#}"))?;
     let response = catalog_endpoint_calibration_response(&contract.family, request, &output)
@@ -13288,7 +13520,7 @@ fn catalog_endpoint_calibration_seal(
         "schema_version": 1,
         "endpoint_family": contract.family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(request),
         "transport_request_fingerprint": transport_fingerprint,
     });
     Ok(transport)
@@ -13479,10 +13711,13 @@ fn calibration_endpoint_attribute_is_handled(
                 | "prompt"
                 | "n"
                 | "size"
+                | "width"
+                | "height"
                 | "response_format"
                 | "negative_prompt"
                 | "steps"
                 | "cfg_scale"
+                | "shift"
                 | "seed"
                 | "scheduler"
         ),
@@ -13491,9 +13726,11 @@ fn calibration_endpoint_attribute_is_handled(
             "inputs"
                 | "parameters.guidance_scale"
                 | "parameters.negative_prompt"
+                | "parameters.num_images_per_prompt"
                 | "parameters.num_inference_steps"
                 | "parameters.width"
                 | "parameters.height"
+                | "parameters.shift"
                 | "parameters.scheduler"
                 | "parameters.seed"
         ),
@@ -13824,26 +14061,77 @@ fn verify_calibration_artifact_matches_catalog(
     Ok(())
 }
 
-fn verify_calibration_vision_projector_matches_catalog(
-    artifact: &catalog::CatalogArtifact,
+fn catalog_calibration_sidecar_paths(
+    assignments: &[String],
     vision_projector_path: Option<&Path>,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let mut paths = BTreeMap::new();
+    for assignment in assignments {
+        let (name, path) = assignment
+            .split_once('=')
+            .with_context(|| format!("invalid --artifact-sidecar {assignment:?}; use NAME=PATH"))?;
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+            "invalid --artifact-sidecar name {name:?}"
+        );
+        ensure!(
+            !path.trim().is_empty(),
+            "artifact sidecar {name} path is empty"
+        );
+        let path = absolutize(PathBuf::from(path))?;
+        ensure!(
+            paths.insert(name.to_owned(), path).is_none(),
+            "artifact sidecar {name} was supplied more than once"
+        );
+    }
+    if let Some(path) = vision_projector_path {
+        ensure!(
+            paths
+                .insert("mmproj".to_owned(), path.to_path_buf())
+                .is_none(),
+            "mmproj was supplied through both --vision-projector-path and --artifact-sidecar"
+        );
+    }
+    Ok(paths)
+}
+
+fn verify_calibration_sidecars_match_catalog(
+    artifact: &catalog::CatalogArtifact,
+    paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    match (artifact.sidecars.get("mmproj"), vision_projector_path) {
-        (Some(sidecar), Some(path)) => verify_calibration_bound_file(
+    for (name, path) in paths {
+        let sidecar = artifact.sidecars.get(name).with_context(|| {
+            format!("artifact sidecar {name} is not declared by the admin catalog artifact")
+        })?;
+        verify_calibration_bound_file(
             path,
             &sidecar.artifact_root_kind,
             &sidecar.artifact_root,
             sidecar.weights_bytes,
-            "vision projector",
-        ),
-        (Some(_), None) => bail!(
-            "catalog artifact declares an admin-bound mmproj; pass --vision-projector-path so calibration proves the image path"
-        ),
-        (None, Some(_)) => bail!(
-            "--vision-projector-path is only allowed when the catalog artifact declares the mmproj sidecar"
-        ),
-        (None, None) => Ok(()),
+            &format!("artifact sidecar {name}"),
+        )?;
     }
+    if artifact.sidecars.contains_key("mmproj") && !paths.contains_key("mmproj") {
+        bail!(
+            "catalog artifact declares an admin-bound mmproj; pass --vision-projector-path so calibration proves the image path"
+        );
+    }
+    if artifact
+        .stable_diffusion_cpp
+        .is_some_and(|config| config.separate_diffusion_model)
+    {
+        for required in ["text_encoder", "vae"] {
+            ensure!(
+                paths.contains_key(required),
+                "split stable-diffusion.cpp calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn verify_calibration_bound_file(
@@ -16174,6 +16462,17 @@ fn catalog_canary_calibration_plan_command(
         let path = catalog_canary_plan_sidecar_path(artifact_base, sidecar);
         push_plan_path_arg(&mut argv, "--vision-projector-path", &path);
     }
+    for (name, sidecar) in &artifact.sidecars {
+        if name == "mmproj" {
+            continue;
+        }
+        let path = catalog_canary_plan_sidecar_path(artifact_base, sidecar);
+        push_plan_value_arg(
+            &mut argv,
+            "--artifact-sidecar",
+            format!("{name}={}", path.display()),
+        );
+    }
     push_plan_value_arg(&mut argv, "--ctx-size", args.ctx_size.max(1).to_string());
     push_plan_value_arg(&mut argv, "--seed", args.seed.to_string());
     if let Some(threads) = args.threads {
@@ -16856,7 +17155,7 @@ fn canary_set_file_sha256(
 fn catalog_calibration_backend(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
-    vision_projector_path: Option<&Path>,
+    sidecar_paths: &BTreeMap<String, PathBuf>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
     let managed_runtime = if matches!(artifact.engine.as_str(), "mlx" | "trt-llm" | "vllm") {
@@ -16910,13 +17209,38 @@ fn catalog_calibration_backend(
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
     }
-    if let Some(path) = vision_projector_path {
+    if let Some(path) = sidecar_paths.get("mmproj") {
         let sidecar = artifact
             .sidecars
             .get("mmproj")
             .context("verified vision projector is missing its catalog sidecar")?;
         config.vision_projector =
             Some(ModelArtifact::gguf(path).with_sha256(sidecar.source_sha256.clone()));
+    }
+    if artifact.engine == "stable-diffusion.cpp" {
+        config.stable_diffusion_cpp = artifact
+            .stable_diffusion_cpp
+            .context("stable-diffusion.cpp calibration is missing signed runtime semantics")?;
+        if let Some(path) = sidecar_paths.get("text_encoder") {
+            let sidecar = artifact
+                .sidecars
+                .get("text_encoder")
+                .context("verified text_encoder is missing its catalog sidecar")?;
+            config.stable_diffusion_llm = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+        if let Some(path) = sidecar_paths.get("vae") {
+            let sidecar = artifact
+                .sidecars
+                .get("vae")
+                .context("verified VAE is missing its catalog sidecar")?;
+            config.stable_diffusion_vae = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
     }
 
     match artifact.engine.as_str() {
@@ -17081,10 +17405,14 @@ fn calibrate_token_canary_prompt_with_speciality(
     let max_tokens = request.max_new_tokens;
     let mut token_ids = Vec::new();
     let output = backend
-        .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
-            token_ids.push(chunk.token_id);
-            Ok(())
-        })
+        .generate(
+            request,
+            &mut |chunk: mayhem_engine::TokenChunk| {
+                token_ids.push(chunk.token_id);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating canary prompt {}", prompt.id))?;
     if token_ids.is_empty() {
         bail!("canary prompt {} produced no tokens", prompt.id);
@@ -17133,12 +17461,17 @@ fn calibrate_image_perceptual_hash_prompt(
     }
     request.steps = prompt.steps.unwrap_or(1).max(1);
     request.guidance_scale = prompt.cfg_scale.unwrap_or(1.0);
+    request.flow_shift = prompt.shift;
     let mut artifacts = Vec::new();
     backend
-        .generate_image(request, &mut |chunk: ArtifactChunk| {
-            artifacts.push(chunk);
-            Ok(())
-        })
+        .generate_image(
+            request,
+            &mut |chunk: ArtifactChunk| {
+                artifacts.push(chunk);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating image canary prompt {}", prompt.id))?;
     let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
     let artifact = artifacts
@@ -17195,7 +17528,10 @@ fn calibrate_embedding_cosine_prompt(
     let input = canary_prompt_text(prompt)?;
     let input_bytes = u64::try_from(input.len()).unwrap_or(u64::MAX);
     let output = backend
-        .embed(mayhem_engine::EmbeddingRequest::new(input))
+        .embed(
+            mayhem_engine::EmbeddingRequest::new(input),
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
     let vector = output
         .embeddings
@@ -17249,7 +17585,7 @@ fn calibrate_transcript_match_prompt(
     let audio_bytes = u64::try_from(request.audio.len()).unwrap_or(u64::MAX);
     let measured_audio_seconds = wav_duration_seconds_ceil(&request.audio).unwrap_or(1);
     let output = backend
-        .transcribe(request)
+        .transcribe(request, &CancellationToken::new())
         .with_context(|| format!("transcribing canary prompt {}", prompt.id))?;
     if output.text.trim().is_empty() {
         bail!(
@@ -17307,10 +17643,14 @@ fn calibrate_audio_fingerprint_prompt(
     };
     let mut artifacts = Vec::new();
     let speech = backend
-        .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
-            artifacts.push(chunk);
-            Ok(())
-        })
+        .synthesize_speech(
+            request,
+            &mut |chunk: ArtifactChunk| {
+                artifacts.push(chunk);
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
         .with_context(|| format!("synthesizing TTS canary prompt {}", prompt.id))?;
     let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
     let artifact = artifacts
@@ -17841,6 +18181,14 @@ async fn admin(command: AdminCommands) -> Result<()> {
             )
             .await;
         }
+        AdminCommands::TapDepositReversal(args) => {
+            return run_admin_deposit_feature(
+                &args.tx,
+                "tapDepositReversal",
+                admin_tap_deposit_reversal_payload(args),
+            )
+            .await;
+        }
         AdminCommands::FiatDeposit(args) => {
             return run_admin_deposit_feature(
                 &args.tx,
@@ -17866,6 +18214,9 @@ async fn admin(command: AdminCommands) -> Result<()> {
         }
         AdminCommands::FiatSettlement(args) => {
             return run_admin_fiat_settlement_feature(args).await;
+        }
+        AdminCommands::FiatDustSweep(args) => {
+            return run_admin_fiat_dust_sweep_feature(args).await;
         }
         AdminCommands::ReputationAnchor(args) => {
             return run_admin_reputation_anchor(args).await;
@@ -19288,7 +19639,7 @@ async fn build_reputation_anchor_feature(
     epoch: u64,
     at: u64,
 ) -> Result<ReputationAnchorReport> {
-    let provider_record = read_state_value(rpc, &format!("prov/{provider}"))
+    let _provider_record = read_state_value(rpc, &format!("prov/{provider}"))
         .await?
         .with_context(|| format!("provider {provider} is not registered"))?;
     let head_record = read_state_value(rpc, &format!("ev/rep/head/{provider}"))
@@ -19300,32 +19651,38 @@ async fn build_reputation_anchor_feature(
         .filter(|head| is_hex_len(head, 64))
         .with_context(|| format!("provider {provider} reputation head is invalid"))?
         .to_owned();
-    let mut event_entries = read_prefix_entries(rpc, &format!("ev/rep/{provider}/"))
+    let fold = read_state_value(rpc, &format!("ev/rep/fold/{provider}"))
         .await?
-        .into_iter()
-        .filter(|entry| entry.key != format!("ev/rep/head/{provider}"))
-        .collect::<Vec<_>>();
-    event_entries.sort_by(|left, right| {
-        reputation_event_sort_key(left)
-            .cmp(&reputation_event_sort_key(right))
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    let events = event_entries
-        .iter()
-        .map(contract_reputation_event_to_fold_event)
-        .collect::<Result<Vec<_>>>()?;
-    if events.is_empty() {
+        .with_context(|| format!("provider {provider} has no contract reputation fold"))?;
+    let fold_provider = fold
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("contract reputation fold missing provider")?;
+    if fold_provider != provider {
+        bail!("contract reputation fold provider mismatch");
+    }
+    let fold_head = fold
+        .get("events_head")
+        .and_then(Value::as_str)
+        .context("contract reputation fold missing events_head")?;
+    if fold_head != events_head {
+        bail!("contract reputation fold head mismatch");
+    }
+    let event_count = fold
+        .get("event_count")
+        .and_then(Value::as_u64)
+        .context("contract reputation fold missing event_count")?;
+    if event_count == 0 {
         bail!("provider {provider} has no reputation events to fold");
     }
-
-    let policy = read_reputation_probation_policy(rpc, at).await?;
-    let probation_since = provider_record
-        .get("probation")
-        .and_then(|probation| probation.get("since_seconds"))
+    let head_count = head_record
+        .get("count")
         .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let folded = fold_reputation(provider, &events, at, epoch, probation_since, 0, &policy)
-        .context("folding reputation events")?;
+        .context("provider reputation head missing count")?;
+    if event_count != head_count {
+        bail!("contract reputation fold count mismatch");
+    }
+    let folded = contract_reputation_fold_at(&fold, at)?;
     let value = reputation_anchor_payload(
         provider,
         epoch,
@@ -19333,7 +19690,7 @@ async fn build_reputation_anchor_feature(
         &events_head,
         folded.r_bps,
         folded.raw_milli,
-        folded.probation.successful_sessions,
+        folded.successful_sessions,
         folded.provenance_violation,
     );
     let key = reputation_anchor_feature_key(&value)?;
@@ -19346,13 +19703,15 @@ async fn build_reputation_anchor_feature(
     let previous = read_state_value(rpc, &format!("rep/{provider}")).await?;
     Ok(ReputationAnchorReport {
         provider: provider.to_owned(),
-        event_count: events.len(),
+        event_count: event_count
+            .try_into()
+            .context("reputation event count exceeds usize")?,
         events_head,
         previous,
         snapshot: json!({
             "r_bps": folded.r_bps,
             "raw_milli": folded.raw_milli,
-            "successful_sessions": folded.probation.successful_sessions,
+            "successful_sessions": folded.successful_sessions,
             "provenance_violation": folded.provenance_violation,
             "folded_at": at,
             "epoch": epoch,
@@ -19416,139 +19775,69 @@ fn reputation_anchor_feature_key(value: &Value) -> Result<String> {
     Ok(format!("rep/{provider}/{epoch}/{digest}"))
 }
 
-fn contract_reputation_event_to_fold_event(entry: &PrefixStateEntry) -> Result<ReputationEvent> {
-    let value = &entry.value;
-    let provider = value
-        .get("provider")
+struct ContractReputationFold {
+    r_bps: u32,
+    raw_milli: i64,
+    successful_sessions: u64,
+    provenance_violation: bool,
+}
+
+fn contract_reputation_fold_at(fold: &Value, folded_at: u64) -> Result<ContractReputationFold> {
+    const HALF_LIFE_SECONDS: u64 = 14 * 24 * 60 * 60;
+    const DECAY_PICO_SCALE: i128 = 1_000_000_000_000;
+    const RAW_NANO_PER_MILLI: i128 = 1_000_000;
+
+    let mut raw_nano = fold
+        .get("raw_nano")
         .and_then(Value::as_str)
-        .with_context(|| format!("{} missing provider", entry.key))?
-        .to_owned();
-    let event_id = value
-        .get("event_id")
-        .and_then(Value::as_str)
-        .with_context(|| format!("{} missing event_id", entry.key))?
-        .to_owned();
-    let epoch = value
-        .get("epoch")
-        .and_then(Value::as_u64)
-        .with_context(|| format!("{} missing epoch", entry.key))?;
-    let at_seconds = value
+        .context("contract reputation fold missing raw_nano")?
+        .parse::<i128>()
+        .context("contract reputation fold has invalid raw_nano")?;
+    let fold_at = fold
         .get("at")
         .and_then(Value::as_u64)
-        .with_context(|| format!("{} missing at", entry.key))?;
-    let evidence_hash = value
-        .get("evidence_hash")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let kind = match value
-        .get("kind")
-        .and_then(Value::as_str)
-        .with_context(|| format!("{} missing kind", entry.key))?
-    {
-        "session_ok" => ReputationEventKind::SessionOk {
-            paid_au: value
-                .get("paid_au")
-                .and_then(value_money_au)
-                .with_context(|| format!("{} session_ok missing paid_au", entry.key))?,
-        },
-        "session_partial" => ReputationEventKind::SessionPartial {
-            paid_au: value
-                .get("paid_au")
-                .and_then(value_money_au)
-                .with_context(|| format!("{} session_partial missing paid_au", entry.key))?,
-        },
-        "session_fail" => ReputationEventKind::SessionFail {
-            max_spend_au: value
-                .get("max_spend_au")
-                .and_then(value_money_au)
-                .with_context(|| format!("{} session_fail missing max_spend_au", entry.key))?,
-        },
-        "probe_ok" => ReputationEventKind::ProbeOk,
-        "probe_fail" => ReputationEventKind::ProbeFail,
-        "uptime_tick" => ReputationEventKind::UptimeTick,
-        "underdelivery" => ReputationEventKind::Underdelivery,
-        "dispute_lost" => ReputationEventKind::DisputeLost,
-        "provenance_violation" => ReputationEventKind::ProvenanceViolation,
-        other => bail!(
-            "{} has unsupported reputation event kind {other}",
-            entry.key
-        ),
-    };
-    Ok(ReputationEvent {
-        provider,
-        event_id,
-        epoch,
-        at_seconds,
-        evidence_hash,
-        kind,
+        .context("contract reputation fold missing at")?;
+    if folded_at < fold_at {
+        bail!("reputation folded_at precedes the latest event");
+    }
+    let decay = 2.0_f64.powf(-((folded_at - fold_at) as f64 / HALF_LIFE_SECONDS as f64));
+    let decay_pico = (decay * DECAY_PICO_SCALE as f64).round() as i128;
+    raw_nano = round_signed_ratio_i128(
+        raw_nano
+            .checked_mul(decay_pico)
+            .context("contract reputation decay overflow")?,
+        DECAY_PICO_SCALE,
+    )?;
+    let raw_milli_i128 = round_signed_ratio_i128(raw_nano, RAW_NANO_PER_MILLI)?;
+    let raw_milli = i64::try_from(raw_milli_i128).context("reputation raw_milli overflow")?;
+    let raw = raw_milli as f64 / 1_000.0;
+    let r = 1.0 / (1.0 + (-raw / 25.0).exp());
+    let r_bps = (r * 10_000.0).round().clamp(0.0, 10_000.0) as u32;
+    Ok(ContractReputationFold {
+        r_bps,
+        raw_milli,
+        successful_sessions: fold
+            .get("successful_sessions")
+            .and_then(Value::as_u64)
+            .context("contract reputation fold missing successful_sessions")?,
+        provenance_violation: fold
+            .get("provenance_violation")
+            .and_then(Value::as_bool)
+            .context("contract reputation fold missing provenance_violation")?,
     })
 }
 
-fn reputation_event_sort_key(entry: &PrefixStateEntry) -> (u64, u64, String) {
-    (
-        entry
-            .value
-            .get("epoch")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
-        entry
-            .value
-            .get("at")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
-        entry
-            .value
-            .get("event_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-    )
-}
-
-async fn read_reputation_probation_policy(rpc: &PeerRpcClient, at: u64) -> Result<ProbationPolicy> {
-    let default = ProbationPolicy::default();
-    let default_caps = ProbationCaps::default();
-    Ok(ProbationPolicy {
-        required_successful_sessions: read_param_u64_at(
-            rpc,
-            "probation_successful_sessions",
-            default.required_successful_sessions,
-            at,
-        )
-        .await?,
-        required_seconds: read_param_u64_at(rpc, "probation_seconds", default.required_seconds, at)
-            .await?,
-        caps: ProbationCaps {
-            max_concurrent_sessions_per_user: read_param_u64_at(
-                rpc,
-                "probation_max_concurrent_sessions_per_user",
-                u64::from(default_caps.max_concurrent_sessions_per_user),
-                at,
-            )
-            .await?
-            .try_into()
-            .context("probation_max_concurrent_sessions_per_user exceeds u32")?,
-            price_max_bps: read_param_u64_at(
-                rpc,
-                "probation_price_max_bps",
-                u64::from(default_caps.price_max_bps),
-                at,
-            )
-            .await?
-            .try_into()
-            .context("probation_price_max_bps exceeds u32")?,
-            weight_bps: read_param_u64_at(
-                rpc,
-                "probation_weight_bps",
-                u64::from(default_caps.weight_bps),
-                at,
-            )
-            .await?
-            .try_into()
-            .context("probation_weight_bps exceeds u32")?,
-        },
-    })
+fn round_signed_ratio_i128(value: i128, divisor: i128) -> Result<i128> {
+    if divisor <= 0 {
+        bail!("signed ratio divisor must be positive");
+    }
+    let negative = value < 0;
+    let absolute = value.checked_abs().context("signed ratio overflow")?;
+    let rounded = absolute
+        .checked_add(divisor / 2)
+        .context("signed ratio overflow")?
+        / divisor;
+    Ok(if negative { -rounded } else { rounded })
 }
 
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
@@ -19592,13 +19881,16 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
             unreachable!("admin tier3 commands are handled before admin_tx_args")
         }
         AdminCommands::AuditorRegister(args) => &args.tx,
+        AdminCommands::AuditorSlash(args) => &args.tx,
         AdminCommands::ReputationAnchor(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TapRateOracle(args) => &args.tx,
         AdminCommands::TnkSettlement(args) => &args.tx,
         AdminCommands::FiatSettlement(args) => &args.tx,
+        AdminCommands::FiatDustSweep(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::TapDeposit(args) => &args.tx,
+        AdminCommands::TapDepositReversal(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::PayoutConfirm(args) => &args.tx,
@@ -19682,6 +19974,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
         }
+        AdminCommands::AuditorSlash(args) => {
+            Ok(("auditorSlash", admin_auditor_slash_payload(args)?))
+        }
         AdminCommands::ReputationAnchor(_) => {
             bail!("reputation anchors are free features, not paid admin txs")
         }
@@ -19694,8 +19989,15 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::FiatSettlement(_) => {
             bail!("fiat settlement updates are free features, not paid admin txs")
         }
+        AdminCommands::FiatDustSweep(_) => {
+            bail!("fiat dust sweeps are free features, not paid admin txs")
+        }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
+        AdminCommands::TapDepositReversal(args) => Ok((
+            "tapDepositReversal",
+            admin_tap_deposit_reversal_payload(args),
+        )),
         AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
         AdminCommands::FiatChargeback(args) => {
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
@@ -19915,10 +20217,20 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
                 bytes,
                 canary_max_bytes
             );
+            let prompt_ids = load_canary_prompts_checked(
+                Some(&canaries_dir),
+                set_id,
+                None,
+                false,
+            )?
+            .into_iter()
+            .map(|prompt| prompt.id)
+            .collect::<Vec<_>>();
             Ok(json!({
                 "set_id": set_id,
                 "url": catalog_release_url_join(&args.canaries_base_url, &format!("{set_id}.json"))?,
                 "hash": blake3_file_hex(&path)?,
+                "prompt_ids": prompt_ids,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -20825,6 +21137,31 @@ fn admin_auditor_register_payload(args: &AdminAuditorRegisterArgs) -> Value {
     })
 }
 
+fn admin_auditor_slash_payload(args: &AdminAuditorSlashArgs) -> Result<Value> {
+    if !is_hex_len(&args.auditor, 64) {
+        bail!("--auditor must be a 32-byte hexadecimal public key");
+    }
+    if !is_hex_len(&args.provider, 64) {
+        bail!("--provider must be a 32-byte hexadecimal public key");
+    }
+    if !is_safe_key_part(&args.probe_id) {
+        bail!("--probe-id is not a safe contract key component");
+    }
+    if !is_hex_len(&args.evidence_hash, 64) {
+        bail!("--evidence-hash must be a 32-byte hexadecimal digest");
+    }
+    Ok(json!({
+        "op": "auditor_slash",
+        "auditor": args.auditor.to_ascii_lowercase(),
+        "provider": args.provider.to_ascii_lowercase(),
+        "probe_id": &args.probe_id,
+        "epoch": args.epoch,
+        "reason": args.reason.as_str(),
+        "evidence_hash": args.evidence_hash.to_ascii_lowercase(),
+        "at": args.at.unwrap_or(unix_epoch_seconds()?),
+    }))
+}
+
 fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
     json!({
         "op": "rate_oracle",
@@ -20870,9 +21207,6 @@ fn admin_fiat_settlement_payload(args: &AdminFiatSettlementArgs) -> Result<Value
 }
 
 async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
-    if args.submit_transfer && !args.msb_tx_hashes.is_empty() {
-        bail!("pass only one of --submit-transfer or --msb-tx-hash");
-    }
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
     }
@@ -20894,6 +21228,9 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    if args.tx.submit || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let treasury_address =
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
@@ -20902,12 +21239,6 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
     let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
     let manifest_path = tnk_settlement_manifest_path(&home, &network, epoch);
-    let provided_msb_tx_hashes = args
-        .msb_tx_hashes
-        .iter()
-        .map(|hash| validate_msb_tx_hash(hash))
-        .collect::<Result<Vec<_>>>()?;
-
     let mut plan = build_tnk_settlement_plan(
         &rpc,
         epoch,
@@ -20915,11 +21246,6 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         &network,
         &treasury_address,
         &operator_tnk_address,
-        if provided_msb_tx_hashes.is_empty() {
-            None
-        } else {
-            Some(provided_msb_tx_hashes.as_slice())
-        },
         args.submit_transfer.then_some(manifest_path.as_path()),
     )
     .await?;
@@ -20939,16 +21265,16 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hashes")
+            .get("msb_transfers")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
         && args.tx.submit
         && !args.submit_transfer
     {
-        bail!("--submit requires one --msb-tx-hash per output or --submit-transfer for TNK settlement evidence");
+        bail!("--submit requires --submit-transfer so the embedded MSB reader can confirm every TNK settlement output");
     }
 
-    let mut msb_transfers = Vec::new();
+    let mut msb_transfer_results = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
         let manifest = settlement_manifest
             .as_ref()
@@ -20979,7 +21305,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             );
         }
         let (stores_directory, store_name) = msb_store_from_keypair_path(keypair_path)?;
-        let mut hashes = Vec::with_capacity(plan.msb_outputs.len());
+        let mut evidence = Vec::with_capacity(plan.msb_outputs.len());
         for (index, output) in plan.msb_outputs.iter().enumerate() {
             let operation_id = tnk_settlement_output_operation_id(manifest, index, output);
             let journal_path = tnk_settlement_output_journal_path(manifest_path, &operation_id)?;
@@ -21019,24 +21345,42 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                     index + 1
                 );
             }
-            hashes.push(transfer.tx_hash.clone());
-            msb_transfers.push(json!({
+            let confirmed_length = transfer
+                .confirmed_length
+                .context("embedded MSB reader did not return the confirmed transfer length")?;
+            let observed_signed_length = transfer
+                .observed_signed_length
+                .context("embedded MSB reader did not return its observed signed length")?;
+            if confirmed_length == 0 || observed_signed_length < confirmed_length {
+                bail!("embedded MSB reader returned invalid transfer confirmation evidence");
+            }
+            evidence.push(json!({
+                "schema_version": 1,
+                "network": network,
+                "tx_hash": transfer.tx_hash.clone(),
+                "confirmed_length": confirmed_length,
+                "observed_signed_length": observed_signed_length,
+                "from": transfer.from.clone(),
+                "to": transfer.to.clone(),
+                "amount_e18": output.amount_e18.clone(),
+            }));
+            msb_transfer_results.push(json!({
                 "output_index": index,
                 "operation_id": operation_id,
                 "journal_file": journal_path,
                 "transfer": transfer,
             }));
         }
-        plan.payload["msb_tx_hashes"] = json!(hashes);
+        plan.payload["msb_transfers"] = json!(evidence);
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hashes")
+            .get("msb_transfers")
             .and_then(Value::as_array)
-            .is_some_and(|hashes| hashes.len() == plan.msb_outputs.len() && !hashes.is_empty())
+            .is_some_and(|items| items.len() == plan.msb_outputs.len() && !items.is_empty())
     {
         Some(json!({
             "feature": "mayhem",
@@ -21058,8 +21402,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             bail!("TNK settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
-        let expected_hashes = settlement_report
-            .get("msb_tx_hashes")
+        let expected_transfers = settlement_report
+            .get("msb_transfers")
             .cloned()
             .unwrap_or(Value::Null);
         let expected_root = settlement_report
@@ -21068,7 +21412,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .unwrap_or(Value::Null);
         settlement_state = Some(
             wait_for_state(&rpc, &format!("settle/tnk/{epoch}"), |value| {
-                value.get("msb_tx_hashes") == Some(&expected_hashes)
+                value.get("msb_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             })
@@ -21172,7 +21516,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         "feature": feature,
         "feature_result": feature_result,
         "settlement_state": settlement_state,
-        "msb_transfers": msb_transfers,
+        "msb_transfers": msb_transfer_results,
         "msb_outputs": plan.msb_outputs,
         "skipped_providers": plan.skipped_providers,
         "copy_paste": {
@@ -21199,10 +21543,28 @@ async fn run_admin_fiat_settlement_feature(args: &AdminFiatSettlementArgs) -> Re
     run_admin_fiat_settlement_runner(args).await
 }
 
-async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
-    if args.submit_transfer && !args.stripe_refs.is_empty() {
-        bail!("pass only one of --submit-transfer or --stripe-ref");
+async fn run_admin_fiat_dust_sweep_feature(args: &AdminFiatDustSweepArgs) -> Result<()> {
+    let value = admin_fiat_dust_sweep_payload(args)?;
+    let key = fiat_dust_sweep_feature_key(&value)?;
+    run_admin_feature_command(&args.tx, "fiatDustSweep", key, value).await
+}
+
+fn admin_fiat_dust_sweep_payload(args: &AdminFiatDustSweepArgs) -> Result<Value> {
+    if !is_hex_len(&args.provider, 64) || args.provider != args.provider.to_ascii_lowercase() {
+        bail!("--provider must be a lowercase 32-byte provider key");
     }
+    if args.epoch == 0 {
+        bail!("--epoch must be positive");
+    }
+    Ok(json!({
+        "op": "fiat_dust_sweep",
+        "provider": args.provider,
+        "epoch": args.epoch,
+        "at": args.at,
+    }))
+}
+
+async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
     }
@@ -21222,44 +21584,31 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         bail!("--epoch must be positive");
     }
     let at = args.at.unwrap_or(now_unix_seconds()?);
-    let operator_to =
-        normalize_fiat_settlement_ref(&args.operator_stripe_account, "operator Stripe account")?;
+    let operator_to = args.operator_stripe_account.trim().to_owned();
+    if !is_safe_key_part(&operator_to) {
+        bail!("operator Stripe account is not contract-safe");
+    }
     let operator_currency = normalize_admin_fiat_currency(&args.operator_currency)?;
-    let provided_refs = args
-        .stripe_refs
-        .iter()
-        .map(|value| normalize_fiat_settlement_ref(value, "Stripe reference"))
-        .collect::<Result<Vec<_>>>()?;
-
     let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    if args.tx.submit || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let mut plan = build_fiat_settlement_plan(
-        &rpc,
-        epoch,
-        at,
-        &operator_to,
-        &operator_currency,
-        args.operator_stripe_ref.as_deref(),
-        if provided_refs.is_empty() {
-            None
-        } else {
-            Some(provided_refs.as_slice())
-        },
-    )
-    .await?;
+    let mut plan =
+        build_fiat_settlement_plan(&rpc, epoch, at, &operator_to, &operator_currency).await?;
 
     if plan.already_settled.is_none()
         && plan
             .payload
-            .get("stripe_refs")
+            .get("stripe_transfers")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
         && args.tx.submit
         && !args.submit_transfer
     {
-        bail!("--submit requires one --stripe-ref per output or --submit-transfer for provider Stripe transfer evidence");
+        bail!("--submit requires --submit-transfer so every provider payout is retrieved and verified from Stripe");
     }
 
     let mut stripe_transfers = Vec::new();
@@ -21283,7 +21632,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             stripe_transfer_runtime_is_mainnet()?,
         )?;
         let client = reqwest::Client::new();
-        let mut refs = Vec::with_capacity(plan.stripe_outputs.len());
+        let mut evidence = Vec::with_capacity(plan.stripe_outputs.len());
         for (index, output) in plan.stripe_outputs.iter().enumerate() {
             if output.role == "provider" {
                 let account = stripe_connect_payout_status(
@@ -21358,30 +21707,42 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         index + 1
                     );
                 }
-                refs.push(transfer.id.clone());
+                evidence.push(json!({
+                    "schema_version": 1,
+                    "kind": "stripe_transfer",
+                    "ref": transfer.id.clone(),
+                    "destination": transfer.destination.clone(),
+                    "currency": transfer.currency.clone(),
+                    "amount_minor": transfer.amount_minor.to_string(),
+                    "transfer_group": transfer.transfer_group.clone(),
+                }));
                 stripe_transfers.push(json!({
                     "output_index": index,
                     "account": account,
                     "transfer": transfer,
                 }));
             } else {
-                refs.push(operator_fiat_settlement_ref(
-                    args.operator_stripe_ref.as_deref(),
-                    epoch,
-                    &plan.epoch_apply_hash,
-                )?);
+                evidence.push(json!({
+                    "schema_version": 1,
+                    "kind": "platform_balance",
+                    "ref": operator_fiat_settlement_ref(epoch, &plan.epoch_apply_hash),
+                    "destination": output.to,
+                    "currency": output.currency,
+                    "amount_minor": output.amount_minor.to_string(),
+                    "transfer_group": null,
+                }));
             }
         }
-        plan.payload["stripe_refs"] = json!(refs);
+        plan.payload["stripe_transfers"] = json!(evidence);
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("stripe_refs")
+            .get("stripe_transfers")
             .and_then(Value::as_array)
-            .is_some_and(|refs| refs.len() == plan.stripe_outputs.len() && !refs.is_empty())
+            .is_some_and(|items| items.len() == plan.stripe_outputs.len() && !items.is_empty())
     {
         Some(json!({
             "feature": "mayhem",
@@ -21403,8 +21764,8 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             bail!("fiat settlement feature was not accepted: {submitted}");
         }
         feature_result = Some(submitted);
-        let expected_refs = settlement_report
-            .get("stripe_refs")
+        let expected_transfers = settlement_report
+            .get("stripe_transfers")
             .cloned()
             .unwrap_or(Value::Null);
         let expected_root = settlement_report
@@ -21413,7 +21774,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .unwrap_or(Value::Null);
         settlement_state = Some(
             wait_for_state(&rpc, &format!("settle/fiat/{epoch}"), |value| {
-                value.get("stripe_refs") == Some(&expected_refs)
+                value.get("stripe_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             })
@@ -21534,8 +21895,16 @@ fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     json!({
         "op": "tnk_deposit",
         "memo_hash": &args.memo_hash,
-        "tnk_e18": &args.tnk_e18,
-        "msb_tx_hash": &args.msb_tx_hash,
+        "msb_transfer": {
+            "schema_version": 1,
+            "network": &args.msb_network,
+            "tx_hash": &args.msb_tx_hash,
+            "confirmed_length": args.msb_confirmed_length,
+            "observed_signed_length": args.msb_observed_signed_length,
+            "from": &args.msb_from,
+            "to": &args.msb_to,
+            "amount_e18": &args.tnk_e18,
+        },
         "epoch": args.epoch,
         "at": args.at,
     })
@@ -21557,6 +21926,26 @@ fn admin_tap_deposit_payload(args: &AdminTapDepositArgs) -> Value {
         "confirmation_policy": &args.confirmation_policy,
         "event_signature": &args.event_signature,
         "watcher_id": &args.watcher_id,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
+fn admin_tap_deposit_reversal_payload(args: &AdminTapDepositReversalArgs) -> Value {
+    json!({
+        "op": "tap_deposit_reversal",
+        "chain_id": args.chain_id,
+        "pool_address": &args.pool_address,
+        "eth_tx_hash": &args.eth_tx_hash,
+        "log_index": args.log_index,
+        "block_number": args.block_number,
+        "block_hash": &args.block_hash,
+        "reconciliation_from_block": args.reconciliation_from_block,
+        "reconciliation_to_block": args.reconciliation_to_block,
+        "finalized_block_number": args.finalized_block_number,
+        "confirmation_policy": &args.confirmation_policy,
+        "watcher_id": &args.watcher_id,
+        "reason": &args.reason,
         "epoch": args.epoch,
         "at": args.at,
     })
@@ -21739,17 +22128,39 @@ fn deposit_feature_key(value: &Value) -> Result<String> {
                 .context("tnk_deposit feature missing memo_hash")?;
             Ok(format!("dep/tnk/{memo_hash}/{digest}"))
         }
-        "tap_deposit" => {
+        "tap_deposit" | "tap_deposit_reversal" => {
+            let chain_id = value
+                .get("chain_id")
+                .and_then(Value::as_u64)
+                .context("tap_deposit feature missing chain_id")?;
+            let pool_address = value
+                .get("pool_address")
+                .and_then(Value::as_str)
+                .context("tap_deposit feature missing pool_address")?;
             let eth_tx_hash = value
                 .get("eth_tx_hash")
                 .and_then(Value::as_str)
-                .context("tap_deposit feature missing eth_tx_hash")?
-                .to_ascii_lowercase();
+                .context("tap_deposit feature missing eth_tx_hash")?;
             let log_index = value
                 .get("log_index")
                 .and_then(Value::as_u64)
                 .context("tap_deposit feature missing log_index")?;
-            Ok(format!("dep/tap/{eth_tx_hash}/{log_index}/{digest}"))
+            let block_hash = value
+                .get("block_hash")
+                .and_then(Value::as_str)
+                .context("tap_deposit feature missing block_hash")?;
+            let identity = tap_deposit_identity_key(
+                chain_id,
+                pool_address,
+                eth_tx_hash,
+                log_index,
+                block_hash,
+            )?;
+            if op == "tap_deposit_reversal" {
+                Ok(format!("{identity}/reversal"))
+            } else {
+                Ok(identity)
+            }
         }
         "fiat_deposit" => {
             let ext_ref_hash = value
@@ -21805,6 +22216,24 @@ fn fiat_settlement_feature_key(value: &Value) -> Result<String> {
         "value": value,
     }));
     Ok(format!("settle/fiat/{epoch}/{digest}"))
+}
+
+fn fiat_dust_sweep_feature_key(value: &Value) -> Result<String> {
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|provider| is_hex_len(provider, 64))
+        .context("fiat dust sweep feature payload missing provider")?;
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .context("fiat dust sweep feature payload missing epoch")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-fiat-dust-sweep-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("settle/fiat-dust/{provider}/{epoch}/{digest}"))
 }
 
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
@@ -22221,12 +22650,12 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
     if !report["already_settled"].is_null() {
         println!("Already settled: true");
-        let hashes = report["already_settled"]["msb_tx_hashes"]
+        let transfers = report["already_settled"]["msb_transfers"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0);
-        if hashes > 0 {
-            println!("MSB tx hashes: {hashes}");
+        if transfers > 0 {
+            println!("Confirmed MSB transfers: {transfers}");
         }
         return Ok(());
     }
@@ -22250,19 +22679,19 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
             "Transfer root: {}",
             settlement["transfer_root"].as_str().unwrap_or("")
         );
-        if let Some(hashes) = settlement["msb_tx_hashes"].as_array() {
-            if hashes.is_empty() {
-                println!("MSB tx hashes: pending (dry plan only)");
+        if let Some(transfers) = settlement["msb_transfers"].as_array() {
+            if transfers.is_empty() {
+                println!("Confirmed MSB transfers: pending (dry plan only)");
             } else {
-                println!("MSB tx hashes: {}", hashes.len());
-                for (index, hash) in hashes.iter().enumerate() {
-                    if let Some(hash) = hash.as_str() {
+                println!("Confirmed MSB transfers: {}", transfers.len());
+                for (index, transfer) in transfers.iter().enumerate() {
+                    if let Some(hash) = transfer.get("tx_hash").and_then(Value::as_str) {
                         println!("  {}: {}", index + 1, hash);
                     }
                 }
             }
         } else {
-            println!("MSB tx hashes: pending (dry plan only)");
+            println!("Confirmed MSB transfers: pending (dry plan only)");
         }
     }
     println!(
@@ -22315,12 +22744,12 @@ fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
     if !report["already_settled"].is_null() {
         println!("Already settled: true");
-        let refs = report["already_settled"]["stripe_refs"]
+        let transfers = report["already_settled"]["stripe_transfers"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0);
-        if refs > 0 {
-            println!("Stripe refs: {refs}");
+        if transfers > 0 {
+            println!("Confirmed Stripe records: {transfers}");
         }
         return Ok(());
     }
@@ -22340,19 +22769,19 @@ fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
             "Transfer root: {}",
             settlement["transfer_root"].as_str().unwrap_or("")
         );
-        if let Some(refs) = settlement["stripe_refs"].as_array() {
-            if refs.is_empty() {
-                println!("Stripe refs: pending (dry plan only)");
+        if let Some(transfers) = settlement["stripe_transfers"].as_array() {
+            if transfers.is_empty() {
+                println!("Confirmed Stripe records: pending (dry plan only)");
             } else {
-                println!("Stripe refs: {}", refs.len());
-                for (index, reference) in refs.iter().enumerate() {
-                    if let Some(reference) = reference.as_str() {
+                println!("Confirmed Stripe records: {}", transfers.len());
+                for (index, transfer) in transfers.iter().enumerate() {
+                    if let Some(reference) = transfer.get("ref").and_then(Value::as_str) {
                         println!("  {}: {}", index + 1, reference);
                     }
                 }
             }
         } else {
-            println!("Stripe refs: pending (dry plan only)");
+            println!("Confirmed Stripe records: pending (dry plan only)");
         }
     }
     println!(
@@ -22485,6 +22914,13 @@ struct CanonicalPaymentState {
     tnk_rate: CanonicalTnkRate,
     rate_staleness_seconds: u64,
     observed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TnkFundTrustAnchor {
+    source: &'static str,
+    admin_peer_pubkey: String,
+    treasury_address: String,
 }
 
 async fn deposit_command(command: DepositCommands) -> Result<()> {
@@ -22719,6 +23155,12 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         .unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    if args.confirm {
+        require_secure_fund_rpc_url(&peer_rpc_url)?;
+        if let Some(eth_rpc) = args.eth_rpc.as_deref() {
+            require_secure_fund_rpc_url(eth_rpc)?;
+        }
+    }
     let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
     let payment_state = read_canonical_payment_state(&peer_rpc).await?;
     let tap = payment_state.payments.tap.clone();
@@ -22975,7 +23417,21 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     };
     let (tap_log_index, tap_seen) = match args.eth_tx_hash.as_deref() {
         Some(hash) => {
-            read_tap_deposit_confirmation(&rpc, hash, args.log_index, &balance_who).await?
+            let payments: CanonicalPayments = serde_json::from_value(
+                read_state_value(&rpc, "payments/current")
+                    .await?
+                    .context("payments/current is required to identify a TAP deposit")?,
+            )
+            .context("payments/current has an invalid schema")?;
+            read_tap_deposit_confirmation(
+                &rpc,
+                payments.tap.chain_id,
+                &payments.tap.pool_address,
+                hash,
+                args.log_index,
+                &balance_who,
+            )
+            .await?
         }
         None => (None, None),
     };
@@ -23060,6 +23516,12 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         .unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    if args.confirm {
+        require_secure_fund_rpc_url(&peer_rpc_url)?;
+        if let Some(eth_rpc) = args.eth_rpc.as_deref() {
+            require_secure_fund_rpc_url(eth_rpc)?;
+        }
+    }
     let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
     let payment_state = read_canonical_payment_state(&peer_rpc).await?;
     let tap = payment_state.payments.tap.clone();
@@ -24049,28 +24511,84 @@ fn proof_to_script_arg(proof: &Value) -> Result<String> {
     }
 }
 
-fn tap_deposit_seen_key(eth_tx_hash: &str, log_index: u64) -> String {
-    format!("dep/tap/{}/{log_index}", eth_tx_hash.to_ascii_lowercase())
+fn tap_deposit_identity_key(
+    chain_id: u64,
+    pool_address: &str,
+    eth_tx_hash: &str,
+    log_index: u64,
+    block_hash: &str,
+) -> Result<String> {
+    ensure!(chain_id > 0, "TAP deposit chain id must be positive");
+    ensure!(
+        is_eth_address(pool_address),
+        "TAP deposit pool address is invalid"
+    );
+    ensure!(
+        eth_tx_hash.len() == 66
+            && eth_tx_hash.starts_with("0x")
+            && eth_tx_hash[2..]
+                .as_bytes()
+                .iter()
+                .all(u8::is_ascii_hexdigit),
+        "TAP deposit transaction hash is invalid"
+    );
+    ensure!(
+        block_hash.len() == 66
+            && block_hash.starts_with("0x")
+            && block_hash[2..].as_bytes().iter().all(u8::is_ascii_hexdigit),
+        "TAP deposit block hash is invalid"
+    );
+    Ok(format!(
+        "dep/tap/{}/{}/{}/{}/{}",
+        chain_id,
+        pool_address.to_ascii_lowercase(),
+        eth_tx_hash.to_ascii_lowercase(),
+        log_index,
+        block_hash.to_ascii_lowercase(),
+    ))
 }
 
 async fn read_tap_deposit_confirmation(
     rpc: &PeerRpcClient,
+    chain_id: u64,
+    pool_address: &str,
     eth_tx_hash: &str,
     log_index: Option<u64>,
     who: &str,
 ) -> Result<(Option<u64>, Option<Value>)> {
-    if let Some(log_index) = log_index {
-        let key = tap_deposit_seen_key(eth_tx_hash, log_index);
-        return Ok((Some(log_index), read_state_value(rpc, &key).await?));
-    }
-
     let normalized_hash = eth_tx_hash.to_ascii_lowercase();
-    let prefix = format!("dep/tap/{normalized_hash}/");
+    let normalized_pool = pool_address.to_ascii_lowercase();
+    ensure!(chain_id > 0, "canonical TAP chain id must be positive");
+    ensure!(
+        is_eth_address(&normalized_pool),
+        "canonical TAP pool address is invalid"
+    );
+    ensure!(
+        normalized_hash.len() == 66
+            && normalized_hash.starts_with("0x")
+            && normalized_hash[2..]
+                .as_bytes()
+                .iter()
+                .all(u8::is_ascii_hexdigit),
+        "TAP transaction hash is invalid"
+    );
+    let prefix = match log_index {
+        Some(log_index) => {
+            format!("dep/tap/{chain_id}/{normalized_pool}/{normalized_hash}/{log_index}/")
+        }
+        None => format!("dep/tap/{chain_id}/{normalized_pool}/{normalized_hash}/"),
+    };
     let mut matches = read_prefix_entries(rpc, &prefix)
         .await?
         .into_iter()
         .filter(|entry| {
             entry.value.get("who").and_then(Value::as_str) == Some(who)
+                && entry.value.get("chain_id").and_then(Value::as_u64) == Some(chain_id)
+                && entry
+                    .value
+                    .get("pool_address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&normalized_pool))
                 && entry
                     .value
                     .get("eth_tx_hash")
@@ -24080,12 +24598,17 @@ async fn read_tap_deposit_confirmation(
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| left.key.cmp(&right.key));
     if matches.len() > 1 {
+        if log_index.is_some() {
+            bail!(
+                "TAP transaction {eth_tx_hash} has multiple block identities for the requested log; inspect the watcher for a reorg"
+            );
+        }
         bail!(
             "TAP transaction {eth_tx_hash} contains multiple deposits for this wallet; pass --log-index"
         );
     }
     let Some(entry) = matches.pop() else {
-        return Ok((None, None));
+        return Ok((log_index, None));
     };
     let log_index = entry
         .value
@@ -24255,18 +24778,25 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("");
     let wallet = resolve_cli_wallet_with_keypair(
         &home,
         config.as_ref(),
         args.keypair.as_deref(),
         &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
+        wallet_password,
     )
     .await?;
     let amount_au = parse_usd_amount_to_au(&args.amount)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    if args.submit_intent || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let payment_state = read_canonical_payment_state(&rpc).await?;
+    let trust_anchor = (args.submit_intent || args.submit_transfer)
+        .then(|| validate_tnk_fund_trust_anchor(config.as_ref(), &payment_state))
+        .transpose()?;
     let treasury_address = payment_state.payments.tnk.treasury_address.clone();
     let msb_network = payment_state.payments.tnk.network.clone();
     let rate_age = require_fresh_payment_rate(
@@ -24308,7 +24838,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let keypair_path = PathBuf::from(wallet.keypair_path.clone());
     let intent_sig = sign_message(
         &keypair_path,
-        args.wallet_password.as_deref().unwrap_or(""),
+        wallet_password,
         &deposit_tnk_intent_message(&intent_payload),
     )
     .await?;
@@ -24333,9 +24863,11 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         shell_single_quote(&intent_feature_json)
     ));
     let admin_confirm_command = format!(
-        "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
+        "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --msb-network {} --msb-from <confirmed-from> --msb-to {} --msb-confirmed-length <confirmed-length> --msb-observed-signed-length <signed-length> --epoch <epoch> --at <unix-seconds>",
         shell_single_quote(&memo_hash),
-        tnk_e18
+        tnk_e18,
+        shell_single_quote(&msb_network),
+        shell_single_quote(&treasury_address),
     );
 
     emit_tnk_handoff(
@@ -24345,6 +24877,22 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         &memo_hash,
         &deposit_intent_command,
     )?;
+    let depositor_address = if args.submit_transfer {
+        let depositor = wallet
+            .address
+            .as_deref()
+            .context("local wallet did not expose a TNK/MSB source address")?;
+        confirm_tnk_transfer_destination(
+            args.yes,
+            depositor,
+            &treasury_address,
+            &tnk_decimal,
+            &msb_network,
+        )?;
+        Some(depositor.to_owned())
+    } else {
+        None
+    };
 
     let before_au = if args.wait {
         Some(read_user_balance_au(&rpc, &wallet.public_key, "tnk").await?)
@@ -24372,19 +24920,27 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let msb_transfer = if args.submit_transfer {
         let keypair_path = PathBuf::from(wallet.keypair_path.clone());
         let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
-        Some(
-            submit_msb_transfer(
-                &msb_network,
-                &stores_directory,
-                &store_name,
-                &treasury_address,
-                &tnk_decimal,
-                args.msb_transfer_timeout_seconds,
-                3,
-                None,
-            )
-            .await?,
+        let transfer = submit_msb_transfer(
+            &msb_network,
+            &stores_directory,
+            &store_name,
+            &treasury_address,
+            &tnk_decimal,
+            args.msb_transfer_timeout_seconds,
+            3,
+            None,
         )
+        .await?;
+        verify_tnk_transfer_result(
+            &transfer,
+            &msb_network,
+            depositor_address
+                .as_deref()
+                .context("TNK depositor address missing after confirmation")?,
+            &treasury_address,
+            &tnk_decimal,
+        )?;
+        Some(transfer)
     } else {
         None
     };
@@ -24424,6 +24980,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "msb_network": msb_network,
             "treasury_address": treasury_address,
         },
+        "local_trust_anchor": trust_anchor,
         "rate": {
             "source_key": "rate/latest",
             "denom": "tnk_usd_au",
@@ -24547,6 +25104,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     )
     .await?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    require_secure_fund_rpc_url(&rpc_url)?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let payment_state = read_canonical_payment_state(&rpc).await?;
     let currency = args.currency.trim().to_ascii_lowercase();
@@ -24674,7 +25232,7 @@ struct UpProviderWorker {
     enclave: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct UpPlan {
     home: PathBuf,
     config_path: PathBuf,
@@ -24701,6 +25259,8 @@ struct UpPlan {
     dashboard_url: String,
     supervisor_bind: String,
     supervisor_url: String,
+    mayhemd_control_token: String,
+    wallet_password: Option<String>,
     gateway_bind: SocketAddr,
     rail: GatewayLedgerRail,
     gateway_require_auth: bool,
@@ -25245,10 +25805,11 @@ async fn up_add_selected_provider_workers(
             hardware_quote_config,
             worker_name,
         )?;
-        let response = post_gateway_json(
+        let response = post_mayhemd_json(
             client,
             &format!("{}/children/add", plan.supervisor_url),
             &child,
+            &plan.mayhemd_control_token,
         )
         .await
         .with_context(|| {
@@ -25432,6 +25993,11 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let sc_bridge_url = format!("ws://127.0.0.1:{}", args.sc_bridge_port);
     let supervisor_bind = format!("127.0.0.1:{}", args.supervisor_port);
     let supervisor_url = format!("http://{supervisor_bind}");
+    let mayhemd_control_token = load_or_create_mayhemd_control_token(&home)?;
+    let wallet_password = args
+        .wallet_password
+        .clone()
+        .or_else(|| env::var("MAYHEM_WALLET_PASSWORD").ok());
     let config_path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&config_path)?;
     let gateway_bind =
@@ -25617,6 +26183,8 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         dashboard_url,
         supervisor_bind,
         supervisor_url,
+        mayhemd_control_token,
+        wallet_password,
         gateway_bind,
         rail,
         gateway_require_auth,
@@ -25859,6 +26427,22 @@ fn validate_mainnet_manifest(manifest: &MainnetManifest) -> Result<()> {
         "mainnet manifest must pin the complete official HyperDHT bootstrap set"
     );
     ensure!(
+        !manifest.network.inference_relays.is_empty()
+            && manifest
+                .network
+                .inference_relays
+                .iter()
+                .all(|relay| is_hex_len(relay, 64))
+            && manifest
+                .network
+                .inference_relays
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == manifest.network.inference_relays.len(),
+        "mainnet manifest inference relays must be unique 32-byte public keys"
+    );
+    ensure!(
         is_hex_len(&manifest.contract.admin_peer_pubkey, 64),
         "mainnet manifest admin key is invalid"
     );
@@ -26020,6 +26604,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             manifest.network.dht.msb_bootstrap.join(","),
             "--msb-direct-peer".to_owned(),
             manifest.network.msb.direct_peers.join(","),
+            "--inference-relay-peers".to_owned(),
+            manifest.network.inference_relays.join(","),
         ]);
     }
     peer_args.extend([
@@ -26037,8 +26623,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "127.0.0.1".to_owned(),
         "--sc-bridge-port".to_owned(),
         sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
-        "--sc-bridge-token".to_owned(),
-        plan.sc_bridge_token.clone(),
         "--sc-bridge-cli".to_owned(),
         "1".to_owned(),
         "--rpc".to_owned(),
@@ -26058,6 +26642,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         &plan.pear_runtime,
         &peer_args,
         Some(&plan.intercom_dir),
+        &[("SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
     )?;
 
     let mut gateway_args = vec![
@@ -26068,8 +26653,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         plan.rpc_url.clone(),
         "--sc-bridge-url".to_owned(),
         plan.sc_bridge_url.clone(),
-        "--sc-bridge-token".to_owned(),
-        plan.sc_bridge_token.clone(),
         "--bind".to_owned(),
         plan.gateway_bind.to_string(),
         "--rail".to_owned(),
@@ -26089,7 +26672,14 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     if plan.dev_embedded_catalog {
         gateway_args.push("--dev-embedded-catalog".to_owned());
     }
-    write_supervisor_child(&mut out, "gateway", &plan.mayhem_path, &gateway_args, None)?;
+    write_supervisor_child(
+        &mut out,
+        "gateway",
+        &plan.mayhem_path,
+        &gateway_args,
+        None,
+        &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
+    )?;
 
     if plan.fraud_challenger {
         let challenger_args = vec![
@@ -26113,6 +26703,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             &plan.mayhem_path,
             &challenger_args,
             None,
+            &[],
         )?;
     }
 
@@ -26127,8 +26718,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 plan.rpc_url.clone(),
                 "--sc-bridge-url".to_owned(),
                 plan.sc_bridge_url.clone(),
-                "--sc-bridge-token".to_owned(),
-                plan.sc_bridge_token.clone(),
                 "--serve-sessions".to_owned(),
             ];
             if let Some(enclave) = &worker.enclave {
@@ -26162,6 +26751,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 &plan.mayhem_path,
                 &provider_args,
                 None,
+                &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
             )?;
         }
     }
@@ -26174,6 +26764,7 @@ fn write_supervisor_child(
     command: &Path,
     args: &[String],
     cwd: Option<&Path>,
+    env: &[(&str, &str)],
 ) -> Result<()> {
     writeln!(out, "[[supervisor.children]]")?;
     writeln!(out, "name = {}", toml_string(name))?;
@@ -26185,6 +26776,14 @@ fn write_supervisor_child(
     writeln!(out, "args = [{}]", toml_string_array(args))?;
     if let Some(cwd) = cwd {
         writeln!(out, "cwd = {}", toml_string(&cwd.display().to_string()))?;
+    }
+    if !env.is_empty() {
+        let entries = env
+            .iter()
+            .map(|(key, value)| format!("{} = {}", toml_string(key), toml_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "env = {{ {entries} }}")?;
     }
     writeln!(out, "restart = true")?;
     writeln!(out, "restart_backoff_ms = 1000")?;
@@ -26222,9 +26821,16 @@ fn start_mayhemd_for_up(plan: &UpPlan) -> Result<()> {
         .arg("--config")
         .arg(&plan.supervisor_config_path)
         .arg("--json")
+        .env(
+            MAYHEMD_CONTROL_TOKEN_ENV,
+            plan.mayhemd_control_token.as_str(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if let Some(password) = plan.wallet_password.as_deref() {
+        command.env("MAYHEM_WALLET_PASSWORD", password);
+    }
     command.spawn().with_context(|| {
         format!(
             "starting mayhemd {}; logs at {}",
@@ -26297,6 +26903,29 @@ fn mayhemd_state_path(home: &Path) -> PathBuf {
 
 fn mayhemd_up_config_path(home: &Path) -> PathBuf {
     home.join(MAYHEMD_UP_CONFIG_FILE)
+}
+
+fn mayhemd_control_token_path(home: &Path) -> PathBuf {
+    home.join(MAYHEMD_CONTROL_TOKEN_FILE)
+}
+
+fn load_or_create_mayhemd_control_token(home: &Path) -> Result<String> {
+    let path = mayhemd_control_token_path(home);
+    if path.exists() {
+        let token =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let token = token.trim();
+        if !is_hex_len(token, 64) {
+            bail!("{} contains an invalid control token", path.display());
+        }
+        return Ok(token.to_owned());
+    }
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("generating mayhemd control token entropy")?;
+    let token = hex_encode(&random);
+    write_private_file(&path, format!("{token}\n").as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
 }
 
 fn read_pid_file(path: &Path) -> Result<Option<u32>> {
@@ -27481,6 +28110,20 @@ fn configured_nonnegative_millis(env_name: &str, default_value: u64) -> Result<u
     }
 }
 
+fn gateway_startup_wallet_report(
+    public_key: Option<&String>,
+    rail: &str,
+    balance_au: Option<MoneyAu>,
+) -> Option<Value> {
+    public_key.map(|public_key| {
+        json!({
+            "public_key": public_key,
+            "balance_au": money_au_json(balance_au.unwrap_or(0)),
+            "balance_source": format!("bal/{public_key}/{rail}"),
+        })
+    })
+}
+
 async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -27817,8 +28460,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 )
             })?;
         let balance_au = read_user_balance_au(&rpc, &wallet.public_key, args.rail.as_str()).await?;
-        let payment_directory =
-            canonical_payment_state_json(&read_canonical_payment_state(&rpc).await?)?;
+        let payment_state = read_canonical_payment_state(&rpc).await?;
+        let payment_directory = canonical_payment_state_json(&payment_state)?;
         let (models, blocked_version_gates) = match catalog_doc.as_ref() {
             Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
             None => (models, Vec::new()),
@@ -27856,7 +28499,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             });
         }
         let model_count = models.len();
-        let provider_earnings = read_gateway_provider_earnings(&rpc, &wallet.public_key).await?;
+        let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+            .await?
+            .into_iter()
+            .filter(|record| earning_matches_current_payment_scope(record, &payment_state.payments))
+            .map(earning_view)
+            .map(|view| {
+                view.and_then(|view| {
+                    serde_json::to_value(view).context("serializing provider earning view")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
             Some(&home),
             args.sc_bridge_url.as_deref(),
@@ -27902,18 +28555,22 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             min_tok_s: session_config.min_tok_s,
         };
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
+        let state = GatewayState::from_models(models)
+            .with_canary_registry(canary_registry)
+            .with_provider_earnings(provider_earnings)
+            .with_local_provider_id(wallet.public_key.clone())
+            .with_hidden_update_models(hidden_update_models)
+            .with_failover_policy(failover_policy)
+            .with_epoch_seconds(gateway_epoch_seconds)
+            .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
+            .with_receipt_user_seed(user_seed)
+            .with_job_store_dir(home.join("gateway-jobs"))
+            .map_err(anyhow::Error::msg)
+            .context("opening encrypted gateway job vault")?
+            .with_receipt_balance_au(balance_au)
+            .with_session_backend(Arc::new(backend));
         (
-            GatewayState::from_models(models)
-                .with_canary_registry(canary_registry)
-                .with_provider_earnings(provider_earnings)
-                .with_local_provider_id(wallet.public_key.clone())
-                .with_hidden_update_models(hidden_update_models)
-                .with_failover_policy(failover_policy)
-                .with_epoch_seconds(gateway_epoch_seconds)
-                .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
-                .with_receipt_user_seed(user_seed)
-                .with_receipt_balance_au(balance_au)
-                .with_session_backend(Arc::new(backend)),
+            state,
             catalog_source,
             Some(model_count),
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
@@ -28000,16 +28657,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "provider_heartbeat_ttl_ms": provider_heartbeat_ttl_millis,
         "provider_heartbeat_clock_skew_ms": provider_heartbeat_clock_skew_millis,
         "rail": args.rail.as_str(),
-        "wallet": wallet_public_key.as_ref().map(|public_key| json!({
-            "public_key": public_key,
-            "balance_au": balance_au.unwrap_or(0),
-            "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
-        })),
+        "wallet": gateway_startup_wallet_report(
+            wallet_public_key.as_ref(),
+            args.rail.as_str(),
+            balance_au,
+        ),
         "receipt_checkpoint_every": {
             "tokens": receipt_checkpoint_every.tokens,
             "ms": receipt_checkpoint_every.ms,
         },
-        "default_max_price_au": default_max_price_au,
+        "default_max_price_au": default_max_price_au.map(money_au_json),
         "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
         "preferred_provider_models": preferred_providers.len(),
@@ -28282,17 +28939,8 @@ async fn models(args: ModelsArgs) -> Result<()> {
 
 async fn read_canonical_payment_state(rpc: &PeerRpcClient) -> Result<CanonicalPaymentState> {
     let observed_at = unix_epoch_seconds()?;
-    let admin = read_state_value(rpc, "admin")
-        .await?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .context("contract admin is not initialized")?
-        .to_ascii_lowercase();
-    let payments_value = read_state_value(rpc, "payments/current").await?.context(
-        "canonical payments/current is missing; the admin must publish all payment rails",
-    )?;
-    let payments: CanonicalPayments = serde_json::from_value(payments_value)
-        .context("canonical payments/current has an invalid schema")?;
-    validate_canonical_payments(&payments, &admin)?;
+    let payments = read_canonical_payments(rpc).await?;
+    let admin = payments.set_by.to_ascii_lowercase();
 
     let tap_rate: CanonicalTapRate = serde_json::from_value(
         read_state_value(rpc, "tap/rate/latest")
@@ -28324,6 +28972,21 @@ async fn read_canonical_payment_state(rpc: &PeerRpcClient) -> Result<CanonicalPa
         rate_staleness_seconds,
         observed_at,
     })
+}
+
+async fn read_canonical_payments(rpc: &PeerRpcClient) -> Result<CanonicalPayments> {
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("contract admin is not initialized")?
+        .to_ascii_lowercase();
+    let payments_value = read_state_value(rpc, "payments/current").await?.context(
+        "canonical payments/current is missing; the admin must publish all payment rails",
+    )?;
+    let payments: CanonicalPayments = serde_json::from_value(payments_value)
+        .context("canonical payments/current has an invalid schema")?;
+    validate_canonical_payments(&payments, &admin)?;
+    Ok(payments)
 }
 
 fn validate_canonical_payments(payments: &CanonicalPayments, admin: &str) -> Result<()> {
@@ -28398,7 +29061,7 @@ fn validate_tap_rate(rate: &CanonicalTapRate, admin: &str) -> Result<()> {
     );
     ensure!(rate.tap_usd_au > 0, "TAP/USD rate must be positive");
     ensure!(
-        matches!(rate.source.as_str(), "uniswap-v2" | "config" | "stale"),
+        matches!(rate.source.as_str(), "uniswap-v2-twap-median" | "config"),
         "unsupported TAP/USD rate source {}",
         rate.source
     );
@@ -28814,6 +29477,8 @@ async fn reputation(args: ReputationArgs) -> Result<()> {
             provider: provider.clone(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 0,
             held_au: 0,
             paid_cum_au: 0,
@@ -29944,6 +30609,8 @@ struct CanaryPrompt {
     #[serde(default)]
     cfg_scale: Option<f32>,
     #[serde(default)]
+    shift: Option<f32>,
+    #[serde(default)]
     seed: Option<u32>,
 }
 
@@ -30233,22 +30900,80 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
     let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
     let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await?;
+    let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+    let provider = args.provider.to_ascii_lowercase();
+    let enclave_id = args.enclave_id.to_ascii_lowercase();
+    if !is_hex_len(&provider, 64) {
+        bail!("--provider must be a 32-byte hexadecimal public key");
+    }
+    if !is_hex_len(&enclave_id, 64) {
+        bail!("--enclave-id must be a 32-byte hexadecimal enclave id");
+    }
+    let challenge_epoch = args
+        .epoch
+        .checked_sub(1)
+        .context("--epoch must be at least 1 so it follows a finalized challenge epoch")?;
+    let release = read_catalog_release_anchor(&rpc).await?;
+    let canary_ref = release
+        .canaries
+        .iter()
+        .find(|canary| canary.set_id == args.canary_set)
+        .with_context(|| {
+            format!(
+                "canary set {} is not published in catalog/current",
+                args.canary_set
+            )
+        })?;
+    validate_catalog_canary_prompt_ids(&canary_ref.prompt_ids, &args.canary_set)?;
+    let challenge_apply_hash = read_canary_challenge_apply_hash(&rpc, challenge_epoch).await?;
+    let challenge_seed = opaque_value_hash(
+        "mayhem-canary-challenge-v1",
+        &json!({
+            "challenge_epoch": challenge_epoch,
+            "challenge_apply_hash": challenge_apply_hash,
+            "probe_epoch": args.epoch,
+            "auditor": wallet.public_key,
+            "provider": provider,
+            "enclave_id": enclave_id,
+            "canary_set": args.canary_set,
+            "catalog_hash": release.catalog_hash,
+        }),
+    );
+    let selected_index = hexadecimal_modulo(&challenge_seed, canary_ref.prompt_ids.len())?;
+    let selected_prompt_id = canary_ref.prompt_ids[selected_index].clone();
+    let fetched_release;
+    let canaries_dir = if let Some(path) = args.canaries_dir.as_deref() {
+        Some(absolutize(path.to_path_buf())?)
+    } else {
+        fetched_release = fetch_catalog_release_files(&client, &home, &release).await?;
+        Some(fetched_release.canaries_dir)
+    };
 
     let models = fetch_gateway_models(&client, &gateway_root).await?;
     let model = select_test_model(&models, args.model.as_deref())?;
     let canary = load_canary_prompt(
-        args.canaries_dir.as_deref(),
+        canaries_dir.as_deref(),
         &args.canary_set,
-        args.prompt_id.as_deref(),
+        Some(&selected_prompt_id),
     )?;
     let expected_text = read_expected_canary_text(&args)?;
     let request = canary_probe_request(&model.id, &canary);
-    let response = post_gateway_json(
+    let response = post_gateway_json_for_provider(
         &client,
         &format!("{gateway_root}/v1/chat/completions"),
         &request,
+        &provider,
     )
     .await?;
     let observed_text = gateway_chat_observed_text(&response)?;
@@ -30259,26 +30984,22 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     )?;
     let session_receipt_hash = stable_value_hash(&latest_receipt);
     let receipt_body = receipt_body(&latest_receipt);
-    let provider = args
-        .provider
-        .clone()
-        .or_else(|| {
-            receipt_body
-                .and_then(|body| body.get("provider"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .context("--provider is required when the gateway receipt does not expose provider")?;
-    let enclave_id = args
-        .enclave_id
-        .clone()
-        .or_else(|| {
-            receipt_body
-                .and_then(|body| body.get("enclave_id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .context("--enclave-id is required when the gateway receipt does not expose enclave_id")?;
+    let receipt_provider = receipt_body
+        .and_then(|body| body.get("provider"))
+        .and_then(Value::as_str)
+        .context("gateway receipt does not expose the challenged provider")?;
+    let receipt_enclave_id = receipt_body
+        .and_then(|body| body.get("enclave_id"))
+        .and_then(Value::as_str)
+        .context("gateway receipt does not expose the challenged enclave_id")?;
+    ensure!(
+        receipt_provider.eq_ignore_ascii_case(&provider),
+        "gateway routed the canary to provider {receipt_provider}, not challenged provider {provider}"
+    );
+    ensure!(
+        receipt_enclave_id.eq_ignore_ascii_case(&enclave_id),
+        "gateway routed the canary to enclave {receipt_enclave_id}, not challenged enclave {enclave_id}"
+    );
     let binary_hash = model
         .binary_hashes_by_enclave
         .get(&enclave_id)
@@ -30292,6 +31013,10 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
         "gateway_url": gateway_root,
         "model": model.id,
         "canary_set": args.canary_set,
+        "canary_prompt_id": canary.id,
+        "challenge_epoch": challenge_epoch,
+        "challenge_apply_hash": challenge_apply_hash,
+        "challenge_seed": challenge_seed,
         "verification_method": verification_method,
         "prompt_id": canary.id,
         "request": request,
@@ -30308,18 +31033,11 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
             "enclave_id": enclave_id,
             "canary_set": args.canary_set,
             "prompt_id": canary.id,
+            "challenge_seed": challenge_seed,
             "epoch": args.epoch,
             "evidence_hash": evidence_hash,
         }))
     });
-    let wallet = resolve_cli_wallet(
-        &home,
-        config.as_ref(),
-        &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
-    )
-    .await?;
-    let keypair_path = PathBuf::from(wallet.keypair_path.clone());
     let mut probe_command = canary_probe_command(CanaryProbeCommandInput {
         probe_id: probe_id.clone(),
         provider: provider.clone(),
@@ -30328,6 +31046,10 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
         epoch: args.epoch,
         at,
         canary_set: args.canary_set.clone(),
+        canary_prompt_id: canary.id.clone(),
+        challenge_epoch,
+        challenge_apply_hash: challenge_apply_hash.clone(),
+        challenge_seed: challenge_seed.clone(),
         verification_method: verification_method.to_owned(),
         match_bps: evaluation.match_bps,
         pass: evaluation.pass,
@@ -30358,8 +31080,6 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     }
 
     let tx = if args.submit {
-        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
-        let rpc = PeerRpcClient::new(&rpc_url)?;
         Some(
             submit_contract_command(
                 &rpc,
@@ -30540,6 +31260,10 @@ struct CanaryProbeCommandInput {
     epoch: u64,
     at: u64,
     canary_set: String,
+    canary_prompt_id: String,
+    challenge_epoch: u64,
+    challenge_apply_hash: String,
+    challenge_seed: String,
     verification_method: String,
     match_bps: u32,
     pass: bool,
@@ -30559,6 +31283,10 @@ fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
         "epoch": input.epoch,
         "at": input.at,
         "canary_set": input.canary_set,
+        "canary_prompt_id": input.canary_prompt_id,
+        "challenge_epoch": input.challenge_epoch,
+        "challenge_apply_hash": input.challenge_apply_hash,
+        "challenge_seed": input.challenge_seed,
         "verification_method": input.verification_method,
         "match_bps": input.match_bps,
         "pass": input.pass,
@@ -30591,6 +31319,10 @@ fn probe_result_message(value: &Value, auditor: &str) -> String {
         "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
         "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
         "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "canary_prompt_id": value.get("canary_prompt_id").cloned().unwrap_or(Value::Null),
+        "challenge_epoch": value.get("challenge_epoch").cloned().unwrap_or(Value::Null),
+        "challenge_apply_hash": value.get("challenge_apply_hash").cloned().unwrap_or(Value::Null),
+        "challenge_seed": value.get("challenge_seed").cloned().unwrap_or(Value::Null),
         "verification_method": value.get("verification_method").cloned().unwrap_or(Value::Null),
         "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
         "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
@@ -30653,6 +31385,85 @@ fn stable_value_hash(value: &Value) -> String {
     blake3::hash(stable.to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn opaque_value_hash(domain: &str, value: &Value) -> String {
+    stable_value_hash(&json!({
+        "domain": domain,
+        "value": value,
+    }))
+}
+
+fn hexadecimal_modulo(value: &str, modulus: usize) -> Result<usize> {
+    ensure!(
+        modulus > 0,
+        "hexadecimal modulo requires a positive modulus"
+    );
+    let bytes = hex_decode_vec(value, "challenge seed")?;
+    ensure!(!bytes.is_empty(), "challenge seed must not be empty");
+    Ok(bytes.into_iter().fold(0_usize, |remainder, byte| {
+        (remainder * 256 + usize::from(byte)) % modulus
+    }))
+}
+
+fn validate_catalog_canary_prompt_ids(prompt_ids: &[String], set_id: &str) -> Result<()> {
+    ensure!(
+        !prompt_ids.is_empty() && prompt_ids.len() <= 1_024,
+        "catalog/current canary {set_id} must publish 1..=1024 prompt ids"
+    );
+    let mut unique = BTreeSet::new();
+    for prompt_id in prompt_ids {
+        ensure!(
+            is_safe_key_part(prompt_id),
+            "catalog/current canary {set_id} contains an invalid prompt id"
+        );
+        ensure!(
+            unique.insert(prompt_id),
+            "catalog/current canary {set_id} contains a duplicate prompt id"
+        );
+    }
+    Ok(())
+}
+
+async fn read_canary_challenge_apply_hash(
+    rpc: &PeerRpcClient,
+    challenge_epoch: u64,
+) -> Result<String> {
+    let historical_key = format!("epoch/challenge/{challenge_epoch}");
+    let anchor = if let Some(anchor) = read_state_value(rpc, &historical_key).await? {
+        anchor
+    } else {
+        let current = read_state_value(rpc, "epoch/apply/state")
+            .await?
+            .context("epoch/apply/state is not initialized")?;
+        ensure!(
+            current.get("updated_epoch").and_then(Value::as_u64) == Some(challenge_epoch),
+            "finalized canary challenge epoch {challenge_epoch} is not anchored"
+        );
+        ensure!(
+            current.get("pending_epoch").is_none_or(Value::is_null),
+            "canary challenge epoch {challenge_epoch} still has a pending apply"
+        );
+        current
+    };
+    ensure!(
+        anchor
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .is_none_or(|epoch| epoch == challenge_epoch),
+        "canary challenge anchor epoch does not match {challenge_epoch}"
+    );
+    let apply_hash = anchor
+        .get("apply_hash")
+        .or_else(|| anchor.get("last_apply_hash"))
+        .and_then(Value::as_str)
+        .context("canary challenge anchor has no apply hash")?
+        .to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&apply_hash, 64),
+        "canary challenge anchor has an invalid apply hash"
+    );
+    Ok(apply_hash)
 }
 
 fn stable_json_value(value: &Value) -> Value {
@@ -31710,6 +32521,48 @@ async fn run_gateway_tool_smoke(
 async fn post_gateway_json(client: &reqwest::Client, url: &str, body: &Value) -> Result<Value> {
     let response = client
         .post(url)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("posting {url}"))?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("gateway returned {status} for {url}: {response_body}");
+    }
+    serde_json::from_str(&response_body).with_context(|| format!("parsing JSON from {url}"))
+}
+
+async fn post_mayhemd_json(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    control_token: &str,
+) -> Result<Value> {
+    let response = client
+        .post(url)
+        .bearer_auth(control_token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("posting {url}"))?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("mayhemd returned {status} for {url}: {response_body}");
+    }
+    serde_json::from_str(&response_body).with_context(|| format!("parsing JSON from {url}"))
+}
+
+async fn post_gateway_json_for_provider(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    provider: &str,
+) -> Result<Value> {
+    let response = client
+        .post(url)
+        .header("X-Mayhem-Prefer-Providers", provider)
         .json(body)
         .send()
         .await
@@ -32880,14 +33733,20 @@ async fn payouts(args: PayoutsArgs) -> Result<()> {
 async fn earnings(args: EarningsArgs) -> Result<()> {
     let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let payments = read_canonical_payments(&rpc).await?;
     let records = if let Some(provider) = &args.provider {
         read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
             .await?
             .into_iter()
             .filter(|record| record.provider == *provider)
+            .filter(|record| earning_matches_current_payment_scope(record, &payments))
             .collect::<Vec<_>>()
     } else {
-        read_prefix_values(&rpc, "earn/").await?
+        read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+            .await?
+            .into_iter()
+            .filter(|record| earning_matches_current_payment_scope(record, &payments))
+            .collect()
     };
     let mut views = records
         .into_iter()
@@ -33455,6 +34314,113 @@ fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<
         .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()))
 }
 
+fn require_secure_fund_rpc_url(rpc_url: &str) -> Result<()> {
+    let parsed =
+        reqwest::Url::parse(rpc_url).with_context(|| format!("parsing fund RPC URL {rpc_url}"))?;
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "fund RPC URL must not contain credentials"
+    );
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed
+                .host_str()
+                .context("fund RPC URL must include a host")?;
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            ensure!(
+                loopback,
+                "refusing plaintext HTTP RPC for fund operation on non-loopback host {host}; use HTTPS or a loopback RPC"
+            );
+            Ok(())
+        }
+        scheme => bail!("fund RPC URL must use HTTPS or loopback HTTP, not {scheme}"),
+    }
+}
+
+fn validate_tnk_fund_trust_anchor(
+    config: Option<&MayhemConfig>,
+    payment_state: &CanonicalPaymentState,
+) -> Result<TnkFundTrustAnchor> {
+    let payments = &payment_state.payments;
+    if payments.tnk.network == "mainnet" {
+        let manifest = canonical_mainnet_manifest()?;
+        ensure!(
+            payments
+                .set_by
+                .eq_ignore_ascii_case(&manifest.contract.admin_peer_pubkey),
+            "RPC admin {} does not match the locally pinned mainnet admin",
+            payments.set_by
+        );
+        ensure!(
+            payments.tnk.treasury_address == manifest.payments.tnk.treasury_address,
+            "RPC TNK treasury {} does not match the locally pinned mainnet treasury",
+            payments.tnk.treasury_address
+        );
+        return Ok(TnkFundTrustAnchor {
+            source: "compiled-mainnet-manifest",
+            admin_peer_pubkey: manifest.contract.admin_peer_pubkey,
+            treasury_address: manifest.payments.tnk.treasury_address,
+        });
+    }
+
+    let local_network = config.and_then(|config| config.network.as_ref());
+    let admin_peer_pubkey = local_network
+        .and_then(|network| network.admin_peer_pubkey.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_ADMIN_PEER_PUBKEY")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .context(
+            "non-mainnet TNK fund operations require local network.admin_peer_pubkey or MAYHEM_ADMIN_PEER_PUBKEY",
+        )?;
+    ensure!(
+        is_hex_len(&admin_peer_pubkey, 64),
+        "local TNK admin trust anchor must be a 32-byte hex public key"
+    );
+    let treasury_address = local_network
+        .and_then(|network| network.tnk_treasury_address.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_TNK_TREASURY_ADDRESS")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .context("non-mainnet TNK fund operations require a local treasury trust anchor")?;
+    ensure!(
+        is_safe_key_part(&treasury_address),
+        "local TNK treasury trust anchor is invalid"
+    );
+    ensure!(
+        payments.set_by.eq_ignore_ascii_case(&admin_peer_pubkey),
+        "RPC admin {} does not match the local admin trust anchor",
+        payments.set_by
+    );
+    ensure!(
+        payments.tnk.treasury_address == treasury_address,
+        "RPC TNK treasury {} does not match the local treasury trust anchor",
+        payments.tnk.treasury_address
+    );
+    Ok(TnkFundTrustAnchor {
+        source: "local-config",
+        admin_peer_pubkey,
+        treasury_address,
+    })
+}
+
 fn resolve_cli_tnk_treasury_address(
     config: Option<&MayhemConfig>,
     treasury_address: Option<&str>,
@@ -33666,26 +34632,18 @@ fn resolve_tnk_treasury_keypair_path(explicit: Option<&Path>) -> Result<Option<P
         .transpose()
 }
 
-fn validate_msb_tx_hash(value: &str) -> Result<String> {
-    let value = value.trim().to_ascii_lowercase();
-    if !is_hex_len(&value, 64) {
-        bail!("MSB transaction hash must be 64 hex characters");
-    }
-    Ok(value)
-}
-
 fn tnk_settlement_manifest_value(
     plan: &TnkSettlementPlan,
     epoch: u64,
     network: &str,
     treasury_address: &str,
 ) -> Result<Value> {
-    let msb_tx_hashes = plan
+    let msb_transfers = plan
         .payload
-        .get("msb_tx_hashes")
+        .get("msb_transfers")
         .and_then(Value::as_array)
-        .context("TNK settlement plan missing msb_tx_hashes")?;
-    if !msb_tx_hashes.is_empty() {
+        .context("TNK settlement plan missing msb_transfers")?;
+    if !msb_transfers.is_empty() {
         bail!("TNK settlement manifest must be created before MSB transfers");
     }
     let transfer_root = plan
@@ -33773,11 +34731,11 @@ fn read_tnk_settlement_manifest(
     if payload.get("epoch").and_then(Value::as_u64) != Some(epoch) {
         bail!("TNK settlement manifest frozen payload has a different epoch");
     }
-    let hashes = payload
-        .get("msb_tx_hashes")
+    let transfers = payload
+        .get("msb_transfers")
         .and_then(Value::as_array)
-        .context("TNK settlement manifest frozen payload missing msb_tx_hashes")?;
-    if !hashes.is_empty() {
+        .context("TNK settlement manifest frozen payload missing msb_transfers")?;
+    if !transfers.is_empty() {
         bail!("TNK settlement manifest frozen payload must predate MSB transfers");
     }
     for field in ["epoch_apply_hash", "transfer_root"] {
@@ -33896,7 +34854,7 @@ fn tnk_settlement_output_operation_id(
         "transfer_root": manifest.get("transfer_root"),
         "output_index": output_index,
         "to": output.to,
-        "amount": output.amount,
+        "amount_e18": output.amount_e18,
     }))
 }
 
@@ -33914,7 +34872,6 @@ async fn build_tnk_settlement_plan(
     network: &str,
     treasury_address: &str,
     operator_tnk_address: &str,
-    msb_tx_hashes: Option<&[String]>,
     manifest_path: Option<&Path>,
 ) -> Result<TnkSettlementPlan> {
     for (label, value) in [
@@ -34035,7 +34992,8 @@ async fn build_tnk_settlement_plan(
             }));
             continue;
         };
-        let payable_au = tnk_payable_earning_au(rpc, &earning, provider, epoch, &params).await?;
+        let (_, payable_au) =
+            tnk_payable_earning_state(rpc, &earning, provider, epoch, &params).await?;
         if payable_au == 0 {
             continue;
         }
@@ -34075,16 +35033,6 @@ async fn build_tnk_settlement_plan(
     }
 
     let totals = tnk_settlement_output_totals(&outputs)?;
-    let provided_msb_tx_hashes = msb_tx_hashes
-        .map(|hashes| hashes.to_vec())
-        .unwrap_or_default();
-    if !provided_msb_tx_hashes.is_empty() && provided_msb_tx_hashes.len() != outputs.len() {
-        bail!(
-            "TNK settlement requires one --msb-tx-hash per output: got {}, expected {}",
-            provided_msb_tx_hashes.len(),
-            outputs.len()
-        );
-    }
     let transfer_root = stable_value_hash(&json!({
         "domain": "mayhem-tnk-settlement-transfer-root-v1",
         "value": outputs,
@@ -34101,7 +35049,7 @@ async fn build_tnk_settlement_plan(
         "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
         "rate_ts": rate_ts,
-        "msb_tx_hashes": provided_msb_tx_hashes,
+        "msb_transfers": [],
         "transfer_root": transfer_root,
         "provider_count": totals.provider_count,
         "provider_au": money_au_json(totals.provider_au),
@@ -34143,6 +35091,7 @@ fn msb_outputs_from_tnk_settlement_payload(
                     .context("settlement output missing recipient")?
                     .to_owned(),
                 amount: tnk_e18_to_decimal(tnk_e18),
+                amount_e18: tnk_e18.to_string(),
             })
         })
         .collect()
@@ -34349,13 +35298,13 @@ async fn read_tnk_fee_record(rpc: &PeerRpcClient) -> Result<LedgerFeeRecord> {
     }
 }
 
-async fn tnk_payable_earning_au(
+async fn tnk_payable_earning_state(
     rpc: &PeerRpcClient,
     earning: &LedgerEarningRecord,
     provider: &Value,
     epoch: u64,
     params: &TnkSettlementParams,
-) -> Result<MoneyAu> {
+) -> Result<(MoneyAu, MoneyAu)> {
     let locked_epochs = provider_tnk_locked_epochs(provider, params)?;
     let kept = refresh_tnk_holdbacks(rpc, earning, epoch, locked_epochs, params).await?;
     let held_au = kept
@@ -34366,9 +35315,10 @@ async fn tnk_payable_earning_au(
         .total_au
         .checked_sub(held_au)
         .context("TNK held amount exceeds total earnings")?;
-    released_au
+    let payable_au = released_au
         .checked_sub(earning.paid_cum_au)
-        .context("TNK paid amount exceeds released earnings")
+        .context("TNK paid amount exceeds released earnings")?;
+    Ok((held_au, payable_au))
 }
 
 fn provider_tnk_locked_epochs(provider: &Value, params: &TnkSettlementParams) -> Result<u64> {
@@ -34395,6 +35345,13 @@ async fn refresh_tnk_holdbacks(
     params: &TnkSettlementParams,
 ) -> Result<Vec<LedgerHoldbackBucket>> {
     let holdbacks = normalize_tnk_holdbacks(earning)?;
+    let open_disputes = read_state_value(rpc, &format!("disp/provider-open/{}", earning.provider))
+        .await?
+        .and_then(|record| record.get("count").and_then(Value::as_u64))
+        .unwrap_or(0);
+    if open_disputes > 0 {
+        return Ok(holdbacks);
+    }
     let probe_gate_enabled =
         params.canary_probe_holdback_bps > 0 && params.canary_probe_release_min_passes > 0;
     let mut kept = Vec::new();
@@ -34498,9 +35455,10 @@ fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) 
         bail!("provider status is not payable");
     }
     let payout = provider
-        .get("payout")
+        .get("payouts")
+        .and_then(|payouts| payouts.get("tnk"))
         .and_then(Value::as_object)
-        .context("provider payout target is not set")?;
+        .context("provider TNK payout target is not set")?;
     if payout.get("method").and_then(Value::as_str) != Some("tnk") {
         bail!("provider payout target is not TNK");
     }
@@ -34535,8 +35493,6 @@ async fn build_fiat_settlement_plan(
     at: u64,
     operator_to: &str,
     operator_currency: &str,
-    operator_ref: Option<&str>,
-    stripe_refs: Option<&[String]>,
 ) -> Result<FiatSettlementPlan> {
     if !is_safe_key_part(operator_to) {
         bail!("operator Stripe account is not contract-safe");
@@ -34605,7 +35561,8 @@ async fn build_fiat_settlement_plan(
             }));
             continue;
         };
-        let payable_au = tnk_payable_earning_au(rpc, &earning, provider, epoch, &params).await?;
+        let (_, payable_au) =
+            tnk_payable_earning_state(rpc, &earning, provider, epoch, &params).await?;
         let transferable_au = fiat_whole_minor_au(payable_au);
         if transferable_au == 0 {
             if payable_au > 0 {
@@ -34652,25 +35609,6 @@ async fn build_fiat_settlement_plan(
             au: operator_fee_au,
         });
     }
-    let provided_refs = stripe_refs.map(|refs| refs.to_vec()).unwrap_or_default();
-    if !provided_refs.is_empty() && provided_refs.len() != outputs.len() {
-        bail!(
-            "fiat settlement requires one --stripe-ref per output: got {}, expected {}",
-            provided_refs.len(),
-            outputs.len()
-        );
-    }
-    if provided_refs.is_empty()
-        && operator_ref.is_some()
-        && !outputs.iter().any(|output| output.role == "operator_fee")
-    {
-        bail!("--operator-stripe-ref was provided but the settlement has no operator fee output");
-    }
-    let refs = if provided_refs.is_empty() {
-        Vec::new()
-    } else {
-        validate_fiat_settlement_refs(&outputs, provided_refs)?
-    };
     let output_values = fiat_settlement_output_values(&outputs);
     let transfer_root = stable_value_hash(&json!({
         "domain": "mayhem-fiat-settlement-transfer-root-v1",
@@ -34685,7 +35623,7 @@ async fn build_fiat_settlement_plan(
         "processor": "stripe",
         "operator_to": operator_to,
         "epoch_apply_hash": epoch_apply_hash,
-        "stripe_refs": refs,
+        "stripe_transfers": [],
         "transfer_root": transfer_root,
         "provider_count": totals.provider_count,
         "provider_au": money_au_json(totals.provider_au),
@@ -34848,16 +35786,11 @@ fn fiat_provider_payout_target(
     provider_id: &str,
     admin: &str,
 ) -> Result<(String, String)> {
-    if !matches!(
-        provider.get("status").and_then(Value::as_str),
-        Some("active" | "banned")
-    ) {
-        bail!("provider status is not payable");
-    }
     let payout = provider
-        .get("payout")
+        .get("payouts")
+        .and_then(|payouts| payouts.get("stripe"))
         .and_then(Value::as_object)
-        .context("provider payout target is not set")?;
+        .context("provider Stripe payout target is not set")?;
     if payout.get("method").and_then(Value::as_str) != Some("stripe") {
         bail!("provider payout target is not Stripe");
     }
@@ -34889,14 +35822,6 @@ fn fiat_provider_payout_target(
     Ok((addr.to_owned(), currency))
 }
 
-fn normalize_fiat_settlement_ref(value: &str, label: &str) -> Result<String> {
-    let value = value.trim();
-    if !is_safe_key_part(value) {
-        bail!("{label} is not contract-safe");
-    }
-    Ok(value.to_owned())
-}
-
 fn stripe_transfer_idempotency_key(
     epoch: u64,
     provider: &str,
@@ -34918,40 +35843,11 @@ fn stripe_transfer_idempotency_key(
     ))
 }
 
-fn operator_fiat_settlement_ref(
-    override_ref: Option<&str>,
-    epoch: u64,
-    epoch_apply_hash: &str,
-) -> Result<String> {
-    if let Some(value) = override_ref {
-        return normalize_fiat_settlement_ref(value, "operator Stripe reference");
-    }
-    Ok(format!(
+fn operator_fiat_settlement_ref(epoch: u64, epoch_apply_hash: &str) -> String {
+    format!(
         "platform_balance:{epoch}:{}",
         epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
-    ))
-}
-
-fn validate_fiat_settlement_refs(
-    outputs: &[FiatSettlementOutput],
-    refs: Vec<String>,
-) -> Result<Vec<String>> {
-    if refs.len() != outputs.len() {
-        bail!("fiat settlement Stripe reference count must match outputs");
-    }
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::with_capacity(refs.len());
-    for (output, reference) in outputs.iter().zip(refs.iter()) {
-        let reference = normalize_fiat_settlement_ref(reference, "Stripe reference")?;
-        if !seen.insert(reference.clone()) {
-            bail!("duplicate fiat settlement Stripe reference");
-        }
-        if output.role == "provider" && !reference.starts_with("tr_") {
-            bail!("provider Stripe references must be transfer ids starting with tr_");
-        }
-        normalized.push(reference);
-    }
-    Ok(normalized)
+    )
 }
 
 fn stripe_api_base_url(override_url: Option<&str>) -> Result<String> {
@@ -35671,6 +36567,78 @@ fn emit_tnk_handoff(
     Ok(())
 }
 
+fn confirm_tnk_transfer_destination(
+    yes: bool,
+    from: &str,
+    treasury: &str,
+    amount: &str,
+    network: &str,
+) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "refusing TNK transfer without interactive destination confirmation; pass --yes for unattended operation"
+        );
+    }
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "TNK transfer destination confirmation")?;
+    writeln!(stderr, "Network: {network}")?;
+    writeln!(stderr, "From: {from}")?;
+    writeln!(stderr, "To treasury: {treasury}")?;
+    writeln!(stderr, "Amount: {amount} TNK")?;
+    write!(stderr, "Type the full treasury address to continue: ")?;
+    stderr.flush()?;
+    drop(stderr);
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    ensure!(
+        answer.trim() == treasury,
+        "TNK transfer cancelled: treasury confirmation did not match"
+    );
+    Ok(())
+}
+
+fn verify_tnk_transfer_result(
+    transfer: &MsbTransferOutput,
+    expected_network: &str,
+    expected_from: &str,
+    expected_to: &str,
+    expected_amount: &str,
+) -> Result<()> {
+    ensure!(transfer.ok, "MSB transfer helper did not report success");
+    ensure!(
+        transfer.network == expected_network,
+        "MSB transfer network {} does not match expected {expected_network}",
+        transfer.network
+    );
+    ensure!(
+        transfer.from == expected_from,
+        "MSB transfer source {} does not match local depositor {expected_from}",
+        transfer.from
+    );
+    ensure!(
+        transfer.to == expected_to,
+        "MSB transfer destination {} does not match pinned treasury {expected_to}",
+        transfer.to
+    );
+    ensure!(
+        transfer.amount == expected_amount,
+        "MSB transfer amount {} does not match confirmed amount {expected_amount}",
+        transfer.amount
+    );
+    ensure!(
+        is_hex_len(&transfer.tx_hash, 64),
+        "MSB transfer helper returned an invalid transaction hash"
+    );
+    ensure!(
+        transfer.validator_connections > 0,
+        "MSB transfer helper returned no validator connection"
+    );
+    Ok(())
+}
+
 async fn submit_journaled_msb_settlement_transfer(
     network: &str,
     stores_directory: &Path,
@@ -35756,6 +36724,7 @@ where
     let (command, helper_args) = args
         .split_first()
         .context("MSB transfer helper command is required")?;
+    validate_external_helper_option_pairs(helper_args)?;
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
     let output = Command::new(&pear_runtime)
@@ -35786,6 +36755,36 @@ where
         );
     }
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+}
+
+fn validate_external_helper_option_pairs(args: &[String]) -> Result<()> {
+    let mut pairs = args.chunks_exact(2);
+    for pair in &mut pairs {
+        ensure!(
+            pair[0].starts_with("--") && pair[0].len() > 2,
+            "external helper argument {} is not an option",
+            pair[0]
+        );
+        ensure_external_helper_value(&pair[0], &pair[1])?;
+    }
+    ensure!(
+        pairs.remainder().is_empty(),
+        "external helper options must have explicit values"
+    );
+    Ok(())
+}
+
+fn ensure_external_helper_value(option: &str, value: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "{option} helper value must not be empty");
+    ensure!(
+        !value.starts_with('-'),
+        "{option} helper value must not start with '-'"
+    );
+    ensure!(
+        !value.chars().any(char::is_control),
+        "{option} helper value must not contain control characters"
+    );
+    Ok(())
 }
 
 fn parse_msb_transfer_helper_json<T>(stdout: &[u8], stderr: &[u8]) -> Result<T>
@@ -36079,19 +37078,45 @@ async fn read_user_balance_au(rpc: &PeerRpcClient, who: &str, rail: &str) -> Res
 
 async fn read_balance_record(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<Value> {
     let value = read_state_value(rpc, &format!("bal/{who}/{rail}")).await?;
-    normalize_balance_record(who, rail, value)
+    let tap = if rail == "tap" {
+        Some(read_canonical_payments(rpc).await?.tap)
+    } else {
+        None
+    };
+    normalize_balance_record(who, rail, value, tap.as_ref())
 }
 
-fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Result<Value> {
+fn normalize_balance_record(
+    who: &str,
+    rail: &str,
+    value: Option<Value>,
+    tap: Option<&CanonicalTapRail>,
+) -> Result<Value> {
+    let value = if let Some(tap) = tap {
+        value.filter(|record| {
+            record.get("chain_id").and_then(Value::as_u64) == Some(tap.chain_id)
+                && record
+                    .get("pool_address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|pool| pool.eq_ignore_ascii_case(&tap.pool_address))
+        })
+    } else {
+        value
+    };
     let mut record = value.unwrap_or_else(|| {
-        json!({
+        let mut record = json!({
             "user": who,
             "rail": rail,
             "denom": "au_usd",
             "au": money_au_json(0),
             "updated_epoch": 0,
             "updated_at": null,
-        })
+        });
+        if let Some(tap) = tap {
+            record["chain_id"] = Value::Number(tap.chain_id.into());
+            record["pool_address"] = Value::String(tap.pool_address.to_ascii_lowercase());
+        }
+        record
     });
     let object = record
         .as_object_mut()
@@ -36921,6 +37946,8 @@ struct CatalogReleaseCanaryRef {
     set_id: String,
     url: String,
     hash: String,
+    #[serde(default)]
+    prompt_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36955,6 +37982,10 @@ struct LedgerEarningRecord {
     provider: String,
     rail: String,
     denom: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_address: Option<String>,
     #[serde(with = "mayhem_proto::decimal_u128")]
     total_au: MoneyAu,
     #[serde(with = "mayhem_proto::decimal_u128")]
@@ -36977,6 +38008,18 @@ struct LedgerEarningRecord {
     last_settlement_epoch: Option<u64>,
     #[serde(default)]
     last_settlement_msb_tx_hash: Option<String>,
+}
+
+fn earning_matches_current_payment_scope(
+    record: &LedgerEarningRecord,
+    payments: &CanonicalPayments,
+) -> bool {
+    record.rail != "tap"
+        || (record.chain_id == Some(payments.tap.chain_id)
+            && record
+                .pool_address
+                .as_deref()
+                .is_some_and(|pool| pool.eq_ignore_ascii_case(&payments.tap.pool_address)))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37163,6 +38206,12 @@ struct ProviderJoinContextTerms {
     served_specialities: BTreeMap<String, Vec<String>>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderJoinAttestationEvidence {
+    att_tier: u8,
+    attestation_head: String,
 }
 
 #[derive(Debug, Clone)]
@@ -37383,6 +38432,7 @@ struct ProviderLoadSnapshot {
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
     accepting_new: bool,
+    modality_at_capacity: bool,
     modality_active_items: BTreeMap<String, u32>,
 }
 
@@ -37397,6 +38447,7 @@ impl Default for ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         }
     }
@@ -37422,6 +38473,7 @@ impl ProviderLoadSnapshot {
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         }
     }
@@ -37438,10 +38490,12 @@ struct ProviderHeartbeatLoad {
     stop: Arc<AtomicBool>,
     modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
     modality_max_inflight_items: Arc<BTreeMap<String, u64>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0);
         Self {
             active_slots: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
@@ -37452,6 +38506,7 @@ impl Default for ProviderHeartbeatLoad {
             stop: Arc::new(AtomicBool::new(false)),
             modality_active_items: Arc::new(BTreeMap::new()),
             modality_max_inflight_items: Arc::new(BTreeMap::new()),
+            changes,
         }
     }
 }
@@ -37481,7 +38536,27 @@ impl ProviderHeartbeatLoad {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
         let session_capacity = u64::from(max_sessions);
-        let free_slots = session_capacity.saturating_sub(active_slots);
+        let modality_active_items = self
+            .modality_active_items
+            .iter()
+            .map(|(modality, active)| {
+                (
+                    modality.clone(),
+                    u32::try_from(active.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let modality_at_capacity = modality_active_items.iter().any(|(modality, active)| {
+            self.modality_max_inflight_items
+                .get(modality)
+                .is_some_and(|limit| *limit > 0 && u64::from(*active) >= *limit)
+        });
+        let session_at_capacity = max_sessions > 0 && active_slots >= session_capacity;
+        let free_slots = if modality_at_capacity {
+            0
+        } else {
+            session_capacity.saturating_sub(active_slots)
+        };
         let engine_backlog = active_requests.saturating_sub(session_capacity);
         let rolling_turn_ms = self.rolling_turn_ms.load(Ordering::Relaxed);
         let est_wait_ms = if engine_backlog > 0 && rolling_turn_ms > 0 {
@@ -37501,23 +38576,19 @@ impl ProviderHeartbeatLoad {
             est_wait_ms,
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
-            accepting_new: self.accepting_new.load(Ordering::Relaxed),
-            modality_active_items: self
-                .modality_active_items
-                .iter()
-                .map(|(modality, active)| {
-                    (
-                        modality.clone(),
-                        u32::try_from(active.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-                    )
-                })
-                .collect(),
+            accepting_new: self.accepting_new.load(Ordering::Relaxed)
+                && !session_at_capacity
+                && !modality_at_capacity,
+            modality_at_capacity,
+            modality_active_items,
         }
     }
 
     fn set_active_sessions(&self, sessions: usize) {
         let active = u64::try_from(sessions).unwrap_or(u64::MAX);
-        self.active_slots.store(active, Ordering::Relaxed);
+        if self.active_slots.swap(active, Ordering::AcqRel) != active {
+            self.notify_change();
+        }
     }
 
     fn begin_request(
@@ -37528,10 +38599,16 @@ impl ProviderHeartbeatLoad {
         for (modality, item_count) in &modality_items {
             let Some(counter) = self.modality_active_items.get(modality) else {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!("provider has no live capacity counter for {modality}");
             };
             let Some(limit) = self.modality_max_inflight_items.get(modality).copied() else {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!("provider has no in-flight capacity limit for {modality}");
             };
             let item_count = u64::from(*item_count);
@@ -37542,6 +38619,9 @@ impl ProviderHeartbeatLoad {
                 .is_ok();
             if !reserved_ok {
                 self.release_modality_items(&reserved);
+                if !reserved.is_empty() {
+                    self.notify_change();
+                }
                 bail!(
                     "provider {modality} capacity is full; request needs {item_count} item(s), limit {limit}"
                 );
@@ -37549,6 +38629,7 @@ impl ProviderHeartbeatLoad {
             reserved.push((modality.clone(), item_count));
         }
         self.active_requests.fetch_add(1, Ordering::Relaxed);
+        self.notify_change();
         Ok(ProviderRequestLoadGuard {
             load: self.clone(),
             modality_items,
@@ -37575,7 +38656,9 @@ impl ProviderHeartbeatLoad {
     }
 
     fn set_accepting_new(&self, accepting_new: bool) {
-        self.accepting_new.store(accepting_new, Ordering::Relaxed);
+        if self.accepting_new.swap(accepting_new, Ordering::AcqRel) != accepting_new {
+            self.notify_change();
+        }
     }
 
     fn is_accepting_new(&self) -> bool {
@@ -37593,6 +38676,7 @@ impl ProviderHeartbeatLoad {
             .map(|(modality, count)| (modality.clone(), u64::from(*count)))
             .collect::<Vec<_>>();
         self.release_modality_items(&reserved);
+        self.notify_change();
     }
 
     fn release_modality_items(&self, reserved: &[(String, u64)]) {
@@ -37620,11 +38704,22 @@ impl ProviderHeartbeatLoad {
     }
 
     fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if !self.stop.swap(true, Ordering::AcqRel) {
+            self.notify_change();
+        }
     }
 
     fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self) {
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -38345,6 +39440,10 @@ struct ActiveProviderSession {
     remote: String,
     user_pubkey: String,
     session_id: String,
+    billing_id: String,
+    billing_attempt: u32,
+    billing_prior_usage: ReceiptUsage,
+    billing_prior_au_owed_cum: MoneyAu,
     rail: String,
     price_ver: u64,
     locked_rate_map: Vec<RateMapEntry>,
@@ -38356,6 +39455,7 @@ struct ActiveProviderSession {
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
+    max_spend_au: MoneyAu,
     accept_replay: Option<ProviderSessionAcceptReplay>,
 }
 
@@ -38447,14 +39547,16 @@ trait ProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput>;
     fn respond_streaming(
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
         _stream: Option<&mut ProviderSessionLiveStream<'_>>,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
-        self.respond(terms, body)
+        self.respond(terms, body, cancellation)
     }
 }
 
@@ -38469,7 +39571,9 @@ impl ProviderSessionResponder for DeterministicProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
+        cancellation.check().context("provider request cancelled")?;
         Ok(provider_session_response(terms, body))
     }
 }
@@ -38491,6 +39595,7 @@ impl ProviderSessionResponder for UnavailableProviderSessionResponder {
         &mut self,
         _terms: &ProviderSessionTerms,
         _body: &Value,
+        _cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         bail!("{}", self.reason)
     }
@@ -38521,6 +39626,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response_with_sampling(
             self.backend.as_mut(),
@@ -38529,6 +39635,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             &terms.sampling,
             body,
             None,
+            cancellation,
         )
     }
 
@@ -38537,6 +39644,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         terms: &ProviderSessionTerms,
         body: &Value,
         stream: Option<&mut ProviderSessionLiveStream<'_>>,
+        cancellation: &CancellationToken,
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response_with_sampling(
             self.backend.as_mut(),
@@ -38545,6 +39653,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             &terms.sampling,
             body,
             stream,
+            cancellation,
         )
     }
 }
@@ -38868,6 +39977,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         .build()
         .context("building mayhemd control HTTP client")?;
     let supervisor_url = mayhemd_control_url(&home)?;
+    let control_token = load_or_create_mayhemd_control_token(&home)?;
     let serve_plan_args = ProviderServePlanArgs {
         home: Some(home.clone()),
         rpc_url: None,
@@ -38920,9 +40030,14 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         computed.hardware_quote_config.as_ref(),
         None,
     )?;
-    let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
-        .await
-        .context("adding provider worker to mayhemd")?;
+    let response = post_mayhemd_json(
+        &client,
+        &format!("{supervisor_url}/children/add"),
+        &child,
+        &control_token,
+    )
+    .await
+    .context("adding provider worker to mayhemd")?;
     let report = json!({
         "ok": true,
         "home": home,
@@ -38958,12 +40073,14 @@ async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
         .build()
         .context("building mayhemd control HTTP client")?;
     let supervisor_url = mayhemd_control_url(&home)?;
+    let control_token = load_or_create_mayhemd_control_token(&home)?;
     let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
     let child_name = provider_serve_child_name_for_target(&status, &args.target)?;
-    let response = post_gateway_json(
+    let response = post_mayhemd_json(
         &client,
         &format!("{supervisor_url}/children/remove"),
         &json!({ "name": child_name }),
+        &control_token,
     )
     .await
     .context("removing provider worker from mayhemd")?;
@@ -39041,8 +40158,6 @@ fn provider_serve_child_config(
         rpc_url,
         "--sc-bridge-url".to_owned(),
         sc_bridge_url,
-        "--sc-bridge-token".to_owned(),
-        sc_bridge_token,
         "--serve-sessions".to_owned(),
         "--enclave".to_owned(),
         enclave.to_owned(),
@@ -39074,7 +40189,8 @@ fn provider_serve_child_config(
         ]);
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
-    let runtime_env = provider_backend_runtime_child_env(backend, runtime);
+    let mut runtime_env = provider_backend_runtime_child_env(backend, runtime);
+    runtime_env.insert("MAYHEM_SC_BRIDGE_TOKEN".to_owned(), sc_bridge_token);
     Ok(json!({
         "name": name.unwrap_or_else(|| format!("provider-live-{}", up_provider_worker_slug(enclave))),
         "command": mayhem_path.display().to_string(),
@@ -39886,6 +41002,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let provider_feature =
         ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
     let serve_terms = provider_join_context_terms_for_candidate(&selected)?;
+    let join_attestation = ProviderJoinAttestationEvidence {
+        att_tier: attestation.report.att_tier,
+        attestation_head: attestation.report_head.clone(),
+    };
     let serve_feature = ensure_joined_enclave(
         &rpc,
         &keypair_path,
@@ -39895,6 +41015,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &serve_terms,
         Some(&hardware_fingerprint),
         device_key.as_deref(),
+        &join_attestation,
         args.sim,
     )
     .await?;
@@ -40003,7 +41124,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         },
         "rules": &rules,
         "market": {
-            "min_ask_au": args.min_ask_au,
+            "min_ask_au": money_au_json(args.min_ask_au),
         },
         "context": {
             "served_ctx": selected.served_ctx,
@@ -40018,7 +41139,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "protection": {
             "max_sessions": protection_config.max_sessions,
             "accept_rate_per_minute": protection_config.accept_rate_per_minute,
-            "serve_budget_au": protection_config.budget_au,
+            "serve_budget_au": money_au_json(protection_config.budget_au),
             "serve_budget_units": protection_config.budget_units,
             "serve_budget_period_seconds": protection_config.budget_period.as_secs(),
         },
@@ -41520,6 +42641,11 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
     let contract = read_contract_catalog(&ctx.rpc).await?;
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
+    ensure!(
+        enclave.att_tier == mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER,
+        "Tier-{} enclave admission requires the hardware-bound report generated by `mayhem provider start`; the lightweight join command only proves Tier 1",
+        enclave.att_tier
+    );
     let catalog_ctx = u64::from(gateway_caps_from_contract(&enclave.caps).ctx);
     let served_ctx = resolve_provider_join_served_ctx(catalog_ctx, args.ctx)?;
     let price_ctx_bracket = price_ctx_bracket_for_model_class(
@@ -41552,6 +42678,8 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     )?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
     let hardware_fingerprint = current_provider_hardware_fingerprint();
+    let join_attestation =
+        provider_tier1_join_attestation(&ctx.wallet.public_key, &enclave, &hardware_fingerprint)?;
     let provider_feature = ensure_provider_registered(
         &ctx.rpc,
         &ctx.keypair_path,
@@ -41569,6 +42697,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         &serve_terms,
         Some(&hardware_fingerprint),
         None,
+        &join_attestation,
         args.tx.sim,
     )
     .await?;
@@ -41603,6 +42732,26 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+fn provider_tier1_join_attestation(
+    provider: &str,
+    enclave: &LedgerEnclave,
+    hardware_fingerprint: &str,
+) -> Result<ProviderJoinAttestationEvidence> {
+    let binary_hash = measure_binary(&std::env::current_exe()?)?;
+    Ok(ProviderJoinAttestationEvidence {
+        att_tier: mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER,
+        attestation_head: stable_value_hash(&json!({
+            "domain": "mayhem-provider-tier1-admission-v1",
+            "provider": provider,
+            "enclave_id": enclave.enclave_id,
+            "artifact_root": enclave.artifact_root,
+            "manifest_hash": enclave.manifest_hash,
+            "binary_hash": binary_hash,
+            "hardware_fingerprint": hardware_fingerprint,
+        })),
+    })
 }
 
 fn resolve_provider_join_served_ctx(catalog_ctx: u64, requested: Option<u64>) -> Result<u64> {
@@ -41852,7 +43001,9 @@ fn provider_lifecycle_intent(
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
-    provider_lifecycle_intent_with_anchors(provider, op, enclave_id, room_id, None, None, None)
+    provider_lifecycle_intent_with_anchors(
+        provider, op, enclave_id, room_id, None, None, None, None,
+    )
 }
 
 fn provider_lifecycle_intent_with_anchors(
@@ -41863,6 +43014,7 @@ fn provider_lifecycle_intent_with_anchors(
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
     join_terms: Option<&ProviderJoinContextTerms>,
+    attestation: Option<&ProviderJoinAttestationEvidence>,
 ) -> Result<Value> {
     let nonce = provider_lifecycle_nonce(provider, op, enclave_id, room_id)?;
     let mut value = match (enclave_id, room_id) {
@@ -41889,6 +43041,16 @@ fn provider_lifecycle_intent_with_anchors(
     if op == "join_enclave" {
         let join_terms =
             join_terms.context("join_enclave lifecycle intent requires committed context terms")?;
+        let attestation = attestation
+            .context("join_enclave lifecycle intent requires signed attestation evidence")?;
+        if !(1..=mayhem_proto::TIER3_CONFIDENTIAL_COMPUTE_TIER).contains(&attestation.att_tier) {
+            bail!("provider attestation tier must be between 1 and 3");
+        }
+        if !is_hex_len(&attestation.attestation_head, 64) {
+            bail!("provider attestation head must be a 32-byte hex digest");
+        }
+        value["att_tier"] = json!(attestation.att_tier);
+        value["attestation_head"] = json!(attestation.attestation_head.to_ascii_lowercase());
         value["served_ctx"] = json!(join_terms.served_ctx);
         value["served_modalities"] = json!(&join_terms.served_modalities);
         value["served_specialities"] = json!(&join_terms.served_specialities);
@@ -47918,6 +49080,7 @@ async fn ensure_joined_enclave(
     serve_terms: &ProviderJoinContextTerms,
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
+    attestation: &ProviderJoinAttestationEvidence,
     sim: bool,
 ) -> Result<Value> {
     let key = format!("serve/{}/{}", wallet.public_key, enclave.enclave_id);
@@ -47948,6 +49111,7 @@ async fn ensure_joined_enclave(
         hardware_fingerprint,
         device_key,
         Some(serve_terms),
+        Some(attestation),
     )
     .await?;
     if sim {
@@ -48095,8 +49259,10 @@ async fn submit_provider_lifecycle_feature(
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
-    submit_provider_lifecycle_feature_with_anchors(ctx, op, enclave_id, room_id, None, None, None)
-        .await
+    submit_provider_lifecycle_feature_with_anchors(
+        ctx, op, enclave_id, room_id, None, None, None, None,
+    )
+    .await
 }
 
 async fn submit_provider_lifecycle_feature_with_anchors(
@@ -48107,6 +49273,7 @@ async fn submit_provider_lifecycle_feature_with_anchors(
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
     join_terms: Option<&ProviderJoinContextTerms>,
+    attestation: Option<&ProviderJoinAttestationEvidence>,
 ) -> Result<Value> {
     let intent = provider_lifecycle_intent_with_anchors(
         &ctx.wallet.public_key,
@@ -48116,6 +49283,7 @@ async fn submit_provider_lifecycle_feature_with_anchors(
         hardware_fingerprint,
         device_key,
         join_terms,
+        attestation,
     )?;
     submit_provider_lifecycle_intent(ctx, intent).await
 }
@@ -48311,7 +49479,11 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "identity_anchor": identity_anchor,
             "accepting_new": load.accepting_new,
-            "sat": provider_saturation(load.active_slots, max_sessions),
+            "sat": if load.modality_at_capacity {
+                1.0
+            } else {
+                provider_saturation(load.active_slots, max_sessions)
+            },
             "slots": {
                 "active": load.active_slots,
                 "active_requests": load.active_requests,
@@ -48453,7 +49625,9 @@ async fn run_provider_session_heartbeat_connection(
     let mut seq = 0_u64;
     let mut join_rooms = true;
     let mut heartbeat_cache_updated_at = None::<Instant>;
+    let mut load_changes = ctx.load.subscribe_changes();
     while !ctx.load.is_stopped() {
+        load_changes.borrow_and_update();
         let round_started = Instant::now();
         let sent = timeout(
             ctx.bridge_operation_timeout,
@@ -48502,7 +49676,16 @@ async fn run_provider_session_heartbeat_connection(
         // the lag is reported even without session debug enabled.
         let round_elapsed = round_started.elapsed();
         match ctx.heartbeat_interval.checked_sub(round_elapsed) {
-            Some(remaining) => sleep(remaining).await,
+            Some(remaining) => {
+                tokio::select! {
+                    _ = sleep(remaining) => {}
+                    changed = load_changes.changed() => {
+                        if changed.is_err() {
+                            bail!("provider heartbeat load-change channel closed");
+                        }
+                    }
+                }
+            }
             None => eprintln!(
                 "warning: provider heartbeat pipeline is behind: seq {} took {}ms against a {}ms interval; sending the next beat immediately",
                 seq.saturating_sub(1),
@@ -48945,6 +50128,11 @@ async fn serve_provider_sessions(
                         .clone()
                         .or_else(|| engine_watchdog_reject.clone())
                         .or_else(|| engine_recovery.rejection());
+                    let event_belongs_to_process = provider_session_event_belongs_to_process(
+                        &event,
+                        &sessions,
+                        &terms,
+                    );
                     if let Err(err) = handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
@@ -48954,6 +50142,9 @@ async fn serve_provider_sessions(
                         &mut protection,
                         &terms,
                         &runtime,
+                        &sc_bridge_url,
+                        &sc_bridge_token,
+                        session_bridge_operation_deadline,
                         responder.as_mut(),
                         &mut engine_recovery,
                         session_reject,
@@ -48967,17 +50158,25 @@ async fn serve_provider_sessions(
                         provider_session_debug(format!(
                             "session {event_session_id} failed without stopping provider serving: {err:#}"
                         ));
-                        if is_hex_len(&event_remote, 64) && is_hex_len(&event_session_id, 64) {
+                        let owns_session = sessions
+                            .get(&event_session_id)
+                            .is_some_and(|active| active.remote == event_remote);
+                        if event_belongs_to_process
+                            && is_hex_len(&event_remote, 64)
+                            && is_hex_len(&event_session_id, 64)
+                        {
                             let _ = bridge
                                 .session_close(&event_remote, &event_session_id)
                                 .await;
                         }
-                        discard_provider_session_state(
-                            &mut sessions,
-                            &mut pending_requests,
-                            &mut pending_payloads,
-                            &event_session_id,
-                        );
+                        if owns_session {
+                            discard_provider_session_state(
+                                &mut sessions,
+                                &mut pending_requests,
+                                &mut pending_payloads,
+                                &event_session_id,
+                            );
+                        }
                         heartbeat_load.set_active_sessions(sessions.len());
                     }
                 }
@@ -49139,6 +50338,95 @@ async fn reconnect_provider_session_bridge(
                 delay = (delay * 2).min(max_delay);
             }
         }
+    }
+}
+
+struct ProviderSessionLivenessMonitor {
+    cancellation: CancellationToken,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl ProviderSessionLivenessMonitor {
+    async fn start(
+        sc_bridge_url: &str,
+        sc_bridge_token: &str,
+        session_id: &str,
+        remote: &str,
+        operation_deadline: Option<Duration>,
+    ) -> Result<Self> {
+        let mut bridge = ScBridgeClient::connect(
+            ScBridgeConfig::new(sc_bridge_url, sc_bridge_token.to_owned())?
+                .with_operation_deadline(operation_deadline),
+        )
+        .await
+        .context("connecting the provider session liveness monitor to SC-Bridge")?;
+        let subscription = bridge
+            .session_subscribe([session_id])
+            .await
+            .context("subscribing the provider session liveness monitor")?;
+        ensure!(
+            subscription
+                .get("session_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(session_id))),
+            "SC-Bridge did not confirm the provider session liveness subscription"
+        );
+
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let session_id = session_id.to_owned();
+        let remote = remote.to_owned();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => return Ok(()),
+                    event = bridge.next_session_event_for(&session_id, None) => {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => {
+                                task_cancellation.cancel();
+                                return Err(anyhow!(error))
+                                    .context("provider session liveness stream stopped");
+                            }
+                        };
+                        if event.get("remote").and_then(Value::as_str) != Some(remote.as_str()) {
+                            continue;
+                        }
+                        let transport_closed = event.get("type").and_then(Value::as_str)
+                            == Some("session_closed");
+                        let peer_closed = event
+                            .get("frame")
+                            .and_then(|frame| frame.get("t"))
+                            .and_then(Value::as_str)
+                            == Some("s.close");
+                        if transport_closed || peer_closed {
+                            task_cancellation.cancel();
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            cancellation,
+            stop: Some(stop),
+            task,
+        })
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.task
+            .await
+            .context("provider session liveness monitor task panicked")?
     }
 }
 
@@ -50068,6 +51356,9 @@ async fn handle_provider_session_frame(
     protection: &mut ProviderProtectionState,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
+    sc_bridge_url: &str,
+    sc_bridge_token: &str,
+    bridge_operation_deadline: Option<Duration>,
     responder: &mut dyn ProviderSessionResponder,
     engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
@@ -50105,6 +51396,12 @@ async fn handle_provider_session_frame(
         .and_then(Value::as_str)
         .filter(|frame_type| !frame_type.is_empty() && frame_type.len() <= 64)
         .context("provider session frame has invalid type")?;
+    if !provider_session_event_belongs_to_process(&event, sessions, terms) {
+        provider_session_debug(format!(
+            "ignoring unowned provider session frame {frame_type} for {session_id} from {remote} on the shared SC-Bridge"
+        ));
+        return Ok(());
+    }
     match frame_type {
         "s.open" => {
             if let Some(existing) = sessions.get(&session_id) {
@@ -50145,9 +51442,8 @@ async fn handle_provider_session_frame(
             }
             if !provider_session_open_targets_enclave(&frame, terms) {
                 provider_session_debug(format!(
-                    "refusing s.open for session {session_id} from {remote}: frame targets a different enclave"
+                    "ignoring s.open for session {session_id} from {remote}: frame targets a different enclave"
                 ));
-                let _ = bridge.session_close(&remote, &session_id).await;
                 return Ok(());
             }
             provider_session_debug(format!(
@@ -50237,6 +51533,10 @@ async fn handle_provider_session_frame(
                             .unwrap_or_default()
                             .to_owned(),
                         session_id: session_id.clone(),
+                        billing_id: spend_voucher.body.billing_id.clone(),
+                        billing_attempt: spend_voucher.body.billing_attempt,
+                        billing_prior_usage: spend_voucher.body.billing_prior_usage.clone(),
+                        billing_prior_au_owed_cum: spend_voucher.body.billing_prior_au_owed_cum,
                         price_ver: spend_voucher.body.price_ver,
                         locked_rate_map: normalize_rate_map(
                             spend_voucher.body.locked_rate_map.clone(),
@@ -50249,6 +51549,7 @@ async fn handle_provider_session_frame(
                         ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                         ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                         checkpoint_every,
+                        max_spend_au: spend_voucher.body.max_spend_au,
                         accept_replay: None,
                     };
                     let ts = unix_epoch_millis()?;
@@ -50534,6 +51835,19 @@ async fn handle_provider_session_frame(
                 }
             };
             let request_started = request_load.started();
+            let liveness = ProviderSessionLivenessMonitor::start(
+                sc_bridge_url,
+                sc_bridge_token,
+                &active.session_id,
+                &active.remote,
+                bridge_operation_deadline,
+            )
+            .await
+            .context("starting in-session provider peer liveness")?;
+            let cancellation = liveness.cancellation();
+            if provider_session_client_disconnect_requested(bridge, &active).await? {
+                cancellation.cancel();
+            }
             let mut live_stream = responder.supports_live_text_streaming().then(|| {
                 ProviderSessionLiveStream::new(
                     bridge,
@@ -50547,10 +51861,29 @@ async fn handle_provider_session_frame(
                 )
             });
             let response = contain_provider_request(|| {
-                let output = responder.respond_streaming(terms, &body, live_stream.as_mut())?;
+                let mut output = responder.respond_streaming(
+                    terms,
+                    &body,
+                    live_stream.as_mut(),
+                    &cancellation,
+                )?;
+                normalize_provider_visible_output_usage(&body, &mut output)?;
+                cancellation
+                    .check()
+                    .context("provider request cancelled before response publication")?;
                 validate_provider_session_output(terms, &body, &output)?;
                 Ok(output)
             });
+            let response = match liveness.stop().await {
+                Ok(()) => response,
+                Err(error) if response.is_ok() => Err(error),
+                Err(error) => {
+                    provider_session_debug(format!(
+                        "provider session liveness monitor also failed after engine failure: {error:#}"
+                    ));
+                    response
+                }
+            };
             let (output, measured_throughput) = match response {
                 Ok(output) => {
                     if live_stream
@@ -50616,6 +51949,50 @@ async fn handle_provider_session_frame(
                 }
                 Err(err) => {
                     request_load.finish();
+                    let err_text = format!("{err:#}");
+                    if cancellation.is_cancelled()
+                        && !err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT)
+                    {
+                        if let Some(reason) = provider_engine_component_failure(responder, &err) {
+                            heartbeat_load.set_accepting_new(false);
+                            provider_session_debug(format!(
+                                "provider engine component stopped while cancelling session {session_id}; scheduling isolated reload: {reason}"
+                            ));
+                            engine_recovery.mark_failed(reason);
+                        }
+                        let (usage, usage_attribution, receipt_seq) = live_stream
+                            .as_ref()
+                            .map(|stream| stream.cancellation_receipt_state())
+                            .unwrap_or_else(|| (ReceiptUsage::default(), BTreeMap::new(), 1));
+                        match settle_cancelled_provider_session(
+                            bridge,
+                            &active,
+                            request_id,
+                            terms,
+                            &body,
+                            usage,
+                            usage_attribution,
+                            receipt_seq,
+                            runtime.runtime_keypair,
+                        )
+                        .await
+                        {
+                            Ok(receipt) => {
+                                protection.record_usage(
+                                    &receipt.body.usage,
+                                    receipt.body.au_owed_cum,
+                                );
+                            }
+                            Err(settlement_error) => provider_session_debug(format!(
+                                "client-disconnect settlement failed for session {session_id}: {settlement_error:#}"
+                            )),
+                        }
+                        sessions.remove(&session_id);
+                        pending_requests.remove(&session_id);
+                        remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                        heartbeat_load.set_active_sessions(sessions.len());
+                        return Ok(());
+                    }
                     if let Some(reason) = provider_engine_component_failure(responder, &err) {
                         heartbeat_load.set_accepting_new(false);
                         provider_session_debug(format!(
@@ -50623,7 +52000,6 @@ async fn handle_provider_session_frame(
                         ));
                         engine_recovery.mark_failed(reason);
                     }
-                    let err_text = format!("{err:#}");
                     if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
                         provider_session_debug(format!(
                             "client disconnected after partial receipt for session {session_id} request {request_id}"
@@ -50790,6 +52166,30 @@ async fn handle_provider_session_frame(
     Ok(())
 }
 
+fn provider_session_event_belongs_to_process(
+    event: &Value,
+    sessions: &HashMap<String, ActiveProviderSession>,
+    terms: &ProviderSessionTerms,
+) -> bool {
+    let Some(session_id) = event.get("session_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(remote) = event.get("remote").and_then(Value::as_str) else {
+        return false;
+    };
+    if sessions
+        .get(session_id)
+        .is_some_and(|active| active.remote == remote)
+    {
+        return true;
+    }
+    let Some(frame) = event.get("frame") else {
+        return false;
+    };
+    frame.get("t").and_then(Value::as_str) == Some("s.open")
+        && provider_session_open_targets_enclave(frame, terms)
+}
+
 async fn open_provider_direct_session(
     bridge: &mut ScBridgeClient,
     remote: &str,
@@ -50823,8 +52223,9 @@ fn provider_bridge_error_missing_direct_connection(error: &BridgeError) -> bool 
 struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_tokens: u64,
-    delivered_tokens: u64,
+    last_checkpoint_metered_units: u64,
+    delivered_metered_units: u64,
+    reasoning_units: u64,
     prompt_tokens: u64,
 }
 
@@ -50839,15 +52240,19 @@ struct ProviderSessionLiveStream<'a> {
     heartbeat_load: ProviderHeartbeatLoad,
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_tokens: u64,
+    last_checkpoint_metered_units: u64,
     first_ttft_ms: Option<u64>,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
-    delivered_tokens: u64,
+    generated_tokens: u64,
+    delivered_metered_units: u64,
     prompt_tokens: u64,
     streamed_any: bool,
     pending_text: String,
+    pending_hidden_reasoning: String,
     pending_token_ids: Vec<i32>,
+    visible_text: String,
+    hidden_reasoning: String,
 }
 
 const PROVIDER_REASONING_OPEN_TAG: &str = "<think>";
@@ -50892,7 +52297,21 @@ struct ProviderReasoningOutputFilter {
     delimiters: ProviderReasoningDelimiters,
 }
 
+#[derive(Default)]
+struct ProviderReasoningFilteredText {
+    visible: String,
+    hidden: String,
+}
+
+impl ProviderReasoningFilteredText {
+    fn extend(&mut self, next: Self) {
+        self.visible.push_str(&next.visible);
+        self.hidden.push_str(&next.hidden);
+    }
+}
+
 impl ProviderReasoningOutputFilter {
+    #[cfg(test)]
     fn new(mode: ProviderReasoningOutputMode) -> Self {
         Self::with_delimiters(mode, PROVIDER_QWEN_REASONING_DELIMITERS)
     }
@@ -50913,24 +52332,27 @@ impl ProviderReasoningOutputFilter {
         }
     }
 
-    fn push(&mut self, text: &str) -> String {
+    fn push_split(&mut self, text: &str) -> ProviderReasoningFilteredText {
         match self.state {
             ProviderReasoningStreamState::Preserve | ProviderReasoningStreamState::Passthrough => {
-                text.to_owned()
+                ProviderReasoningFilteredText {
+                    visible: text.to_owned(),
+                    hidden: String::new(),
+                }
             }
             ProviderReasoningStreamState::Probe => {
                 self.pending.push_str(text);
-                self.resolve_probe()
+                self.resolve_probe_split()
             }
             ProviderReasoningStreamState::Suppress => {
                 self.pending.push_str(text);
-                self.resolve_suppressed()
+                self.resolve_suppressed_split()
             }
-            ProviderReasoningStreamState::Boundary => self.resolve_boundary(text),
+            ProviderReasoningStreamState::Boundary => self.resolve_boundary_split(text),
         }
     }
 
-    fn finish(&mut self) -> String {
+    fn finish_split(&mut self) -> ProviderReasoningFilteredText {
         match self.state {
             ProviderReasoningStreamState::Probe => {
                 let trimmed = self.pending.trim_start();
@@ -50938,72 +52360,109 @@ impl ProviderReasoningOutputFilter {
                     && (self.delimiters.open.starts_with(trimmed)
                         || self.delimiters.close.starts_with(trimmed))
                 {
-                    self.pending.clear();
-                    return String::new();
+                    return ProviderReasoningFilteredText {
+                        visible: String::new(),
+                        hidden: std::mem::take(&mut self.pending),
+                    };
                 }
                 self.state = ProviderReasoningStreamState::Passthrough;
-                std::mem::take(&mut self.pending)
+                ProviderReasoningFilteredText {
+                    visible: std::mem::take(&mut self.pending),
+                    hidden: String::new(),
+                }
             }
-            ProviderReasoningStreamState::Suppress => {
-                self.pending.clear();
-                String::new()
-            }
+            ProviderReasoningStreamState::Suppress => ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden: std::mem::take(&mut self.pending),
+            },
             ProviderReasoningStreamState::Preserve
             | ProviderReasoningStreamState::Boundary
-            | ProviderReasoningStreamState::Passthrough => String::new(),
+            | ProviderReasoningStreamState::Passthrough => ProviderReasoningFilteredText::default(),
         }
     }
 
-    fn resolve_probe(&mut self) -> String {
+    fn resolve_probe_split(&mut self) -> ProviderReasoningFilteredText {
         let trimmed = self.pending.trim_start();
         if trimmed.is_empty()
             || self.delimiters.open.starts_with(trimmed)
             || self.delimiters.close.starts_with(trimmed)
         {
-            return String::new();
+            return ProviderReasoningFilteredText::default();
         }
         if let Some(rest) = trimmed.strip_prefix(self.delimiters.open) {
+            let consumed = self.pending.len() - rest.len();
+            let hidden = self.pending[..consumed].to_owned();
             self.pending = rest.to_owned();
             self.state = ProviderReasoningStreamState::Suppress;
-            return self.resolve_suppressed();
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_suppressed_split());
+            return filtered;
         }
         if let Some(rest) = trimmed.strip_prefix(self.delimiters.close) {
+            let consumed = self.pending.len() - rest.len();
+            let hidden = self.pending[..consumed].to_owned();
             let rest = rest.to_owned();
             self.pending.clear();
-            return self.resolve_boundary(&rest);
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_boundary_split(&rest));
+            return filtered;
         }
         self.state = ProviderReasoningStreamState::Passthrough;
-        std::mem::take(&mut self.pending)
+        ProviderReasoningFilteredText {
+            visible: std::mem::take(&mut self.pending),
+            hidden: String::new(),
+        }
     }
 
-    fn resolve_suppressed(&mut self) -> String {
+    fn resolve_suppressed_split(&mut self) -> ProviderReasoningFilteredText {
         if let Some(index) = self.pending.find(self.delimiters.close) {
-            let rest = self.pending[index + self.delimiters.close.len()..].to_owned();
+            let hidden_end = index + self.delimiters.close.len();
+            let hidden = self.pending[..hidden_end].to_owned();
+            let rest = self.pending[hidden_end..].to_owned();
             self.pending.clear();
-            return self.resolve_boundary(&rest);
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_boundary_split(&rest));
+            return filtered;
         }
 
         let retained = (1..self.delimiters.close.len())
             .rev()
             .find(|length| self.pending.ends_with(&self.delimiters.close[..*length]))
             .unwrap_or(0);
-        if retained == 0 {
-            self.pending.clear();
-        } else {
-            let tail = self.pending.split_off(self.pending.len() - retained);
-            self.pending = tail;
+        let hidden_end = self.pending.len() - retained;
+        let hidden = self.pending[..hidden_end].to_owned();
+        let tail = self.pending[hidden_end..].to_owned();
+        self.pending = tail;
+        ProviderReasoningFilteredText {
+            visible: String::new(),
+            hidden,
         }
-        String::new()
     }
 
-    fn resolve_boundary(&mut self, text: &str) -> String {
+    fn resolve_boundary_split(&mut self, text: &str) -> ProviderReasoningFilteredText {
         let visible = trim_provider_reasoning_boundary(text);
+        let hidden = text[..text.len() - visible.len()].to_owned();
         if visible.is_empty() {
             self.state = ProviderReasoningStreamState::Boundary;
-            String::new()
+            ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            }
         } else {
             self.state = ProviderReasoningStreamState::Passthrough;
-            visible.to_owned()
+            ProviderReasoningFilteredText {
+                visible: visible.to_owned(),
+                hidden,
+            }
         }
     }
 }
@@ -51037,19 +52496,28 @@ impl<'a> ProviderSessionLiveStream<'a> {
             heartbeat_load,
             next_index: 0,
             receipt_seq: 1,
-            last_checkpoint_tokens: 0,
+            last_checkpoint_metered_units: 0,
             first_ttft_ms: None,
             first_token_at: None,
             last_token_at: None,
-            delivered_tokens: 0,
+            generated_tokens: 0,
+            delivered_metered_units: 0,
             prompt_tokens: 0,
             streamed_any: false,
             pending_text: String::new(),
+            pending_hidden_reasoning: String::new(),
             pending_token_ids: Vec::new(),
+            visible_text: String::new(),
+            hidden_reasoning: String::new(),
         }
     }
 
-    fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
+    fn on_token(
+        &mut self,
+        chunk: TokenChunk,
+        hidden_reasoning: &str,
+        prompt_tokens: u64,
+    ) -> Result<()> {
         self.prompt_tokens = prompt_tokens;
         let token_at = Instant::now();
         if self.first_ttft_ms.is_none() {
@@ -51061,17 +52529,17 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.last_token_at = Some(token_at);
         provider_session_debug(format!(
             "live buffering token #{} for session {} request {}",
-            self.delivered_tokens, self.active.session_id, self.request_id
+            self.generated_tokens, self.active.session_id, self.request_id
         ));
         self.pending_text.push_str(&chunk.text);
+        self.pending_hidden_reasoning.push_str(hidden_reasoning);
         self.pending_token_ids.push(chunk.token_id);
-        self.delivered_tokens = self.delivered_tokens.saturating_add(1);
-        self.streamed_any = true;
+        self.generated_tokens = self.generated_tokens.saturating_add(1);
 
         let checkpoint_due = provider_session_checkpoint_due(
-            self.delivered_tokens,
+            self.projected_metered_units(),
             u64::MAX,
-            self.last_checkpoint_tokens,
+            self.last_checkpoint_metered_units,
             provider_session_checkpoint_tokens(self.active),
         );
         if self.next_index == 0
@@ -51083,12 +52551,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
         }
 
         if checkpoint_due {
-            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_tokens);
-            let receipt = provider_session_receipt_for_usage(
+            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_metered_units);
+            let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
+            let receipt = provider_session_receipt_for_usage_attribution(
                 self.terms,
                 self.active,
                 self.body,
                 usage,
+                usage_attribution,
                 self.receipt_seq,
                 false,
                 self.runtime_keypair,
@@ -51114,15 +52584,32 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_tokens = self.delivered_tokens;
+            self.last_checkpoint_metered_units = self.delivered_metered_units;
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
     }
 
-    fn append_visible_text(&mut self, text: &str) {
-        self.pending_text.push_str(text);
+    fn append_filtered_text(&mut self, filtered: ProviderReasoningFilteredText) {
+        self.pending_text.push_str(&filtered.visible);
+        self.pending_hidden_reasoning.push_str(&filtered.hidden);
+    }
+
+    fn projected_metered_units(&self) -> u64 {
+        let bytes = self
+            .visible_text
+            .len()
+            .saturating_add(self.hidden_reasoning.len())
+            .saturating_add(self.pending_text.len())
+            .saturating_add(self.pending_hidden_reasoning.len());
+        if bytes == 0 {
+            0
+        } else {
+            u64::try_from(bytes)
+                .unwrap_or(u64::MAX)
+                .div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
+        }
     }
 
     fn first_ttft_ms(&self) -> Option<u64> {
@@ -51130,7 +52617,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn measured_generation_tok_s(&self) -> Option<f64> {
-        let token_intervals = self.delivered_tokens.checked_sub(1)?;
+        let token_intervals = self.generated_tokens.checked_sub(1)?;
         if token_intervals == 0 {
             return None;
         }
@@ -51145,13 +52632,30 @@ impl<'a> ProviderSessionLiveStream<'a> {
         (tok_s.is_finite() && tok_s > 0.0).then_some(tok_s)
     }
 
+    fn cancellation_receipt_state(&self) -> (ReceiptUsage, BTreeMap<String, u64>, u64) {
+        let usage = if self.last_checkpoint_metered_units == 0 {
+            ReceiptUsage::default()
+        } else {
+            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_metered_units)
+        };
+        let usage_attribution = if self.last_checkpoint_metered_units == 0 {
+            BTreeMap::new()
+        } else {
+            provider_reasoning_usage_attribution(&self.hidden_reasoning)
+        };
+        (usage, usage_attribution, self.receipt_seq)
+    }
+
     fn finish(&mut self) -> Result<()> {
         self.flush_pending_delta()?;
         self.poll_client_disconnect()
     }
 
     fn flush_pending_delta(&mut self) -> Result<()> {
-        if self.pending_text.is_empty() && self.pending_token_ids.is_empty() {
+        if self.pending_text.is_empty()
+            && self.pending_hidden_reasoning.is_empty()
+            && self.pending_token_ids.is_empty()
+        {
             return Ok(());
         }
         provider_session_debug(format!(
@@ -51166,6 +52670,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             "rid": self.request_id,
             "i": self.next_index,
             "d": &self.pending_text,
+            "reasoning_evidence_delta": &self.pending_hidden_reasoning,
             "token_ids_delta": &self.pending_token_ids,
             "tools": null,
             "fin": null,
@@ -51178,7 +52683,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("sending live token s.delta")
             })
         })?;
+        self.visible_text.push_str(&self.pending_text);
+        self.hidden_reasoning
+            .push_str(&self.pending_hidden_reasoning);
+        self.delivered_metered_units =
+            metered_output_units(&self.visible_text, &self.hidden_reasoning, &[]);
+        self.streamed_any = true;
         self.pending_text.clear();
+        self.pending_hidden_reasoning.clear();
         self.pending_token_ids.clear();
         self.next_index = self.next_index.saturating_add(1);
         Ok(())
@@ -51230,15 +52742,19 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
-        if self.delivered_tokens == 0 || self.delivered_tokens == self.last_checkpoint_tokens {
+        if self.delivered_metered_units == 0
+            || self.delivered_metered_units == self.last_checkpoint_metered_units
+        {
             return Ok(());
         }
-        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_tokens);
-        let receipt = provider_session_receipt_for_usage(
+        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_metered_units);
+        let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
+        let receipt = provider_session_receipt_for_usage_attribution(
             self.terms,
             self.active,
             self.body,
             usage,
+            usage_attribution,
             self.receipt_seq,
             false,
             self.runtime_keypair,
@@ -51264,7 +52780,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 Ok::<(), anyhow::Error>(())
             })
         })?;
-        self.last_checkpoint_tokens = self.delivered_tokens;
+        self.last_checkpoint_metered_units = self.delivered_metered_units;
         self.receipt_seq = self.receipt_seq.saturating_add(1);
         Ok(())
     }
@@ -51273,11 +52789,83 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.streamed_any.then_some(ProviderSessionLiveStreamState {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
-            last_checkpoint_tokens: self.last_checkpoint_tokens,
-            delivered_tokens: self.delivered_tokens,
+            last_checkpoint_metered_units: self.last_checkpoint_metered_units,
+            delivered_metered_units: self.delivered_metered_units,
+            reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
         })
     }
+}
+
+async fn settle_cancelled_provider_session(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    terms: &ProviderSessionTerms,
+    body: &Value,
+    usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
+    receipt_seq: u64,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    let receipt = provider_cancelled_session_receipt(
+        terms,
+        active,
+        body,
+        usage,
+        usage_attribution,
+        receipt_seq,
+        runtime_keypair,
+    )
+    .context("building cancelled provider session receipt")?;
+    send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "client_disconnect")
+        .await?;
+    wait_for_provider_receipt_ack(
+        bridge,
+        active,
+        &receipt,
+        provider_session_receipt_ack_timeout(active),
+    )
+    .await
+    .context("waiting for cancelled provider session receipt ack")?;
+    send_provider_session_close(
+        bridge,
+        &active.remote,
+        &active.session_id,
+        "client_disconnect_settled",
+    )
+    .await?;
+    Ok(receipt)
+}
+
+fn provider_cancelled_session_receipt(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    metered_usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
+    receipt_seq: u64,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    let usage = cancellation_settlement_usage(
+        &active.locked_rate_map,
+        active.locked_per_req_au,
+        active.locked_min_session_au,
+        &metered_usage,
+    )
+    .context(
+        "admin-locked price schedule has no nonzero fixed fee or billable cancellation quantum",
+    )?;
+    provider_session_receipt_for_usage_attribution(
+        terms,
+        active,
+        body,
+        usage,
+        usage_attribution,
+        receipt_seq,
+        true,
+        runtime_keypair,
+    )
 }
 
 async fn send_provider_session_output(
@@ -51300,26 +52888,30 @@ async fn send_provider_session_output(
         .map(|state| state.receipt_seq)
         .unwrap_or(1);
     let checkpoint_tokens = provider_session_checkpoint_tokens(active);
-    let mut last_checkpoint_tokens = live_stream_state
+    let mut last_checkpoint_metered_units = live_stream_state
         .as_ref()
-        .map(|state| state.last_checkpoint_tokens)
+        .map(|state| state.last_checkpoint_metered_units)
         .unwrap_or(0);
     let mut token_ids_sent_in_deltas = live_stream_state.is_some();
-    if output.tools.is_empty() && live_stream_state.is_none() {
+    if live_stream_state.is_none() {
         let max_frame_bytes = provider_session_max_frame_bytes();
-        let parts = provider_stream_parts(
-            &output.content,
-            provider_session_text_delta_bytes(max_frame_bytes),
-        );
+        let delta_bytes = provider_session_text_delta_bytes(max_frame_bytes);
+        let parts = if output.tools.is_empty() {
+            provider_stream_parts(&output.content, delta_bytes)
+        } else {
+            Vec::new()
+        };
+        let reasoning_parts = provider_stream_parts(&output.reasoning_evidence, delta_bytes);
         let token_part_count = output
             .token_ids
             .len()
             .div_ceil(PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA);
-        let part_count = parts.len().max(token_part_count);
-        let mut delivered_token_ids = 0_usize;
-        let mut delivered_rough_tokens = IncrementalRoughTokenCounter::default();
+        let part_count = parts.len().max(reasoning_parts.len()).max(token_part_count);
+        let mut delivered_metered_bytes = 0_u64;
+        let mut delivered_reasoning_bytes = 0_u64;
         for part_index in 0..part_count {
             let part = parts.get(part_index).copied().unwrap_or("");
+            let reasoning_part = reasoning_parts.get(part_index).copied().unwrap_or("");
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
                 active.session_id
@@ -51329,8 +52921,13 @@ async fn send_provider_session_output(
             if !token_ids_delta.is_empty() {
                 token_ids_sent_in_deltas = true;
             }
-            let frame =
-                provider_session_content_delta_frame(request_id, index, part, token_ids_delta);
+            let frame = provider_session_content_delta_frame(
+                request_id,
+                index,
+                part,
+                reasoning_part,
+                token_ids_delta,
+            );
             let frame_len = provider_session_frame_json_len(&frame)?;
             ensure!(
                 frame_len <= max_frame_bytes,
@@ -51342,25 +52939,36 @@ async fn send_provider_session_output(
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
-            delivered_token_ids = delivered_token_ids.saturating_add(token_ids_delta.len());
-            delivered_rough_tokens.observe(part);
-            let delivered_tokens = if output.token_ids.is_empty() {
-                delivered_rough_tokens.count
+            delivered_metered_bytes = delivered_metered_bytes
+                .saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(reasoning_part.len()).unwrap_or(u64::MAX));
+            delivered_reasoning_bytes = delivered_reasoning_bytes
+                .saturating_add(u64::try_from(reasoning_part.len()).unwrap_or(u64::MAX));
+            let delivered_metered_units = if delivered_metered_bytes == 0 {
+                0
             } else {
-                u64::try_from(delivered_token_ids).unwrap_or(u64::MAX)
+                delivered_metered_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
             };
             if provider_session_checkpoint_due(
-                delivered_tokens,
+                delivered_metered_units,
                 output.usage.output_tokens(),
-                last_checkpoint_tokens,
+                last_checkpoint_metered_units,
                 checkpoint_tokens,
             ) {
-                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_tokens);
-                let receipt = provider_session_receipt_for_usage(
+                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_metered_units);
+                let reasoning_units =
+                    delivered_reasoning_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT);
+                let usage_attribution = if reasoning_units == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([("reasoning_output_tokens".to_owned(), reasoning_units)])
+                };
+                let receipt = provider_session_receipt_for_usage_attribution(
                     terms,
                     active,
                     body,
                     usage,
+                    usage_attribution,
                     receipt_seq,
                     false,
                     runtime_keypair,
@@ -51382,7 +52990,7 @@ async fn send_provider_session_output(
                 )
                 .await
                 .context("waiting for checkpoint receipt ack")?;
-                last_checkpoint_tokens = delivered_tokens;
+                last_checkpoint_metered_units = delivered_metered_units;
                 receipt_seq = receipt_seq.saturating_add(1);
             }
         }
@@ -51463,13 +53071,21 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    if state.delivered_tokens > 0 && state.delivered_tokens != state.last_checkpoint_tokens {
-        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_tokens);
-        let receipt = provider_session_receipt_for_usage(
+    if state.delivered_metered_units > 0
+        && state.delivered_metered_units != state.last_checkpoint_metered_units
+    {
+        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_metered_units);
+        let usage_attribution = if state.reasoning_units == 0 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("reasoning_output_tokens".to_owned(), state.reasoning_units)])
+        };
+        let receipt = provider_session_receipt_for_usage_attribution(
             terms,
             active,
             body,
             usage,
+            usage_attribution,
             state.receipt_seq,
             false,
             runtime_keypair,
@@ -51604,6 +53220,7 @@ async fn send_provider_session_final_output_frames(
         "usage_attribution": output.usage_attribution,
         "quality": provider_quality,
         "token_ids": null,
+        "reasoning_evidence_delta": "",
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
     if !output.tools.is_empty() {
@@ -51745,6 +53362,7 @@ fn provider_session_final_delta_frames(
         "usage": output.usage,
         "quality": provider_quality,
         "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
+        "reasoning_evidence_delta": "",
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
     if provider_session_frame_json_len(&final_frame)? <= max_frame_bytes {
@@ -51865,6 +53483,7 @@ fn provider_session_content_delta_frame(
     request_id: &str,
     index: u64,
     part: &str,
+    reasoning_evidence_delta: &str,
     token_ids_delta: &[i32],
 ) -> Value {
     json!({
@@ -51872,6 +53491,7 @@ fn provider_session_content_delta_frame(
         "rid": request_id,
         "i": index,
         "d": part,
+        "reasoning_evidence_delta": reasoning_evidence_delta,
         "token_ids_delta": token_ids_delta,
         "tools": null,
         "fin": null,
@@ -52071,6 +53691,7 @@ fn provider_session_artifact_delta_frame(
         "rid": request_id,
         "i": index,
         "d": "",
+        "reasoning_evidence_delta": "",
         "tools": null,
         "fin": null,
         "artifact": {
@@ -52258,7 +53879,7 @@ fn verify_provider_session_receipt_ack(
     let signature = Signature::from_bytes(&sig_bytes);
     let payload = receipt_signing_bytes(body)?;
     verifying_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .context("receipt ack user signature failed")
 }
 
@@ -52337,9 +53958,23 @@ fn provider_session_receipt_for_usage_attribution(
     final_receipt: bool,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
+    let usage = provider_session_logical_usage(active, &usage);
+    let au_owed_cum = provider_session_au_owed(active, &usage)
+        .context("logical receipt usage regressed from its signed billing baseline")?;
+    let incremental_au = au_owed_cum
+        .checked_sub(active.billing_prior_au_owed_cum)
+        .context("logical receipt amount regressed from its signed billing baseline")?;
+    ensure!(
+        incremental_au <= active.max_spend_au,
+        "provider receipt exceeds the signed incremental spend maximum"
+    );
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
+        billing_id: active.billing_id.clone(),
+        billing_attempt: active.billing_attempt,
+        billing_prior_usage: active.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: active.billing_prior_au_owed_cum,
         seq,
         final_receipt,
         rail: active.rail.clone(),
@@ -52357,7 +53992,7 @@ fn provider_session_receipt_for_usage_attribution(
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
         usage_attribution,
-        au_owed_cum: provider_session_au_owed(active, &usage),
+        au_owed_cum,
         prompt_hash: provider_session_prompt_hash(body),
         ts: unix_epoch_millis()?,
     };
@@ -52368,19 +54003,72 @@ fn provider_session_receipt_for_usage_attribution(
     })
 }
 
-fn provider_session_au_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> MoneyAu {
-    priced_usage_au(
+fn provider_session_logical_usage(
+    active: &ActiveProviderSession,
+    attempt_usage: &ReceiptUsage,
+) -> ReceiptUsage {
+    if active.billing_prior_au_owed_cum == 0 {
+        return attempt_usage.clone();
+    }
+    let incremental = ReceiptUsage::from_units(
+        attempt_usage
+            .units()
+            .iter()
+            .filter(|(unit, _)| {
+                !matches!(
+                    unit.as_str(),
+                    USAGE_INPUT_TOKEN | USAGE_CACHED_INPUT_TOKEN | USAGE_INPUT_CHARACTER
+                )
+            })
+            .map(|(unit, count)| (unit.clone(), *count)),
+    );
+    active.billing_prior_usage.saturating_add(&incremental)
+}
+
+fn provider_session_au_owed(
+    active: &ActiveProviderSession,
+    usage: &ReceiptUsage,
+) -> Option<MoneyAu> {
+    logical_cumulative_priced_usage_au(
         &active.locked_rate_map,
         active.locked_per_req_au,
         active.locked_min_session_au,
+        &active.billing_prior_usage,
+        active.billing_prior_au_owed_cum,
         usage,
     )
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
+    let endpoint_family = body
+        .get("mayhem_contract")
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    if endpoint_family.is_some_and(provider_receipt_binds_contract_request) {
+        return mayhem_proto::endpoint_request_fingerprint(
+            body.get("contract_request").unwrap_or(body),
+        );
+    }
     blake3::hash(provider_session_prompt_text(body).as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
+    matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+            | mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+            | mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    )
 }
 
 fn provider_session_prompt_text(body: &Value) -> String {
@@ -52782,7 +54470,7 @@ fn provider_modality_self_test(
     let mut reports = Vec::new();
     for case in cases {
         let output = responder
-            .respond(terms, &case.body)
+            .respond(terms, &case.body, &CancellationToken::new())
             .with_context(|| format!("functional modality canary {} failed", case.prompt_id))?;
         validate_provider_canary_self_test_output(&ctx.selected.model, &output).with_context(
             || {
@@ -52899,15 +54587,27 @@ fn provider_canary_self_test_body(
             "kind": "embedding",
             "input": canary_prompt_text(prompt)?,
         })),
-        "image-generation" => Ok(json!({
-            "kind": "image_generation",
-            "prompt": canary_prompt_text(prompt)?,
-            "n": 1,
-            "size": prompt.size.clone().unwrap_or_else(|| "64x64".to_owned()),
-            "steps": prompt.steps.unwrap_or(1).clamp(1, 2),
-            "cfg_scale": prompt.cfg_scale.unwrap_or(1.0),
-            "seed": prompt.seed.unwrap_or(7),
-        })),
+        "image-generation" => {
+            let mut body = json!({
+                "kind": "image_generation",
+                "prompt": canary_prompt_text(prompt)?,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("image canary body is an object");
+            for (name, value) in [
+                ("size", prompt.size.clone().map(Value::from)),
+                ("steps", prompt.steps.map(Value::from)),
+                ("cfg_scale", prompt.cfg_scale.map(Value::from)),
+                ("shift", prompt.shift.map(Value::from)),
+                ("seed", prompt.seed.map(Value::from)),
+            ] {
+                if let Some(value) = value {
+                    object.insert(name.to_owned(), value);
+                }
+            }
+            Ok(body)
+        }
         "video-generation" => Ok(json!({
             "kind": "video_generation",
             "prompt": canary_prompt_text(prompt)?,
@@ -53125,6 +54825,34 @@ fn provider_engine_load_config(
         .then_some(selected.feasibility.memory_budget.worker_limit_bytes);
     config.backend_cache_dir = backend_runtime.cache_dir.clone();
     config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
+    if selected.artifact.engine == "stable-diffusion.cpp" {
+        config.stable_diffusion_cpp = selected
+            .artifact
+            .stable_diffusion_cpp
+            .context("stable-diffusion.cpp catalog artifact is missing signed runtime semantics")?;
+        if let Some(path) = artifact_paths.sidecars.get("text_encoder") {
+            let sidecar = selected
+                .artifact
+                .sidecars
+                .get("text_encoder")
+                .context("downloaded text_encoder is missing from selected catalog artifact")?;
+            config.stable_diffusion_llm = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+        if let Some(path) = artifact_paths.sidecars.get("vae") {
+            let sidecar = selected
+                .artifact
+                .sidecars
+                .get("vae")
+                .context("downloaded VAE is missing from selected catalog artifact")?;
+            config.stable_diffusion_vae = Some(
+                ModelArtifact::stable_diffusion_checkpoint(path)
+                    .with_sha256(sidecar.source_sha256.clone()),
+            );
+        }
+    }
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
         let sidecar = selected
             .artifact
@@ -53844,7 +55572,17 @@ fn provider_session_spend_reservation_value(
 }
 
 fn spend_reservation_evidence(value: &Value) -> Value {
-    json!({
+    let mut voucher = stable_json_value(value.get("voucher").unwrap_or(&Value::Null));
+    if let Value::Object(voucher) = &mut voucher {
+        if voucher
+            .get("required_specialities")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            voucher.remove("required_specialities");
+        }
+    }
+    let mut evidence = json!({
         "contract_version": value.get("contract_version").cloned().unwrap_or(Value::Null),
         "session_id": value.get("session_id").cloned().unwrap_or(Value::Null),
         "epoch": value.get("epoch").cloned().unwrap_or(Value::Null),
@@ -53857,12 +55595,20 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
         "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
         "required_modalities": value.get("required_modalities").cloned().unwrap_or(Value::Null),
-        "required_specialities": value.get("required_specialities").cloned().unwrap_or(Value::Null),
         "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
         "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
         "max_spend_au": value.get("max_spend_au").cloned().unwrap_or(Value::Null),
-        "voucher": stable_json_value(value.get("voucher").unwrap_or(&Value::Null)),
-    })
+        "voucher": voucher,
+    });
+    if value
+        .get("required_specialities")
+        .and_then(Value::as_object)
+        .is_some_and(|specialities| !specialities.is_empty())
+    {
+        evidence["required_specialities"] =
+            stable_json_value(value.get("required_specialities").unwrap());
+    }
+    evidence
 }
 
 fn spend_reservation_message(value: &Value) -> String {
@@ -53988,6 +55734,29 @@ fn provider_session_open_decision(
     };
     if voucher.body.session_id.as_str() != session_id {
         return reject("VOUCHER", "voucher session_id mismatch".to_owned());
+    }
+    if !is_hex_len(&voucher.body.billing_id, 64) {
+        return reject(
+            "VOUCHER",
+            "voucher billing_id must be 32 bytes of hex".to_owned(),
+        );
+    }
+    if voucher.body.billing_attempt == 0
+        && (voucher.body.billing_prior_usage != ReceiptUsage::default()
+            || voucher.body.billing_prior_au_owed_cum != 0)
+    {
+        return reject(
+            "VOUCHER",
+            "initial billing attempt must have an empty cumulative baseline".to_owned(),
+        );
+    }
+    if voucher.body.billing_prior_au_owed_cum == 0
+        && voucher.body.billing_prior_usage != ReceiptUsage::default()
+    {
+        return reject(
+            "VOUCHER",
+            "billing prior usage requires a nonzero cumulative amount".to_owned(),
+        );
     }
     if voucher.body.rail.as_str() != rail {
         return reject("VOUCHER", "voucher rail mismatch".to_owned());
@@ -54176,7 +55945,7 @@ fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &s
     let signature = Signature::from_bytes(&sig_bytes);
     let payload = spend_voucher_signing_bytes(&voucher.body)?;
     verifying_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .context("spend voucher user signature failed")
 }
 
@@ -54190,6 +55959,7 @@ struct ProviderSessionArtifact {
 #[derive(Clone, Debug, PartialEq)]
 struct ProviderSessionOutput {
     content: String,
+    reasoning_evidence: String,
     tools: Vec<Value>,
     embeddings: Option<Vec<Vec<f32>>>,
     artifacts: Vec<ProviderSessionArtifact>,
@@ -54199,6 +55969,84 @@ struct ProviderSessionOutput {
     token_ids: Vec<i32>,
     usage: ReceiptUsage,
     usage_attribution: BTreeMap<String, u64>,
+}
+
+fn provider_visible_tool_calls(tools: &[Value]) -> Result<Vec<VisibleToolCall>> {
+    tools
+        .iter()
+        .map(|tool| {
+            Ok(VisibleToolCall {
+                id: tool
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing id")?
+                    .to_owned(),
+                name: tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing name")?
+                    .to_owned(),
+                arguments: tool
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing arguments")?
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_provider_visible_output_usage(
+    body: &Value,
+    output: &mut ProviderSessionOutput,
+) -> Result<()> {
+    let endpoint_family = body
+        .get("mayhem_contract")
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    let is_text_generation = body.get("kind").is_none()
+        || matches!(
+            endpoint_family,
+            Some(
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            )
+        );
+    if !is_text_generation {
+        return Ok(());
+    }
+    let tools = provider_visible_tool_calls(&output.tools)?;
+    let metered_units = metered_output_units(&output.content, &output.reasoning_evidence, &tools);
+    output.completion_tokens = metered_units;
+    output.usage = ReceiptUsage::from_units(
+        output
+            .usage
+            .units()
+            .iter()
+            .filter(|(unit, _)| unit.as_str() != USAGE_OUTPUT_TOKEN)
+            .map(|(unit, count)| (unit.clone(), *count))
+            .chain([(USAGE_OUTPUT_TOKEN.to_owned(), metered_units)]),
+    );
+    let reasoning_units = metered_output_units("", &output.reasoning_evidence, &[]);
+    if reasoning_units > 0 {
+        output
+            .usage_attribution
+            .insert("reasoning_output_tokens".to_owned(), reasoning_units);
+    } else {
+        output.usage_attribution.remove("reasoning_output_tokens");
+    }
+    Ok(())
+}
+
+fn provider_reasoning_usage_attribution(reasoning_evidence: &str) -> BTreeMap<String, u64> {
+    let reasoning_units = metered_output_units("", reasoning_evidence, &[]);
+    if reasoning_units == 0 {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([("reasoning_output_tokens".to_owned(), reasoning_units)])
+    }
 }
 
 fn validate_provider_session_output(
@@ -54212,25 +56060,18 @@ fn validate_provider_session_output(
     );
     if body.get("kind").and_then(Value::as_str).is_none() {
         let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
-        let max_output_tokens = body
-            .get("max_tokens")
-            .and_then(Value::as_u64)
+        let max_output_tokens = provider_requested_max_output_tokens(body)
             .unwrap_or(available_tokens)
             .min(available_tokens);
+        let max_visible_output_units =
+            max_output_tokens.saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN);
         ensure!(
-            output.completion_tokens <= max_output_tokens,
-            "provider output exceeded the selected session token budget"
+            output.completion_tokens <= max_visible_output_units,
+            "provider visible output exceeded the selected session byte-derived unit budget"
         );
         ensure!(
             u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
             "provider token ids exceeded the selected session token budget"
-        );
-        let max_text_bytes = usize::try_from(max_output_tokens)
-            .unwrap_or(usize::MAX / DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
-            .saturating_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN);
-        ensure!(
-            output.content.len() <= max_text_bytes,
-            "provider text output exceeded the selected session byte budget"
         );
     } else {
         ensure!(
@@ -54381,7 +56222,7 @@ fn provider_verify_endpoint_request<'a>(
         .and_then(Value::as_str)
         .context("provider request missing normalized request fingerprint")?;
     ensure!(
-        declared_request_fingerprint == stable_value_hash(request),
+        declared_request_fingerprint == mayhem_proto::endpoint_request_fingerprint(request),
         "provider normalized request fingerprint mismatch"
     );
     let mut transport = transport_body.clone();
@@ -54408,7 +56249,19 @@ fn provider_verify_endpoint_request<'a>(
                 .join("; ")
         )
     })?;
-    if let Some(expected_model_id) = expected_model_id {
+    let request_with_defaults =
+        mayhem_proto::materialize_endpoint_request_defaults(contract, request)
+            .map_err(anyhow::Error::msg)?;
+    ensure!(
+        &request_with_defaults == request,
+        "provider request omitted an admin-signed endpoint default"
+    );
+    if let Some(expected_model_id) = expected_model_id.filter(|_| {
+        contract
+            .request_attributes
+            .iter()
+            .any(|path| path == "model")
+    }) {
         ensure!(
             request.get("model").and_then(Value::as_str) == Some(expected_model_id),
             "provider request model does not match the loaded canonical model"
@@ -54503,6 +56356,19 @@ fn provider_seal_local_contract_request(
         }
         request = public;
     }
+    request = mayhem_proto::materialize_endpoint_request_defaults(contract, &request)
+        .map_err(anyhow::Error::msg)?;
+    mayhem_proto::validate_endpoint_request(contract, &request).map_err(|violations| {
+        anyhow::anyhow!(
+            "local provider request violates signed endpoint contract: {}",
+            violations
+                .iter()
+                .take(4)
+                .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
     let mut transport = json!({"kind": provider_endpoint_transport_kind(family)?});
     for key in ["audio", "audio_seconds"] {
         if let Some(value) = body.get(key) {
@@ -54515,7 +56381,7 @@ fn provider_seal_local_contract_request(
         "schema_version": 1,
         "endpoint_family": family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(&request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&request),
         "transport_request_fingerprint": transport_fingerprint,
     });
     Ok(transport)
@@ -54586,6 +56452,7 @@ fn provider_reasoning_level_disabled(level: &str, value: &Value) -> bool {
         })
 }
 
+#[cfg(test)]
 fn provider_reasoning_visible_output(text: &str, mode: ProviderReasoningOutputMode) -> String {
     provider_reasoning_visible_output_with_delimiters(
         text,
@@ -54599,10 +56466,18 @@ fn provider_reasoning_visible_output_with_delimiters(
     mode: ProviderReasoningOutputMode,
     delimiters: ProviderReasoningDelimiters,
 ) -> String {
+    provider_reasoning_output_parts_with_delimiters(text, mode, delimiters).visible
+}
+
+fn provider_reasoning_output_parts_with_delimiters(
+    text: &str,
+    mode: ProviderReasoningOutputMode,
+    delimiters: ProviderReasoningDelimiters,
+) -> ProviderReasoningFilteredText {
     let mut filter = ProviderReasoningOutputFilter::with_delimiters(mode, delimiters);
-    let mut visible = filter.push(text);
-    visible.push_str(&filter.finish());
-    visible
+    let mut filtered = filter.push_split(text);
+    filtered.extend(filter.finish_split());
+    filtered
 }
 
 fn provider_reasoning_delimiters(adapter: &catalog::CatalogAdapter) -> ProviderReasoningDelimiters {
@@ -54655,6 +56530,7 @@ fn provider_engine_session_response(
         &catalog::CatalogSamplingProfile::default(),
         &sealed,
         live_stream,
+        &CancellationToken::new(),
     )
 }
 
@@ -54665,6 +56541,7 @@ fn provider_engine_session_response_with_sampling(
     sampling: &catalog::CatalogSamplingProfile,
     body: &Value,
     live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
+    cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
     provider_engine_session_response_with_sampling_bounded(
         backend,
@@ -54674,6 +56551,7 @@ fn provider_engine_session_response_with_sampling(
         body,
         live_stream,
         None,
+        cancellation,
     )
 }
 
@@ -54685,7 +56563,9 @@ fn provider_engine_session_response_with_sampling_bounded(
     body: &Value,
     mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
     output_token_cap: Option<u32>,
+    cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
+    cancellation.check().context("provider request cancelled")?;
     let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
     let endpoint_family = verified.family;
     let request_body = verified.request;
@@ -54698,10 +56578,11 @@ fn provider_engine_session_response_with_sampling_bounded(
             provider_audio_transcription_request_from_body(endpoint_family, request_body, body)?;
         let audio_seconds = request.audio_seconds;
         let output = backend
-            .transcribe(request.engine)
+            .transcribe(request.engine, cancellation)
             .context("transcribing provider session audio with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: output.text,
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -54723,10 +56604,14 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("audio_speech input character count overflowed u64")?;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .synthesize_speech(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("synthesizing provider session speech with mayhem-engine")?;
         let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
         if artifacts.is_empty() {
@@ -54734,6 +56619,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -54753,12 +56639,18 @@ fn provider_engine_session_response_with_sampling_bounded(
         let request = provider_image_generation_request_from_body(endpoint_family, request_body)?;
         let image_count = request.image_count;
         let steps = u64::from(request.steps);
+        let width = request.width;
+        let height = request.height;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .generate_image(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .generate_image(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("generating provider session image artifact with mayhem-engine")?;
         ensure!(
             output.image_count == image_count && u64::from(output.steps) == steps,
@@ -54768,7 +56660,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         if artifacts.is_empty() {
             bail!("provider image generation engine produced no image artifacts");
         }
-        let usage = provider_image_generation_usage(artifacts.len() as u64, steps);
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
         if artifacts.len() as u32 != image_count {
             bail!(
                 "provider image generation engine produced {} artifact(s), expected {image_count}",
@@ -54777,6 +56669,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -54798,10 +56691,14 @@ fn provider_engine_session_response_with_sampling_bounded(
         let requested_frames = request.frame_count;
         let mut artifact_chunks = Vec::new();
         let output = backend
-            .generate_video(request, &mut |chunk: ArtifactChunk| {
-                artifact_chunks.push(chunk);
-                Ok(())
-            })
+            .generate_video(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+                cancellation,
+            )
             .context("generating provider session video artifact with mayhem-engine")?;
         ensure!(
             output.duration_seconds > 0 && output.frame_count > 0,
@@ -54831,6 +56728,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         );
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -54856,17 +56754,25 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut artifact_chunks = Vec::new();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
-                .generate_music(request, &mut |chunk: ArtifactChunk| {
-                    artifact_chunks.push(chunk);
-                    Ok(())
-                })
+                .generate_music(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifact_chunks.push(chunk);
+                        Ok(())
+                    },
+                    cancellation,
+                )
                 .context("generating provider session music artifact with mayhem-engine")?
         } else {
             backend
-                .generate_audio(request, &mut |chunk: ArtifactChunk| {
-                    artifact_chunks.push(chunk);
-                    Ok(())
-                })
+                .generate_audio(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifact_chunks.push(chunk);
+                        Ok(())
+                    },
+                    cancellation,
+                )
                 .context("generating provider session audio artifact with mayhem-engine")?
         };
         ensure!(
@@ -54899,6 +56805,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -54923,10 +56830,14 @@ fn provider_engine_session_response_with_sampling_bounded(
             .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
             .transpose()?;
         let output = backend
-            .embed(mayhem_engine::EmbeddingRequest { inputs, dimensions })
+            .embed(
+                mayhem_engine::EmbeddingRequest { inputs, dimensions },
+                cancellation,
+            )
             .context("generating provider session embeddings with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: Some(output.embeddings),
             artifacts: Vec::new(),
@@ -54975,10 +56886,11 @@ fn provider_engine_session_response_with_sampling_bounded(
             &mut |chunk: mayhem_engine::TokenChunk| {
                 if tool_mode.is_none() {
                     if let Some(stream) = live_stream.as_deref_mut() {
+                        let filtered = reasoning_stream_filter.push_split(&chunk.text);
                         let mut visible_chunk = chunk.clone();
-                        visible_chunk.text = reasoning_stream_filter.push(&chunk.text);
+                        visible_chunk.text = filtered.visible;
                         stream
-                            .on_token(visible_chunk, prompt_tokens)
+                            .on_token(visible_chunk, &filtered.hidden, prompt_tokens)
                             .map_err(|err| {
                                 mayhem_engine::EngineError::InvalidConfig(format!(
                                     "provider live stream failed: {err:#}"
@@ -54993,13 +56905,14 @@ fn provider_engine_session_response_with_sampling_bounded(
                 artifact_chunks.push(chunk);
                 Ok(())
             },
+            cancellation,
         )
         .context("generating provider session response with mayhem-engine")?;
     if tool_mode.is_none() {
-        let trailing_visible_text = reasoning_stream_filter.finish();
-        if !trailing_visible_text.is_empty() {
+        let trailing = reasoning_stream_filter.finish_split();
+        if !trailing.visible.is_empty() || !trailing.hidden.is_empty() {
             if let Some(stream) = live_stream.as_deref_mut() {
-                stream.append_visible_text(&trailing_visible_text);
+                stream.append_filtered_text(trailing);
             }
         }
     }
@@ -55047,7 +56960,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     } else {
         "tool_calls".to_owned()
     };
-    let visible_output = provider_reasoning_visible_output_with_delimiters(
+    let filtered_output = provider_reasoning_output_parts_with_delimiters(
         &output.text,
         reasoning_output_mode,
         reasoning_delimiters,
@@ -55055,10 +56968,11 @@ fn provider_engine_session_response_with_sampling_bounded(
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: if tools.is_empty() {
-            visible_output
+            filtered_output.visible
         } else {
             String::new()
         },
+        reasoning_evidence: filtered_output.hidden,
         tools,
         embeddings: None,
         artifacts,
@@ -55219,10 +57133,20 @@ fn provider_image_generation_request_from_body(
         .context("image_generation request missing prompt")?
         .to_owned();
     let image_count = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
-        1
+        u32::try_from(
+            parameters
+                .and_then(|parameters| parameters.get("num_images_per_prompt"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+        )
+        .context("image_generation num_images_per_prompt overflowed u32")?
     } else {
-        u32::try_from(body.get("n").and_then(Value::as_u64).unwrap_or(1))
-            .context("image_generation n overflowed u32")?
+        u32::try_from(
+            body.get("n")
+                .and_then(Value::as_u64)
+                .context("signed image endpoint defaults did not resolve n")?,
+        )
+        .context("image_generation n overflowed u32")?
     };
     let steps = body
         .get("steps")
@@ -55232,7 +57156,7 @@ fn provider_image_generation_request_from_body(
                 .and_then(|parameters| parameters.get("num_inference_steps"))
                 .and_then(Value::as_u64)
         })
-        .unwrap_or(1);
+        .context("signed image endpoint defaults did not resolve steps")?;
     let cfg_scale = body
         .get("cfg_scale")
         .and_then(Value::as_f64)
@@ -55241,7 +57165,8 @@ fn provider_image_generation_request_from_body(
                 .and_then(|parameters| parameters.get("guidance_scale"))
                 .and_then(Value::as_f64)
         })
-        .unwrap_or(1.0) as f32;
+        .context("signed image endpoint defaults did not resolve guidance scale")?
+        as f32;
     let (width, height) = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE {
         (
             parameters
@@ -55250,14 +57175,27 @@ fn provider_image_generation_request_from_body(
                 .map(u32::try_from)
                 .transpose()
                 .context("image_generation width overflowed u32")?
-                .unwrap_or(512),
+                .context("signed image endpoint defaults did not resolve width")?,
             parameters
                 .and_then(|parameters| parameters.get("height"))
                 .and_then(Value::as_u64)
                 .map(u32::try_from)
                 .transpose()
                 .context("image_generation height overflowed u32")?
-                .unwrap_or(512),
+                .context("signed image endpoint defaults did not resolve height")?,
+        )
+    } else if body.get("width").is_some() || body.get("height").is_some() {
+        let width = body
+            .get("width")
+            .and_then(Value::as_u64)
+            .context("image_generation width is missing or invalid")?;
+        let height = body
+            .get("height")
+            .and_then(Value::as_u64)
+            .context("image_generation height is missing or invalid")?;
+        (
+            u32::try_from(width).context("image_generation width overflowed u32")?,
+            u32::try_from(height).context("image_generation height overflowed u32")?,
         )
     } else {
         provider_image_generation_size(body)?
@@ -55266,6 +57204,11 @@ fn provider_image_generation_request_from_body(
     request.image_count = image_count;
     request.steps = u32::try_from(steps).context("image_generation steps overflowed u32")?;
     request.guidance_scale = cfg_scale;
+    request.flow_shift = body
+        .get("shift")
+        .or_else(|| parameters.and_then(|parameters| parameters.get("shift")))
+        .and_then(Value::as_f64)
+        .map(|value| value as f32);
     request.width = width;
     request.height = height;
     request.negative_prompt = body
@@ -55293,7 +57236,7 @@ fn provider_image_generation_size(body: &Value) -> Result<(u32, u32)> {
     let size = body
         .get("size")
         .and_then(Value::as_str)
-        .unwrap_or("512x512");
+        .context("signed image endpoint defaults did not resolve size")?;
     let (width, height) = size
         .split_once('x')
         .context("image_generation size must be WIDTHxHEIGHT")?;
@@ -55400,10 +57343,22 @@ fn provider_duration_seconds_ceil(value: &Value) -> Option<u64> {
     })
 }
 
-fn provider_image_generation_usage(image_count: u64, steps: u64) -> ReceiptUsage {
+fn provider_image_generation_usage(
+    image_count: u64,
+    steps: u64,
+    width: u32,
+    height: u32,
+) -> ReceiptUsage {
+    let pixels = u64::from(width).saturating_mul(u64::from(height)).max(1);
+    let resolution_scale = pixels.div_ceil(512 * 512).max(1);
     ReceiptUsage::from_units([
         (USAGE_IMAGE, image_count),
-        (USAGE_STEP, image_count.saturating_mul(steps)),
+        (
+            USAGE_STEP,
+            image_count
+                .saturating_mul(steps)
+                .saturating_mul(resolution_scale),
+        ),
     ])
 }
 
@@ -55512,19 +57467,7 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.media = provider_engine_media_inputs(&messages);
     request.tools = template_tools;
     request.speciality_parameters = speciality_parameters;
-    if let Some(max_tokens) = body
-        .get("max_tokens")
-        .filter(|value| !value.is_null())
-        .or_else(|| {
-            body.get("max_completion_tokens")
-                .filter(|value| !value.is_null())
-        })
-        .or_else(|| {
-            body.get("max_output_tokens")
-                .filter(|value| !value.is_null())
-        })
-        .and_then(Value::as_u64)
-    {
+    if let Some(max_tokens) = provider_requested_max_output_tokens(body) {
         request.max_new_tokens = u32::try_from(max_tokens)
             .context("max_tokens exceeds provider engine request range")?;
     } else if let Some(default_cap) = speciality_output_cap {
@@ -55576,6 +57519,20 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         });
     }
     Ok(request)
+}
+
+fn provider_requested_max_output_tokens(body: &Value) -> Option<u64> {
+    body.get("max_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            body.get("max_completion_tokens")
+                .filter(|value| !value.is_null())
+        })
+        .or_else(|| {
+            body.get("max_output_tokens")
+                .filter(|value| !value.is_null())
+        })
+        .and_then(Value::as_u64)
 }
 
 fn provider_engine_template_messages(
@@ -56489,6 +58446,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             completion_tokens,
             token_ids: synthetic_provider_token_ids(completion_tokens),
             content,
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -56502,6 +58460,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
                 "name": "bash",
@@ -56520,6 +58479,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
                 "name": tool_name,
@@ -56554,6 +58514,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         completion_tokens,
         token_ids: synthetic_provider_token_ids(completion_tokens),
         content,
+        reasoning_evidence: String::new(),
         tools: Vec::new(),
         embeddings: None,
         artifacts: Vec::new(),
@@ -56822,6 +58783,7 @@ fn is_hex_len(value: &str, len: usize) -> bool {
 
 fn is_safe_key_part(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('-')
         && value.len() <= 128
         && value
             .as_bytes()
@@ -57214,6 +59176,9 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "tnk_treasury_address" | "network.tnk_treasury_address" => {
             Ok("network.tnk_treasury_address")
         }
+        "admin_peer_pubkey" | "network.admin_peer_pubkey" => {
+            Ok("network.admin_peer_pubkey")
+        }
         "subnet_channel" | "network.subnet_channel" => Ok("network.subnet_channel"),
         "subnet_bootstrap" | "network.subnet_bootstrap" => Ok("network.subnet_bootstrap"),
         "msb_channel" | "network.msb_channel" => Ok("network.msb_channel"),
@@ -57239,7 +59204,7 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "rail" | "user.rail" => Ok("user.rail"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.rail, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, admin_peer_pubkey, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.rail, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -57549,6 +59514,10 @@ async fn materialize_wallet(
     password: &str,
 ) -> Result<WalletInfo> {
     let exists = keypair_path.exists();
+    let mnemonic = args
+        .mnemonic
+        .clone()
+        .or_else(|| env::var("MAYHEM_WALLET_MNEMONIC").ok());
     match args.wallet {
         WalletMode::Auto => {
             if exists {
@@ -57557,7 +59526,7 @@ async fn materialize_wallet(
                 create_wallet(
                     keypair_path,
                     password,
-                    args.mnemonic.as_deref(),
+                    mnemonic.as_deref(),
                     false,
                     None,
                     None,
@@ -57575,7 +59544,7 @@ async fn materialize_wallet(
             create_wallet(
                 keypair_path,
                 password,
-                args.mnemonic.as_deref(),
+                mnemonic.as_deref(),
                 args.force,
                 None,
                 None,
@@ -57589,10 +59558,9 @@ async fn materialize_wallet(
                     keypair_path.display()
                 );
             }
-            let mnemonic = args
-                .mnemonic
+            let mnemonic = mnemonic
                 .as_deref()
-                .context("--wallet import requires --mnemonic")?;
+                .context("--wallet import requires --mnemonic-file or MAYHEM_WALLET_MNEMONIC")?;
             create_wallet(keypair_path, password, Some(mnemonic), true, None, None).await
         }
         WalletMode::Reuse => {
@@ -57615,39 +59583,35 @@ async fn create_wallet(
     ethereum_private_key: Option<&str>,
     ethereum_mnemonic: Option<&str>,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "create".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    if let Some(mnemonic) = mnemonic {
-        args.extend(["--mnemonic".to_owned(), mnemonic.to_owned()]);
-    }
-    if let Some(private_key) = ethereum_private_key {
-        args.extend(["--ethereum-private-key".to_owned(), private_key.to_owned()]);
-    }
-    if let Some(mnemonic) = ethereum_mnemonic {
-        args.extend(["--ethereum-mnemonic".to_owned(), mnemonic.to_owned()]);
-    }
+    let mut args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
     if force {
         args.push("--force".to_owned());
     }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "create",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            mnemonic: mnemonic.map(str::to_owned),
+            ethereum_private_key: ethereum_private_key.map(str::to_owned),
+            ethereum_mnemonic: ethereum_mnemonic.map(str::to_owned),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn inspect_wallet(keypair_path: &Path, password: &str) -> Result<WalletInfo> {
-    let mut args = vec![
-        "inspect".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "inspect",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn inspect_wallet_for_network_prefix(
@@ -57655,29 +59619,34 @@ async fn inspect_wallet_for_network_prefix(
     password: &str,
     network_prefix: &str,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "inspect".to_owned(),
+    let args = vec![
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
         "--network-prefix".to_owned(),
         network_prefix.to_owned(),
     ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "inspect",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn backup_wallet(keypair_path: &Path, password: &str) -> Result<WalletInfo> {
-    let mut args = vec![
-        "backup".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "backup",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn rotate_wallet_password(
@@ -57685,29 +59654,30 @@ async fn rotate_wallet_password(
     old_password: &str,
     new_password: &str,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "passwd".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-        "--new-password".to_owned(),
-        new_password.to_owned(),
-    ];
-    if !old_password.is_empty() {
-        args.extend(["--password".to_owned(), old_password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "passwd",
+        args,
+        WalletHelperSecrets {
+            password: (!old_password.is_empty()).then(|| old_password.to_owned()),
+            new_password: Some(new_password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn ethereum_wallet_key(keypair_path: &Path, password: &str) -> Result<EthereumKeyOutput> {
-    let mut args = vec![
-        "eth-key".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "eth-key",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn sign_ethereum_message(
@@ -57715,17 +59685,21 @@ async fn sign_ethereum_message(
     password: &str,
     message: &str,
 ) -> Result<EthereumSignOutput> {
-    let mut args = vec![
-        "eth-sign".to_owned(),
+    let args = vec![
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
         "--message".to_owned(),
         message.to_owned(),
     ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "eth-sign",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 // One Pear wallet-helper spawn per signature froze busy providers: at a 2s
@@ -57746,15 +59720,16 @@ async fn cached_wallet_signing_key(keypair_path: &Path, password: &str) -> Resul
     if let Some(key) = cache.get(&cache_key) {
         return Ok(key.clone());
     }
-    let mut args = vec![
-        "seed".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    let output: WalletSeedOutput = run_wallet_helper(
+        "seed",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await?;
     let seed = hex_decode_array::<32>(&output.signing_seed_hex, "wallet signing seed")?;
     let key = SigningKey::from_bytes(&seed);
     let derived_public_key = hex_encode(&key.verifying_key().to_bytes());
@@ -57785,15 +59760,16 @@ async fn wallet_signing_seed(
     password: &str,
     expected_public_key: &str,
 ) -> Result<[u8; 32]> {
-    let mut args = vec![
-        "seed".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    let output: WalletSeedOutput = run_wallet_helper(
+        "seed",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await?;
     if !output.public_key.eq_ignore_ascii_case(expected_public_key) {
         bail!(
             "wallet helper returned public key {}, expected {}",
@@ -57813,28 +59789,52 @@ async fn wallet_signing_seed(
     Ok(seed)
 }
 
-async fn run_wallet_helper<T>(args: Vec<String>) -> Result<T>
+async fn run_wallet_helper<T>(
+    command: &str,
+    helper_args: Vec<String>,
+    mut secrets: WalletHelperSecrets,
+) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let (command, helper_args) = args
-        .split_first()
-        .context("wallet helper command is required")?;
+    validate_wallet_helper_public_args(&helper_args)?;
+    secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
-    let output = Command::new(&pear_runtime)
+    let mut process = Command::new(&pear_runtime);
+    process
         .arg("run")
         .arg(&intercom_app)
         .arg(format!("--wallet-helper={command}"))
-        .args(helper_args)
-        .output()
+        .args(&helper_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().with_context(|| {
+        format!(
+            "running wallet helper via pear-runtime app {}",
+            intercom_app.display()
+        )
+    })?;
+    let encoded_secrets =
+        serde_json::to_vec(&secrets).context("serializing wallet helper secrets")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("wallet helper stdin pipe was not created")?;
+    stdin
+        .write_all(&encoded_secrets)
         .await
-        .with_context(|| {
-            format!(
-                "running wallet helper via pear-runtime app {}",
-                intercom_app.display()
-            )
-        })?;
+        .context("writing wallet helper secrets to stdin")?;
+    stdin
+        .shutdown()
+        .await
+        .context("closing wallet helper secret stdin")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("waiting for wallet helper")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -57849,6 +59849,44 @@ where
 
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
         .context("parsing Pear wallet helper JSON output")
+}
+
+fn validate_wallet_helper_public_args(args: &[String]) -> Result<()> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if [
+            "--password",
+            "--password=",
+            "--new-password",
+            "--new-password=",
+            "--mnemonic",
+            "--mnemonic=",
+            "--ethereum-private-key",
+            "--ethereum-private-key=",
+            "--ethereum-mnemonic",
+            "--ethereum-mnemonic=",
+        ]
+        .iter()
+        .any(|secret_arg| arg == secret_arg || arg.starts_with(secret_arg))
+        {
+            bail!("wallet helper secrets must use the typed stdin channel");
+        }
+        match arg.as_str() {
+            "--keypair" | "--network-prefix" | "--message" | "--message-hex" => {
+                let value = args
+                    .get(index + 1)
+                    .with_context(|| format!("{arg} requires a value"))?;
+                ensure_external_helper_value(arg, value)?;
+                index += 2;
+            }
+            "--force" => {
+                index += 1;
+            }
+            _ => bail!("unsupported wallet helper argument {arg}"),
+        }
+    }
+    Ok(())
 }
 
 fn write_config(
@@ -58113,6 +60151,14 @@ mod tests {
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn weak_identity_key_and_signature() -> (String, String) {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        (hex_encode(&weak_key), hex_encode(&weak_signature))
+    }
+
     #[test]
     fn gateway_heartbeat_watcher_reconciles_catalog_room_changes() {
         let subscribed = ["mx/room/old", "mx/room/shared"]
@@ -58256,6 +60302,8 @@ mod tests {
         transcription_output: mayhem_engine::AudioTranscriptionOutput,
         speech_audio_seconds: u64,
         artifact_chunks: Vec<ArtifactChunk>,
+        repeat_image_artifact_to_count: bool,
+        image_generation_calls: usize,
         last_request: Option<GenerateRequest>,
         last_image_request: Option<EngineImageGenerationRequest>,
         last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
@@ -58299,6 +60347,7 @@ mod tests {
             &mut self,
             request: GenerateRequest,
             sink: &mut dyn mayhem_engine::TokenSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
             let level = request
                 .speciality_parameters
@@ -58353,6 +60402,8 @@ mod tests {
                 },
                 speech_audio_seconds: 3,
                 artifact_chunks: Vec::new(),
+                repeat_image_artifact_to_count: false,
+                image_generation_calls: 0,
                 last_request: None,
                 last_image_request: None,
                 last_embedding_request: None,
@@ -58366,6 +60417,11 @@ mod tests {
 
         fn with_artifact_chunks(mut self, artifact_chunks: Vec<ArtifactChunk>) -> Self {
             self.artifact_chunks = artifact_chunks;
+            self
+        }
+
+        fn with_repeated_image_artifact(mut self) -> Self {
+            self.repeat_image_artifact_to_count = true;
             self
         }
     }
@@ -58398,6 +60454,7 @@ mod tests {
             &mut self,
             request: GenerateRequest,
             _sink: &mut dyn mayhem_engine::TokenSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
             self.last_request = Some(request);
             Ok(self.output.clone())
@@ -58408,8 +60465,9 @@ mod tests {
             request: GenerateRequest,
             token_sink: &mut dyn mayhem_engine::TokenSink,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
-            let output = self.generate(request, token_sink)?;
+            let output = self.generate(request, token_sink, cancellation)?;
             for chunk in self.artifact_chunks.clone() {
                 artifact_sink.on_artifact_chunk(chunk)?;
             }
@@ -58419,6 +60477,7 @@ mod tests {
         fn embed(
             &mut self,
             request: mayhem_engine::EmbeddingRequest,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
             self.last_embedding_request = Some(request);
             Ok(self.embedding_output.clone())
@@ -58428,14 +60487,25 @@ mod tests {
             &mut self,
             request: EngineImageGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::ImageGenerationOutput> {
+            self.image_generation_calls = self.image_generation_calls.saturating_add(1);
             let output = mayhem_engine::ImageGenerationOutput {
                 image_count: request.image_count,
                 steps: request.steps,
             };
+            let image_count = request.image_count;
             self.last_image_request = Some(request);
-            for chunk in self.artifact_chunks.clone() {
-                artifact_sink.on_artifact_chunk(chunk)?;
+            if self.repeat_image_artifact_to_count && self.artifact_chunks.len() == 1 {
+                for index in 0..image_count {
+                    let mut chunk = self.artifact_chunks[0].clone();
+                    chunk.artifact_id = format!("image-{}", index + 1);
+                    artifact_sink.on_artifact_chunk(chunk)?;
+                }
+            } else {
+                for chunk in self.artifact_chunks.clone() {
+                    artifact_sink.on_artifact_chunk(chunk)?;
+                }
             }
             Ok(output)
         }
@@ -58443,6 +60513,7 @@ mod tests {
         fn transcribe(
             &mut self,
             request: EngineAudioTranscriptionRequest,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::AudioTranscriptionOutput> {
             self.last_transcription_request = Some(request);
             Ok(self.transcription_output.clone())
@@ -58452,6 +60523,7 @@ mod tests {
             &mut self,
             request: SpeechRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::SpeechOutput> {
             self.last_speech_request = Some(request);
             for chunk in self.artifact_chunks.clone() {
@@ -58466,6 +60538,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -58483,6 +60556,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -58500,6 +60574,7 @@ mod tests {
             &mut self,
             request: EngineMediaGenerationRequest,
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
@@ -58582,18 +60657,31 @@ mod tests {
 
     #[test]
     fn wallet_cli_parses_ethereum_import_key() {
-        let cli = Cli::try_parse_from([
-            "mayhem",
-            "wallet",
-            "import",
-            "--keypair",
-            "/tmp/mayhem-wallet/db/keypair.json",
-            "--mnemonic",
-            "bar same olive hurry place manage truck sleep banana wrist harvest bus clap prefer clarify copy leader jeans acoustic stairs cover echo reopen grow",
-            "--ethereum-private-key",
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "--force",
-            "--json",
+        let temp = test_temp_dir("wallet-cli-secret-files");
+        let mnemonic_path = temp.join("mnemonic");
+        let private_key_path = temp.join("ethereum-key");
+        fs::write(
+            &mnemonic_path,
+            "bar same olive hurry place manage truck sleep banana wrist harvest bus clap prefer clarify copy leader jeans acoustic stairs cover echo reopen grow\n",
+        )
+        .unwrap();
+        fs::write(
+            &private_key_path,
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "mayhem".to_owned(),
+            "wallet".to_owned(),
+            "import".to_owned(),
+            "--keypair".to_owned(),
+            temp.join("keypair.json").display().to_string(),
+            "--mnemonic-file".to_owned(),
+            mnemonic_path.display().to_string(),
+            "--ethereum-private-key-file".to_owned(),
+            private_key_path.display().to_string(),
+            "--force".to_owned(),
+            "--json".to_owned(),
         ])
         .unwrap();
 
@@ -58609,6 +60697,74 @@ mod tests {
             Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
         assert!(args.ethereum_mnemonic.is_none());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn wallet_cli_rejects_secret_valued_legacy_flags() {
+        assert!(Cli::try_parse_from([
+            "mayhem",
+            "wallet",
+            "show",
+            "--wallet-password",
+            "argv-secret",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(
+            ["mayhem", "wallet", "import", "--mnemonic", "argv mnemonic",]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wallet_helper_keeps_every_secret_out_of_child_argv() {
+        let public_args = vec![
+            "--keypair".to_owned(),
+            "wallet.json".to_owned(),
+            "--force".to_owned(),
+        ];
+        let secrets = WalletHelperSecrets {
+            password: Some("old-password".to_owned()),
+            new_password: Some("new-password".to_owned()),
+            mnemonic: Some("mnemonic words".to_owned()),
+            ethereum_private_key: Some("0xprivate".to_owned()),
+            ethereum_mnemonic: Some("ethereum mnemonic".to_owned()),
+        };
+        validate_wallet_helper_public_args(&public_args).unwrap();
+        assert_eq!(
+            public_args,
+            ["--keypair", "wallet.json", "--force"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        let child_argv = public_args.join("\0");
+        for secret in [
+            "old-password",
+            "new-password",
+            "mnemonic words",
+            "0xprivate",
+            "ethereum mnemonic",
+        ] {
+            assert!(!child_argv.contains(secret));
+        }
+        assert_eq!(secrets.password.as_deref(), Some("old-password"));
+        assert_eq!(secrets.new_password.as_deref(), Some("new-password"));
+        assert_eq!(secrets.mnemonic.as_deref(), Some("mnemonic words"));
+        assert_eq!(secrets.ethereum_private_key.as_deref(), Some("0xprivate"));
+        assert_eq!(
+            secrets.ethereum_mnemonic.as_deref(),
+            Some("ethereum mnemonic")
+        );
+        let serialized = serde_json::to_string(&secrets).unwrap();
+        assert!(serialized.contains("old-password"));
+        assert!(serialized.contains("ethereum mnemonic"));
+    }
+
+    #[test]
+    fn wallet_helper_public_args_reject_secret_pseudo_flags() {
+        let args = vec!["--password".to_owned(), "argv-secret".to_owned()];
+        assert!(validate_wallet_helper_public_args(&args).is_err());
     }
 
     #[test]
@@ -59644,7 +61800,21 @@ mod tests {
             classify_deposit_status(0, None, None, None, true),
             "pending"
         );
-        assert_eq!(tap_deposit_seen_key("0xABCDEF", 7), "dep/tap/0xabcdef/7");
+        assert_eq!(
+            tap_deposit_identity_key(
+                1,
+                "0x2222222222222222222222222222222222222222",
+                &format!("0x{}", "aa".repeat(32)),
+                7,
+                &format!("0x{}", "bb".repeat(32)),
+            )
+            .unwrap(),
+            format!(
+                "dep/tap/1/0x2222222222222222222222222222222222222222/0x{}/7/0x{}",
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        );
     }
 
     #[test]
@@ -61314,6 +63484,37 @@ mod tests {
     }
 
     #[test]
+    fn admin_auditor_slash_payload_binds_exact_passing_probe() {
+        let (tx_type, payload) =
+            admin_command_payload(&AdminCommands::AuditorSlash(AdminAuditorSlashArgs {
+                tx: test_admin_tx_args(),
+                auditor: "aa".repeat(32),
+                provider: "bb".repeat(32),
+                probe_id: "canary-pass-7".to_owned(),
+                epoch: 7,
+                reason: AdminAuditorSlashReason::Collusion,
+                evidence_hash: "cc".repeat(32),
+                at: Some(25_000),
+            }))
+            .unwrap();
+
+        assert_eq!(tx_type, "auditorSlash");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "auditor_slash",
+                "auditor": "aa".repeat(32),
+                "provider": "bb".repeat(32),
+                "probe_id": "canary-pass-7",
+                "epoch": 7,
+                "reason": "collusion",
+                "evidence_hash": "cc".repeat(32),
+                "at": 25_000,
+            })
+        );
+    }
+
+    #[test]
     fn admin_payout_payload_is_admin_set_not_provider_supplied() {
         let (tx_type, payload) = admin_command_payload(&AdminCommands::SetProviderPayout(
             AdminSetProviderPayoutArgs {
@@ -61456,7 +63657,7 @@ mod tests {
         let tap_rate_payload = admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
             tx: test_admin_tx_args(),
             tap_usd_au: 50_000_000_000_000_000,
-            source: AdminTapRateSource::UniswapV2,
+            source: AdminTapRateSource::UniswapV2TwapMedian,
             ts: 3_600,
         });
         assert_eq!(
@@ -61464,7 +63665,7 @@ mod tests {
             json!({
                 "op": "tap_rate_oracle",
                 "tap_usd_au": "50000000000000000",
-                "source": "uniswap-v2",
+                "source": "uniswap-v2-twap-median",
                 "ts": 3_600,
             })
         );
@@ -61479,7 +63680,7 @@ mod tests {
             admin_command_payload(&AdminCommands::TapRateOracle(AdminTapRateOracleArgs {
                 tx: test_admin_tx_args(),
                 tap_usd_au: 50_000_000_000_000_000,
-                source: AdminTapRateSource::UniswapV2,
+                source: AdminTapRateSource::UniswapV2TwapMedian,
                 ts: 3_600,
             }))
             .unwrap_err()
@@ -61499,7 +63700,16 @@ mod tests {
             "rate_tnk_usd_au": "50000000000000000",
             "rate_source": "gate-spot",
             "rate_ts": 25_200,
-            "msb_tx_hashes": ["b".repeat(64)],
+            "msb_transfers": [{
+                "schema_version": 1,
+                "network": "testnet1",
+                "tx_hash": "b".repeat(64),
+                "confirmed_length": 10,
+                "observed_signed_length": 12,
+                "from": "testtrac1treasury",
+                "to": "testtrac1operator",
+                "amount_e18": "1000000000000000000"
+            }],
             "transfer_root": "c".repeat(64),
             "provider_count": 0,
             "provider_au": "0",
@@ -61526,7 +63736,6 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -61556,7 +63765,6 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -61574,7 +63782,26 @@ mod tests {
             "processor": "stripe",
             "operator_to": "platform_balance",
             "epoch_apply_hash": "a".repeat(64),
-            "stripe_refs": ["tr_test_provider", "platform_balance:7:fee"],
+            "stripe_transfers": [
+                {
+                    "schema_version": 1,
+                    "kind": "stripe_transfer",
+                    "ref": "tr_test_provider",
+                    "destination": "acct_provider",
+                    "currency": "usd",
+                    "amount_minor": "85",
+                    "transfer_group": format!("mayhem_fiat_epoch_7_{}", &"a".repeat(64)[..16])
+                },
+                {
+                    "schema_version": 1,
+                    "kind": "platform_balance",
+                    "ref": "platform_balance:7:fee",
+                    "destination": "platform_balance",
+                    "currency": "eur",
+                    "amount_minor": "15",
+                    "transfer_group": null
+                }
+            ],
             "transfer_root": "c".repeat(64),
             "provider_count": 1,
             "provider_au": "850000000000000000",
@@ -61605,11 +63832,9 @@ mod tests {
                 settlement_file: None,
                 epoch: None,
                 at: None,
-                operator_stripe_ref: None,
                 operator_stripe_account: "platform_balance".to_owned(),
                 operator_currency: "eur".to_owned(),
                 submit_transfer: false,
-                stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
                 stripe_transfer_max_attempts: 4,
@@ -61634,11 +63859,9 @@ mod tests {
                 settlement_file: None,
                 epoch: None,
                 at: None,
-                operator_stripe_ref: None,
                 operator_stripe_account: "platform_balance".to_owned(),
                 operator_currency: "eur".to_owned(),
                 submit_transfer: false,
-                stripe_refs: Vec::new(),
                 stripe_env_file: None,
                 stripe_api_base_url: None,
                 stripe_transfer_max_attempts: 4,
@@ -61649,20 +63872,54 @@ mod tests {
             "fiat settlement updates are free features, not paid admin txs"
         );
 
+        let fiat_dust_args = AdminFiatDustSweepArgs {
+            tx: test_admin_tx_args(),
+            provider: "11".repeat(32),
+            epoch: 7,
+            at: 25_200,
+        };
+        let fiat_dust_payload = admin_fiat_dust_sweep_payload(&fiat_dust_args).unwrap();
+        assert_eq!(
+            fiat_dust_sweep_feature_key(&fiat_dust_payload).unwrap(),
+            format!(
+                "settle/fiat-dust/{}/7/c18df170b5420344c89886d3aeef42f3f9064e29b92c66da4e503245f076f78d",
+                "11".repeat(32)
+            )
+        );
+        assert_eq!(
+            admin_command_payload(&AdminCommands::FiatDustSweep(fiat_dust_args))
+                .unwrap_err()
+                .to_string(),
+            "fiat dust sweeps are free features, not paid admin txs"
+        );
+
         assert_eq!(
             admin_tnk_deposit_payload(&AdminTnkDepositArgs {
                 tx: test_admin_tx_args(),
                 memo_hash: "memo".to_owned(),
                 tnk_e18: "1000000000000000000".to_owned(),
                 msb_tx_hash: "msb".to_owned(),
+                msb_network: "testnet1".to_owned(),
+                msb_from: "testtrac1from".to_owned(),
+                msb_to: "testtrac1to".to_owned(),
+                msb_confirmed_length: 10,
+                msb_observed_signed_length: 12,
                 epoch: 1,
                 at: 3_600,
             }),
             json!({
                 "op": "tnk_deposit",
                 "memo_hash": "memo",
-                "tnk_e18": "1000000000000000000",
-                "msb_tx_hash": "msb",
+                "msb_transfer": {
+                    "schema_version": 1,
+                    "network": "testnet1",
+                    "tx_hash": "msb",
+                    "confirmed_length": 10,
+                    "observed_signed_length": 12,
+                    "from": "testtrac1from",
+                    "to": "testtrac1to",
+                    "amount_e18": "1000000000000000000"
+                },
                 "epoch": 1,
                 "at": 3_600,
             })
@@ -61706,6 +63963,53 @@ mod tests {
                 "epoch": 7,
                 "at": 25_200,
             })
+        );
+
+        let reversal = AdminTapDepositReversalArgs {
+            tx: test_admin_tx_args(),
+            eth_tx_hash: format!("0x{}", "ab".repeat(32)),
+            log_index: 0,
+            block_number: 123,
+            block_hash: format!("0x{}", "cd".repeat(32)),
+            pool_address: "0x0000000000000000000000000000000000000abc".to_owned(),
+            chain_id: 61_000,
+            reconciliation_from_block: 100,
+            reconciliation_to_block: 123,
+            finalized_block_number: 135,
+            confirmation_policy: "finalized-tag".to_owned(),
+            watcher_id: "tap-deposit-watcher-v1".to_owned(),
+            reason: "canonical_event_missing".to_owned(),
+            epoch: 7,
+            at: 25_201,
+        };
+        let reversal_payload = admin_tap_deposit_reversal_payload(&reversal);
+        assert_eq!(
+            reversal_payload,
+            json!({
+                "op": "tap_deposit_reversal",
+                "chain_id": 61_000,
+                "pool_address": "0x0000000000000000000000000000000000000abc",
+                "eth_tx_hash": format!("0x{}", "ab".repeat(32)),
+                "log_index": 0,
+                "block_number": 123,
+                "block_hash": format!("0x{}", "cd".repeat(32)),
+                "reconciliation_from_block": 100,
+                "reconciliation_to_block": 123,
+                "finalized_block_number": 135,
+                "confirmation_policy": "finalized-tag",
+                "watcher_id": "tap-deposit-watcher-v1",
+                "reason": "canonical_event_missing",
+                "epoch": 7,
+                "at": 25_201,
+            })
+        );
+        assert_eq!(
+            deposit_feature_key(&reversal_payload).unwrap(),
+            format!(
+                "dep/tap/61000/0x0000000000000000000000000000000000000abc/0x{}/0/0x{}/reversal",
+                "ab".repeat(32),
+                "cd".repeat(32),
+            )
         );
 
         assert_eq!(
@@ -61770,7 +64074,7 @@ mod tests {
     }
 
     #[test]
-    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_validate_refs() {
+    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_bind_platform_balance() {
         assert_eq!(
             fiat_whole_minor_au(FIAT_MINOR_AU_CLI * 85 + 1),
             FIAT_MINOR_AU_CLI * 85
@@ -61778,45 +64082,10 @@ mod tests {
         assert_eq!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85).unwrap(), 85);
         assert!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85 + 1).is_err());
 
-        let outputs = vec![
-            FiatSettlementOutput {
-                role: "provider".to_owned(),
-                provider: Some("aa".repeat(32)),
-                to: "acct_provider".to_owned(),
-                currency: "usd".to_owned(),
-                amount_minor: 85,
-                au: FIAT_MINOR_AU_CLI * 85,
-            },
-            FiatSettlementOutput {
-                role: "operator_fee".to_owned(),
-                provider: None,
-                to: "platform_balance".to_owned(),
-                currency: "eur".to_owned(),
-                amount_minor: 15,
-                au: FIAT_MINOR_AU_CLI * 15,
-            },
-        ];
         assert_eq!(
-            validate_fiat_settlement_refs(
-                &outputs,
-                vec![
-                    "tr_test_provider".to_owned(),
-                    "platform_balance:7:fee".to_owned()
-                ]
-            )
-            .unwrap(),
-            vec!["tr_test_provider", "platform_balance:7:fee"]
+            operator_fiat_settlement_ref(7, &"ab".repeat(32)),
+            format!("platform_balance:7:{}", &"ab".repeat(32)[..16])
         );
-        assert!(validate_fiat_settlement_refs(
-            &outputs,
-            vec![
-                "pi_not_transfer".to_owned(),
-                "platform_balance:7:fee".to_owned()
-            ]
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("tr_"));
     }
 
     #[test]
@@ -62354,9 +64623,9 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 7);
+        assert_eq!(CONTRACT_VERSION, 12);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
-        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
 
     #[test]
@@ -62404,6 +64673,10 @@ mod tests {
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
         };
+        let join_attestation = ProviderJoinAttestationEvidence {
+            att_tier: 1,
+            attestation_head: "33".repeat(32),
+        };
         let join = provider_lifecycle_intent_with_anchors(
             &provider,
             "join_enclave",
@@ -62412,8 +64685,11 @@ mod tests {
             None,
             None,
             Some(&join_terms),
+            Some(&join_attestation),
         )
         .expect("join intent");
+        assert_eq!(join["att_tier"], 1);
+        assert_eq!(join["attestation_head"], "33".repeat(32));
         assert_eq!(join["served_ctx"], 8192);
         assert_eq!(join["ctx_bracket"], ctx_bracket_for_tokens(8192));
         assert_eq!(join["ctx_bracket_table_ver"], CTX_BRACKET_TABLE_VERSION);
@@ -62992,11 +65268,10 @@ mod tests {
             "command": "mayhem",
             "args": [
                 "provider",
-                "start",
-                "--sc-bridge-token",
-                "local-secret-value"
+                "start"
             ],
             "env": {
+                "MAYHEM_SC_BRIDGE_TOKEN": "local-secret-value",
                 "MAYHEM_VLLM_PYTHON": "provider-python"
             },
             "restart": true,
@@ -63014,6 +65289,44 @@ mod tests {
         assert!(report.get("env").is_none());
         assert!(!encoded.contains("local-secret-value"));
         assert!(!encoded.contains("provider-python"));
+    }
+
+    #[test]
+    fn provider_serve_child_inherits_sc_bridge_token_without_argv_exposure() {
+        let home = test_temp_dir("provider-child-secret-channel");
+        let config = toml::from_str::<toml::Value>(
+            r#"
+            [network]
+            rpc_url = "http://127.0.0.1:49223/v1"
+            sc_bridge_url = "ws://127.0.0.1:8001"
+            sc_bridge_token = "provider-secret-token"
+            "#,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+
+        let child = provider_serve_child_config(
+            &home,
+            &"11".repeat(32),
+            "llama.cpp",
+            &ProviderBackendRuntime::default(),
+            None,
+            None,
+            &["text".to_owned()],
+            &BTreeMap::new(),
+            None,
+            Some("provider-live-test".to_owned()),
+        )
+        .unwrap();
+        let args = child["args"].as_array().unwrap();
+        assert!(!args.iter().any(|arg| arg == "--sc-bridge-token"));
+        assert!(!args.iter().any(|arg| arg == "provider-secret-token"));
+        assert_eq!(
+            child["env"]["MAYHEM_SC_BRIDGE_TOKEN"],
+            "provider-secret-token"
+        );
+
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -65375,7 +67688,7 @@ mod tests {
                 successful_sessions: 0,
                 required_successful_sessions: 50,
                 required_seconds: 7 * 24 * 60 * 60,
-                caps: ProbationCaps {
+                caps: mayhem_gateway::ProbationCaps {
                     max_concurrent_sessions_per_user: 2,
                     price_max_bps: 10_000,
                     weight_bps: 5_000,
@@ -65637,6 +67950,84 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_demultiplexes_shared_bridge_by_enclave_and_ownership() {
+        let terms = test_provider_session_terms();
+        let session_id = "aa".repeat(32);
+        let remote = "22".repeat(32);
+        let sessions = HashMap::new();
+        let open = test_session_open_frame(&terms);
+        let open_event = json!({
+            "type": "session_frame",
+            "session_id": session_id,
+            "remote": remote,
+            "frame": open,
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &open_event,
+            &sessions,
+            &terms
+        ));
+
+        let mut other_enclave_open = open_event.clone();
+        other_enclave_open["frame"]["enclave_id"] = json!("33".repeat(32));
+        assert!(!provider_session_event_belongs_to_process(
+            &other_enclave_open,
+            &sessions,
+            &terms
+        ));
+
+        for frame_type in [
+            "s.accept",
+            "s.reject",
+            "s.delta",
+            "s.receipt",
+            "s.error",
+            "s.close",
+        ] {
+            let unrelated = json!({
+                "type": "session_frame",
+                "session_id": "aa".repeat(32),
+                "remote": "22".repeat(32),
+                "frame": {
+                    "t": frame_type,
+                    "session_id": "aa".repeat(32),
+                },
+            });
+            assert!(
+                !provider_session_event_belongs_to_process(&unrelated, &sessions, &terms),
+                "unowned {frame_type} must not let a co-located provider close a buyer session"
+            );
+        }
+
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.remote = "22".repeat(32);
+        let mut owned_sessions = HashMap::new();
+        owned_sessions.insert("aa".repeat(32), active);
+        let owned_request = json!({
+            "type": "session_frame",
+            "session_id": "aa".repeat(32),
+            "remote": "22".repeat(32),
+            "frame": {
+                "t": "s.req",
+                "session_id": "aa".repeat(32),
+            },
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &owned_request,
+            &owned_sessions,
+            &terms
+        ));
+
+        let mut wrong_remote = owned_request;
+        wrong_remote["remote"] = json!("44".repeat(32));
+        assert!(!provider_session_event_belongs_to_process(
+            &wrong_remote,
+            &owned_sessions,
+            &terms
+        ));
+    }
+
+    #[test]
     fn provider_session_open_accepts_unbracketed_non_text_terms() {
         let mut terms = test_provider_session_terms();
         terms.ctx_bracket = None;
@@ -65706,6 +68097,21 @@ mod tests {
         assert!(message.starts_with("mayhem-spend-reservation-v1"));
         assert!(message.contains("\"max_spend_au\":\"1000\""));
         assert!(!message.contains("provider_sig"));
+        assert!(
+            !message.contains("required_specialities"),
+            "empty speciality maps must use the contract's omitted canonical form"
+        );
+
+        let mut specialised = value.clone();
+        specialised["required_specialities"] = json!({ "reasoning_effort": ["high"] });
+        specialised["voucher"]["required_specialities"] = json!({ "reasoning_effort": ["high"] });
+        assert_eq!(
+            spend_reservation_message(&specialised)
+                .matches("required_specialities")
+                .count(),
+            2,
+            "non-empty speciality maps remain bound in both reservation and voucher evidence"
+        );
 
         let key = spend_reservation_feature_key(&value).unwrap();
         assert!(key.starts_with(&format!(
@@ -66116,6 +68522,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -66127,6 +68537,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -66138,6 +68549,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -66182,7 +68594,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
     }
 
@@ -66195,6 +68607,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -66206,6 +68622,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -66237,8 +68654,121 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn cancelled_provider_receipt_charges_locked_minimum_for_zero_usage() {
+        let mut terms = test_provider_session_terms();
+        terms.per_req_au = 11;
+        terms.min_session_au = 37;
+        let active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        let receipt = provider_cancelled_session_receipt(
+            &terms,
+            &active,
+            &json!({
+                "mayhem_contract": {
+                    "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                },
+                "contract_request": {"prompt": "cancelled render"},
+            }),
+            ReceiptUsage::default(),
+            BTreeMap::new(),
+            1,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .expect("cancelled receipt");
+
+        assert!(receipt.body.final_receipt);
+        assert_eq!(receipt.body.usage, ReceiptUsage::default());
+        assert_eq!(receipt.body.locked_per_req_au, 11);
+        assert_eq!(receipt.body.locked_min_session_au, 37);
+        assert_eq!(receipt.body.au_owed_cum, 37);
+    }
+
+    #[test]
+    fn cancelled_provider_receipt_charges_signed_quantum_for_variable_only_price() {
+        let mut terms = test_provider_session_terms();
+        terms.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_au: 2_499_999_999_999_999,
+                granularity: 36,
+            },
+        ];
+        terms.per_req_au = 0;
+        terms.min_session_au = 0;
+        let active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        let receipt = provider_cancelled_session_receipt(
+            &terms,
+            &active,
+            &json!({
+                "mayhem_contract": {
+                    "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                },
+                "contract_request": {"prompt": "cancelled render"},
+            }),
+            ReceiptUsage::default(),
+            BTreeMap::new(),
+            1,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .expect("variable-only cancelled receipt");
+
+        assert_eq!(
+            receipt.body.usage,
+            ReceiptUsage::from_units([(USAGE_STEP, 1)])
+        );
+        assert_eq!(receipt.body.au_owed_cum, 69_444_444_444_445);
+    }
+
+    #[test]
+    fn gateway_startup_report_accepts_balance_above_json_u64_limit() {
+        let max = MoneyAu::MAX;
+        let public_key = "ab".repeat(32);
+        let wallet = gateway_startup_wallet_report(Some(&public_key), "tap", Some(max))
+            .expect("startup wallet report");
+        let report = json!({
+            "wallet": wallet,
+            "default_max_price_au": Some(money_au_json(max)),
+            "market": {
+                "min_ask_au": Some(money_au_json(max)),
+            },
+            "protection": {
+                "serve_budget_au": Some(money_au_json(max)),
+            },
+        });
+
+        let encoded = serde_json::to_string(&report).expect("large money report json");
+        let decoded: Value = serde_json::from_str(&encoded).expect("large money report roundtrip");
+        let expected = max.to_string();
+        assert_eq!(decoded["wallet"]["public_key"], public_key);
+        assert_eq!(
+            decoded["wallet"]["balance_source"],
+            format!("bal/{public_key}/tap")
+        );
+        assert_eq!(
+            decoded["wallet"]["balance_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["default_max_price_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["market"]["min_ask_au"].as_str(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decoded["protection"]["serve_budget_au"].as_str(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -66248,6 +68778,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -66259,6 +68793,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -66283,7 +68818,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(receipt.body.usage, usage);
         assert_eq!(
             receipt.body.au_owed_cum,
-            provider_session_au_owed(&active, &usage)
+            provider_session_au_owed(&active, &usage).expect("priced checkpoint usage")
         );
 
         let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
@@ -66293,8 +68828,67 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn provider_redispatch_receipt_nets_prior_usage_and_fixed_floor() {
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.locked_rate_map = normalize_rate_map(vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 10,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 10,
+                granularity: 1,
+            },
+        ]);
+        active.locked_per_req_au = 500;
+        active.locked_min_session_au = 700;
+        active.billing_attempt = 1;
+        active.billing_prior_usage = ReceiptUsage::text(10, 2);
+        active.billing_prior_au_owed_cum = 700;
+        active.max_spend_au = 30;
+
+        let body = json!({
+            "messages": [{ "role": "user", "content": "retried prompt" }],
+            "max_tokens": 8,
+        });
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            ReceiptUsage::text(99, 3),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([19; 32]),
+        )
+        .expect("redispatch receipt should charge only the new visible output");
+
+        assert_eq!(receipt.body.billing_attempt, 1);
+        assert_eq!(receipt.body.billing_prior_usage, ReceiptUsage::text(10, 2));
+        assert_eq!(receipt.body.usage, ReceiptUsage::text(10, 5));
+        assert_eq!(receipt.body.billing_prior_au_owed_cum, 700);
+        assert_eq!(receipt.body.au_owed_cum, 730);
+
+        active.max_spend_au = 29;
+        assert!(provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            ReceiptUsage::text(99, 3),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([19; 32]),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("incremental spend maximum"));
     }
 
     #[test]
@@ -66309,6 +68903,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: 1,
             locked_rate_map: text_generation_rate_map(1, 2),
@@ -66320,6 +68918,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         assert_eq!(
@@ -66347,6 +68946,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -66358,6 +68961,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -66366,6 +68970,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -66405,6 +69010,45 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut wrong_sig = frame;
         wrong_sig["user_sig"] = json!("11".repeat(64));
         assert!(provider_session_receipt_ack_from_frame(&wrong_sig, &active, &receipt).is_err());
+    }
+
+    #[test]
+    fn provider_session_user_signatures_reject_low_order_forgeries() {
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.user_pubkey = weak_key.clone();
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &json!({"messages": [{"role": "user", "content": "strict ack"}]}),
+            ReceiptUsage::text(1, 1),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap();
+        let ack_frame = json!({
+            "t": "s.receipt_ack",
+            "v": 1,
+            "session_id": active.session_id,
+            "seq": receipt.body.seq,
+            "user_sig": weak_signature,
+        });
+        provider_session_receipt_ack_from_frame(&ack_frame, &active, &receipt)
+            .expect_err("low-order receipt ack forgery must fail strict verification");
+
+        let mut open_frame = test_session_open_frame(&terms);
+        open_frame["user"] = json!(weak_key);
+        open_frame["voucher"]["user_sig"] = json!(weak_signature);
+        open_frame["sig"] = json!(weak_signature);
+        assert!(matches!(
+            provider_session_open_decision(&open_frame, &terms),
+            ProviderSessionDecision::Reject {
+                code: "SIGNATURE",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -66970,13 +69614,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "\npublic ",
             "answer",
         ];
-        let visible = chunks
-            .iter()
-            .map(|chunk| filter.push(chunk))
-            .collect::<String>();
+        let mut filtered = ProviderReasoningFilteredText::default();
+        for chunk in chunks {
+            filtered.extend(filter.push_split(chunk));
+        }
+        filtered.extend(filter.finish_split());
 
-        assert_eq!(visible, "public answer");
-        assert_eq!(filter.finish(), "");
+        assert_eq!(filtered.visible, "public answer");
+        assert_eq!(filtered.hidden, "private chain of thought</think>\n\n");
     }
 
     #[test]
@@ -67119,6 +69764,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &catalog::CatalogSamplingProfile::default(),
             &sealed,
             None,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(production.last_request.unwrap().max_new_tokens, 262_144);
@@ -67132,6 +69778,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &sealed,
             None,
             Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -67179,6 +69826,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &model.sampling,
                 &sealed,
                 None,
+                &CancellationToken::new(),
             )
             .unwrap_or_else(|error| panic!("{} translate: {error:#}", prompt.id));
             covered.extend(modalities);
@@ -67213,6 +69861,195 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(body["max_tokens"], 4);
         assert_eq!(body["thinking_mode"], "disabled");
         assert_eq!(body["thinking_history"], "latest_only");
+    }
+
+    #[test]
+    fn image_provider_canary_uses_explicit_values_or_signed_defaults() {
+        let mut model = test_catalog(&"aa".repeat(32)).models.remove(0);
+        model.model_class = "image-generation".to_owned();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("image endpoint contract")];
+        let contract = model.adapter.endpoint_families.first_mut().unwrap();
+        for (name, value) in [
+            ("n", json!(1)),
+            ("width", json!(1024)),
+            ("height", json!(1024)),
+            ("response_format", json!("b64_json")),
+            ("steps", json!(9)),
+            ("cfg_scale", json!(0.0)),
+            ("seed", json!(7)),
+        ] {
+            contract
+                .request_attribute_specs
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("missing {name} image attribute"))
+                .default = Some(value);
+        }
+
+        let defaulted_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "signed-defaults",
+            "prompt": "a compass on a map"
+        }))
+        .unwrap();
+        let body = provider_canary_self_test_body(&model, &defaulted_prompt).unwrap();
+        assert!(body.get("n").is_none());
+        assert!(body.get("size").is_none());
+        assert!(body.get("steps").is_none());
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let request = &sealed["contract_request"];
+        assert_eq!(request["n"], 1);
+        assert_eq!(request["width"], 1024);
+        assert_eq!(request["height"], 1024);
+        assert_eq!(request["steps"], 9);
+        assert_eq!(request["cfg_scale"], 0.0);
+
+        let explicit_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "explicit-values",
+            "prompt": "a compass on a map",
+            "size": "1536x1024",
+            "steps": 9,
+            "cfg_scale": 0.0,
+            "seed": 11
+        }))
+        .unwrap();
+        let explicit = provider_canary_self_test_body(&model, &explicit_prompt).unwrap();
+        assert_eq!(explicit["size"], "1536x1024");
+        assert_eq!(explicit["steps"], 9);
+        assert_eq!(explicit["cfg_scale"], 0.0);
+        assert_eq!(explicit["seed"], 11);
+    }
+
+    #[test]
+    fn provider_accepts_semantically_equal_javascript_image_numbers() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let body = json!({
+            "kind": "image_generation",
+            "model": model.model_id,
+            "prompt": "a glass observatory",
+            "steps": 8,
+            "cfg_scale": 1.0,
+            "shift": 3.0,
+            "seed": 424242,
+            "response_format": "b64_json"
+        });
+        let mut sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+
+        // JSON.parse/stringify in the SC bridge removes the redundant decimal suffix.
+        sealed["contract_request"]["cfg_scale"] = json!(1);
+        sealed["contract_request"]["shift"] = json!(3);
+
+        provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+        assert_eq!(
+            provider_session_prompt_hash(&sealed),
+            sealed["mayhem_contract"]["normalized_request_fingerprint"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_matrix_has_unique_ids() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+
+        for contract in &model.adapter.endpoint_families {
+            mayhem_proto::generate_endpoint_calibration_cases(contract)
+                .unwrap_or_else(|error| panic!("{}: {error}", contract.family));
+        }
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_preflight_is_complete() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+    }
+
+    #[test]
+    fn live_z_image_endpoint_calibration_executes_each_normalized_request_once() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .expect("Z-Image catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let mut backend = FakeEngineBackend::new("")
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "image-1".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: b"\x89PNG".to_vec(),
+                final_chunk: true,
+            }])
+            .with_repeated_image_artifact();
+
+        let report = catalog_endpoint_calibration_report(&mut backend, model, &prompts);
+        let failures = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| !case.ok)
+            .map(|case| {
+                format!(
+                    "{}: translation={:?}; backend={:?}; response={:?}",
+                    case.case_id,
+                    case.provider_translation.error,
+                    case.backend_execution.error,
+                    case.response_normalization.error
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(report.ok, "{failures:#?}");
+        let accepted = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| case.expect_accept)
+            .count();
+        let distinct_normalized = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter_map(|case| {
+                case.gateway_normalization
+                    .fingerprint
+                    .as_ref()
+                    .map(|fingerprint| (case.endpoint_family.clone(), fingerprint.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(backend.image_generation_calls, distinct_normalized);
+        assert!(backend.image_generation_calls < accepted);
     }
 
     #[test]
@@ -67475,6 +70312,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &model.sampling,
             &sealed,
             None,
+            &CancellationToken::new(),
         )
         .unwrap();
 
@@ -67572,8 +70410,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "kind": "image_generation",
             "prompt": "draw a red square",
             "n": 1,
-            "size": "64x64",
+            "size": "1024x1024",
             "steps": 3,
+            "cfg_scale": 1.0,
             "seed": 9
         });
 
@@ -67587,7 +70426,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(output.artifacts.len(), 1);
         assert_eq!(output.usage.get(USAGE_IMAGE), 1);
-        assert_eq!(output.usage.get(USAGE_STEP), 3);
+        assert_eq!(output.usage.get(USAGE_STEP), 12);
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
         let request = backend
@@ -67595,10 +70434,74 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .expect("image generation request");
         assert_eq!(request.prompt, "draw a red square");
         assert_eq!(request.image_count, 1);
-        assert_eq!(request.width, 64);
-        assert_eq!(request.height, 64);
+        assert_eq!(request.width, 1024);
+        assert_eq!(request.height, 1024);
         assert_eq!(request.steps, 3);
         assert_eq!(request.seed, Some(9));
+    }
+
+    #[test]
+    fn provider_image_translation_preserves_signed_controls_without_fallbacks() {
+        let openai = provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            &json!({
+                "prompt":"a brass compass",
+                "n":4,
+                "width":768,
+                "height":1024,
+                "steps":9,
+                "cfg_scale":0.0,
+                "negative_prompt":"blur, watermark",
+                "shift":3.0,
+                "seed":17
+            }),
+        )
+        .unwrap();
+        assert_eq!(openai.image_count, 4);
+        assert_eq!((openai.width, openai.height), (768, 1024));
+        assert_eq!(openai.steps, 9);
+        assert_eq!(openai.guidance_scale, 0.0);
+        assert_eq!(openai.negative_prompt.as_deref(), Some("blur, watermark"));
+        assert_eq!(openai.flow_shift, Some(3.0));
+        assert_eq!(openai.seed, Some(17));
+
+        let hf = provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+            &json!({
+                "inputs":"a brass compass",
+                "parameters":{
+                    "width":1024,
+                    "height":768,
+                    "num_images_per_prompt":3,
+                    "num_inference_steps":11,
+                    "guidance_scale":2.5,
+                    "negative_prompt":"text, watermark",
+                    "shift":4.5,
+                    "seed":23
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(hf.image_count, 3);
+        assert_eq!((hf.width, hf.height), (1024, 768));
+        assert_eq!(hf.steps, 11);
+        assert_eq!(hf.guidance_scale, 2.5);
+        assert_eq!(hf.negative_prompt.as_deref(), Some("text, watermark"));
+        assert_eq!(hf.flow_shift, Some(4.5));
+        assert_eq!(hf.seed, Some(23));
+
+        assert!(provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            &json!({
+                "prompt":"a brass compass",
+                "n":1,
+                "steps":9,
+                "cfg_scale":0.0
+            }),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("signed image endpoint defaults did not resolve size"));
     }
 
     #[test]
@@ -67809,6 +70712,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             };
             let output = ProviderSessionOutput {
                 content: String::new(),
+                reasoning_evidence: String::new(),
                 tools: Vec::new(),
                 embeddings: None,
                 artifacts: vec![ProviderSessionArtifact {
@@ -68635,6 +71539,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -68645,6 +71553,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -68685,6 +71594,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -68695,6 +71608,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -68734,6 +71648,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "tap".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -68744,6 +71662,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -68805,6 +71724,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &mut self,
                 _terms: &ProviderSessionTerms,
                 _body: &Value,
+                _cancellation: &CancellationToken,
             ) -> Result<ProviderSessionOutput> {
                 bail!("injected engine child failure")
             }
@@ -69056,7 +71976,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         for (index, part) in parts.iter().enumerate() {
             token_counter.observe(part);
             let delta = provider_token_ids_delta_for_part(&token_ids, index, parts.len());
-            let frame = provider_session_content_delta_frame("rid", index as u64, part, delta);
+            let frame = provider_session_content_delta_frame("rid", index as u64, part, "", delta);
+            assert_eq!(frame["reasoning_evidence_delta"], "");
             observed.extend(
                 frame["token_ids_delta"]
                     .as_array()
@@ -69085,7 +72006,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut observed = Vec::new();
         for index in 0..part_count {
             let token_delta = provider_token_ids_delta_for_part(&token_ids, index, part_count);
-            let frame = provider_session_content_delta_frame("rid", index as u64, "", token_delta);
+            let frame =
+                provider_session_content_delta_frame("rid", index as u64, "", "", token_delta);
             assert!(provider_session_frame_json_len(&frame).unwrap() <= max_frame_bytes);
             observed.extend_from_slice(token_delta);
         }
@@ -69095,9 +72017,34 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_session_output_budget_allows_large_valid_text_and_rejects_overrun() {
         let terms = test_provider_session_terms();
-        let body = json!({ "messages": [], "max_tokens": 8192 });
+        let max_tokens = 8192_u64;
+        let body = json!({ "messages": [], "max_tokens": max_tokens });
+        assert_eq!(
+            provider_requested_max_output_tokens(&body),
+            Some(max_tokens)
+        );
+        assert_eq!(
+            provider_requested_max_output_tokens(
+                &json!({ "messages": [], "max_completion_tokens": max_tokens })
+            ),
+            Some(max_tokens)
+        );
+        assert_eq!(
+            provider_requested_max_output_tokens(
+                &json!({ "messages": [], "max_output_tokens": max_tokens })
+            ),
+            Some(max_tokens)
+        );
+        let max_visible_bytes = max_tokens
+            .saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN)
+            .saturating_mul(VISIBLE_OUTPUT_BYTES_PER_UNIT);
+        assert_eq!(
+            max_visible_bytes,
+            max_tokens.saturating_mul(MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN)
+        );
         let mut output = ProviderSessionOutput {
-            content: "x".repeat(8192 * DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN),
+            content: "x".repeat(usize::try_from(max_visible_bytes).unwrap()),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -69108,13 +72055,15 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             usage: ReceiptUsage::text(0, 8192),
             usage_attribution: BTreeMap::new(),
         };
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
         validate_provider_session_output(&terms, &body, &output).unwrap();
 
         output.content.push('x');
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
         assert!(validate_provider_session_output(&terms, &body, &output)
             .unwrap_err()
             .to_string()
-            .contains("byte budget"));
+            .contains("byte-derived unit budget"));
 
         output.content.clear();
         output.completion_tokens = 0;
@@ -69134,9 +72083,47 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_reasoning_only_output_is_billed_from_evidence() {
+        let body = json!({ "messages": [], "max_tokens": 32 });
+        let mut output = ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: "r".repeat(128),
+            tools: Vec::new(),
+            embeddings: None,
+            artifacts: Vec::new(),
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 5,
+            completion_tokens: 32,
+            token_ids: vec![7; 32],
+            usage: ReceiptUsage::text(5, 32),
+            usage_attribution: BTreeMap::from([("reasoning_output_tokens".to_owned(), 31)]),
+        };
+
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
+
+        assert_eq!(output.usage.output_tokens(), 32);
+        assert_eq!(output.completion_tokens, 32);
+        assert_eq!(
+            output
+                .usage_attribution
+                .get("reasoning_output_tokens")
+                .copied(),
+            Some(32)
+        );
+
+        output.content = "public answer".to_owned();
+        output.reasoning_evidence.clear();
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
+        assert!(!output
+            .usage_attribution
+            .contains_key("reasoning_output_tokens"));
+    }
+
+    #[test]
     fn provider_session_final_delta_frames_chunk_large_fields_under_transport_limit() {
         let output = ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![
                 json!({
                     "id": "call-large-1",
@@ -69222,9 +72209,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_load_tracks_live_active_slots() {
         let load = ProviderHeartbeatLoad::default();
+        let mut changes = load.subscribe_changes();
         assert_eq!(load.snapshot(0), ProviderLoadSnapshot::default());
         assert_eq!(load.snapshot(8), ProviderLoadSnapshot::idle(8));
+        assert!(!changes.has_changed().unwrap());
         load.set_active_sessions(2);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
         assert_eq!(
             load.snapshot(4),
             ProviderLoadSnapshot {
@@ -69236,10 +72227,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 ttft_ms: 0,
                 measured_tok_s_milli: None,
                 accepting_new: true,
+                modality_at_capacity: false,
                 modality_active_items: BTreeMap::new(),
             }
         );
         load.set_accepting_new(false);
+        assert!(changes.has_changed().unwrap());
         assert!(!load.snapshot(4).accepting_new);
         assert!(!load.is_stopped());
         load.stop();
@@ -69306,14 +72299,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let first = load
             .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
             .unwrap();
-        assert_eq!(load.snapshot(4).modality_active_items["image"], 1);
+        let busy = load.snapshot(4);
+        assert_eq!(busy.modality_active_items["image"], 1);
+        assert!(busy.modality_at_capacity);
+        assert!(!busy.accepting_new);
+        assert_eq!(busy.free_slots, 0);
         let err = match load.begin_request(BTreeMap::from([("image".to_owned(), 1)])) {
             Ok(_) => panic!("a held image slot must refuse another image"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("image capacity is full"));
         drop(first);
-        assert_eq!(load.snapshot(4).modality_active_items["image"], 0);
+        let idle = load.snapshot(4);
+        assert_eq!(idle.modality_active_items["image"], 0);
+        assert!(!idle.modality_at_capacity);
+        assert!(idle.accepting_new);
+        assert_eq!(idle.free_slots, 4);
 
         let released = load
             .begin_request(BTreeMap::from([("image".to_owned(), 1)]))
@@ -69345,6 +72346,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_text_throughput_excludes_prefill_and_ignores_one_token_turns() {
         let output = ProviderSessionOutput {
             content: "ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -69619,6 +72621,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ttft_ms: 0,
             measured_tok_s_milli: None,
             accepting_new: true,
+            modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
         };
 
@@ -70241,6 +73244,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider: "provider-a".to_owned(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 10_000,
             held_au: 2_500,
             paid_cum_au: 3_000,
@@ -70272,6 +73277,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider: "bad-provider".to_owned(),
             rail: "fiat".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             holdbacks: Vec::new(),
             updated_epoch: 0,
             updated_at: None,
@@ -70387,7 +73394,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn balance_record_defaults_missing_contract_key_to_zero_au_usd() {
-        let record = normalize_balance_record("user", "tnk", None).unwrap();
+        let record = normalize_balance_record("user", "tnk", None, None).unwrap();
 
         assert_eq!(record["user"], "user");
         assert_eq!(record["rail"], "tnk");
@@ -70410,6 +73417,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "updated_epoch": 3,
                 "updated_at": 7
             })),
+            None,
         )
         .unwrap();
         assert_eq!(record["au"], "42");
@@ -70417,27 +73425,60 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "provider_coin", "au": "1" }))
+            Some(json!({ "user": "user", "denom": "provider_coin", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "other", "denom": "au_usd", "au": "1" }))
+            Some(json!({ "user": "other", "denom": "au_usd", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "rail": "tap", "denom": "au_usd", "au": "1" }))
+            Some(json!({ "user": "user", "rail": "tap", "denom": "au_usd", "au": "1" })),
+            None,
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "au_usd" }))
+            Some(json!({ "user": "user", "denom": "au_usd" })),
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn tap_balance_record_ignores_credit_backed_by_a_retired_pool() {
+        let current = CanonicalTapRail {
+            chain_id: 1,
+            token_address: "0x1111111111111111111111111111111111111111".to_owned(),
+            pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+        };
+        let record = normalize_balance_record(
+            "user",
+            "tap",
+            Some(json!({
+                "user": "user",
+                "rail": "tap",
+                "denom": "au_usd",
+                "au": "48000000000000000000",
+                "chain_id": 1,
+                "pool_address": "0x3333333333333333333333333333333333333333",
+                "updated_epoch": 9,
+                "updated_at": "old-pool"
+            })),
+            Some(&current),
+        )
+        .unwrap();
+
+        assert_eq!(record["au"], "0");
+        assert_eq!(record["chain_id"], 1);
+        assert_eq!(record["pool_address"], current.pool_address);
     }
 
     #[test]
@@ -70704,6 +73745,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 gateway_bind: None,
                 gateway_url: None,
                 tnk_treasury_address: Some("testtrac1treasury".to_owned()),
+                admin_peer_pubkey: Some("11".repeat(32)),
             }),
             provider: None,
             user: None,
@@ -70715,6 +73757,215 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "testtrac1treasury"
         );
         assert!(resolve_cli_tnk_treasury_address(Some(&config), Some("bad address")).is_err());
+    }
+
+    fn tnk_payment_state(network: &str, treasury: &str, admin: &str) -> CanonicalPaymentState {
+        CanonicalPaymentState {
+            payments: CanonicalPayments {
+                denom: "au_usd".to_owned(),
+                rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+                fiat: CanonicalFiatRail {
+                    processor: "stripe".to_owned(),
+                    currencies: vec!["usd".to_owned(), "eur".to_owned()],
+                    locale: "en".to_owned(),
+                },
+                tap: CanonicalTapRail {
+                    chain_id: MAINNET_TAP_CHAIN_ID,
+                    token_address: MAINNET_TAP_TOKEN_ADDRESS.to_owned(),
+                    pool_address: MAINNET_TAP_POOL_ADDRESS.to_owned(),
+                },
+                tnk: CanonicalTnkRail {
+                    network: network.to_owned(),
+                    treasury_address: treasury.to_owned(),
+                },
+                ver: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                set_by: admin.to_owned(),
+                set_by_role: "admin".to_owned(),
+            },
+            tap_rate: CanonicalTapRate {
+                denom: "tap_usd_au".to_owned(),
+                tap_usd_au: 1,
+                source: "config".to_owned(),
+                ts: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                posted_by: admin.to_owned(),
+                posted_by_role: "admin".to_owned(),
+            },
+            tnk_rate: CanonicalTnkRate {
+                denom: "tnk_usd_au".to_owned(),
+                tnk_usd_au: 1,
+                source: "gate-spot".to_owned(),
+                ts: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                posted_by: admin.to_owned(),
+                posted_by_role: "admin".to_owned(),
+            },
+            rate_staleness_seconds: 1,
+            observed_at: 1,
+        }
+    }
+
+    #[test]
+    fn fund_rpc_rejects_remote_plaintext_and_accepts_loopback_or_tls() {
+        assert!(require_secure_fund_rpc_url("http://127.0.0.1:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://[::1]:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://localhost:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("https://rpc.example.test/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://192.0.2.10:49223/v1").is_err());
+        assert!(require_secure_fund_rpc_url("ws://127.0.0.1:49223/v1").is_err());
+        assert!(require_secure_fund_rpc_url("https://user:password@rpc.example.test/v1").is_err());
+    }
+
+    #[test]
+    fn tnk_mainnet_fund_anchor_rejects_a_self_consistent_hostile_rpc() {
+        let manifest = canonical_mainnet_manifest().unwrap();
+        let honest = tnk_payment_state(
+            "mainnet",
+            MAINNET_TNK_TREASURY_ADDRESS,
+            &manifest.contract.admin_peer_pubkey,
+        );
+        let anchor = validate_tnk_fund_trust_anchor(None, &honest).unwrap();
+        assert_eq!(anchor.source, "compiled-mainnet-manifest");
+        assert_eq!(anchor.treasury_address, MAINNET_TNK_TREASURY_ADDRESS);
+
+        let hostile = tnk_payment_state(
+            "mainnet",
+            "trac1attacker000000000000000000000000000000000000000000000000",
+            &"aa".repeat(32),
+        );
+        assert!(validate_tnk_fund_trust_anchor(None, &hostile).is_err());
+    }
+
+    #[test]
+    fn tnk_testnet_fund_anchor_requires_matching_local_admin_and_treasury() {
+        let admin = "22".repeat(32);
+        let treasury = "testtrac1trustedtreasury";
+        let config = MayhemConfig {
+            identity: None,
+            network: Some(ConfigNetwork {
+                rpc_url: None,
+                sc_bridge_url: None,
+                sc_bridge_token: None,
+                gateway_bind: None,
+                gateway_url: None,
+                tnk_treasury_address: Some(treasury.to_owned()),
+                admin_peer_pubkey: Some(admin.clone()),
+            }),
+            provider: None,
+            user: None,
+            role: None,
+        };
+        let honest = tnk_payment_state("testnet1", treasury, &admin);
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &honest).is_ok());
+        let redirected = tnk_payment_state("testnet1", "testtrac1attacker", &admin);
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &redirected).is_err());
+        let hostile_admin = tnk_payment_state("testnet1", treasury, &"33".repeat(32));
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &hostile_admin).is_err());
+    }
+
+    fn valid_msb_transfer() -> MsbTransferOutput {
+        MsbTransferOutput {
+            ok: true,
+            network: "mainnet".to_owned(),
+            from: "trac1depositor".to_owned(),
+            to: "trac1treasury".to_owned(),
+            amount: "1.25".to_owned(),
+            tx_hash: "ab".repeat(32),
+            before_balance: "10".to_owned(),
+            validator_connections: 1,
+            confirmed_length: Some(10),
+            observed_signed_length: Some(12),
+        }
+    }
+
+    #[test]
+    fn tnk_transfer_result_must_match_confirmed_identity() {
+        let transfer = valid_msb_transfer();
+        assert!(verify_tnk_transfer_result(
+            &transfer,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_ok());
+
+        let mut wrong_from = valid_msb_transfer();
+        wrong_from.from = "trac1attacker".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_from,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+        let mut wrong_to = valid_msb_transfer();
+        wrong_to.to = "trac1attacker".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_to,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+        let mut wrong_amount = valid_msb_transfer();
+        wrong_amount.amount = "125".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_amount,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tnk_destination_confirmation_preserves_headless_operation() {
+        assert!(confirm_tnk_transfer_destination(
+            true,
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+            "mainnet",
+        )
+        .is_ok());
+        if !io::stdin().is_terminal() {
+            assert!(confirm_tnk_transfer_destination(
+                false,
+                "trac1depositor",
+                "trac1treasury",
+                "1.25",
+                "mainnet",
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn helper_values_and_contract_key_parts_reject_leading_dash() {
+        assert!(is_safe_key_part("trac1destination"));
+        assert!(!is_safe_key_part("-destination"));
+        assert!(validate_external_helper_option_pairs(&[
+            "--to".to_owned(),
+            "trac1destination".to_owned(),
+            "--amount".to_owned(),
+            "1.25".to_owned(),
+        ])
+        .is_ok());
+        assert!(validate_external_helper_option_pairs(&[
+            "--to".to_owned(),
+            "--attacker-option".to_owned(),
+        ])
+        .is_err());
+        assert!(validate_wallet_helper_public_args(&[
+            "--keypair".to_owned(),
+            "--attacker-option".to_owned(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -70791,7 +74042,7 @@ State initialization...
                 "rate_tnk_usd_au": "50000000000000000",
                 "rate_source": "gate-spot",
                 "rate_ts": 90_000,
-                "msb_tx_hashes": [],
+                "msb_transfers": [],
                 "transfer_root": transfer_root,
                 "provider_count": 1,
                 "provider_au": "62500000000000000",
@@ -70803,6 +74054,7 @@ State initialization...
             msb_outputs: vec![MsbSettlementTransferOutput {
                 to: "testtrac1provider".to_owned(),
                 amount: "1.25".to_owned(),
+                amount_e18: "1250000000000000000".to_owned(),
             }],
             skipped_providers: Vec::new(),
             already_settled: None,
@@ -70899,11 +74151,13 @@ State initialization...
         let provider = json!({
             "provider": provider_id,
             "status": "active",
-            "payout": {
-                "method": "tnk",
-                "addr": "testtrac1provider",
-                "set_by": admin,
-                "set_by_role": "admin",
+            "payouts": {
+                "tnk": {
+                    "method": "tnk",
+                    "addr": "testtrac1provider",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                }
             }
         });
 
@@ -70913,12 +74167,42 @@ State initialization...
         );
 
         let mut wrong_method = provider.clone();
-        wrong_method["payout"]["method"] = json!("stripe");
+        wrong_method["payouts"]["tnk"]["method"] = json!("stripe");
         assert!(tnk_provider_payout_target(&wrong_method, &provider_id, &admin).is_err());
 
         let mut wrong_admin = provider.clone();
-        wrong_admin["payout"]["set_by"] = json!("bb".repeat(32));
+        wrong_admin["payouts"]["tnk"]["set_by"] = json!("bb".repeat(32));
         assert!(tnk_provider_payout_target(&wrong_admin, &provider_id, &admin).is_err());
+    }
+
+    #[test]
+    fn fiat_settlement_provider_payout_uses_rail_specific_stripe_target() {
+        let admin = "aa".repeat(32);
+        let provider_id = "11".repeat(32);
+        let provider = json!({
+            "provider": provider_id,
+            "status": "active",
+            "payouts": {
+                "tnk": {
+                    "method": "tnk",
+                    "addr": "trac1provider",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                },
+                "stripe": {
+                    "method": "stripe",
+                    "addr": "acct_provider",
+                    "currency": "eur",
+                    "set_by": admin,
+                    "set_by_role": "admin",
+                }
+            }
+        });
+
+        assert_eq!(
+            fiat_provider_payout_target(&provider, &provider_id, &admin).unwrap(),
+            ("acct_provider".to_owned(), "eur".to_owned())
+        );
     }
 
     #[test]
@@ -70927,6 +74211,8 @@ State initialization...
             provider: "11".repeat(32),
             rail: "tnk".to_owned(),
             denom: "au_usd".to_owned(),
+            chain_id: None,
+            pool_address: None,
             total_au: 10_000,
             held_au: 4_000,
             paid_cum_au: 1_000,
@@ -71002,6 +74288,7 @@ State initialization...
                 gateway_bind: None,
                 gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
                 tnk_treasury_address: None,
+                admin_peer_pubkey: None,
             }),
             provider: None,
             user: None,
@@ -71109,29 +74396,32 @@ State initialization...
 
     #[test]
     fn use_gateway_accepts_wallet_and_rail_flags() {
-        let cli = Cli::try_parse_from([
-            "mayhem",
-            "use",
-            "--keypair",
-            "/tmp/mayhem/stores/main/db/keypair.json",
-            "--peer-store-name",
-            "terminal",
-            "--wallet-password",
-            "secret",
-            "--rail",
-            "tnk",
-            "--min-ctx",
-            "128000",
-            "--canary-probe-min-interval-sessions",
-            "1",
-            "--canary-probe-max-interval-sessions",
-            "1",
-            "--canary-probe-epoch",
-            "7",
-            "--receipt-checkpoint-tokens",
-            "32",
-            "--receipt-checkpoint-ms",
-            "2500",
+        let temp = test_temp_dir("use-wallet-password-file");
+        let password_path = temp.join("wallet-password");
+        fs::write(&password_path, "secret\n").unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "mayhem".to_owned(),
+            "use".to_owned(),
+            "--keypair".to_owned(),
+            "/tmp/mayhem/stores/main/db/keypair.json".to_owned(),
+            "--peer-store-name".to_owned(),
+            "terminal".to_owned(),
+            "--wallet-password-file".to_owned(),
+            password_path.display().to_string(),
+            "--rail".to_owned(),
+            "tnk".to_owned(),
+            "--min-ctx".to_owned(),
+            "128000".to_owned(),
+            "--canary-probe-min-interval-sessions".to_owned(),
+            "1".to_owned(),
+            "--canary-probe-max-interval-sessions".to_owned(),
+            "1".to_owned(),
+            "--canary-probe-epoch".to_owned(),
+            "7".to_owned(),
+            "--receipt-checkpoint-tokens".to_owned(),
+            "32".to_owned(),
+            "--receipt-checkpoint-ms".to_owned(),
+            "2500".to_owned(),
         ])
         .unwrap();
         match cli.command {
@@ -71152,6 +74442,7 @@ State initialization...
             }
             other => panic!("expected use command, got {other:?}"),
         }
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -71560,6 +74851,7 @@ State initialization...
             size: None,
             steps: None,
             cfg_scale: None,
+            shift: None,
             seed: None,
         };
 
@@ -73429,6 +76721,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -73540,6 +76833,7 @@ State initialization...
             "nvfp4".to_owned(),
             catalog::CatalogArtifact {
                 engine: "trt-llm".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-nvfp4".to_owned(),
@@ -73727,6 +77021,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -74325,6 +77620,30 @@ State initialization...
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn release_manifest_signature_rejects_low_order_forgery() {
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        let manifest_bytes = br#"{"schema":1,"name":"mayhem"}"#;
+        let signature = ReleaseDetachedSignature {
+            schema_version: 1,
+            alg: "ed25519".to_owned(),
+            signed_path: "manifest.json".to_owned(),
+            key_id: "test-release-key".to_owned(),
+            public_key: weak_key.clone(),
+            sha256: sha256_bytes_hex(manifest_bytes),
+            sig: weak_signature,
+        };
+
+        verify_release_manifest_signature(
+            manifest_bytes,
+            &signature,
+            None,
+            Some(&weak_key),
+            Some("test-release-key"),
+        )
+        .expect_err("low-order release manifest forgery must fail strict verification");
+    }
+
     #[tokio::test]
     async fn update_report_rejects_tampered_release_archive() {
         let temp = test_temp_dir("mayhem-release-update-tamper");
@@ -74477,6 +77796,29 @@ State initialization...
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
 
         assert_eq!(stable_value_hash(&a), stable_value_hash(&b));
+    }
+
+    #[test]
+    fn canary_challenge_hash_and_selection_match_contract_vector() {
+        let seed = opaque_value_hash(
+            "mayhem-canary-challenge-v1",
+            &json!({
+                "challenge_epoch": 41,
+                "challenge_apply_hash": "ab".repeat(32),
+                "probe_epoch": 42,
+                "auditor": "11".repeat(32),
+                "provider": "22".repeat(32),
+                "enclave_id": "33".repeat(32),
+                "canary_set": "canary-main-v1",
+                "catalog_hash": "44".repeat(32),
+            }),
+        );
+
+        assert_eq!(
+            seed,
+            "8c9d4f7b4c6a460145f2d3f99a2adf7c702d8378610f27d0db1a144c44ba3ce3"
+        );
+        assert_eq!(hexadecimal_modulo(&seed, 7).unwrap(), 1);
     }
 
     #[test]
@@ -74978,6 +78320,10 @@ State initialization...
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -74989,6 +78335,7 @@ State initialization...
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         }
     }
@@ -74999,6 +78346,10 @@ State initialization...
         let user = hex_encode(&user_key.verifying_key().to_bytes());
         let voucher_body = mayhem_proto::SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
@@ -75037,6 +78388,10 @@ State initialization...
             "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
             "voucher": {
                 "session_id": voucher_body.session_id,
+                "billing_id": voucher_body.billing_id,
+                "billing_attempt": voucher_body.billing_attempt,
+                "billing_prior_usage": voucher_body.billing_prior_usage,
+                "billing_prior_au_owed_cum": money_au_json(voucher_body.billing_prior_au_owed_cum),
                 "rail": voucher_body.rail,
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,
@@ -75322,6 +78677,7 @@ State initialization...
             artifact: "gguf-q4_k_m".to_owned(),
             artifact_path: PathBuf::from("/tmp/model.gguf"),
             vision_projector_path: None,
+            artifact_sidecars: Vec::new(),
             prompt_id: None,
             ctx_size: 1024,
             threads: None,
@@ -75638,6 +78994,8 @@ State initialization...
             dashboard_url: "http://127.0.0.1:11435/mayhem/dashboard".to_owned(),
             supervisor_bind: "127.0.0.1:11437".to_owned(),
             supervisor_url: "http://127.0.0.1:11437".to_owned(),
+            mayhemd_control_token: "11".repeat(32),
+            wallet_password: None,
             gateway_bind: "0.0.0.0:11435".parse().unwrap(),
             rail: GatewayLedgerRail::Tap,
             gateway_require_auth: true,
@@ -75687,7 +79045,25 @@ State initialization...
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["peer", "gateway"]);
         assert!(up_provider_workers_deferred(&plan));
-        assert!(text.contains("--sc-bridge-token"));
+        assert!(children.iter().all(|child| {
+            child
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|args| {
+                    args.iter().all(|arg| {
+                        arg.as_str() != Some("--sc-bridge-token")
+                            && arg.as_str() != Some("test-token")
+                    })
+                })
+        }));
+        assert_eq!(
+            children[0]["env"]["SC_BRIDGE_TOKEN"].as_str(),
+            Some("test-token")
+        );
+        assert_eq!(
+            children[1]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),
+            Some("test-token")
+        );
         assert!(text.contains("test-token"));
         assert!(text.contains("--subnet-channel"));
         assert!(text.contains("mayhem-mainnet-v1"));
@@ -75746,6 +79122,26 @@ State initialization...
         fs::remove_dir_all(home).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mayhemd_control_token_is_private_stable_and_validated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_temp_dir("mayhemd-control-token");
+        fs::create_dir_all(&home).unwrap();
+        let first = load_or_create_mayhemd_control_token(&home).unwrap();
+        let second = load_or_create_mayhemd_control_token(&home).unwrap();
+        assert_eq!(first, second);
+        assert!(is_hex_len(&first, 64));
+        let path = mayhemd_control_token_path(&home);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        fs::write(&path, "weak-token\n").unwrap();
+        assert!(load_or_create_mayhemd_control_token(&home).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn canonical_mainnet_manifest_pins_public_network_and_payment_identity() {
         let manifest = canonical_mainnet_manifest().expect("canonical mainnet manifest");
@@ -75762,6 +79158,12 @@ State initialization...
             .eq(MAINNET_MSB_DIRECT_PEERS));
         assert_eq!(manifest.network.dht.peer_bootstrap.len(), 5);
         assert_eq!(manifest.network.dht.msb_bootstrap.len(), 5);
+        assert_eq!(manifest.network.inference_relays.len(), 1);
+        assert!(manifest
+            .network
+            .inference_relays
+            .iter()
+            .all(|relay| is_hex_len(relay, 64)));
         assert_eq!(manifest.payments.directory_min_version, 3);
         assert_eq!(manifest.payments.tap.chain_id, MAINNET_TAP_CHAIN_ID);
         assert_eq!(
@@ -75808,6 +79210,12 @@ State initialization...
         assert!(text.contains("--peer-dht-bootstrap"));
         assert!(text.contains("--msb-dht-bootstrap"));
         assert!(text.contains("--msb-direct-peer"));
+        assert!(text.contains("--inference-relay-peers"));
+        assert!(manifest
+            .network
+            .inference_relays
+            .iter()
+            .all(|relay| text.contains(relay)));
         assert!(MAINNET_MSB_DIRECT_PEERS
             .iter()
             .all(|peer| text.contains(peer)));
@@ -76277,6 +79685,7 @@ State initialization...
             "gguf-q4_k_m".to_owned(),
             catalog::CatalogArtifact {
                 engine: "llama.cpp".to_owned(),
+                stable_diffusion_cpp: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model".to_owned(),
@@ -76559,6 +79968,7 @@ State initialization...
         );
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
+            stable_diffusion_cpp: None,
             source,
             upstream_source: None,
             path: "model.safetensors".to_owned(),
@@ -76701,6 +80111,10 @@ State initialization...
             epoch: 7,
             at: 42,
             canary_set: "canary-dev-v1".to_owned(),
+            canary_prompt_id: "dev-arithmetic-json".to_owned(),
+            challenge_epoch: 6,
+            challenge_apply_hash: "cc".repeat(32),
+            challenge_seed: "dd".repeat(32),
             verification_method: "token_fingerprint".to_owned(),
             match_bps: 9_700,
             pass: true,

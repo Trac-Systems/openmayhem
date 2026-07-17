@@ -29,6 +29,8 @@ const providerRegistration = {
 const providerJoin = {
   op: 'join_enclave',
   enclave_id: enclaveId,
+  att_tier: 1,
+  attestation_head: 'd'.repeat(64),
   served_ctx: 32768,
   served_modalities: ['text'],
   served_specialities: {},
@@ -45,6 +47,12 @@ const seededBalance = (user, au, rail = 'fiat') => ({
   au: auString(au),
   updated_epoch: 0,
   updated_at: null,
+  ...(rail === 'tap'
+    ? {
+        chain_id: 61_000,
+        pool_address: `0x${'2'.repeat(40)}`,
+      }
+    : {}),
 });
 
 const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_au;
@@ -580,6 +588,78 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   assert.equal(reseed.ver, 4);
 });
 
+test('MayhemContract clamps sustained market steps to the active absolute model-reference band', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const tuned = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: {
+        price_min_bps: 5_000,
+        price_max_bps: 10_000,
+        market_cold_start_min_providers: 1,
+      },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(tuned.ok, true, tuned.message);
+  const seeded = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({ effective_at: DAY_SECONDS }),
+    admin.publicKey,
+    6
+  );
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    7
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 100_000_000));
+
+  for (let epoch = 1; epoch <= 8; epoch += 1) {
+    const applyValue = {
+      op: 'epoch_apply',
+      epoch,
+      at: DAY_SECONDS + epoch * 3_600,
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '1000000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' }],
+      market_usage: [makeMarketUsage(1_000_000, 4)],
+    };
+    await seedSpendHoldsForApply(storage, applyValue);
+    const applied = await executeEpochApplyFeature(
+      contract,
+      storage,
+      applyValue,
+      admin.publicKey
+    );
+    assert.equal(applied.ok, true, applied.message);
+    const current = (await storage.get(priceKey)).value.current;
+    assert.ok(BigInt(rateFor(current.rate_map, 'input_token')) <= 20n);
+    assert.ok(BigInt(rateFor(current.rate_map, 'output_token')) <= 60n);
+  }
+
+  const current = (await storage.get(priceKey)).value.current;
+  assert.equal(rateFor(current.rate_map, 'input_token'), '20');
+  assert.equal(rateFor(current.rate_map, 'output_token'), '60');
+  assert.equal(contract.validateRateMapBounds(current.rate_map, textRateMap(20, 60), {
+    price_min_bps: 5_000,
+    price_max_bps: 10_000,
+  }), null);
+});
+
 test('MayhemContract market price math supports sub-micro atto price steps', async () => {
   const { contract } = await setupRegisteredEnclave();
   const qwenEmbeddingPerTokenAu = '10000000';
@@ -947,6 +1027,28 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
     10
   );
   assert.equal(tapRails.ok, true, tapRails.message);
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: {
+        network: 'testnet1',
+        treasury_address: `testtrac1${'1'.repeat(40)}`,
+      },
+    },
+    admin.publicKey,
+    11
+  );
+  assert.equal(payments.ok, true, payments.message);
 
   await storage.put(`bal/${fiatUser.publicKey}/fiat`, seededBalance(fiatUser.publicKey, 2_000_000, 'fiat'));
   await storage.put(`bal/${tapUser.publicKey}/tap`, seededBalance(tapUser.publicKey, 2_000_000, 'tap'));

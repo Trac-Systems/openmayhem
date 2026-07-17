@@ -1,6 +1,6 @@
 {
   "catalog_id": "openmayhem-mainnet",
-  "generated_at": "2026-07-13T00:00:00Z",
+  "generated_at": "2026-07-15T13:11:53Z",
   "models": [
     {
       "adapter": {
@@ -7075,6 +7075,663 @@
           "Pinned Gemma 4 card/template research found a boolean thinking toggle and five visual-token budgets; no low/medium/high reasoning-effort enum or separate reasoning-token budget is documented, so none is invented."
         ],
         "unsupported": {}
+      },
+      "tier": "launch"
+    },
+    {
+      "model_id": "tongyi/z-image-turbo",
+      "model_class": "image-generation",
+      "family": "z-image",
+      "params_b": 6.0,
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "Tongyi-MAI/Z-Image-Turbo",
+          "revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:leejet/Z-Image-Turbo-GGUF@c61c0e422dc8b541b7548cf33a4ef8302b0f8085",
+            "input_sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd",
+            "output_sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:unsloth/Qwen3-4B-Instruct-2507-GGUF@a06e946bb6b655725eafa393f4a9745d460374c9",
+            "input_sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+            "output_sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:black-forest-labs/FLUX.1-schnell@741f7c3ce8b383c54771c7003378a50191e9efe9",
+            "input_sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+            "output_sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      "artifacts": {
+        "gguf-q4_k": {
+          "engine": "stable-diffusion.cpp",
+          "stable_diffusion_cpp": {
+            "separate_diffusion_model": true,
+            "guidance_scale_offset": 1,
+            "steps_offset": -1
+          },
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-tongyi-z-image-turbo-GGUF",
+            "revision": "b0110258385798d6e5b9bea626f6560607ce17ad",
+            "publisher_key": "huggingface-repo"
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "repo": "leejet/Z-Image-Turbo-GGUF",
+            "revision": "c61c0e422dc8b541b7548cf33a4ef8302b0f8085",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "z_image_turbo-Q4_K.gguf",
+          "artifact_root": "b055db058206ff8a0722cd5bb112b8b388d4d29758570aa40987452c3a3f3e6e",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 3864250304,
+          "source_sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd",
+          "download_check": true,
+          "notes": "Pinned Q4_K Z-Image diffusion payload with pinned Qwen3 text encoder and FLUX AE sidecars; public pipeline steps/guidance map to stable-diffusion.cpp through the signed artifact offsets.",
+          "sidecars": {
+            "text_encoder": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-tongyi-z-image-turbo-GGUF",
+                "revision": "b0110258385798d6e5b9bea626f6560607ce17ad",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+              "artifact_root": "177f910273be34ff3d7fe8270818787978659697bdd15de35eb1ef39c4dff573",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2497281120,
+              "source_sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
+            },
+            "vae": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-tongyi-z-image-turbo-GGUF",
+                "revision": "b0110258385798d6e5b9bea626f6560607ce17ad",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "ae.safetensors",
+              "artifact_root": "7c63aa5035e272e951df72d9b0d11526412ef58b84fe3a37a30bacfa4e46e24f",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 335304388,
+              "source_sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 512,
+        "vision": false,
+        "image": true,
+        "video": false,
+        "audio": false,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 16,
+        "min_vram_gb_full_offload": 8,
+        "cpu_flags": [],
+        "backends": [
+          "stable-diffusion.cpp"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "openai_image_generations",
+            "request_attributes": [
+              "model",
+              "prompt",
+              "negative_prompt",
+              "n",
+              "response_format",
+              "size",
+              "width",
+              "height",
+              "steps",
+              "cfg_scale",
+              "shift",
+              "seed"
+            ],
+            "required_request_attributes": [
+              "model",
+              "prompt"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "data",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "data",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "tongyi/z-image-turbo"
+                ],
+                "calibration_values": [
+                  "tongyi/z-image-turbo"
+                ]
+              },
+              "prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 32000,
+                "calibration_values": [
+                  "a red cube on a white table, simple studio photo"
+                ]
+              },
+              "negative_prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 32000,
+                "calibration_values": [
+                  "",
+                  "blur, watermark"
+                ]
+              },
+              "n": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1,
+                "minimum": 1.0,
+                "maximum": 4.0,
+                "calibration_values": [
+                  4,
+                  1
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "b64_json",
+                "enum_values": [
+                  "b64_json"
+                ],
+                "calibration_values": [
+                  "b64_json"
+                ]
+              },
+              "size": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "576x1344",
+                  "1024x1024",
+                  "2048x1152"
+                ]
+              },
+              "width": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1024,
+                "minimum": 576.0,
+                "maximum": 2048.0,
+                "multiple_of": 16.0,
+                "calibration_values": [
+                  1024
+                ]
+              },
+              "height": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1024,
+                "minimum": 576.0,
+                "maximum": 2048.0,
+                "multiple_of": 16.0,
+                "calibration_values": [
+                  1024
+                ]
+              },
+              "steps": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 9,
+                "minimum": 7.0,
+                "maximum": 9.0,
+                "calibration_values": [
+                  7,
+                  8,
+                  9
+                ]
+              },
+              "cfg_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 49.0,
+                "calibration_values": [
+                  0.0,
+                  7.5,
+                  1.0
+                ]
+              },
+              "shift": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 3.0,
+                "minimum": 1.0,
+                "maximum": 10.0,
+                "calibration_values": [
+                  1.0,
+                  10.0,
+                  3.0
+                ]
+              },
+              "seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 42,
+                "minimum": 0.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  0,
+                  42,
+                  4294967295
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "created": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0.0,
+                "maximum": 1.8446744073709552e+19,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "data": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": [
+              [
+                "n",
+                "width",
+                "height",
+                "negative_prompt",
+                "steps",
+                "cfg_scale",
+                "shift",
+                "seed"
+              ],
+              [
+                "size",
+                "negative_prompt",
+                "steps",
+                "cfg_scale",
+                "shift",
+                "seed"
+              ]
+            ],
+            "speciality_mappings": {}
+          },
+          {
+            "family": "hf_text_to_image",
+            "request_attributes": [
+              "inputs",
+              "parameters.guidance_scale",
+              "parameters.negative_prompt",
+              "parameters.num_images_per_prompt",
+              "parameters.num_inference_steps",
+              "parameters.width",
+              "parameters.height",
+              "parameters.shift",
+              "parameters.seed"
+            ],
+            "required_request_attributes": [
+              "inputs"
+            ],
+            "response_attributes": [
+              "image",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "image",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "inputs": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 32000,
+                "calibration_values": [
+                  "a red cube on a white table, simple studio photo"
+                ]
+              },
+              "parameters.guidance_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 49.0,
+                "calibration_values": [
+                  0.0,
+                  7.5,
+                  1.0
+                ]
+              },
+              "parameters.negative_prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 32000,
+                "calibration_values": [
+                  "",
+                  "blur, watermark"
+                ]
+              },
+              "parameters.num_images_per_prompt": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1,
+                "minimum": 1.0,
+                "maximum": 4.0,
+                "calibration_values": [
+                  4,
+                  1
+                ]
+              },
+              "parameters.num_inference_steps": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 9,
+                "minimum": 7.0,
+                "maximum": 9.0,
+                "calibration_values": [
+                  7,
+                  8,
+                  9
+                ]
+              },
+              "parameters.width": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1024,
+                "minimum": 576.0,
+                "maximum": 2048.0,
+                "multiple_of": 16.0,
+                "calibration_values": [
+                  1024
+                ]
+              },
+              "parameters.height": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1024,
+                "minimum": 576.0,
+                "maximum": 2048.0,
+                "multiple_of": 16.0,
+                "calibration_values": [
+                  1024
+                ]
+              },
+              "parameters.shift": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 3.0,
+                "minimum": 1.0,
+                "maximum": 10.0,
+                "calibration_values": [
+                  1.0,
+                  10.0,
+                  3.0
+                ]
+              },
+              "parameters.seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 42,
+                "minimum": 0.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  0,
+                  42,
+                  4294967295
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "image": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": [
+              [
+                "parameters.width",
+                "parameters.height",
+                "parameters.negative_prompt",
+                "parameters.num_images_per_prompt",
+                "parameters.num_inference_steps",
+                "parameters.guidance_scale",
+                "parameters.shift",
+                "parameters.seed"
+              ]
+            ],
+            "speciality_mappings": {}
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "image"
+        ],
+        "specialities": []
+      },
+      "modality_assessment": {
+        "detected": [
+          "image"
+        ],
+        "evidence": [
+          "Pinned Tongyi-MAI/Z-Image-Turbo card, creator inference, official Space, ZImagePipeline, and stable-diffusion.cpp a8a91b24 expose text-to-image generation with a 1024x1024 default, official 576..2048 resolution envelope divisible by 16, user-selectable 7..9 public steps (9 maps to 8 DiT forwards), guidance 0..49 with default 0, negative prompting that becomes active above guidance 0, 1..4 images, seed control, and flow shift 1..10 with default 3."
+        ],
+        "calibrated_fingerprints": {
+          "gguf-q4_k": {
+            "image": "c497478338bcf0bf46dece355946e20a870e5b92b155fd512c46839db83b4495"
+          }
+        },
+        "resource_profiles": {
+          "gguf-q4_k": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "process_rss; pool=system_memory; host available memory; --memory-reserve override 15% = 9.46GiB",
+              "max_item_bytes": 1457895,
+              "max_item_units": 1048576,
+              "measured_item_bytes": 1457895,
+              "measured_item_units": 1048576,
+              "measured_working_set_bytes": 407236608,
+              "calibration_baseline_memory_bytes": 308359168,
+              "calibration_peak_memory_bytes": 715595776,
+              "calibration_f13_budget_bytes": 49719441203,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "Pinned card and pipeline research found no model speciality or reasoning-effort mechanism beyond the ordinary signed image-generation controls."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {},
+      "canary": {
+        "set_id": "canary-z-image-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 1500,
+        "perceptual_hashes": {
+          "gguf-q4_k": {
+            "z-image-red-cube-studio-seed7": "a0000303c3c73f07"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "rate_map": [
+          {
+            "unit": "image",
+            "per_unit_au": "1",
+            "granularity": 1
+          },
+          {
+            "unit": "step",
+            "per_unit_au": "2499999999999999",
+            "granularity": 36
+          }
+        ]
       },
       "tier": "launch"
     }

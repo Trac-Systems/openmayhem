@@ -6,6 +6,7 @@ import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
 import { createServer as createRpcServer } from './rpc.js';
+import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
@@ -21,6 +22,7 @@ import MayhemProtocol from '../contract/protocol.js';
 import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
+import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
@@ -211,12 +213,13 @@ const contractResultAccepted = (response) => {
 const waitForProviderPayout = async (peer, provider, accountId, currency) => {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const record = (await peer.base.view.get(`prov/${provider}`))?.value;
-    if (record?.payout?.addr === accountId &&
-        record?.payout?.method === 'stripe' &&
-        record?.payout?.currency === currency &&
-        record?.payout?.set_by === peer.wallet.publicKey &&
-        record?.payout?.set_by_role === 'admin') {
-      return record.payout;
+    const payout = record?.payouts?.stripe;
+    if (payout?.addr === accountId &&
+        payout?.method === 'stripe' &&
+        payout?.currency === currency &&
+        payout?.set_by === peer.wallet.publicKey &&
+        payout?.set_by_role === 'admin') {
+      return payout;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
@@ -235,7 +238,7 @@ const bindStripePayoutTarget = async (peer, provider, account) => {
     throw new Error(`Stripe payout currency ${currency || '(missing)'} is not enabled by the admin.`);
   }
   const current = (await peer.base.view.get(`prov/${provider}`))?.value;
-  const payout = current?.payout;
+  const payout = current?.payouts?.stripe;
   if (payout?.addr === accountId && payout?.method === 'stripe' &&
       payout?.currency === currency && payout?.set_by_role === 'admin') {
     return { ok: true, changed: false, payout };
@@ -348,8 +351,12 @@ if (flags['msb-transfer-helper']) {
 
 if (flags['wallet-helper']) {
   try {
-    const { runWalletHelper } = await import('./wallet-helper.js');
-    const output = await runWalletHelper(flags);
+    const {
+      readWalletHelperSecretsFromStdin,
+      runWalletHelper,
+    } = await import('./wallet-helper.js');
+    const secrets = await readWalletHelperSecretsFromStdin();
+    const output = await runWalletHelper(flags, secrets);
     console.log(JSON.stringify(output));
     Bare.exit(0);
   } catch (error) {
@@ -460,6 +467,13 @@ const peerReplicateFlushTimeoutMs = parseInteger(
   flagValue('peer-replicate-flush-timeout-ms', env.PEER_REPLICATE_FLUSH_TIMEOUT_MS || ''),
   headless ? 5_000 : 0
 );
+const peerDirectPeers = parseCsvList(
+  flagValue('peer-direct-peer', env.PEER_DIRECT_PEERS || '')
+) || [];
+if (peerDirectPeers.length > 16 ||
+    peerDirectPeers.some((key) => !/^[0-9a-fA-F]{64}$/.test(key))) {
+  throw new Error('Invalid --peer-direct-peer. Expected at most 16 comma-separated 32-byte public keys.');
+}
 const keepAlive = parseBool(flagValue('keep-alive', env.MAYHEM_KEEP_ALIVE || ''), headless);
 
 const peerStoreName =
@@ -719,6 +733,85 @@ const directSessionMaxSessionsPerConnection = Number.parseInt(
     '',
   10
 );
+
+const inferenceRelayServe = parseBool(
+  flagValue('inference-relay-serve', env.MAYHEM_INFERENCE_RELAY_SERVE || ''),
+  false
+);
+const inferenceRelayPeers = parseCsvList(
+  flagValue('inference-relay-peers', env.MAYHEM_INFERENCE_RELAY_PEERS || '')
+) || [];
+const inferenceRelayForce = parseBool(
+  flagValue('inference-relay-force', env.MAYHEM_INFERENCE_RELAY_FORCE || ''),
+  false
+);
+const inferenceRelayDirectWaitMs = parseInteger(
+  flagValue('inference-relay-direct-wait-ms', env.MAYHEM_INFERENCE_RELAY_DIRECT_WAIT_MS || ''),
+  15_000
+);
+const inferenceRelayWaitMs = parseInteger(
+  flagValue('inference-relay-wait-ms', env.MAYHEM_INFERENCE_RELAY_WAIT_MS || ''),
+  45_000
+);
+const inferenceRelayMaxClients = parseInteger(
+  flagValue('inference-relay-max-clients', env.MAYHEM_INFERENCE_RELAY_MAX_CLIENTS || ''),
+  256
+);
+const inferenceRelayMaxPendingPairs = parseInteger(
+  flagValue(
+    'inference-relay-max-pending-pairs',
+    env.MAYHEM_INFERENCE_RELAY_MAX_PENDING_PAIRS || ''
+  ),
+  512
+);
+const inferenceRelayMaxActivePairs = parseInteger(
+  flagValue(
+    'inference-relay-max-active-pairs',
+    env.MAYHEM_INFERENCE_RELAY_MAX_ACTIVE_PAIRS || ''
+  ),
+  128
+);
+const inferenceRelayMaxBytesPerLink = parseInteger(
+  flagValue(
+    'inference-relay-max-bytes-per-link',
+    env.MAYHEM_INFERENCE_RELAY_MAX_BYTES_PER_LINK || ''
+  ),
+  512 * 1024 * 1024
+);
+const inferenceRelayRateBytesPerSecond = parseInteger(
+  flagValue(
+    'inference-relay-rate-bytes-per-second',
+    env.MAYHEM_INFERENCE_RELAY_RATE_BYTES_PER_SECOND || ''
+  ),
+  32 * 1024 * 1024
+);
+const inferenceRelayRateBurstBytes = parseInteger(
+  flagValue(
+    'inference-relay-rate-burst-bytes',
+    env.MAYHEM_INFERENCE_RELAY_RATE_BURST_BYTES || ''
+  ),
+  64 * 1024 * 1024
+);
+const inferenceRelayIdleTimeoutMs = parseInteger(
+  flagValue(
+    'inference-relay-idle-timeout-ms',
+    env.MAYHEM_INFERENCE_RELAY_IDLE_TIMEOUT_MS || ''
+  ),
+  120_000
+);
+if (
+  inferenceRelayDirectWaitMs <= 0
+  || inferenceRelayWaitMs <= 0
+  || inferenceRelayMaxClients <= 0
+  || inferenceRelayMaxPendingPairs <= 0
+  || inferenceRelayMaxActivePairs <= 0
+  || inferenceRelayMaxBytesPerLink <= 0
+  || inferenceRelayRateBytesPerSecond <= 0
+  || inferenceRelayRateBurstBytes <= 0
+  || inferenceRelayIdleTimeoutMs <= 0
+) {
+  throw new Error('Inference relay limits and timeouts must be positive.');
+}
 
 const scBridgeEnabled = parseBool(
   (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
@@ -1003,6 +1096,8 @@ const peer = new Peer({
   contract: MayhemContract,
 });
 await peer.ready();
+joinCanonicalPeers(peer, peerDirectPeers);
+await hydrateAdminWriterViews(peer);
 
 let mayhemFeature = null;
 {
@@ -1082,11 +1177,34 @@ if (scBridgeEnabled) {
   const portDisplay = Number.isSafeInteger(scBridgePort) ? scBridgePort : 49222;
   console.log('SC-Bridge:', `ws://${scBridgeHost}:${portDisplay}`);
 }
+if (inferenceRelayServe || inferenceRelayPeers.length > 0) {
+  console.log('Inference relay service:', inferenceRelayServe ? 'enabled' : 'disabled');
+  console.log('Inference relay peers:', inferenceRelayPeers.join(', ') || '(none)');
+  console.log('Inference relay direct-first:', !inferenceRelayForce);
+}
 if (rpcEnabled) {
   console.log('RPC:', `http://${rpcHost}:${rpcPort}/v1`);
 }
 console.log('================================================================');
 console.log('');
+
+const inferenceRelay = new InferenceRelay(peer, {
+  serve: inferenceRelayServe,
+  relays: inferenceRelayPeers,
+  forceRelay: inferenceRelayForce,
+  debug: directSessionDebug,
+  directWaitMs: inferenceRelayDirectWaitMs,
+  relayWaitMs: inferenceRelayWaitMs,
+  maxClients: inferenceRelayMaxClients,
+  maxPendingPairs: inferenceRelayMaxPendingPairs,
+  maxActivePairs: inferenceRelayMaxActivePairs,
+  maxBytesPerLink: inferenceRelayMaxBytesPerLink,
+  rateBytesPerSecond: inferenceRelayRateBytesPerSecond,
+  rateBurstBytes: inferenceRelayRateBurstBytes,
+  idleTimeoutMs: inferenceRelayIdleTimeoutMs,
+});
+await inferenceRelay.start();
+peer.inferenceRelay = inferenceRelay;
 
 let scBridge = null;
 if (scBridgeEnabled) {
@@ -1165,6 +1283,7 @@ const directSession = new DirectSession(peer, {
   maxSessionsPerConnection: Number.isSafeInteger(directSessionMaxSessionsPerConnection)
     ? directSessionMaxSessionsPerConnection
     : undefined,
+  transportInfo: (connection, remote) => inferenceRelay.connectionTransport(connection, remote),
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
     : null,
@@ -1219,6 +1338,7 @@ peer.sidechannel = sidechannel;
 if (scBridge) {
   scBridge.attachSidechannel(sidechannel);
   scBridge.attachDirectSession(directSession);
+  scBridge.attachInferenceRelay(inferenceRelay);
   scBridge.start();
   peer.scBridge = scBridge;
 }
@@ -1252,6 +1372,12 @@ if (keepAlive) {
     if (msbDirectPeerTimer) clearInterval(msbDirectPeerTimer);
     try {
       rpcServer?.close?.();
+    } catch (_e) {}
+    try {
+      scBridge?.stop?.();
+    } catch (_e) {}
+    try {
+      await inferenceRelay.stop();
     } catch (_e) {}
     try {
       await peer.close?.();

@@ -8,6 +8,7 @@ import {
   makeTxKey,
   makeVerifier,
   signConsent,
+  textRateMap,
 } from './helpers/contract.js';
 
 const rulesHash = '7'.repeat(64);
@@ -15,6 +16,8 @@ const enclaveId = '6'.repeat(64);
 const DAY_SECONDS = 24 * 60 * 60;
 const DISPUTE_DEPOSIT_AU = '1000000000000000000';
 const DOUBLE_DISPUTE_DEPOSIT_AU = '2000000000000000000';
+const SESSION_ID = '5'.repeat(64);
+const SECOND_SESSION_ID = '8'.repeat(64);
 
 async function setupDisputeContract() {
   const admin = await makeIdentity();
@@ -72,13 +75,57 @@ async function setupDisputeContract() {
     updated_epoch: 0,
     updated_at: null,
   });
+  await storage.put(`enclave/${enclaveId}`, {
+    enclave_id: enclaveId,
+    model_id: 'test/dispute-model',
+    model_class: 'text-generation',
+    status: 'active',
+    caps: {
+      modality_set: ['text'],
+      speciality_levels: {},
+    },
+  });
+  await storage.put(`hold/fiat/${user.publicKey}/2`, {
+    user: user.publicKey,
+    rail: 'fiat',
+    denom: 'au_usd',
+    epoch: 2,
+    reserved_au: DISPUTE_DEPOSIT_AU,
+    balance_au_at_last_reserve: DOUBLE_DISPUTE_DEPOSIT_AU,
+    sessions: [{
+      session_id: SESSION_ID,
+      provider: provider.publicKey,
+      enclave_id: enclaveId,
+      price_ver: 1,
+      locked_rate_map: textRateMap(20, 60),
+      locked_per_req_au: '0',
+      locked_min_session_au: '1',
+      served_ctx: 32768,
+      required_modalities: ['text'],
+      required_specialities: {},
+      ctx_bracket: 'le32k',
+      ctx_bracket_table_ver: 1,
+      rules_ver: 1,
+      max_spend_au: DISPUTE_DEPOSIT_AU,
+      voucher_hash: '4'.repeat(64),
+      feature_key: 'test-reservation',
+      reserved_at: 7_100,
+      recorded_at: makeTxKey(4),
+    }],
+    updated_at: makeTxKey(4),
+  });
+  await storage.put('epoch/apply/state', {
+    updated_epoch: 2,
+    updated_at: makeTxKey(4),
+    last_apply_hash: 'e'.repeat(64),
+  });
   return { admin, user, provider, outsider, storage, contract };
 }
 
 function openDispute(user, provider, overrides = {}) {
   return {
     op: 'dispute',
-    session_id: 'session-dispute-1',
+    session_id: SESSION_ID,
     rail: 'fiat',
     reason: 'service_failure',
     provider: provider.publicKey,
@@ -114,6 +161,24 @@ function seedProviderHoldback(storage, provider, overrides = {}) {
   });
 }
 
+async function addLinkedSession(storage, user, provider, sessionId) {
+  const key = `hold/fiat/${user.publicKey}/2`;
+  const hold = (await storage.get(key)).value;
+  await storage.put(key, {
+    ...hold,
+    reserved_au: DOUBLE_DISPUTE_DEPOSIT_AU,
+    sessions: [
+      ...hold.sessions,
+      {
+        ...hold.sessions[0],
+        session_id: sessionId,
+        voucher_hash: '9'.repeat(64),
+        feature_key: 'test-reservation-2',
+      },
+    ],
+  });
+}
+
 test('MayhemContract dispute default bond blocks half-cent spam-scale opens', async () => {
   const { user, provider, storage, contract } = await setupDisputeContract();
   await storage.put(`bal/${user.publicKey}/fiat`, {
@@ -135,6 +200,180 @@ test('MayhemContract dispute default bond blocks half-cent spam-scale opens', as
   );
   assert.match(opened.message, /insufficient balance for dispute deposit/i);
   assert.equal(storage.snapshotBytes(), before);
+});
+
+test('MayhemContract dispute rejects unlinked sessions and future epochs without moving funds', async () => {
+  const { user, provider, storage, contract } = await setupDisputeContract();
+
+  const beforeUnlinked = storage.snapshotBytes();
+  const unlinked = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, { session_id: 'f'.repeat(64) }),
+    user.publicKey,
+    5
+  );
+  assert.match(unlinked.message, /opener-linked spend reservation/i);
+  assert.equal(storage.snapshotBytes(), beforeUnlinked);
+
+  const beforeFuture = storage.snapshotBytes();
+  const future = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, { epoch: 3 }),
+    user.publicKey,
+    6
+  );
+  assert.match(future.message, /cannot exceed the latest applied epoch/i);
+  assert.equal(storage.snapshotBytes(), beforeFuture);
+});
+
+test('MayhemContract dispute enforces the governed open cap and permanent session link', async () => {
+  const { admin, user, provider, storage, contract } = await setupDisputeContract();
+  await addLinkedSession(storage, user, provider, SECOND_SESSION_ID);
+
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { max_open_disputes_per_opener: 1 },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, { at: DAY_SECONDS }),
+    user.publicKey,
+    6
+  );
+  assert.equal(opened.ok, true, opened.message);
+  assert.equal((await storage.get(`disp/open/${user.publicKey}`)).value.count, 1);
+  assert.equal((await storage.get(`disp/provider-open/${provider.publicKey}`)).value.count, 1);
+
+  const beforeCapped = storage.snapshotBytes();
+  const capped = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, {
+      session_id: SECOND_SESSION_ID,
+      at: DAY_SECONDS,
+    }),
+    user.publicKey,
+    7
+  );
+  assert.match(capped.message, /open dispute limit reached/i);
+  assert.equal(storage.snapshotBytes(), beforeCapped);
+
+  const resolved = await execute(
+    contract,
+    storage,
+    'disputeResolve',
+    {
+      op: 'dispute_resolve',
+      dispute_id: 1,
+      outcome: 'opener_fault',
+      deposit_action: 'partial_forfeit',
+      rationale_hash: 'b'.repeat(64),
+      at: DAY_SECONDS,
+    },
+    admin.publicKey,
+    8
+  );
+  assert.equal(resolved.ok, true, resolved.message);
+
+  const beforeRepeat = storage.snapshotBytes();
+  const repeated = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, { at: DAY_SECONDS }),
+    user.publicKey,
+    9
+  );
+  assert.match(repeated.message, /session already has a dispute/i);
+  assert.equal(storage.snapshotBytes(), beforeRepeat);
+
+  const second = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider, {
+      session_id: SECOND_SESSION_ID,
+      at: DAY_SECONDS,
+    }),
+    user.publicKey,
+    10
+  );
+  assert.equal(second.ok, true, second.message);
+});
+
+test('MayhemContract keeps aged provider holdback slashable until a linked dispute closes', async () => {
+  const { admin, user, provider, storage, contract } = await setupDisputeContract();
+  await seedProviderHoldback(storage, provider);
+
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider),
+    user.publicKey,
+    5
+  );
+  assert.equal(opened.ok, true, opened.message);
+
+  const earning = (await storage.get(`earn/fiat/${provider.publicKey}`)).value;
+  contract.storage = storage;
+  const openGate = await contract.providerHasOpenDispute(provider.publicKey);
+  contract.storage = undefined;
+  assert.equal(openGate, true);
+  const locked = contract.refreshEarningHoldback(earning, 100, 0, null, openGate);
+  assert.equal(locked.held_au, '10000');
+  assert.deepEqual(locked.holdbacks, earning.holdbacks);
+  await storage.put(`earn/fiat/${provider.publicKey}`, locked);
+  await storage.put('epoch/apply/state', {
+    updated_epoch: 100,
+    updated_at: makeTxKey(6),
+    last_apply_hash: 'e'.repeat(64),
+  });
+
+  const resolved = await execute(
+    contract,
+    storage,
+    'disputeResolve',
+    {
+      op: 'dispute_resolve',
+      dispute_id: 1,
+      outcome: 'opener_fault',
+      deposit_action: 'partial_forfeit',
+      rationale_hash: 'c'.repeat(64),
+      at: 10_800,
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(resolved.ok, true, resolved.message);
+  assert.equal((await storage.get(`disp/open/${user.publicKey}`)).value.count, 0);
+  assert.equal((await storage.get(`disp/provider-open/${provider.publicKey}`)).value.count, 0);
+
+  contract.storage = storage;
+  const closedGate = await contract.providerHasOpenDispute(provider.publicKey);
+  contract.storage = undefined;
+  assert.equal(closedGate, false);
+  const released = contract.refreshEarningHoldback(locked, 100, 0, null, closedGate);
+  assert.equal(released.held_au, '0');
+  assert.deepEqual(released.holdbacks, []);
 });
 
 test('MayhemContract dispute timeout permissionlessly refunds unresolved opener bond', async () => {
@@ -435,7 +674,6 @@ test('MayhemContract dispute resolution validates slash target before mutating f
     storage,
     'dispute',
     openDispute(user, provider, {
-      session_id: 'session-invalid-beneficiary',
       evidence_hash: 'e'.repeat(64),
     }),
     user.publicKey,
@@ -470,7 +708,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
   assert.equal(await storage.get('fee/fiat/cum'), null);
 });
 
-test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', async () => {
+test('MayhemContract opener-fault dispute partially forfeits the bond', async () => {
   const { admin, user, provider, storage, contract } = await setupDisputeContract();
 
   const opened = await execute(
@@ -478,7 +716,6 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
     storage,
     'dispute',
     openDispute(user, provider, {
-      session_id: 'session-bad-opener',
       reason: 'invalid_claim',
       evidence_hash: 'c'.repeat(64),
       evidence: { receipts: [] },
@@ -496,7 +733,7 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
       op: 'dispute_resolve',
       dispute_id: 1,
       outcome: 'opener_fault',
-      deposit_action: 'forfeit',
+      deposit_action: 'partial_forfeit',
       rationale_hash: 'd'.repeat(64),
       at: 10_800,
     },
@@ -504,15 +741,15 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
     6
   );
   assert.equal(resolved.ok, true, resolved.message);
-  assert.equal(resolved.deposit_refunded_au, '0');
-  assert.equal(resolved.deposit_forfeited_au, DISPUTE_DEPOSIT_AU);
+  assert.equal(resolved.deposit_refunded_au, '750000000000000000');
+  assert.equal(resolved.deposit_forfeited_au, '250000000000000000');
   assert.equal(resolved.slash, null);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, DISPUTE_DEPOSIT_AU);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1750000000000000000');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '250000000000000000');
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.outcome, 'opener_fault');
-  assert.equal(dispute.deposit_action, 'forfeit');
+  assert.equal(dispute.deposit_action, 'partial_forfeit');
   assert.equal(dispute.slash, null);
 });

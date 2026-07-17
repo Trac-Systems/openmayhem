@@ -8,7 +8,7 @@ const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
-const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+const SESSION_RECEIPT_SCHEMA_VERSION = 9;
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -218,17 +218,56 @@ function normalizeCurrentReceiptBody(body) {
   if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
     throw new Error(`receipt schema_version must be ${SESSION_RECEIPT_SCHEMA_VERSION}`);
   }
+  if (typeof body.billing_id !== 'string' || !/^[0-9a-f]{64}$/.test(body.billing_id)) {
+    throw new Error('receipt billing_id must be 32 bytes of lowercase hex');
+  }
+  safeCount(body.billing_attempt, 'receipt billing_attempt', { allowZero: true });
+  const billingPriorUsage = normalizeReceiptUsage(body.billing_prior_usage);
+  if (stableJson(billingPriorUsage) !== stableJson(body.billing_prior_usage)) {
+    throw new Error('receipt billing_prior_usage must be canonical');
+  }
   const current = {
     ...body,
+    billing_prior_usage: billingPriorUsage,
     usage: normalizeReceiptUsage(body.usage),
   };
   if (stableJson(current.usage) !== stableJson(body.usage)) {
     throw new Error('receipt usage must be canonical');
   }
-  for (const field of ['locked_per_req_au', 'locked_min_session_au', 'au_owed_cum']) {
+  for (const field of [
+    'billing_prior_au_owed_cum',
+    'locked_per_req_au',
+    'locked_min_session_au',
+    'au_owed_cum',
+  ]) {
     current[field] = canonicalAu(safeAu(current[field], `receipt ${field}`, { allowZero: true }));
   }
+  if (
+    current.billing_attempt === 0 &&
+    (Object.keys(current.billing_prior_usage).length > 0 || current.billing_prior_au_owed_cum !== '0')
+  ) {
+    throw new Error('initial receipt billing attempt must have an empty baseline');
+  }
+  if (
+    current.billing_prior_au_owed_cum === '0' &&
+    Object.keys(current.billing_prior_usage).length > 0
+  ) {
+    throw new Error('receipt billing prior usage requires a prior cumulative amount');
+  }
+  assertUsageMonotonic(current.billing_prior_usage, current.usage);
+  if (safeAu(current.au_owed_cum, 'receipt au_owed_cum') <
+      safeAu(current.billing_prior_au_owed_cum, 'receipt billing_prior_au_owed_cum', { allowZero: true })) {
+    throw new Error('receipt cumulative au regressed below its signed billing baseline');
+  }
   return current;
+}
+
+function assertUsageMonotonic(previous, current) {
+  for (const [unit, previousCount] of Object.entries(previous)) {
+    if ((current[unit] ?? 0) < previousCount) {
+      throw new Error(`receipt cumulative usage regressed for ${unit}`);
+    }
+  }
 }
 
 function receiptEnvelope(entry) {
@@ -259,13 +298,75 @@ function receiptLeafEnvelope(envelope) {
   };
 }
 
-function receiptAmount(entry, body, previousBySession) {
+function receiptAmount(entry, body, billingStates) {
   const explicit = entry.settle_au ?? entry.au_delta;
-  if (explicit !== undefined) return safeAu(explicit, 'receipt settle_au');
+  if (explicit !== undefined) {
+    throw new Error('receipt settlement amount must derive from the signed logical billing chain');
+  }
 
   const current = safeAu(body.au_owed_cum, 'receipt au_owed_cum');
-  const previous = safeAu(entry.previous_au_owed_cum ?? previousBySession.get(body.session_id) ?? '0', 'receipt previous_au_owed_cum', { allowZero: true });
+  const signedPrior = safeAu(
+    body.billing_prior_au_owed_cum,
+    'receipt billing_prior_au_owed_cum',
+    { allowZero: true }
+  );
+  const state = billingStates.get(body.billing_id);
+  let previous = signedPrior;
+  let attemptPriorUsage = body.billing_prior_usage;
+  let attemptPriorAu = signedPrior;
+
+  if (!state && (signedPrior !== 0n || Object.keys(body.billing_prior_usage).length > 0)) {
+    throw new Error('receipt logical billing baseline has no prior signed receipt in the batch');
+  }
+  if (state) {
+    if (body.billing_attempt < state.attempt) {
+      throw new Error('receipt billing attempt regressed');
+    }
+    if (body.billing_attempt === state.attempt) {
+      if (body.session_id !== state.sessionId) {
+        throw new Error('receipt transport session changed within one billing attempt');
+      }
+      if (
+        signedPrior !== state.attemptPriorAu ||
+        stableJson(body.billing_prior_usage) !== stableJson(state.attemptPriorUsage)
+      ) {
+        throw new Error('receipt billing attempt baseline changed');
+      }
+      if (body.seq <= state.seq) throw new Error('receipt sequence did not advance');
+    } else if (
+      signedPrior !== state.currentAu ||
+      stableJson(body.billing_prior_usage) !== stableJson(state.currentUsage)
+    ) {
+      throw new Error('receipt redispatch baseline does not match prior logical settlement');
+    }
+    assertUsageMonotonic(state.currentUsage, body.usage);
+    previous = state.currentAu;
+    if (body.billing_attempt === state.attempt) {
+      attemptPriorUsage = state.attemptPriorUsage;
+      attemptPriorAu = state.attemptPriorAu;
+    }
+  }
+
+  if (entry.previous_au_owed_cum !== undefined) {
+    const declaredPrevious = safeAu(
+      entry.previous_au_owed_cum,
+      'receipt previous_au_owed_cum',
+      { allowZero: true }
+    );
+    if (declaredPrevious !== previous) {
+      throw new Error('receipt previous_au_owed_cum contradicts the signed logical billing chain');
+    }
+  }
   if (current < previous) throw new Error('receipt cumulative au regressed');
+  billingStates.set(body.billing_id, {
+    attempt: body.billing_attempt,
+    attemptPriorUsage,
+    attemptPriorAu,
+    sessionId: body.session_id,
+    seq: body.seq,
+    currentUsage: body.usage,
+    currentAu: current,
+  });
   return current - previous;
 }
 
@@ -332,13 +433,14 @@ export async function recomputeEpoch(bundle) {
   const debitMap = new Map();
   const grossEarningMap = new Map();
   const marketUsageMap = new Map();
-  const previousBySession = new Map();
+  const billingStates = new Map();
   const sessions = new Set();
 
   const normalizedReceipts = receipts
     .map((entry) => ({ entry, envelope: receiptEnvelope(entry) }))
     .sort((a, b) => (
-      String(a.envelope.body.session_id).localeCompare(String(b.envelope.body.session_id)) ||
+      String(a.envelope.body.billing_id).localeCompare(String(b.envelope.body.billing_id)) ||
+      Number(a.envelope.body.billing_attempt ?? 0) - Number(b.envelope.body.billing_attempt ?? 0) ||
       Number(a.envelope.body.seq ?? 0) - Number(b.envelope.body.seq ?? 0)
     ));
 
@@ -349,14 +451,13 @@ export async function recomputeEpoch(bundle) {
         throw new Error(`receipt ${field} is required`);
       }
     }
-    const settleAu = receiptAmount(entry, body, previousBySession);
-    previousBySession.set(body.session_id, body.au_owed_cum ?? canonicalAu(settleAu));
+    const settleAu = receiptAmount(entry, body, billingStates);
     if (settleAu === 0n) continue;
     const rail = normalizeLedgerRail(entry.rail ?? body.rail);
-    sessions.add(body.session_id);
+    sessions.add(body.billing_id);
     addRailAmount(debitMap, rail, body.user, settleAu, 'debit');
     addRailAmount(grossEarningMap, rail, body.provider, settleAu, 'earning');
-    addMarketUsage(marketUsageMap, body, body.session_id, settleAu);
+    addMarketUsage(marketUsageMap, body, body.billing_id, settleAu);
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
   }
 

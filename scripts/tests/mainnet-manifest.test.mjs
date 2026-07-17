@@ -20,3 +20,14 @@ test('mainnet manifest keeps atto-USD parameters as decimal strings', () => {
   const result = validateMainnetManifest(manifest, { allowPlaceholders: true });
   assert.match(result.errors.join('\n'), /probe_reward_au must be a non-negative decimal string/);
 });
+
+test('mainnet manifest requires unique inference relay public keys', () => {
+  const invalid = structuredClone(template);
+  invalid.network.inference_relays = ['11'.repeat(32), '11'.repeat(32)];
+  const duplicate = validateMainnetManifest(invalid, { allowPlaceholders: true });
+  assert.match(duplicate.errors.join('\n'), /inference_relays must contain unique public keys/);
+
+  invalid.network.inference_relays = ['not-a-public-key'];
+  const malformed = validateMainnetManifest(invalid, { allowPlaceholders: true });
+  assert.match(malformed.errors.join('\n'), /inference_relays\[0\] has invalid format/);
+});

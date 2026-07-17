@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compileAll } from './compile.mjs';
 import { deployPoolWithToken } from './deploy-local.mjs';
+import { safeErrorMessage } from './safe-output.mjs';
 import {
   TAP_DEPLOYER_SIGNER_ENV,
   walletFromEnv,
@@ -127,14 +128,29 @@ function explorerBaseForChain(chainId) {
   return 'https://etherscan.io';
 }
 
-async function buildDeploymentPreflight(provider, signer, plan, token, owner, maxEpochDelta) {
+async function buildDeploymentPreflight(
+  provider,
+  signer,
+  plan,
+  token,
+  owner,
+  governanceSigner,
+  governanceDelay,
+  maxEpochDelta
+) {
   const art = compileAll();
   const factory = new ethers.ContractFactory(
     art.MayhemInferencePool.abi,
     art.MayhemInferencePool.bytecode,
     signer
   );
-  const deployTx = await factory.getDeployTransaction(token, owner, maxEpochDelta);
+  const deployTx = await factory.getDeployTransaction(
+    token,
+    owner,
+    governanceSigner,
+    governanceDelay,
+    maxEpochDelta
+  );
   const nonce = await provider.getTransactionCount(plan.deployer, 'pending');
   const feeData = await provider.getFeeData();
   const feePerGas = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
@@ -174,6 +190,22 @@ export async function buildDeployPlan({
     const deployer = normalizeAddress(await wallet.getAddress(), 'deployer');
     const ownerEnv = firstEnv(env, ['MAYHEM_TAP_POOL_OWNER']);
     const owner = normalizeAddress(ownerEnv?.value || deployer, 'MAYHEM_TAP_POOL_OWNER');
+    const governanceSignerEnv = requireEnv(
+      env,
+      ['MAYHEM_TAP_GOVERNANCE_SIGNER'],
+      'independent TAP governance signer address'
+    );
+    const governanceSigner = normalizeAddress(
+      governanceSignerEnv.value,
+      governanceSignerEnv.name
+    );
+    if (governanceSigner.toLowerCase() === owner.toLowerCase()) {
+      throw new Error('MAYHEM_TAP_GOVERNANCE_SIGNER must be distinct from the pool owner');
+    }
+    const governanceDelay = parseNonNegativeBigInt(
+      env.MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS,
+      'MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS'
+    );
     const maxEpochDelta = parseNonNegativeBigInt(env.MAYHEM_TAP_MAX_EPOCH_DELTA, 'MAYHEM_TAP_MAX_EPOCH_DELTA');
     const allowZeroCap = boolArg(env.MAYHEM_TAP_ALLOW_ZERO_CAP, false);
     if (maxEpochDelta === 0n && !allowZeroCap) {
@@ -209,6 +241,9 @@ export async function buildDeployPlan({
         token_symbol: symbol,
         token_decimals: decimals,
         owner,
+        governance_signer: governanceSigner,
+        governance_signer_env: governanceSignerEnv.name,
+        governance_delay_seconds: governanceDelay.toString(),
         deployer,
         signer_env: envName,
         deployer_balance_wei: balanceWei.toString(),
@@ -217,6 +252,8 @@ export async function buildDeployPlan({
       },
       maxEpochDelta,
       owner,
+      governanceSigner,
+      governanceDelay,
       token,
     };
   } catch (error) {
@@ -231,6 +268,7 @@ function printPlan(plan, { confirm = false } = {}) {
   console.log('  rpc            :', `${plan.rpc_env} (${plan.rpc_url_redacted})`);
   console.log('  token (TAP)    :', plan.token, `symbol ${plan.token_symbol ?? 'UNKNOWN'} decimals ${plan.token_decimals ?? 'UNKNOWN'}`);
   console.log('  pool owner     :', plan.owner, plan.owner.toLowerCase() === plan.deployer.toLowerCase() ? '(= deployer)' : '(MAYHEM_TAP_POOL_OWNER)');
+  console.log('  governance     :', plan.governance_signer, `delay ${plan.governance_delay_seconds}s`);
   console.log('  deployer       :', plan.deployer, `balance ${ethers.formatEther(plan.deployer_balance_wei)} ETH`);
   console.log('  signer env     :', plan.signer_env);
   console.log('  maxEpochDelta  :', plan.max_epoch_delta_wei, 'wei', plan.zero_cap_override ? '(ZERO CAP OVERRIDE)' : '');
@@ -262,10 +300,28 @@ export async function deployMainnet({
   const confirm = boolArg(args.confirm, boolArg(env.MAYHEM_TAP_DEPLOY_CONFIRM, false));
   const json = boolArg(args.json, false);
   const built = await buildDeployPlan({ args, env });
-  const { provider, signer, plan, owner, token, maxEpochDelta } = built;
+  const {
+    provider,
+    signer,
+    plan,
+    owner,
+    governanceSigner,
+    governanceDelay,
+    token,
+    maxEpochDelta,
+  } = built;
 
   try {
-    const preflight = await buildDeploymentPreflight(provider, signer, plan, token, owner, maxEpochDelta);
+    const preflight = await buildDeploymentPreflight(
+      provider,
+      signer,
+      plan,
+      token,
+      owner,
+      governanceSigner,
+      governanceDelay,
+      maxEpochDelta
+    );
     Object.assign(plan, preflight);
     if (!json) printPlan(plan, { confirm });
     if (!confirm) {
@@ -275,7 +331,13 @@ export async function deployMainnet({
     }
 
     const art = compileAll();
-    const { pool, poolAddr } = await deployPoolWithToken(signer, token, owner, maxEpochDelta, art);
+    const { pool, poolAddr } = await deployPoolWithToken(signer, token, {
+      ownerAddr: owner,
+      governanceSigner,
+      governanceDelay,
+      maxEpochDelta,
+      art,
+    });
     const deploymentTx = pool.deploymentTransaction();
     if (!deploymentTx) throw new Error('Deployment transaction is unavailable');
     const deploymentReceipt = await deploymentTx.wait();
@@ -284,9 +346,17 @@ export async function deployMainnet({
     }
     const onToken = normalizeAddress(await pool.token(), 'token()');
     const onOwner = normalizeAddress(await pool.owner(), 'owner()');
+    const onGovernanceSigner = normalizeAddress(await pool.governanceSigner(), 'governanceSigner()');
+    const onGovernanceDelay = await pool.governanceDelay();
     const onCap = await pool.maxEpochDelta();
     if (onToken !== token) throw new Error(`Post-deploy token mismatch: ${onToken} != ${token}`);
     if (onOwner !== owner) throw new Error(`Post-deploy owner mismatch: ${onOwner} != ${owner}`);
+    if (onGovernanceSigner !== governanceSigner) {
+      throw new Error(`Post-deploy governance signer mismatch: ${onGovernanceSigner} != ${governanceSigner}`);
+    }
+    if (onGovernanceDelay !== governanceDelay) {
+      throw new Error(`Post-deploy governance delay mismatch: ${onGovernanceDelay} != ${governanceDelay}`);
+    }
     if (onCap !== maxEpochDelta) throw new Error(`Post-deploy maxEpochDelta mismatch: ${onCap} != ${maxEpochDelta}`);
 
     const out = {
@@ -295,6 +365,8 @@ export async function deployMainnet({
       pool: normalizeAddress(poolAddr, 'pool'),
       token,
       owner,
+      governanceSigner,
+      governanceDelay: governanceDelay.toString(),
       deployer: plan.deployer,
       signerEnv: plan.signer_env,
       chainId: plan.chain_id,
@@ -332,6 +404,7 @@ export async function deployMainnet({
       console.log('  pool           :', out.pool);
       console.log('  token()        :', onToken);
       console.log('  owner()        :', onOwner);
+      console.log('  governance     :', onGovernanceSigner, `delay ${onGovernanceDelay}s`);
       console.log('  maxEpochDelta():', onCap.toString());
       console.log('  deployment tx  :', out.deploymentTxHash);
       console.log('  wrote          :', plan.deployment_file);
@@ -348,7 +421,7 @@ export async function deployMainnet({
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   deployMainnet().catch((error) => {
-    console.error('deploy-mainnet:', error?.shortMessage || error?.message || String(error));
+    console.error('deploy-mainnet:', safeErrorMessage(error));
     process.exit(1);
   });
 }

@@ -704,7 +704,6 @@ async fn workbench_chat_completions(
     with_workbench_scenario_cookie(with_dashboard_security_headers(response), scenario)
 }
 
-
 async fn workbench_image_generation(
     State(state): State<WorkbenchState>,
     headers: HeaderMap,
@@ -835,13 +834,11 @@ async fn workbench_audio_speech(
         "x-mayhem-backend",
         HeaderValue::from_static("workbench-speech-fixture"),
     );
-    response.headers_mut().insert(
-        "x-mayhem-direct-session",
-        HeaderValue::from_static("false"),
-    );
+    response
+        .headers_mut()
+        .insert("x-mayhem-direct-session", HeaderValue::from_static("false"));
     with_workbench_scenario_cookie(with_dashboard_security_headers(response), scenario)
 }
-
 
 fn workbench_include_usage(payload: &Value) -> Result<bool, (&'static str, &'static str)> {
     let Some(stream_options) = payload.get("stream_options") else {

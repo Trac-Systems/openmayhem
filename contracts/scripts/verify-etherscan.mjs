@@ -12,6 +12,7 @@ import { ethers } from 'ethers';
 import solc from 'solc';
 
 import { DEFAULT_MAINNET_DEPLOYMENT_FILE } from './deploy-mainnet.mjs';
+import { safeErrorMessage } from './safe-output.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SRC_DIR = join(REPO, 'contracts', 'src');
@@ -154,6 +155,8 @@ export function buildVerificationRequest({
   const pool = normalizeAddress(args.pool || deployment.pool || env.MAYHEM_TAP_POOL_ADDRESS, 'pool address');
   const token = normalizeAddress(deployment.token || env.MAYHEM_TAP_TOKEN_ADDRESS || env.MAYHEM_TAP_TOKEN_ADDR, 'TAP token');
   const owner = normalizeAddress(deployment.owner, 'pool owner');
+  const governanceSigner = normalizeAddress(deployment.governanceSigner, 'governance signer');
+  const governanceDelay = parseNonNegativeBigInt(deployment.governanceDelay, 'governanceDelay');
   const maxEpochDelta = parseNonNegativeBigInt(deployment.maxEpochDelta ?? deployment.max_epoch_delta_wei, 'maxEpochDelta');
   const chainId = Number(deployment.chainId ?? env.MAYHEM_TAP_ETH_CHAIN_ID ?? env.MAYHEM_TAP_CHAIN_ID ?? 1);
   if (!Number.isSafeInteger(chainId) || chainId <= 0) throw new Error('chainId must be a positive safe integer');
@@ -161,7 +164,10 @@ export function buildVerificationRequest({
   const compilerVersion = solcCompilerVersion();
   const { standardJson, localSourceCount, importSourceCount } = buildStandardJsonInput();
   const constructorArgs = new ethers.AbiCoder()
-    .encode(['address', 'address', 'uint256'], [token, owner, maxEpochDelta])
+    .encode(
+      ['address', 'address', 'address', 'uint64', 'uint256'],
+      [token, owner, governanceSigner, governanceDelay, maxEpochDelta]
+    )
     .slice(2);
   const apiKey = firstEnv(env, ['MAYHEM_ETHERSCAN_API_KEY']);
   const sourceCode = JSON.stringify(standardJson);
@@ -304,7 +310,7 @@ export async function verifyEtherscan({
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   verifyEtherscan().catch((error) => {
-    console.error('verify-etherscan:', error?.shortMessage || error?.message || String(error));
+    console.error('verify-etherscan:', safeErrorMessage(error));
     process.exit(1);
   });
 }

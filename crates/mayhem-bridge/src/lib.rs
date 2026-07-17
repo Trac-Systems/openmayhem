@@ -49,6 +49,45 @@ pub enum BridgeError {
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScBridgeSessionTransport {
+    Direct,
+    Relayed { relay: String },
+}
+
+pub fn sc_bridge_session_transport(value: &Value) -> Result<ScBridgeSessionTransport> {
+    let direct = value.get("direct").and_then(Value::as_bool) == Some(true);
+    let relayed = value.get("relayed").and_then(Value::as_bool) == Some(true);
+    match (direct, relayed) {
+        (true, false) => Ok(ScBridgeSessionTransport::Direct),
+        (false, true) => {
+            let relay = value
+                .get("relay")
+                .and_then(Value::as_str)
+                .filter(|key| {
+                    key.len() == 64
+                        && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && key.bytes().all(|byte| !byte.is_ascii_uppercase())
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    BridgeError::Protocol(
+                        "relayed session must identify a canonical relay peer key".to_owned(),
+                    )
+                })?;
+            if relay.chars().all(|character| character == '0') {
+                return Err(BridgeError::Protocol(
+                    "relayed session returned the zero relay peer key".to_owned(),
+                ));
+            }
+            Ok(ScBridgeSessionTransport::Relayed { relay })
+        }
+        _ => Err(BridgeError::Protocol(
+            "session must report exactly one of direct or relayed transport".to_owned(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScBridgeConfig {
     pub url: Url,
@@ -745,6 +784,47 @@ impl PeerRpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_transport_requires_one_authenticated_path() {
+        assert_eq!(
+            sc_bridge_session_transport(&json!({ "direct": true, "relayed": false })).unwrap(),
+            ScBridgeSessionTransport::Direct
+        );
+        assert_eq!(
+            sc_bridge_session_transport(&json!({
+                "direct": false,
+                "relayed": true,
+                "relay": "a".repeat(64)
+            }))
+            .unwrap(),
+            ScBridgeSessionTransport::Relayed {
+                relay: "a".repeat(64)
+            }
+        );
+        assert!(sc_bridge_session_transport(&json!({
+            "direct": true,
+            "relayed": true
+        }))
+        .is_err());
+        assert!(sc_bridge_session_transport(&json!({
+            "direct": false,
+            "relayed": true
+        }))
+        .is_err());
+        assert!(sc_bridge_session_transport(&json!({
+            "direct": false,
+            "relayed": true,
+            "relay": "A".repeat(64)
+        }))
+        .is_err());
+        assert!(sc_bridge_session_transport(&json!({
+            "direct": false,
+            "relayed": true,
+            "relay": "not-a-key"
+        }))
+        .is_err());
+    }
 
     #[test]
     fn rpc_endpoint_join_preserves_v1_base() {

@@ -4,13 +4,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "llama-cpp")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "llama-cpp")]
 use mayhem_engine::LlamaCppBackend;
 use mayhem_engine::{
-    verify_artifact, EngineBackend, GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig,
-    MlxBackend, ModelArtifact, ToolSpec,
+    verify_artifact, CancellationToken, EngineBackend, GenerateOutput, GenerateRequest,
+    GrammarSpec, LoadConfig, MlxBackend, ModelArtifact, ToolSpec,
 };
 use serde_json::json;
 
@@ -63,6 +64,7 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
             chunks.push(chunk);
             Ok(())
         },
+        &CancellationToken::new(),
     )?;
     assert!(!chunks.is_empty(), "streaming sink received no tokens");
     assert!(!output.text.trim().is_empty(), "model returned empty text");
@@ -76,6 +78,7 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
                     tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
                 }),
             &mut |_chunk| Ok(()),
+            &CancellationToken::new(),
         )
         .expect_err("MLX must not fake grammar-constrained tool calls");
     assert!(
@@ -93,6 +96,7 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
             canary_chunks.push(chunk);
             Ok(())
         },
+        &CancellationToken::new(),
     )?;
     assert_usage(&canary);
     assert!(!canary_chunks.is_empty(), "canary produced no token chunks");
@@ -158,6 +162,7 @@ fn mlx_benchmark_requires_llama_cpp_feature() {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 fn timed_generate<B: EngineBackend>(
     backend: &mut B,
     prompt: &str,
@@ -167,10 +172,12 @@ fn timed_generate<B: EngineBackend>(
     let output = backend.generate(
         GenerateRequest::new(prompt).with_max_new_tokens(max_new_tokens),
         &mut |_chunk| Ok(()),
+        &CancellationToken::new(),
     )?;
     Ok((output, start.elapsed()))
 }
 
+#[cfg(feature = "llama-cpp")]
 fn throughput_samples<B: EngineBackend>(
     backend: &mut B,
     prompt: &str,
@@ -185,10 +192,12 @@ fn throughput_samples<B: EngineBackend>(
     Ok(results)
 }
 
+#[cfg(feature = "llama-cpp")]
 fn tokens_per_second(output: &GenerateOutput, elapsed: Duration) -> f64 {
     output.usage.completion_tokens as f64 / elapsed.as_secs_f64().max(0.001)
 }
 
+#[cfg(feature = "llama-cpp")]
 fn median(values: &[f64]) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);

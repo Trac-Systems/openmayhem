@@ -30,7 +30,7 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const providerAccount = await providerA.getAddress();
-  const { token, pool, poolAddr } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(3))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(3))).wait();
@@ -52,6 +52,7 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
+    governanceSigner: governanceWallet,
     operatorAddress: await operator.getAddress(),
     post: true,
   });
@@ -74,6 +75,7 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
   assert.ok(proof.leaf.startsWith('0x'));
 
   await (await pool.connect(providerA).claim(
+    proof.epoch,
     proof.account,
     BigInt(proof.cumulative_wei),
     proof.proof
@@ -90,6 +92,7 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
   assert.equal(refundProof.cumulative_wei, expectedRefund.toString());
   assert.equal(refundProof.claimable_wei, expectedRefund.toString());
   await (await pool.connect(buyer).claim(
+    refundProof.epoch,
     refundProof.account,
     BigInt(refundProof.cumulative_wei),
     refundProof.proof

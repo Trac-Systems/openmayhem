@@ -191,8 +191,16 @@ export function matchPendingTransfers({
   transfers,
   treasuryAddress,
   addressPrefix,
+  network,
+  observedSignedLength,
   seen = new Set(),
 }) {
+  if (!['mainnet', 'testnet1'].includes(network)) {
+    throw new Error('MSB transfer matching requires mainnet or testnet1.');
+  }
+  if (!Number.isSafeInteger(observedSignedLength) || observedSignedLength < 1) {
+    throw new Error('MSB transfer matching requires a positive observed signed length.');
+  }
   const matches = [];
   const skipped = [];
   const used = new Set();
@@ -203,7 +211,7 @@ export function matchPendingTransfers({
   for (const pending of orderedPending) {
     const memoHash = String(pending.memo_hash ?? '');
     const expectedSender = pubKeyHexToMsbAddress(pending.user, addressPrefix);
-    const expectedTreasury = pending.treasury_address ?? treasuryAddress;
+    const expectedTreasury = treasuryAddress;
     const expectedAmount = canonicalAmount(pending.tnk_e18);
     const quotedAu = canonicalAmount(pending.quoted_au);
     const rateTnkUsdAu = canonicalAmount(pending.rate_tnk_usd_au);
@@ -215,6 +223,10 @@ export function matchPendingTransfers({
     }
     if (!expectedTreasury) {
       skipped.push({ memo_hash: memoHash, reason: 'pending intent has no treasury address and watcher has none' });
+      continue;
+    }
+    if (!sameAddress(pending.treasury_address, expectedTreasury)) {
+      skipped.push({ memo_hash: memoHash, reason: 'pending intent treasury is not canonical' });
       continue;
     }
     if (!expectedAmount) {
@@ -236,6 +248,9 @@ export function matchPendingTransfers({
       && sameAddress(transfer.from, expectedSender)
       && sameAddress(transfer.to, expectedTreasury)
       && (!expectedAmount || transfer.tnk_e18 === expectedAmount)
+      && Number.isSafeInteger(transfer.confirmed_length)
+      && transfer.confirmed_length > 0
+      && transfer.confirmed_length <= observedSignedLength
     ));
 
     if (candidates.length === 0) {
@@ -256,11 +271,16 @@ export function matchPendingTransfers({
     matches.push({
       memo_hash: memoHash,
       user: pending.user,
-      from: transfer.from,
-      treasury_address: expectedTreasury,
-      tnk_e18: transfer.tnk_e18,
-      msb_tx_hash: transfer.hash,
-      confirmed_length: transfer.confirmed_length,
+      msb_transfer: {
+        schema_version: 1,
+        network,
+        tx_hash: transfer.hash,
+        confirmed_length: transfer.confirmed_length,
+        observed_signed_length: observedSignedLength,
+        from: transfer.from,
+        to: expectedTreasury,
+        amount_e18: transfer.tnk_e18,
+      },
       quoted_au: quotedAu,
       rate_tnk_usd_au: rateTnkUsdAu,
       rate_source: rateSource,
@@ -287,9 +307,19 @@ export function buildAdminCommandArgs(match, {
     '--memo-hash',
     match.memo_hash,
     '--tnk-e18',
-    match.tnk_e18,
+    match.msb_transfer.amount_e18,
     '--msb-tx-hash',
-    match.msb_tx_hash,
+    match.msb_transfer.tx_hash,
+    '--msb-network',
+    match.msb_transfer.network,
+    '--msb-from',
+    match.msb_transfer.from,
+    '--msb-to',
+    match.msb_transfer.to,
+    '--msb-confirmed-length',
+    String(match.msb_transfer.confirmed_length),
+    '--msb-observed-signed-length',
+    String(match.msb_transfer.observed_signed_length),
     '--epoch',
     String(epoch),
     '--at',
@@ -316,6 +346,8 @@ export function depositStateMatches(match, {
   pending,
   balance,
   depositRoot,
+  credited,
+  transferSeen,
   epoch,
 } = {}) {
   const quotedAu = canonicalAmount(match?.quoted_au);
@@ -334,7 +366,11 @@ export function depositStateMatches(match, {
     && depositCount !== null
     && depositCount > 0
     && depositAuTotal !== null
-    && BigInt(depositAuTotal) >= BigInt(quotedAu);
+    && BigInt(depositAuTotal) >= BigInt(quotedAu)
+    && credited?.memo_hash === match.memo_hash
+    && credited?.msb_transfer?.tx_hash === match.msb_transfer?.tx_hash
+    && transferSeen?.purpose === 'deposit'
+    && transferSeen?.memo_hash === match.memo_hash;
 }
 
 export async function waitForDepositState(match, {
@@ -347,12 +383,18 @@ export async function waitForDepositState(match, {
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
   let state = null;
   while (deadline === null || Date.now() <= deadline) {
-    const [pending, balance, depositRoot] = await Promise.all([
+    const [pending, balance, depositRoot, credited, transferSeen] = await Promise.all([
       readContractStateValue(rpcUrl, `dep/pending/${match.memo_hash}`, { fetchImpl }),
       readContractStateValue(rpcUrl, `bal/${match.user}/tnk`, { fetchImpl }),
       readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
+      readContractStateValue(rpcUrl, `dep/tnk-credited/${match.memo_hash}`, { fetchImpl }),
+      readContractStateValue(
+        rpcUrl,
+        `rail/seen/msb/${match.msb_transfer.network}/${match.msb_transfer.tx_hash}`,
+        { fetchImpl }
+      ),
     ]);
-    state = { pending, balance, depositRoot };
+    state = { pending, balance, depositRoot, credited, transferSeen };
     if (depositStateMatches(match, { ...state, epoch })) {
       return { verified: true, state };
     }
@@ -505,6 +547,8 @@ async function main() {
     transfers: unmatchedTransfers,
     treasuryAddress,
     addressPrefix: config.addressPrefix,
+    network,
+    observedSignedLength: scan.confirmedLength,
     seen,
   });
 
@@ -582,13 +626,13 @@ async function main() {
           confirmation.verified = verification.verified;
           confirmation.state = verification.state;
           if (verification.verified) {
-            submittedHashes.add(match.msb_tx_hash);
+            submittedHashes.add(match.msb_transfer.tx_hash);
           } else {
             confirmation.error = 'tnkDeposit submit did not update pending intent, balance, and deposit root';
           }
         } else {
           confirmation.verification_skipped = true;
-          submittedHashes.add(match.msb_tx_hash);
+          submittedHashes.add(match.msb_transfer.tx_hash);
         }
       }
     }
@@ -596,7 +640,7 @@ async function main() {
   }
 
   for (const hash of submittedHashes) seen.add(hash);
-  const matchedButUnsubmitted = submit ? [] : matches.map((match) => match.msb_tx_hash);
+  const matchedButUnsubmitted = submit ? [] : matches.map((match) => match.msb_transfer.tx_hash);
   const nextCursor = {
     next_signed_length: Math.max(fromSignedLength, scan.safeEnd),
     seen_msb_tx_hashes: Array.from(seen).sort(),

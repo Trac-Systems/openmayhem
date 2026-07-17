@@ -700,13 +700,15 @@ async function seedSettlementState({ harness, admin, provider, account, args, us
     provider,
     status: 'active',
     accepted_rails: ['fiat'],
-    payout: {
-      addr: account.id,
-      method: 'stripe',
-      currency: args.currency,
-      set_by: admin,
-      set_by_role: 'admin',
-      set_at: 'stripe-sandbox-payout-smoke',
+    payouts: {
+      stripe: {
+        addr: account.id,
+        method: 'stripe',
+        currency: args.currency,
+        set_by: admin,
+        set_by_role: 'admin',
+        set_at: 'stripe-sandbox-payout-smoke',
+      },
     },
     probation: { successful_sessions: 1 },
     registered_at: 'stripe-sandbox-payout-smoke',
@@ -718,6 +720,10 @@ async function seedSettlementState({ harness, admin, provider, account, args, us
   const receipt = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: sessionId,
+    billing_id: randomBytes(32).toString('hex'),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 1,
     final: true,
     rail: 'fiat',
@@ -1055,7 +1061,7 @@ async function main() {
     assert.equal(recovered.report.stripe_transfers[0].transfer.recovered, true);
     assert.equal(recovered.report.stripe_transfers[0].transfer.id, transfersAfterFailure[0].id);
     const settlement = (await harness.storage.get(`settle/fiat/${epoch}`))?.value;
-    assert.equal(settlement?.stripe_refs?.[0], transfersAfterFailure[0].id);
+    assert.equal(settlement?.stripe_transfers?.[0]?.ref, transfersAfterFailure[0].id);
     assert.equal(settlement?.epoch_apply_hash, applyState.last_apply_hash);
 
     const settledSnapshot = harness.storage.snapshotBytes();

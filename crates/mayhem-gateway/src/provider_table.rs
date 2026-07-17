@@ -94,6 +94,8 @@ pub struct ProviderObservation {
     #[serde(default)]
     pub capacity_mismatch_event_emitted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_mismatch_last_heartbeat_received_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_open_until_millis: Option<u64>,
     pub samples: u64,
 }
@@ -506,17 +508,39 @@ impl ProviderTable {
             observed.circuit_open_until_millis = None;
             observed.capacity_mismatch_streak = 0;
             observed.capacity_mismatch_event_emitted = false;
+            observed.capacity_mismatch_last_heartbeat_received_at_millis = None;
         }
         observed.samples += 1;
         underdelivery_event
     }
 
-    pub fn record_capacity_mismatch_at(
+    pub fn record_capacity_refusal_at(
         &mut self,
         key: &ProviderKey,
         now_millis: u64,
     ) -> Option<ProviderCapacityMismatchEvent> {
+        let live = self.heartbeats.get(key)?;
+        if now_millis.saturating_sub(live.received_at_millis) > self.heartbeat_ttl_millis {
+            return None;
+        }
+        let heartbeat = &live.heartbeat;
+        let advertised_free_capacity = heartbeat.accepting_new
+            && heartbeat.sat < DEFAULT_SATURATION_CUTOFF
+            && (heartbeat.q.free_slots > 0 || heartbeat.slots.active < heartbeat.slots.max);
         let observed = self.observations.entry(key.clone()).or_default();
+        if !advertised_free_capacity {
+            observed.capacity_mismatch_streak = 0;
+            observed.capacity_mismatch_event_emitted = false;
+            observed.capacity_mismatch_last_heartbeat_received_at_millis = None;
+            return None;
+        }
+        if observed.capacity_mismatch_last_heartbeat_received_at_millis
+            == Some(live.received_at_millis)
+        {
+            return None;
+        }
+        observed.capacity_mismatch_last_heartbeat_received_at_millis =
+            Some(live.received_at_millis);
         observed.capacity_mismatch_streak = observed.capacity_mismatch_streak.saturating_add(1);
         if observed.capacity_mismatch_streak < DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK
             || observed.capacity_mismatch_event_emitted
@@ -524,15 +548,10 @@ impl ProviderTable {
             return None;
         }
         observed.capacity_mismatch_event_emitted = true;
-        let heartbeat = self.heartbeats.get(key).map(|live| &live.heartbeat);
         Some(ProviderCapacityMismatchEvent {
             key: key.clone(),
-            advertised_free_slots: heartbeat
-                .map(|heartbeat| heartbeat.q.free_slots)
-                .unwrap_or(0),
-            advertised_engine_backlog: heartbeat
-                .map(|heartbeat| heartbeat.q.engine_backlog)
-                .unwrap_or(0),
+            advertised_free_slots: heartbeat.q.free_slots,
+            advertised_engine_backlog: heartbeat.q.engine_backlog,
             streak: observed.capacity_mismatch_streak,
             observed_at_millis: now_millis,
         })
@@ -1479,6 +1498,29 @@ mod tests {
                 },
             );
         assert!(evaluate_eligibility(&entry, &request).is_ok());
+
+        entry
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .unwrap()
+            .active_items = 1;
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::ModalityCapacity),
+            "an occupied serial image backend must not be routed another request"
+        );
+        entry.heartbeat.as_mut().unwrap().accepting_new = false;
+        entry.heartbeat.as_mut().unwrap().sat = 1.0;
+        entry.heartbeat.as_mut().unwrap().q.free_slots = 0;
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::Draining),
+            "the proactive busy heartbeat must make the provider ineligible"
+        );
     }
 
     #[test]
@@ -2120,23 +2162,43 @@ mod tests {
         table.upsert_heartbeat(heartbeat_for(2, now, 0.2, 100, 9, "55"), now);
 
         assert!(table
-            .record_capacity_mismatch_at(&mismatch_key, now + 1)
+            .record_capacity_refusal_at(&mismatch_key, now + 1)
             .is_none());
         assert!(table
-            .record_capacity_mismatch_at(&mismatch_key, now + 2)
+            .record_capacity_refusal_at(&mismatch_key, now + 2)
             .is_none());
+        assert_eq!(
+            table
+                .entries(now + 2)
+                .into_iter()
+                .find(|entry| entry.key == mismatch_key)
+                .unwrap()
+                .observed
+                .capacity_mismatch_streak,
+            1,
+            "one stale advertised heartbeat must count at most once"
+        );
+        table.upsert_heartbeat(heartbeat_for(1, now + 2, 0.2, 100, 9, "44"), now + 2);
+        assert!(table
+            .record_capacity_refusal_at(&mismatch_key, now + 2)
+            .is_none());
+        table.upsert_heartbeat(heartbeat_for(1, now + 3, 0.2, 100, 9, "44"), now + 3);
         let event = table
-            .record_capacity_mismatch_at(&mismatch_key, now + 3)
-            .expect("third mismatch emits");
+            .record_capacity_refusal_at(&mismatch_key, now + 3)
+            .expect("third distinct false-free advertisement emits");
         assert_eq!(event.key, mismatch_key);
         assert_eq!(event.advertised_free_slots, 1);
         assert_eq!(event.streak, DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK);
         assert!(table
-            .record_capacity_mismatch_at(&mismatch_key, now + 4)
+            .record_capacity_refusal_at(&mismatch_key, now + 4)
             .is_none());
         for offset in 5..=8 {
+            table.upsert_heartbeat(
+                heartbeat_for(1, now + offset, 0.2, 100, 9, "44"),
+                now + offset,
+            );
             assert!(table
-                .record_capacity_mismatch_at(&mismatch_key, now + offset)
+                .record_capacity_refusal_at(&mismatch_key, now + offset)
                 .is_none());
         }
 

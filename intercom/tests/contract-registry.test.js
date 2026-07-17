@@ -125,6 +125,7 @@ const catalogRelease = {
     set_id: 'canary-launch-v1',
     url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-launch-v1.json',
     hash: 'b'.repeat(64),
+    prompt_ids: ['launch-text'],
   }],
 };
 
@@ -140,6 +141,8 @@ const priceSchedule = {
 const providerJoin = {
   op: 'join_enclave',
   enclave_id: enclaveId,
+  att_tier: 1,
+  attestation_head: 'd'.repeat(64),
   served_ctx: 32768,
   served_modalities: ['text'],
   served_specialities: {},
@@ -250,7 +253,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   const providerEntry = await first.storage.get(`prov/${provider.publicKey}`);
   assert.deepEqual(providerEntry.value, {
     provider: provider.publicKey,
-    payout: null,
+    payouts: {},
     accepted_rails: ['fiat'],
     accepted_rails_schema_version: 1,
     accepted_rails_set_by: provider.publicKey,
@@ -302,6 +305,9 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     enclave_id: enclaveId,
     model_id: enclaveRegistration.model_id,
     status: 'tombstoned',
+    att_tier: 1,
+    effective_att_tier: 1,
+    attestation_head: 'd'.repeat(64),
     served_ctx: 32768,
     served_modalities: ['text'],
     served_specialities: {},
@@ -846,6 +852,8 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     op: 'join_enclave',
     provider: provider.publicKey,
     enclave_id: enclaveId,
+    att_tier: 1,
+    attestation_head: 'd'.repeat(64),
     served_ctx: 32768,
     served_modalities: ['text'],
     served_specialities: {},
@@ -913,6 +921,84 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     (await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`)).value.status,
     'active'
   );
+});
+
+test('MayhemContract enclave admission checks the provider attestation tier', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(provider.wallet) } }, {});
+
+  await execute(
+    contract,
+    storage,
+    'setRules',
+    { op: 'set_rules', ver: 1, hash: rulesHash },
+    admin.publicKey,
+    1
+  );
+  await execute(
+    contract,
+    storage,
+    'consent',
+    {
+      op: 'consent',
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(provider.wallet, 1, rulesHash),
+    },
+    provider.publicKey,
+    2
+  );
+  await execute(
+    contract,
+    storage,
+    'registerProvider',
+    providerRegistration,
+    provider.publicKey,
+    3
+  );
+  const tier2Enclave = { ...enclaveRegistration, att_tier: 2 };
+  const registered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    tier2Enclave,
+    admin.publicKey,
+    4
+  );
+  assert.equal(registered.ok, true, registered.message);
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: tier2Enclave.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const lowTier = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, att_tier: 1 },
+    provider.publicKey,
+    6
+  );
+  assert.match(lowTier.message, /does not match enclave tier 2/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  const admitted = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, att_tier: 2 },
+    provider.publicKey,
+    7
+  );
+  assert.equal(admitted.ok, true, admitted.message);
+  const serving = (await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value;
+  assert.equal(serving.att_tier, 2);
+  assert.equal(serving.effective_att_tier, 2);
+  assert.equal(serving.attestation_head, 'd'.repeat(64));
 });
 
 test('MayhemContract appends Tier-3 measurement blessings as admin-only feature records', async () => {
@@ -1748,7 +1834,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   assert.equal(registered.ok, true, registered.message);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
-  assert.equal(providerEntry.value.payout, null);
+  assert.deepEqual(providerEntry.value.payouts, {});
   assert.equal(providerEntry.value.probation.since_seconds, 0);
 
   const providerPayout = await execute(
@@ -1801,12 +1887,14 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   });
 
   const updated = await storage.get(`prov/${provider.publicKey}`);
-  assert.deepEqual(updated.value.payout, {
-    addr: 'admin-approved-target',
-    method: 'tnk',
-    set_by: admin.publicKey,
-    set_by_role: 'admin',
-    set_at: makeTxKey(8),
+  assert.deepEqual(updated.value.payouts, {
+    tnk: {
+      addr: 'admin-approved-target',
+      method: 'tnk',
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      set_at: makeTxKey(8),
+    },
   });
   assert.equal(updated.value.updated_at, makeTxKey(8));
 });
@@ -2297,6 +2385,8 @@ test('MayhemContract rejects provider-authored serving terms on joins', async ()
     {
       op: 'join_enclave',
       enclave_id: enclaveId,
+      att_tier: 1,
+      attestation_head: 'd'.repeat(64),
       served_ctx: 32768,
       served_modalities: ['text'],
       served_specialities: {},
@@ -2545,6 +2635,8 @@ test('MayhemContract rejects unsafe canonical registry identifiers', async () =>
     {
       op: 'join_enclave',
       enclave_id: 'bad/enclave',
+      att_tier: 1,
+      attestation_head: 'd'.repeat(64),
       served_ctx: 32768,
       served_modalities: ['text'],
       served_specialities: {},

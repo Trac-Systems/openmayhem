@@ -168,12 +168,15 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "quality",
                 "response_format",
                 "size",
+                "width",
+                "height",
                 "stream",
                 "style",
                 "user",
                 "negative_prompt",
                 "steps",
                 "cfg_scale",
+                "shift",
                 "seed",
                 "scheduler",
             ],
@@ -197,9 +200,11 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "inputs",
                 "parameters.guidance_scale",
                 "parameters.negative_prompt",
+                "parameters.num_images_per_prompt",
                 "parameters.num_inference_steps",
                 "parameters.width",
                 "parameters.height",
+                "parameters.shift",
                 "parameters.scheduler",
                 "parameters.seed",
             ],
@@ -454,15 +459,18 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
         ],
         ENDPOINT_OPENAI_IMAGE_GENERATIONS => &[
             &["background", "output_format", "response_format"],
-            &["quality", "size", "steps", "cfg_scale"],
+            &["quality", "size", "steps", "cfg_scale", "shift"],
+            &["width", "height"],
             &["negative_prompt", "scheduler", "seed"],
         ],
         ENDPOINT_HF_TEXT_TO_IMAGE => &[
             &[
                 "parameters.width",
                 "parameters.height",
+                "parameters.num_images_per_prompt",
                 "parameters.num_inference_steps",
                 "parameters.guidance_scale",
+                "parameters.shift",
             ],
             &[
                 "parameters.negative_prompt",
@@ -731,7 +739,11 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             ],
         ),
         "seconds" => enum_spec(Some(json!("4")), &[json!("4"), json!("8"), json!("12")]),
-        "size" => string_spec(3, 64, json!("512x512")),
+        "size" => {
+            let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
+            spec.calibration_values.push(json!("512x512"));
+            spec
+        }
         "stop" => union_spec(
             &[
                 EndpointValueType::String,
@@ -748,6 +760,26 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             &[EndpointValueType::Boolean, EndpointValueType::String],
             &[json!(false), json!(true), json!("never")],
         ),
+        "n" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => integer_spec(1.0, 4.0, 1),
+        "parameters.num_images_per_prompt" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
+            integer_spec(1.0, 4.0, 1)
+        }
+        "steps" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => integer_spec(1.0, 150.0, 9),
+        "parameters.num_inference_steps" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
+            integer_spec(1.0, 150.0, 9)
+        }
+        "width" | "height" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            integer_spec(64.0, 2_048.0, 1_024)
+        }
+        "parameters.width" | "parameters.height" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
+            integer_spec(64.0, 2_048.0, 1_024)
+        }
+        "cfg_scale" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => number_spec(0.0, 50.0, 1.0),
+        "parameters.guidance_scale" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
+            number_spec(0.0, 50.0, 1.0)
+        }
+        "shift" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => number_spec(1.0, 10.0, 3.0),
+        "parameters.shift" if family == ENDPOINT_HF_TEXT_TO_IMAGE => number_spec(1.0, 10.0, 3.0),
         _ if boolean_leaf(leaf) => boolean_spec(None),
         _ if integer_leaf(leaf) => integer_spec(0.0, integer_maximum(leaf), integer_baseline(leaf)),
         _ if number_leaf(leaf) => number_spec(
@@ -804,6 +836,7 @@ fn integer_leaf(leaf: &str) -> bool {
             | "partial_images"
             | "steps"
             | "num_inference_steps"
+            | "num_images_per_prompt"
             | "max_length"
             | "max_new_tokens"
             | "min_length"
@@ -827,6 +860,7 @@ fn number_leaf(leaf: &str) -> bool {
             | "repeat_penalty"
             | "cfg_scale"
             | "guidance_scale"
+            | "shift"
             | "speed"
             | "duration_seconds"
             | "penalty_alpha"
@@ -836,6 +870,7 @@ fn number_leaf(leaf: &str) -> bool {
 fn integer_maximum(leaf: &str) -> f64 {
     match leaf {
         "n" => 10.0,
+        "num_images_per_prompt" => 10.0,
         "partial_images" => 3.0,
         "output_compression" => 100.0,
         "steps" | "num_inference_steps" => 1_000.0,
@@ -851,6 +886,7 @@ fn integer_maximum(leaf: &str) -> f64 {
 fn integer_baseline(leaf: &str) -> i64 {
     match leaf {
         "n" => 1,
+        "num_images_per_prompt" => 1,
         "partial_images" => 1,
         "output_compression" => 50,
         "steps" | "num_inference_steps" => 4,
@@ -879,6 +915,7 @@ fn number_maximum(leaf: &str) -> f64 {
         "frequency_penalty" | "presence_penalty" => 2.0,
         "repeat_penalty" => 10.0,
         "cfg_scale" | "guidance_scale" => 100.0,
+        "shift" => 10.0,
         "speed" => 4.0,
         "duration_seconds" => 86_400.0,
         "penalty_alpha" => 1.0,
@@ -894,6 +931,7 @@ fn number_baseline(leaf: &str) -> f64 {
         "typical_p" => 0.95,
         "repeat_penalty" | "speed" => 1.0,
         "cfg_scale" | "guidance_scale" => 1.0,
+        "shift" => 3.0,
         "duration_seconds" => 1.0,
         _ => 0.0,
     }
@@ -966,6 +1004,7 @@ fn union_spec(
         enum_values: Vec::new(),
         minimum: None,
         maximum: None,
+        multiple_of: None,
         min_length: None,
         max_length: None,
         min_items: None,
@@ -1063,6 +1102,16 @@ pub fn validate_endpoint_attribute_value(
         }
         if spec.maximum.is_some_and(|maximum| number > maximum) {
             return Err(format!("number {number} exceeds the maximum"));
+        }
+        if let Some(multiple) = spec.multiple_of {
+            if !multiple.is_finite() || multiple <= 0.0 {
+                return Err("multiple_of must be finite and greater than zero".to_owned());
+            }
+            let quotient = number / multiple;
+            let tolerance = f64::EPSILON * quotient.abs().max(1.0) * 8.0;
+            if (quotient - quotient.round()).abs() > tolerance {
+                return Err(format!("number {number} is not a multiple of {multiple}"));
+            }
         }
     }
     if let Some(text) = value.as_str() {
@@ -1264,11 +1313,20 @@ pub fn generate_endpoint_calibration_cases(
         );
     }
 
+    let mut covered_interaction_pairs = std::collections::BTreeSet::new();
     for group in &contract.interaction_groups {
         for left in 0..group.len() {
             for right in (left + 1)..group.len() {
                 let left_path = &group[left];
                 let right_path = &group[right];
+                let pair = if left_path <= right_path {
+                    (left_path.clone(), right_path.clone())
+                } else {
+                    (right_path.clone(), left_path.clone())
+                };
+                if !covered_interaction_pairs.insert(pair) {
+                    continue;
+                }
                 let left_value = endpoint_calibration_interaction_value(
                     contract
                         .request_attribute_specs
@@ -1315,9 +1373,18 @@ pub fn generate_endpoint_calibration_cases(
         }
     }
 
-    let mut ids = std::collections::BTreeSet::new();
-    if cases.iter().any(|case| !ids.insert(case.case_id.clone())) {
-        return Err("generated calibration matrix contains duplicate case IDs".to_owned());
+    let mut ids = std::collections::BTreeMap::new();
+    for case in &cases {
+        if let Some(previous) = ids.insert(case.case_id.clone(), case) {
+            return Err(format!(
+                "generated calibration matrix contains duplicate case ID {} ({} {:?} and {} {:?})",
+                case.case_id,
+                previous.case_kind,
+                previous.attributes,
+                case.case_kind,
+                case.attributes,
+            ));
+        }
     }
     Ok(cases)
 }
@@ -1357,6 +1424,64 @@ pub fn materialize_endpoint_calibration_request(
         }
     }
     Ok(request)
+}
+
+pub fn materialize_endpoint_request_defaults(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+) -> Result<Value, String> {
+    let image_aliases = if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
+        let object = request
+            .as_object()
+            .ok_or_else(|| "endpoint request must be an object".to_owned())?;
+        let has_size = object.contains_key("size");
+        let has_width = object.contains_key("width");
+        let has_height = object.contains_key("height");
+        if has_size && (has_width || has_height) {
+            return Err("image request cannot combine size with width/height".to_owned());
+        }
+        if has_width != has_height {
+            return Err("image request width and height must be supplied together".to_owned());
+        }
+        Some((has_size, has_width))
+    } else {
+        None
+    };
+    let mut normalized = request.clone();
+    for path in &contract.request_attributes {
+        if image_aliases.is_some_and(|(has_size, has_dimensions)| {
+            (has_size && matches!(path.as_str(), "width" | "height"))
+                || (has_dimensions && path == "size")
+        }) {
+            continue;
+        }
+        if !endpoint_values_at_path(&normalized, path).is_empty() {
+            continue;
+        }
+        let Some(default) = contract
+            .request_attribute_specs
+            .get(path)
+            .and_then(|spec| spec.default.clone())
+        else {
+            continue;
+        };
+        set_endpoint_path(&mut normalized, path, default)?;
+    }
+    if image_aliases.is_some() {
+        let object = normalized
+            .as_object()
+            .ok_or_else(|| "normalized endpoint request must be an object".to_owned())?;
+        let has_size = object.contains_key("size");
+        let has_width = object.contains_key("width");
+        let has_height = object.contains_key("height");
+        if has_width != has_height || has_size == has_width {
+            return Err(
+                "signed image endpoint contract must resolve exactly one of size or width/height"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(normalized)
 }
 
 fn endpoint_calibration_baseline(spec: &EndpointAttributeSpec) -> Option<Value> {
@@ -1531,6 +1656,14 @@ fn add_calibration_companion_mutations(
                 ),
             );
         }
+        "width" if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => add(
+            "height",
+            endpoint_calibration_companion_baseline(contract, "height", json!(1024)),
+        ),
+        "height" if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => add(
+            "width",
+            endpoint_calibration_companion_baseline(contract, "width", json!(1024)),
+        ),
         _ => {}
     }
 }
@@ -1689,6 +1822,32 @@ fn numeric_boundary_values(spec: &EndpointAttributeSpec) -> Vec<(&'static str, V
             ),
             false,
         ));
+    }
+    if let Some(multiple) = spec
+        .multiple_of
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        let minimum = spec.minimum.unwrap_or(0.0);
+        let maximum = spec.maximum.unwrap_or(f64::MAX);
+        let valid = (minimum / multiple).ceil() * multiple;
+        if valid.is_finite() && valid <= maximum {
+            values.push(("multiple_of_valid", number_value(valid, integer), true));
+            let delta = if integer { 1.0 } else { multiple / 2.0 };
+            if delta > 0.0 && (delta / multiple).fract() != 0.0 {
+                let above = valid + delta;
+                let below = valid - delta;
+                let invalid = if above <= maximum {
+                    Some(above)
+                } else if below >= minimum {
+                    Some(below)
+                } else {
+                    None
+                };
+                if let Some(invalid) = invalid {
+                    values.push(("not_multiple_of", number_value(invalid, integer), false));
+                }
+            }
+        }
     }
     values
 }
@@ -1915,17 +2074,135 @@ pub fn endpoint_contract_fingerprint(contract: &EndpointFamilyContract) -> Strin
     blake3::hash(&encoded).to_hex().to_string()
 }
 
+/// Hashes the semantic JSON value while remaining stable across JavaScript relays.
+/// JavaScript serializes integral JSON numbers such as `1.0` as `1`; those values
+/// must compare equally without making changed integers or non-integral values equal.
+#[must_use]
+pub fn endpoint_request_fingerprint(request: &Value) -> String {
+    let canonical = javascript_roundtrip_stable_value(request);
+    blake3::hash(canonical.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn javascript_roundtrip_stable_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(javascript_roundtrip_stable_value)
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                stable.insert(key.clone(), javascript_roundtrip_stable_value(value));
+            }
+            Value::Object(stable)
+        }
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                return Value::Number(number.clone());
+            }
+            let Some(float) = number.as_f64() else {
+                return Value::Number(number.clone());
+            };
+            if float == 0.0 {
+                Value::Number(0.into())
+            } else if float.fract() == 0.0 && float.abs() <= 9_007_199_254_740_991.0 {
+                Value::Number((float as i64).into())
+            } else {
+                Value::Number(number.clone())
+            }
+        }
+        value => value.clone(),
+    }
+}
+
 pub fn validate_endpoint_request(
     contract: &EndpointFamilyContract,
     request: &Value,
 ) -> Result<(), Vec<EndpointContractViolation>> {
-    validate_endpoint_value(
+    let mut violations = validate_endpoint_value(
         &contract.request_attributes,
         &contract.required_request_attributes,
         &contract.request_attribute_specs,
         request,
         "request",
     )
+    .err()
+    .unwrap_or_default();
+    if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
+        validate_openai_image_dimension_aliases(contract, request, &mut violations);
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+fn validate_openai_image_dimension_aliases(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    let Some(object) = request.as_object() else {
+        return;
+    };
+    let has_size = object.contains_key("size");
+    let has_width = object.contains_key("width");
+    let has_height = object.contains_key("height");
+    if has_size && (has_width || has_height) {
+        violations.push(EndpointContractViolation {
+            path: "size".to_owned(),
+            reason: "size cannot be combined with width/height".to_owned(),
+        });
+        return;
+    }
+    if has_width != has_height {
+        violations.push(EndpointContractViolation {
+            path: if has_width { "height" } else { "width" }.to_owned(),
+            reason: "width and height must be supplied together".to_owned(),
+        });
+    }
+    let Some(size) = object.get("size").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((width, height)) = size.split_once('x') else {
+        violations.push(EndpointContractViolation {
+            path: "size".to_owned(),
+            reason: "size must be WIDTHxHEIGHT".to_owned(),
+        });
+        return;
+    };
+    if height.contains('x') {
+        violations.push(EndpointContractViolation {
+            path: "size".to_owned(),
+            reason: "size must be WIDTHxHEIGHT".to_owned(),
+        });
+        return;
+    }
+    for (path, component) in [("width", width), ("height", height)] {
+        let Ok(component) = component.parse::<u64>() else {
+            violations.push(EndpointContractViolation {
+                path: "size".to_owned(),
+                reason: format!("size {path} is not a positive integer"),
+            });
+            continue;
+        };
+        let Some(spec) = contract.request_attribute_specs.get(path) else {
+            continue;
+        };
+        if let Err(reason) = validate_endpoint_attribute_value(spec, &json!(component)) {
+            violations.push(EndpointContractViolation {
+                path: "size".to_owned(),
+                reason: format!("size {path} violates the signed {path} constraint: {reason}"),
+            });
+        }
+    }
 }
 
 pub fn validate_endpoint_response(
@@ -2083,6 +2360,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_request_fingerprint_survives_javascript_number_serialization() {
+        let rust_shape = serde_json::from_str::<Value>(
+            r#"{"cfg_scale":1.0,"shift":3.0,"nested":{"epsilon":1e-6,"zero":-0.0}}"#,
+        )
+        .unwrap();
+        let javascript_shape = serde_json::from_str::<Value>(
+            r#"{"nested":{"zero":0,"epsilon":0.000001},"shift":3,"cfg_scale":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            endpoint_request_fingerprint(&rust_shape),
+            endpoint_request_fingerprint(&javascript_shape)
+        );
+        assert_eq!(
+            endpoint_request_fingerprint(&rust_shape),
+            blake3::hash(
+                javascript_roundtrip_stable_value(&javascript_shape)
+                    .to_string()
+                    .as_bytes()
+            )
+            .to_hex()
+            .to_string(),
+            "the normalized sender hash remains compatible with the existing receiver hash"
+        );
+    }
+
+    #[test]
+    fn endpoint_request_fingerprint_detects_numeric_value_changes() {
+        assert_ne!(
+            endpoint_request_fingerprint(&json!({"seed": 9_007_199_254_740_993_u64})),
+            endpoint_request_fingerprint(&json!({"seed": 9_007_199_254_740_992_u64}))
+        );
+        assert_ne!(
+            endpoint_request_fingerprint(&json!({"cfg_scale": 1.5})),
+            endpoint_request_fingerprint(&json!({"cfg_scale": 1.500_000_1}))
+        );
+    }
+
+    #[test]
     fn every_endpoint_template_has_complete_typed_specs() {
         for family in [
             ENDPOINT_OPENAI_CHAT_COMPLETIONS,
@@ -2146,6 +2463,94 @@ mod tests {
         assert!(validate_endpoint_attribute_value(error, &Value::Null).is_ok());
         assert!(validate_endpoint_attribute_value(error, &json!({"code": "failed"})).is_ok());
         assert!(validate_endpoint_attribute_value(error, &json!("failed")).is_err());
+    }
+
+    #[test]
+    fn attribute_validator_enforces_numeric_multiple() {
+        let mut spec = integer_spec(256.0, 2_048.0, 1_024);
+        spec.multiple_of = Some(16.0);
+        assert!(validate_endpoint_attribute_value(&spec, &json!(1024)).is_ok());
+        assert!(validate_endpoint_attribute_value(&spec, &json!(1025)).is_err());
+        assert!(numeric_boundary_values(&spec)
+            .iter()
+            .any(|(kind, _, accepted)| *kind == "not_multiple_of" && !accepted));
+    }
+
+    #[test]
+    fn request_defaults_materialize_without_overwriting_client_values() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_HF_TEXT_TO_IMAGE).unwrap();
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.width")
+            .unwrap()
+            .default = Some(json!(1024));
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.height")
+            .unwrap()
+            .default = Some(json!(1024));
+
+        let normalized = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({"inputs":"hello", "parameters":{"width":768}}),
+        )
+        .unwrap();
+        assert_eq!(normalized["parameters"]["width"], json!(768));
+        assert_eq!(normalized["parameters"]["height"], json!(1024));
+    }
+
+    #[test]
+    fn openai_image_aliases_share_signed_dimension_constraints() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+            .expect("OpenAI image endpoint contract");
+        for path in ["width", "height"] {
+            let spec = contract.request_attribute_specs.get_mut(path).unwrap();
+            spec.default = Some(json!(1024));
+            spec.multiple_of = Some(16.0);
+        }
+
+        let normalized = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({"model":"test/image", "prompt":"a compass"}),
+        )
+        .unwrap();
+        assert_eq!(normalized["width"], json!(1024));
+        assert_eq!(normalized["height"], json!(1024));
+        assert!(normalized.get("size").is_none());
+
+        let explicit_size = json!({
+            "model":"test/image",
+            "prompt":"a compass",
+            "size":"768x1024"
+        });
+        assert!(validate_endpoint_request(&contract, &explicit_size).is_ok());
+        let normalized = materialize_endpoint_request_defaults(&contract, &explicit_size).unwrap();
+        assert_eq!(normalized["size"], json!("768x1024"));
+        assert!(normalized.get("width").is_none());
+        assert!(normalized.get("height").is_none());
+
+        let invalid_multiple = validate_endpoint_request(
+            &contract,
+            &json!({"model":"test/image", "prompt":"a compass", "size":"770x1024"}),
+        )
+        .unwrap_err();
+        assert!(invalid_multiple.iter().any(|violation| {
+            violation.path == "size" && violation.reason.contains("multiple of 16")
+        }));
+        let conflicting = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model":"test/image",
+                "prompt":"a compass",
+                "size":"1024x1024",
+                "width":1024,
+                "height":1024
+            }),
+        )
+        .unwrap_err();
+        assert!(conflicting
+            .iter()
+            .any(|violation| violation.reason.contains("cannot be combined")));
     }
 
     #[test]

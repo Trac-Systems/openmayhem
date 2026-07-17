@@ -48,8 +48,13 @@ append_default() {
 }
 
 append_default MAYHEM_REPO "$repo"
+append_default MAYHEM_ASSET_DIR "$repo"
 append_default MAYHEM_PEER_RPC 'http://127.0.0.1:49223/v1'
 append_default MAYHEM_CONTRACT_RPC_URL 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_RPC_URL 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_GATEWAY_URL 'http://127.0.0.1:11435'
+append_default MAYHEM_ADMIN_HOME "$root/.mayhem-local/live-home"
+append_default MAYHEM_CADENCE_STATE_DIR "$root/.mayhem-local/settlement"
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_CONTRACT_DRY_RUN '0'
 append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
@@ -114,9 +119,17 @@ require_equal MSB_CHANNEL '0000trac0network0msb0mainnet0000'
 require_equal MAYHEM_TNK_TREASURY_ADDRESS 'trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh'
 require_equal MAYHEM_TAP_ETH_CHAIN_ID '1'
 require_equal MAYHEM_TAP_TOKEN_ADDR '0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454'
-require_equal MAYHEM_TAP_POOL_ADDRESS '0x9B254d37C28Fb5893F46513a61925eDC2F300615'
+require_equal MAYHEM_TAP_POOL_ADDRESS '0xcFEA9A256F1F96269D848cABF1eCb00fD2DD6a28'
+require_equal MAYHEM_TAP_GOVERNANCE_SIGNER '0x199E54a7dfe9DcfD4567Fd635a298e2902d0F8B3'
+require_equal MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS '3600'
 require_live_rpc MAYHEM_TAP_ETH_RPC
 require_live_rpc MAYHEM_TAP_ETH_RPC_FALLBACKS
+require_live_rpc MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS
+require_equal MAYHEM_TAP_PRICE_FLOOR_AU '1000000000000000'
+require_equal MAYHEM_TAP_PRICE_CEILING_AU '10000000000000000000'
+require_equal MAYHEM_TAP_PRICE_MAX_DEVIATION_BPS '2000'
+require_equal MAYHEM_TAP_PRICE_MIN_SOURCES '2'
+require_equal MAYHEM_TAP_TWAP_WINDOW_SECONDS '1800'
 require_equal MAYHEM_PAYGATE_STRIPE_ENABLED '1'
 require_equal MAYHEM_STRIPE_MODE 'live'
 require_equal MAYHEM_STRIPE_API_BASE_URL 'https://api.stripe.com'
@@ -181,6 +194,7 @@ systemctl enable \
   mayhem-tap-deposit.service \
   mayhem-tnk-deposit.service \
   mayhem-tap-settlement.service \
+  mayhem-epoch-cadence.timer \
   mayhem-backup.timer
 
 echo "Mayhem mainnet units installed and enabled."

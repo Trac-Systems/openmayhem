@@ -5,12 +5,21 @@ import { fileURLToPath } from 'node:url';
 
 import { ethers } from 'ethers';
 
+import { safeErrorMessage } from './safe-output.mjs';
+
 const scriptPath = fileURLToPath(import.meta.url);
 const USD_AU = 1_000_000_000_000_000_000n;
 
 export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 export const DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_RPC_TIMEOUT_MS = 4_000;
+export const DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_ADMIN_VERIFY_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_FAILURE_RETRY_MS = 30 * 1000;
+export const DEFAULT_TWAP_WINDOW_SECONDS = 30 * 60;
+export const DEFAULT_ESTIMATED_BLOCK_SECONDS = 12;
+export const DEFAULT_MIN_PRICE_SOURCES = 2;
+export const DEFAULT_MAX_DEVIATION_BPS = 2_000;
 export const DEFAULT_TAP_USDT_POOL = '0x1563e9af51616e78830de3325da752de369c1714';
 export const DEFAULT_USDT_ADDRESS = '0xdac17f958d2ee523a2206206994597c13d831ec7';
 export const DEFAULT_MAINNET_CHAIN_ID = 1;
@@ -18,7 +27,13 @@ export const UNIV2_POOL_ABI = [
   'function token0() view returns (address)',
   'function token1() view returns (address)',
   'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function price0CumulativeLast() view returns (uint256)',
+  'function price1CumulativeLast() view returns (uint256)',
 ];
+
+const Q112 = 2n ** 112n;
+const UINT32_MODULUS = 2n ** 32n;
+const UINT256_MODULUS = 2n ** 256n;
 
 let cache = null;
 let inFlight = null;
@@ -57,7 +72,7 @@ function rpcFailureLabel(url) {
 }
 
 function rpcErrorMessage(error) {
-  return String(error?.message || error || 'unknown error').replace(/https?:\/\/[^\s"'<>]+/g, 'https://<redacted>');
+  return safeErrorMessage(error, 500);
 }
 
 function shellQuote(value) {
@@ -211,6 +226,204 @@ export function tapUsdAuFromReserves({
   return (numerator / denominator).toString();
 }
 
+function uint256Add(left, right) {
+  return (left + right) % UINT256_MODULUS;
+}
+
+function uint256Delta(end, start) {
+  return (end - start + UINT256_MODULUS) % UINT256_MODULUS;
+}
+
+export function counterfactualCumulativePrices({
+  price0Cumulative,
+  price1Cumulative,
+  reserve0,
+  reserve1,
+  blockTimestampLast,
+  blockTimestamp,
+} = {}) {
+  const r0 = toPositiveBigInt(reserve0, 'reserve0');
+  const r1 = toPositiveBigInt(reserve1, 'reserve1');
+  const timestampLast = BigInt(parseNonNegativeInt(blockTimestampLast, 'blockTimestampLast'));
+  const timestamp = BigInt(parseNonNegativeInt(blockTimestamp, 'blockTimestamp')) % UINT32_MODULUS;
+  const elapsed = (timestamp - timestampLast + UINT32_MODULUS) % UINT32_MODULUS;
+  return {
+    price0_cumulative: uint256Add(
+      BigInt(price0Cumulative),
+      ((r1 * Q112) / r0) * elapsed
+    ),
+    price1_cumulative: uint256Add(
+      BigInt(price1Cumulative),
+      ((r0 * Q112) / r1) * elapsed
+    ),
+    block_timestamp: Number(timestamp),
+  };
+}
+
+export function tapUsdAuFromAverageQ112({
+  averagePriceQ112,
+  tapDecimals = 18,
+  usdtDecimals = 6,
+} = {}) {
+  const average = toPositiveBigInt(averagePriceQ112, 'average Q112 price');
+  return (
+    average
+    * pow10(tapDecimals)
+    * USD_AU
+    / Q112
+    / pow10(usdtDecimals)
+  ).toString();
+}
+
+function blockTagForNumber(blockNumber) {
+  return `0x${blockNumber.toString(16)}`;
+}
+
+async function readRpcBlock(provider, blockTag, timeoutMs) {
+  let block;
+  if (typeof provider.send === 'function') {
+    block = await withTimeout(
+      provider.send('eth_getBlockByNumber', [blockTag, false]),
+      timeoutMs,
+      `eth_getBlockByNumber(${blockTag})`
+    );
+  } else if (typeof provider.getBlock === 'function') {
+    block = await withTimeout(provider.getBlock(blockTag), timeoutMs, `getBlock(${blockTag})`);
+  } else {
+    throw new Error('Ethereum provider cannot read blocks');
+  }
+  if (!block || block.number === undefined || block.timestamp === undefined) {
+    throw new Error(`Ethereum RPC returned no block for ${blockTag}`);
+  }
+  const number = typeof block.number === 'string' ? Number(BigInt(block.number)) : Number(block.number);
+  const timestamp = typeof block.timestamp === 'string'
+    ? Number(BigInt(block.timestamp))
+    : Number(block.timestamp);
+  if (!Number.isSafeInteger(number) || number < 0 || !Number.isSafeInteger(timestamp) || timestamp < 0) {
+    throw new Error(`Ethereum RPC returned an invalid block for ${blockTag}`);
+  }
+  return { number, timestamp, hash: block.hash ?? null };
+}
+
+async function readPairSnapshot(pool, block, timeoutMs) {
+  const blockTag = block.number;
+  const [reserves, price0Cumulative, price1Cumulative] = await Promise.all([
+    withTimeout(pool.getReserves({ blockTag }), timeoutMs, `pool.getReserves(${blockTag})`),
+    withTimeout(pool.price0CumulativeLast({ blockTag }), timeoutMs, `pool.price0CumulativeLast(${blockTag})`),
+    withTimeout(pool.price1CumulativeLast({ blockTag }), timeoutMs, `pool.price1CumulativeLast(${blockTag})`),
+  ]);
+  const reserve0 = reserveAt(reserves, 0, 'reserve0');
+  const reserve1 = reserveAt(reserves, 1, 'reserve1');
+  const blockTimestampLast = reserveAt(reserves, 2, 'blockTimestampLast');
+  return {
+    ...block,
+    reserve0: toPositiveBigInt(reserve0, 'reserve0'),
+    reserve1: toPositiveBigInt(reserve1, 'reserve1'),
+    ...counterfactualCumulativePrices({
+      price0Cumulative,
+      price1Cumulative,
+      reserve0,
+      reserve1,
+      blockTimestampLast: Number(blockTimestampLast),
+      blockTimestamp: block.timestamp,
+    }),
+  };
+}
+
+async function findTwapStartBlock(provider, endBlock, {
+  windowSeconds,
+  estimatedBlockSeconds,
+  timeoutMs,
+} = {}) {
+  const window = parsePositiveInt(windowSeconds, '--twap-window-seconds', DEFAULT_TWAP_WINDOW_SECONDS);
+  const estimate = parsePositiveInt(
+    estimatedBlockSeconds,
+    '--estimated-block-seconds',
+    DEFAULT_ESTIMATED_BLOCK_SECONDS
+  );
+  let blocksBack = Math.max(1, Math.ceil(window / estimate));
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const number = Math.max(0, endBlock.number - blocksBack);
+    const start = await readRpcBlock(provider, blockTagForNumber(number), timeoutMs);
+    const elapsed = endBlock.timestamp - start.timestamp;
+    if (elapsed >= window || number === 0) return start;
+    const missing = window - elapsed;
+    blocksBack += Math.max(1, Math.ceil(missing / estimate));
+  }
+  throw new Error('Unable to locate a sufficiently old block for the TAP TWAP window');
+}
+
+export async function readTapUsdTwapFromDex({
+  provider,
+  poolAddress = DEFAULT_TAP_USDT_POOL,
+  tapAddress,
+  usdtAddress = DEFAULT_USDT_ADDRESS,
+  tapDecimals = 18,
+  usdtDecimals = 6,
+  windowSeconds = DEFAULT_TWAP_WINDOW_SECONDS,
+  estimatedBlockSeconds = DEFAULT_ESTIMATED_BLOCK_SECONDS,
+  timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
+  poolFactory = (address, abi, providerArg) => new ethers.Contract(address, abi, providerArg),
+} = {}) {
+  if (!provider) throw new Error('Missing Ethereum RPC provider');
+  const pool = poolFactory(poolAddress, UNIV2_POOL_ABI, provider);
+  const endBlock = await readRpcBlock(provider, 'finalized', timeoutMs);
+  const startBlock = await findTwapStartBlock(provider, endBlock, {
+    windowSeconds,
+    estimatedBlockSeconds,
+    timeoutMs,
+  });
+  const [token0, token1, start, end] = await Promise.all([
+    withTimeout(pool.token0({ blockTag: endBlock.number }), timeoutMs, 'pool.token0'),
+    withTimeout(pool.token1({ blockTag: endBlock.number }), timeoutMs, 'pool.token1'),
+    readPairSnapshot(pool, startBlock, timeoutMs),
+    readPairSnapshot(pool, endBlock, timeoutMs),
+  ]);
+  const token0Lc = normalizeAddress(token0, 'pool token0');
+  const token1Lc = normalizeAddress(token1, 'pool token1');
+  const tap = normalizeAddress(tapAddress, 'TAP address');
+  const usdt = normalizeAddress(usdtAddress, 'USDT address');
+  const elapsed = end.timestamp - start.timestamp;
+  if (!Number.isSafeInteger(elapsed) || elapsed < parsePositiveInt(windowSeconds, '--twap-window-seconds')) {
+    throw new Error('TAP TWAP observation window is too short');
+  }
+
+  let cumulativeDelta;
+  let tapReserve;
+  let usdtReserve;
+  if (token0Lc === tap && token1Lc === usdt) {
+    cumulativeDelta = uint256Delta(end.price0_cumulative, start.price0_cumulative);
+    tapReserve = end.reserve0;
+    usdtReserve = end.reserve1;
+  } else if (token1Lc === tap && token0Lc === usdt) {
+    cumulativeDelta = uint256Delta(end.price1_cumulative, start.price1_cumulative);
+    tapReserve = end.reserve1;
+    usdtReserve = end.reserve0;
+  } else {
+    throw new Error('Configured TAP/USDT pool token ordering does not match the provided token addresses');
+  }
+  const averagePriceQ112 = cumulativeDelta / BigInt(elapsed);
+  return {
+    tap_usd_au: tapUsdAuFromAverageQ112({ averagePriceQ112, tapDecimals, usdtDecimals }),
+    spot_tap_usd_au: tapUsdAuFromReserves({
+      tapReserve,
+      usdtReserve,
+      tapDecimals,
+      usdtDecimals,
+    }),
+    pool_address: normalizeAddress(poolAddress, 'pool address'),
+    token0: token0Lc,
+    token1: token1Lc,
+    tap_reserve: tapReserve.toString(),
+    usdt_reserve: usdtReserve.toString(),
+    start_block: start.number,
+    end_block: end.number,
+    start_timestamp: start.timestamp,
+    end_timestamp: end.timestamp,
+    window_seconds: elapsed,
+  };
+}
+
 function reserveAt(reserves, index, name) {
   const byName = reserves?.[name];
   const byIndex = reserves?.[index];
@@ -289,21 +502,88 @@ function cacheRate(rate, nowMs) {
   return { ...cache };
 }
 
+export function medianInteger(values) {
+  if (!Array.isArray(values) || values.length === 0) throw new Error('Cannot medianize zero values');
+  const sorted = values.map((value) => BigInt(value)).sort((left, right) => (
+    left < right ? -1 : left > right ? 1 : 0
+  ));
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2n;
+}
+
+export function deviationWithinBps(value, reference, maxDeviationBps) {
+  const observed = toPositiveBigInt(value, 'observed price');
+  const expected = toPositiveBigInt(reference, 'reference price');
+  const bps = parseNonNegativeInt(maxDeviationBps, 'max deviation bps');
+  if (bps > 10_000) throw new Error('max deviation bps cannot exceed 10000');
+  const delta = observed > expected ? observed - expected : expected - observed;
+  return delta * 10_000n <= expected * BigInt(bps);
+}
+
+function mainnetPricePolicy({
+  hardFloorAu,
+  hardCeilingAu,
+  maxDeviationBps,
+  minimumSources,
+  env,
+} = {}) {
+  const floor = parsePositiveDecimalIntegerString(
+    hardFloorAu ?? env.MAYHEM_TAP_PRICE_FLOOR_AU,
+    'MAYHEM_TAP_PRICE_FLOOR_AU'
+  );
+  const ceiling = parsePositiveDecimalIntegerString(
+    hardCeilingAu ?? env.MAYHEM_TAP_PRICE_CEILING_AU,
+    'MAYHEM_TAP_PRICE_CEILING_AU'
+  );
+  if (BigInt(floor) >= BigInt(ceiling)) {
+    throw new Error('TAP hard price floor must be below the hard price ceiling');
+  }
+  const deviationBps = parseNonNegativeInt(
+    maxDeviationBps ?? env.MAYHEM_TAP_PRICE_MAX_DEVIATION_BPS ?? DEFAULT_MAX_DEVIATION_BPS,
+    'MAYHEM_TAP_PRICE_MAX_DEVIATION_BPS'
+  );
+  if (deviationBps > 10_000) throw new Error('TAP max price deviation cannot exceed 10000 bps');
+  const sources = parsePositiveInt(
+    minimumSources ?? env.MAYHEM_TAP_PRICE_MIN_SOURCES ?? DEFAULT_MIN_PRICE_SOURCES,
+    'MAYHEM_TAP_PRICE_MIN_SOURCES'
+  );
+  if (sources < 2) throw new Error('TAP mainnet price oracle requires at least two independent sources');
+  return {
+    hard_floor_au: floor,
+    hard_ceiling_au: ceiling,
+    max_deviation_bps: deviationBps,
+    minimum_sources: sources,
+  };
+}
+
 export async function resolveTapUsdRate({
   rpcUrl,
   rpcUrls,
   fallbackRpcUrls,
+  publicFallbackRpcUrls,
   chainId,
   poolAddress = DEFAULT_TAP_USDT_POOL,
   tapAddress,
   usdtAddress = DEFAULT_USDT_ADDRESS,
   fallbackUsd,
   fallbackUsdAu,
+  hardFloorAu,
+  hardCeilingAu,
+  maxDeviationBps,
+  minimumSources,
+  windowSeconds = DEFAULT_TWAP_WINDOW_SECONDS,
+  estimatedBlockSeconds = DEFAULT_ESTIMATED_BLOCK_SECONDS,
   env = process.env,
   ttlMs = DEFAULT_CACHE_TTL_MS,
   timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
-  providerFactory = (url) => new ethers.JsonRpcProvider(url),
+  providerFactory = (url) => new ethers.JsonRpcProvider(url, DEFAULT_MAINNET_CHAIN_ID, {
+    staticNetwork: true,
+    batchMaxCount: 1,
+  }),
   poolFactory,
+  priceReader = readTapUsdTwapFromDex,
   nowMs = () => Date.now(),
   nowSeconds = () => Math.floor(Date.now() / 1000),
 } = {}) {
@@ -332,50 +612,105 @@ export async function resolveTapUsdRate({
       }, now);
     }
 
-    for (const candidate of candidates) {
+    const policy = mainnetPricePolicy({
+      hardFloorAu,
+      hardCeilingAu,
+      maxDeviationBps,
+      minimumSources,
+      env,
+    });
+    const observations = [];
+    const observeCandidates = async (sourceCandidates, publicFallback = false) => Promise.all(
+      sourceCandidates.map(async (candidate) => {
+      let provider;
       try {
-        const provider = providerFactory(candidate);
-        const dex = await readTapUsdAuFromDex({
+        provider = providerFactory(candidate);
+        const dex = await priceReader({
           provider,
           poolAddress,
           tapAddress,
           usdtAddress,
+          windowSeconds,
+          estimatedBlockSeconds,
           timeoutMs,
           poolFactory,
         });
-        return cacheRate({
-          source: 'uniswap-v2',
-          tap_usd_au: dex.tap_usd_au,
-          ts: nowSeconds(),
-          pool_address: dex.pool_address,
-          tap_reserve: dex.tap_reserve,
-          usdt_reserve: dex.usdt_reserve,
+        observations.push({
+          ...dex,
           rpc_source: rpcFailureLabel(candidate),
-          failures,
-        }, now);
+          public_fallback: publicFallback,
+        });
       } catch (error) {
         failures.push({
-          source: 'uniswap-v2',
+          source: 'uniswap-v2-twap',
           rpc_source: rpcFailureLabel(candidate),
           error: rpcErrorMessage(error),
+          public_fallback: publicFallback,
         });
+      } finally {
+        provider?.destroy?.();
+      }
+      })
+    );
+    await observeCandidates(candidates);
+    if (observations.length < policy.minimum_sources) {
+      const privateUrls = new Set(candidates);
+      const publicCandidates = rpcUrlCandidates({ rpcUrls: publicFallbackRpcUrls })
+        .filter((candidate) => !privateUrls.has(candidate));
+      for (const candidate of publicCandidates) {
+        await observeCandidates([candidate], true);
+        if (observations.length >= policy.minimum_sources) break;
       }
     }
+
+    if (observations.length >= policy.minimum_sources) {
+      observations.sort((left, right) => left.rpc_source.localeCompare(right.rpc_source));
+      const medianTwap = medianInteger(observations.map((item) => item.tap_usd_au));
+      const medianSpot = medianInteger(observations.map((item) => item.spot_tap_usd_au));
+      if (medianTwap < BigInt(policy.hard_floor_au) || medianTwap > BigInt(policy.hard_ceiling_au)) {
+        throw new Error('TAP TWAP median is outside the configured hard price bounds');
+      }
+      for (const observation of observations) {
+        if (!deviationWithinBps(observation.tap_usd_au, medianTwap, policy.max_deviation_bps)) {
+          throw new Error(`TAP TWAP source ${observation.rpc_source} exceeds the median deviation band`);
+        }
+        if (!deviationWithinBps(observation.spot_tap_usd_au, medianTwap, policy.max_deviation_bps)) {
+          throw new Error(`TAP spot price from ${observation.rpc_source} exceeds the TWAP deviation band`);
+        }
+      }
+      return cacheRate({
+        source: 'uniswap-v2-twap-median',
+        tap_usd_au: medianTwap.toString(),
+        spot_tap_usd_au: medianSpot.toString(),
+        ts: nowSeconds(),
+        pool_address: observations[0].pool_address,
+        rpc_sources: observations.map((item) => item.rpc_source),
+        observations: observations.map((item) => ({
+          rpc_source: item.rpc_source,
+          tap_usd_au: item.tap_usd_au,
+          spot_tap_usd_au: item.spot_tap_usd_au,
+          start_block: item.start_block,
+          end_block: item.end_block,
+          start_timestamp: item.start_timestamp,
+          end_timestamp: item.end_timestamp,
+          window_seconds: item.window_seconds,
+          public_fallback: item.public_fallback,
+        })),
+        policy,
+        failures,
+      }, now);
+    }
+
+    failures.push({
+      source: 'uniswap-v2-twap-median',
+      error: `source quorum unavailable: ${observations.length}/${policy.minimum_sources}`,
+    });
 
     if (fallback !== null) {
       return cacheRate({
         source: 'config',
         tap_usd_au: fallback,
         ts: nowSeconds(),
-        failures,
-      }, now);
-    }
-    if (cache) {
-      return cacheRate({
-        source: 'stale',
-        tap_usd_au: cache.tap_usd_au,
-        ts: nowSeconds(),
-        stale_from_ts: cache.ts,
         failures,
       }, now);
     }
@@ -423,20 +758,35 @@ export function tapRateStateMatches(rate, value) {
 
 export async function waitForTapRateState(rate, {
   rpcUrl,
-  timeoutMs = 0,
+  timeoutMs = DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+  requestTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+  const deadline = Date.now() + parsePositiveInt(
+    timeoutMs,
+    '--verify-timeout-ms',
+    DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+  );
   let last = null;
-  while (deadline === null || Date.now() <= deadline) {
-    last = await readContractStateValue(rpcUrl, 'tap/rate/latest', { fetchImpl });
+  let lastError = null;
+  while (Date.now() <= deadline) {
+    try {
+      last = await withTimeout(
+        readContractStateValue(rpcUrl, 'tap/rate/latest', { fetchImpl }),
+        requestTimeoutMs,
+        'tap/rate/latest state read',
+      );
+      lastError = null;
+    } catch (error) {
+      lastError = safeErrorMessage(error, 500);
+    }
     if (tapRateStateMatches(rate, last)) {
       return { verified: true, state: last };
     }
     await sleep(pollMs);
   }
-  return { verified: false, state: last };
+  return { verified: false, state: last, error: lastError };
 }
 
 export function buildAdminCommandArgs(rate, {
@@ -483,14 +833,15 @@ export async function runOnce(options = {}) {
     ...options,
     rpcUrl: options.priceRpcUrl ?? options.ethRpcUrl ?? options.rpcUrl,
     fallbackRpcUrls: options.fallbackPriceRpcUrls ?? options.ethRpcFallbacks,
+    publicFallbackRpcUrls: options.publicPriceRpcUrls ?? options.publicEthRpcFallbacks,
     chainId,
   });
   if (
-    options.requireLiveMainnetPrice
+    (options.requireLiveMainnetPrice || options.submit)
     && chainId === DEFAULT_MAINNET_CHAIN_ID
-    && rate.source !== 'uniswap-v2'
+    && rate.source !== 'uniswap-v2-twap-median'
   ) {
-    throw new Error(`Refusing to post non-mainnet-live TAP price on chain-id 1 (source=${rate.source}). Configure MAYHEM_TAP_ETH_RPC plus QuickNode fallback, or pass --allow-price-fallback only for local/emergency dry runs.`);
+    throw new Error(`Refusing to use a non-live TAP price for a mainnet submission (source=${rate.source}). Configure at least two independent Ethereum RPC sources; pinned fallback prices are dry-run only on chain-id 1.`);
   }
   const adminOptions = {
     submit: true,
@@ -508,11 +859,16 @@ export async function runOnce(options = {}) {
     verified: false,
     source: rate.source,
     tap_usd_au: rate.tap_usd_au,
+    spot_tap_usd_au: rate.spot_tap_usd_au ?? null,
     ts: rate.ts,
     pool_address: rate.pool_address ?? null,
     tap_reserve: rate.tap_reserve ?? null,
     usdt_reserve: rate.usdt_reserve ?? null,
     rpc_source: rate.rpc_source ?? null,
+    rpc_sources: rate.rpc_sources ?? [],
+    observations: rate.observations ?? [],
+    public_fallback_used: rate.observations?.some((item) => item.public_fallback === true) ?? false,
+    policy: rate.policy ?? null,
     stale_from_ts: rate.stale_from_ts ?? null,
     cache_hit: Boolean(rate.cache_hit),
     failures: rate.failures ?? [],
@@ -521,22 +877,40 @@ export async function runOnce(options = {}) {
 
   if (options.submit) {
     const spawnImpl = options.spawnImpl ?? spawnSync;
+    const submitTimeoutMs = parsePositiveInt(
+      options.submitTimeoutMs,
+      '--submit-timeout-ms',
+      DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+    );
     const child = spawnImpl(
       adminOptions.mayhemBin,
       buildAdminCommandArgs(rate, adminOptions),
-      { encoding: 'utf8' }
+      {
+        encoding: 'utf8',
+        timeout: submitTimeoutMs,
+        killSignal: 'SIGKILL',
+        maxBuffer: 1024 * 1024,
+      }
     );
     report.submitted = child.status === 0;
     report.exit_status = child.status;
+    report.submit_timed_out = child.error?.code === 'ETIMEDOUT';
     report.stdout = child.stdout?.trim() || null;
     report.stderr = child.stderr?.trim() || null;
-    if (child.status !== 0) {
+    if (report.submit_timed_out) {
+      report.ok = false;
+      report.error = `mayhem admin tap-rate-oracle timed out after ${submitTimeoutMs}ms`;
+    } else if (child.error) {
+      report.ok = false;
+      report.error = `mayhem admin tap-rate-oracle failed: ${safeErrorMessage(child.error, 500)}`;
+    } else if (child.status !== 0) {
       report.ok = false;
       report.error = `mayhem admin tap-rate-oracle exited ${child.status}`;
     } else if (adminOptions.rpcUrl && options.verify !== false && !adminOptions.sim) {
       const verification = await waitForTapRateState(rate, {
         rpcUrl: adminOptions.rpcUrl,
         timeoutMs: options.verifyTimeoutMs,
+        requestTimeoutMs: options.adminRpcTimeoutMs,
         pollMs: options.verifyPollMs,
         fetchImpl: options.fetchImpl,
       });
@@ -570,15 +944,24 @@ async function main() {
     || process.env.MAYHEM_TAP_ETH_RPC_FALLBACKS
     || process.env.MAYHEM_TAP_ETH_RPC_FALLBACK
     || process.env.ETH_RPC_FALLBACKS;
+  const publicEthRpcFallbacks = args['public-eth-rpc-fallbacks']
+    || args['public-eth-rpc-fallback']
+    || process.env.MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS;
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const chainId = args['chain-id'] ?? process.env.MAYHEM_TAP_ETH_CHAIN_ID ?? (ethRpc ? DEFAULT_MAINNET_CHAIN_ID : 0);
   const intervalMs = parsePositiveInt(args['interval-ms'] ?? DEFAULT_INTERVAL_MS, '--interval-ms', DEFAULT_INTERVAL_MS);
+  const failureRetryMs = parsePositiveInt(
+    args['failure-retry-ms'] ?? DEFAULT_FAILURE_RETRY_MS,
+    '--failure-retry-ms',
+    DEFAULT_FAILURE_RETRY_MS,
+  );
   const once = boolArg(args.once, false);
   const json = boolArg(args.json, false);
   const submit = boolArg(args.submit, false);
   const options = {
     priceRpcUrl: ethRpc,
     fallbackPriceRpcUrls: ethRpcFallbacks,
+    publicPriceRpcUrls: publicEthRpcFallbacks,
     adminRpcUrl,
     chainId,
     poolAddress: args.pool || process.env.MAYHEM_TAP_USDT_POOL || DEFAULT_TAP_USDT_POOL,
@@ -586,9 +969,36 @@ async function main() {
     usdtAddress: args['usdt-token'] || process.env.MAYHEM_USDT_TOKEN_ADDR || DEFAULT_USDT_ADDRESS,
     fallbackUsd: args['tap-usd'],
     fallbackUsdAu: args['tap-usd-au'] ?? args['fallback-usd-au'],
+    hardFloorAu: args['hard-floor-au'] ?? process.env.MAYHEM_TAP_PRICE_FLOOR_AU,
+    hardCeilingAu: args['hard-ceiling-au'] ?? process.env.MAYHEM_TAP_PRICE_CEILING_AU,
+    maxDeviationBps: args['max-deviation-bps']
+      ?? process.env.MAYHEM_TAP_PRICE_MAX_DEVIATION_BPS,
+    minimumSources: args['minimum-sources'] ?? process.env.MAYHEM_TAP_PRICE_MIN_SOURCES,
+    windowSeconds: parsePositiveInt(
+      args['twap-window-seconds']
+        ?? process.env.MAYHEM_TAP_TWAP_WINDOW_SECONDS
+        ?? DEFAULT_TWAP_WINDOW_SECONDS,
+      '--twap-window-seconds',
+      DEFAULT_TWAP_WINDOW_SECONDS
+    ),
+    estimatedBlockSeconds: parsePositiveInt(
+      args['estimated-block-seconds'] ?? DEFAULT_ESTIMATED_BLOCK_SECONDS,
+      '--estimated-block-seconds',
+      DEFAULT_ESTIMATED_BLOCK_SECONDS
+    ),
     env: process.env,
     ttlMs: parsePositiveInt(args['cache-ttl-ms'] ?? DEFAULT_CACHE_TTL_MS, '--cache-ttl-ms', DEFAULT_CACHE_TTL_MS),
     timeoutMs: parsePositiveInt(args['rpc-timeout-ms'] ?? DEFAULT_RPC_TIMEOUT_MS, '--rpc-timeout-ms', DEFAULT_RPC_TIMEOUT_MS),
+    adminRpcTimeoutMs: parsePositiveInt(
+      args['admin-rpc-timeout-ms'] ?? DEFAULT_RPC_TIMEOUT_MS,
+      '--admin-rpc-timeout-ms',
+      DEFAULT_RPC_TIMEOUT_MS,
+    ),
+    submitTimeoutMs: parsePositiveInt(
+      args['submit-timeout-ms'] ?? DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+      '--submit-timeout-ms',
+      DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+    ),
     submit,
     sim: boolArg(args.sim, false),
     mayhemBin: args['mayhem-bin'] || 'mayhem',
@@ -598,7 +1008,11 @@ async function main() {
       ? process.env[String(args['admin-wallet-password-env'])]
       : undefined,
     verify: !boolArg(args['no-verify'], false),
-    verifyTimeoutMs: parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0),
+    verifyTimeoutMs: parsePositiveInt(
+      args['verify-timeout-ms'] ?? DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+      '--verify-timeout-ms',
+      DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+    ),
     verifyPollMs: parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500),
     requireLiveMainnetPrice: !boolArg(args['allow-price-fallback'], false),
   };
@@ -610,8 +1024,9 @@ async function main() {
     } else {
       console.log('[tap:rate] TAP/USD oracle tick complete');
       console.log('[tap:rate] source:', report.source);
-      if (report.rpc_source) console.log('[tap:rate] rpc_source:', report.rpc_source);
+      if (report.rpc_sources.length > 0) console.log('[tap:rate] rpc_sources:', report.rpc_sources.join(', '));
       console.log('[tap:rate] tap_usd_au:', report.tap_usd_au);
+      if (report.spot_tap_usd_au) console.log('[tap:rate] spot_tap_usd_au:', report.spot_tap_usd_au);
       console.log('[tap:rate] submitted:', report.submitted);
       console.log('Copy/paste admin TAP rate oracle submit command:');
       console.log(report.copy_paste_admin_submit_command);
@@ -621,13 +1036,13 @@ async function main() {
     }
     if (!report.ok) process.exitCode = 2;
     if (once) break;
-    await sleep(intervalMs);
+    await sleep(report.ok ? intervalMs : failureRetryMs);
   } while (true);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
-    console.error(error?.stack || error?.message || String(error));
+    console.error(safeErrorMessage(error));
     process.exit(1);
   });
 }

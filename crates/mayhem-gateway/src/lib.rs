@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod failover;
+mod job_store;
 pub mod openai;
 pub mod pricing;
 pub mod provider_table;
@@ -20,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use jsonwebtoken::{
     decode, decode_header,
     jwk::{JwkSet, KeyAlgorithm},
@@ -44,6 +45,16 @@ pub const HEARTBEAT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
+pub const MAX_HARDWARE_QUOTE_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_HARDWARE_QUOTE_ENDORSEMENTS: usize = 64;
+pub const MAX_HARDWARE_QUOTE_ENDORSEMENT_BYTES: usize = 64 * 1024;
+pub const MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES: usize = 256 * 1024;
+pub const MAX_HARDWARE_QUOTE_METADATA_BYTES: usize = 256 * 1024;
+pub const MAX_HARDWARE_QUOTE_METADATA_DEPTH: usize = 32;
+pub const MAX_HARDWARE_QUOTE_METADATA_NODES: usize = 16_384;
+pub const MAX_NVIDIA_EAT_DEPTH: usize = 32;
+pub const MAX_NVIDIA_EAT_NODES: usize = 16_384;
+pub const MAX_NVIDIA_EAT_TOKENS: usize = 64;
 const APPLE_APP_ATTEST_ISSUER: &str = "https://appattest.apple.com";
 const NVIDIA_LOCAL_VERIFIER_ISSUER: &str = "https://local.verifier.attestation.nvidia.com";
 const NVIDIA_NRAS_ISSUER: &str = "https://nras.attestation.nvidia.com";
@@ -547,14 +558,17 @@ pub fn verify_attestation(
 }
 
 fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result<()> {
+    let Some(quote) = request.report.hw_quote.as_ref() else {
+        return if request.contract.att_tier < 2 {
+            Ok(())
+        } else {
+            Err(GatewayError::HardwareQuoteRequired)
+        };
+    };
+    validate_hardware_quote_bounds(quote)?;
     if request.contract.att_tier < 2 {
         return Ok(());
     }
-    let quote = request
-        .report
-        .hw_quote
-        .as_ref()
-        .ok_or(GatewayError::HardwareQuoteRequired)?;
     if quote.evidence.is_empty() {
         return Err(GatewayError::HardwareQuoteEvidenceMissing);
     }
@@ -625,18 +639,144 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
     }
 }
 
+fn validate_hardware_quote_bounds(quote: &HardwareQuote) -> Result<()> {
+    let kind = hardware_quote_kind_name(&quote.kind);
+    if quote.evidence.len() > MAX_HARDWARE_QUOTE_EVIDENCE_BYTES {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "evidence is {} bytes, maximum is {MAX_HARDWARE_QUOTE_EVIDENCE_BYTES}",
+                quote.evidence.len()
+            ),
+        ));
+    }
+    if quote.endorsements.len() > MAX_HARDWARE_QUOTE_ENDORSEMENTS {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "endorsements contain {} entries, maximum is {MAX_HARDWARE_QUOTE_ENDORSEMENTS}",
+                quote.endorsements.len()
+            ),
+        ));
+    }
+    let mut total_endorsement_bytes = 0_usize;
+    for endorsement in &quote.endorsements {
+        if endorsement.len() > MAX_HARDWARE_QUOTE_ENDORSEMENT_BYTES {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!(
+                    "an endorsement is {} bytes, maximum is {MAX_HARDWARE_QUOTE_ENDORSEMENT_BYTES}",
+                    endorsement.len()
+                ),
+            ));
+        }
+        total_endorsement_bytes = total_endorsement_bytes
+            .checked_add(endorsement.len())
+            .ok_or_else(|| hardware_quote_invalid(kind, "endorsement byte length overflow"))?;
+        if total_endorsement_bytes > MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!(
+                    "endorsements are {total_endorsement_bytes} bytes, maximum is {MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES}"
+                ),
+            ));
+        }
+    }
+    validate_bounded_json_value(
+        &quote.metadata,
+        MAX_HARDWARE_QUOTE_METADATA_BYTES,
+        MAX_HARDWARE_QUOTE_METADATA_DEPTH,
+        MAX_HARDWARE_QUOTE_METADATA_NODES,
+    )
+    .map_err(|reason| hardware_quote_invalid(kind, format!("metadata {reason}")))
+}
+
+fn validate_bounded_json_value(
+    value: &Value,
+    max_bytes: usize,
+    max_depth: usize,
+    max_nodes: usize,
+) -> std::result::Result<(), String> {
+    let mut stack = vec![(value, 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(format!("depth exceeds maximum {max_depth}"));
+        }
+        visited = visited.saturating_add(1);
+        if visited > max_nodes {
+            return Err(format!("node count exceeds maximum {max_nodes}"));
+        }
+        match value {
+            Value::Array(values) => {
+                if visited
+                    .saturating_add(stack.len())
+                    .saturating_add(values.len())
+                    > max_nodes
+                {
+                    return Err(format!("node count exceeds maximum {max_nodes}"));
+                }
+                stack.extend(values.iter().rev().map(|child| (child, depth + 1)));
+            }
+            Value::Object(object) => {
+                if visited
+                    .saturating_add(stack.len())
+                    .saturating_add(object.len())
+                    > max_nodes
+                {
+                    return Err(format!("node count exceeds maximum {max_nodes}"));
+                }
+                stack.extend(object.values().rev().map(|child| (child, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+
+    let mut writer = BoundedJsonWriter::new(max_bytes);
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| format!("serialized size exceeds maximum {max_bytes} bytes"))
+}
+
+struct BoundedJsonWriter {
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: 0,
+            max_bytes,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.max_bytes.saturating_sub(self.bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "bounded JSON size exceeded",
+            ));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HardwareQuoteVerifierCommandOutput {
     #[serde(default)]
     ok: bool,
     #[serde(default)]
     reason: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    binding: Option<String>,
-    #[serde(default)]
-    att_tier: Option<u8>,
+    kind: String,
+    binding: String,
+    att_tier: u8,
     #[serde(default)]
     root: Option<String>,
     #[serde(default)]
@@ -833,33 +973,26 @@ fn verify_hardware_quote_with_command(
             ),
         ));
     }
-    if verdict.kind.as_deref().is_some_and(|actual| actual != kind) {
+    if verdict.kind != kind {
         return Err(hardware_quote_invalid(
             kind,
             format!(
                 "admin verifier returned kind {}, expected {kind}",
-                verdict.kind.as_deref().unwrap_or_default()
+                verdict.kind
             ),
         ));
     }
-    if verdict
-        .binding
-        .as_deref()
-        .is_some_and(|actual| actual != expected_binding)
-    {
+    if verdict.binding != expected_binding {
         return Err(GatewayError::HardwareQuoteBindingMismatch {
             expected: expected_binding.to_owned(),
-            actual: verdict.binding.unwrap_or_default(),
+            actual: verdict.binding,
         });
     }
-    if verdict
-        .att_tier
-        .is_some_and(|actual| actual != quote.kind.attestation_tier())
-    {
+    if verdict.att_tier != quote.kind.attestation_tier() {
         return Err(GatewayError::ContractMismatch {
             field: "hw_quote.verifier.att_tier",
             expected: quote.kind.attestation_tier().to_string(),
-            actual: verdict.att_tier.unwrap_or_default().to_string(),
+            actual: verdict.att_tier.to_string(),
         });
     }
     let roots = verifier_verified_roots(&verdict);
@@ -948,7 +1081,7 @@ fn golden_tier3_measurements(value: &Value) -> GoldenTier3Measurements {
     ) {
         let layer = normalize_tier3_measurement_layer(layer);
         let name = normalize_verifier_root(name);
-        let measurement = measurement.trim().to_ascii_lowercase();
+        let measurement = measurement.trim().to_owned();
         if !layer.is_empty() && !name.is_empty() && !measurement.is_empty() {
             out.entry(layer)
                 .or_default()
@@ -1080,7 +1213,7 @@ fn insert_matched_measurement(
 ) {
     let layer = normalize_tier3_measurement_layer(layer);
     let name = normalize_verifier_root(name);
-    let value = value.trim().to_ascii_lowercase();
+    let value = value.trim().to_owned();
     if !layer.is_empty() && !name.is_empty() && !value.is_empty() {
         matched.entry(layer).or_default().insert(name, value);
     }
@@ -1639,7 +1772,7 @@ fn require_claim_matches_for_kind(
     if claims
         .get(field)
         .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        .is_some_and(|value| value == expected)
     {
         Ok(())
     } else {
@@ -1740,7 +1873,7 @@ fn verify_tpm2_verdict_device_key(
                 "TPM quote metadata must carry the EK device_key submitted to the contract",
             )
         })?;
-    if !quote_device_key.eq_ignore_ascii_case(verifier_device_key) {
+    if quote_device_key != verifier_device_key {
         return Err(hardware_quote_invalid(
             kind,
             "TPM EK device_key in quote metadata does not match the verifier-confirmed EK",
@@ -1776,7 +1909,7 @@ fn verify_nvidia_nras_quote(
         kind: "nvidia_nras_jwt".to_owned(),
     })?;
     let jwks = parse_nvidia_jwks(trusted_jwks)?;
-    let tokens = nvidia_eat_tokens(evidence)?;
+    let NvidiaEatTokens { tokens, detached } = nvidia_eat_tokens(evidence)?;
     if tokens.is_empty() {
         return Err(nvidia_quote_invalid("no JWT found in NVIDIA NRAS evidence"));
     }
@@ -1803,7 +1936,7 @@ fn verify_nvidia_nras_quote(
             "NVIDIA NRAS evidence did not contain a successful GPU claim",
         ));
     }
-    if evidence_contains_detached_eat(evidence) && !saw_overall_success {
+    if detached && !saw_overall_success {
         return Err(nvidia_quote_invalid(
             "NVIDIA NRAS detached EAT did not contain a successful overall claim",
         ));
@@ -1822,7 +1955,7 @@ fn verify_nvidia_nvtrust_offline_quote(
     })?;
     let jwks = parse_vendor_jwks(trusted_jwks, KIND)?;
     let issuers = nvidia_offline_issuers(trusted_jwks);
-    let tokens = nvidia_eat_tokens_for_kind(evidence, KIND)?;
+    let NvidiaEatTokens { tokens, detached } = nvidia_eat_tokens_for_kind(evidence, KIND)?;
     if tokens.is_empty() {
         return Err(hardware_quote_invalid(
             KIND,
@@ -1853,7 +1986,7 @@ fn verify_nvidia_nvtrust_offline_quote(
             "NVIDIA offline evidence did not contain a successful GPU claim",
         ));
     }
-    if evidence_contains_detached_eat(evidence) && !saw_overall_success {
+    if detached && !saw_overall_success {
         return Err(hardware_quote_invalid(
             KIND,
             "NVIDIA offline detached EAT did not contain a successful overall claim",
@@ -1891,61 +2024,127 @@ fn parse_nvidia_jwks(value: &Value) -> Result<JwkSet> {
     })
 }
 
-fn nvidia_eat_tokens(evidence: &str) -> Result<Vec<String>> {
+#[derive(Debug)]
+struct NvidiaEatTokens {
+    tokens: Vec<String>,
+    detached: bool,
+}
+
+fn nvidia_eat_tokens(evidence: &str) -> Result<NvidiaEatTokens> {
     nvidia_eat_tokens_for_kind(evidence, "nvidia_nras_jwt")
 }
 
-fn nvidia_eat_tokens_for_kind(evidence: &str, kind: &'static str) -> Result<Vec<String>> {
+fn nvidia_eat_tokens_for_kind(evidence: &str, kind: &'static str) -> Result<NvidiaEatTokens> {
+    if evidence.len() > MAX_HARDWARE_QUOTE_EVIDENCE_BYTES {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "evidence is {} bytes, maximum is {MAX_HARDWARE_QUOTE_EVIDENCE_BYTES}",
+                evidence.len()
+            ),
+        ));
+    }
     if looks_like_jwt(evidence.trim()) {
-        return Ok(vec![evidence.trim().to_owned()]);
+        return Ok(NvidiaEatTokens {
+            tokens: vec![evidence.trim().to_owned()],
+            detached: false,
+        });
     }
     let value: Value =
         serde_json::from_str(evidence).map_err(|err| GatewayError::HardwareQuoteInvalid {
             kind: kind.to_owned(),
             reason: format!("NVIDIA evidence is neither a JWT nor JSON: {err}"),
         })?;
+    let detached = value.get("detached_eat").is_some();
     let root = value.get("detached_eat").unwrap_or(&value);
-    let mut tokens = Vec::new();
-    collect_nvidia_eat_tokens(root, &mut tokens);
-    tokens.sort();
-    tokens.dedup();
-    Ok(tokens)
+    let mut tokens = BTreeSet::new();
+    collect_nvidia_eat_tokens(root, &mut tokens, kind)?;
+    Ok(NvidiaEatTokens {
+        tokens: tokens.into_iter().collect(),
+        detached,
+    })
 }
 
-fn collect_nvidia_eat_tokens(value: &Value, tokens: &mut Vec<String>) {
-    match value {
-        Value::String(text) if looks_like_jwt(text) => tokens.push(text.clone()),
-        Value::Array(values) => {
-            if values.len() == 2
-                && values[0].as_str() == Some("JWT")
-                && values[1].as_str().is_some_and(looks_like_jwt)
-            {
-                if let Some(token) = values[1].as_str() {
-                    tokens.push(token.to_owned());
+fn collect_nvidia_eat_tokens(
+    value: &Value,
+    tokens: &mut BTreeSet<String>,
+    kind: &'static str,
+) -> Result<()> {
+    let mut stack = vec![(value, 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth > MAX_NVIDIA_EAT_DEPTH {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!("NVIDIA EAT nesting exceeds maximum depth {MAX_NVIDIA_EAT_DEPTH}"),
+            ));
+        }
+        visited = visited.saturating_add(1);
+        if visited > MAX_NVIDIA_EAT_NODES {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!("NVIDIA EAT node count exceeds maximum {MAX_NVIDIA_EAT_NODES}"),
+            ));
+        }
+        match value {
+            Value::String(text) if looks_like_jwt(text) => {
+                tokens.insert(text.clone());
+            }
+            Value::Array(values) => {
+                if values.len() == 2
+                    && values[0].as_str() == Some("JWT")
+                    && values[1].as_str().is_some_and(looks_like_jwt)
+                {
+                    if let Some(token) = values[1].as_str() {
+                        tokens.insert(token.to_owned());
+                    }
                 }
+                if visited
+                    .saturating_add(stack.len())
+                    .saturating_add(values.len())
+                    > MAX_NVIDIA_EAT_NODES
+                {
+                    return Err(hardware_quote_invalid(
+                        kind,
+                        format!("NVIDIA EAT node count exceeds maximum {MAX_NVIDIA_EAT_NODES}"),
+                    ));
+                }
+                stack.extend(values.iter().rev().map(|child| (child, depth + 1)));
             }
-            for child in values {
-                collect_nvidia_eat_tokens(child, tokens);
+            Value::Object(object) => {
+                if visited
+                    .saturating_add(stack.len())
+                    .saturating_add(object.len())
+                    > MAX_NVIDIA_EAT_NODES
+                {
+                    return Err(hardware_quote_invalid(
+                        kind,
+                        format!("NVIDIA EAT node count exceeds maximum {MAX_NVIDIA_EAT_NODES}"),
+                    ));
+                }
+                stack.extend(object.values().rev().map(|child| (child, depth + 1)));
             }
+            _ => {}
         }
-        Value::Object(object) => {
-            for child in object.values() {
-                collect_nvidia_eat_tokens(child, tokens);
-            }
+        if tokens.len() > MAX_NVIDIA_EAT_TOKENS {
+            return Err(hardware_quote_invalid(
+                kind,
+                format!("NVIDIA EAT token count exceeds maximum {MAX_NVIDIA_EAT_TOKENS}"),
+            ));
         }
-        _ => {}
     }
+    Ok(())
 }
 
 fn looks_like_jwt(value: &str) -> bool {
-    value.split('.').count() == 3 && !value.chars().any(char::is_whitespace)
-}
-
-fn evidence_contains_detached_eat(evidence: &str) -> bool {
-    serde_json::from_str::<Value>(evidence)
-        .ok()
-        .and_then(|value| value.get("detached_eat").cloned())
-        .is_some()
+    let mut segments = value.split('.');
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    (0..3).all(|_| segments.next().is_some_and(valid_segment)) && segments.next().is_none()
 }
 
 fn decode_nvidia_nras_jwt(token: &str, jwks: &JwkSet) -> Result<Value> {
@@ -2205,7 +2404,7 @@ fn require_nvidia_nonce_for_kind(
         .and_then(Value::as_str)
         .or_else(|| claims.get("x-nv-gpu-nonce").and_then(Value::as_str))
         .ok_or_else(|| hardware_quote_invalid(kind, "NVIDIA claim is missing nonce"))?;
-    if !nonce.eq_ignore_ascii_case(expected_nonce) {
+    if nonce != expected_nonce {
         return Err(hardware_quote_invalid(
             kind,
             "NVIDIA nonce does not match quote binding",
@@ -2490,7 +2689,7 @@ fn verify_heartbeat_signature(raw: &Value, provider: &str, signature_hex: &str) 
     })?;
     let payload = heartbeat_signing_payload(raw)?;
     public_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .map_err(|err| GatewayError::BadHeartbeatSignature {
             reason: err.to_string(),
         })
@@ -2674,7 +2873,7 @@ fn verify_report_signature(report: &AttestationReport, signer: AttestationSigner
     let payload = attestation_signing_bytes(&body, signer)
         .map_err(|err| GatewayError::SigningPayload(err.to_string()))?;
     public_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .map_err(|err| GatewayError::BadSignature {
             signer: signer_name,
             reason: err.to_string(),
@@ -2715,6 +2914,14 @@ mod tests {
             sig_enclave: "33".repeat(64),
             sig_provider: "44".repeat(64),
         }
+    }
+
+    fn weak_identity_key_and_signature() -> (String, String) {
+        let mut public_key = [0_u8; 32];
+        public_key[0] = 1;
+        let mut signature = [0_u8; 64];
+        signature[0] = 1;
+        (hex::encode(public_key), hex::encode(signature))
     }
 
     #[test]
@@ -2777,6 +2984,76 @@ mod tests {
         })
         .expect_err("tampered heartbeat must fail");
         assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn heartbeat_rejects_low_order_signature_forgery() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(
+            &signing_key,
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+            now,
+            "ac",
+        );
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        heartbeat["provider"] = json!(weak_key);
+        heartbeat["sig"] = json!(weak_signature);
+
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("low-order heartbeat forgery must fail strict verification");
+
+        assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn attestation_report_rejects_low_order_signature_forgery() {
+        let mut report = sample_report();
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        report.enclave_pubkey = weak_key;
+        report.sig_enclave = weak_signature;
+
+        let err = verify_report_signature(&report, AttestationSigner::Enclave)
+            .expect_err("low-order attestation forgery must fail strict verification");
+
+        assert!(matches!(
+            err,
+            GatewayError::BadSignature {
+                signer: "enclave",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn security_identity_claims_are_case_sensitive() {
+        let claims = json!({ "eat_nonce": "AA" });
+
+        assert!(require_claim_matches_for_kind(&claims, "eat_nonce", "aa", "test_quote").is_err());
+        assert!(require_nvidia_nonce_for_kind(&claims, "aa", "test_quote").is_err());
+    }
+
+    #[test]
+    fn nvidia_eat_traversal_rejects_excessive_depth() {
+        let mut evidence = Value::String("header.payload.signature".to_owned());
+        for _ in 0..=MAX_NVIDIA_EAT_DEPTH {
+            evidence = Value::Array(vec![evidence]);
+        }
+
+        let err = nvidia_eat_tokens_for_kind(&evidence.to_string(), "nvidia_nvtrust_offline_jwt")
+            .expect_err("depth-unbounded NVIDIA EAT must be rejected");
+
+        assert!(matches!(
+            err,
+            GatewayError::HardwareQuoteInvalid { reason, .. }
+                if reason.contains("maximum depth")
+        ));
     }
 
     #[test]

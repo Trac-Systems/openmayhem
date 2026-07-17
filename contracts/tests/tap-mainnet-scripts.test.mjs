@@ -13,7 +13,11 @@ import { compileAll } from '../scripts/compile.mjs';
 
 const DEPLOY_SCRIPT = fileURLToPath(new URL('../scripts/deploy-mainnet.mjs', import.meta.url));
 const VERIFY_SCRIPT = fileURLToPath(new URL('../scripts/verify-etherscan.mjs', import.meta.url));
+const SETTLEMENT_SERVICE_SCRIPT = fileURLToPath(
+  new URL('../../scripts/ops/run-tap-settlement-roller.sh', import.meta.url)
+);
 const OPERATOR_KEY = `0x${'44'.repeat(32)}`;
+const GOVERNANCE_ADDRESS = new ethers.Wallet(`0x${'45'.repeat(32)}`).address;
 const GANACHE_BALANCE = ethers.toBeHex(ethers.parseEther('100'));
 const CAP = ethers.parseUnits('500', 18).toString();
 
@@ -52,6 +56,15 @@ async function closeServer(server) {
   }
 }
 
+test('mainnet settlement service resumes delayed governed roots using current report fields', () => {
+  const source = fs.readFileSync(SETTLEMENT_SERVICE_SCRIPT, 'utf8');
+  assert.doesNotMatch(source, /set_root_dry_run/);
+  assert.match(source, /propose_root_dry_run/);
+  assert.match(source, /root_pending/);
+  assert.match(source, /awaiting_governance_delay/);
+  assert.match(source, /execution_tx/);
+});
+
 test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a locked RPC node', async (t) => {
   const server = Ganache.server({
     logging: { quiet: true },
@@ -84,6 +97,8 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
     MAYHEM_TAP_ETH_RPC: rpc,
     MAYHEM_TAP_TOKEN_ADDR: tokenAddr,
     MAYHEM_TAP_MAX_EPOCH_DELTA: CAP,
+    MAYHEM_TAP_GOVERNANCE_SIGNER: GOVERNANCE_ADDRESS,
+    MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS: '3600',
     MAYHEM_TAP_DEPLOYMENT_FILE: deploymentFile,
   };
 
@@ -95,6 +110,8 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal(dryReport.contract_name, 'MayhemInferencePool.sol:MayhemInferencePool');
   assert.equal(dryReport.token, ethers.getAddress(tokenAddr));
   assert.equal(dryReport.max_epoch_delta_wei, CAP);
+  assert.equal(dryReport.governance_signer, ethers.getAddress(GOVERNANCE_ADDRESS));
+  assert.equal(dryReport.governance_delay_seconds, '3600');
   assert.equal(dryReport.rpc, undefined);
   assert.equal(dryReport.rpc_env, 'MAYHEM_TAP_ETH_RPC');
   assert.equal(dryReport.rpc_url_redacted.includes(String(server.address().port)), true);
@@ -121,6 +138,8 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal(written.pool, deployReport.pool);
   assert.equal(written.token, ethers.getAddress(tokenAddr));
   assert.equal(written.maxEpochDelta, CAP);
+  assert.equal(written.governanceSigner, ethers.getAddress(GOVERNANCE_ADDRESS));
+  assert.equal(written.governanceDelay, '3600');
   assert.equal(written.deploymentTxHash, deployReport.deployment_tx_hash);
   assert.equal(written.deploymentBlockNumber, deployReport.deployment_block_number);
   assert.equal(written.deploymentGasUsed, deployReport.deployment_gas_used);
@@ -130,6 +149,8 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   const pool = new ethers.Contract(written.pool, art.MayhemInferencePool.abi, provider);
   assert.equal(ethers.getAddress(await pool.token()), ethers.getAddress(tokenAddr));
   assert.equal(ethers.getAddress(await pool.owner()), ethers.getAddress(new ethers.Wallet(OPERATOR_KEY).address));
+  assert.equal(ethers.getAddress(await pool.governanceSigner()), ethers.getAddress(GOVERNANCE_ADDRESS));
+  assert.equal(await pool.governanceDelay(), 3600n);
   assert.equal((await pool.maxEpochDelta()).toString(), CAP);
 
   const verify = await runNode([VERIFY_SCRIPT, '--dry-run', '--json'], {
@@ -149,10 +170,10 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal(verifyReport.request.action, 'verifysourcecode');
   assert.equal(verifyReport.request.codeformat, 'solidity-standard-json-input');
   assert.equal(verifyReport.source_file_count >= 1, true);
-  assert.equal(verifyReport.constructor_args.length, 64 * 3);
+  assert.equal(verifyReport.constructor_args.length, 64 * 5);
 });
 
-test('mainnet deploy dry-run allows one-key owner and deployer config', async (t) => {
+test('mainnet deploy allows one owner/deployer key but requires a distinct governance signer', async (t) => {
   const server = Ganache.server({
     logging: { quiet: true },
     chain: { chainId: 1 },
@@ -183,6 +204,8 @@ test('mainnet deploy dry-run allows one-key owner and deployer config', async (t
       MAYHEM_TAP_TOKEN_ADDR: await token.getAddress(),
       MAYHEM_TAP_POOL_OWNER: operatorAddress,
       MAYHEM_TAP_MAX_EPOCH_DELTA: CAP,
+      MAYHEM_TAP_GOVERNANCE_SIGNER: GOVERNANCE_ADDRESS,
+      MAYHEM_TAP_GOVERNANCE_DELAY_SECONDS: '3600',
     },
   });
   assert.equal(dryRun.status, 0, dryRun.stderr);
@@ -191,4 +214,6 @@ test('mainnet deploy dry-run allows one-key owner and deployer config', async (t
   assert.equal(report.deployed, false);
   assert.equal(ethers.getAddress(report.owner), operatorAddress);
   assert.equal(ethers.getAddress(report.deployer), operatorAddress);
+  assert.equal(ethers.getAddress(report.governance_signer), ethers.getAddress(GOVERNANCE_ADDRESS));
+  assert.notEqual(report.governance_signer.toLowerCase(), report.owner.toLowerCase());
 });

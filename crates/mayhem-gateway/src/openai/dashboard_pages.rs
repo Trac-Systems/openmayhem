@@ -1789,33 +1789,93 @@ struct DashboardModelLab {
 }
 
 fn dashboard_model_lab(model: &GatewayModel) -> DashboardModelLab {
-    let search = format!("{} {} {}", model.id, model.mayhem.family, model.owned_by)
-        .to_ascii_lowercase();
+    let search =
+        format!("{} {} {}", model.id, model.mayhem.family, model.owned_by).to_ascii_lowercase();
     let known = [
         ("qwen", "Qwen", "Q", &["qwen", "tongyi-qianwen"] as &[&str]),
         ("hauhau", "HauHau", "HH", &["hauhau", "hauhaucs"] as &[&str]),
-        ("deepmind", "Google DeepMind", "DM", &["deepmind"] as &[&str]),
+        (
+            "deepmind",
+            "Google DeepMind",
+            "DM",
+            &["deepmind"] as &[&str],
+        ),
         ("google", "Google", "G", &["google", "gemma"] as &[&str]),
-        ("openai", "OpenAI", "OA", &["openai/", "gpt-", "o1-", "o3-"] as &[&str]),
+        (
+            "openai",
+            "OpenAI",
+            "OA",
+            &["openai/", "gpt-", "o1-", "o3-"] as &[&str],
+        ),
         ("deepseek", "DeepSeek", "DS", &["deepseek"] as &[&str]),
-        ("mistral", "Mistral AI", "M", &["mistral", "mixtral"] as &[&str]),
-        ("meta-ai", "Meta AI", "M", &["meta-llama", "meta/", "llama"] as &[&str]),
-        ("moonshot-ai", "Moonshot AI", "K", &["moonshot", "kimi"] as &[&str]),
+        (
+            "mistral",
+            "Mistral AI",
+            "M",
+            &["mistral", "mixtral"] as &[&str],
+        ),
+        (
+            "meta-ai",
+            "Meta AI",
+            "M",
+            &["meta-llama", "meta/", "llama"] as &[&str],
+        ),
+        (
+            "moonshot-ai",
+            "Moonshot AI",
+            "K",
+            &["moonshot", "kimi"] as &[&str],
+        ),
         ("minimax", "MiniMax", "MM", &["minimax"] as &[&str]),
         ("nvidia", "NVIDIA", "N", &["nvidia", "nemotron"] as &[&str]),
         ("z-ai", "Z.ai", "Z", &["z-ai", "zai", "glm-"] as &[&str]),
-        ("huggingface", "Hugging Face", "HF", &["huggingface", "smollm"] as &[&str]),
-        ("microsoft", "Microsoft", "MS", &["microsoft", "phi-"] as &[&str]),
-        ("black-forest-labs", "Black Forest Labs", "BFL", &["black-forest", "flux"] as &[&str]),
+        (
+            "huggingface",
+            "Hugging Face",
+            "HF",
+            &["huggingface", "smollm"] as &[&str],
+        ),
+        (
+            "microsoft",
+            "Microsoft",
+            "MS",
+            &["microsoft", "phi-"] as &[&str],
+        ),
+        (
+            "black-forest-labs",
+            "Black Forest Labs",
+            "BFL",
+            &["black-forest", "flux"] as &[&str],
+        ),
         ("baai", "BAAI", "BA", &["baai", "bge-"] as &[&str]),
-        ("stability-ai", "Stability AI", "SA", &["stability", "stable-diffusion"] as &[&str]),
-        ("tencent", "Tencent Hunyuan", "T", &["tencent", "hunyuan"] as &[&str]),
+        (
+            "stability-ai",
+            "Stability AI",
+            "SA",
+            &["stability", "stable-diffusion"] as &[&str],
+        ),
+        (
+            "tencent",
+            "Tencent Hunyuan",
+            "T",
+            &["tencent", "hunyuan"] as &[&str],
+        ),
         ("jina-ai", "Jina AI", "J", &["jina"] as &[&str]),
         ("nomic-ai", "Nomic AI", "N", &["nomic"] as &[&str]),
-        ("lightricks", "Lightricks", "L", &["lightricks", "ltx-"] as &[&str]),
+        (
+            "lightricks",
+            "Lightricks",
+            "L",
+            &["lightricks", "ltx-"] as &[&str],
+        ),
         ("resemble-ai", "Resemble AI", "R", &["resemble"] as &[&str]),
         ("ace-step", "ACE-Step", "AS", &["ace-step"] as &[&str]),
-        ("deepreinforce", "DeepReinforce", "DR", &["deepreinforce"] as &[&str]),
+        (
+            "deepreinforce",
+            "DeepReinforce",
+            "DR",
+            &["deepreinforce"] as &[&str],
+        ),
         ("empero-ai", "Empero AI", "E", &["empero"] as &[&str]),
         ("hexgrad", "Hexgrad", "H", &["hexgrad"] as &[&str]),
         ("huihui-ai", "Huihui AI", "H", &["huihui"] as &[&str]),
@@ -1855,7 +1915,11 @@ fn dashboard_model_lab(model: &GatewayModel) -> DashboardModelLab {
     DashboardModelLab {
         key: "other",
         name,
-        initials: if initials.is_empty() { "AI".to_owned() } else { initials },
+        initials: if initials.is_empty() {
+            "AI".to_owned()
+        } else {
+            initials
+        },
     }
 }
 
@@ -1888,28 +1952,29 @@ fn dashboard_model_name(model: &GatewayModel) -> String {
 fn dashboard_model_lab_icon(lab: &DashboardModelLab) -> String {
     let asset = match lab.key {
         "openai" => Some("openai-symbol.svg"),
-        "ace-step" | "baai" | "black-forest-labs" | "deepreinforce" | "empero-ai"
-        | "hexgrad" | "huihui-ai" | "jina-ai" | "lightricks" | "lodestones"
-        | "microsoft" | "nomic-ai" | "resemble-ai" | "stability-ai" | "tencent"
-        | "tongyi-mai" | "wepiqx" => Some(match lab.key {
-            "ace-step" => "ace-step.webp",
-            "baai" => "baai.webp",
-            "black-forest-labs" => "black-forest-labs.webp",
-            "deepreinforce" => "deepreinforce.webp",
-            "empero-ai" => "empero-ai.webp",
-            "hexgrad" => "hexgrad.webp",
-            "huihui-ai" => "huihui-ai.webp",
-            "jina-ai" => "jina-ai.webp",
-            "lightricks" => "lightricks.webp",
-            "lodestones" => "lodestones.webp",
-            "microsoft" => "microsoft.webp",
-            "nomic-ai" => "nomic-ai.webp",
-            "resemble-ai" => "resemble-ai.webp",
-            "stability-ai" => "stability-ai.webp",
-            "tencent" => "tencent.webp",
-            "tongyi-mai" => "tongyi-mai.webp",
-            _ => "wepiqx.webp",
-        }),
+        "ace-step" | "baai" | "black-forest-labs" | "deepreinforce" | "empero-ai" | "hexgrad"
+        | "huihui-ai" | "jina-ai" | "lightricks" | "lodestones" | "microsoft" | "nomic-ai"
+        | "resemble-ai" | "stability-ai" | "tencent" | "tongyi-mai" | "wepiqx" => {
+            Some(match lab.key {
+                "ace-step" => "ace-step.webp",
+                "baai" => "baai.webp",
+                "black-forest-labs" => "black-forest-labs.webp",
+                "deepreinforce" => "deepreinforce.webp",
+                "empero-ai" => "empero-ai.webp",
+                "hexgrad" => "hexgrad.webp",
+                "huihui-ai" => "huihui-ai.webp",
+                "jina-ai" => "jina-ai.webp",
+                "lightricks" => "lightricks.webp",
+                "lodestones" => "lodestones.webp",
+                "microsoft" => "microsoft.webp",
+                "nomic-ai" => "nomic-ai.webp",
+                "resemble-ai" => "resemble-ai.webp",
+                "stability-ai" => "stability-ai.webp",
+                "tencent" => "tencent.webp",
+                "tongyi-mai" => "tongyi-mai.webp",
+                _ => "wepiqx.webp",
+            })
+        }
         "hauhau" => Some("hauhau.svg"),
         "deepmind" => Some("deepmind.svg"),
         "deepseek" => Some("deepseek.svg"),
@@ -1976,11 +2041,8 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
         .collect::<Vec<_>>();
     choices.sort_by_key(|(_, availability)| availability.tone != "good");
 
-    let explicit_selection = selected_model.filter(|candidate| {
-        choices
-            .iter()
-            .any(|(model, _)| model.id == *candidate)
-    });
+    let explicit_selection =
+        selected_model.filter(|candidate| choices.iter().any(|(model, _)| model.id == *candidate));
     let default_index = explicit_selection
         .and_then(|candidate| choices.iter().position(|(model, _)| model.id == candidate))
         .unwrap_or(0);
@@ -2118,8 +2180,16 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
     };
 
     let chat_hidden = if active_mode == "chat" { "" } else { " hidden" };
-    let image_hidden = if active_mode == "image" { "" } else { " hidden" };
-    let speech_hidden = if active_mode == "speech" { "" } else { " hidden" };
+    let image_hidden = if active_mode == "image" {
+        ""
+    } else {
+        " hidden"
+    };
+    let speech_hidden = if active_mode == "speech" {
+        ""
+    } else {
+        " hidden"
+    };
     let content = if credential_needed {
         page_empty_block(
             "Create an access token first",
@@ -3020,9 +3090,7 @@ fn earn_overview_page(
     let claimable_freshness = if claimable.confirmed {
         earnings_freshness_window(&data.earnings).map_or_else(
             || html_escape(&claimable.freshness),
-            |window| {
-                volatile_relative_label("Refreshed", window, "Refresh to reconfirm amounts")
-            },
+            |window| volatile_relative_label("Refreshed", window, "Refresh to reconfirm amounts"),
         )
     } else {
         html_escape(&claimable.freshness)
@@ -3208,8 +3276,7 @@ fn provider_activation_panel(
                 .to_owned()
         }
     } else if !first_job_done {
-        r##"<a class="primary-button" href="/mayhem/dashboard/earn/jobs">Open jobs</a>"##
-            .to_owned()
+        r##"<a class="primary-button" href="/mayhem/dashboard/earn/jobs">Open jobs</a>"##.to_owned()
     } else if !earnings_done {
         r##"<a class="primary-button" href="/mayhem/dashboard/earn/earnings">Check settlement</a>"##
             .to_owned()
@@ -3370,7 +3437,13 @@ fn earn_jobs_page(
         } else {
             "Jobs recorded"
         },
-        if provider.is_none() || incomplete > 0 { "warn" } else if jobs.is_empty() { "" } else { "good" },
+        if provider.is_none() || incomplete > 0 {
+            "warn"
+        } else if jobs.is_empty() {
+            ""
+        } else {
+            "good"
+        },
         if provider.is_none() {
             r##"<a class="primary-button" href="/mayhem/dashboard/earn">Start provider setup</a>"##
         } else {
@@ -3482,7 +3555,18 @@ fn earn_opportunities_page(
     );
     let provider_entries = data.provider_entries(requested);
     let state = provider_page_state(data, requested, &provider_entries);
-    shell_wide(data, expires, DashboardAppPage::Earn, "Provider planning", "Model fit", "Which catalog models this machine can run, next to what the network currently supplies.", state.label, state.tone, "", &content)
+    shell_wide(
+        data,
+        expires,
+        DashboardAppPage::Earn,
+        "Provider planning",
+        "Model fit",
+        "Which catalog models this machine can run, next to what the network currently supplies.",
+        state.label,
+        state.tone,
+        "",
+        &content,
+    )
 }
 
 fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str>) -> String {
@@ -3516,7 +3600,12 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
             )
         },
         |window| {
-            volatile_status_badge(snapshot_state, snapshot_tone, window, "Refresh to reconfirm")
+            volatile_status_badge(
+                snapshot_state,
+                snapshot_tone,
+                window,
+                "Refresh to reconfirm",
+            )
         },
     );
     let refresh_label = snapshot_window.map_or_else(
@@ -3591,7 +3680,18 @@ fn earn_reliability_page(
         }
     );
     let state = aggregate_provider_state(&entries);
-    shell_wide(data, expires, DashboardAppPage::Earn, "Provider quality", "Reliability", "Network reputation, probation requirements, and what this gateway has observed.", state.label, state.tone, "", &content)
+    shell_wide(
+        data,
+        expires,
+        DashboardAppPage::Earn,
+        "Provider quality",
+        "Reliability",
+        "Network reputation, probation requirements, and what this gateway has observed.",
+        state.label,
+        state.tone,
+        "",
+        &content,
+    )
 }
 
 fn provider_probation_progress(probation: Option<&ProviderProbation>) -> String {
@@ -3755,7 +3855,26 @@ fn network_models_page(data: &DashboardData, expires: u64, requested_page: Optio
         r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Network models</h2><p>Catalog terms paired with fresh advertised route capacity.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="network-models-table"><caption class="sr-only">Network models, advertised capacity, capabilities, and price</caption><thead><tr><th>Model</th><th>Advertised capacity</th><th>Capabilities</th><th>Catalog price</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}</footer></section>"##,
         network_subnav(DashboardProductPage::NetworkModels),
     );
-    shell_wide(data, expires, DashboardAppPage::Network, "Network analysis", "Models", "Every catalog model with its current advertised supply.", if data.models.is_empty() { "Catalog unavailable" } else { "Catalog loaded" }, if data.models.is_empty() { "warn" } else { "good" }, "", &content)
+    shell_wide(
+        data,
+        expires,
+        DashboardAppPage::Network,
+        "Network analysis",
+        "Models",
+        "Every catalog model with its current advertised supply.",
+        if data.models.is_empty() {
+            "Catalog unavailable"
+        } else {
+            "Catalog loaded"
+        },
+        if data.models.is_empty() {
+            "warn"
+        } else {
+            "good"
+        },
+        "",
+        &content,
+    )
 }
 
 fn network_providers_page(
@@ -3865,7 +3984,18 @@ fn network_markets_page(
         r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Catalog markets</h2><p>Market structure is contractual; current acceptance still belongs to heartbeat evidence.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="market-table"><caption class="sr-only">Catalog markets and reference prices</caption><thead><tr><th>Model / enclave</th><th>Tier / quant</th><th>Catalog supply</th><th>Availability label</th><th>Reference price</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{market_summary}</span>{pagination}</footer></section>"##,
         network_subnav(DashboardProductPage::NetworkMarkets),
     );
-    shell_wide(data, expires, DashboardAppPage::Network, "Network analysis", "Markets", "How each catalog market is structured: tiers, supply, and reference prices.", "Catalog view", "", "", &content)
+    shell_wide(
+        data,
+        expires,
+        DashboardAppPage::Network,
+        "Network analysis",
+        "Markets",
+        "How each catalog market is structured: tiers, supply, and reference prices.",
+        "Catalog view",
+        "",
+        "",
+        &content,
+    )
 }
 
 fn network_activity_page(
@@ -4136,7 +4266,18 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         version_tone,
         html_escape(&update)
     );
-    shell(data, expires, DashboardAppPage::Settings, "Application", "Settings", "Display, motion, and money-visibility preferences, plus this gateway session's facts.", version_status, version_tone, "", &content)
+    shell(
+        data,
+        expires,
+        DashboardAppPage::Settings,
+        "Application",
+        "Settings",
+        "Display, motion, and money-visibility preferences, plus this gateway session's facts.",
+        version_status,
+        version_tone,
+        "",
+        &content,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -4205,7 +4346,10 @@ fn model_availability(data: &DashboardData, model: &GatewayModel) -> ModelAvaila
             tone: "warn",
             explanation: format!(
                 "{}; no fresh heartbeat",
-                count_noun(model.mayhem.route_candidates.len() as u64, "canonical route")
+                count_noun(
+                    model.mayhem.route_candidates.len() as u64,
+                    "canonical route"
+                )
             ),
         }
     } else {

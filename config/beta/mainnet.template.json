@@ -8,7 +8,12 @@
       "address_prefix": "trac",
       "network_id": 918,
       "bootstrap": "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685",
-      "channel": "0000trac0network0msb0mainnet0000"
+      "channel": "0000trac0network0msb0mainnet0000",
+      "direct_peers": [
+        "2a8ccdeb077a84cf555ff0c1a068f40fa025e0229f9085b19bebbc8f5a65b00c",
+        "08019b10edc930eb5feab8b921ed3402de801a1f15937455c1a6fb46b5fca2e9",
+        "29de5dbddce25b036aa07350c5d11be48d6b238f7ab169bc97cde815c75685b5"
+      ]
     },
     "subnet": {
       "channel": "mayhem-router-subnet",
@@ -29,7 +34,10 @@
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
       ]
-    }
+    },
+    "inference_relays": [
+      "98118758e6a13ad1d831ed0d9438968910040e06560f23ed0c4e0b54b31f0e02"
+    ]
   },
   "startup": {
     "runtime": "pear",
@@ -80,7 +88,7 @@
       "auditor_min_age_seconds": 2592000,
       "canary_match_min_bps": 9000,
       "canary_probe_holdback_bps": 0,
-      "canary_probe_release_min_passes": 1,
+      "canary_probe_release_min_passes": 2,
       "probe_reward_au": "5000000000000000",
       "uptime_tick_seconds": 21600,
       "fraud_slash_bps": 10000,
@@ -91,6 +99,8 @@
       "fee_bps": 1500,
       "dispute_deposit_au": "1000000000000000000",
       "dispute_timeout_epochs": 168,
+      "max_open_disputes_per_opener": 8,
+      "dispute_opener_fault_forfeit_bps": 2500,
       "payout_min_au": "1000000000000000000",
       "price_min_bps": 2500,
       "price_max_bps": 40000,
@@ -137,9 +147,22 @@
       "chain_id": 1,
       "token_address": "<0x-canonical-TAP-token-address>",
       "pool_address": "<MayhemInferencePool-mainnet-address-after-C5>",
+      "governance_signer": "<0x-independent-TAP-governance-signer>",
+      "governance_delay_seconds": 3600,
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
-      "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
-      "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+      "participant_rpc_policy": "public-only",
+      "operator_oracle": {
+        "method": "uniswap-v2-twap-median",
+        "private_rpc_env": "MAYHEM_TAP_ETH_RPC",
+        "private_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+        "public_fallbacks_env": "MAYHEM_TAP_ETH_PUBLIC_RPC_FALLBACKS",
+        "interval_seconds": 1800,
+        "twap_window_seconds": 1800,
+        "minimum_sources": 2,
+        "max_deviation_bps": 2000,
+        "hard_floor_au": "1000000000000000",
+        "hard_ceiling_au": "10000000000000000000"
+      },
       "max_epoch_delta_wei": "10000000000000000000000",
       "operator_address": "<0x-operator-fee-address>"
     },

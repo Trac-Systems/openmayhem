@@ -1,0 +1,15 @@
+{
+  "set_id": "canary-z-image-launch-v1",
+  "description": "Deterministic Z-Image-Turbo launch canary with explicit signed generation controls.",
+  "prompts": [
+    {
+      "id": "z-image-red-cube-studio-seed7",
+      "prompt": "a red cube on a white table, simple studio photo",
+      "size": "1024x1024",
+      "steps": 9,
+      "cfg_scale": 0,
+      "shift": 3,
+      "seed": 7
+    }
+  ]
+}

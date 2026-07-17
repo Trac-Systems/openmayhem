@@ -48,7 +48,11 @@ while true; do
     sleep "$interval"
     continue
   fi
-  if ! jq -e '.blocked != true and (.root | type == "string") and (.set_root_dry_run.ok == true)' "$dry_report" >/dev/null; then
+  if ! jq -e '
+    .blocked != true and
+    (.root | type == "string") and
+    (.root_already_posted == true or .propose_root_dry_run.ok == true)
+  ' "$dry_report" >/dev/null; then
     echo "TAP settlement dry-run did not pass for $name" >&2
     sleep "$interval"
     continue
@@ -58,10 +62,23 @@ while true; do
     sleep "$interval"
     continue
   fi
+  if jq -e '
+    .blocked != true and
+    .root_pending == true and
+    .awaiting_governance_delay == true and
+    (.execute_after | type == "number")
+  ' "$final_report" >/dev/null; then
+    echo "TAP settlement root for $name is cross-signed and waiting for its governance delay." >&2
+    sleep "$interval"
+    continue
+  fi
   if ! jq -e '
     .blocked != true and
     .root_confirmed == true and
-    ((.posted == true and (.tx | type == "string")) or .root_already_posted == true) and
+    (
+      .root_already_posted == true or
+      (.posted == true and ((.execution_tx | type == "string") or (.proposal_tx | type == "string")))
+    ) and
     .operator_fee.completed == true and
     .operator_fee.remaining_claimable_wei == "0" and
     (.operator_fee.predicted_claimable_wei == "0" or .operator_fee.auto_sent == true) and

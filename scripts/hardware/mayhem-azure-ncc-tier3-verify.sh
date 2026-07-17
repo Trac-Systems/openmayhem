@@ -21,8 +21,16 @@ import tempfile
 import time
 import urllib.request
 
+verdict_binding = (os.environ.get("MAYHEM_HW_VERIFY_BINDING") or "").lower()
+
 def fail(reason):
-    print(json.dumps({"ok": False, "reason": reason}, sort_keys=True))
+    print(json.dumps({
+        "ok": False,
+        "kind": "nvidia_nvtrust_offline_jwt",
+        "binding": verdict_binding,
+        "att_tier": 3,
+        "reason": reason,
+    }, sort_keys=True))
     sys.exit(0)
 
 def jstr(value):

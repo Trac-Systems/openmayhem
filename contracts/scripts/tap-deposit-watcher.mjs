@@ -6,10 +6,16 @@ import { fileURLToPath } from 'node:url';
 
 import { ethers } from 'ethers';
 
+import { safeErrorMessage } from './safe-output.mjs';
+
 const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tap-deposit-watcher.json');
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const MIN_TAP_CONFIRMATIONS = 12;
+const DEFAULT_LOOKBACK_BLOCKS = 50_000;
+const DEFAULT_RETRY_ATTEMPTS = 5;
+const DEFAULT_RETRY_BASE_MS = 250;
+const DEFAULT_RETRY_MAX_MS = 4_000;
 export const TAP_DEPOSIT_EVENT_SIGNATURE = ethers.id('Deposit(address,uint256)');
 export const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
@@ -85,6 +91,19 @@ function normalizeBlockHash(value) {
   return hash;
 }
 
+export function redactRpcUrl(value) {
+  try {
+    const url = new URL(String(value));
+    if (url.username) url.username = '***';
+    if (url.password) url.password = '***';
+    if (url.search) url.search = '';
+    if ((url.pathname || '').length > 1) url.pathname = '/...';
+    return url.toString();
+  } catch (_error) {
+    return '<redacted>';
+  }
+}
+
 function positiveDecimalBigInt(value, label) {
   try {
     const raw = String(value ?? '').trim();
@@ -151,7 +170,73 @@ export function tapDepositFromLog(log, {
 }
 
 export function tapDepositKey(deposit) {
-  return `${deposit.eth_tx_hash}/${deposit.log_index}`;
+  const chainId = parsePositiveInt(deposit.chain_id, 'chain_id');
+  const poolAddress = normalizeAddress(deposit.pool_address, 'pool_address');
+  const ethTxHash = normalizeTxHash(deposit.eth_tx_hash);
+  const logIndex = parseNonNegativeInt(deposit.log_index, 'log_index');
+  const blockHash = normalizeBlockHash(deposit.block_hash);
+  return `${chainId}/${poolAddress}/${ethTxHash}/${logIndex}/${blockHash}`;
+}
+
+export function tapDepositReversalKey(deposit) {
+  return `${tapDepositKey(deposit)}/reversal`;
+}
+
+export function tapDepositReversalFromCredit(deposit, {
+  reconciliationFromBlock,
+  reconciliationToBlock,
+  finalizedBlockNumber,
+  confirmationPolicy = 'finalized-tag',
+  watcherId = TAP_DEPOSIT_WATCHER_ID,
+} = {}) {
+  if (confirmationPolicy !== 'finalized-tag') {
+    throw new Error('TAP deposit reversal requires finalized-tag reconciliation');
+  }
+  const blockNumber = parseNonNegativeInt(deposit.block_number, 'block_number');
+  const from = parseNonNegativeInt(reconciliationFromBlock, 'reconciliation_from_block');
+  const to = parseNonNegativeInt(reconciliationToBlock, 'reconciliation_to_block');
+  const finalized = parseNonNegativeInt(finalizedBlockNumber, 'finalized_block_number');
+  if (from > blockNumber || to < blockNumber) {
+    throw new Error('TAP reversal reconciliation window must contain the credited block');
+  }
+  if (finalized - to < MIN_TAP_CONFIRMATIONS) {
+    throw new Error(`TAP reversal requires a ${MIN_TAP_CONFIRMATIONS}-block finalized gap`);
+  }
+  return {
+    chain_id: parsePositiveInt(deposit.chain_id, 'chain_id'),
+    pool_address: normalizeAddress(deposit.pool_address, 'pool_address'),
+    eth_tx_hash: normalizeTxHash(deposit.eth_tx_hash),
+    log_index: parseNonNegativeInt(deposit.log_index, 'log_index'),
+    block_number: blockNumber,
+    block_hash: normalizeBlockHash(deposit.block_hash),
+    reconciliation_from_block: from,
+    reconciliation_to_block: to,
+    finalized_block_number: finalized,
+    confirmation_policy: confirmationPolicy,
+    watcher_id: String(watcherId),
+    reason: 'canonical_event_missing',
+  };
+}
+
+export function reconcileCreditedDeposits(creditedDeposits, canonicalDeposits, scan) {
+  if (scan?.finalizedPolicy !== true) {
+    throw new Error('TAP credited-deposit reconciliation requires finalized-tag scan evidence');
+  }
+  const canonicalKeys = new Set(canonicalDeposits.map(tapDepositKey));
+  return creditedDeposits
+    .filter((deposit) => {
+      const blockNumber = Number(deposit?.block_number);
+      return Number.isSafeInteger(blockNumber)
+        && blockNumber >= scan.from
+        && blockNumber <= scan.to
+        && !canonicalKeys.has(tapDepositKey(deposit));
+    })
+    .map((deposit) => tapDepositReversalFromCredit(deposit, {
+      reconciliationFromBlock: scan.from,
+      reconciliationToBlock: scan.to,
+      finalizedBlockNumber: scan.referenceBlock,
+      confirmationPolicy: 'finalized-tag',
+    }));
 }
 
 export function buildAdminCommandArgs(deposit, {
@@ -212,6 +297,66 @@ export function buildAdminCommandArgs(deposit, {
 export function buildAdminCommand(deposit, options = {}) {
   const bin = options.mayhemBin ?? 'mayhem';
   const args = buildAdminCommandArgs(deposit, options)
+    .filter((arg, index, all) => all[index - 1] !== '--wallet-password' && arg !== '--wallet-password');
+  return [bin, ...args].map(shellQuote).join(' ');
+}
+
+export function buildAdminReversalCommandArgs(reversal, {
+  epoch,
+  at,
+  submit = true,
+  sim = false,
+  json = true,
+  rpcUrl,
+  home,
+  peerStoreName,
+  walletPassword,
+} = {}) {
+  const args = [
+    'admin',
+    'tap-deposit-reversal',
+    '--eth-tx-hash',
+    reversal.eth_tx_hash,
+    '--log-index',
+    String(reversal.log_index),
+    '--block-number',
+    String(reversal.block_number),
+    '--block-hash',
+    reversal.block_hash,
+    '--pool-address',
+    reversal.pool_address,
+    '--chain-id',
+    String(reversal.chain_id),
+    '--reconciliation-from-block',
+    String(reversal.reconciliation_from_block),
+    '--reconciliation-to-block',
+    String(reversal.reconciliation_to_block),
+    '--finalized-block-number',
+    String(reversal.finalized_block_number),
+    '--confirmation-policy',
+    reversal.confirmation_policy,
+    '--watcher-id',
+    reversal.watcher_id,
+    '--reason',
+    reversal.reason,
+    '--epoch',
+    String(epoch),
+    '--at',
+    String(at),
+  ];
+  if (home) args.push('--home', home);
+  if (rpcUrl) args.push('--rpc-url', rpcUrl);
+  if (peerStoreName) args.push('--peer-store-name', peerStoreName);
+  if (walletPassword) args.push('--wallet-password', walletPassword);
+  if (submit) args.push('--submit');
+  if (sim) args.push('--sim');
+  if (json) args.push('--json');
+  return args;
+}
+
+export function buildAdminReversalCommand(reversal, options = {}) {
+  const bin = options.mayhemBin ?? 'mayhem';
+  const args = buildAdminReversalCommandArgs(reversal, options)
     .filter((arg, index, all) => all[index - 1] !== '--wallet-password' && arg !== '--wallet-password');
   return [bin, ...args].map(shellQuote).join(' ');
 }
@@ -283,19 +428,23 @@ export function tapDepositStateMatches(deposit, {
     && Number(seen?.log_index) === deposit.log_index
     && seen?.ethereum_address === deposit.who
     && seen?.tap_wei === deposit.tap_wei
+    && Number(seen?.block_number) === Number(deposit.block_number)
     && seen?.block_hash === deposit.block_hash
+    && Number(seen?.chain_id) === Number(deposit.chain_id)
+    && seen?.pool_address === deposit.pool_address
     && Number(seen?.finalized_block_number) === Number(deposit.finalized_block_number)
     && Number(seen?.confirmation_depth) === Number(deposit.confirmation_depth)
     && seen?.confirmation_policy === deposit.confirmation_policy
     && seen?.event_signature === deposit.event_signature
     && seen?.watcher_id === deposit.watcher_id
     && (!hasExpectedAu || readAu(seen?.au) === expectedAu)
+    && Number(seen?.epoch) === Number(epoch)
+    && seen?.reversed !== true
     && typeof canonicalWho === 'string'
     && balance?.user === canonicalWho
     && balance?.rail === 'tap'
     && balance?.denom === 'au_usd'
     && balanceAu !== null
-    && (!hasExpectedAu || balanceAu >= expectedAu)
     && depositRoot?.type === 'deposit_root'
     && Number(depositRoot?.epoch) === Number(epoch)
     && Number.isSafeInteger(rootCount)
@@ -330,6 +479,56 @@ export async function waitForTapDepositState(deposit, {
   return { verified: false, state };
 }
 
+export function tapDepositReversalStateMatches(reversal, {
+  seen,
+  reversalSeen,
+  depositRoot,
+  epoch,
+} = {}) {
+  return seen?.reversed === true
+    && seen?.eth_tx_hash === reversal.eth_tx_hash
+    && Number(seen?.log_index) === reversal.log_index
+    && Number(seen?.block_number) === reversal.block_number
+    && seen?.block_hash === reversal.block_hash
+    && reversalSeen?.reason === 'canonical_event_missing'
+    && reversalSeen?.eth_tx_hash === reversal.eth_tx_hash
+    && Number(reversalSeen?.log_index) === reversal.log_index
+    && Number(reversalSeen?.block_number) === reversal.block_number
+    && reversalSeen?.block_hash === reversal.block_hash
+    && Number(reversalSeen?.reconciliation_from_block) === reversal.reconciliation_from_block
+    && Number(reversalSeen?.reconciliation_to_block) === reversal.reconciliation_to_block
+    && Number(reversalSeen?.finalized_block_number) === reversal.finalized_block_number
+    && reversalSeen?.confirmation_policy === 'finalized-tag'
+    && reversalSeen?.watcher_id === TAP_DEPOSIT_WATCHER_ID
+    && depositRoot?.type === 'deposit_root'
+    && Number(depositRoot?.epoch) === Number(epoch);
+}
+
+export async function waitForTapDepositReversalState(reversal, {
+  rpcUrl,
+  epoch,
+  timeoutMs = 0,
+  pollMs = 500,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+  const seenKey = `dep/tap/${tapDepositKey(reversal)}`;
+  let state = null;
+  while (deadline === null || Date.now() <= deadline) {
+    const [seen, reversalSeen, depositRoot] = await Promise.all([
+      readContractStateValue(rpcUrl, seenKey, { fetchImpl }),
+      readContractStateValue(rpcUrl, `${seenKey}/reversal`, { fetchImpl }),
+      readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
+    ]);
+    state = { seen, reversalSeen, depositRoot };
+    if (tapDepositReversalStateMatches(reversal, { ...state, epoch })) {
+      return { verified: true, state };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return { verified: false, state };
+}
+
 function readJsonIfExists(filePath, fallback) {
   if (!filePath || !fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -340,38 +539,118 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function normalizeDepositList(value) {
+  if (!Array.isArray(value)) return [];
+  const deposits = [];
+  for (const deposit of value) {
+    try {
+      tapDepositKey(deposit);
+      deposits.push(deposit);
+    } catch (_error) {}
+  }
+  return deposits;
+}
+
+function normalizeReversalList(value) {
+  if (!Array.isArray(value)) return [];
+  const reversals = [];
+  for (const reversal of value) {
+    try {
+      tapDepositReversalKey(reversal);
+      if (reversal.reason !== 'canonical_event_missing') continue;
+      reversals.push(reversal);
+    } catch (_error) {}
+  }
+  return reversals;
+}
+
 function normalizeCursor(raw) {
   const cursor = raw && typeof raw === 'object' ? raw : {};
   return {
     next_block: Number.isSafeInteger(cursor.next_block) && cursor.next_block >= 0
       ? cursor.next_block
       : 0,
-    seen_log_keys: Array.isArray(cursor.seen_log_keys)
-      ? cursor.seen_log_keys.filter((key) => typeof key === 'string')
-      : [],
-    unsubmitted_deposits: Array.isArray(cursor.unsubmitted_deposits)
-      ? cursor.unsubmitted_deposits.filter((deposit) => deposit?.eth_tx_hash && Number.isSafeInteger(deposit?.log_index))
+    credited_deposits: normalizeDepositList(cursor.credited_deposits),
+    pending_deposits: normalizeDepositList(cursor.pending_deposits),
+    pending_reversals: normalizeReversalList(cursor.pending_reversals),
+    reversed_log_keys: Array.isArray(cursor.reversed_log_keys)
+      ? cursor.reversed_log_keys.filter((key) => typeof key === 'string')
       : [],
   };
 }
 
-async function safeToBlock(provider, { toBlock, confirmations = 12, blockTag }) {
-  if (blockTag === 'finalized') {
+export function adminSubmitFailureIsTransient(child) {
+  if (child?.status === 0) return false;
+  if (child?.status === null || child?.signal) return true;
+  const output = `${child?.stdout ?? ''}\n${child?.stderr ?? ''}`.toLowerCase();
+  return [
+    /rate oracle timestamp is in the future/,
+    /econn(?:reset|refused|aborted)/,
+    /connection (?:reset|refused|closed|lost)/,
+    /socket hang up/,
+    /network (?:error|unavailable|unreachable)/,
+    /timed? out/,
+    /timeout/,
+    /\b429\b/,
+    /\b50[0234]\b/,
+    /temporar(?:y|ily)/,
+    /resource .*unavailable/,
+    /peer .*not (?:ready|available|connected)/,
+  ].some((pattern) => pattern.test(output));
+}
+
+export async function runAdminCommandWithRetry({
+  mayhemBin,
+  buildArgs,
+  attempts = DEFAULT_RETRY_ATTEMPTS,
+  baseDelayMs = DEFAULT_RETRY_BASE_MS,
+  maxDelayMs = DEFAULT_RETRY_MAX_MS,
+  spawnImpl = spawnSync,
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+} = {}) {
+  const maxAttempts = parsePositiveInt(attempts, '--retry-attempts', DEFAULT_RETRY_ATTEMPTS);
+  const base = parseNonNegativeInt(baseDelayMs, '--retry-base-ms', DEFAULT_RETRY_BASE_MS);
+  const cap = parseNonNegativeInt(maxDelayMs, '--retry-max-ms', DEFAULT_RETRY_MAX_MS);
+  let child;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    child = spawnImpl(mayhemBin, buildArgs(attempt), { encoding: 'utf8' });
+    if (child.status === 0 || !adminSubmitFailureIsTransient(child) || attempt + 1 === maxAttempts) {
+      return { child, attempts: attempt + 1, transient: adminSubmitFailureIsTransient(child) };
+    }
+    await sleep(Math.min(cap, base * (2 ** attempt)));
+  }
+  return { child, attempts: maxAttempts, transient: adminSubmitFailureIsTransient(child) };
+}
+
+async function safeToBlock(provider, { toBlock, confirmations = 12, blockTag, chainId }) {
+  const effectiveBlockTag = blockTag ?? (Number(chainId) === 1 ? 'finalized' : undefined);
+  if (Number(chainId) === 1 && effectiveBlockTag !== 'finalized') {
+    throw new Error('Ethereum mainnet TAP watcher requires --block-tag finalized');
+  }
+  if (effectiveBlockTag === 'finalized') {
     const block = await provider.send('eth_getBlockByNumber', ['finalized', false]);
     if (!block || block.number == null) throw new Error('finalized block tag unavailable from RPC');
-    const safeTo = Number(block.number);
-    return { safeTo, referenceBlock: safeTo, finalizedPolicy: true };
+    const referenceBlock = Number(block.number);
+    const maxSafe = Math.max(-1, referenceBlock - MIN_TAP_CONFIRMATIONS);
+    if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
+      const explicit = parseNonNegativeInt(toBlock, '--to-block');
+      if (explicit > maxSafe) {
+        throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} blocks behind the finalized reference`);
+      }
+      return { safeTo: explicit, referenceBlock, finalizedPolicy: true };
+    }
+    return { safeTo: maxSafe, referenceBlock, finalizedPolicy: true };
   }
   const head = Number(await provider.send('eth_blockNumber', []));
   const depth = parseNonNegativeInt(confirmations, '--confirmations', 12);
   if (depth < MIN_TAP_CONFIRMATIONS) {
-    throw new Error(`--confirmations must be at least ${MIN_TAP_CONFIRMATIONS} unless --block-tag finalized is used`);
+    throw new Error(`--confirmations must be at least ${MIN_TAP_CONFIRMATIONS}`);
   }
   const maxSafe = Math.max(-1, head - depth);
   if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
     const explicit = parseNonNegativeInt(toBlock, '--to-block');
     if (explicit > maxSafe) {
-      throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} confirmations deep unless --block-tag finalized is used`);
+      throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} confirmations deep`);
     }
     return { safeTo: explicit, referenceBlock: head, finalizedPolicy: false };
   }
@@ -385,6 +664,7 @@ export async function scanTapDeposits({
   confirmations = 12,
   blockTag,
   chunkSize = 5000,
+  lookbackBlocks = DEFAULT_LOOKBACK_BLOCKS,
   tapUsdAu,
   chainId,
   poolAddress,
@@ -393,9 +673,24 @@ export async function scanTapDeposits({
   if (!provider) throw new Error('pool contract has no provider');
   const network = chainId ? null : await provider.getNetwork();
   const normalizedChainId = Number(chainId ?? network.chainId);
-  const { safeTo, referenceBlock, finalizedPolicy } = await safeToBlock(provider, { toBlock, confirmations, blockTag });
-  const from = parseNonNegativeInt(fromBlock, '--from-block', 0);
-  if (safeTo < from) return { deposits: [], from, to: from - 1 };
+  const { safeTo, referenceBlock, finalizedPolicy } = await safeToBlock(provider, {
+    toBlock,
+    confirmations,
+    blockTag,
+    chainId: normalizedChainId,
+  });
+  const requestedFrom = parseNonNegativeInt(fromBlock, '--from-block', 0);
+  const lookback = parsePositiveInt(lookbackBlocks, '--lookback-blocks', DEFAULT_LOOKBACK_BLOCKS);
+  const from = Math.max(0, requestedFrom - (lookback - 1));
+  if (safeTo < from) {
+    return {
+      deposits: [],
+      from,
+      to: from - 1,
+      referenceBlock,
+      finalizedPolicy,
+    };
+  }
 
   const deposits = [];
   const window = Math.max(1, parsePositiveInt(chunkSize, '--chunk-size', 5000));
@@ -416,7 +711,7 @@ export async function scanTapDeposits({
       }));
     }
   }
-  return { deposits, from, to: safeTo };
+  return { deposits, from, to: safeTo, referenceBlock, finalizedPolicy };
 }
 
 export function mergeDeposits(existing, incoming) {
@@ -424,6 +719,21 @@ export function mergeDeposits(existing, incoming) {
   for (const deposit of [...existing, ...incoming]) {
     try {
       merged.set(tapDepositKey(deposit), deposit);
+    } catch (_error) {}
+  }
+  return Array.from(merged.values())
+    .sort((a, b) => (
+      Number(a.block_number) - Number(b.block_number)
+      || Number(a.log_index) - Number(b.log_index)
+      || String(a.eth_tx_hash).localeCompare(String(b.eth_tx_hash))
+    ));
+}
+
+export function mergeReversals(existing, incoming) {
+  const merged = new Map();
+  for (const reversal of [...existing, ...incoming]) {
+    try {
+      merged.set(tapDepositReversalKey(reversal), reversal);
     } catch (_error) {}
   }
   return Array.from(merged.values())
@@ -456,6 +766,26 @@ async function main() {
     : cursor.next_block;
   const confirmations = parseNonNegativeInt(args.confirmations ?? 12, '--confirmations', 12);
   const chunkSize = parsePositiveInt(args['chunk-size'] ?? 5000, '--chunk-size', 5000);
+  const lookbackBlocks = parsePositiveInt(
+    args['lookback-blocks'] ?? DEFAULT_LOOKBACK_BLOCKS,
+    '--lookback-blocks',
+    DEFAULT_LOOKBACK_BLOCKS
+  );
+  const retryAttempts = parsePositiveInt(
+    args['retry-attempts'] ?? DEFAULT_RETRY_ATTEMPTS,
+    '--retry-attempts',
+    DEFAULT_RETRY_ATTEMPTS
+  );
+  const retryBaseMs = parseNonNegativeInt(
+    args['retry-base-ms'] ?? DEFAULT_RETRY_BASE_MS,
+    '--retry-base-ms',
+    DEFAULT_RETRY_BASE_MS
+  );
+  const retryMaxMs = parseNonNegativeInt(
+    args['retry-max-ms'] ?? DEFAULT_RETRY_MAX_MS,
+    '--retry-max-ms',
+    DEFAULT_RETRY_MAX_MS
+  );
   const submit = boolArg(args.submit, false);
   const sim = boolArg(args.sim, false);
   const json = boolArg(args.json, false);
@@ -472,14 +802,33 @@ async function main() {
     confirmations,
     blockTag: args['block-tag'],
     chunkSize,
+    lookbackBlocks,
     tapUsdAu,
     chainId: args['chain-id'] ? parsePositiveInt(args['chain-id'], '--chain-id') : undefined,
     poolAddress,
   });
 
-  const seen = new Set(cursor.seen_log_keys);
-  const unsubmitted = mergeDeposits(cursor.unsubmitted_deposits, scan.deposits)
-    .filter((deposit) => !seen.has(tapDepositKey(deposit)));
+  const canonicalKeys = new Set(scan.deposits.map(tapDepositKey));
+  const reversedKeys = new Set(cursor.reversed_log_keys);
+  let creditedDeposits = mergeDeposits([], cursor.credited_deposits);
+  const creditedKeys = new Set(creditedDeposits.map(tapDepositKey));
+  const detectedReversals = scan.finalizedPolicy
+    ? reconcileCreditedDeposits(creditedDeposits, scan.deposits, scan)
+    : [];
+  const pendingReversals = mergeReversals(cursor.pending_reversals, detectedReversals)
+    .filter((reversal) => (
+      !canonicalKeys.has(tapDepositKey(reversal))
+      && !reversedKeys.has(tapDepositReversalKey(reversal))
+    ));
+  const pendingDeposits = mergeDeposits(cursor.pending_deposits, scan.deposits)
+    .filter((deposit) => (
+      (Number(deposit.block_number) < scan.from
+        || Number(deposit.block_number) > scan.to
+        || canonicalKeys.has(tapDepositKey(deposit)))
+      &&
+      !creditedKeys.has(tapDepositKey(deposit))
+      && !reversedKeys.has(tapDepositReversalKey(deposit))
+    ));
   const adminOptions = {
     epoch,
     submit: true,
@@ -494,102 +843,196 @@ async function main() {
       : undefined,
   };
 
-  const confirmationsOut = [];
-  const submittedKeys = new Set();
-  for (const deposit of unsubmitted) {
+  const reversalResults = [];
+  const reversedThisRun = new Set();
+  let submissionBlocked = false;
+  for (const reversal of pendingReversals) {
     let submitOptions = {
       ...adminOptions,
       at: explicitAt ?? Math.floor(Date.now() / 1000),
     };
-    const confirmation = {
-      ...deposit,
+    const result = {
+      ...reversal,
       at: submitOptions.at,
-      copy_paste_admin_submit_command: buildAdminCommand(deposit, submitOptions),
+      copy_paste_admin_submit_command: buildAdminReversalCommand(reversal, submitOptions),
       submitted: false,
       preflighted: false,
       verified: false,
     };
     if (submit) {
-      let child;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        submitOptions = {
-          ...submitOptions,
-          at: explicitAt ?? Math.floor(Date.now() / 1000),
-        };
-        child = spawnSync(
-          args['mayhem-bin'] || 'mayhem',
-          buildAdminCommandArgs(deposit, submitOptions),
-          { encoding: 'utf8' }
-        );
-        const output = `${child.stdout ?? ''}\n${child.stderr ?? ''}`;
-        if (
-          child.status === 0
-          || explicitAt !== null
-          || !output.includes('TAP rate oracle timestamp is in the future')
-          || attempt === 1
-        ) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1_100));
-      }
-      confirmation.at = submitOptions.at;
-      confirmation.copy_paste_admin_submit_command = buildAdminCommand(deposit, submitOptions);
+      const execution = await runAdminCommandWithRetry({
+        mayhemBin: args['mayhem-bin'] || 'mayhem',
+        attempts: retryAttempts,
+        baseDelayMs: retryBaseMs,
+        maxDelayMs: retryMaxMs,
+        buildArgs: () => {
+          submitOptions = {
+            ...submitOptions,
+            at: explicitAt ?? Math.floor(Date.now() / 1000),
+          };
+          return buildAdminReversalCommandArgs(reversal, submitOptions);
+        },
+      });
+      const { child } = execution;
+      result.at = submitOptions.at;
+      result.copy_paste_admin_submit_command = buildAdminReversalCommand(reversal, submitOptions);
+      result.attempts = execution.attempts;
       if (sim) {
-        confirmation.preflighted = child.status === 0;
+        result.preflighted = child.status === 0;
       } else {
-        confirmation.submitted = child.status === 0;
+        result.submitted = child.status === 0;
       }
-      confirmation.exit_status = child.status;
-      confirmation.stdout = child.stdout?.trim() || null;
-      confirmation.stderr = child.stderr?.trim() || null;
+      result.exit_status = child.status;
+      result.stdout = child.stdout?.trim() || null;
+      result.stderr = child.stderr?.trim() || null;
       if (child.status !== 0) {
-        confirmation.error = `mayhem admin tap-deposit exited ${child.status}`;
+        result.failure_kind = execution.transient ? 'transient_exhausted' : 'permanent';
+        result.error = `mayhem admin tap-deposit-reversal exited ${child.status}`;
+        submissionBlocked = true;
       } else if (!sim) {
         if (adminOptions.rpcUrl && verify) {
-          const verification = await waitForTapDepositState(deposit, {
+          const verification = await waitForTapDepositReversalState(reversal, {
             rpcUrl: adminOptions.rpcUrl,
             epoch,
             timeoutMs: verifyTimeoutMs,
             pollMs: verifyPollMs,
           });
-          confirmation.verified = verification.verified;
-          confirmation.state = verification.state;
+          result.verified = verification.verified;
+          result.state = verification.state;
           if (verification.verified) {
-            submittedKeys.add(tapDepositKey(deposit));
+            reversedThisRun.add(tapDepositReversalKey(reversal));
           } else {
-            confirmation.error = 'tapDeposit submit did not update seen log, balance, and deposit root';
+            result.error = 'tapDepositReversal did not update the credited event, reversal marker, and deposit root';
+            submissionBlocked = true;
           }
         } else {
-          confirmation.verification_skipped = true;
-          submittedKeys.add(tapDepositKey(deposit));
+          result.verification_skipped = true;
+          reversedThisRun.add(tapDepositReversalKey(reversal));
         }
       }
     }
-    confirmationsOut.push(confirmation);
+    reversalResults.push(result);
+    if (submissionBlocked) break;
   }
 
-  for (const key of submittedKeys) seen.add(key);
+  const depositResults = [];
+  const creditedThisRun = new Set();
+  if (!submissionBlocked) {
+    for (const deposit of pendingDeposits) {
+      let submitOptions = {
+        ...adminOptions,
+        at: explicitAt ?? Math.floor(Date.now() / 1000),
+      };
+      const result = {
+        ...deposit,
+        at: submitOptions.at,
+        copy_paste_admin_submit_command: buildAdminCommand(deposit, submitOptions),
+        submitted: false,
+        preflighted: false,
+        verified: false,
+      };
+      if (submit) {
+        const execution = await runAdminCommandWithRetry({
+          mayhemBin: args['mayhem-bin'] || 'mayhem',
+          attempts: retryAttempts,
+          baseDelayMs: retryBaseMs,
+          maxDelayMs: retryMaxMs,
+          buildArgs: () => {
+            submitOptions = {
+              ...submitOptions,
+              at: explicitAt ?? Math.floor(Date.now() / 1000),
+            };
+            return buildAdminCommandArgs(deposit, submitOptions);
+          },
+        });
+        const { child } = execution;
+        result.at = submitOptions.at;
+        result.copy_paste_admin_submit_command = buildAdminCommand(deposit, submitOptions);
+        result.attempts = execution.attempts;
+        if (sim) {
+          result.preflighted = child.status === 0;
+        } else {
+          result.submitted = child.status === 0;
+        }
+        result.exit_status = child.status;
+        result.stdout = child.stdout?.trim() || null;
+        result.stderr = child.stderr?.trim() || null;
+        if (child.status !== 0) {
+          result.failure_kind = execution.transient ? 'transient_exhausted' : 'permanent';
+          result.error = `mayhem admin tap-deposit exited ${child.status}`;
+          submissionBlocked = true;
+        } else if (!sim) {
+          if (adminOptions.rpcUrl && verify) {
+            const verification = await waitForTapDepositState(deposit, {
+              rpcUrl: adminOptions.rpcUrl,
+              epoch,
+              timeoutMs: verifyTimeoutMs,
+              pollMs: verifyPollMs,
+            });
+            result.verified = verification.verified;
+            result.state = verification.state;
+            if (verification.verified) {
+              creditedThisRun.add(tapDepositKey(deposit));
+            } else {
+              result.error = 'tapDeposit submit did not update the seen event, balance, and deposit root';
+              submissionBlocked = true;
+            }
+          } else {
+            result.verification_skipped = true;
+            creditedThisRun.add(tapDepositKey(deposit));
+          }
+        }
+      }
+      depositResults.push(result);
+      if (submissionBlocked) break;
+    }
+  }
+
+  for (const key of reversedThisRun) reversedKeys.add(key);
+  creditedDeposits = creditedDeposits.filter(
+    (deposit) => !reversedKeys.has(tapDepositReversalKey(deposit))
+  );
+  creditedDeposits = mergeDeposits(
+    creditedDeposits,
+    pendingDeposits.filter((deposit) => creditedThisRun.has(tapDepositKey(deposit)))
+  );
+  const finalCreditedKeys = new Set(creditedDeposits.map(tapDepositKey));
   const nextCursor = {
     next_block: Math.max(cursor.next_block, scan.to + 1),
-    seen_log_keys: Array.from(seen).sort(),
-    unsubmitted_deposits: unsubmitted.filter((deposit) => !seen.has(tapDepositKey(deposit))),
+    credited_deposits: creditedDeposits,
+    pending_deposits: pendingDeposits.filter(
+      (deposit) => !finalCreditedKeys.has(tapDepositKey(deposit))
+    ),
+    pending_reversals: pendingReversals.filter(
+      (reversal) => !reversedKeys.has(tapDepositReversalKey(reversal))
+    ),
+    reversed_log_keys: Array.from(reversedKeys).sort(),
   };
   writeJson(cursorPath, nextCursor);
 
   const report = {
-    ok: confirmationsOut.every((item) => item.error === undefined),
-    rpc,
+    ok: [...reversalResults, ...depositResults].every((item) => item.error === undefined),
+    rpc_url_redacted: redactRpcUrl(rpc),
     pool: normalizeAddress(poolAddress, 'pool'),
     epoch,
-    at: confirmationsOut.at(-1)?.at ?? explicitAt ?? Math.floor(Date.now() / 1000),
+    at: depositResults.at(-1)?.at
+      ?? reversalResults.at(-1)?.at
+      ?? explicitAt
+      ?? Math.floor(Date.now() / 1000),
     tap_usd_au: tapUsdAu,
     confirmations,
+    finalized_policy: scan.finalizedPolicy,
+    finalized_reference_block: scan.referenceBlock,
+    lookback_blocks: lookbackBlocks,
     from_block: scan.from,
     safe_to_block: scan.to,
     cursor: cursorPath,
     observed_deposit_count: scan.deposits.length,
-    unsubmitted_deposit_count: nextCursor.unsubmitted_deposits.length,
-    confirmations: confirmationsOut,
+    pending_deposit_count: nextCursor.pending_deposits.length,
+    pending_reversal_count: nextCursor.pending_reversals.length,
+    credited_deposit_count: nextCursor.credited_deposits.length,
+    reversals: reversalResults,
+    deposits: depositResults,
   };
 
   if (json) {
@@ -598,8 +1041,13 @@ async function main() {
     console.log('[tap:watch] TAP deposit watcher scan complete');
     console.log('[tap:watch] pool:', report.pool);
     console.log('[tap:watch] safe block:', scan.to);
-    console.log('[tap:watch] matched deposits:', confirmationsOut.length);
-    for (const item of confirmationsOut) {
+    console.log('[tap:watch] pending reversals:', reversalResults.length);
+    console.log('[tap:watch] matched deposits:', depositResults.length);
+    for (const item of reversalResults) {
+      console.log('Copy/paste admin TAP deposit reversal command:');
+      console.log(item.copy_paste_admin_submit_command);
+    }
+    for (const item of depositResults) {
       console.log('Copy/paste admin TAP deposit submit command:');
       console.log(item.copy_paste_admin_submit_command);
     }
@@ -610,7 +1058,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
-    console.error(error?.stack || error?.message || String(error));
+    console.error(safeErrorMessage(error));
     process.exit(1);
   });
 }

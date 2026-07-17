@@ -51,6 +51,10 @@ const seededBalance = (user, au, rail = 'fiat') => ({
   au: auString(au),
   updated_epoch: 0,
   updated_at: null,
+  ...(rail === 'tap' ? {
+    chain_id: 61_000,
+    pool_address: `0x${'2'.repeat(40)}`,
+  } : {}),
 });
 
 const paymentKeys = (storage) =>
@@ -136,6 +140,26 @@ async function setupLedgerContract(identities = null) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+
+  const payments = await execute(
+    contract,
+    storage,
+    'setPayments',
+    {
+      op: 'set_payments',
+      ver: 1,
+      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      tap: {
+        chain_id: 61_000,
+        token_address: `0x${'1'.repeat(40)}`,
+        pool_address: `0x${'2'.repeat(40)}`,
+      },
+      tnk: { network: 'testnet1', treasury_address: `testtrac1${'1'.repeat(40)}` },
+    },
+    admin.publicKey,
+    100_000
+  );
+  assert.equal(payments.ok, true, payments.message);
 
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
   return { admin, provider, provider2, user, outsider, storage, contract };
@@ -272,6 +296,10 @@ function signedSpendReservation(
   const lockedMinSessionAuString = auString(lockedMinSessionAu);
   const voucherBody = {
     session_id: sessionId,
+    billing_id: sessionId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     rail: 'fiat',
     enclave_id: enclaveId,
     price_ver: priceVer,
@@ -370,8 +398,16 @@ test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
     {
       op: 'tnk_deposit',
       memo_hash: 'memo-1',
-      tnk_e18: '1000000000000000000',
-      msb_tx_hash: 'a'.repeat(64),
+      msb_transfer: {
+        schema_version: 1,
+        network: 'testnet1',
+        tx_hash: 'a'.repeat(64),
+        confirmed_length: 10,
+        observed_signed_length: 12,
+        from: 'testtrac1sender',
+        to: 'testtrac1treasury',
+        amount_e18: '1000000000000000000',
+      },
       epoch: 1,
       at: 3_600,
     },
@@ -457,7 +493,16 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
       rate_tnk_usd_au: '50000000000000000',
       rate_source: 'gate-spot',
       rate_ts: 3_600,
-      msb_tx_hash: 'b'.repeat(64),
+      msb_transfers: [{
+        schema_version: 1,
+        network: 'testnet1',
+        tx_hash: 'b'.repeat(64),
+        confirmed_length: 10,
+        observed_signed_length: 12,
+        from: 'testtrac1treasury',
+        to: 'testtrac1operator',
+        amount_e18: '20000000000000',
+      }],
       transfer_root: 'c'.repeat(64),
       provider_count: 0,
       provider_au: '0',
@@ -496,7 +541,7 @@ test('MayhemProtocol keeps rate oracle updates off the paid tx route', () => {
     { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
     { op: 'rate_oracle', tnk_usd_au: '50000000000000000', source: 'gate-spot', ts: 3_600 },
     { op: 'rate_oracle', tnk_usd_au: '51000000000000000', source: 'mexc-spot', ts: 5_400 },
-    { op: 'tap_rate_oracle', tap_usd_au: '50000000000000000', source: 'uniswap-v2', ts: 3_600 },
+    { op: 'tap_rate_oracle', tap_usd_au: '50000000000000000', source: 'uniswap-v2-twap-median', ts: 3_600 },
     { op: 'tap_rate_oracle', tap_usd_au: '52000000000000000', source: 'config', ts: 5_400 },
   ];
 
@@ -511,7 +556,7 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
     commands.push({ op: 'epoch_commit', epoch, at: epoch * 3_600, roots: {}, totals: {} });
     commands.push(makeEpochApply(epoch, `user-${epoch}`, `provider-${epoch}`, 1_000 + epoch));
     commands.push({ op: 'rate_oracle', tnk_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'gate-spot', ts: epoch * 3_600 });
-    commands.push({ op: 'tap_rate_oracle', tap_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'uniswap-v2', ts: epoch * 3_600 });
+    commands.push({ op: 'tap_rate_oracle', tap_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'uniswap-v2-twap-median', ts: epoch * 3_600 });
 
     for (let i = 0; i < 4; i += 1) {
       commands.push({
@@ -523,8 +568,16 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
       commands.push({
         op: 'tnk_deposit',
         memo_hash: `memo-${epoch}-${i}`,
-        tnk_e18: '1000000000000000000',
-        msb_tx_hash: `${epoch}${i}`.padEnd(64, 'a'),
+        msb_transfer: {
+          schema_version: 1,
+          network: 'testnet1',
+          tx_hash: `${epoch}${i}`.padEnd(64, 'a'),
+          confirmed_length: epoch * 100 + i + 1,
+          observed_signed_length: epoch * 100 + 10,
+          from: `testtrac1user${epoch}${i}`,
+          to: 'testtrac1treasury',
+          amount_e18: '1000000000000000000',
+        },
         epoch,
         at: epoch * 3_600 + i,
       });

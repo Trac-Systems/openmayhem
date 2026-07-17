@@ -31,9 +31,14 @@ use crate::{
         RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
         DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
+    job_store::{
+        gateway_job_id, BeginGatewayJob, GatewayJobArtifact, GatewayJobListEntry, GatewayJobLookup,
+        GatewayJobStatus, GatewayJobStore, StoredGatewayJob, StoredGatewayJobSummary,
+    },
     pricing::{
-        normalize_rate_map, priced_usage_au, rate_gate_basis_au, text_generation_rate_map,
-        usage_units_au, RateMapEntry,
+        cancellation_settlement_usage, logical_cumulative_priced_usage_au, normalize_rate_map,
+        priced_usage_au, rate_gate_basis_au, text_generation_rate_map, usage_units_au,
+        RateMapEntry,
     },
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
@@ -41,7 +46,7 @@ use crate::{
         ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements, SelectionWeights,
         DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
         DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
-        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, DEFAULT_SATURATION_CUTOFF,
+        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
@@ -65,22 +70,24 @@ use base64::{
     },
     Engine as _,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{stream, Stream};
 use image::ImageReader;
-use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
+use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 #[cfg(test)]
-use mayhem_proto::chunk_json_payload;
+use mayhem_proto::{chunk_json_payload, visible_output_units};
 use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
-    payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, AttestationReport,
-    CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract, ModelSpecialityDescriptor,
-    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
+    metered_output_units, payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, VisibleToolCall, ATTESTATION_ALG,
     ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
     USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
     USAGE_VIDEO_SECOND,
@@ -159,7 +166,9 @@ pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
-const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
+const DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN: usize = 256;
+const DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN: usize =
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN as usize;
 const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS: usize = 32;
 const DEFAULT_GATEWAY_MAX_CHAT_MEDIA_ITEMS: u32 = 16;
@@ -175,9 +184,9 @@ const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS: u64 = 1_000_000_000_000;
 const DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS: usize = 1_024;
 const DEFAULT_GATEWAY_MAX_STORED_RECEIPTS: usize = 4_096;
 const DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES: usize = 4_096;
-const DEFAULT_GATEWAY_MAX_STORED_VIDEO_JOBS: usize = 64;
-const DEFAULT_GATEWAY_MAX_STORED_VIDEO_BYTES: usize = 512 * 1024 * 1024;
-const DEFAULT_GATEWAY_VIDEO_TTL_SECONDS: u64 = 3_600;
+const DEFAULT_GATEWAY_MAX_STORED_JOBS: usize = 64;
+const DEFAULT_GATEWAY_MAX_STORED_JOB_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_GATEWAY_JOB_TTL_SECONDS: u64 = 3_600;
 const DEFAULT_SESSION_MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_SESSION_MAX_ARTIFACTS: usize = 128;
 const MAX_SESSION_ARTIFACT_ID_BYTES: usize = 128;
@@ -203,10 +212,10 @@ pub struct GatewayState {
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
-    video_jobs: Arc<Mutex<GatewayVideoJobStore>>,
+    jobs: Arc<Mutex<GatewayJobStore>>,
     retention_limits: GatewayRetentionLimits,
     receipt_config: ReceiptConfig,
-    ledger_balance_au: Arc<Mutex<MoneyAu>>,
+    wallet_spend: Arc<Mutex<GatewayWalletSpendState>>,
     payment_directory: Arc<Mutex<Option<Value>>>,
     session_backend: Arc<dyn GatewaySessionBackend>,
     hardware_quote_trust: Arc<HardwareQuoteTrust>,
@@ -240,6 +249,124 @@ struct GatewayProviderEarningsSnapshot {
     entries: Vec<Value>,
     refreshed_at_seconds: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayReceiptRecorder {
+    receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    spend_reservation: GatewaySpendReservation,
+}
+
+#[derive(Debug)]
+struct GatewayWalletSpendState {
+    balance_au: MoneyAu,
+    reservations: BTreeMap<String, MoneyAu>,
+}
+
+#[derive(Debug)]
+struct GatewaySpendReservationInner {
+    id: String,
+    remaining_au: Mutex<Option<MoneyAu>>,
+    wallet_spend: Arc<Mutex<GatewayWalletSpendState>>,
+    access_control: Arc<GatewayAccessControl>,
+    access_token: Option<GatewayTokenAttribution>,
+}
+
+impl GatewaySpendReservationInner {
+    fn settle(&self, delta_au: MoneyAu, terminal: bool) -> Result<(), ApiError> {
+        let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
+        let Some(current_remaining) = *remaining else {
+            return Ok(());
+        };
+        if delta_au > current_remaining {
+            return Err(ApiError::payment_required(
+                "signed settlement exceeds the reserved session maximum",
+                Some("model"),
+            ));
+        }
+        self.access_control
+            .settle_reservation(&self.access_token, &self.id, delta_au, terminal)?;
+        let next_remaining = current_remaining.saturating_sub(delta_au);
+        let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
+        wallet.balance_au = wallet.balance_au.saturating_sub(delta_au);
+        if terminal {
+            wallet.reservations.remove(&self.id);
+            *remaining = None;
+        } else {
+            wallet.reservations.insert(self.id.clone(), next_remaining);
+            *remaining = Some(next_remaining);
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
+        if remaining.take().is_none() {
+            return;
+        }
+        self.access_control
+            .release_reservation(&self.access_token, &self.id);
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .remove(&self.id);
+    }
+}
+
+impl Drop for GatewaySpendReservationInner {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatewaySpendReservation(Arc<GatewaySpendReservationInner>);
+
+impl GatewaySpendReservation {
+    fn settle(&self, delta_au: MoneyAu, terminal: bool) -> Result<(), ApiError> {
+        self.0.settle(delta_au, terminal)
+    }
+
+    fn release(&self) {
+        self.0.release();
+    }
+}
+
+impl GatewayReceiptRecorder {
+    fn record(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
+        let mut receipts = self.receipts.lock_recover("receipt store");
+        if let Some(existing) = receipts.iter().find(|existing| {
+            existing.receipt.body.session_id == receipt.receipt.body.session_id
+                && existing.receipt.body.seq == receipt.receipt.body.seq
+        }) {
+            if existing == &receipt {
+                return Ok(());
+            }
+            return Err(ApiError::conflict(
+                "receipt sequence already contains different signed settlement data",
+                None,
+            ));
+        }
+        let billing_id = receipt.receipt.body.billing_id.as_str();
+        let cumulative = receipt.receipt.body.au_owed_cum;
+        let previous = receipts
+            .iter()
+            .filter(|existing| existing.receipt.body.billing_id == billing_id)
+            .map(|existing| existing.receipt.body.au_owed_cum)
+            .max()
+            .unwrap_or(0);
+        let spend_delta = cumulative.checked_sub(previous).ok_or_else(|| {
+            ApiError::conflict("logical billing cumulative amount regressed", None)
+        })?;
+        self.spend_reservation
+            .settle(spend_delta, receipt.receipt.body.final_receipt)?;
+        receipts.push(receipt);
+        Ok(())
+    }
+
+    fn release_reservation(&self) {
+        self.spend_reservation.release();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,9 +499,9 @@ struct GatewayRetentionLimits {
     receipts: usize,
     paused_sessions: usize,
     chat_affinities: usize,
-    video_jobs: usize,
-    video_bytes: usize,
-    video_ttl_seconds: u64,
+    jobs: usize,
+    job_bytes: usize,
+    job_ttl_seconds: u64,
 }
 
 impl Default for GatewayRetentionLimits {
@@ -396,91 +523,21 @@ impl Default for GatewayRetentionLimits {
                 "MAYHEM_GATEWAY_MAX_CHAT_AFFINITIES",
                 DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES,
             ),
-            video_jobs: configured_positive_usize(
-                "MAYHEM_GATEWAY_MAX_STORED_VIDEO_JOBS",
-                DEFAULT_GATEWAY_MAX_STORED_VIDEO_JOBS,
+            jobs: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_JOBS",
+                DEFAULT_GATEWAY_MAX_STORED_JOBS,
             ),
-            video_bytes: configured_positive_usize(
-                "MAYHEM_GATEWAY_MAX_STORED_VIDEO_BYTES",
-                DEFAULT_GATEWAY_MAX_STORED_VIDEO_BYTES,
+            job_bytes: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_JOB_BYTES",
+                DEFAULT_GATEWAY_MAX_STORED_JOB_BYTES,
             )
             .max(session_artifact_bytes),
-            video_ttl_seconds: u64::try_from(configured_positive_usize(
-                "MAYHEM_GATEWAY_VIDEO_TTL_SECONDS",
-                usize::try_from(DEFAULT_GATEWAY_VIDEO_TTL_SECONDS).unwrap_or(3_600),
+            job_ttl_seconds: u64::try_from(configured_positive_usize(
+                "MAYHEM_GATEWAY_JOB_TTL_SECONDS",
+                usize::try_from(DEFAULT_GATEWAY_JOB_TTL_SECONDS).unwrap_or(3_600),
             ))
-            .unwrap_or(DEFAULT_GATEWAY_VIDEO_TTL_SECONDS),
+            .unwrap_or(DEFAULT_GATEWAY_JOB_TTL_SECONDS),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct StoredVideoJob {
-    id: String,
-    model: String,
-    metadata: Value,
-    artifact: GatewayArtifactOutput,
-    access_token: Option<GatewayTokenAttribution>,
-    expires_at: u64,
-}
-
-#[derive(Debug, Default)]
-struct GatewayVideoJobStore {
-    jobs: VecDeque<StoredVideoJob>,
-    total_bytes: usize,
-}
-
-impl GatewayVideoJobStore {
-    fn purge_expired(&mut self, now: u64) {
-        self.jobs.retain(|job| job.expires_at > now);
-        self.total_bytes = self
-            .jobs
-            .iter()
-            .map(|job| job.artifact.bytes.len())
-            .fold(0_usize, usize::saturating_add);
-    }
-
-    fn insert(
-        &mut self,
-        job: StoredVideoJob,
-        max_jobs: usize,
-        max_bytes: usize,
-        now: u64,
-    ) -> Result<(), String> {
-        self.purge_expired(now);
-        let bytes = job.artifact.bytes.len();
-        if bytes > max_bytes {
-            return Err(format!(
-                "video artifact is {bytes} bytes, above the {max_bytes}-byte lifecycle store limit"
-            ));
-        }
-        if let Some(index) = self.jobs.iter().position(|existing| existing.id == job.id) {
-            if let Some(existing) = self.jobs.remove(index) {
-                self.total_bytes = self
-                    .total_bytes
-                    .saturating_sub(existing.artifact.bytes.len());
-            }
-        }
-        let max_jobs = max_jobs.max(1);
-        while self.jobs.len() >= max_jobs || self.total_bytes.saturating_add(bytes) > max_bytes {
-            let Some(evicted) = self.jobs.pop_front() else {
-                break;
-            };
-            self.total_bytes = self
-                .total_bytes
-                .saturating_sub(evicted.artifact.bytes.len());
-        }
-        self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.jobs.push_back(job);
-        Ok(())
-    }
-
-    fn remove(&mut self, id: &str, now: u64) -> Option<StoredVideoJob> {
-        self.purge_expired(now);
-        let index = self.jobs.iter().position(|job| job.id == id)?;
-        let job = self.jobs.remove(index)?;
-        self.total_bytes = self.total_bytes.saturating_sub(job.artifact.bytes.len());
-        Some(job)
     }
 }
 
@@ -961,7 +1018,7 @@ impl GatewayFailoverInvocation {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredReceipt {
     pub rail: String,
     pub voucher: SpendVoucher,
@@ -1144,6 +1201,7 @@ pub struct GatewayAccessControl {
     store_path: Option<PathBuf>,
     store: Arc<Mutex<GatewayTokenStore>>,
     rate_windows: Arc<Mutex<BTreeMap<String, GatewayTokenRateWindow>>>,
+    reservations: Arc<Mutex<BTreeMap<(String, String), MoneyAu>>>,
 }
 
 impl GatewayAccessControl {
@@ -1157,6 +1215,7 @@ impl GatewayAccessControl {
             store_path,
             store: Arc::new(Mutex::new(store.normalized())),
             rate_windows: Arc::new(Mutex::new(BTreeMap::new())),
+            reservations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1246,9 +1305,10 @@ impl GatewayAccessControl {
         Ok(Some(attribution))
     }
 
-    fn ensure_budget_allows(
+    fn reserve_budget(
         &self,
         attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
         max_spend_au: MoneyAu,
     ) -> Result<(), ApiError> {
         let Some(attribution) = attribution else {
@@ -1262,38 +1322,101 @@ impl GatewayAccessControl {
             .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
             .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
         token.reset_budget_window_if_needed(now);
+        let key = (attribution.token_id.clone(), reservation_id.to_owned());
+        let mut reservations = self.reservations.lock_recover("gateway token reservations");
+        if reservations.contains_key(&key) {
+            return Err(ApiError::conflict(
+                "session spend reservation already exists",
+                Some("model"),
+            ));
+        }
+        let reserved_au = reservations
+            .iter()
+            .filter(|((token_id, _), _)| token_id == &attribution.token_id)
+            .map(|(_, amount)| *amount)
+            .fold(0_u128, MoneyAu::saturating_add);
         if token.budget_au.is_some_and(|budget_au| {
-            token.effective_spent_au().saturating_add(max_spend_au) > budget_au
+            token
+                .effective_spent_au()
+                .saturating_add(reserved_au)
+                .saturating_add(max_spend_au)
+                > budget_au
         }) {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
                 Some("Authorization"),
             ));
         }
-        self.persist_store(&store)
+        self.persist_store(&store)?;
+        reservations.insert(key, max_spend_au);
+        Ok(())
     }
 
-    fn record_spend(
+    fn settle_reservation(
         &self,
-        attribution: &GatewayTokenAttribution,
+        attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
         spend_au_delta: MoneyAu,
+        terminal: bool,
     ) -> Result<(), ApiError> {
-        if spend_au_delta == 0 {
-            return Ok(());
-        }
-        let now = now_secs();
-        let mut store = self.store.lock_recover("gateway token store");
-        let Some(token) = store
-            .tokens
-            .iter_mut()
-            .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
-        else {
+        let Some(attribution) = attribution else {
             return Ok(());
         };
-        token.reset_budget_window_if_needed(now);
-        token.spent_total_au = token.spent_total_au.saturating_add(spend_au_delta);
-        token.spent_period_au = token.spent_period_au.saturating_add(spend_au_delta);
-        self.persist_store(&store)
+        let now = now_secs();
+        let mut store = self.store.lock_recover("gateway token store");
+        let Some(token_index) = store.tokens.iter().position(|token| {
+            token.name == attribution.name && token.token_id == attribution.token_id
+        }) else {
+            return Err(ApiError::unauthorized(
+                "reserved bearer token no longer exists",
+                Some("Authorization"),
+            ));
+        };
+        let key = (attribution.token_id.clone(), reservation_id.to_owned());
+        let mut reservations = self.reservations.lock_recover("gateway token reservations");
+        let remaining = reservations.get(&key).copied().ok_or_else(|| {
+            ApiError::conflict(
+                "session token reservation is missing",
+                Some("Authorization"),
+            )
+        })?;
+        if spend_au_delta > remaining {
+            return Err(ApiError::payment_required(
+                "signed settlement exceeds bearer token reservation",
+                Some("Authorization"),
+            ));
+        }
+        let previous_token = store.tokens[token_index].clone();
+        store.tokens[token_index].reset_budget_window_if_needed(now);
+        store.tokens[token_index].spent_total_au = store.tokens[token_index]
+            .spent_total_au
+            .saturating_add(spend_au_delta);
+        store.tokens[token_index].spent_period_au = store.tokens[token_index]
+            .spent_period_au
+            .saturating_add(spend_au_delta);
+        if let Err(error) = self.persist_store(&store) {
+            store.tokens[token_index] = previous_token;
+            return Err(error);
+        }
+        if terminal {
+            reservations.remove(&key);
+        } else {
+            reservations.insert(key, remaining.saturating_sub(spend_au_delta));
+        }
+        Ok(())
+    }
+
+    fn release_reservation(
+        &self,
+        attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
+    ) {
+        let Some(attribution) = attribution else {
+            return;
+        };
+        self.reservations
+            .lock_recover("gateway token reservations")
+            .remove(&(attribution.token_id.clone(), reservation_id.to_owned()));
     }
 
     fn summary(&self) -> Value {
@@ -1542,6 +1665,7 @@ pub struct GatewayCanaryPrompt {
     pub size: Option<String>,
     pub steps: Option<u64>,
     pub cfg_scale: Option<f32>,
+    pub shift: Option<f32>,
     pub seed: Option<i64>,
 }
 
@@ -1755,9 +1879,23 @@ pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
     #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub moderation: Option<String>,
+    #[serde(default)]
     pub n: Option<u32>,
     #[serde(default)]
+    pub output_compression: Option<u32>,
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub partial_images: Option<u32>,
+    #[serde(default)]
     pub size: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
@@ -1771,9 +1909,13 @@ pub struct ImageGenerationRequest {
     #[serde(default)]
     pub cfg_scale: Option<f32>,
     #[serde(default)]
+    pub shift: Option<f32>,
+    #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
     pub scheduler: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
     #[serde(default)]
     pub user: Option<String>,
     #[serde(skip)]
@@ -1826,7 +1968,6 @@ struct CompletedArtifactGeneration {
     quality: Option<GatewaySessionQuality>,
     receipt: Option<Value>,
     session_id: String,
-    access_token: Option<GatewayTokenAttribution>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1876,53 +2017,47 @@ pub fn normalize_endpoint_request_for_provider(
             .collect::<Vec<_>>()
             .join("; ")
     })?;
-    let mut normalized_request = match contract.family.as_str() {
+    let defaulted_request =
+        mayhem_proto::materialize_endpoint_request_defaults(contract, raw_request)?;
+    mayhem_proto::validate_endpoint_request(contract, &defaulted_request).map_err(
+        |violations| {
+            format!(
+                "request with signed defaults violates contract: {}",
+                violations
+                    .iter()
+                    .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        },
+    )?;
+    match contract.family.as_str() {
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
         | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => {
-            let request = serde_json::from_value::<ChatCompletionRequest>(raw_request.clone())
+            serde_json::from_value::<ChatCompletionRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid chat request: {err}"))?;
-            let mut normalized =
-                direct_session_contract_request(&direct_session_request_body(&request));
-            if contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT {
-                normalized
-                    .as_object_mut()
-                    .expect("chat normalization always produces an object")
-                    .remove("metadata");
-            }
-            normalized
         }
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS => {
-            let request = serde_json::from_value::<CompletionRequest>(raw_request.clone())
+            serde_json::from_value::<CompletionRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid completion request: {err}"))?;
-            json_object_without_nulls(
-                serde_json::to_value(request)
-                    .map_err(|err| format!("normalizing completion request: {err}"))?,
-            )
         }
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES => {
-            let request = serde_json::from_value::<ResponsesRequest>(raw_request.clone())
+            serde_json::from_value::<ResponsesRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid Responses request: {err}"))?;
-            json_object_without_nulls(
-                serde_json::to_value(request)
-                    .map_err(|err| format!("normalizing Responses request: {err}"))?,
-            )
         }
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
-            let request = serde_json::from_value::<EmbeddingRequest>(raw_request.clone())
+            serde_json::from_value::<EmbeddingRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid embedding request: {err}"))?;
-            direct_session_contract_request(&direct_session_embedding_request_body(&request))
         }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
-            let request = serde_json::from_value::<ImageGenerationRequest>(raw_request.clone())
+            serde_json::from_value::<ImageGenerationRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid image request: {err}"))?;
-            direct_session_contract_request(&direct_session_image_generation_request_body(&request))
         }
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => {
-            let request = serde_json::from_value::<AudioSpeechRequest>(raw_request.clone())
+            serde_json::from_value::<AudioSpeechRequest>(defaulted_request.clone())
                 .map_err(|err| format!("invalid speech request: {err}"))?;
-            direct_session_contract_request(&direct_session_audio_speech_request_body(&request))
         }
-        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => raw_request.clone(),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => {}
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
         | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
@@ -1931,26 +2066,19 @@ pub fn normalize_endpoint_request_for_provider(
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
         | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
-        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => raw_request.clone(),
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {}
         other => {
             return Err(format!(
                 "endpoint family {other} has no gateway normalization path"
             ))
         }
-    };
+    }
+    let mut normalized_request = defaulted_request;
     restore_explicit_null_attributes(raw_request, &mut normalized_request);
-    let raw_object = raw_request
-        .as_object()
-        .ok_or_else(|| "endpoint request must be an object".to_owned())?;
-    let normalized_object = normalized_request
-        .as_object()
-        .ok_or_else(|| "normalized endpoint request must be an object".to_owned())?;
-    for (key, value) in raw_object {
-        if normalized_object.get(key) != Some(value) {
-            return Err(format!(
-                "gateway normalization changed or dropped supplied attribute {key}"
-            ));
-        }
+    if let Some(path) = changed_supplied_endpoint_path(raw_request, &normalized_request, "") {
+        return Err(format!(
+            "gateway normalization changed or dropped supplied attribute {path}"
+        ));
     }
     mayhem_proto::validate_endpoint_request(contract, &normalized_request).map_err(
         |violations| {
@@ -1967,9 +2095,36 @@ pub fn normalize_endpoint_request_for_provider(
     Ok(EndpointRequestNormalization {
         endpoint_family: contract.family.clone(),
         contract_fingerprint: mayhem_proto::endpoint_contract_fingerprint(contract),
-        normalized_request_fingerprint: stable_value_hash(&normalized_request),
+        normalized_request_fingerprint: mayhem_proto::endpoint_request_fingerprint(
+            &normalized_request,
+        ),
         normalized_request,
     })
+}
+
+fn changed_supplied_endpoint_path(raw: &Value, normalized: &Value, path: &str) -> Option<String> {
+    let Value::Object(raw) = raw else {
+        return (raw != normalized).then(|| path.to_owned());
+    };
+    let Value::Object(normalized) = normalized else {
+        return Some(path.to_owned());
+    };
+    for (key, raw_value) in raw {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        let Some(normalized_value) = normalized.get(key) else {
+            return Some(child_path);
+        };
+        if let Some(changed) =
+            changed_supplied_endpoint_path(raw_value, normalized_value, &child_path)
+        {
+            return Some(changed);
+        }
+    }
+    None
 }
 
 fn restore_explicit_null_attributes(raw_request: &Value, normalized_request: &mut Value) {
@@ -1983,13 +2138,6 @@ fn restore_explicit_null_attributes(raw_request: &Value, normalized_request: &mu
             normalized.insert(key.clone(), Value::Null);
         }
     }
-}
-
-fn json_object_without_nulls(mut value: Value) -> Value {
-    if let Some(object) = value.as_object_mut() {
-        object.retain(|_, value| !value.is_null());
-    }
-    value
 }
 
 #[derive(Debug)]
@@ -2041,7 +2189,7 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a GatewayHedgeProbeInvocation,
     ) -> GatewayHedgeProbeFuture<'a> {
         Box::pin(async move {
             Ok(GatewayHedgeProbeResult {
@@ -2216,6 +2364,243 @@ pub struct ProviderSignedReceipt {
     pub enclave_pubkey: String,
 }
 
+#[derive(Clone)]
+struct GatewayJobHandle {
+    id: String,
+    store: Arc<Mutex<GatewayJobStore>>,
+}
+
+impl GatewayJobHandle {
+    async fn persist_terminal(
+        &self,
+        status: GatewayJobStatus,
+        result: Option<Value>,
+        artifacts: Vec<GatewayJobArtifact>,
+        receipt: Option<Value>,
+        error: Option<String>,
+    ) -> Result<StoredGatewayJob, GatewaySessionError> {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store.lock_recover("gateway job vault").complete(
+                &id,
+                status,
+                result,
+                artifacts,
+                receipt,
+                error,
+                now_secs(),
+            )
+        })
+        .await
+        .map_err(|err| {
+            GatewaySessionError::new(format!("gateway job persistence task failed: {err}"))
+        })?
+        .map_err(|err| {
+            GatewaySessionError::new(format!("persisting encrypted gateway job failed: {err}"))
+        })
+    }
+
+    async fn persist_failure_if_active(&self, error: String) {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock_recover("gateway job vault");
+            if !store.is_active(&id) {
+                return Ok(());
+            }
+            store.complete(
+                &id,
+                GatewayJobStatus::Failed,
+                None,
+                Vec::new(),
+                None,
+                Some(error),
+                now_secs(),
+            )?;
+            Ok::<_, String>(())
+        })
+        .await;
+        if let Err(error) = persisted
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+        {
+            eprintln!("persisting failed gateway job {} failed: {error}", self.id);
+        }
+    }
+
+    async fn persist_completed_if_active(
+        &self,
+        result: Value,
+        artifacts: Vec<GatewayJobArtifact>,
+        receipt: Option<Value>,
+    ) -> Result<StoredGatewayJob, ApiError> {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock_recover("gateway job vault");
+            if store.is_active(&id) {
+                return store.complete(
+                    &id,
+                    GatewayJobStatus::Completed,
+                    Some(result),
+                    artifacts,
+                    receipt,
+                    None,
+                    now_secs(),
+                );
+            }
+            store
+                .get(&id, now_secs())?
+                .ok_or_else(|| format!("completed gateway job {id} is missing from the vault"))
+        })
+        .await
+        .map_err(|err| ApiError::internal_message(format!("gateway job task failed: {err}")))?
+        .map_err(ApiError::internal_message)
+    }
+}
+
+impl fmt::Debug for GatewayJobHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayJobHandle")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GatewayJobHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.store, &other.store)
+    }
+}
+
+fn gateway_job_artifacts(artifacts: &[GatewayArtifactOutput]) -> Vec<GatewayJobArtifact> {
+    artifacts
+        .iter()
+        .map(|artifact| GatewayJobArtifact {
+            id: artifact.id.clone(),
+            content_type: artifact.content_type.clone(),
+            bytes: artifact.bytes.clone(),
+            blake3: artifact.blake3.clone(),
+        })
+        .collect()
+}
+
+fn gateway_job_settled_receipt(receipt: &ProviderSignedReceipt, receipt_ack: &ReceiptAck) -> Value {
+    json!({
+        "body": receipt.body,
+        "enclave_sig": receipt.enclave_sig,
+        "enclave_pubkey": receipt.enclave_pubkey,
+        "receipt_ack": receipt_ack,
+    })
+}
+
+async fn persist_completed_invocation_job(
+    invocation: &GatewaySessionInvocation,
+    result: Value,
+    artifacts: &[GatewayArtifactOutput],
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+) -> Result<(), GatewaySessionError> {
+    let Some(job) = invocation.job.as_ref() else {
+        return Ok(());
+    };
+    job.persist_terminal(
+        GatewayJobStatus::Completed,
+        Some(result),
+        gateway_job_artifacts(artifacts),
+        Some(gateway_job_settled_receipt(provider_receipt, receipt_ack)),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_cancelled_invocation_job(
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+) -> Result<(), GatewaySessionError> {
+    let Some(job) = invocation.job.as_ref() else {
+        return Ok(());
+    };
+    job.persist_terminal(
+        GatewayJobStatus::Cancelled,
+        Some(json!({
+            "kind": "cancelled",
+            "reason": "client_disconnect",
+            "usage": provider_receipt.body.usage,
+            "au_owed_cum": provider_receipt.body.au_owed_cum,
+        })),
+        Vec::new(),
+        Some(gateway_job_settled_receipt(provider_receipt, receipt_ack)),
+        Some("client disconnected before the result became deliverable".to_owned()),
+    )
+    .await?;
+    Ok(())
+}
+
+fn chat_job_result(output: &ChatOutput) -> Value {
+    json!({
+        "kind": "chat",
+        "content": output.content,
+        "tool_calls": output.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
+        "finish_reason": output.finish_reason,
+        "usage": output.usage,
+        "artifacts": artifact_summaries(&output.artifacts),
+    })
+}
+
+fn embedding_job_result(output: &EmbeddingOutput) -> Value {
+    json!({
+        "kind": "embedding",
+        "embeddings": output.embeddings,
+        "usage": output.usage,
+    })
+}
+
+fn image_job_result(output: &ImageGenerationOutput) -> Value {
+    json!({
+        "kind": "image",
+        "usage": output.usage,
+        "artifacts": artifact_summaries(&output.artifacts),
+    })
+}
+
+fn audio_speech_job_result(output: &AudioSpeechOutput) -> Value {
+    json!({
+        "kind": "audio_speech",
+        "usage": output.usage,
+        "artifacts": artifact_summaries(&output.artifacts),
+    })
+}
+
+fn audio_transcription_job_result(output: &AudioTranscriptionOutput) -> Value {
+    json!({
+        "kind": "audio_transcription",
+        "text": output.text,
+        "usage": output.usage,
+    })
+}
+
+fn artifact_generation_job_result(
+    request: &ArtifactGenerationRequest,
+    output: &ArtifactGenerationOutput,
+) -> Value {
+    json!({
+        "kind": format!("{}_generation", request.output_modality),
+        "model": request.model,
+        "prompt": request.prompt,
+        "size": request.contract_request.get("size").cloned().unwrap_or(Value::Null),
+        "seconds": request.duration_seconds,
+        "frames": request.frame_count,
+        "steps": request.step_count,
+        "usage": output.usage,
+        "artifacts": artifact_summaries(&output.artifacts),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct GatewaySessionInvocation {
     pub contract_version: u32,
@@ -2236,8 +2621,36 @@ pub struct GatewaySessionInvocation {
     pub hedge: GatewayHedgeInvocation,
     pub failover: GatewayFailoverInvocation,
     pub access_token: Option<GatewayTokenAttribution>,
+    client_cancellation: Option<GatewayRequestCancellation>,
+    job: Option<GatewayJobHandle>,
+    receipt_recorder: GatewayReceiptRecorder,
     receipt_cosign_enabled: bool,
     receipt_user_seed: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayHedgeProbeInvocation {
+    pub session_id: String,
+    pub provider_pubkey: Option<String>,
+    pub transport_peer: Option<String>,
+    pub failover: GatewayFailoverInvocation,
+}
+
+impl GatewayHedgeProbeInvocation {
+    fn provider_pubkey_required(&self) -> Result<&str, GatewaySessionError> {
+        self.provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))
+    }
+
+    fn direct_peer(&self) -> Result<&str, GatewaySessionError> {
+        self.transport_peer.as_deref().ok_or_else(|| {
+            GatewaySessionError::retryable(format!(
+                "provider {} has no fresh signed transport peer heartbeat",
+                self.provider_pubkey.as_deref().unwrap_or("unknown")
+            ))
+        })
+    }
 }
 
 impl GatewaySessionInvocation {
@@ -2508,6 +2921,7 @@ impl GatewayState {
         let models = sanitize_gateway_models(models);
         let receipt_config = ReceiptConfig::default();
         let ledger_balance_au = receipt_config.balance_au;
+        let retention_limits = GatewayRetentionLimits::default();
         let provider_table = provider_table_from_models(&models, receipt_config.rules_ver);
         let media_limits = GatewayMediaLimits::from_env().unwrap_or_else(|err| {
             eprintln!("Invalid gateway media limit during state construction: {err}");
@@ -2521,10 +2935,18 @@ impl GatewayState {
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
-            video_jobs: Arc::new(Mutex::new(GatewayVideoJobStore::default())),
-            retention_limits: GatewayRetentionLimits::default(),
+            jobs: Arc::new(Mutex::new(GatewayJobStore::in_memory(
+                receipt_config.user_seed,
+                retention_limits.jobs,
+                retention_limits.job_bytes,
+                retention_limits.job_ttl_seconds,
+            ))),
+            retention_limits,
             receipt_config,
-            ledger_balance_au: Arc::new(Mutex::new(ledger_balance_au)),
+            wallet_spend: Arc::new(Mutex::new(GatewayWalletSpendState {
+                balance_au: ledger_balance_au,
+                reservations: BTreeMap::new(),
+            })),
             payment_directory: Arc::new(Mutex::new(None)),
             session_backend: Arc::new(NoProviderSessionBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
@@ -2566,12 +2988,32 @@ impl GatewayState {
 
     pub fn with_receipt_user_seed(mut self, seed: [u8; 32]) -> Self {
         self.receipt_config.user_seed = seed;
+        self.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+            seed,
+            self.retention_limits.jobs,
+            self.retention_limits.job_bytes,
+            self.retention_limits.job_ttl_seconds,
+        )));
         self
+    }
+
+    pub fn with_job_store_dir(mut self, directory: impl Into<PathBuf>) -> Result<Self, String> {
+        self.jobs = Arc::new(Mutex::new(GatewayJobStore::durable(
+            self.receipt_config.user_seed,
+            directory.into(),
+            self.retention_limits.jobs,
+            self.retention_limits.job_bytes,
+            self.retention_limits.job_ttl_seconds,
+            now_secs(),
+        )?));
+        Ok(self)
     }
 
     pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
         self.receipt_config.balance_au = balance_au;
-        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au = balance_au;
         self
     }
 
@@ -2583,14 +3025,66 @@ impl GatewayState {
     }
 
     pub fn update_ledger_payment_state(&self, balance_au: MoneyAu, payment_directory: Value) {
-        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au = balance_au;
         *self
             .payment_directory
             .lock_recover("gateway payment directory") = Some(payment_directory);
     }
 
     fn ledger_balance_au(&self) -> MoneyAu {
-        *self.ledger_balance_au.lock_recover("gateway balance store")
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au
+    }
+
+    fn reserve_session_spend(
+        &self,
+        reservation_id: &str,
+        max_spend_au: MoneyAu,
+        access_token: &Option<GatewayTokenAttribution>,
+    ) -> Result<GatewaySpendReservation, ApiError> {
+        self.access_control
+            .reserve_budget(access_token, reservation_id, max_spend_au)?;
+        let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
+        let reserved_au = wallet
+            .reservations
+            .values()
+            .copied()
+            .fold(0_u128, MoneyAu::saturating_add);
+        if reserved_au.saturating_add(max_spend_au) > wallet.balance_au {
+            drop(wallet);
+            self.access_control
+                .release_reservation(access_token, reservation_id);
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        if wallet
+            .reservations
+            .insert(reservation_id.to_owned(), max_spend_au)
+            .is_some()
+        {
+            drop(wallet);
+            self.access_control
+                .release_reservation(access_token, reservation_id);
+            return Err(ApiError::conflict(
+                "session spend reservation already exists",
+                Some("model"),
+            ));
+        }
+        drop(wallet);
+        Ok(GatewaySpendReservation(Arc::new(
+            GatewaySpendReservationInner {
+                id: reservation_id.to_owned(),
+                remaining_au: Mutex::new(Some(max_spend_au)),
+                wallet_spend: self.wallet_spend.clone(),
+                access_control: self.access_control.clone(),
+                access_token: access_token.clone(),
+            },
+        )))
     }
 
     fn payment_directory(&self) -> Option<Value> {
@@ -2938,45 +3432,6 @@ impl GatewayState {
             .len()
     }
 
-    fn record_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
-        let spend_delta = receipt.access_token.as_ref().and_then(|access_token| {
-            let session_id = receipt.receipt.body.session_id.as_str();
-            let cumulative = receipt.receipt.body.au_owed_cum;
-            let receipts = self.receipts.lock_recover("receipt store");
-            let previous = receipts
-                .iter()
-                .filter(|existing| {
-                    existing.access_token.as_ref() == Some(access_token)
-                        && existing.receipt.body.session_id == session_id
-                })
-                .map(|existing| existing.receipt.body.au_owed_cum)
-                .max()
-                .unwrap_or(0);
-            cumulative
-                .checked_sub(previous)
-                .filter(|delta| *delta > 0)
-                .map(|delta| (access_token.clone(), delta))
-        });
-        {
-            let mut receipts = self.receipts.lock_recover("receipt store");
-            receipts.push(receipt);
-            if receipts.len() > self.retention_limits.receipts {
-                let remove = receipts.len() - self.retention_limits.receipts;
-                receipts.drain(..remove);
-            }
-        }
-        if let Some((access_token, delta)) = spend_delta {
-            self.access_control.record_spend(&access_token, delta)?;
-        }
-        if let Err(err) = self.persist_dashboard_history() {
-            eprintln!(
-                "Mayhem dashboard could not persist receipt history: {}",
-                err.message
-            );
-        }
-        Ok(())
-    }
-
     fn record_probe(&self, probe: StoredProbeEvent) {
         self.probes.lock_recover("probe store").push(probe);
     }
@@ -3135,6 +3590,16 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
         .route("/v1/images/generations", post(create_image_generation))
+        .route("/v1/jobs", get(list_gateway_jobs))
+        .route(
+            "/v1/jobs/{job_id}",
+            get(retrieve_gateway_job).delete(delete_gateway_job),
+        )
+        .route("/v1/jobs/{job_id}/result", get(retrieve_gateway_job_result))
+        .route(
+            "/v1/jobs/{job_id}/artifacts/{artifact_id}",
+            get(retrieve_gateway_job_artifact),
+        )
         .route(
             "/v1/videos",
             get(list_video_generations).post(create_video_generation),
@@ -3204,8 +3669,8 @@ fn gateway_request_body_limit(state: &GatewayState) -> usize {
         .max()
         .unwrap_or(0);
     let context_limit = usize::try_from(max_ctx)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
         .max(DEFAULT_GATEWAY_REQUEST_BODY_BYTES);
     let decoded_media_bytes = state
         .media_limits
@@ -3444,26 +3909,44 @@ fn parse_catalog_endpoint_request<T: DeserializeOwned>(
     state: &GatewayState,
     raw_request: &Value,
     endpoint_family: &str,
-) -> Result<T, ApiError> {
+) -> Result<(T, Value), ApiError> {
     let model_id = endpoint_request_model(raw_request)?;
-    validate_catalog_endpoint_request(state, model_id, endpoint_family, raw_request)?;
-    serde_json::from_value(raw_request.clone()).map_err(|err| {
+    let normalized =
+        normalize_catalog_endpoint_request(state, model_id, endpoint_family, raw_request)?;
+    let request = serde_json::from_value(normalized.clone()).map_err(|err| {
         ApiError::bad_request(format!("invalid endpoint request: {err}"), Some("request"))
-    })
+    })?;
+    Ok((request, normalized))
 }
 
-fn validate_catalog_endpoint_request(
+fn normalize_catalog_endpoint_request(
     state: &GatewayState,
     model_id: &str,
     endpoint_family: &str,
     raw_request: &Value,
-) -> Result<(), ApiError> {
+) -> Result<Value, ApiError> {
+    let contract = catalog_endpoint_contract(state, model_id, endpoint_family)?;
+    normalize_endpoint_request_for_provider(&contract, raw_request)
+        .map(|normalized| normalized.normalized_request)
+        .map_err(|err| {
+            ApiError::bad_request(
+                format!("request normalization failed: {err}"),
+                Some("request"),
+            )
+        })
+}
+
+fn catalog_endpoint_contract(
+    state: &GatewayState,
+    model_id: &str,
+    endpoint_family: &str,
+) -> Result<EndpointFamilyContract, ApiError> {
     let model = require_model(state, model_id)?;
-    let contract = model
+    model
         .mayhem
         .adapter
         .endpoint_families
-        .iter()
+        .into_iter()
         .find(|contract| contract.family == endpoint_family)
         .ok_or_else(|| {
             ApiError::bad_request(
@@ -3473,20 +3956,7 @@ fn validate_catalog_endpoint_request(
                 ),
                 Some("model"),
             )
-        })?;
-    if let Err(violations) = mayhem_proto::validate_endpoint_request(contract, raw_request) {
-        let summary = violations
-            .iter()
-            .take(4)
-            .map(|violation| format!("{}: {}", violation.path, violation.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApiError::bad_request(
-            format!("request violates the signed model endpoint contract: {summary}"),
-            Some("request"),
-        ));
-    }
-    Ok(())
+        })
 }
 
 fn endpoint_request_model(raw_request: &Value) -> Result<&str, ApiError> {
@@ -3495,6 +3965,510 @@ fn endpoint_request_model(raw_request: &Value) -> Result<&str, ApiError> {
         .and_then(Value::as_str)
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("request missing model", Some("model")))
+}
+
+enum PreparedGatewayJob {
+    Started(GatewayJobHandle),
+    InProgress(String),
+    Existing(StoredGatewayJob),
+}
+
+async fn prepare_gateway_job(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    endpoint_family: &str,
+    model: &str,
+    normalized_request: &Value,
+    access_token: &Option<GatewayTokenAttribution>,
+) -> Result<PreparedGatewayJob, ApiError> {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value.to_str().map(str::to_owned).map_err(|_| {
+                ApiError::bad_request(
+                    "Idempotency-Key must be valid ASCII",
+                    Some("Idempotency-Key"),
+                )
+            })
+        })
+        .transpose()?;
+    let owner_token_id = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.clone());
+    let id = gateway_job_id(
+        state.receipt_config.user_seed,
+        owner_token_id.as_deref(),
+        endpoint_family,
+        idempotency_key.as_deref(),
+    )
+    .map_err(|err| ApiError::bad_request(err, Some("Idempotency-Key")))?;
+    let request_fingerprint = stable_value_hash(normalized_request);
+    let store = state.jobs.clone();
+    let begin_id = id.clone();
+    let begin_endpoint = endpoint_family.to_owned();
+    let begin_model = model.to_owned();
+    let begin = tokio::task::spawn_blocking(move || {
+        store.lock_recover("gateway job vault").begin(
+            begin_id,
+            begin_endpoint,
+            begin_model,
+            owner_token_id,
+            request_fingerprint,
+            now_secs(),
+        )
+    })
+    .await
+    .map_err(|err| ApiError::internal_message(format!("gateway job task failed: {err}")))?
+    .map_err(|err| ApiError::conflict(err, Some("Idempotency-Key")))?;
+    Ok(match begin {
+        BeginGatewayJob::Started => PreparedGatewayJob::Started(GatewayJobHandle {
+            id,
+            store: state.jobs.clone(),
+        }),
+        BeginGatewayJob::InProgress => PreparedGatewayJob::InProgress(id),
+        BeginGatewayJob::Existing(job) => PreparedGatewayJob::Existing(job),
+    })
+}
+
+fn gateway_job_metadata(job: &StoredGatewayJob) -> Value {
+    gateway_job_summary_metadata(&StoredGatewayJobSummary::from(job))
+}
+
+fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
+    json!({
+        "id": job.id,
+        "object": "mayhem.job",
+        "status": job.status.as_str(),
+        "endpoint_family": job.endpoint_family,
+        "model": job.model,
+        "created_at": job.created_at,
+        "finished_at": job.finished_at,
+        "expires_at": job.expires_at,
+        "result_url": format!("/v1/jobs/{}/result", job.id),
+        "artifacts": job.artifacts.iter().map(|artifact| json!({
+            "id": artifact.id,
+            "content_type": artifact.content_type,
+            "bytes": artifact.bytes,
+            "blake3": artifact.blake3,
+            "content_url": format!("/v1/jobs/{}/artifacts/{}", job.id, artifact.id),
+        })).collect::<Vec<_>>(),
+        "receipt": job.receipt,
+        "error": job.error,
+    })
+}
+
+fn gateway_job_pending_response(id: &str) -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "id": id,
+            "object": "mayhem.job",
+            "status": "in_progress",
+            "status_url": format!("/v1/jobs/{id}"),
+        })),
+    )
+        .into_response();
+    attach_gateway_job_headers(&mut response, id);
+    response
+}
+
+fn gateway_existing_job_response(job: StoredGatewayJob) -> Response {
+    let status = if job.status == GatewayJobStatus::Completed {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    let id = job.id.clone();
+    let mut response = (status, Json(gateway_job_metadata(&job))).into_response();
+    attach_gateway_job_headers(&mut response, &id);
+    response
+}
+
+fn attach_gateway_job_headers(response: &mut Response, id: &str) {
+    if let Ok(value) = HeaderValue::from_str(id) {
+        response.headers_mut().insert("x-mayhem-job-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("/v1/jobs/{id}")) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+}
+
+fn gateway_prefers_async_response(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|preference| preference.trim().split(';').next())
+        .any(|preference| preference.eq_ignore_ascii_case("respond-async"))
+}
+
+fn gateway_job_in_progress_metadata(
+    id: &str,
+    endpoint_family: &str,
+    model: &str,
+    created_at: u64,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "mayhem.job",
+        "status": "in_progress",
+        "endpoint_family": endpoint_family,
+        "model": model,
+        "created_at": created_at,
+        "status_url": format!("/v1/jobs/{id}"),
+        "result_url": format!("/v1/jobs/{id}/result"),
+        "artifacts": [],
+        "receipt": Value::Null,
+        "error": Value::Null,
+    })
+}
+
+fn gateway_job_lookup_id(job: &GatewayJobLookup) -> &str {
+    match job {
+        GatewayJobLookup::InProgress { id, .. } => id,
+        GatewayJobLookup::Terminal(job) => &job.id,
+    }
+}
+
+fn gateway_job_lookup_model(job: &GatewayJobLookup) -> &str {
+    match job {
+        GatewayJobLookup::InProgress { model, .. } => model,
+        GatewayJobLookup::Terminal(job) => &job.model,
+    }
+}
+
+fn gateway_job_lookup_owner(job: &GatewayJobLookup) -> Option<&str> {
+    match job {
+        GatewayJobLookup::InProgress { owner_token_id, .. } => owner_token_id.as_deref(),
+        GatewayJobLookup::Terminal(job) => job.owner_token_id.as_deref(),
+    }
+}
+
+fn gateway_job_lookup_metadata(job: &GatewayJobLookup) -> Value {
+    match job {
+        GatewayJobLookup::InProgress {
+            id,
+            endpoint_family,
+            model,
+            created_at,
+            ..
+        } => gateway_job_in_progress_metadata(id, endpoint_family, model, *created_at),
+        GatewayJobLookup::Terminal(job) => gateway_job_metadata(job),
+    }
+}
+
+fn gateway_job_list_entry_id(job: &GatewayJobListEntry) -> &str {
+    match job {
+        GatewayJobListEntry::InProgress { id, .. } => id,
+        GatewayJobListEntry::Terminal(job) => &job.id,
+    }
+}
+
+fn gateway_job_list_entry_created_at(job: &GatewayJobListEntry) -> u64 {
+    match job {
+        GatewayJobListEntry::InProgress { created_at, .. } => *created_at,
+        GatewayJobListEntry::Terminal(job) => job.created_at,
+    }
+}
+
+fn gateway_job_list_entry_metadata(job: &GatewayJobListEntry) -> Value {
+    match job {
+        GatewayJobListEntry::InProgress {
+            id,
+            endpoint_family,
+            model,
+            created_at,
+        } => gateway_job_in_progress_metadata(id, endpoint_family, model, *created_at),
+        GatewayJobListEntry::Terminal(job) => gateway_job_summary_metadata(job),
+    }
+}
+
+async fn lookup_gateway_job(
+    state: &GatewayState,
+    id: &str,
+) -> Result<Option<GatewayJobLookup>, ApiError> {
+    let store = state.jobs.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        store
+            .lock_recover("gateway job vault")
+            .lookup(&id, now_secs())
+    })
+    .await
+    .map_err(|err| ApiError::internal_message(format!("gateway job lookup task failed: {err}")))?
+    .map_err(ApiError::internal_message)
+}
+
+fn authorize_gateway_job(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    job: &GatewayJobLookup,
+) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+    let access_token =
+        state.authorize_gateway_request(headers, Some(gateway_job_lookup_model(job)))?;
+    let owner_token_id = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.as_str());
+    if owner_token_id != gateway_job_lookup_owner(job) {
+        return Err(ApiError::not_found(
+            "gateway job was not found",
+            Some("job_id"),
+        ));
+    }
+    Ok(access_token)
+}
+
+async fn list_gateway_jobs(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<VideoListQuery>,
+) -> Response {
+    let access_token = match state.authorize_gateway_request(&headers, None) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return ApiError::bad_request("limit must be between 1 and 100", Some("limit"))
+            .into_response();
+    }
+    let descending = match query.order.as_deref().unwrap_or("desc") {
+        "desc" => true,
+        "asc" => false,
+        _ => {
+            return ApiError::bad_request("order must be asc or desc", Some("order"))
+                .into_response()
+        }
+    };
+    let owner = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.clone());
+    let store = state.jobs.clone();
+    let mut jobs = match tokio::task::spawn_blocking(move || {
+        store
+            .lock_recover("gateway job vault")
+            .list_entries_for_owner(owner.as_deref(), now_secs())
+    })
+    .await
+    {
+        Ok(Ok(jobs)) => jobs,
+        Ok(Err(err)) => return ApiError::internal_message(err).into_response(),
+        Err(err) => {
+            return ApiError::internal_message(format!("gateway job list task failed: {err}"))
+                .into_response()
+        }
+    };
+    jobs.sort_by_key(|job| {
+        (
+            gateway_job_list_entry_created_at(job),
+            gateway_job_list_entry_id(job).to_owned(),
+        )
+    });
+    if descending {
+        jobs.reverse();
+    }
+    let start = if let Some(after) = query.after.as_deref() {
+        match jobs
+            .iter()
+            .position(|job| gateway_job_list_entry_id(job) == after)
+        {
+            Some(index) => index.saturating_add(1),
+            None => {
+                return ApiError::bad_request("after cursor was not found", Some("after"))
+                    .into_response()
+            }
+        }
+    } else {
+        0
+    };
+    let has_more = jobs.len().saturating_sub(start) > limit;
+    let data = jobs
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|job| gateway_job_list_entry_metadata(&job))
+        .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(|job| job.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_id = data
+        .last()
+        .and_then(|job| job.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": has_more,
+    }))
+    .into_response()
+}
+
+async fn retrieve_gateway_job(
+    State(state): State<SharedState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match lookup_gateway_job(&state, &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
+        return err.into_response();
+    }
+    let status = if matches!(job, GatewayJobLookup::InProgress { .. }) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let mut response = (status, Json(gateway_job_lookup_metadata(&job))).into_response();
+    attach_gateway_job_headers(&mut response, gateway_job_lookup_id(&job));
+    response
+}
+
+async fn retrieve_gateway_job_result(
+    State(state): State<SharedState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match lookup_gateway_job(&state, &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
+        return err.into_response();
+    }
+    let GatewayJobLookup::Terminal(job) = job else {
+        return gateway_job_pending_response(&job_id);
+    };
+    if job.status != GatewayJobStatus::Completed {
+        return gateway_existing_job_response(job);
+    }
+    let mut response = Json(json!({
+        "id": job.id,
+        "object": "mayhem.job.result",
+        "status": job.status.as_str(),
+        "result": job.result,
+        "receipt": job.receipt,
+    }))
+    .into_response();
+    attach_gateway_job_headers(&mut response, &job_id);
+    response
+}
+
+async fn retrieve_gateway_job_artifact(
+    State(state): State<SharedState>,
+    Path((job_id, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match lookup_gateway_job(&state, &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
+        return err.into_response();
+    }
+    let GatewayJobLookup::Terminal(job) = job else {
+        return gateway_job_pending_response(&job_id);
+    };
+    if job.status != GatewayJobStatus::Completed {
+        return gateway_existing_job_response(job);
+    }
+    let Some(artifact) = job
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.id == artifact_id)
+    else {
+        return ApiError::not_found("gateway job artifact was not found", Some("artifact_id"))
+            .into_response();
+    };
+    let mut response = Body::from(artifact.bytes).into_response();
+    let content_type = match HeaderValue::from_str(&artifact.content_type) {
+        Ok(content_type) => content_type,
+        Err(err) => {
+            return ApiError::internal_message(format!(
+                "stored gateway job content type is invalid: {err}"
+            ))
+            .into_response()
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    if let Ok(blake3) = HeaderValue::from_str(&artifact.blake3) {
+        response
+            .headers_mut()
+            .insert("x-mayhem-artifact-blake3", blake3);
+    }
+    attach_gateway_job_headers(&mut response, &job_id);
+    response
+}
+
+async fn delete_gateway_job(
+    State(state): State<SharedState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match lookup_gateway_job(&state, &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match authorize_gateway_job(&state, &headers, &job) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    if matches!(job, GatewayJobLookup::InProgress { .. }) {
+        return ApiError::conflict(
+            "an in-progress job cannot be deleted; disconnect or cancellation must settle first",
+            Some("job_id"),
+        )
+        .into_response();
+    }
+    let owner = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.clone());
+    let store = state.jobs.clone();
+    let remove_id = job_id.clone();
+    let removed = match tokio::task::spawn_blocking(move || {
+        store
+            .lock_recover("gateway job vault")
+            .remove(&remove_id, owner.as_deref(), now_secs())
+    })
+    .await
+    {
+        Ok(Ok(removed)) => removed,
+        Ok(Err(err)) => return ApiError::internal_message(err).into_response(),
+        Err(err) => {
+            return ApiError::internal_message(format!("gateway job delete task failed: {err}"))
+                .into_response()
+        }
+    };
+    if removed.is_none() {
+        return ApiError::not_found("gateway job was not found", Some("job_id")).into_response();
+    }
+    Json(json!({
+        "id": job_id,
+        "object": "mayhem.job.deleted",
+        "deleted": true,
+    }))
+    .into_response()
 }
 
 async fn create_chat_completion(
@@ -3514,23 +4488,76 @@ async fn create_chat_completion(
         Ok(family) => family,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<ChatCompletionRequest>(
-        &state,
-        &raw_request,
-        &endpoint_family,
-    ) {
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<
+        ChatCompletionRequest,
+    >(&state, &raw_request, &endpoint_family)
+    {
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(endpoint_family);
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_chat_completion(state.clone(), request, options).await {
-        Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+    if request.stream {
+        return match build_chat_completion(state, request, options).await {
+            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
+            Err(err) => err.into_response(),
+        };
+    }
+    let endpoint_family = request
+        .endpoint_family
+        .as_deref()
+        .expect("normalized chat endpoint family is present");
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        endpoint_family,
+        &request.model,
+        request
+            .endpoint_request
+            .as_ref()
+            .expect("normalized chat request is present"),
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        spawn_gateway_job_request(job, async move {
+            build_chat_completion(state, request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_chat_completion(state, request, options).await
+    })
+    .await;
+    match result {
+        Ok(ChatResponse::Json(value)) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
@@ -3596,7 +4623,7 @@ async fn create_completion(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let request = match parse_catalog_endpoint_request::<CompletionRequest>(
+    let (request, normalized_request) = match parse_catalog_endpoint_request::<CompletionRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
@@ -3609,8 +4636,55 @@ async fn create_completion(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_completion(state.clone(), request, raw_request, options).await {
-        Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+    if request.stream {
+        return match build_completion(state, request, normalized_request, options).await {
+            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
+            Err(err) => err.into_response(),
+        };
+    }
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+        &request.model,
+        &normalized_request,
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        spawn_gateway_job_request(job, async move {
+            build_completion(state, request, normalized_request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_completion(state, request, normalized_request, options).await
+    })
+    .await;
+    match result {
+        Ok(ChatResponse::Json(value)) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
@@ -3630,7 +4704,7 @@ async fn create_response(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let request = match parse_catalog_endpoint_request::<ResponsesRequest>(
+    let (request, normalized_request) = match parse_catalog_endpoint_request::<ResponsesRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
@@ -3643,8 +4717,55 @@ async fn create_response(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_response(state.clone(), request, raw_request, options).await {
-        Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+    if request.stream {
+        return match build_response(state, request, normalized_request, options).await {
+            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
+            Err(err) => err.into_response(),
+        };
+    }
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        &request.model,
+        &normalized_request,
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        spawn_gateway_job_request(job, async move {
+            build_response(state, request, normalized_request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_response(state, request, normalized_request, options).await
+    })
+    .await;
+    match result {
+        Ok(ChatResponse::Json(value)) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
@@ -3664,7 +4785,7 @@ async fn create_embedding(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<EmbeddingRequest>(
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<EmbeddingRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
@@ -3673,14 +4794,58 @@ async fn create_embedding(
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_embedding(&state, request, options).await {
-        Ok(value) => Json(value).into_response(),
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+        &request.model,
+        request
+            .endpoint_request
+            .as_ref()
+            .expect("normalized embedding request is present"),
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        let request_state = state.clone();
+        spawn_gateway_job_request(job, async move {
+            build_embedding(&request_state, request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let request_state = state.clone();
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_embedding(&request_state, request, options).await
+    })
+    .await;
+    match result {
+        Ok(value) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -3698,23 +4863,68 @@ async fn create_image_generation(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<ImageGenerationRequest>(
-        &state,
-        &raw_request,
-        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
-    ) {
-        Ok(request) => request,
-        Err(err) => return err.into_response(),
-    };
+    let (mut request, normalized_request) =
+        match parse_catalog_endpoint_request::<ImageGenerationRequest>(
+            &state,
+            &raw_request,
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        ) {
+            Ok(request) => request,
+            Err(err) => return err.into_response(),
+        };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_image_generation(&state, request, options).await {
-        Ok(value) => Json(value).into_response(),
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        &request.model,
+        request
+            .endpoint_request
+            .as_ref()
+            .expect("normalized image request is present"),
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        let request_state = state.clone();
+        spawn_gateway_job_request(job, async move {
+            build_image_generation(&request_state, request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let request_state = state.clone();
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_image_generation(&request_state, request, options).await
+    })
+    .await;
+    match result {
+        Ok(value) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -3724,18 +4934,42 @@ async fn create_video_generation(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
-    match execute_artifact_generation_endpoint(
-        &state,
-        &headers,
-        raw_request,
-        mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
-    )
+    let cancellation = GatewayRequestCancellation::new();
+    let request_state = state.clone();
+    match run_detached_nonstreaming_request(cancellation.clone(), async move {
+        execute_artifact_generation_endpoint(
+            &request_state,
+            &headers,
+            raw_request,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            Some(cancellation),
+        )
+        .await
+    })
     .await
     {
-        Ok((request, run)) => match state.store_completed_video(&request, &run) {
-            Ok(metadata) => Json(metadata).into_response(),
-            Err(err) => err.into_response(),
-        },
+        Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
+        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
+            let stored = match job
+                .persist_completed_if_active(
+                    artifact_generation_job_result(&request, &run.output),
+                    gateway_job_artifacts(&run.output.artifacts),
+                    run.receipt.clone(),
+                )
+                .await
+            {
+                Ok(stored) => stored,
+                Err(err) => return err.into_response(),
+            };
+            match video_generation_metadata_from_job(&stored) {
+                Ok(metadata) => {
+                    let mut response = Json(metadata).into_response();
+                    attach_gateway_job_headers(&mut response, &job.id);
+                    response
+                }
+                Err(err) => err.into_response(),
+            }
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -3745,16 +4979,36 @@ async fn create_audio_generation(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
-    match execute_artifact_generation_endpoint(
-        &state,
-        &headers,
-        raw_request,
-        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
-    )
+    let cancellation = GatewayRequestCancellation::new();
+    let request_state = state.clone();
+    match run_detached_nonstreaming_request(cancellation.clone(), async move {
+        execute_artifact_generation_endpoint(
+            &request_state,
+            &headers,
+            raw_request,
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            Some(cancellation),
+        )
+        .await
+    })
     .await
     {
-        Ok((request, run)) => {
-            Json(artifact_generation_response_value(&request, &run)).into_response()
+        Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
+        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
+            if let Err(err) = job
+                .persist_completed_if_active(
+                    artifact_generation_job_result(&request, &run.output),
+                    gateway_job_artifacts(&run.output.artifacts),
+                    run.receipt.clone(),
+                )
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response =
+                Json(artifact_generation_response_value(&request, &run)).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
         }
         Err(err) => err.into_response(),
     }
@@ -3765,19 +5019,48 @@ async fn create_music_generation(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
-    match execute_artifact_generation_endpoint(
-        &state,
-        &headers,
-        raw_request,
-        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
-    )
+    let cancellation = GatewayRequestCancellation::new();
+    let request_state = state.clone();
+    match run_detached_nonstreaming_request(cancellation.clone(), async move {
+        execute_artifact_generation_endpoint(
+            &request_state,
+            &headers,
+            raw_request,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            Some(cancellation),
+        )
+        .await
+    })
     .await
     {
-        Ok((request, run)) => {
-            Json(artifact_generation_response_value(&request, &run)).into_response()
+        Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
+        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
+            if let Err(err) = job
+                .persist_completed_if_active(
+                    artifact_generation_job_result(&request, &run.output),
+                    gateway_job_artifacts(&run.output.artifacts),
+                    run.receipt.clone(),
+                )
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response =
+                Json(artifact_generation_response_value(&request, &run)).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
         }
         Err(err) => err.into_response(),
     }
+}
+
+enum ArtifactEndpointOutcome {
+    Immediate(Response),
+    Completed {
+        request: ArtifactGenerationRequest,
+        run: CompletedArtifactGeneration,
+        job: GatewayJobHandle,
+    },
 }
 
 async fn execute_artifact_generation_endpoint(
@@ -3785,82 +5068,143 @@ async fn execute_artifact_generation_endpoint(
     headers: &HeaderMap,
     raw_request: Value,
     endpoint_family: &str,
-) -> Result<(ArtifactGenerationRequest, CompletedArtifactGeneration), ApiError> {
+    client_cancellation: Option<GatewayRequestCancellation>,
+) -> Result<ArtifactEndpointOutcome, ApiError> {
     let model_id = endpoint_request_model(&raw_request)?.to_owned();
     let access_token = state.authorize_gateway_request(headers, Some(&model_id))?;
-    validate_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
-    let request = artifact_generation_request(&model_id, endpoint_family, raw_request)?;
+    let normalized =
+        normalize_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
+    let request = artifact_generation_request(&model_id, endpoint_family, normalized.clone())?;
     let mut options = state.request_options_from_headers(headers)?;
     options.access_token = access_token;
-    let run = build_artifact_generation(state, request.clone(), options).await?;
-    Ok((request, run))
-}
-
-impl GatewayState {
-    fn store_completed_video(
-        &self,
-        request: &ArtifactGenerationRequest,
-        run: &CompletedArtifactGeneration,
-    ) -> Result<Value, ApiError> {
-        let artifact = run.output.artifacts.first().cloned().ok_or_else(|| {
-            ApiError::bad_gateway("video generation response is empty", Some("model"))
-        })?;
-        if !artifact.content_type.starts_with("video/") {
-            return Err(ApiError::bad_gateway(
-                format!(
-                    "video provider returned non-video content type {}",
-                    artifact.content_type
-                ),
-                Some("model"),
-            ));
+    options.client_cancellation = client_cancellation;
+    let job = match prepare_gateway_job(
+        state,
+        headers,
+        endpoint_family,
+        &model_id,
+        &normalized,
+        &options.access_token,
+    )
+    .await?
+    {
+        PreparedGatewayJob::Started(job) => job,
+        PreparedGatewayJob::InProgress(id) => {
+            return Ok(ArtifactEndpointOutcome::Immediate(
+                gateway_job_pending_response(&id),
+            ))
         }
-        let now = now_secs();
-        let id = video_job_id(&run.session_id);
-        let metadata = video_generation_metadata(
-            request,
-            run,
-            &id,
-            now,
-            self.retention_limits.video_ttl_seconds,
-        );
-        self.video_jobs
-            .lock_recover("video lifecycle store")
-            .insert(
-                StoredVideoJob {
-                    id,
-                    model: request.model.clone(),
-                    metadata: metadata.clone(),
-                    artifact,
-                    access_token: run.access_token.clone(),
-                    expires_at: now.saturating_add(self.retention_limits.video_ttl_seconds),
-                },
-                self.retention_limits.video_jobs,
-                self.retention_limits.video_bytes,
-                now,
-            )
-            .map_err(ApiError::internal_message)?;
-        Ok(metadata)
+        PreparedGatewayJob::Existing(job) => {
+            return Ok(ArtifactEndpointOutcome::Immediate(
+                gateway_existing_job_response(job),
+            ))
+        }
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(headers) {
+        options.client_cancellation = None;
+        let job_id = job.id.clone();
+        let request_state = state.clone();
+        let task_request = request.clone();
+        spawn_gateway_job_request(job, async move {
+            build_artifact_generation(&request_state, task_request, options).await
+        });
+        return Ok(ArtifactEndpointOutcome::Immediate(
+            gateway_job_pending_response(&job_id),
+        ));
     }
-
-    fn video_job(&self, id: &str) -> Option<StoredVideoJob> {
-        let now = now_secs();
-        let mut store = self.video_jobs.lock_recover("video lifecycle store");
-        store.purge_expired(now);
-        store.jobs.iter().find(|job| job.id == id).cloned()
-    }
+    let run = match build_artifact_generation(state, request.clone(), options).await {
+        Ok(run) => run,
+        Err(error) => {
+            job.persist_failure_if_active(error.message.clone()).await;
+            return Err(error);
+        }
+    };
+    Ok(ArtifactEndpointOutcome::Completed { request, run, job })
 }
 
-fn requester_owns_video(
-    job: &StoredVideoJob,
-    access_token: &Option<GatewayTokenAttribution>,
-) -> Result<(), ApiError> {
-    if &job.access_token == access_token {
-        Ok(())
-    } else {
-        Err(ApiError::not_found(
+fn video_generation_metadata_from_job(job: &StoredGatewayJob) -> Result<Value, ApiError> {
+    video_generation_metadata_from_summary(&StoredGatewayJobSummary::from(job))
+}
+
+fn video_generation_metadata_from_summary(
+    job: &StoredGatewayJobSummary,
+) -> Result<Value, ApiError> {
+    if job.endpoint_family != mayhem_proto::ENDPOINT_OPENAI_VIDEOS {
+        return Err(ApiError::not_found(
             "video job was not found",
             Some("video_id"),
-        ))
+        ));
+    }
+    let result = job.result_metadata.as_ref().and_then(Value::as_object);
+    let prompt = result
+        .and_then(|result| result.get("prompt"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let size = result
+        .and_then(|result| result.get("size"))
+        .cloned()
+        .unwrap_or_else(|| json!("720x1280"));
+    let seconds = match result.and_then(|result| result.get("seconds")) {
+        Some(Value::String(seconds)) => seconds.clone(),
+        Some(Value::Number(seconds)) => seconds.to_string(),
+        _ => "0".to_owned(),
+    };
+    let usage = result
+        .and_then(|result| result.get("usage"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let status = job.status.as_str();
+    Ok(json!({
+        "id": job.id,
+        "object": "video",
+        "model": job.model,
+        "status": status,
+        "progress": if job.status == GatewayJobStatus::Completed { 100 } else { 0 },
+        "created_at": job.created_at,
+        "completed_at": job.finished_at,
+        "expires_at": job.expires_at,
+        "error": job.error,
+        "prompt": prompt,
+        "size": size,
+        "seconds": seconds,
+        "usage": usage,
+        "mayhem": {
+            "receipt": job.receipt,
+            "job_url": format!("/v1/jobs/{}", job.id),
+        },
+    }))
+}
+
+fn video_generation_metadata_from_lookup(job: &GatewayJobLookup) -> Result<Value, ApiError> {
+    match job {
+        GatewayJobLookup::InProgress {
+            id,
+            endpoint_family,
+            model,
+            created_at,
+            ..
+        } => {
+            if endpoint_family != mayhem_proto::ENDPOINT_OPENAI_VIDEOS {
+                return Err(ApiError::not_found(
+                    "video job was not found",
+                    Some("video_id"),
+                ));
+            }
+            Ok(json!({
+                "id": id,
+                "object": "video",
+                "model": model,
+                "status": "in_progress",
+                "progress": 0,
+                "created_at": created_at,
+                "completed_at": Value::Null,
+                "expires_at": Value::Null,
+                "error": Value::Null,
+                "mayhem": { "job_url": format!("/v1/jobs/{id}") },
+            }))
+        }
+        GatewayJobLookup::Terminal(job) => video_generation_metadata_from_job(job),
     }
 }
 
@@ -3886,17 +5230,28 @@ async fn list_video_generations(
                 .into_response()
         }
     };
-    let mut jobs = {
-        let now = now_secs();
-        let mut store = state.video_jobs.lock_recover("video lifecycle store");
-        store.purge_expired(now);
+    let owner = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.clone());
+    let store = state.jobs.clone();
+    let mut jobs = match tokio::task::spawn_blocking(move || {
         store
-            .jobs
-            .iter()
-            .filter(|job| job.access_token == access_token)
-            .cloned()
-            .collect::<Vec<_>>()
+            .lock_recover("gateway job vault")
+            .list_summaries_for_owner(owner.as_deref(), now_secs())
+    })
+    .await
+    {
+        Ok(Ok(jobs)) => jobs
+            .into_iter()
+            .filter(|job| job.endpoint_family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+            .collect::<Vec<_>>(),
+        Ok(Err(err)) => return ApiError::internal_message(err).into_response(),
+        Err(err) => {
+            return ApiError::internal_message(format!("video job list task failed: {err}"))
+                .into_response()
+        }
     };
+    jobs.sort_by_key(|job| (job.created_at, job.id.clone()));
     if descending {
         jobs.reverse();
     }
@@ -3916,8 +5271,12 @@ async fn list_video_generations(
         .into_iter()
         .skip(start)
         .take(limit)
-        .map(|job| job.metadata)
-        .collect::<Vec<_>>();
+        .map(|job| video_generation_metadata_from_summary(&job))
+        .collect::<Result<Vec<_>, _>>();
+    let data = match data {
+        Ok(data) => data,
+        Err(err) => return err.into_response(),
+    };
     let first_id = data
         .first()
         .and_then(|job| job.get("id"))
@@ -3943,15 +5302,18 @@ async fn retrieve_video_generation(
     Path(video_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(job) = state.video_job(&video_id) else {
-        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
-    };
-    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
-        Ok(access_token) => access_token,
+    let job = match lookup_gateway_job(&state, &video_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("video job was not found", Some("video_id")).into_response()
+        }
         Err(err) => return err.into_response(),
     };
-    match requester_owns_video(&job, &access_token) {
-        Ok(()) => Json(job.metadata).into_response(),
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
+        return err.into_response();
+    }
+    match video_generation_metadata_from_lookup(&job) {
+        Ok(metadata) => Json(metadata).into_response(),
         Err(err) => err.into_response(),
     }
 }
@@ -3961,24 +5323,47 @@ async fn delete_video_generation(
     Path(video_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(job) = state.video_job(&video_id) else {
-        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    let job = match lookup_gateway_job(&state, &video_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("video job was not found", Some("video_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
     };
-    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
+    let access_token = match authorize_gateway_job(&state, &headers, &job) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    if let Err(err) = requester_owns_video(&job, &access_token) {
-        return err.into_response();
-    }
-    let Some(removed) = state
-        .video_jobs
-        .lock_recover("video lifecycle store")
-        .remove(&video_id, now_secs())
-    else {
-        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    let GatewayJobLookup::Terminal(job) = job else {
+        return ApiError::conflict("an in-progress video cannot be deleted", Some("video_id"))
+            .into_response();
     };
-    let mut metadata = removed.metadata;
+    let mut metadata = match video_generation_metadata_from_job(&job) {
+        Ok(metadata) => metadata,
+        Err(err) => return err.into_response(),
+    };
+    let owner = access_token
+        .as_ref()
+        .map(|access_token| access_token.token_id.clone());
+    let store = state.jobs.clone();
+    let remove_id = video_id.clone();
+    let removed = match tokio::task::spawn_blocking(move || {
+        store
+            .lock_recover("gateway job vault")
+            .remove(&remove_id, owner.as_deref(), now_secs())
+    })
+    .await
+    {
+        Ok(Ok(removed)) => removed,
+        Ok(Err(err)) => return ApiError::internal_message(err).into_response(),
+        Err(err) => {
+            return ApiError::internal_message(format!("video job delete task failed: {err}"))
+                .into_response()
+        }
+    };
+    if removed.is_none() {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    }
     metadata["deleted"] = json!(true);
     Json(metadata).into_response()
 }
@@ -3996,18 +5381,34 @@ async fn retrieve_video_generation_content(
         )
         .into_response();
     }
-    let Some(job) = state.video_job(&video_id) else {
-        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
-    };
-    let access_token = match state.authorize_gateway_request(&headers, Some(&job.model)) {
-        Ok(access_token) => access_token,
+    let job = match lookup_gateway_job(&state, &video_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("video job was not found", Some("video_id")).into_response()
+        }
         Err(err) => return err.into_response(),
     };
-    if let Err(err) = requester_owns_video(&job, &access_token) {
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
         return err.into_response();
     }
-    let mut response = Body::from(job.artifact.bytes).into_response();
-    let content_type = match HeaderValue::from_str(&job.artifact.content_type) {
+    let GatewayJobLookup::Terminal(job) = job else {
+        return gateway_job_pending_response(&video_id);
+    };
+    if job.endpoint_family != mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+        || job.status != GatewayJobStatus::Completed
+    {
+        return ApiError::not_found("video job was not found", Some("video_id")).into_response();
+    }
+    let Some(artifact) = job
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.content_type.starts_with("video/"))
+    else {
+        return ApiError::not_found("video content was not found", Some("video_id"))
+            .into_response();
+    };
+    let mut response = Body::from(artifact.bytes).into_response();
+    let content_type = match HeaderValue::from_str(&artifact.content_type) {
         Ok(content_type) => content_type,
         Err(err) => {
             return ApiError::internal_message(format!(
@@ -4019,7 +5420,7 @@ async fn retrieve_video_generation_content(
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, content_type);
-    if let Ok(blake3) = HeaderValue::from_str(&job.artifact.blake3) {
+    if let Ok(blake3) = HeaderValue::from_str(&artifact.blake3) {
         response
             .headers_mut()
             .insert("x-mayhem-artifact-blake3", blake3);
@@ -4040,7 +5441,7 @@ async fn create_audio_speech(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let mut request = match parse_catalog_endpoint_request::<AudioSpeechRequest>(
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<AudioSpeechRequest>(
         &state,
         &raw_request,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
@@ -4049,14 +5450,51 @@ async fn create_audio_speech(
         Err(err) => return err.into_response(),
     };
     request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH.to_owned());
-    request.endpoint_request = Some(raw_request);
+    request.endpoint_request = Some(normalized_request);
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    match build_audio_speech(&state, request, options).await {
-        Ok(response) => response,
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+        &request.model,
+        request
+            .endpoint_request
+            .as_ref()
+            .expect("normalized audio speech request is present"),
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        let request_state = state.clone();
+        spawn_gateway_job_request(job, async move {
+            build_audio_speech(&request_state, request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let request_state = state.clone();
+    match run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_audio_speech(&request_state, request, options).await
+    })
+    .await
+    {
+        Ok(mut response) => {
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -4074,23 +5512,60 @@ async fn create_audio_transcription(
         .await
         .and_then(|request| Ok((request, options)))
     {
-        Ok((request, mut options)) => {
+        Ok((mut request, mut options)) => {
             let access_token = match state.authorize_gateway_request(&headers, Some(&request.model))
             {
                 Ok(access_token) => access_token,
                 Err(err) => return err.into_response(),
             };
-            if let Err(err) = validate_catalog_endpoint_request(
+            let normalized = match normalize_catalog_endpoint_request(
                 &state,
                 &request.model,
                 mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
                 &request.contract_request,
             ) {
-                return err.into_response();
-            }
+                Ok(normalized) => normalized,
+                Err(err) => return err.into_response(),
+            };
+            request.contract_request = normalized;
             options.access_token = access_token;
-            match build_audio_transcription(&state, request, options).await {
-                Ok(value) => Json(value).into_response(),
+            let job = match prepare_gateway_job(
+                &state,
+                &headers,
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+                &request.model,
+                &request.contract_request,
+                &options.access_token,
+            )
+            .await
+            {
+                Ok(PreparedGatewayJob::Started(job)) => job,
+                Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+                Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+                Err(err) => return err.into_response(),
+            };
+            options.job = Some(job.clone());
+            if gateway_prefers_async_response(&headers) {
+                let job_id = job.id.clone();
+                let request_state = state.clone();
+                spawn_gateway_job_request(job, async move {
+                    build_audio_transcription(&request_state, request, options).await
+                });
+                return gateway_job_pending_response(&job_id);
+            }
+            let cancellation = GatewayRequestCancellation::new();
+            options.client_cancellation = Some(cancellation.clone());
+            let request_state = state.clone();
+            match run_detached_gateway_job_request(cancellation, job.clone(), async move {
+                build_audio_transcription(&request_state, request, options).await
+            })
+            .await
+            {
+                Ok(value) => {
+                    let mut response = Json(value).into_response();
+                    attach_gateway_job_headers(&mut response, &job.id);
+                    response
+                }
                 Err(err) => err.into_response(),
             }
         }
@@ -4112,83 +5587,95 @@ async fn create_hf_inference(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    if let Err(err) =
-        validate_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
-    {
-        return err.into_response();
-    }
+    let raw_request =
+        match normalize_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
+        {
+            Ok(normalized) => normalized,
+            Err(err) => return err.into_response(),
+        };
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        &endpoint_family,
+        &model_id,
+        &raw_request,
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        spawn_gateway_job_request(
+            job,
+            execute_hf_inference_job(state, model_id, endpoint_family, raw_request, options),
+        );
+        return gateway_job_pending_response(&job_id);
+    }
+    let cancellation = GatewayRequestCancellation::new();
+    options.client_cancellation = Some(cancellation.clone());
+    let result = run_detached_gateway_job_request(
+        cancellation,
+        job.clone(),
+        execute_hf_inference_job(state, model_id, endpoint_family, raw_request, options),
+    )
+    .await;
+    match result {
+        Ok(mut response) => {
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
+        Err(err) => err.into_response(),
+    }
+}
 
+async fn execute_hf_inference_job(
+    state: SharedState,
+    model_id: String,
+    endpoint_family: String,
+    raw_request: Value,
+    options: GatewayRequestOptions,
+) -> Result<Response, ApiError> {
     match endpoint_family.as_str() {
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
-            let request = match hf_embedding_request(&model_id, raw_request) {
-                Ok(request) => request,
-                Err(err) => return err.into_response(),
-            };
-            match build_embedding(&state, request, options).await {
-                Ok(value) => match hf_embedding_response(value) {
-                    Ok(value) => Json(value).into_response(),
-                    Err(err) => err.into_response(),
-                },
-                Err(err) => err.into_response(),
-            }
+            let request = hf_embedding_request(&model_id, raw_request)?;
+            let value = build_embedding(&state, request, options).await?;
+            Ok(Json(hf_embedding_response(value)?).into_response())
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
-            let request = match hf_image_generation_request(&model_id, raw_request) {
-                Ok(request) => request,
-                Err(err) => return err.into_response(),
-            };
-            match build_image_generation(&state, request, options).await {
-                Ok(value) => match hf_image_response(value) {
-                    Ok(response) => response,
-                    Err(err) => err.into_response(),
-                },
-                Err(err) => err.into_response(),
-            }
+            let request = hf_image_generation_request(&model_id, raw_request)?;
+            let value = build_image_generation(&state, request, options).await?;
+            hf_image_response(value)
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
-            let request = match hf_audio_speech_request(&model_id, raw_request) {
-                Ok(request) => request,
-                Err(err) => return err.into_response(),
-            };
-            match build_audio_speech(&state, request, options).await {
-                Ok(response) => response,
-                Err(err) => err.into_response(),
-            }
+            let request = hf_audio_speech_request(&model_id, raw_request)?;
+            build_audio_speech(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
-            let request = match hf_audio_transcription_request(&model_id, raw_request) {
-                Ok(request) => request,
-                Err(err) => return err.into_response(),
-            };
-            match build_audio_transcription(&state, request, options).await {
-                Ok(value) => Json(value).into_response(),
-                Err(err) => err.into_response(),
-            }
+            let request = hf_audio_transcription_request(&model_id, raw_request)?;
+            let value = build_audio_transcription(&state, request, options).await?;
+            Ok(Json(value).into_response())
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
-            let request =
-                match artifact_generation_request(&model_id, &endpoint_family, raw_request) {
-                    Ok(request) => request,
-                    Err(err) => return err.into_response(),
-                };
-            match build_artifact_generation(&state, request.clone(), options).await {
-                Ok(run) => match artifact_generation_raw_response(&request, &run) {
-                    Ok(response) => response,
-                    Err(err) => err.into_response(),
-                },
-                Err(err) => err.into_response(),
-            }
+            let request = artifact_generation_request(&model_id, &endpoint_family, raw_request)?;
+            let response_request = request.clone();
+            let run = build_artifact_generation(&state, request, options).await?;
+            artifact_generation_raw_response(&response_request, &run)
         }
-        _ => ApiError::bad_request(
+        _ => Err(ApiError::bad_request(
             format!("endpoint family {endpoint_family} is not an HF task route"),
             Some("model"),
-        )
-        .into_response(),
+        )),
     }
 }
 
@@ -4318,14 +5805,32 @@ fn hf_image_generation_request(
             Some("parameters"),
         ));
     }
-    let size = width
-        .zip(height)
-        .map(|(width, height)| format!("{width}x{height}"));
     Ok(ImageGenerationRequest {
         model: model_id.to_owned(),
         prompt,
-        n: Some(1),
-        size,
+        background: None,
+        moderation: None,
+        n: parameters
+            .get("num_images_per_prompt")
+            .and_then(Value::as_u64)
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| {
+                ApiError::bad_request(
+                    "parameters.num_images_per_prompt is too large",
+                    Some("parameters"),
+                )
+            })?,
+        output_compression: None,
+        output_format: None,
+        partial_images: None,
+        size: None,
+        width: width.map(u32::try_from).transpose().map_err(|_| {
+            ApiError::bad_request("parameters.width is too large", Some("parameters"))
+        })?,
+        height: height.map(u32::try_from).transpose().map_err(|_| {
+            ApiError::bad_request("parameters.height is too large", Some("parameters"))
+        })?,
         response_format: Some("b64_json".to_owned()),
         quality: None,
         style: None,
@@ -4340,11 +5845,16 @@ fn hf_image_generation_request(
             .get("guidance_scale")
             .and_then(Value::as_f64)
             .map(|value| value as f32),
+        shift: parameters
+            .get("shift")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
         seed: parameters.get("seed").and_then(Value::as_i64),
         scheduler: parameters
             .get("scheduler")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        stream: None,
         user: None,
         endpoint_family: Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE.to_owned()),
         endpoint_request: Some(raw_request),
@@ -4610,7 +6120,7 @@ fn artifact_generation_response_value(
             run,
             &video_job_id(&run.session_id),
             now_secs(),
-            DEFAULT_GATEWAY_VIDEO_TTL_SECONDS,
+            DEFAULT_GATEWAY_JOB_TTL_SECONDS,
         ),
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => json!({
             "id": id,
@@ -5673,12 +7183,160 @@ enum ChatResponse {
 }
 
 #[derive(Clone)]
+struct GatewayRequestCancellation {
+    sender: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl GatewayRequestCancellation {
+    fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
+
+    fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.sender.subscribe();
+        while !*receiver.borrow_and_update() {
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl fmt::Debug for GatewayRequestCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayRequestCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GatewayRequestCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+}
+
+struct GatewayRequestLifetimeGuard {
+    cancellation: GatewayRequestCancellation,
+    completed: bool,
+}
+
+impl GatewayRequestLifetimeGuard {
+    fn new(cancellation: GatewayRequestCancellation) -> Self {
+        Self {
+            cancellation,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for GatewayRequestLifetimeGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+async fn run_detached_nonstreaming_request<T, F>(
+    cancellation: GatewayRequestCancellation,
+    request: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let mut lifetime = GatewayRequestLifetimeGuard::new(cancellation);
+    let result = tokio::spawn(request).await.map_err(|error| {
+        ApiError::internal_message(format!("gateway request task failed: {error}"))
+    })?;
+    lifetime.complete();
+    result
+}
+
+async fn run_detached_gateway_job_request<T, F>(
+    cancellation: GatewayRequestCancellation,
+    job: GatewayJobHandle,
+    request: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let result = run_detached_nonstreaming_request(cancellation, request).await;
+    if let Err(error) = &result {
+        job.persist_failure_if_active(error.message.clone()).await;
+    }
+    result
+}
+
+fn spawn_gateway_job_request<T, F>(job: GatewayJobHandle, request: F)
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let error = match tokio::spawn(request).await {
+            Ok(Ok(_)) => return,
+            Ok(Err(error)) => error.message,
+            Err(error) => format!("gateway job task failed: {error}"),
+        };
+        job.persist_failure_if_active(error).await;
+    });
+}
+
+#[derive(Clone)]
 struct ResponseMayhemMeta<'a> {
     backend: &'a str,
     direct_session: bool,
     billable: bool,
     dev_session: bool,
     hedge: GatewayHedgeInvocation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GatewayBillingContext {
+    billing_id: String,
+    billing_attempt: u32,
+    prior_usage: ReceiptUsage,
+    prior_au_owed_cum: MoneyAu,
+}
+
+impl GatewayBillingContext {
+    fn initial(billing_id: String) -> Self {
+        Self {
+            billing_id,
+            billing_attempt: 0,
+            prior_usage: ReceiptUsage::default(),
+            prior_au_owed_cum: 0,
+        }
+    }
+
+    fn after_attempt(&self, receipt: Option<&ReceiptBody>) -> Self {
+        let mut next = self.clone();
+        next.billing_attempt = next.billing_attempt.saturating_add(1);
+        if let Some(receipt) = receipt {
+            next.prior_usage = receipt.usage.clone();
+            next.prior_au_owed_cum = receipt.au_owed_cum;
+        }
+        next
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5692,6 +7350,9 @@ struct GatewayRequestOptions {
     failover_overrides: GatewayFailoverPolicyConfig,
     preferred_providers: Option<Vec<String>>,
     access_token: Option<GatewayTokenAttribution>,
+    client_cancellation: Option<GatewayRequestCancellation>,
+    job: Option<GatewayJobHandle>,
+    billing: Option<GatewayBillingContext>,
 }
 
 impl Default for GatewayRequestOptions {
@@ -5706,6 +7367,9 @@ impl Default for GatewayRequestOptions {
             failover_overrides: GatewayFailoverPolicyConfig::default(),
             preferred_providers: None,
             access_token: None,
+            client_cancellation: None,
+            job: None,
+            billing: None,
         }
     }
 }
@@ -5867,6 +7531,8 @@ struct CanaryPromptDocument {
     steps: Option<u64>,
     #[serde(default)]
     cfg_scale: Option<f32>,
+    #[serde(default)]
+    shift: Option<f32>,
     #[serde(default)]
     seed: Option<i64>,
 }
@@ -6233,6 +7899,7 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             size: prompt.size,
             steps: prompt.steps,
             cfg_scale: prompt.cfg_scale,
+            shift: prompt.shift,
             seed: prompt.seed,
         })
         .collect()
@@ -6673,6 +8340,9 @@ impl GatewayRequestOptions {
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
             preferred_providers: parse_x_mayhem_prefer_providers(headers)?,
             access_token: None,
+            client_cancellation: None,
+            job: None,
+            billing: None,
         })
     }
 }
@@ -7063,6 +8733,10 @@ impl ScBridgeGatewaySessionBackend {
     }
 }
 
+fn sc_bridge_session_transport_valid(opened: &Value) -> bool {
+    sc_bridge_session_transport(opened).is_ok()
+}
+
 impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     fn name(&self) -> &str {
         "sc-bridge-direct-session"
@@ -7076,7 +8750,7 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a GatewayHedgeProbeInvocation,
     ) -> GatewayHedgeProbeFuture<'a> {
         Box::pin(async move { self.hedge_probe_over_bridge(invocation).await })
     }
@@ -7154,7 +8828,7 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 impl ScBridgeGatewaySessionBackend {
     async fn hedge_probe_over_bridge(
         &self,
-        invocation: &GatewaySessionInvocation,
+        invocation: &GatewayHedgeProbeInvocation,
     ) -> Result<GatewayHedgeProbeResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
@@ -7185,11 +8859,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "hedge session {} was not direct/non-relayed",
+                "hedge session {} did not open an authenticated direct-or-relayed transport",
                 invocation.session_id
             )));
         }
@@ -7240,11 +8912,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "session {} was not opened as a direct non-relayed channel",
+                "session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -7322,10 +8992,36 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
         .await
         {
             Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                let (expected_usage, expected_seq) = err
+                    .partial
+                    .as_ref()
+                    .map(|partial| {
+                        (
+                            partial.provider_receipt.body.usage.clone(),
+                            partial.provider_receipt.body.seq.saturating_add(1),
+                        )
+                    })
+                    .unwrap_or_else(|| (ReceiptUsage::default(), 1));
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    blake3_hex(chat_prompt_text(request).as_bytes()),
+                    expected_usage,
+                    expected_seq,
+                )
+                .await?;
+                return Err(err);
+            }
             Err(err) => {
                 if let Some(partial) = err.partial.as_ref() {
                     let receipt_ack = direct_session_partial_receipt_ack(
@@ -7366,6 +9062,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            chat_job_result(&collected.output),
+            &collected.output.artifacts,
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -7431,11 +9136,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "embedding session {} was not opened as a direct non-relayed channel",
+                "embedding session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -7503,7 +9206,7 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let collected = collect_direct_session_embedding_output(
+        let collected = match collect_direct_session_embedding_output(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
@@ -7511,8 +9214,28 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             &inputs,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    blake3_hex(embedding_prompt_text(&inputs).as_bytes()),
+                    ReceiptUsage::default(),
+                    1,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let receipt_ack = direct_session_embedding_receipt_ack(
             &inputs,
             &collected.output,
@@ -7521,6 +9244,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            embedding_job_result(&collected.output),
+            &[],
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -7583,11 +9315,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "image session {} was not opened as a direct non-relayed channel",
+                "image session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -7655,7 +9385,7 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let collected = collect_direct_session_image_generation_output(
+        let collected = match collect_direct_session_image_generation_output(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
@@ -7663,8 +9393,28 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    image_generation_prompt_hash(request),
+                    ReceiptUsage::default(),
+                    1,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let receipt_ack = direct_session_image_generation_receipt_ack(
             request,
             &collected.output,
@@ -7673,6 +9423,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            image_job_result(&collected.output),
+            &collected.output.artifacts,
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -7735,11 +9494,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "audio speech session {} was not opened as a direct non-relayed channel",
+                "audio speech session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -7797,7 +9554,7 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let collected = collect_direct_session_audio_speech_output(
+        let collected = match collect_direct_session_audio_speech_output(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
@@ -7805,8 +9562,28 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    audio_speech_prompt_hash(request),
+                    ReceiptUsage::default(),
+                    1,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let receipt_ack = direct_session_audio_speech_receipt_ack(
             request,
             &collected.output,
@@ -7815,6 +9592,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            audio_speech_job_result(&collected.output),
+            &collected.output.artifacts,
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -7877,11 +9663,9 @@ impl ScBridgeGatewaySessionBackend {
                     invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "audio transcription session {} was not opened as a direct non-relayed channel",
+                "audio transcription session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
             )));
         }
@@ -7939,7 +9723,7 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let collected = collect_direct_session_audio_transcription_output(
+        let collected = match collect_direct_session_audio_transcription_output(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
@@ -7947,8 +9731,28 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    audio_transcription_prompt_hash(request),
+                    ReceiptUsage::default(),
+                    1,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let receipt_ack = direct_session_audio_transcription_receipt_ack(
             request,
             &collected.output,
@@ -7957,6 +9761,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            audio_transcription_job_result(&collected.output),
+            &[],
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -8019,11 +9832,9 @@ impl ScBridgeGatewaySessionBackend {
                     request.output_modality, invocation.session_id, provider, direct_peer
                 ))
             })?;
-        if opened.get("direct").and_then(Value::as_bool) != Some(true)
-            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-        {
+        if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
-                "{} generation session {} was not opened as a direct non-relayed channel",
+                "{} generation session {} did not open an authenticated direct-or-relayed channel",
                 request.output_modality, invocation.session_id
             )));
         }
@@ -8080,7 +9891,7 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let collected = collect_direct_session_artifact_generation_output(
+        let collected = match collect_direct_session_artifact_generation_output(
             &mut bridge,
             &invocation.session_id,
             direct_peer,
@@ -8088,8 +9899,28 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation.client_cancellation.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) if is_client_disconnect_error(&err) => {
+                cancel_and_settle_direct_session(
+                    &mut bridge,
+                    invocation,
+                    direct_peer,
+                    provider,
+                    model,
+                    &accept_info.enclave_pubkey,
+                    artifact_generation_prompt_hash(request),
+                    ReceiptUsage::default(),
+                    1,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let receipt_ack = direct_session_artifact_generation_receipt_ack(
             request,
             &collected.output,
@@ -8098,6 +9929,15 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
+        persist_completed_invocation_job(
+            invocation,
+            artifact_generation_job_result(request, &collected.output),
+            &collected.output.artifacts,
+            &collected.provider_receipt,
+            &receipt_ack,
+        )
+        .await?;
+        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
             direct_peer,
@@ -8235,7 +10075,7 @@ fn verify_direct_session_accept_signature(
         .map_err(|err| GatewaySessionError::new(format!("invalid provider pubkey: {err}")))?;
     let signature = Signature::from_bytes(&signature);
     verifying_key
-        .verify(
+        .verify_strict(
             &session_accept_signing_bytes(frame).map_err(|err| {
                 GatewaySessionError::new(format!("provider accept signing payload failed: {err}"))
             })?,
@@ -8287,7 +10127,7 @@ fn verify_provider_receipt_signature(
     let payload = receipt_signing_bytes(&receipt.body).map_err(|err| {
         GatewaySessionError::new(format!("provider receipt signing payload failed: {err}"))
     })?;
-    if verifying_key.verify(&payload, &signature).is_ok() {
+    if verifying_key.verify_strict(&payload, &signature).is_ok() {
         return Ok(());
     }
     Err(GatewaySessionError::new(
@@ -8564,7 +10404,7 @@ fn seal_direct_session_request_body(
         "schema_version": 1,
         "endpoint_family": endpoint_family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
-        "normalized_request_fingerprint": stable_value_hash(&contract_request),
+        "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
     Ok(sealed)
@@ -8611,13 +10451,52 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
         "model": &request.model,
         "prompt": &request.prompt,
         "n": image_generation_count(request),
-        "size": request.size.as_deref().unwrap_or("512x512"),
         "steps": image_generation_steps(request),
         "cfg_scale": image_generation_cfg_scale(request),
-        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "response_format": request
+            .response_format
+            .as_deref()
+            .expect("validated image request has an admin-signed response format"),
         "endpoint_family": image_generation_endpoint_family(request),
     });
+    set_optional_json(
+        &mut body,
+        "background",
+        request.background.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "moderation",
+        request.moderation.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "output_compression",
+        request.output_compression.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "output_format",
+        request.output_format.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "partial_images",
+        request.partial_images.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "size",
+        request.size.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "width", request.width.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "height",
+        request.height.map(|value| json!(value)),
+    );
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
+    set_optional_json(&mut body, "shift", request.shift.map(|value| json!(value)));
     set_optional_json(
         &mut body,
         "quality",
@@ -8637,6 +10516,11 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
         &mut body,
         "scheduler",
         request.scheduler.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "stream",
+        request.stream.map(|value| json!(value)),
     );
     set_optional_json(
         &mut body,
@@ -8851,8 +10735,8 @@ fn direct_session_request_byte_limit_for_len(
     configured: Option<usize>,
 ) -> usize {
     let derived = usize::try_from(served_ctx)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
         .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES)
         .max(request_body_bytes);
     configured.unwrap_or(derived)
@@ -9134,6 +11018,22 @@ fn direct_session_throughput_floor_error(session_id: &str, tok_s: f64, min_tok_s
     )
 }
 
+fn visible_tool_calls(tool_calls: &[ToolCallOutput]) -> Vec<VisibleToolCall> {
+    tool_calls
+        .iter()
+        .map(|call| VisibleToolCall {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn visible_output_unit_count(content: &str, tool_calls: &[ToolCallOutput]) -> u64 {
+    visible_output_units(content, &visible_tool_calls(tool_calls))
+}
+
 fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
     if token_ids.is_empty() {
         rough_tokens(content)
@@ -9235,8 +11135,8 @@ fn direct_session_chat_output_byte_limit(
         .min(available_tokens)
         .max(1);
     let derived = usize::try_from(output_tokens)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET);
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN);
     configured_optional_positive_usize("MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES").unwrap_or(derived)
 }
 
@@ -9267,6 +11167,35 @@ fn session_delta_text(frame: &Value) -> Result<Option<&str>, GatewaySessionError
             "provider s.delta d field must be text or null",
         )),
     }
+}
+
+fn session_delta_reasoning_evidence(frame: &Value) -> Result<&str, GatewaySessionError> {
+    match frame.get("reasoning_evidence_delta") {
+        Some(Value::String(delta)) => Ok(delta.as_str()),
+        None => Err(GatewaySessionError::new(
+            "provider s.delta missing mandatory reasoning_evidence_delta field",
+        )),
+        Some(_) => Err(GatewaySessionError::new(
+            "provider s.delta reasoning_evidence_delta field must be text",
+        )),
+    }
+}
+
+fn ensure_metered_text_within_limit(
+    content: &str,
+    reasoning_evidence: &str,
+    max_bytes: usize,
+) -> Result<(), GatewaySessionError> {
+    let total = content
+        .len()
+        .checked_add(reasoning_evidence.len())
+        .ok_or_else(|| GatewaySessionError::new("metered chat output byte length overflow"))?;
+    if total > max_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "metered chat output exceeded the {max_bytes}-byte session output budget"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_session_token_ids_within_limit(
@@ -9457,9 +11386,11 @@ async fn collect_direct_session_output(
     provider: &str,
     model: &GatewayModel,
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectSessionCollected, GatewaySessionError> {
     let failover = invocation.failover;
     let mut content = String::new();
+    let mut reasoning_evidence = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
@@ -9489,6 +11420,7 @@ async fn collect_direct_session_output(
                 retryable_interrupted_direct_session_error(
                     direct_session_timeout_error(kind, session_id),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -9500,7 +11432,7 @@ async fn collect_direct_session_output(
                     "mid_stream_timeout",
                 )
             })?;
-        let frame = match next_session_frame_with_optional_wait(
+        let frame = match next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
@@ -9512,16 +11444,36 @@ async fn collect_direct_session_output(
                 "s.error",
                 "s.close",
             ],
+            if finish_reason.is_some() {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
         {
             Ok(frame) => frame,
+            Err(err) if is_client_disconnect_error(&err) => {
+                let mut disconnected = client_disconnect_direct_session_error(
+                    request,
+                    &content,
+                    &reasoning_evidence,
+                    tool_calls.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                );
+                disconnected.retryable = false;
+                return Err(disconnected);
+            }
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
                 let timeout = watchdog.timeout_error(session_id, now);
                 return Err(retryable_interrupted_direct_session_error(
                     timeout,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -9538,6 +11490,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -9565,6 +11518,25 @@ async fn collect_direct_session_output(
                 watchdog.record_delta(now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
+                }
+                let delta = session_delta_reasoning_evidence(&frame)?;
+                if !delta.is_empty() {
+                    append_session_text(
+                        &mut reasoning_evidence,
+                        delta,
+                        max_text_bytes,
+                        "reasoning evidence",
+                    )?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
@@ -9586,6 +11558,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -9628,6 +11601,7 @@ async fn collect_direct_session_output(
                             direct_session_throughput_floor_error(session_id, tok_s, min_tok_s);
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -9665,6 +11639,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -9694,6 +11669,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     GatewaySessionError::new(err),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -9717,6 +11693,7 @@ async fn collect_direct_session_output(
                     return Err(retryable_interrupted_direct_session_error(
                         GatewaySessionError::new(err),
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         latest_checkpoint_receipt.is_some()
@@ -9736,7 +11713,7 @@ async fn collect_direct_session_output(
         }
     }
 
-    let mut usage = observed_chat_usage(request, &content, &token_ids);
+    let mut usage = observed_chat_usage(request, &content, &reasoning_evidence, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {session_id} ended without a final receipt"
@@ -9744,6 +11721,10 @@ async fn collect_direct_session_output(
     })?;
     validate_usage_attribution(
         &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    validate_reasoning_evidence_attribution(
+        &reasoning_evidence,
         &final_receipt.body.usage_attribution,
     )?;
     if claimed_usage_attribution
@@ -9797,7 +11778,7 @@ async fn collect_direct_session_output(
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(&content, &token_ids),
                     first_delta_at_millis,
                     completed_at_millis,
                 ),
@@ -9828,9 +11809,15 @@ async fn collect_direct_session_output(
     })
 }
 
-fn observed_chat_usage(request: &ChatCompletionRequest, content: &str, token_ids: &[i32]) -> Usage {
+fn observed_chat_usage(
+    request: &ChatCompletionRequest,
+    content: &str,
+    reasoning_evidence: &str,
+    tool_calls: &[ToolCallOutput],
+) -> Usage {
     let prompt_tokens = rough_tokens(&chat_prompt_text(request));
-    let completion_tokens = streamed_output_token_count(content, token_ids);
+    let completion_tokens =
+        metered_output_units(content, reasoning_evidence, &visible_tool_calls(tool_calls));
     Usage {
         prompt_tokens,
         completion_tokens,
@@ -9846,6 +11833,7 @@ async fn collect_direct_session_embedding_output(
     failover: GatewayFailoverInvocation,
     inputs: &[String],
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectEmbeddingSessionCollected, GatewaySessionError> {
     let mut embeddings = None;
     let mut usage = None;
@@ -9866,7 +11854,7 @@ async fn collect_direct_session_embedding_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame_with_optional_wait(
+        let frame = next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
@@ -9878,9 +11866,20 @@ async fn collect_direct_session_embedding_output(
                 "s.error",
                 "s.close",
             ],
+            if embeddings.is_some() {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                error
+            } else {
+                error.into_retryable()
+            }
+        })?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta_chunk")
                 if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
@@ -9975,6 +11974,7 @@ async fn collect_direct_session_image_generation_output(
     failover: GatewayFailoverInvocation,
     request: &ImageGenerationRequest,
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectImageGenerationSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
     let mut usage = None;
@@ -9995,15 +11995,26 @@ async fn collect_direct_session_image_generation_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame_with_optional_wait(
+        let frame = next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
+            if finish_seen {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                error
+            } else {
+                error.into_retryable()
+            }
+        })?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
@@ -10090,6 +12101,7 @@ async fn collect_direct_session_audio_speech_output(
     failover: GatewayFailoverInvocation,
     request: &AudioSpeechRequest,
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectAudioSpeechSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
     let mut usage = None;
@@ -10110,15 +12122,26 @@ async fn collect_direct_session_audio_speech_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame_with_optional_wait(
+        let frame = next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
+            if finish_seen {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                error
+            } else {
+                error.into_retryable()
+            }
+        })?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
@@ -10204,6 +12227,7 @@ async fn collect_direct_session_artifact_generation_output(
     failover: GatewayFailoverInvocation,
     request: &ArtifactGenerationRequest,
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectArtifactGenerationSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
     let mut usage = None;
@@ -10224,15 +12248,26 @@ async fn collect_direct_session_artifact_generation_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame_with_optional_wait(
+        let frame = next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
+            if finish_seen {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                error
+            } else {
+                error.into_retryable()
+            }
+        })?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
@@ -10328,6 +12363,7 @@ async fn collect_direct_session_audio_transcription_output(
     failover: GatewayFailoverInvocation,
     request: &AudioTranscriptionRequest,
     enclave_pubkey: &str,
+    client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectAudioTranscriptionSessionCollected, GatewaySessionError> {
     let mut content = String::new();
     let mut finish_seen = false;
@@ -10352,15 +12388,26 @@ async fn collect_direct_session_audio_transcription_output(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
-        let frame = next_session_frame_with_optional_wait(
+        let frame = next_session_frame_with_client_cancellation(
             bridge,
             session_id,
             expected_remote,
             remaining_millis.map(Duration::from_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
+            if finish_seen {
+                None
+            } else {
+                client_cancellation
+            },
         )
         .await
-        .map_err(GatewaySessionError::into_retryable)?;
+        .map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                error
+            } else {
+                error.into_retryable()
+            }
+        })?;
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
@@ -10471,6 +12518,7 @@ fn embeddings_from_session_delta(
 
 fn interrupted_direct_session_partial(
     content: &str,
+    _reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
@@ -10487,7 +12535,7 @@ fn interrupted_direct_session_partial(
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
         tok_s: generated_tokens_per_second(
-            usage.completion_tokens,
+            streamed_output_token_count(content, token_ids),
             first_delta_at_millis,
             now_millis,
         ),
@@ -10511,6 +12559,7 @@ fn interrupted_direct_session_partial(
 fn retryable_interrupted_direct_session_error(
     err: GatewaySessionError,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     receipt_seen: bool,
@@ -10521,6 +12570,7 @@ fn retryable_interrupted_direct_session_error(
 ) -> GatewaySessionError {
     if let Some(partial) = interrupted_direct_session_partial(
         content,
+        reasoning_evidence,
         tool_calls,
         provider_receipt,
         token_ids,
@@ -10539,6 +12589,7 @@ fn retryable_interrupted_direct_session_error(
 fn client_disconnect_direct_session_error(
     request: &ChatCompletionRequest,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
@@ -10548,6 +12599,7 @@ fn client_disconnect_direct_session_error(
     let err = retryable_interrupted_direct_session_error(
         GatewaySessionError::retryable("end-user disconnected before stream completed"),
         content,
+        reasoning_evidence,
         tool_calls.clone(),
         provider_receipt,
         provider_receipt.is_some(),
@@ -10562,11 +12614,11 @@ fn client_disconnect_direct_session_error(
     let Some(first_delta_at_millis) = watchdog.first_delta_at_millis else {
         return err;
     };
-    let usage = observed_chat_usage(request, content, token_ids);
+    let usage = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
         tok_s: generated_tokens_per_second(
-            usage.completion_tokens,
+            streamed_output_token_count(content, token_ids),
             first_delta_at_millis,
             now_millis,
         ),
@@ -10591,20 +12643,21 @@ fn client_disconnect_direct_session_error(
 fn direct_session_checkpoint_partial(
     request: &ChatCompletionRequest,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: ProviderSignedReceipt,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
 ) -> GatewaySessionPartial {
-    let usage = observed_chat_usage(request, content, token_ids);
+    let usage = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let quality =
         watchdog
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(content, token_ids),
                     first_delta_at_millis,
                     now_millis,
                 ),
@@ -10671,6 +12724,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     receipt: &ProviderSignedReceipt,
     token_ids: &[i32],
@@ -10678,18 +12732,28 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     now_millis: u64,
     model: &GatewayModel,
 ) -> Result<Option<Value>, GatewaySessionError> {
-    let observed_usage = observed_chat_usage(request, content, token_ids);
+    let observed = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
+    let observed_usage = expected_chat_usage_for_invocation(
+        request,
+        None,
+        observed.prompt_tokens,
+        observed.completion_tokens,
+        &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
+    )?;
     let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
     let claimed_output_tokens = receipt.body.usage.output_tokens();
-    if claimed_prompt_tokens != observed_usage.prompt_tokens {
+    validate_usage_attribution(&receipt.body.usage, &receipt.body.usage_attribution)?;
+    validate_reasoning_evidence_attribution(reasoning_evidence, &receipt.body.usage_attribution)?;
+    if claimed_prompt_tokens != observed_usage.prompt_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt prompt usage mismatch",
         ));
     }
-    if claimed_output_tokens > observed_usage.completion_tokens {
+    if claimed_output_tokens > observed_usage.output_tokens() {
         return Ok(None);
     }
-    if claimed_output_tokens < observed_usage.completion_tokens {
+    if claimed_output_tokens < observed_usage.output_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt trails gateway-observed output",
         ));
@@ -10698,6 +12762,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     let partial = direct_session_checkpoint_partial(
         request,
         content,
+        reasoning_evidence,
         tool_calls,
         receipt.clone(),
         token_ids,
@@ -11091,12 +13156,13 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let usage = expected_chat_usage_for_provider(
+    let usage = expected_chat_usage_for_invocation(
         request,
         Some(&provider_receipt.body.usage),
         output.usage.prompt_tokens,
         output.usage.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
     )?;
     let expected = ExpectedProviderReceipt {
         provider,
@@ -11106,7 +13172,7 @@ fn direct_session_receipt_ack(
         prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         usage,
     };
-    if expected.au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+    if locked_increment_exceeds_voucher(invocation, expected.au_owed_cum) {
         return Err(GatewaySessionError::new(
             "provider receipt exceeds signed spend voucher",
         ));
@@ -11233,6 +13299,181 @@ fn direct_session_artifact_generation_receipt_ack(
     })
 }
 
+fn record_direct_session_receipt(
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+) -> Result<(), GatewaySessionError> {
+    invocation
+        .receipt_recorder
+        .record(StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt: SessionReceipt {
+                body: provider_receipt.body.clone(),
+                enclave_sig: provider_receipt.enclave_sig.clone(),
+                enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
+                user_sig: receipt_ack.user_sig.clone(),
+            },
+            receipt_ack: receipt_ack.clone(),
+            access_token: invocation.access_token.clone(),
+        })
+        .map_err(|error| GatewaySessionError::new(error.message))
+}
+
+async fn record_cancelled_direct_session_receipt(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    prompt_hash: String,
+    expected_usage: ReceiptUsage,
+    expected_seq: u64,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; cancelled session paused",
+        ));
+    }
+    let expected_usage = cancellation_settlement_usage(
+        &invocation.spend_voucher.body.locked_rate_map,
+        invocation.spend_voucher.body.locked_per_req_au,
+        invocation.spend_voucher.body.locked_min_session_au,
+        &expected_usage,
+    )
+    .ok_or_else(|| {
+        GatewaySessionError::new(
+            "admin-locked price schedule has no nonzero fixed fee or billable cancellation quantum",
+        )
+    })?;
+    let au_owed_cum = calculate_locked_au_owed(invocation, &expected_usage);
+    if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
+        return Err(GatewaySessionError::new(
+            "cancelled provider receipt exceeds signed spend voucher",
+        ));
+    }
+    validate_provider_receipt(
+        model,
+        invocation,
+        provider_receipt,
+        ExpectedProviderReceipt {
+            provider,
+            seq: expected_seq,
+            final_receipt: true,
+            au_owed_cum,
+            usage: expected_usage,
+            prompt_hash,
+        },
+    )?;
+    let receipt_ack = receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body)
+        .map_err(|error| {
+        GatewaySessionError::new(format!(
+            "cancelled provider receipt ack signing failed: {error}"
+        ))
+    })?;
+    persist_cancelled_invocation_job(invocation, provider_receipt, &receipt_ack).await?;
+    record_direct_session_receipt(invocation, provider_receipt, &receipt_ack)?;
+    Ok(receipt_ack)
+}
+
+async fn cancel_and_settle_direct_session(
+    bridge: &mut ScBridgeClient,
+    invocation: &GatewaySessionInvocation,
+    direct_peer: &str,
+    provider: &str,
+    model: &GatewayModel,
+    enclave_pubkey: &str,
+    prompt_hash: String,
+    expected_usage: ReceiptUsage,
+    expected_seq: u64,
+) -> Result<(), GatewaySessionError> {
+    bridge
+        .session_send(
+            direct_peer,
+            &invocation.session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": invocation.session_id,
+                "reason": "client_disconnect",
+            }),
+        )
+        .await
+        .map_err(|error| {
+            GatewaySessionError::retryable(format!(
+                "sending client-disconnect close for session {} failed: {error}",
+                invocation.session_id
+            ))
+        })?;
+
+    loop {
+        let frame = next_session_frame_with_optional_wait(
+            bridge,
+            &invocation.session_id,
+            direct_peer,
+            invocation.failover.stall_timeout(),
+            &["s.receipt", "s.error", "s.close"],
+        )
+        .await?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.receipt") => {
+                let receipt = provider_signed_receipt_from_frame(
+                    &frame,
+                    &invocation.session_id,
+                    enclave_pubkey,
+                )?;
+                let receipt_ack = record_cancelled_direct_session_receipt(
+                    model,
+                    invocation,
+                    &receipt,
+                    provider,
+                    prompt_hash,
+                    expected_usage,
+                    expected_seq,
+                )
+                .await?;
+                send_direct_session_frame_with_peer_reconnect(
+                    bridge,
+                    direct_peer,
+                    &invocation.session_id,
+                    json!({
+                        "t": "s.receipt_ack",
+                        "v": 1,
+                        "session_id": receipt_ack.session_id,
+                        "seq": receipt_ack.seq,
+                        "user_sig": receipt_ack.user_sig,
+                        "reason": "client_disconnect",
+                    }),
+                    invocation.failover.open_timeout(),
+                    "sending cancelled-session s.receipt_ack",
+                )
+                .await?;
+                let _ = bridge
+                    .session_close(direct_peer, &invocation.session_id)
+                    .await;
+                return Ok(());
+            }
+            Some("s.error") => {
+                return Err(GatewaySessionError::new(format!(
+                    "provider failed cancelled-session settlement for {}: {}",
+                    invocation.session_id,
+                    frame
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider error")
+                )));
+            }
+            Some("s.close") => {
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed cancelled session {} without its minimum receipt",
+                    invocation.session_id
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn direct_session_partial_receipt_ack(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
@@ -11246,15 +13487,16 @@ fn direct_session_partial_receipt_ack(
         ));
     }
     let body = &partial.provider_receipt.body;
-    let usage = expected_chat_usage_for_provider(
+    let usage = expected_chat_usage_for_invocation(
         request,
         Some(&partial.provider_receipt.body.usage),
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
     )?;
     let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-    if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+    if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
         return Err(GatewaySessionError::new(
             "provider partial receipt exceeds signed spend voucher",
         ));
@@ -11442,6 +13684,46 @@ fn expected_chat_usage_for_provider(
     ]))
 }
 
+fn expected_chat_usage_for_invocation(
+    request: &ChatCompletionRequest,
+    provider_usage: Option<&ReceiptUsage>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
+    locked_rate_map: &[RateMapEntry],
+    invocation: &GatewaySessionInvocation,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let prior_usage = &invocation.spend_voucher.body.billing_prior_usage;
+    let prior_au_owed_cum = invocation.spend_voucher.body.billing_prior_au_owed_cum;
+    if prior_au_owed_cum == 0 && prior_usage != &ReceiptUsage::default() {
+        return Err(GatewaySessionError::new(
+            "billing prior usage requires a nonzero prior cumulative amount",
+        ));
+    }
+    if let Some(provider_usage) = provider_usage {
+        if !provider_usage.is_monotonic_from(prior_usage) {
+            return Err(GatewaySessionError::new(
+                "provider receipt usage regressed across logical billing attempts",
+            ));
+        }
+    }
+    let local_provider_usage = provider_usage
+        .filter(|_| prior_au_owed_cum == 0)
+        .map(|usage| ReceiptUsage::saturating_delta(prior_usage, usage));
+    let local_usage = expected_chat_usage_for_provider(
+        request,
+        local_provider_usage.as_ref(),
+        observed_prompt_tokens,
+        observed_completion_tokens,
+        locked_rate_map,
+    )?;
+    let increment = if prior_au_owed_cum == 0 {
+        local_usage
+    } else {
+        ReceiptUsage::from_units([(USAGE_OUTPUT_TOKEN, local_usage.output_tokens())])
+    };
+    Ok(prior_usage.saturating_add(&increment))
+}
+
 fn validate_provider_receipt(
     model: &GatewayModel,
     invocation: &GatewaySessionInvocation,
@@ -11459,6 +13741,23 @@ fn validate_provider_receipt(
         (
             body.session_id == invocation.session_id,
             "provider receipt session_id mismatch",
+        ),
+        (
+            body.billing_id == invocation.spend_voucher.body.billing_id,
+            "provider receipt billing_id mismatch",
+        ),
+        (
+            body.billing_attempt == invocation.spend_voucher.body.billing_attempt,
+            "provider receipt billing_attempt mismatch",
+        ),
+        (
+            body.billing_prior_usage == invocation.spend_voucher.body.billing_prior_usage,
+            "provider receipt billing prior usage mismatch",
+        ),
+        (
+            body.billing_prior_au_owed_cum
+                == invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            "provider receipt billing prior amount mismatch",
         ),
         (body.seq == expected.seq, "provider receipt seq mismatch"),
         (
@@ -11697,6 +13996,24 @@ fn validate_usage_attribution(
     Ok(())
 }
 
+fn validate_reasoning_evidence_attribution(
+    reasoning_evidence: &str,
+    attribution: &BTreeMap<String, u64>,
+) -> Result<(), GatewaySessionError> {
+    let observed = metered_output_units("", reasoning_evidence, &[]);
+    if attribution
+        .get("reasoning_output_tokens")
+        .copied()
+        .unwrap_or(0)
+        != observed
+    {
+        return Err(GatewaySessionError::new(
+            "provider reasoning attribution did not match gateway-observed reasoning evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn receipt_usage_from_session_delta(frame: &Value) -> Option<ReceiptUsage> {
     serde_json::from_value(frame.get("usage")?.clone()).ok()
 }
@@ -11759,6 +14076,14 @@ async fn run_embedding_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &embedding_prompt_text(inputs),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -11770,7 +14095,7 @@ async fn run_embedding_with_route_retry(
             }
         };
         let invocation =
-            state.prepare_embedding_invocation_for_route(model, inputs, route, &options)?;
+            state.prepare_embedding_invocation_for_route(model, inputs, route, &attempt_options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -11791,8 +14116,13 @@ async fn run_embedding_with_route_retry(
                     metering_output,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -11868,6 +14198,14 @@ async fn run_image_generation_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &image_generation_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -11878,8 +14216,12 @@ async fn run_image_generation_with_route_retry(
                 continue;
             }
         };
-        let invocation =
-            state.prepare_image_generation_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_image_generation_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -11904,8 +14246,13 @@ async fn run_image_generation_with_route_retry(
                     metering_output,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -11977,6 +14324,14 @@ async fn run_audio_speech_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &audio_speech_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -11987,8 +14342,12 @@ async fn run_audio_speech_with_route_retry(
                 continue;
             }
         };
-        let invocation =
-            state.prepare_audio_speech_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_audio_speech_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -12013,8 +14372,13 @@ async fn run_audio_speech_with_route_retry(
                     metering_output,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -12090,6 +14454,14 @@ async fn run_audio_transcription_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &audio_transcription_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -12100,8 +14472,12 @@ async fn run_audio_transcription_with_route_retry(
                 continue;
             }
         };
-        let invocation = state
-            .prepare_audio_transcription_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_audio_transcription_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -12126,8 +14502,13 @@ async fn run_audio_transcription_with_route_retry(
                     metering_output,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -12211,6 +14592,14 @@ async fn run_artifact_generation_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &artifact_generation_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -12221,8 +14610,12 @@ async fn run_artifact_generation_with_route_retry(
                 continue;
             }
         };
-        let invocation = state
-            .prepare_artifact_generation_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_artifact_generation_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -12246,8 +14639,13 @@ async fn run_artifact_generation_with_route_retry(
                     invocation,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -12930,14 +15328,17 @@ async fn build_chat_completion(
                 .is_some_and(|options| options.include_usage.unwrap_or(false)),
         )))
     } else {
-        Ok(ChatResponse::Json(chat_response_value(
-            &id,
-            created,
-            &model,
-            &output,
-            receipt.as_ref(),
-            mayhem_meta,
-        )))
+        let response =
+            chat_response_value(&id, created, &model, &output, receipt.as_ref(), mayhem_meta);
+        if let Some(job) = invocation.job.as_ref() {
+            job.persist_completed_if_active(
+                chat_job_result(&output),
+                gateway_job_artifacts(&output.artifacts),
+                receipt.as_ref().map(|receipt| receipt_summary(receipt)),
+            )
+            .await?;
+        }
+        Ok(ChatResponse::Json(response))
     }
 }
 
@@ -13142,14 +15543,12 @@ async fn open_live_direct_chat_session(
                 invocation.session_id, provider, direct_peer
             ))
         })?;
-    if opened.get("direct").and_then(Value::as_bool) != Some(true)
-        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-    {
+    if !sc_bridge_session_transport_valid(&opened) {
         let _ = bridge
             .session_close(direct_peer, &invocation.session_id)
             .await;
         return Err(GatewaySessionError::retryable(format!(
-            "session {} was not opened as a direct non-relayed channel",
+            "session {} did not open an authenticated direct-or-relayed channel",
             invocation.session_id
         )));
     }
@@ -13385,11 +15784,9 @@ async fn reopen_direct_session_and_replay_open(
                 "reopening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
             ))
         })?;
-    if opened.get("direct").and_then(Value::as_bool) != Some(true)
-        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
-    {
+    if !sc_bridge_session_transport_valid(&opened) {
         return Err(GatewaySessionError::transport_closed(format!(
-            "reopened session {session_id} was not a direct non-relayed channel"
+            "reopened session {session_id} did not open an authenticated direct-or-relayed channel"
         )));
     }
     bridge
@@ -13503,6 +15900,60 @@ fn is_client_disconnect_error(err: &GatewaySessionError) -> bool {
             .interrupted
             .as_ref()
             .is_some_and(|interrupted| interrupted.reason == "client_disconnect")
+}
+
+fn client_disconnect_session_error(session_id: &str) -> GatewaySessionError {
+    GatewaySessionError::new(format!(
+        "end-user disconnected from non-streaming session {session_id}"
+    ))
+}
+
+async fn next_session_frame_with_client_cancellation(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    expected_remote: &str,
+    wait: Option<Duration>,
+    expected_types: &[&str],
+    cancellation: Option<&GatewayRequestCancellation>,
+) -> Result<Value, GatewaySessionError> {
+    let Some(cancellation) = cancellation else {
+        return next_session_frame_with_optional_wait(
+            bridge,
+            session_id,
+            expected_remote,
+            wait,
+            expected_types,
+        )
+        .await;
+    };
+    prefer_ready_session_frame_over_cancellation(
+        session_id,
+        next_session_frame_with_optional_wait(
+            bridge,
+            session_id,
+            expected_remote,
+            wait,
+            expected_types,
+        ),
+        cancellation,
+    )
+    .await
+}
+
+async fn prefer_ready_session_frame_over_cancellation<F>(
+    session_id: &str,
+    frame: F,
+    cancellation: &GatewayRequestCancellation,
+) -> Result<Value, GatewaySessionError>
+where
+    F: std::future::Future<Output = Result<Value, GatewaySessionError>>,
+{
+    tokio::pin!(frame);
+    tokio::select! {
+        biased;
+        result = &mut frame => result,
+        _ = cancellation.cancelled() => Err(client_disconnect_session_error(session_id)),
+    }
 }
 
 async fn finish_live_direct_chat_after_client_disconnect(
@@ -13651,7 +16102,28 @@ async fn recover_live_direct_chat_after_retryable(
         "redispatch",
     )
     .await;
+    session.invocation.receipt_recorder.release_reservation();
 
+    let current_billing = GatewayBillingContext {
+        billing_id: session.invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: session.invocation.spend_voucher.body.billing_attempt,
+        prior_usage: session
+            .invocation
+            .spend_voucher
+            .body
+            .billing_prior_usage
+            .clone(),
+        prior_au_owed_cum: session
+            .invocation
+            .spend_voucher
+            .body
+            .billing_prior_au_owed_cum,
+    };
+    let next_billing = current_billing.after_attempt(
+        partial
+            .as_ref()
+            .map(|partial| &partial.provider_receipt.body),
+    );
     let partials = partial.into_iter().collect::<Vec<_>>();
     let retry_request = if partials.is_empty() {
         session.request.clone()
@@ -13659,6 +16131,7 @@ async fn recover_live_direct_chat_after_retryable(
         redispatch_request_with_partials(&session.request, &partials)
     };
     let mut retry_options = session.options.clone();
+    retry_options.billing = Some(next_billing);
     if !partials.is_empty() {
         retry_options.min_ctx = Some(exact_conversation_floor_after_partials(
             &retry_request,
@@ -13747,6 +16220,7 @@ async fn run_live_direct_chat_sse_inner(
     }
 
     let mut content = String::new();
+    let mut reasoning_evidence = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
@@ -13778,6 +16252,7 @@ async fn run_live_direct_chat_sse_inner(
                 retryable_interrupted_direct_session_error(
                     direct_session_timeout_error(kind, &session.invocation.session_id),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -13803,6 +16278,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(client_disconnect_direct_session_error(
                     &session.request,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
@@ -13846,6 +16322,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     timeout,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -13862,6 +16339,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -13895,6 +16373,25 @@ async fn run_live_direct_chat_sse_inner(
                 watchdog.record_delta(now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
+                }
+                let delta = session_delta_reasoning_evidence(&frame)?;
+                if !delta.is_empty() {
+                    append_session_text(
+                        &mut reasoning_evidence,
+                        delta,
+                        max_text_bytes,
+                        "reasoning evidence",
+                    )?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
@@ -13930,6 +16427,7 @@ async fn run_live_direct_chat_sse_inner(
                         return Err(client_disconnect_direct_session_error(
                             &session.request,
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -13946,6 +16444,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -13981,6 +16480,7 @@ async fn run_live_direct_chat_sse_inner(
                             return Err(client_disconnect_direct_session_error(
                                 &session.request,
                                 &content,
+                                &reasoning_evidence,
                                 tool_calls.clone(),
                                 latest_checkpoint_receipt.as_ref(),
                                 &token_ids,
@@ -14012,6 +16512,7 @@ async fn run_live_direct_chat_sse_inner(
                         );
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -14052,6 +16553,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -14084,6 +16586,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     GatewaySessionError::new(err),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -14108,6 +16611,7 @@ async fn run_live_direct_chat_sse_inner(
                     return Err(retryable_interrupted_direct_session_error(
                         GatewaySessionError::new(err),
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         latest_checkpoint_receipt.is_some()
@@ -14128,7 +16632,8 @@ async fn run_live_direct_chat_sse_inner(
         }
     }
 
-    let mut usage = observed_chat_usage(&session.request, &content, &token_ids);
+    let mut usage =
+        observed_chat_usage(&session.request, &content, &reasoning_evidence, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {} ended without a final receipt",
@@ -14137,6 +16642,10 @@ async fn run_live_direct_chat_sse_inner(
     })?;
     validate_usage_attribution(
         &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    validate_reasoning_evidence_attribution(
+        &reasoning_evidence,
         &final_receipt.body.usage_attribution,
     )?;
     if claimed_usage_attribution
@@ -14190,7 +16699,7 @@ async fn run_live_direct_chat_sse_inner(
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(&content, &token_ids),
                     first_delta_at_millis,
                     completed_at_millis,
                 ),
@@ -14580,6 +17089,13 @@ async fn run_chat_with_route_retry(
     }
     let mut attempt_request = request.clone();
     let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &chat_prompt_text(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let hedge_probe =
         run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, &options)
             .await?;
@@ -14668,6 +17184,8 @@ async fn run_chat_with_route_retry(
                             ),
                         );
                         last_retryable_error = Some(message);
+                        billing = billing.after_attempt(None);
+                        attempt_options.billing = Some(billing.clone());
                         continue;
                     }
                 }
@@ -14691,11 +17209,18 @@ async fn run_chat_with_route_retry(
                     metering_output,
                 });
             }
+            Err(err) if is_client_disconnect_error(&err) => {
+                return Err(ApiError::client_closed_request(err.message));
+            }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
                     return Err(refusal);
                 }
+                let billed_receipt = err
+                    .partial
+                    .as_ref()
+                    .map(|partial| partial.provider_receipt.body.clone());
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -14713,6 +17238,8 @@ async fn run_chat_with_route_retry(
                         options.min_ctx,
                     ));
                 }
+                billing = billing.after_attempt(billed_receipt.as_ref());
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -14917,9 +17444,9 @@ async fn run_hedge_probes_if_requested(
         return Ok(GatewayHedgeProbeOutcome::default());
     };
     let first_invocation =
-        state.prepare_chat_invocation_for_route(model, request, Some(routes[0]), options)?;
+        state.prepare_chat_hedge_probe_invocation(model, request, routes[0], options);
     let second_invocation =
-        state.prepare_chat_invocation_for_route(model, request, Some(routes[1]), options)?;
+        state.prepare_chat_hedge_probe_invocation(model, request, routes[1], options);
     let (first, second) = tokio::join!(
         state
             .session_backend
@@ -15833,7 +18360,8 @@ fn request_requirements_for_image_generation(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
-    let (width, height) = parse_image_generation_size(request).unwrap_or((1, 1));
+    let (width, height) = parse_image_generation_size(request)
+        .expect("validated image request has admin-signed dimensions");
     let image_count = image_generation_count(request);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -16224,21 +18752,7 @@ fn record_capacity_mismatch_if_advertised(
     let now_millis = now_millis_u64();
     let maybe_event = {
         let mut table = state.provider_table.lock_recover("provider table");
-        let advertised_free_capacity = table
-            .entries(now_millis)
-            .into_iter()
-            .find(|entry| entry.key == key)
-            .and_then(|entry| entry.heartbeat)
-            .is_some_and(|heartbeat| {
-                heartbeat.accepting_new
-                    && heartbeat.sat < DEFAULT_SATURATION_CUTOFF
-                    && (heartbeat.q.free_slots > 0 || heartbeat.slots.active < heartbeat.slots.max)
-            });
-        if advertised_free_capacity {
-            table.record_capacity_mismatch_at(&key, now_millis)
-        } else {
-            None
-        }
+        table.record_capacity_refusal_at(&key, now_millis)
     };
     if let Some(event) = maybe_event {
         state.record_reputation_event(stored_capacity_mismatch_reputation_event(
@@ -16844,6 +19358,10 @@ async fn build_embedding(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(embedding_job_result(&output), Vec::new(), receipt.clone())
+            .await?;
+    }
     Ok(json!({
         "id": id,
         "object": "list",
@@ -16925,8 +19443,19 @@ async fn build_image_generation(
     }
     let data = image_generation_response_data(
         &output.artifacts,
-        request.response_format.as_deref().unwrap_or("b64_json"),
+        request
+            .response_format
+            .as_deref()
+            .expect("validated image request has an admin-signed response format"),
     )?;
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            image_job_result(&output),
+            gateway_job_artifacts(&output.artifacts),
+            receipt.clone(),
+        )
+        .await?;
+    }
     Ok(json!({
         "id": id,
         "object": "images.response",
@@ -17041,6 +19570,14 @@ async fn build_artifact_generation(
             .maybe_run_canary_probe_after_session(&model, &invocation)
             .await;
     }
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            artifact_generation_job_result(&request, &output),
+            gateway_job_artifacts(&output.artifacts),
+            receipt.clone(),
+        )
+        .await?;
+    }
     Ok(CompletedArtifactGeneration {
         output,
         backend,
@@ -17049,7 +19586,6 @@ async fn build_artifact_generation(
         quality,
         receipt,
         session_id: invocation.session_id,
-        access_token: invocation.access_token,
     })
 }
 
@@ -17102,6 +19638,14 @@ async fn build_audio_speech(
         .ok_or_else(|| {
             ApiError::bad_gateway("provider returned no audio artifact", Some("model"))
         })?;
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            audio_speech_job_result(&output),
+            gateway_job_artifacts(&output.artifacts),
+            receipt.clone(),
+        )
+        .await?;
+    }
     let mut response = Body::from(artifact.bytes.clone()).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -17348,6 +19892,14 @@ async fn build_audio_transcription(
             .await;
         Some(receipt_summary(&receipt))
     };
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            audio_transcription_job_result(&output),
+            Vec::new(),
+            receipt.clone(),
+        )
+        .await?;
+    }
     Ok(json!({
         "text": output.text,
         "usage": output.usage,
@@ -18790,8 +21342,7 @@ impl GatewayState {
             if !expected_hashes.contains_key(&prompt.id) {
                 continue;
             }
-            let request =
-                canary_image_generation_request(&model.id, prompt, self.canary_policy.seed);
+            let request = canary_image_generation_request(model, prompt, self.canary_policy.seed)?;
             validate_image_generation_request(model, &request)?;
             let invocation = self.prepare_image_generation_invocation_for_route(
                 model,
@@ -19382,6 +21933,10 @@ impl GatewayState {
         let input_tokens = rough_tokens(&prompt_text);
         let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19412,22 +21967,20 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let served_ctx = self.served_ctx_for_route(model, route);
-        let max_spend_au = estimate_max_spend_au(price, request, served_ctx);
+        let max_spend_au = estimate_max_spend_au(price, request, served_ctx, &billing);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19466,9 +22019,40 @@ impl GatewayState {
             hedge: hedge_invocation_for_model(model, options, failover),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
+    }
+
+    fn prepare_chat_hedge_probe_invocation(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+        route: &GatewayRouteCandidate,
+        options: &GatewayRequestOptions,
+    ) -> GatewayHedgeProbeInvocation {
+        let prompt_text = chat_prompt_text(request);
+        let input_tokens = rough_tokens(&prompt_text);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let paid_session_id = session_id_for(&model.id, &prompt_text);
+        let session_id = stable_value_hash(&json!({
+            "domain": "mayhem-hedge-probe-session-v1",
+            "paid_session_id": paid_session_id,
+            "provider": route.provider,
+            "transport_peer": self.transport_peer_for_route(Some(route)),
+        }));
+        GatewayHedgeProbeInvocation {
+            session_id,
+            provider_pubkey: Some(route.provider.clone()),
+            transport_peer: self.transport_peer_for_route(Some(route)),
+            failover,
+        }
     }
 
     fn prepare_embedding_invocation_for_route(
@@ -19485,6 +22069,10 @@ impl GatewayState {
             embedding_failover_work_units(inputs),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19516,20 +22104,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19568,6 +22154,12 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -19587,6 +22179,10 @@ impl GatewayState {
             image_generation_failover_work_units(request)?,
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19618,20 +22214,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19670,6 +22264,12 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -19689,6 +22289,10 @@ impl GatewayState {
             audio_speech_failover_work_units(request),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19720,20 +22324,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19772,6 +22374,12 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -19791,6 +22399,10 @@ impl GatewayState {
             audio_transcription_failover_work_units(request),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19822,20 +22434,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19874,6 +22484,12 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -19896,6 +22512,10 @@ impl GatewayState {
         .max(1);
         let failover = self.failover_thresholds_for_model(model, options, work_units);
         let session_id = session_id_for(&model.id, &prompt_hash);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -19927,20 +22547,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -19979,6 +22597,12 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            client_cancellation: options.client_cancellation.clone(),
+            job: options.job.clone(),
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: self.receipts.clone(),
+                spend_reservation,
+            },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -20052,16 +22676,17 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let receipt = if let Some(provider_receipt) = provider_receipt {
             let seq = provider_receipt.body.seq;
-            let usage = expected_chat_usage_for_provider(
+            let usage = expected_chat_usage_for_invocation(
                 request,
                 Some(&provider_receipt.body.usage),
                 output.usage.prompt_tokens,
                 output.usage.completion_tokens,
                 &invocation.spend_voucher.body.locked_rate_map,
+                invocation,
             )
             .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+            if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -20081,14 +22706,17 @@ impl GatewayState {
                 },
             )?
         } else {
-            let usage = chat_receipt_usage(
+            let usage = expected_chat_usage_for_invocation(
                 request,
+                None,
                 output.usage.prompt_tokens,
                 output.usage.completion_tokens,
-                &self.media_limits,
-            );
+                &invocation.spend_voucher.body.locked_rate_map,
+                invocation,
+            )
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+            if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -20097,6 +22725,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20140,7 +22772,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20154,7 +22786,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -20194,6 +22826,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20237,7 +22873,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20251,7 +22887,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -20291,6 +22927,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20334,7 +22974,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20348,7 +22988,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -20387,6 +23027,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20429,7 +23073,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20455,12 +23099,17 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let body = &partial.provider_receipt.body;
-        let usage = ReceiptUsage::text(
+        let usage = expected_chat_usage_for_invocation(
+            request,
+            Some(&partial.provider_receipt.body.usage),
             partial.output.usage.prompt_tokens,
             partial.output.usage.completion_tokens,
-        );
+            &invocation.spend_voucher.body.locked_rate_map,
+            invocation,
+        )
+        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "provider partial receipt exceeds signed spend voucher",
                 Some("model"),
@@ -20491,7 +23140,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20505,7 +23154,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -20545,6 +23194,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20588,7 +23241,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -20602,7 +23255,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -20642,6 +23295,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -20685,7 +23342,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -21029,27 +23686,56 @@ fn canary_image_prompt_text(prompt: &GatewayCanaryPrompt) -> String {
 }
 
 fn canary_image_generation_request(
-    model_id: &str,
+    model: &GatewayModel,
     prompt: &GatewayCanaryPrompt,
     seed: i64,
-) -> ImageGenerationRequest {
-    ImageGenerationRequest {
-        model: model_id.to_owned(),
-        prompt: canary_image_prompt_text(prompt),
-        n: Some(1),
-        size: prompt.size.clone(),
-        response_format: Some("b64_json".to_owned()),
-        quality: None,
-        style: None,
-        negative_prompt: None,
-        steps: prompt.steps,
-        cfg_scale: prompt.cfg_scale,
-        seed: Some(prompt.seed.unwrap_or(seed)),
-        scheduler: None,
-        user: None,
-        endpoint_family: None,
-        endpoint_request: None,
-    }
+) -> Result<ImageGenerationRequest, ApiError> {
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "image canary model has no signed OpenAI image endpoint contract",
+                Some("model"),
+            )
+        })?;
+    let mut raw = json!({
+        "model": model.id,
+        "prompt": canary_image_prompt_text(prompt),
+    });
+    set_optional_json(
+        &mut raw,
+        "size",
+        prompt.size.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(&mut raw, "steps", prompt.steps.map(|value| json!(value)));
+    set_optional_json(
+        &mut raw,
+        "cfg_scale",
+        prompt.cfg_scale.map(|value| json!(value)),
+    );
+    set_optional_json(&mut raw, "shift", prompt.shift.map(|value| json!(value)));
+    raw["seed"] = json!(prompt.seed.unwrap_or(seed));
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|error| {
+        ApiError::bad_gateway(
+            format!("signed image canary request is invalid: {error}"),
+            Some("model"),
+        )
+    })?;
+    let mut request =
+        serde_json::from_value::<ImageGenerationRequest>(normalized.normalized_request.clone())
+            .map_err(|error| {
+                ApiError::bad_gateway(
+                    format!("signed image canary request cannot be decoded: {error}"),
+                    Some("model"),
+                )
+            })?;
+    request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(request)
 }
 
 fn canary_text_input(prompt: &GatewayCanaryPrompt) -> String {
@@ -22180,12 +24866,30 @@ fn calculate_locked_au_owed(
     invocation: &GatewaySessionInvocation,
     usage: &ReceiptUsage,
 ) -> MoneyAu {
-    priced_usage_au(
+    logical_cumulative_priced_usage_au(
         &invocation.spend_voucher.body.locked_rate_map,
         invocation.spend_voucher.body.locked_per_req_au,
         invocation.spend_voucher.body.locked_min_session_au,
+        &invocation.spend_voucher.body.billing_prior_usage,
+        invocation.spend_voucher.body.billing_prior_au_owed_cum,
         usage,
     )
+    .unwrap_or(MoneyAu::MAX)
+}
+
+fn locked_incremental_au_owed(
+    invocation: &GatewaySessionInvocation,
+    cumulative_au_owed: MoneyAu,
+) -> Option<MoneyAu> {
+    cumulative_au_owed.checked_sub(invocation.spend_voucher.body.billing_prior_au_owed_cum)
+}
+
+fn locked_increment_exceeds_voucher(
+    invocation: &GatewaySessionInvocation,
+    cumulative_au_owed: MoneyAu,
+) -> bool {
+    locked_incremental_au_owed(invocation, cumulative_au_owed)
+        .is_none_or(|increment| increment > invocation.spend_voucher.body.max_spend_au)
 }
 
 fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
@@ -22199,6 +24903,24 @@ fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
 
 fn session_id_for(model_id: &str, prompt_text: &str) -> String {
     blake3_hex(format!("{model_id}:{prompt_text}:{}", now_millis()).as_bytes())
+}
+
+fn logical_billing_id_for(model_id: &str, prompt_text: &str) -> String {
+    let mut random = [0_u8; 32];
+    if getrandom::fill(&mut random).is_ok() {
+        return hex_encode(&random);
+    }
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    blake3_hex(
+        format!(
+            "mayhem-logical-billing:{model_id}:{prompt_text}:{now_nanos}:{}",
+            random.as_ptr() as usize
+        )
+        .as_bytes(),
+    )
 }
 
 fn enclave_id_for_model(model_id: &str) -> String {
@@ -22491,19 +25213,23 @@ fn image_generation_prompt_text(request: &ImageGenerationRequest) -> String {
 }
 
 fn image_generation_prompt_hash(request: &ImageGenerationRequest) -> String {
-    stable_value_hash(&direct_session_image_generation_request_body(request))
+    let transport = direct_session_image_generation_request_body(request);
+    mayhem_proto::endpoint_request_fingerprint(&image_generation_contract_request(
+        request, &transport,
+    ))
 }
 
 fn audio_speech_prompt_hash(request: &AudioSpeechRequest) -> String {
-    stable_value_hash(&direct_session_audio_speech_request_body(request))
+    let transport = direct_session_audio_speech_request_body(request);
+    mayhem_proto::endpoint_request_fingerprint(&audio_speech_contract_request(request, &transport))
 }
 
 fn audio_transcription_prompt_hash(request: &AudioTranscriptionRequest) -> String {
-    stable_value_hash(&direct_session_audio_transcription_request_body(request))
+    mayhem_proto::endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn artifact_generation_prompt_hash(request: &ArtifactGenerationRequest) -> String {
-    stable_value_hash(&request.contract_request)
+    mayhem_proto::endpoint_request_fingerprint(&request.contract_request)
 }
 
 fn validate_image_generation_request(
@@ -22517,6 +25243,12 @@ fn validate_image_generation_request(
         ));
     }
     let (width, height) = parse_image_generation_size(request)?;
+    if !(64..=2_048).contains(&width) || !(64..=2_048).contains(&height) {
+        return Err(ApiError::bad_request(
+            "image dimensions must each be between 64 and 2048",
+            Some("size"),
+        ));
+    }
     if let Some(max_width) = model.mayhem.caps.max_image_width {
         if width > max_width {
             return Err(ApiError::bad_request(
@@ -22533,8 +25265,30 @@ fn validate_image_generation_request(
             ));
         }
     }
-    let _ = image_generation_count(request);
-    let steps = image_generation_steps(request);
+    let image_count = request.n.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image count",
+            Some("model"),
+        )
+    })?;
+    if !(1..=4).contains(&image_count) {
+        return Err(ApiError::bad_request(
+            "n must be between 1 and 4",
+            Some("n"),
+        ));
+    }
+    let steps = request.steps.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image steps",
+            Some("model"),
+        )
+    })?;
+    if !(1..=150).contains(&steps) {
+        return Err(ApiError::bad_request(
+            "steps must be between 1 and 150",
+            Some("steps"),
+        ));
+    }
     if let Some(max_steps) = model.mayhem.caps.max_image_steps {
         if steps > max_steps {
             return Err(ApiError::bad_request(
@@ -22543,8 +25297,34 @@ fn validate_image_generation_request(
             ));
         }
     }
-    let _ = image_generation_cfg_scale(request);
-    match request.response_format.as_deref().unwrap_or("b64_json") {
+    let cfg_scale = request.cfg_scale.ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image guidance",
+            Some("model"),
+        )
+    })?;
+    if !cfg_scale.is_finite() || !(0.0..=50.0).contains(&cfg_scale) {
+        return Err(ApiError::bad_request(
+            "cfg_scale must be finite and between 0 and 50",
+            Some("cfg_scale"),
+        ));
+    }
+    if request
+        .shift
+        .is_some_and(|shift| !shift.is_finite() || !(1.0..=10.0).contains(&shift))
+    {
+        return Err(ApiError::bad_request(
+            "shift must be finite and between 1 and 10",
+            Some("shift"),
+        ));
+    }
+    let response_format = request.response_format.as_deref().ok_or_else(|| {
+        ApiError::bad_gateway(
+            "signed model contract did not resolve image response_format",
+            Some("model"),
+        )
+    })?;
+    match response_format {
         "b64_json" | "url" => Ok(()),
         _ => Err(ApiError::bad_request(
             "only response_format=b64_json or response_format=url is supported",
@@ -22554,19 +25334,51 @@ fn validate_image_generation_request(
 }
 
 fn image_generation_count(request: &ImageGenerationRequest) -> u32 {
-    request.n.unwrap_or(1).clamp(1, 4)
+    request
+        .n
+        .expect("validated image request has an admin-signed count")
 }
 
 fn image_generation_steps(request: &ImageGenerationRequest) -> u64 {
-    request.steps.unwrap_or(1).clamp(1, 150)
+    request
+        .steps
+        .expect("validated image request has admin-signed steps")
 }
 
 fn image_generation_cfg_scale(request: &ImageGenerationRequest) -> f32 {
-    request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0)
+    request
+        .cfg_scale
+        .expect("validated image request has admin-signed guidance")
 }
 
 fn parse_image_generation_size(request: &ImageGenerationRequest) -> Result<(u32, u32), ApiError> {
-    let size = request.size.as_deref().unwrap_or("512x512");
+    if request.size.is_some() && (request.width.is_some() || request.height.is_some()) {
+        return Err(ApiError::bad_request(
+            "size cannot be combined with width/height",
+            Some("size"),
+        ));
+    }
+    if request.width.is_some() != request.height.is_some() {
+        return Err(ApiError::bad_request(
+            "width and height must be supplied together",
+            Some("width"),
+        ));
+    }
+    if let Some((width, height)) = request.width.zip(request.height) {
+        if width == 0 || height == 0 {
+            return Err(ApiError::bad_request(
+                "image dimensions must be greater than zero",
+                Some("width"),
+            ));
+        }
+        return Ok((width, height));
+    }
+    let size = request.size.as_deref().ok_or_else(|| {
+        ApiError::bad_request(
+            "signed model defaults did not resolve image dimensions",
+            Some("size"),
+        )
+    })?;
     let (width, height) = size
         .split_once('x')
         .ok_or_else(|| ApiError::bad_request("size must be WIDTHxHEIGHT", Some("size")))?;
@@ -22601,7 +25413,8 @@ fn image_generation_failover_work_units(request: &ImageGenerationRequest) -> Res
 }
 
 fn image_generation_usage_for_request(request: &ImageGenerationRequest) -> ReceiptUsage {
-    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
+    let resolution_scale = image_generation_resolution_scale(request)
+        .expect("validated image request has admin-signed dimensions");
     image_generation_usage_for_count(
         u64::from(image_generation_count(request)),
         image_generation_steps(request),
@@ -22613,7 +25426,8 @@ fn image_generation_usage_for_observed(
     request: &ImageGenerationRequest,
     observed_artifacts: usize,
 ) -> ReceiptUsage {
-    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
+    let resolution_scale = image_generation_resolution_scale(request)
+        .expect("validated image request has admin-signed dimensions");
     image_generation_usage_for_count(
         u64::try_from(observed_artifacts).unwrap_or(u64::MAX),
         image_generation_steps(request),
@@ -22862,6 +25676,7 @@ fn estimate_max_spend_au(
     price: &PriceRefAu,
     request: &ChatCompletionRequest,
     served_ctx: u32,
+    billing: &GatewayBillingContext,
 ) -> MoneyAu {
     let served_ctx = u64::from(served_ctx).max(1);
     let max_output_tokens = request
@@ -22869,8 +25684,30 @@ fn estimate_max_spend_au(
         .max(request.max_completion_tokens)
         .unwrap_or(1024)
         .max(1);
-    let usage = ReceiptUsage::text(served_ctx, u64::from(max_output_tokens).min(served_ctx));
-    calculate_au_owed(price, &usage).max(1_000)
+    let max_visible_output_units = u64::from(max_output_tokens)
+        .min(served_ctx)
+        .saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN);
+    let usage = if billing.prior_au_owed_cum == 0 {
+        ReceiptUsage::text(served_ctx, max_visible_output_units)
+    } else {
+        billing
+            .prior_usage
+            .saturating_add(&ReceiptUsage::from_units([(
+                USAGE_OUTPUT_TOKEN,
+                max_visible_output_units,
+            )]))
+    };
+    logical_cumulative_priced_usage_au(
+        &price.rate_map,
+        price.per_req_au,
+        price.min_session_au,
+        &billing.prior_usage,
+        billing.prior_au_owed_cum,
+        &usage,
+    )
+    .and_then(|cumulative| cumulative.checked_sub(billing.prior_au_owed_cum))
+    .unwrap_or(MoneyAu::MAX)
+    .max(1_000)
 }
 
 fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
@@ -23001,6 +25838,14 @@ impl ApiError {
         }
     }
 
+    fn client_closed_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::from_u16(499).expect("499 is a valid extension status"),
+            message: message.into(),
+            param: None,
+        }
+    }
+
     fn too_many_requests(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -23052,6 +25897,51 @@ mod tests {
     };
 
     #[test]
+    fn reasoning_evidence_is_mandatory_and_independently_metered() {
+        let missing = session_delta_reasoning_evidence(&json!({ "d": "" }))
+            .expect_err("reasoning evidence must be explicit on every delta");
+        assert!(missing.message.contains("mandatory"));
+        assert_eq!(
+            session_delta_reasoning_evidence(&json!({ "d": "", "reasoning_evidence_delta": "" }))
+                .unwrap(),
+            ""
+        );
+
+        let request = test_chat_request("mayhem/reasoning");
+        let reasoning = "r".repeat(128);
+        let usage = observed_chat_usage(&request, "", &reasoning, &[]);
+        assert_eq!(usage.completion_tokens, 32);
+
+        let exact = BTreeMap::from([("reasoning_output_tokens".to_owned(), 32)]);
+        validate_reasoning_evidence_attribution(&reasoning, &exact).unwrap();
+        let understated = BTreeMap::from([("reasoning_output_tokens".to_owned(), 31)]);
+        assert!(validate_reasoning_evidence_attribution(&reasoning, &understated).is_err());
+        assert!(validate_reasoning_evidence_attribution("", &exact).is_err());
+    }
+
+    #[test]
+    fn sc_bridge_accepts_exactly_one_authenticated_transport_kind() {
+        assert!(sc_bridge_session_transport_valid(&json!({
+            "direct": true,
+            "relayed": false
+        })));
+        assert!(sc_bridge_session_transport_valid(&json!({
+            "direct": false,
+            "relayed": true,
+            "relay": "a".repeat(64)
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({
+            "direct": false,
+            "relayed": false
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({
+            "direct": true,
+            "relayed": true
+        })));
+        assert!(!sc_bridge_session_transport_valid(&json!({})));
+    }
+
+    #[test]
     fn hf_chat_normalization_does_not_invent_openai_metadata() {
         let contract = mayhem_proto::endpoint_family_contract_template(
             mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
@@ -23067,6 +25957,230 @@ mod tests {
         .expect("HF request normalization");
         assert!(normalized.normalized_request.get("metadata").is_none());
         assert_eq!(normalized.normalized_request["stream"], false);
+    }
+
+    fn z_image_test_contract() -> EndpointFamilyContract {
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("OpenAI image contract");
+        let supported = [
+            "model",
+            "prompt",
+            "negative_prompt",
+            "n",
+            "size",
+            "width",
+            "height",
+            "response_format",
+            "steps",
+            "cfg_scale",
+            "shift",
+            "seed",
+        ];
+        contract
+            .request_attributes
+            .retain(|path| supported.contains(&path.as_str()));
+        contract
+            .request_attribute_specs
+            .retain(|path, _| supported.contains(&path.as_str()));
+        for group in &mut contract.interaction_groups {
+            group.retain(|path| supported.contains(&path.as_str()));
+        }
+        contract.interaction_groups.retain(|group| group.len() > 1);
+        for (path, value) in [
+            ("n", json!(1)),
+            ("width", json!(1024)),
+            ("height", json!(1024)),
+            ("response_format", json!("b64_json")),
+            ("steps", json!(9)),
+            ("cfg_scale", json!(0.0)),
+            ("shift", json!(3.0)),
+            ("negative_prompt", json!("")),
+        ] {
+            contract
+                .request_attribute_specs
+                .get_mut(path)
+                .unwrap()
+                .default = Some(value);
+        }
+        for path in ["width", "height"] {
+            contract
+                .request_attribute_specs
+                .get_mut(path)
+                .unwrap()
+                .multiple_of = Some(16.0);
+        }
+        for path in ["steps"] {
+            let spec = contract.request_attribute_specs.get_mut(path).unwrap();
+            spec.minimum = Some(7.0);
+            spec.maximum = Some(9.0);
+            spec.calibration_values = vec![json!(7), json!(8), json!(9)];
+        }
+        let guidance = contract
+            .request_attribute_specs
+            .get_mut("cfg_scale")
+            .unwrap();
+        guidance.maximum = Some(49.0);
+        guidance.calibration_values = vec![json!(0.0), json!(1.0), json!(7.5)];
+        contract
+    }
+
+    fn image_job_test_model() -> GatewayModel {
+        let mut model = test_model();
+        model.id = "mayhem/disconnect-image".to_owned();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.caps.tools = false;
+        model.mayhem.caps.json = false;
+        model.mayhem.caps.image = true;
+        model.mayhem.caps.output_modality = Some("image".to_owned());
+        model.mayhem.caps.output_modalities = vec!["image".to_owned()];
+        model.mayhem.caps.max_image_width = Some(2048);
+        model.mayhem.caps.max_image_height = Some(2048);
+        model.mayhem.caps.max_image_steps = Some(9);
+        model.mayhem.adapter.modality_set = vec!["image".to_owned()];
+        model.mayhem.adapter.endpoint_families = vec![z_image_test_contract()];
+        model.mayhem.price_ref_au.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+        ];
+        model
+    }
+
+    #[test]
+    fn image_normalization_uses_only_signed_controls_and_preserves_aliases() {
+        let contract = z_image_test_contract();
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({"model":"test/z-image", "prompt":"a brass compass"}),
+        )
+        .expect("signed defaults");
+        assert_eq!(normalized.normalized_request["n"], json!(1));
+        assert_eq!(normalized.normalized_request["width"], json!(1024));
+        assert_eq!(normalized.normalized_request["height"], json!(1024));
+        assert_eq!(normalized.normalized_request["steps"], json!(9));
+        assert_eq!(normalized.normalized_request["cfg_scale"], json!(0.0));
+        assert_eq!(normalized.normalized_request["negative_prompt"], json!(""));
+        assert_eq!(normalized.normalized_request["shift"], json!(3.0));
+        assert_eq!(
+            normalized.normalized_request["response_format"],
+            json!("b64_json")
+        );
+        assert!(normalized.normalized_request.get("size").is_none());
+        let mut request =
+            serde_json::from_value::<ImageGenerationRequest>(normalized.normalized_request.clone())
+                .unwrap();
+        request.endpoint_request = Some(normalized.normalized_request.clone());
+        assert_eq!(
+            image_generation_prompt_hash(&request),
+            normalized.normalized_request_fingerprint
+        );
+
+        let explicit = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "size":"768x1024",
+                "n":4
+            }),
+        )
+        .expect("explicit OpenAI size alias");
+        assert_eq!(explicit.normalized_request["size"], json!("768x1024"));
+        assert_eq!(explicit.normalized_request["n"], json!(4));
+        assert!(explicit.normalized_request.get("width").is_none());
+        assert!(explicit.normalized_request.get("height").is_none());
+
+        assert!(normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "size":"770x1024"
+            }),
+        )
+        .is_err());
+        let negative_at_default_guidance = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model":"test/z-image",
+                "prompt":"a brass compass",
+                "negative_prompt":"blur, watermark"
+            }),
+        )
+        .expect("negative prompt remains valid at guidance zero");
+        assert_eq!(
+            negative_at_default_guidance.normalized_request["negative_prompt"],
+            json!("blur, watermark")
+        );
+        assert_eq!(
+            negative_at_default_guidance.normalized_request["cfg_scale"],
+            json!(0.0)
+        );
+
+        for steps in [7, 8, 9] {
+            let normalized = normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"steps", "steps":steps}),
+            )
+            .expect("recommended step level");
+            assert_eq!(normalized.normalized_request["steps"], json!(steps));
+        }
+        for steps in [6, 10] {
+            assert!(normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"steps", "steps":steps}),
+            )
+            .is_err());
+        }
+        for shift in [1.0, 3.0, 10.0] {
+            let normalized = normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"shift", "shift":shift}),
+            )
+            .expect("official flow-shift level");
+            assert_eq!(normalized.normalized_request["shift"], json!(shift));
+        }
+        for shift in [0.9, 10.1] {
+            assert!(normalize_endpoint_request_for_provider(
+                &contract,
+                &json!({"model":"test/z-image", "prompt":"shift", "shift":shift}),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn nested_endpoint_defaults_preserve_supplied_leaves() {
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE,
+        )
+        .expect("HF image contract");
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.height")
+            .expect("height spec")
+            .default = Some(json!(1024));
+
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "inputs": "a brass compass",
+                "parameters": {"width": 768}
+            }),
+        )
+        .expect("nested signed defaults");
+
+        assert_eq!(normalized.normalized_request["parameters"]["width"], 768);
+        assert_eq!(normalized.normalized_request["parameters"]["height"], 1024);
     }
 
     #[test]
@@ -23298,16 +26412,25 @@ mod tests {
         let small_image = ImageGenerationRequest {
             model: model.id.clone(),
             prompt: "small".to_owned(),
+            background: None,
+            moderation: None,
             n: Some(1),
+            output_compression: None,
+            output_format: None,
+            partial_images: None,
             size: Some("512x512".to_owned()),
-            response_format: None,
+            width: None,
+            height: None,
+            response_format: Some("b64_json".to_owned()),
             steps: Some(1),
-            cfg_scale: None,
+            cfg_scale: Some(1.0),
+            shift: None,
             seed: None,
             quality: None,
             style: None,
             negative_prompt: None,
             scheduler: None,
+            stream: None,
             user: None,
             endpoint_family: None,
             endpoint_request: None,
@@ -23501,7 +26624,10 @@ mod tests {
             .expect("multimodal request receives a context-bounded voucher");
         let full_context_bound = calculate_au_owed(
             &model.mayhem.price_ref_au,
-            &ReceiptUsage::text(u64::from(model.mayhem.caps.ctx), 2_048),
+            &ReceiptUsage::text(
+                u64::from(model.mayhem.caps.ctx),
+                2_048 * MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+            ),
         )
         .max(1_000);
         let provider_media_receipt =
@@ -24001,6 +27127,16 @@ mod tests {
             .with_access_control(GatewayAccessControl::new(false, store, None));
         let mut invocation = test_invocation();
         invocation.access_token = Some(access_token);
+        invocation.receipt_recorder = GatewayReceiptRecorder {
+            receipts: state.receipts.clone(),
+            spend_reservation: state
+                .reserve_session_spend(
+                    &invocation.session_id,
+                    invocation.spend_voucher.body.max_spend_au,
+                    &invocation.access_token,
+                )
+                .expect("test spend reservation"),
+        };
 
         let stored = state
             .meter_chat_session(&model, &request, &output, &invocation, None)
@@ -24013,9 +27149,11 @@ mod tests {
             .unwrap();
         assert_eq!(spent, stored.receipt.body.au_owed_cum);
 
-        state
-            .record_receipt(stored.clone())
+        invocation
+            .receipt_recorder
+            .record(stored.clone())
             .expect("duplicate cumulative receipt is accepted");
+        assert_eq!(state.receipt_count(), 1);
         let access = state.access_summary();
         assert_eq!(
             access["tokens"][0]["spent_total_au"]
@@ -24025,6 +27163,164 @@ mod tests {
                 .unwrap(),
             spent
         );
+
+        let mut conflicting = stored;
+        conflicting.receipt.body.au_owed_cum =
+            conflicting.receipt.body.au_owed_cum.saturating_add(1);
+        let error = invocation
+            .receipt_recorder
+            .record(conflicting)
+            .expect_err("same receipt sequence cannot be replaced");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(state.receipt_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_wallet_and_bearer_reservations_cannot_overspend_and_release_exactly() {
+        let wallet_state =
+            GatewayState::from_models(vec![test_model()]).with_receipt_balance_au(100);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let state = wallet_state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.reserve_session_spend(&format!("wallet-{index}"), 70, &None)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut admitted = Vec::new();
+        let mut refused = Vec::new();
+        for handle in handles {
+            match handle.join().expect("wallet reservation thread") {
+                Ok(reservation) => admitted.push(reservation),
+                Err(error) => refused.push(error),
+            }
+        }
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].status, StatusCode::PAYMENT_REQUIRED);
+        {
+            let wallet = wallet_state
+                .wallet_spend
+                .lock_recover("gateway wallet spend state");
+            assert_eq!(wallet.balance_au, 100);
+            assert_eq!(wallet.reservations.values().copied().sum::<MoneyAu>(), 70);
+        }
+        admitted
+            .pop()
+            .expect("one wallet reservation")
+            .settle(30, true)
+            .expect("terminal wallet settlement");
+        assert_eq!(wallet_state.ledger_balance_au(), 70);
+        assert!(wallet_state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
+        let exact_remainder = wallet_state
+            .reserve_session_spend("wallet-exact", 70, &None)
+            .expect("the exact released remainder is available");
+        assert_eq!(
+            wallet_state
+                .reserve_session_spend("wallet-over", 71, &None)
+                .expect_err("one atto above the remaining wallet balance must fail")
+                .status,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        exact_remainder.release();
+        let full_balance = wallet_state
+            .reserve_session_spend("wallet-after-redispatch", 70, &None)
+            .expect("explicit redispatch release makes the full remainder available");
+        drop(full_balance);
+
+        let attribution = GatewayTokenAttribution {
+            name: "atomic-agent".to_owned(),
+            token_id: "tok_atomic".to_owned(),
+        };
+        let access = GatewayAccessControl::new(
+            false,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![GatewayTokenRecord {
+                    name: attribution.name.clone(),
+                    token_hash: gateway_token_hash("sk-mayhem-atomic"),
+                    token_id: attribution.token_id.clone(),
+                    created_at: 1,
+                    expires_at: None,
+                    budget_au: Some(100),
+                    budget_period: Some(GatewayTokenBudgetPeriod::Total),
+                    spent_total_au: 0,
+                    spent_period_au: 0,
+                    period_started_at: Some(1),
+                    max_rate_per_minute: None,
+                    models: Vec::new(),
+                    last_used_at: None,
+                    revoked_at: None,
+                }],
+            },
+            None,
+        );
+        let token_state = GatewayState::from_models(vec![test_model()])
+            .with_receipt_balance_au(1_000)
+            .with_access_control(access);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let state = token_state.clone();
+                let barrier = barrier.clone();
+                let attribution = Some(attribution.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.reserve_session_spend(&format!("token-{index}"), 70, &attribution)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut admitted = Vec::new();
+        let mut refused = Vec::new();
+        for handle in handles {
+            match handle.join().expect("bearer reservation thread") {
+                Ok(reservation) => admitted.push(reservation),
+                Err(error) => refused.push(error),
+            }
+        }
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].status, StatusCode::PAYMENT_REQUIRED);
+        admitted
+            .pop()
+            .expect("one bearer reservation")
+            .settle(30, true)
+            .expect("terminal bearer settlement");
+        assert_eq!(
+            token_state.access_summary()["tokens"][0]["spent_total_au"],
+            "30"
+        );
+        let exact_remainder = token_state
+            .reserve_session_spend("token-exact", 70, &Some(attribution.clone()))
+            .expect("the exact released bearer remainder is available");
+        assert_eq!(
+            token_state
+                .reserve_session_spend("token-over", 71, &Some(attribution))
+                .expect_err("one atto above the remaining bearer budget must fail")
+                .status,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        exact_remainder.release();
+        let full_budget = token_state
+            .reserve_session_spend(
+                "token-after-redispatch",
+                70,
+                &Some(GatewayTokenAttribution {
+                    name: "atomic-agent".to_owned(),
+                    token_id: "tok_atomic".to_owned(),
+                }),
+            )
+            .expect("explicit redispatch release makes the full bearer budget available");
+        drop(full_budget);
     }
 
     #[test]
@@ -24228,6 +27524,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_session_signatures_reject_low_order_forgeries() {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        let weak_key = hex::encode(weak_key);
+        let weak_signature = hex::encode(weak_signature);
+
+        let invocation = test_invocation();
+        let accept = test_accept_frame(&invocation);
+        let accept_err =
+            verify_direct_session_accept_signature(&accept, &weak_key, &weak_signature)
+                .expect_err("low-order accept forgery must fail strict verification");
+        assert!(accept_err.message.contains("signature"));
+
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let mut receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        receipt.enclave_pubkey = weak_key;
+        receipt.enclave_sig = weak_signature;
+        let receipt_err = verify_provider_receipt_signature(&receipt)
+            .expect_err("low-order receipt forgery must fail strict verification");
+        assert!(receipt_err.message.contains("signature"));
+    }
+
+    #[test]
     fn provider_signed_receipt_must_match_admin_terms_usage_and_enclave_key() {
         let state = GatewayState::fixture();
         let model = test_model();
@@ -24295,11 +27618,14 @@ mod tests {
             },
             ..output.clone()
         };
+        let mut cached_invocation = test_invocation();
+        cached_invocation.session_id = "ab".repeat(32);
+        cached_invocation.spend_voucher.body.session_id = cached_invocation.session_id.clone();
         let mut cached_receipt =
-            test_provider_receipt(&model, &request, &cached_output, &invocation);
+            test_provider_receipt(&model, &request, &cached_output, &cached_invocation);
         cached_receipt.body.usage = ReceiptUsage::text_with_cached(500, 500, 0);
         cached_receipt.body.au_owed_cum =
-            calculate_locked_au_owed(&invocation, &cached_receipt.body.usage);
+            calculate_locked_au_owed(&cached_invocation, &cached_receipt.body.usage);
         cached_receipt.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&cached_receipt.body).unwrap(),
@@ -24309,7 +27635,7 @@ mod tests {
                 &model,
                 &request,
                 &cached_output,
-                &invocation,
+                &cached_invocation,
                 Some(&cached_receipt),
             )
             .expect("cached input receipt should be co-signed");
@@ -24327,7 +27653,7 @@ mod tests {
         let mut false_cache = cached_receipt.clone();
         false_cache.body.usage = ReceiptUsage::text_with_cached(100, 500, 0);
         false_cache.body.au_owed_cum =
-            calculate_locked_au_owed(&invocation, &false_cache.body.usage);
+            calculate_locked_au_owed(&cached_invocation, &false_cache.body.usage);
         false_cache.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&false_cache.body).unwrap(),
@@ -24337,7 +27663,7 @@ mod tests {
                 &model,
                 &request,
                 &cached_output,
-                &invocation,
+                &cached_invocation,
                 Some(&false_cache),
             )
             .expect_err("false cache hit must not be co-signed");
@@ -24456,6 +27782,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
+            "",
             Vec::new(),
             Some(&provider_receipt),
             &[1, 2, 3],
@@ -24493,6 +27820,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
+            "",
             Vec::new(),
             None,
             &[1, 2, 3],
@@ -24514,7 +27842,151 @@ mod tests {
         assert_eq!(interrupted.token_ids, vec![1, 2, 3]);
         assert_eq!(
             interrupted.output.usage,
-            observed_chat_usage(&request, output.content.as_deref().unwrap(), &[1, 2, 3])
+            observed_chat_usage(&request, output.content.as_deref().unwrap(), "", &[])
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_provider_completion_wins_client_disconnect_race() {
+        let cancellation = GatewayRequestCancellation::new();
+        cancellation.cancel();
+        let ready = json!({"t": "s.receipt", "session_id": "session-ready"});
+        let selected = prefer_ready_session_frame_over_cancellation(
+            "session-ready",
+            std::future::ready(Ok(ready.clone())),
+            &cancellation,
+        )
+        .await
+        .expect("already-ready provider frame must win");
+        assert_eq!(selected, ready);
+
+        let error = prefer_ready_session_frame_over_cancellation(
+            "session-pending",
+            std::future::pending::<Result<Value, GatewaySessionError>>(),
+            &cancellation,
+        )
+        .await
+        .expect_err("in-flight provider work must observe client disconnect");
+        assert!(is_client_disconnect_error(&error));
+    }
+
+    #[tokio::test]
+    async fn repeated_variable_only_disconnects_settle_one_quantum_once_per_session() {
+        let model = test_model();
+        let receipts = Arc::new(Mutex::new(Vec::new()));
+        let cancellation_usage = ReceiptUsage::from_units([(USAGE_STEP, 1)]);
+        let rate_map = vec![RateMapEntry {
+            unit: USAGE_STEP.to_owned(),
+            per_unit_au: 37,
+            granularity: 5,
+        }];
+        let prompt_hash = blake3_hex(b"cancelled render");
+        let provider = verifying_key_hex(&test_provider_seed());
+        let receipt_for = |invocation: &GatewaySessionInvocation| {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider: provider.clone(),
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
+                rules_ver: invocation.rules_ver,
+                usage: cancellation_usage.clone(),
+                usage_attribution: BTreeMap::new(),
+                au_owed_cum: calculate_locked_au_owed(invocation, &cancellation_usage),
+                prompt_hash: prompt_hash.clone(),
+                ts: 123,
+            };
+            ProviderSignedReceipt {
+                enclave_sig: sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&body).unwrap()),
+                body,
+                enclave_pubkey: verifying_key_hex(&test_enclave_seed()),
+            }
+        };
+
+        let mut first = test_invocation();
+        first.spend_voucher.body.locked_rate_map = rate_map.clone();
+        first.spend_voucher.body.locked_per_req_au = 0;
+        first.spend_voucher.body.locked_min_session_au = 0;
+        first.receipt_recorder = test_receipt_recorder(
+            receipts.clone(),
+            &first.session_id,
+            first.spend_voucher.body.max_spend_au,
+        );
+        let first_receipt = receipt_for(&first);
+        record_cancelled_direct_session_receipt(
+            &model,
+            &first,
+            &first_receipt,
+            &provider,
+            prompt_hash.clone(),
+            ReceiptUsage::default(),
+            1,
+        )
+        .await
+        .expect("first disconnect settles");
+        record_cancelled_direct_session_receipt(
+            &model,
+            &first,
+            &first_receipt,
+            &provider,
+            prompt_hash.clone(),
+            ReceiptUsage::default(),
+            1,
+        )
+        .await
+        .expect("identical receipt retransmission is idempotent");
+
+        let mut second = test_invocation();
+        second.session_id = "bb".repeat(32);
+        second.spend_voucher.body.session_id = second.session_id.clone();
+        second.spend_voucher.body.billing_id = second.session_id.clone();
+        second.spend_voucher.body.locked_rate_map = rate_map;
+        second.spend_voucher.body.locked_per_req_au = 0;
+        second.spend_voucher.body.locked_min_session_au = 0;
+        second.receipt_recorder = test_receipt_recorder(
+            receipts.clone(),
+            &second.session_id,
+            second.spend_voucher.body.max_spend_au,
+        );
+        let second_receipt = receipt_for(&second);
+        record_cancelled_direct_session_receipt(
+            &model,
+            &second,
+            &second_receipt,
+            &provider,
+            prompt_hash,
+            ReceiptUsage::default(),
+            1,
+        )
+        .await
+        .expect("second disconnect settles");
+
+        let receipts = receipts.lock_recover("receipt store");
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.receipt.body.au_owed_cum == 8));
+        assert!(receipts.iter().all(|receipt| {
+            receipt.receipt.body.usage == ReceiptUsage::from_units([(USAGE_STEP, 1)])
+        }));
+        assert_ne!(
+            receipts[0].receipt.body.session_id,
+            receipts[1].receipt.body.session_id
         );
     }
 
@@ -24602,6 +28074,30 @@ mod tests {
         );
     }
 
+    fn test_spend_reservation(id: String, max_spend_au: MoneyAu) -> GatewaySpendReservation {
+        GatewaySpendReservation(Arc::new(GatewaySpendReservationInner {
+            id: id.clone(),
+            remaining_au: Mutex::new(Some(max_spend_au)),
+            wallet_spend: Arc::new(Mutex::new(GatewayWalletSpendState {
+                balance_au: MoneyAu::MAX,
+                reservations: BTreeMap::from([(id, max_spend_au)]),
+            })),
+            access_control: Arc::new(GatewayAccessControl::disabled()),
+            access_token: None,
+        }))
+    }
+
+    fn test_receipt_recorder(
+        receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+        id: &str,
+        max_spend_au: MoneyAu,
+    ) -> GatewayReceiptRecorder {
+        GatewayReceiptRecorder {
+            receipts,
+            spend_reservation: test_spend_reservation(id.to_owned(), max_spend_au),
+        }
+    }
+
     fn test_invocation() -> GatewaySessionInvocation {
         let identity = test_identity();
         let session_id = "aa".repeat(32);
@@ -24621,6 +28117,10 @@ mod tests {
         };
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: session_id.clone(),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: enclave_id.clone(),
             price_ver: 7,
@@ -24667,6 +28167,12 @@ mod tests {
             hedge: GatewayHedgeInvocation::default(),
             failover: GatewayFailoverInvocation::default(),
             access_token: None,
+            client_cancellation: None,
+            job: None,
+            receipt_recorder: GatewayReceiptRecorder {
+                receipts: Arc::new(Mutex::new(Vec::new())),
+                spend_reservation: test_spend_reservation("aa".repeat(32), 1_000),
+            },
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
         }
@@ -24860,6 +28366,7 @@ mod tests {
             size: None,
             steps: None,
             cfg_scale: None,
+            shift: None,
             seed: Some(77),
         };
 
@@ -24944,6 +28451,8 @@ mod tests {
                 "num_inference_steps": 17,
                 "guidance_scale": 6.5,
                 "negative_prompt": "blue",
+                "num_images_per_prompt": 3,
+                "shift": 4.5,
                 "scheduler": "euler",
                 "seed": 23
             }
@@ -24951,9 +28460,13 @@ mod tests {
 
         let request = hf_image_generation_request("test/image", raw.clone()).unwrap();
         assert_eq!(request.prompt, "a red cube");
-        assert_eq!(request.size.as_deref(), Some("768x512"));
+        assert_eq!(request.size, None);
+        assert_eq!(request.width, Some(768));
+        assert_eq!(request.height, Some(512));
         assert_eq!(request.steps, Some(17));
         assert_eq!(request.cfg_scale, Some(6.5));
+        assert_eq!(request.n, Some(3));
+        assert_eq!(request.shift, Some(4.5));
         assert_eq!(request.negative_prompt.as_deref(), Some("blue"));
         assert_eq!(request.scheduler.as_deref(), Some("euler"));
         assert_eq!(request.seed, Some(23));
@@ -25101,6 +28614,7 @@ mod tests {
                 size: Some("64x64".to_owned()),
                 steps: Some(1),
                 cfg_scale: Some(1.0),
+                shift: None,
                 seed: Some(7),
             }],
         )]);
@@ -25326,15 +28840,17 @@ mod tests {
                     attempts.len()
                 };
                 if attempt == 1 {
+                    let completion_tokens = visible_output_unit_count("hello ", &[]);
+                    let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                     let output = ChatOutput {
                         content: Some("hello ".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "interrupted".to_owned(),
                         usage: Usage {
-                            prompt_tokens: rough_tokens(&chat_prompt_text(request)),
-                            completion_tokens: 1,
-                            total_tokens: rough_tokens(&chat_prompt_text(request)) + 1,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens: prompt_tokens + completion_tokens,
                         },
                     };
                     let provider_receipt = test_provider_receipt_with_finality(
@@ -25362,15 +28878,17 @@ mod tests {
                     }),
                     "redispatch request should include the checkpointed assistant prefix"
                 );
+                let completion_tokens = visible_output_unit_count("world", &[]);
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let output = ChatOutput {
                     content: Some("world".to_owned()),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
-                        prompt_tokens: rough_tokens(&chat_prompt_text(request)),
-                        completion_tokens: 1,
-                        total_tokens: rough_tokens(&chat_prompt_text(request)) + 1,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
                     },
                 };
                 Ok(GatewaySessionResult {
@@ -25384,6 +28902,63 @@ mod tests {
                     quality: Some(GatewaySessionQuality {
                         ttft_ms: 30,
                         tok_s: Some(25.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PaddedTokenIdsToolBackend;
+
+    impl GatewaySessionBackend for PaddedTokenIdsToolBackend {
+        fn name(&self) -> &str {
+            "test-padded-token-ids-tools"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let tool_calls = vec![
+                    ToolCallOutput {
+                        id: "call_alpha".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: r#"{"path":"alpha.txt"}"#.to_owned(),
+                    },
+                    ToolCallOutput {
+                        id: "call_beta".to_owned(),
+                        name: "write_file".to_owned(),
+                        arguments: r#"{"path":"beta.txt","content":"done"}"#.to_owned(),
+                    },
+                ];
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                let completion_tokens = visible_output_unit_count("", &tool_calls);
+                let output = ChatOutput {
+                    content: None,
+                    tool_calls,
+                    artifacts: Vec::new(),
+                    finish_reason: "tool_calls".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                    },
+                };
+                Ok(GatewaySessionResult {
+                    output: output.clone(),
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: Some(test_provider_receipt(
+                        model, request, &output, invocation,
+                    )),
+                    token_ids: vec![7; 4_096],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(100.0),
                     }),
                 })
             })
@@ -25640,6 +29215,63 @@ mod tests {
     #[derive(Debug)]
     struct ArtifactGenerationSuccessBackend;
 
+    #[derive(Debug)]
+    struct DisconnectCompletesImageBackend {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    impl GatewaySessionBackend for DisconnectCompletesImageBackend {
+        fn name(&self) -> &str {
+            "test-disconnect-image"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async { Err(GatewaySessionError::new("chat not used")) })
+        }
+
+        fn run_image_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ImageGenerationRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayImageGenerationFuture<'a> {
+            let cancellation = invocation
+                .client_cancellation
+                .clone()
+                .expect("non-stream image request has client cancellation");
+            Box::pin(async move {
+                self.started.notify_one();
+                cancellation.cancelled().await;
+                self.cancelled.notify_one();
+                let bytes = b"completed-after-http-disconnect".to_vec();
+                Ok(GatewayImageGenerationResult {
+                    output: ImageGenerationOutput {
+                        artifacts: vec![GatewayArtifactOutput {
+                            id: "image-disconnect-proof".to_owned(),
+                            content_type: "image/png".to_owned(),
+                            blake3: blake3_hex(&bytes),
+                            bytes,
+                        }],
+                        usage: ReceiptUsage::from_units([
+                            (USAGE_IMAGE, u64::from(image_generation_count(request))),
+                            (USAGE_STEP, u64::from(request.steps.unwrap_or(1))),
+                        ]),
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: false,
+                    provider_receipt: None,
+                    quality: None,
+                })
+            })
+        }
+    }
+
     impl GatewaySessionBackend for ArtifactGenerationSuccessBackend {
         fn name(&self) -> &str {
             "test-artifact-generation"
@@ -25652,6 +29284,35 @@ mod tests {
             _invocation: &'a GatewaySessionInvocation,
         ) -> GatewaySessionFuture<'a> {
             Box::pin(async { Err(GatewaySessionError::new("chat not used")) })
+        }
+
+        fn run_image_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ImageGenerationRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayImageGenerationFuture<'a> {
+            Box::pin(async move {
+                let bytes = b"async-image-fixture".to_vec();
+                Ok(GatewayImageGenerationResult {
+                    output: ImageGenerationOutput {
+                        artifacts: vec![GatewayArtifactOutput {
+                            id: "async-image".to_owned(),
+                            content_type: "image/png".to_owned(),
+                            blake3: blake3_hex(&bytes),
+                            bytes,
+                        }],
+                        usage: ReceiptUsage::from_units([
+                            (USAGE_IMAGE, u64::from(image_generation_count(request))),
+                            (USAGE_STEP, u64::from(request.steps.unwrap_or(1))),
+                        ]),
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: false,
+                    provider_receipt: None,
+                    quality: None,
+                })
+            })
         }
 
         fn run_artifact_generation<'a>(
@@ -26331,16 +29992,25 @@ mod tests {
         let image_request = ImageGenerationRequest {
             model: model.id.clone(),
             prompt: "quiet launch panel".to_owned(),
+            background: None,
+            moderation: None,
             n: Some(1),
+            output_compression: None,
+            output_format: None,
+            partial_images: None,
             size: Some("512x512".to_owned()),
-            response_format: None,
+            width: None,
+            height: None,
+            response_format: Some("b64_json".to_owned()),
             steps: Some(4),
-            cfg_scale: None,
+            cfg_scale: Some(1.0),
+            shift: None,
             seed: None,
             quality: None,
             style: None,
             negative_prompt: None,
             scheduler: None,
+            stream: None,
             user: None,
             endpoint_family: None,
             endpoint_request: None,
@@ -26517,8 +30187,8 @@ mod tests {
             derivation: None,
             history: Vec::new(),
         });
-        let state =
-            test_gateway_state_from_models(vec![model.clone()]).with_receipt_balance_au(10_000);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_receipt_balance_au(MoneyAu::MAX);
 
         let selected = ordered_route_candidates_for_request_with_max_price_seed(
             &state,
@@ -26820,7 +30490,21 @@ mod tests {
 
     #[tokio::test]
     async fn route_retry_records_partial_receipt_and_redispatches_remaining_history() {
-        let model = test_routed_model(2);
+        let mut model = test_routed_model(2);
+        model.mayhem.price_ref_au.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 20,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 60,
+                granularity: 1,
+            },
+        ];
+        model.mayhem.price_ref_au.per_req_au = 500;
+        model.mayhem.price_ref_au.min_session_au = 700;
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let providers = Arc::new(Mutex::new(Vec::new()));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
@@ -26838,7 +30522,7 @@ mod tests {
                 .expect("redispatch should recover");
 
         assert_eq!(run.result.output.content.as_deref(), Some("hello world"));
-        assert_eq!(run.result.output.usage.completion_tokens, 2);
+        assert_eq!(run.result.output.usage.completion_tokens, 4);
         assert_eq!(run.result.token_ids, vec![11, 22]);
         assert_eq!(run.metering_output.content.as_deref(), Some("world"));
         assert!(run
@@ -26859,7 +30543,7 @@ mod tests {
         let partial_receipts = state.receipts();
         assert_eq!(partial_receipts.len(), 1);
         assert!(!partial_receipts[0].receipt.body.final_receipt);
-        assert_eq!(partial_receipts[0].receipt.body.usage.output_tokens(), 1);
+        assert_eq!(partial_receipts[0].receipt.body.usage.output_tokens(), 2);
 
         state
             .meter_chat_session(
@@ -26873,7 +30557,87 @@ mod tests {
         let receipts = state.receipts();
         assert_eq!(receipts.len(), 2);
         assert!(receipts[1].receipt.body.final_receipt);
-        assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 1);
+        assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 4);
+        let first = &receipts[0].receipt.body;
+        let second = &receipts[1].receipt.body;
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.billing_id, second.billing_id);
+        assert_eq!(first.billing_attempt, 0);
+        assert_eq!(second.billing_attempt, 1);
+        assert_eq!(first.billing_prior_usage, ReceiptUsage::default());
+        assert_eq!(first.billing_prior_au_owed_cum, 0);
+        assert_eq!(second.billing_prior_usage, first.usage);
+        assert_eq!(second.billing_prior_au_owed_cum, first.au_owed_cum);
+        assert_ne!(first.provider, second.provider);
+        assert_eq!(first.au_owed_cum, 700);
+        assert_eq!(second.au_owed_cum, 820);
+        assert_eq!(second.au_owed_cum - first.au_owed_cum, 2 * 60);
+    }
+
+    #[tokio::test]
+    async fn visible_output_billing_ignores_padded_token_ids_and_counts_every_tool_call() {
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(Arc::new(PaddedTokenIdsToolBackend));
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("tool-call request succeeds");
+        assert_eq!(run.result.token_ids.len(), 4_096);
+        assert_eq!(
+            streamed_output_token_count("", &run.result.token_ids),
+            4_096
+        );
+        assert_eq!(run.result.output.tool_calls.len(), 2);
+        let expected_units = visible_output_unit_count("", &run.result.output.tool_calls);
+        let first_call_units = visible_output_unit_count("", &run.result.output.tool_calls[..1]);
+        assert!(expected_units > first_call_units);
+        assert_ne!(expected_units, run.result.token_ids.len() as u64);
+
+        let stored = state
+            .meter_chat_session(
+                &model,
+                &run.metering_request,
+                &run.metering_output,
+                &run.invocation,
+                run.result.provider_receipt.as_ref(),
+            )
+            .expect("visible tool output receipt is accepted");
+        assert_eq!(stored.receipt.body.usage.output_tokens(), expected_units);
+        assert_ne!(
+            stored.receipt.body.usage.output_tokens(),
+            run.result.token_ids.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn production_providerless_request_hard_refuses_before_the_dev_shim() {
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        assert!(!state.dev_session_shim);
+
+        let error = match run_chat_with_route_retry(
+            &state,
+            &model,
+            &test_chat_request(&model.id),
+            GatewayRequestOptions::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("production must not create a providerless invocation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("production gateway"));
+        assert_eq!(state.receipt_count(), 0);
+        assert!(state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
     }
 
     #[tokio::test]
@@ -26924,6 +30688,7 @@ mod tests {
         let pre_output = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
             "",
+            "",
             Vec::new(),
             None,
             false,
@@ -26938,6 +30703,7 @@ mod tests {
 
         let receipt_seen = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
+            "",
             "",
             Vec::new(),
             None,
@@ -26955,6 +30721,7 @@ mod tests {
         let output_started = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
             "partial output",
+            "",
             Vec::new(),
             None,
             false,
@@ -27139,7 +30906,7 @@ mod tests {
             "seconds": "4",
             "size": "1280x720"
         });
-        validate_catalog_endpoint_request(
+        let raw = normalize_catalog_endpoint_request(
             &state,
             &model.id,
             mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
@@ -27167,45 +30934,395 @@ mod tests {
     }
 
     #[test]
-    fn video_lifecycle_store_evicts_by_count_bytes_and_expiry() {
-        let job = |id: &str, bytes: usize, expires_at: u64| StoredVideoJob {
-            id: id.to_owned(),
-            model: "mayhem/video-test".to_owned(),
-            metadata: json!({"id": id, "object": "video"}),
-            artifact: GatewayArtifactOutput {
-                id: format!("artifact-{id}"),
-                content_type: "video/mp4".to_owned(),
-                bytes: vec![7; bytes],
-                blake3: blake3_hex(id.as_bytes()),
-            },
-            access_token: None,
-            expires_at,
-        };
-        let mut store = GatewayVideoJobStore::default();
-        store.insert(job("a", 4, 100), 2, 8, 1).unwrap();
-        store.insert(job("b", 4, 100), 2, 8, 1).unwrap();
-        store.insert(job("c", 4, 100), 2, 8, 1).unwrap();
-        assert_eq!(
+    fn video_lifecycle_uses_the_bounded_generic_job_vault() {
+        let mut store = GatewayJobStore::in_memory([3_u8; 32], 2, 1024 * 1024, 100);
+        for (id, now) in [("job_a", 1), ("job_b", 2), ("job_c", 3)] {
             store
-                .jobs
-                .iter()
-                .map(|job| job.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["b", "c"]
+                .begin(
+                    id.to_owned(),
+                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS.to_owned(),
+                    "mayhem/video-test".to_owned(),
+                    None,
+                    format!("request-{id}"),
+                    now,
+                )
+                .unwrap();
+            store
+                .complete(
+                    id,
+                    GatewayJobStatus::Completed,
+                    Some(json!({"kind": "video_generation"})),
+                    Vec::new(),
+                    None,
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(store.get("job_a", 3).unwrap().is_none());
+        assert_eq!(store.list_summaries_for_owner(None, 3).unwrap().len(), 2);
+        assert!(store.get("job_c", 103).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn panicked_detached_jobs_become_terminal_failures() {
+        let store = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+            [6_u8; 32],
+            4,
+            1024 * 1024,
+            60,
+        )));
+        for id in ["sync_panic", "async_panic"] {
+            store
+                .lock_recover("gateway job vault")
+                .begin(
+                    id.to_owned(),
+                    "image".to_owned(),
+                    "model".to_owned(),
+                    None,
+                    id.to_owned(),
+                    now_secs(),
+                )
+                .unwrap();
+        }
+
+        let sync_job = GatewayJobHandle {
+            id: "sync_panic".to_owned(),
+            store: store.clone(),
+        };
+        let error = run_detached_gateway_job_request::<(), _>(
+            GatewayRequestCancellation::new(),
+            sync_job,
+            async {
+                panic!("synchronous request panic proof");
+                #[allow(unreachable_code)]
+                Ok::<(), ApiError>(())
+            },
+        )
+        .await
+        .expect_err("a panicked request must fail");
+        assert!(error.message.contains("gateway request task failed"));
+
+        spawn_gateway_job_request::<(), _>(
+            GatewayJobHandle {
+                id: "async_panic".to_owned(),
+                store: store.clone(),
+            },
+            async {
+                panic!("asynchronous request panic proof");
+                #[allow(unreachable_code)]
+                Ok::<(), ApiError>(())
+            },
         );
-        assert_eq!(store.total_bytes, 8);
 
-        store.insert(job("d", 6, 100), 2, 8, 1).unwrap();
-        assert_eq!(store.jobs.len(), 1);
-        assert_eq!(store.jobs[0].id, "d");
-        assert_eq!(store.total_bytes, 6);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let both_failed = {
+                    let mut jobs = store.lock_recover("gateway job vault");
+                    ["sync_panic", "async_panic"].into_iter().all(|id| {
+                        jobs.get(id, now_secs())
+                            .expect("look up failed job")
+                            .is_some_and(|job| {
+                                job.status == GatewayJobStatus::Failed
+                                    && job
+                                        .error
+                                        .as_deref()
+                                        .is_some_and(|error| error.contains("task failed"))
+                                    && !jobs.is_active(id)
+                            })
+                    })
+                };
+                if both_failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("panicked jobs become terminal failures");
+    }
 
-        store.insert(job("expired", 1, 2), 2, 8, 1).unwrap();
-        store.purge_expired(2);
-        assert_eq!(store.jobs.len(), 1);
-        assert_eq!(store.jobs[0].id, "d");
-        assert_eq!(store.total_bytes, 6);
-        assert!(store.insert(job("too-large", 9, 100), 2, 8, 2).is_err());
+    #[tokio::test]
+    async fn prefer_respond_async_returns_job_before_image_completion() {
+        use tower::ServiceExt;
+
+        let model = image_job_test_model();
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_dev_session_shim()
+            .with_session_backend(Arc::new(ArtifactGenerationSuccessBackend));
+        let body = json!({
+            "model": model.id,
+            "prompt": "an asynchronous image",
+            "size": "1024x1024",
+            "steps": 9,
+            "response_format": "b64_json"
+        })
+        .to_string();
+        let response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("prefer", "wait=1, RESPOND-ASYNC; handling=strict")
+                    .header("idempotency-key", "async-image-proof")
+                    .body(Body::from(body))
+                    .expect("async image request"),
+            )
+            .await
+            .expect("async image response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job_id = response
+            .headers()
+            .get("x-mayhem-job-id")
+            .expect("job id header")
+            .to_str()
+            .expect("ASCII job id")
+            .to_owned();
+        let expected_location = format!("/v1/jobs/{job_id}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_location.as_str())
+        );
+
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = {
+                    state
+                        .jobs
+                        .lock_recover("gateway job vault")
+                        .get(&job_id, now_secs())
+                        .expect("read async job")
+                };
+                if let Some(job) = completed {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("async image completed");
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.artifacts[0].bytes, b"async-image-fixture");
+    }
+
+    #[tokio::test]
+    async fn persisted_job_is_private_to_its_bearer_identity() {
+        use tower::ServiceExt;
+
+        let model = image_job_test_model();
+        let raw_owner_token = "sk-mayhem-job-owner";
+        let raw_other_token = "sk-mayhem-job-other";
+        let token = |name: &str, token_id: &str, raw_token: &str| GatewayTokenRecord {
+            name: name.to_owned(),
+            token_hash: gateway_token_hash(raw_token),
+            token_id: token_id.to_owned(),
+            created_at: 1,
+            expires_at: None,
+            budget_au: None,
+            budget_period: None,
+            spent_total_au: 0,
+            spent_period_au: 0,
+            period_started_at: Some(1),
+            max_rate_per_minute: None,
+            models: Vec::new(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let access = GatewayAccessControl::new(
+            true,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![
+                    token("owner", "tok_job_owner", raw_owner_token),
+                    token("other", "tok_job_other", raw_other_token),
+                ],
+            },
+            None,
+        );
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_dev_session_shim()
+            .with_access_control(access)
+            .with_session_backend(Arc::new(ArtifactGenerationSuccessBackend));
+        let app = openai_router(state.clone());
+        let body = json!({
+            "model": model.id,
+            "prompt": "a private persisted image",
+            "size": "1024x1024",
+            "steps": 9,
+            "response_format": "b64_json"
+        })
+        .to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_owner_token}"))
+                    .header("idempotency-key", "private-job-proof")
+                    .body(Body::from(body))
+                    .expect("image request"),
+            )
+            .await
+            .expect("image response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let job_id = response
+            .headers()
+            .get("x-mayhem-job-id")
+            .expect("job id")
+            .to_str()
+            .expect("ASCII job id")
+            .to_owned();
+        let receipt_count = state.receipt_count();
+
+        let authorized_get = |uri: String, raw_token: &'static str| {
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_token}"))
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+        };
+        let job_uri = format!("/v1/jobs/{job_id}");
+        let other_response = authorized_get(job_uri.clone(), raw_other_token)
+            .await
+            .expect("other job response");
+        assert_eq!(other_response.status(), StatusCode::NOT_FOUND);
+        let owner_response = authorized_get(job_uri.clone(), raw_owner_token)
+            .await
+            .expect("owner job response");
+        assert_eq!(owner_response.status(), StatusCode::OK);
+
+        let result_uri = format!("{job_uri}/result");
+        let other_result = authorized_get(result_uri.clone(), raw_other_token)
+            .await
+            .expect("other result response");
+        assert_eq!(other_result.status(), StatusCode::NOT_FOUND);
+        let owner_result = authorized_get(result_uri, raw_owner_token)
+            .await
+            .expect("owner result response");
+        assert_eq!(owner_result.status(), StatusCode::OK);
+
+        let artifact_id = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job_id, now_secs())
+            .expect("read job")
+            .expect("completed job")
+            .artifacts
+            .first()
+            .expect("stored artifact")
+            .id
+            .clone();
+        let artifact_uri = format!("{job_uri}/artifacts/{artifact_id}");
+        let other_artifact = authorized_get(artifact_uri.clone(), raw_other_token)
+            .await
+            .expect("other artifact response");
+        assert_eq!(other_artifact.status(), StatusCode::NOT_FOUND);
+        let owner_artifact = authorized_get(artifact_uri, raw_owner_token)
+            .await
+            .expect("owner artifact response");
+        assert_eq!(owner_artifact.status(), StatusCode::OK);
+        assert_eq!(
+            state.receipt_count(),
+            receipt_count,
+            "retrieval cannot rebill"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_http_image_request_cancels_and_preserves_completed_result() {
+        use tokio::io::AsyncWriteExt;
+
+        let model = image_job_test_model();
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DisconnectCompletesImageBackend {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_dev_session_shim()
+            .with_session_backend(backend);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("test gateway address");
+        let app = openai_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test gateway");
+        });
+
+        let body = json!({
+            "model": model.id,
+            "prompt": "a result that survives a disconnected client",
+            "size": "1024x1024",
+            "steps": 9,
+            "response_format": "b64_json"
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/images/generations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nIdempotency-Key: dropped-image-proof\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect test client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("send image request");
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("image backend started");
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(2), cancelled.notified())
+            .await
+            .expect("HTTP disconnect propagated to backend");
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = {
+                    let mut jobs = state.jobs.lock_recover("gateway job vault");
+                    let completed_id = jobs
+                        .list_summaries_for_owner(None, now_secs())
+                        .expect("list jobs")
+                        .into_iter()
+                        .find(|job| job.status == GatewayJobStatus::Completed)
+                        .map(|job| job.id);
+                    completed_id
+                        .and_then(|id| jobs.get(&id, now_secs()).expect("retrieve completed job"))
+                };
+                if let Some(job) = completed {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed result persisted after disconnect");
+        assert_eq!(
+            completed.endpoint_family,
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+        );
+        assert_eq!(completed.artifacts.len(), 1);
+        assert_eq!(
+            completed.artifacts[0].bytes,
+            b"completed-after-http-disconnect"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -27251,7 +31368,6 @@ mod tests {
                 quality: None,
                 receipt: None,
                 session_id: "test-session".to_owned(),
-                access_token: None,
             };
             let response = artifact_generation_response_value(&request, &run);
             assert_eq!(response["object"], json!(expected_object));
@@ -27371,6 +31487,24 @@ mod tests {
         record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
         assert!(state.reputation_events().is_empty());
         record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+        assert!(state.reputation_events().is_empty());
+
+        let received_base = now_millis_u64().saturating_add(10);
+        for offset in 0..3 {
+            state
+                .provider_table
+                .lock_recover("provider table")
+                .upsert_heartbeat(
+                    heartbeat_for_route(&model, route, received_base + offset),
+                    received_base + offset,
+                );
+            record_retryable_route_attempt(
+                &state,
+                Some(route),
+                Duration::from_millis(5),
+                &capacity,
+            );
+        }
 
         let events = state.reputation_events();
         assert_eq!(events.len(), 1);
@@ -27896,7 +32030,7 @@ mod tests {
 
         assert_eq!(
             direct_session_chat_output_byte_limit(&request, &invocation),
-            100_000 * DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET
+            100_000 * DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN
         );
         let mut output = String::new();
         append_session_text(
@@ -28203,6 +32337,10 @@ mod tests {
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: invocation.session_id.clone(),
+            billing_id: invocation.spend_voucher.body.billing_id.clone(),
+            billing_attempt: invocation.spend_voucher.body.billing_attempt,
+            billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+            billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
             seq: 1,
             final_receipt: true,
             rail: invocation.rail.clone(),
@@ -28239,10 +32377,27 @@ mod tests {
         seq: u64,
         final_receipt: bool,
     ) -> ProviderSignedReceipt {
-        let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+        let attempt_usage =
+            ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+        let usage = if invocation.spend_voucher.body.billing_prior_au_owed_cum == 0 {
+            attempt_usage
+        } else {
+            invocation
+                .spend_voucher
+                .body
+                .billing_prior_usage
+                .saturating_add(&ReceiptUsage::from_units([(
+                    USAGE_OUTPUT_TOKEN,
+                    attempt_usage.output_tokens(),
+                )]))
+        };
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: invocation.session_id.clone(),
+            billing_id: invocation.spend_voucher.body.billing_id.clone(),
+            billing_attempt: invocation.spend_voucher.body.billing_attempt,
+            billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+            billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
             seq,
             final_receipt,
             rail: invocation.rail.clone(),

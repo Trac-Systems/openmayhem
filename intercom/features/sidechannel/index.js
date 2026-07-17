@@ -3,9 +3,11 @@ import b4a from 'b4a';
 import crypto from 'crypto';
 import PeerWallet from 'trac-wallet';
 import {
+  DEFAULT_MAX_JSON_STRING_BYTES,
   boundedJsonEncoding,
   decodedJsonByteLength,
   decodedJsonWasRejected,
+  jsonShapeWithinBounds,
 } from '../bounded-json.js';
 
 const DEFAULT_MUX_RETRY_MAX = 5;
@@ -19,6 +21,12 @@ const DEFAULT_DIRECT_CONNECT_POLL_MS = 100;
 const DEFAULT_MAX_CHANNELS = 1024;
 const DEFAULT_MAX_CHANNEL_NAME_BYTES = 256;
 const DEFAULT_CHANNEL_OPEN_TIMEOUT_MS = 120_000;
+const DEFAULT_RELAY_RATE_BYTES_PER_SECOND = 256_000;
+const DEFAULT_RELAY_BURST_BYTES = 1_000_000;
+const DEFAULT_RELAY_SOURCE_RATE_BYTES_PER_SECOND = 64_000;
+const DEFAULT_RELAY_SOURCE_BURST_BYTES = 256_000;
+const DEFAULT_MAX_RELAY_SOURCES = 1024;
+const MAX_MESSAGE_ID_BYTES = 256;
 
 const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
   Number.isSafeInteger(value) && value >= min ? value : fallback
@@ -125,6 +133,11 @@ class Sidechannel extends Feature {
     this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes) && config.maxMessageBytes > 0
       ? config.maxMessageBytes
       : 1_000_000;
+    this.maxStringBytes = safeIntegerOr(
+      config.maxStringBytes,
+      Math.min(this.maxMessageBytes, DEFAULT_MAX_JSON_STRING_BYTES),
+      { min: 1 }
+    );
     this.maxChannels = safeIntegerOr(config.maxChannels, DEFAULT_MAX_CHANNELS, { min: 1 });
     this.maxChannelNameBytes = safeIntegerOr(
       config.maxChannelNameBytes,
@@ -152,7 +165,48 @@ class Sidechannel extends Feature {
     this.allowRemoteOpen = config.allowRemoteOpen !== false;
     this.autoJoinOnOpen = config.autoJoinOnOpen === true;
     this.relayEnabled = config.relayEnabled !== false;
-    this.relayTtl = Number.isSafeInteger(config.relayTtl) ? config.relayTtl : 3;
+    this.relayTtl = 1;
+    this.relayRateBytesPerSecond = safeIntegerOr(
+      config.relayRateBytesPerSecond,
+      DEFAULT_RELAY_RATE_BYTES_PER_SECOND,
+      { min: 1 }
+    );
+    this.relayBurstBytes = safeIntegerOr(
+      config.relayBurstBytes,
+      DEFAULT_RELAY_BURST_BYTES,
+      { min: 1 }
+    );
+    this.relaySourceRateBytesPerSecond = safeIntegerOr(
+      config.relaySourceRateBytesPerSecond,
+      DEFAULT_RELAY_SOURCE_RATE_BYTES_PER_SECOND,
+      { min: 1 }
+    );
+    this.relaySourceBurstBytes = safeIntegerOr(
+      config.relaySourceBurstBytes,
+      DEFAULT_RELAY_SOURCE_BURST_BYTES,
+      { min: 1 }
+    );
+    this.maxRelaySources = safeIntegerOr(
+      config.maxRelaySources,
+      DEFAULT_MAX_RELAY_SOURCES,
+      { min: 1 }
+    );
+    const now = this._now();
+    this.relayLimiter = {
+      tokens: this.relayBurstBytes,
+      lastRefill: now,
+      lastSeen: now,
+    };
+    this.relaySourceLimits = new Map();
+    this.relayCounters = {
+      messages: 0,
+      bytes: 0,
+      node_budget_drops: 0,
+      source_budget_drops: 0,
+      policy_drops: 0,
+      transitive_drops: 0,
+      unauthenticated_drops: 0,
+    };
     this.maxSeen = Number.isSafeInteger(config.maxSeen) ? config.maxSeen : 5000;
     this.seenTtlMs = Number.isSafeInteger(config.seenTtlMs) ? config.seenTtlMs : 120_000;
     this.rateBytesPerSecond = Number.isSafeInteger(config.rateBytesPerSecond)
@@ -260,6 +314,10 @@ class Sidechannel extends Feature {
     return this.maxMessageBytesByChannel.get(normalizeChannel(channel)) ?? this.maxMessageBytes;
   }
 
+  _maxStringBytes(channel) {
+    return Math.min(this.maxStringBytes, this._maxMessageBytes(channel));
+  }
+
   _getRemoteKey(connection) {
     return normalizeKeyHex(connection?.remotePublicKey) || 'unknown';
   }
@@ -268,19 +326,25 @@ class Sidechannel extends Feature {
     const cutoff = now - this.seenTtlMs;
     for (const [id, ts] of this.seen) {
       if (ts < cutoff) this.seen.delete(id);
-      else break;
     }
   }
 
   _rememberSeen(id, now) {
     if (!id) return false;
+    this._purgeSeen(now);
     if (this.seen.has(id)) return true;
     this.seen.set(id, now);
     if (this.seen.size > this.maxSeen) {
-      const oldest = this.seen.keys().next().value;
-      if (oldest) this.seen.delete(oldest);
+      let oldestId = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [candidateId, candidateAt] of this.seen) {
+        if (candidateAt < oldestAt) {
+          oldestId = candidateId;
+          oldestAt = candidateAt;
+        }
+      }
+      if (oldestId !== null) this.seen.delete(oldestId);
     }
-    this._purgeSeen(now);
     return false;
   }
 
@@ -381,6 +445,19 @@ class Sidechannel extends Feature {
 
   _relay(channel, payload, originConnection) {
     if (!this.relayEnabled) return;
+    if (!this._relayPolicyAllows(channel)) {
+      this.relayCounters.policy_drops += 1;
+      return;
+    }
+    const author = normalizeKeyHex(payload?.from);
+    if (!author || !this.verifyPayload(payload, author)) {
+      this.relayCounters.unauthenticated_drops += 1;
+      return;
+    }
+    if (this._getRemoteKey(originConnection) !== author) {
+      this.relayCounters.transitive_drops += 1;
+      return;
+    }
     const control = payload?.message?.control;
     // Never relay handshake/control messages; they are for direct neighbor authorization.
     if (control === 'auth' || control === 'welcome') return;
@@ -391,18 +468,108 @@ class Sidechannel extends Feature {
       ttl: ttl - 1,
       relayedBy: normalizeKeyHex(this.peer?.wallet?.publicKey) ?? null,
     };
+    let relayedBytes = 0;
+    try {
+      if (
+        !jsonShapeWithinBounds(
+          relayed,
+          undefined,
+          undefined,
+          this._maxStringBytes(channel)
+        )
+      ) {
+        return;
+      }
+      relayedBytes = b4a.byteLength(JSON.stringify(relayed), 'utf8');
+    } catch (_error) {
+      return;
+    }
+    if (relayedBytes > this._maxMessageBytes(channel)) return;
     for (const [connection, perConn] of this.connections.entries()) {
       if (connection === originConnection) continue;
       if (!this._remoteAuthorized(channel, connection)) continue;
       const record = perConn.get(channel);
       if (record?.message) {
+        if (!this._checkRelayBudget(author, relayedBytes)) continue;
         try {
           record.message.send(relayed);
+          this.relayCounters.messages += 1;
+          this.relayCounters.bytes += relayedBytes;
         } catch (error) {
           this._reportEventError(`relay ${channel}`, error, connection);
         }
       }
     }
+  }
+
+  _relayPolicyAllows(channel) {
+    if (this._isEntry(channel)) return false;
+    return (
+      this._powRequired(channel)
+      || this._inviteRequired(channel)
+      || this._ownerWriteOnly(channel)
+    );
+  }
+
+  _refillRelayLimiter(limiter, rateBytesPerSecond, burstBytes, now) {
+    const elapsedMs = now - limiter.lastRefill;
+    if (elapsedMs > 0) {
+      const refill = (elapsedMs / 1000) * rateBytesPerSecond;
+      limiter.tokens = Math.min(burstBytes, limiter.tokens + refill);
+      limiter.lastRefill = now;
+    }
+    limiter.lastSeen = now;
+  }
+
+  _relaySourceLimiter(author, now) {
+    let limiter = this.relaySourceLimits.get(author);
+    if (limiter) return limiter;
+    if (this.relaySourceLimits.size >= this.maxRelaySources) {
+      let oldestAuthor = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [candidate, state] of this.relaySourceLimits) {
+        if (state.lastSeen < oldestAt) {
+          oldestAuthor = candidate;
+          oldestAt = state.lastSeen;
+        }
+      }
+      if (oldestAuthor !== null) this.relaySourceLimits.delete(oldestAuthor);
+    }
+    limiter = {
+      tokens: this.relaySourceBurstBytes,
+      lastRefill: now,
+      lastSeen: now,
+    };
+    this.relaySourceLimits.set(author, limiter);
+    return limiter;
+  }
+
+  _checkRelayBudget(author, bytes) {
+    const now = this._now();
+    this._refillRelayLimiter(
+      this.relayLimiter,
+      this.relayRateBytesPerSecond,
+      this.relayBurstBytes,
+      now
+    );
+    if (bytes > this.relayLimiter.tokens) {
+      this.relayCounters.node_budget_drops += 1;
+      return false;
+    }
+    const source = this._relaySourceLimiter(author, now);
+    this._refillRelayLimiter(
+      source,
+      this.relaySourceRateBytesPerSecond,
+      this.relaySourceBurstBytes,
+      now
+    );
+    if (bytes > source.tokens) {
+      this.relayCounters.source_budget_drops += 1;
+      return false;
+    }
+    this.relayLimiter.tokens -= bytes;
+    source.tokens -= bytes;
+    return true;
   }
 
   _reportEventError(scope, error, connection = null) {
@@ -762,8 +929,8 @@ class Sidechannel extends Feature {
 
   _verifySig(payload, pubkeyHex) {
     const sigHex = payload?.sig || payload?.signature;
-    if (typeof sigHex !== 'string' || sigHex.length === 0) return false;
-    if (typeof pubkeyHex !== 'string' || pubkeyHex.length === 0) return false;
+    if (typeof sigHex !== 'string' || !/^[0-9a-fA-F]{128}$/.test(sigHex)) return false;
+    if (typeof pubkeyHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(pubkeyHex)) return false;
     let sigBuf = null;
     let pubBuf = null;
     try {
@@ -776,10 +943,39 @@ class Sidechannel extends Feature {
     return PeerWallet.verify(sigBuf, b4a.from(msg), pubBuf);
   }
 
+  _payloadStructureValid(payload, channel) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    if (payload.type !== 'sidechannel') return false;
+    if (normalizeChannel(payload.channel) !== normalizeChannel(channel)) return false;
+    if (
+      typeof payload.id !== 'string'
+      || payload.id.length === 0
+      || b4a.byteLength(payload.id, 'utf8') > MAX_MESSAGE_ID_BYTES
+    ) {
+      return false;
+    }
+    if (!Number.isSafeInteger(payload.ts)) return false;
+    if (!Number.isInteger(payload.ttl) || payload.ttl < 0 || payload.ttl > this.relayTtl) {
+      return false;
+    }
+    if (payload.relayedBy !== undefined && payload.relayedBy !== null) {
+      const relayedBy = normalizeKeyHex(payload.relayedBy);
+      if (!relayedBy || !/^[0-9a-f]{64}$/.test(relayedBy)) return false;
+    }
+    return true;
+  }
+
   verifyPayload(payload, expectedKey = payload?.from) {
     const author = normalizeKeyHex(payload?.from);
+    const origin = normalizeKeyHex(payload?.origin);
     const expected = normalizeKeyHex(expectedKey);
-    return !!author && author === expected && this._verifySig(payload, expected);
+    return (
+      !!author
+      && /^[0-9a-f]{64}$/.test(author)
+      && origin === author
+      && author === expected
+      && this._verifySig(payload, expected)
+    );
   }
 
   _registerChannel(name) {
@@ -922,7 +1118,8 @@ class Sidechannel extends Feature {
     const message = channel.addMessage({
       encoding: boundedJsonEncoding(
         this._maxMessageBytes(entry.name),
-        `Sidechannel ${entry.name} message`
+        `Sidechannel ${entry.name} message`,
+        { maxStringBytes: this._maxStringBytes(entry.name) }
       ),
       onmessage: (payload) => {
         try {
@@ -951,6 +1148,20 @@ class Sidechannel extends Feature {
             }
             return;
           }
+          if (!this._checkRate(connection, payloadBytes)) {
+            if (this.debug) {
+              console.log(`[sidechannel:${entry.name}] drop (rate limit) from ${this._getRemoteKey(connection)}`);
+            }
+            return;
+          }
+          if (!this._payloadStructureValid(payload, entry.name)) {
+            if (this.debug) {
+              console.log(
+                `[sidechannel:${entry.name}] drop (invalid envelope) from ${this._getRemoteKey(connection)}`
+              );
+            }
+            return;
+          }
           if (this.debug) {
             console.log(
               `[sidechannel:${entry.name}] recv ${payloadBytes} bytes from ${this._getRemoteKey(connection)}`
@@ -968,9 +1179,12 @@ class Sidechannel extends Feature {
             }
             return;
           }
-          if (!this._checkRate(connection, payloadBytes)) {
+          if (!this.verifyPayload(payload)) {
+            this.relayCounters.unauthenticated_drops += 1;
             if (this.debug) {
-              console.log(`[sidechannel:${entry.name}] drop (rate limit) from ${this._getRemoteKey(connection)}`);
+              console.log(
+                `[sidechannel:${entry.name}] drop (unauthenticated sender) from ${this._getRemoteKey(connection)}`
+              );
             }
             return;
           }
@@ -997,8 +1211,7 @@ class Sidechannel extends Feature {
               return;
             }
           }
-          const payloadId =
-            payload?.id ?? `${payload?.from ?? 'unknown'}:${payload?.ts ?? 0}:${payload?.channel ?? entry.name}`;
+          const payloadId = payload.id;
           const now = this._now();
           if (this._rememberSeen(payloadId, now)) {
             if (this.debug) {
@@ -1313,7 +1526,7 @@ class Sidechannel extends Feature {
     if (!channel) return false;
     const isAuthControl =
       message && typeof message === 'object' && String(message.control || '') === 'auth';
-    const allowUnauthedSend = isAuthControl;
+    const allowPreAuthSend = isAuthControl;
     if (this._ownerWriteOnly(channel) && !isAuthControl) {
       const ownerKey = this._getOwnerKey(channel);
       const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
@@ -1333,6 +1546,21 @@ class Sidechannel extends Feature {
       }
     }
     const payload = this._buildPayload(channel, message, options.invite);
+    let shapeWithinBounds = false;
+    try {
+      shapeWithinBounds = jsonShapeWithinBounds(
+        payload,
+        undefined,
+        undefined,
+        this._maxStringBytes(channel)
+      );
+    } catch (_error) {
+      shapeWithinBounds = false;
+    }
+    if (!shapeWithinBounds) {
+      console.log(`[sidechannel:${channel}] message exceeds JSON shape or string bounds.`);
+      return false;
+    }
     let payloadJson = null;
     try {
       payloadJson = JSON.stringify(payload);
@@ -1353,7 +1581,7 @@ class Sidechannel extends Feature {
     }
     this._rememberSeen(payload.id, this._now());
     for (const [connection, perConn] of this.connections.entries()) {
-      if (!allowUnauthedSend && !this._remoteAuthorized(channel, connection)) {
+      if (!allowPreAuthSend && !this._remoteAuthorized(channel, connection)) {
         if (this.debug) {
           console.log(`[sidechannel:${channel}] skip (unauthorized) ${this._getRemoteKey(connection)}`);
         }
@@ -1466,6 +1694,7 @@ class Sidechannel extends Feature {
     for (const connection of this.connections.keys()) this._dropConnection(connection);
     this.connections.clear();
     this.rateLimits.clear();
+    this.relaySourceLimits.clear();
   }
 }
 

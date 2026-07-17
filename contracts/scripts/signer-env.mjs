@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 
 export const TAP_ROLLER_SIGNER_ENV = 'MAYHEM_TAP_ROLLER_PRIVATE_KEY';
 export const TAP_DEPLOYER_SIGNER_ENV = 'MAYHEM_TAP_DEPLOYER_PRIVATE_KEY';
+export const TAP_GOVERNANCE_SIGNER_ENV = 'MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY';
 
 function normalizePrivateKey(raw, label) {
   const key = String(raw ?? '').trim();

@@ -1,11 +1,46 @@
 import inspect
 import json
+import queue
 import sys
+import threading
 
 
 model = None
 tokenizer = None
 ctx_size = 2048
+request_queue = queue.Queue()
+cancelled_requests = set()
+cancelled_requests_lock = threading.Lock()
+completed_request_id = 0
+
+
+class RequestCancelled(Exception):
+    pass
+
+
+def mark_cancelled(request_id):
+    with cancelled_requests_lock:
+        request_id = int(request_id)
+        if request_id > completed_request_id:
+            cancelled_requests.add(request_id)
+
+
+def finish_request(request_id):
+    global completed_request_id
+    with cancelled_requests_lock:
+        completed_request_id = max(completed_request_id, int(request_id))
+        cancelled_requests.difference_update(
+            request_id
+            for request_id in cancelled_requests
+            if request_id <= completed_request_id
+        )
+
+
+def check_cancelled(request_id):
+    with cancelled_requests_lock:
+        cancelled = int(request_id) in cancelled_requests
+    if cancelled:
+        raise RequestCancelled("engine request cancelled")
 
 
 def send(message):
@@ -202,6 +237,7 @@ def handle_tokenize(payload):
 
 
 def handle_generate(request_id, payload):
+    check_cancelled(request_id)
     if model is None or tokenizer is None:
         raise RuntimeError("model has not been loaded")
 
@@ -287,6 +323,7 @@ def handle_generate(request_id, payload):
         logits_processors=logits_processors,
         max_kv_size=ctx_size,
     ):
+        check_cancelled(request_id)
         segment = str(getattr(response, "text", ""))
         token = int(getattr(response, "token", -1))
         generated_attr = getattr(response, "generation_tokens", None)
@@ -319,6 +356,8 @@ def handle_generate(request_id, payload):
             finish_reason = str(final_reason)
             break
 
+    check_cancelled(request_id)
+
     return {
         "text": text,
         "usage": {
@@ -350,20 +389,50 @@ def handle(request_id, op, payload):
     raise ValueError(f"unknown MLX worker op {op!r}")
 
 
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    try:
-        request = json.loads(line)
+def read_requests():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as exc:
+            request_queue.put({"id": 0, "op": "invalid", "parse_error": str(exc)})
+            continue
         request_id = int(request.get("id", 0))
+        if str(request.get("op", "")) == "cancel":
+            payload = request.get("payload") or {}
+            mark_cancelled(int(payload.get("request_id", request_id)))
+            continue
+        request_queue.put(request)
+    request_queue.put(None)
+
+
+threading.Thread(target=read_requests, name="mayhem-mlx-control", daemon=True).start()
+
+while True:
+    request = request_queue.get()
+    if request is None:
+        break
+    request_id = int(request.get("id", 0))
+    try:
+        if "parse_error" in request:
+            raise ValueError(request["parse_error"])
         result = handle(request_id, str(request.get("op", "")), request.get("payload"))
+        check_cancelled(request_id)
         send({"id": request_id, "type": "response", "ok": True, "result": result})
     except SystemExit:
         raise
+    except RequestCancelled as exc:
+        send(
+            {
+                "id": request_id,
+                "type": "response",
+                "ok": False,
+                "cancelled": True,
+                "error": str(exc),
+            }
+        )
     except Exception as exc:
-        request_id = 0
-        try:
-            request_id = int(json.loads(line).get("id", 0))
-        except Exception:
-            pass
         send({"id": request_id, "type": "response", "ok": False, "error": str(exc)})
+    finally:
+        finish_request(request_id)

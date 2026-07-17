@@ -1,10 +1,15 @@
 // MayhemInferencePool test suite (I2-B1) - deploy MockTTAP + MayhemInferencePool on in-process
-// ganache; exercise deposit -> setRoot -> O(1) cumulative claim -> operator 15% cap -> conservation ->
+// ganache; exercise deposit -> governed root -> O(1) cumulative claim -> operator 15% cap -> conservation ->
 // non-custodial property -> all the revert guards. Exit 0 = green. No external network.
 import Ganache from 'ganache';
 import { ethers } from 'ethers';
 import { compileAll } from './compile.mjs';
 import { distribution } from './merkle.mjs';
+import {
+  signMaxEpochDeltaProposal,
+  signRescueProposal,
+  signRootProposal,
+} from './pool-governance.mjs';
 
 const CHAIN_ID = 61000;
 let passed = 0;
@@ -31,6 +36,7 @@ async function main() {
   const A = async (i) => (await S(i)).getAddress();
 
   const operator = await S(0);          // pool owner / root authority
+  const governance = ethers.Wallet.createRandom().connect(provider); // independent signer; sends no tx
   const [buyer1, buyer2, provA, provB, anyone, opTreasury] = [await A(1), await A(2), await A(3), await A(4), await A(5), await A(6)];
 
   const U = (n) => ethers.parseUnits(String(n), 18);
@@ -39,9 +45,24 @@ async function main() {
   // deploy MockTTAP + pool
   const token = await new ethers.ContractFactory(art.MockTTAP.abi, art.MockTTAP.bytecode, operator).deploy();
   await token.waitForDeployment();
-  const pool = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, operator).deploy(await token.getAddress(), await A(0), 0n);
+  const pool = await new ethers.ContractFactory(
+    art.MayhemInferencePool.abi,
+    art.MayhemInferencePool.bytecode,
+    operator
+  ).deploy(await token.getAddress(), await A(0), governance.address, 0n, 0n);
   await pool.waitForDeployment();
   const poolAddr = await pool.getAddress();
+  const postRoot = async (target, root, newEpoch, newCumulativeSpent) => {
+    const signature = await signRootProposal({
+      signer: governance,
+      pool: target,
+      merkleRoot: root,
+      newEpoch,
+      newCumulativeSpent,
+    });
+    await (await target.proposeRoot(root, newEpoch, newCumulativeSpent, signature)).wait();
+    await (await target.executeRoot()).wait();
+  };
   console.log(`MockTTAP @ ${await token.getAddress()} - MayhemInferencePool @ ${poolAddr}`);
 
   // fund buyers + approve
@@ -56,19 +77,23 @@ async function main() {
 
   // -- Epoch 1: spent 1000 -> providers 75% (A=450,B=300), operator cap 150, burn 100 -----------------
   console.log('\n2) epoch 1 - cumulative root {A:450, B:300}, spent 1000 (75/15/10)');
-  const e1 = distribution([{ account: provA, amount: U(450) }, { account: provB, amount: U(300) }]);
-  await (await pool.setRoot(e1.root, 1, U(1000))).wait();
+  const e1 = distribution([
+    { account: provA, amount: U(450) },
+    { account: provB, amount: U(300) },
+    { account: buyer2, amount: U(200) },
+  ]);
+  await postRoot(pool, e1.root, 1, U(1000));
   ok((await pool.epoch()) === 1n && (await pool.cumulativeSpent()) === U(1000), 'root posted, epoch=1, spent=1000');
 
   // non-custodial + permissionless: `anyone` submits provA's claim; funds go to provA, no operator action.
-  await (await pool.connect(await S(5)).claim(provA, U(450), e1.proofFor(provA))).wait();
+  await (await pool.connect(await S(5)).claim(1, provA, U(450), e1.proofFor(provA))).wait();
   ok((await token.balanceOf(provA)) === U(450), 'provA received 450 (claim submitted by a third party - non-custodial)');
-  await (await pool.connect(await S(4)).claim(provB, U(300), e1.proofFor(provB))).wait();
+  await (await pool.connect(await S(4)).claim(1, provB, U(300), e1.proofFor(provB))).wait();
   ok((await token.balanceOf(provB)) === U(300), 'provB received 300');
   ok((await pool.totalClaimed()) === U(750), 'totalClaimed = 750 (providers 75% of 1000)');
 
-  await expectRevert(() => pool.claim.staticCall(provA, U(450), e1.proofFor(provA)), 'nothing to claim', 're-claim same cumulative reverts');
-  await expectRevert(() => pool.claim.staticCall(provA, U(9999), e1.proofFor(provA)), 'bad proof', 'forged amount -> bad proof');
+  await expectRevert(() => pool.claim.staticCall(1, provA, U(450), e1.proofFor(provA)), 'nothing to claim', 're-claim same cumulative reverts');
+  await expectRevert(() => pool.claim.staticCall(1, provA, U(9999), e1.proofFor(provA)), 'bad proof', 'forged amount -> bad proof');
 
   // operator withdraws its 15% of spent (=150), then is capped
   await (await pool.withdrawOperator(opTreasury, U(150))).wait();
@@ -85,21 +110,33 @@ async function main() {
   await expectRevert(() => pool.burn.staticCall(), 'nothing to burn', 're-burn with nothing accrued reverts');
 
   // root-authority guards (staticCall = eth_call -> revert data returned reliably + custom errors decode)
-  await expectRevert(() => pool.setRoot.staticCall(e1.root, 1, U(1000)), 'epoch !monotonic', 'non-monotonic epoch reverts');
-  await expectRevert(() => pool.setRoot.staticCall(e1.root, 2, U(3000)), 'spent > deposited', 'spent > deposited reverts');
-  await expectRevert(async () => pool.connect(await S(1)).setRoot.staticCall(e1.root, 2, U(1200)), 'OwnableUnauthorizedAccount', 'non-owner setRoot reverts');
+  await expectRevert(() => pool.proposeRoot.staticCall(e1.root, 1, U(1000), '0x'), 'epoch !monotonic', 'non-monotonic epoch reverts');
+  await expectRevert(() => pool.proposeRoot.staticCall(e1.root, 2, U(3000), '0x'), 'spent > deposited', 'spent > deposited reverts');
+  await expectRevert(async () => pool.connect(await S(1)).proposeRoot.staticCall(e1.root, 2, U(1200), '0x'), 'OwnableUnauthorizedAccount', 'non-owner proposeRoot reverts');
+  const badGovernanceSignature = await signRootProposal({
+    signer: ethers.Wallet.createRandom(),
+    pool,
+    merkleRoot: e1.root,
+    newEpoch: 2,
+    newCumulativeSpent: U(1200),
+  });
+  await expectRevert(
+    () => pool.proposeRoot.staticCall(e1.root, 2, U(1200), badGovernanceSignature),
+    'bad governance signature',
+    'owner cannot post a root without the independent signer'
+  );
 
   // -- Epoch 2: cumulative - A=810,B=540 (providers 75% of 1800), buyer2 refund 200, op cap 270, burn 180
   console.log('\n3) epoch 2 - cumulative root {A:810, B:540, buyer2:200}, spent 1800 (75/15/10)');
-  const e2 = distribution([{ account: provA, amount: U(810) }, { account: provB, amount: U(540) }, { account: buyer2, amount: U(200) }]);
-  await (await pool.setRoot(e2.root, 2, U(1800))).wait();
+  const e2 = distribution([{ account: provA, amount: U(810) }, { account: provB, amount: U(540) }]);
+  await postRoot(pool, e2.root, 2, U(1800));
 
-  await (await pool.claim(provA, U(810), e2.proofFor(provA))).wait();
+  await (await pool.claim(2, provA, U(810), e2.proofFor(provA))).wait();
   ok((await token.balanceOf(provA)) === U(810), 'provA cumulative 810 (delta 360 paid)');
-  await (await pool.claim(provB, U(540), e2.proofFor(provB))).wait();
+  await (await pool.claim(2, provB, U(540), e2.proofFor(provB))).wait();
   ok((await token.balanceOf(provB)) === U(540), 'provB cumulative 540 (delta 240 paid)');
-  await (await pool.claim(buyer2, U(200), e2.proofFor(buyer2))).wait();
-  ok((await token.balanceOf(buyer2)) === U(200), 'buyer2 refund 200 claimed (same root, same claim path)');
+  await (await pool.claim(1, buyer2, U(200), e1.proofFor(buyer2))).wait();
+  ok((await token.balanceOf(buyer2)) === U(200), 'buyer2 can claim an older root after a later root omits it');
 
   await (await pool.withdrawOperator(opTreasury, U(120))).wait();
   ok((await token.balanceOf(opTreasury)) === U(270), 'operator cumulative 270 (15% of 1800)');
@@ -127,7 +164,11 @@ async function main() {
   console.log('\n5) C1 cap + zero-addr guard + M11 measured-delta + rescue (security remediation)');
   const ZERO = '0x0000000000000000000000000000000000000000';
   const cap = U(100);
-  const pool2 = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, operator).deploy(await token.getAddress(), await A(0), cap);
+  const pool2 = await new ethers.ContractFactory(
+    art.MayhemInferencePool.abi,
+    art.MayhemInferencePool.bytecode,
+    operator
+  ).deploy(await token.getAddress(), await A(0), governance.address, 0n, cap);
   await pool2.waitForDeployment();
   const pool2Addr = await pool2.getAddress();
   ok((await pool2.maxEpochDelta()) === cap, 'maxEpochDelta set in constructor (C1)');
@@ -138,22 +179,44 @@ async function main() {
   ok((await pool2.totalDeposited()) === U(1000), 'M11: deposit credits the MEASURED amount (1000)');
 
   const r1 = distribution([{ account: provA, amount: U(50) }]);
-  await expectRevert(() => pool2.setRoot.staticCall(r1.root, 1, U(200)), 'epoch delta > cap', 'C1: setRoot whose new spend (200) exceeds the per-epoch cap (100) reverts');
-  await (await pool2.setRoot(r1.root, 1, U(100))).wait();
-  ok((await pool2.cumulativeSpent()) === U(100), 'C1: a setRoot at exactly the cap (delta 100) is allowed');
+  await expectRevert(() => pool2.proposeRoot.staticCall(r1.root, 1, U(200), '0x'), 'epoch delta > cap', 'C1: root whose new spend (200) exceeds the per-epoch cap (100) reverts');
+  await postRoot(pool2, r1.root, 1, U(100));
+  ok((await pool2.cumulativeSpent()) === U(100), 'C1: a governed root at exactly the cap (delta 100) is allowed');
 
   const rz = distribution([{ account: ZERO, amount: U(10) }, { account: provA, amount: U(20) }]);
-  await (await pool2.setRoot(rz.root, 2, U(100))).wait(); // delta 0, within cap
-  await expectRevert(() => pool2.claim.staticCall(ZERO, U(10), rz.proofFor(ZERO)), 'bad account', 'C1: a claim to address(0) reverts (zero/self guard)');
+  await postRoot(pool2, rz.root, 2, U(100)); // delta 0, within cap
+  await expectRevert(() => pool2.claim.staticCall(2, ZERO, U(10), rz.proofFor(ZERO)), 'bad account', 'C1: a claim to address(0) reverts (zero/self guard)');
 
-  await expectRevert(async () => pool2.connect(await S(1)).setMaxEpochDelta.staticCall(U(1)), 'OwnableUnauthorizedAccount', 'setMaxEpochDelta is owner-gated');
+  await expectRevert(async () => pool2.connect(await S(1)).proposeMaxEpochDelta.staticCall(U(1), '0x'), 'OwnableUnauthorizedAccount', 'maxEpochDelta proposal is owner-gated');
+  const capSignature = await signMaxEpochDeltaProposal({
+    signer: governance,
+    pool: pool2,
+    newMaxEpochDelta: U(200),
+  });
+  await (await pool2.proposeMaxEpochDelta(U(200), capSignature)).wait();
+  await (await pool2.executeMaxEpochDelta()).wait();
+  ok((await pool2.maxEpochDelta()) === U(200), 'cap change requires cross-signature and execution');
 
   await (await token.mint(pool2Addr, U(7))).wait(); // stray transfer NOT via deposit -> non-accounted surplus
   ok((await pool2.rescuableSurplus()) === U(7), 'rescue: a stray 7 TAP transfer is rescuable surplus');
-  await expectRevert(() => pool2.rescue.staticCall(opTreasury, U(8)), 'exceeds surplus', 'rescue > surplus reverts (escrow protected)');
-  await (await pool2.rescue(opTreasury, U(7))).wait();
+  await expectRevert(() => pool2.proposeRescue.staticCall(opTreasury, U(8), '0x'), 'exceeds surplus', 'rescue > surplus reverts (escrow protected)');
+  const rescueSignature = await signRescueProposal({
+    signer: governance,
+    pool: pool2,
+    to: opTreasury,
+    amount: U(7),
+  });
+  await (await pool2.proposeRescue(opTreasury, U(7), rescueSignature)).wait();
+  await (await pool2.executeRescue()).wait();
   ok((await pool2.rescuableSurplus()) === 0n, 'rescue: surplus swept; the 1000 escrow is untouched');
   ok((await pool2.totalDeposited()) === U(1000), 'rescue never touched accounted escrow');
+
+  const dustRoot = distribution([{ account: provA, amount: U(20) }]);
+  await postRoot(pool2, dustRoot.root, 3, U(100) + 1n);
+  ok(
+    (await pool2.burnClaimable()) === U(10) + 1n,
+    'fee-split rounding remainder is deterministically assigned to burn'
+  );
 
   console.log(`\nMAYHEM TAP POOL TEST OK - ${passed} checks passed`);
   process.exit(0);

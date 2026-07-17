@@ -171,7 +171,7 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
   );
   assert.match(wrongHead.message, /head mismatch/i);
 
-  const anchored = await execute(
+  const forgedScore = await execute(
     contract,
     storage,
     'anchorReputation',
@@ -188,6 +188,25 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
     admin.publicKey,
     9
   );
+  assert.match(forgedScore.message, /does not match the contract fold/i);
+
+  const anchored = await execute(
+    contract,
+    storage,
+    'anchorReputation',
+    {
+      op: 'anchor_reputation',
+      provider: provider.publicKey,
+      epoch: 1,
+      folded_at: DAY_SECONDS,
+      events_head: second.head,
+      r_bps: 5_359,
+      raw_milli: 3_600,
+      successful_sessions: 1,
+    },
+    admin.publicKey,
+    10
+  );
   assert.deepEqual(anchored, {
     ok: true,
     op: 'anchorReputation',
@@ -199,19 +218,19 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
   const activeRep = await storage.get(`rep/${provider.publicKey}`);
   assert.deepEqual(activeRep.value, {
     provider: provider.publicKey,
-    r: 0.87,
-    r_bps: 8_700,
-    raw: 12.345,
-    raw_milli: 12_345,
+    r: 0.5359,
+    r_bps: 5_359,
+    raw: 3.6,
+    raw_milli: 3_600,
     events_head: second.head,
     epoch: 1,
     folded_at: DAY_SECONDS,
-    updated_at: makeTxKey(9),
+    updated_at: makeTxKey(10),
     probation: {
       active: true,
       since: makeTxKey(3),
       since_seconds: 0,
-      successful_sessions: 10,
+      successful_sessions: 1,
       required_successful_sessions: 50,
       required_seconds: PROBATION_SECONDS,
       caps: {
@@ -223,6 +242,21 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
     provenance_violation: false,
   });
 
+  const probationUpdate = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: DAY_SECONDS,
+      effective_at: 2 * DAY_SECONDS,
+      values: { probation_successful_sessions: 1 },
+    },
+    admin.publicKey,
+    11
+  );
+  assert.equal(probationUpdate.ok, true, probationUpdate.message);
+
   const cleared = await execute(
     contract,
     storage,
@@ -233,21 +267,22 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
       epoch: 2,
       folded_at: PROBATION_SECONDS,
       events_head: second.head,
-      r_bps: 9_000,
-      raw_milli: 20_000,
-      successful_sessions: 50,
+      r_bps: 5_267,
+      raw_milli: 2_675,
+      successful_sessions: 1,
     },
     admin.publicKey,
-    10
+    12
   );
   assert.equal(cleared.ok, true, cleared.message);
 
   const clearedRep = await storage.get(`rep/${provider.publicKey}`);
   assert.equal(clearedRep.value.probation.active, false);
-  assert.equal(clearedRep.value.probation.successful_sessions, 50);
+  assert.equal(clearedRep.value.probation.successful_sessions, 1);
+  assert.equal(clearedRep.value.probation.required_successful_sessions, 1);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
-  assert.equal(providerEntry.value.probation.successful_sessions, 50);
+  assert.equal(providerEntry.value.probation.successful_sessions, 1);
   assert.equal(providerEntry.value.probation.since_seconds, 0);
 });
 
@@ -306,7 +341,7 @@ test('MayhemContract anchors provenance violations from spot audits', async () =
       epoch: 1,
       folded_at: DAY_SECONDS,
       events_head: event.head,
-      r_bps: 0,
+      r_bps: 5_000,
       raw_milli: 0,
       successful_sessions: 0,
       provenance_violation: true,
@@ -455,8 +490,8 @@ test('MayhemContract reputation event log replays deterministically', async () =
         epoch: 1,
         folded_at: DAY_SECONDS,
         events_head: head.value.head,
-        r_bps: 4_200,
-        raw_milli: -3_000,
+        r_bps: 3_842,
+        raw_milli: -11_796,
         successful_sessions: 1,
       },
       ctx.admin.publicKey,
