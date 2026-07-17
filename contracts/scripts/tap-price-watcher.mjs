@@ -13,6 +13,9 @@ const USD_AU = 1_000_000_000_000_000_000n;
 export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 export const DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_RPC_TIMEOUT_MS = 4_000;
+export const DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_ADMIN_VERIFY_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_FAILURE_RETRY_MS = 30 * 1000;
 export const DEFAULT_TWAP_WINDOW_SECONDS = 30 * 60;
 export const DEFAULT_ESTIMATED_BLOCK_SECONDS = 12;
 export const DEFAULT_MIN_PRICE_SOURCES = 2;
@@ -755,20 +758,35 @@ export function tapRateStateMatches(rate, value) {
 
 export async function waitForTapRateState(rate, {
   rpcUrl,
-  timeoutMs = 0,
+  timeoutMs = DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+  requestTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   pollMs = 500,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+  const deadline = Date.now() + parsePositiveInt(
+    timeoutMs,
+    '--verify-timeout-ms',
+    DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+  );
   let last = null;
-  while (deadline === null || Date.now() <= deadline) {
-    last = await readContractStateValue(rpcUrl, 'tap/rate/latest', { fetchImpl });
+  let lastError = null;
+  while (Date.now() <= deadline) {
+    try {
+      last = await withTimeout(
+        readContractStateValue(rpcUrl, 'tap/rate/latest', { fetchImpl }),
+        requestTimeoutMs,
+        'tap/rate/latest state read',
+      );
+      lastError = null;
+    } catch (error) {
+      lastError = safeErrorMessage(error, 500);
+    }
     if (tapRateStateMatches(rate, last)) {
       return { verified: true, state: last };
     }
     await sleep(pollMs);
   }
-  return { verified: false, state: last };
+  return { verified: false, state: last, error: lastError };
 }
 
 export function buildAdminCommandArgs(rate, {
@@ -859,22 +877,40 @@ export async function runOnce(options = {}) {
 
   if (options.submit) {
     const spawnImpl = options.spawnImpl ?? spawnSync;
+    const submitTimeoutMs = parsePositiveInt(
+      options.submitTimeoutMs,
+      '--submit-timeout-ms',
+      DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+    );
     const child = spawnImpl(
       adminOptions.mayhemBin,
       buildAdminCommandArgs(rate, adminOptions),
-      { encoding: 'utf8' }
+      {
+        encoding: 'utf8',
+        timeout: submitTimeoutMs,
+        killSignal: 'SIGKILL',
+        maxBuffer: 1024 * 1024,
+      }
     );
     report.submitted = child.status === 0;
     report.exit_status = child.status;
+    report.submit_timed_out = child.error?.code === 'ETIMEDOUT';
     report.stdout = child.stdout?.trim() || null;
     report.stderr = child.stderr?.trim() || null;
-    if (child.status !== 0) {
+    if (report.submit_timed_out) {
+      report.ok = false;
+      report.error = `mayhem admin tap-rate-oracle timed out after ${submitTimeoutMs}ms`;
+    } else if (child.error) {
+      report.ok = false;
+      report.error = `mayhem admin tap-rate-oracle failed: ${safeErrorMessage(child.error, 500)}`;
+    } else if (child.status !== 0) {
       report.ok = false;
       report.error = `mayhem admin tap-rate-oracle exited ${child.status}`;
     } else if (adminOptions.rpcUrl && options.verify !== false && !adminOptions.sim) {
       const verification = await waitForTapRateState(rate, {
         rpcUrl: adminOptions.rpcUrl,
         timeoutMs: options.verifyTimeoutMs,
+        requestTimeoutMs: options.adminRpcTimeoutMs,
         pollMs: options.verifyPollMs,
         fetchImpl: options.fetchImpl,
       });
@@ -914,6 +950,11 @@ async function main() {
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const chainId = args['chain-id'] ?? process.env.MAYHEM_TAP_ETH_CHAIN_ID ?? (ethRpc ? DEFAULT_MAINNET_CHAIN_ID : 0);
   const intervalMs = parsePositiveInt(args['interval-ms'] ?? DEFAULT_INTERVAL_MS, '--interval-ms', DEFAULT_INTERVAL_MS);
+  const failureRetryMs = parsePositiveInt(
+    args['failure-retry-ms'] ?? DEFAULT_FAILURE_RETRY_MS,
+    '--failure-retry-ms',
+    DEFAULT_FAILURE_RETRY_MS,
+  );
   const once = boolArg(args.once, false);
   const json = boolArg(args.json, false);
   const submit = boolArg(args.submit, false);
@@ -948,6 +989,16 @@ async function main() {
     env: process.env,
     ttlMs: parsePositiveInt(args['cache-ttl-ms'] ?? DEFAULT_CACHE_TTL_MS, '--cache-ttl-ms', DEFAULT_CACHE_TTL_MS),
     timeoutMs: parsePositiveInt(args['rpc-timeout-ms'] ?? DEFAULT_RPC_TIMEOUT_MS, '--rpc-timeout-ms', DEFAULT_RPC_TIMEOUT_MS),
+    adminRpcTimeoutMs: parsePositiveInt(
+      args['admin-rpc-timeout-ms'] ?? DEFAULT_RPC_TIMEOUT_MS,
+      '--admin-rpc-timeout-ms',
+      DEFAULT_RPC_TIMEOUT_MS,
+    ),
+    submitTimeoutMs: parsePositiveInt(
+      args['submit-timeout-ms'] ?? DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+      '--submit-timeout-ms',
+      DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
+    ),
     submit,
     sim: boolArg(args.sim, false),
     mayhemBin: args['mayhem-bin'] || 'mayhem',
@@ -957,7 +1008,11 @@ async function main() {
       ? process.env[String(args['admin-wallet-password-env'])]
       : undefined,
     verify: !boolArg(args['no-verify'], false),
-    verifyTimeoutMs: parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0),
+    verifyTimeoutMs: parsePositiveInt(
+      args['verify-timeout-ms'] ?? DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+      '--verify-timeout-ms',
+      DEFAULT_ADMIN_VERIFY_TIMEOUT_MS,
+    ),
     verifyPollMs: parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500),
     requireLiveMainnetPrice: !boolArg(args['allow-price-fallback'], false),
   };
@@ -981,7 +1036,7 @@ async function main() {
     }
     if (!report.ok) process.exitCode = 2;
     if (once) break;
-    await sleep(intervalMs);
+    await sleep(report.ok ? intervalMs : failureRetryMs);
   } while (true);
 }
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS,
   DEFAULT_USDT_ADDRESS,
   buildAdminCommand,
   buildAdminCommandArgs,
@@ -18,6 +19,7 @@ import {
   runOnce,
   tapRateStateMatches,
   tapUsdAuFromReserves,
+  waitForTapRateState,
 } from '../scripts/tap-price-watcher.mjs';
 
 const TAP = '0x1111111111111111111111111111111111111111';
@@ -371,6 +373,65 @@ test('TAP rate watcher builds redacted admin commands and verifies state shape',
     ts: 3_600,
     posted_by_role: 'admin',
   }), false);
+});
+
+test('TAP rate watcher bounds admin submission and reports a killed hung child', async () => {
+  resetTapPriceCacheForTest();
+  let spawnOptions = null;
+  const submitted = await runOnce({
+    chainId: 0,
+    fallbackUsdAu: '50000000000000000',
+    submit: true,
+    sim: true,
+    spawnImpl: (_bin, _args, options) => {
+      spawnOptions = options;
+      return { status: 0, stdout: '{}', stderr: '' };
+    },
+    nowMs: () => 20_000,
+    nowSeconds: () => 200,
+  });
+  assert.equal(submitted.ok, true);
+  assert.equal(spawnOptions.timeout, DEFAULT_ADMIN_SUBMIT_TIMEOUT_MS);
+  assert.equal(spawnOptions.killSignal, 'SIGKILL');
+
+  resetTapPriceCacheForTest();
+  const timeoutError = Object.assign(new Error('spawnSync mayhem ETIMEDOUT'), {
+    code: 'ETIMEDOUT',
+  });
+  const timedOut = await runOnce({
+    chainId: 0,
+    fallbackUsdAu: '50000000000000000',
+    submit: true,
+    submitTimeoutMs: 25,
+    spawnImpl: () => ({
+      status: null,
+      signal: 'SIGKILL',
+      error: timeoutError,
+      stdout: '',
+      stderr: '',
+    }),
+    nowMs: () => 21_000,
+    nowSeconds: () => 210,
+  });
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.submit_timed_out, true);
+  assert.match(timedOut.error, /timed out after 25ms/);
+});
+
+test('TAP rate watcher bounds each verification read and the overall verification window', async () => {
+  const result = await waitForTapRateState({
+    source: 'uniswap-v2-twap-median',
+    tap_usd_au: '50000000000000000',
+    ts: 1,
+  }, {
+    rpcUrl: 'http://127.0.0.1:1/v1',
+    timeoutMs: 20,
+    requestTimeoutMs: 5,
+    pollMs: 1,
+    fetchImpl: async () => await new Promise(() => {}),
+  });
+  assert.equal(result.verified, false);
+  assert.match(result.error, /timed out/);
 });
 
 test('TAP rate watcher refuses non-live mainnet fallback unless explicitly allowed', async () => {
