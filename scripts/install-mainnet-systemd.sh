@@ -48,6 +48,7 @@ append_default() {
 }
 
 append_default MAYHEM_REPO "$repo"
+append_default MAYHEM_ASSET_DIR "$repo"
 append_default MAYHEM_PEER_RPC 'http://127.0.0.1:49223/v1'
 append_default MAYHEM_CONTRACT_RPC_URL 'http://127.0.0.1:49223/v1'
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
@@ -189,6 +190,7 @@ systemctl enable \
   mayhem-tap-deposit.service \
   mayhem-tnk-deposit.service \
   mayhem-tap-settlement.service \
+  mayhem-epoch-cadence.timer \
   mayhem-backup.timer
 
 echo "Mayhem mainnet units installed and enabled."

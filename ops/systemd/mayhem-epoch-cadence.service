@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenMayhem epoch settlement cadence
+Wants=network-online.target
+After=network-online.target mayhem-stack.service
+
+[Service]
+Type=oneshot
+User=mayhem
+Group=mayhem
+WorkingDirectory=/opt/mayhem/source
+EnvironmentFile=/opt/mayhem/.mayhem-local/secrets/GO-LIVE/mayhem-systemd.env
+ExecStart=/opt/mayhem/source/scripts/ops-epoch-cadence.sh
+NoNewPrivileges=true
+PrivateTmp=true
