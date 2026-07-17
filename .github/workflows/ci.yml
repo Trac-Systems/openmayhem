@@ -32,3 +32,68 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+  dashboard-workbench:
+    name: Dashboard workbench
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/mayhem-gateway/package-lock.json
+
+      - name: Install dashboard browser test dependencies
+        working-directory: crates/mayhem-gateway
+        run: npm ci
+
+      - name: Install headless Chromium
+        working-directory: crates/mayhem-gateway
+        run: npx playwright install --with-deps chromium
+
+      - name: Test dashboard feature
+        run: cargo test -p mayhem-gateway --features dashboard-workbench dashboard
+
+      - name: Build dashboard workbench
+        run: >-
+          cargo build -p mayhem-gateway
+          --features dashboard-workbench
+          --bin mayhem-dashboard-workbench
+
+      - name: Smoke test isolated dashboard workbench
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bind="127.0.0.1:11436"
+          log="$RUNNER_TEMP/dashboard-workbench.log"
+
+          ./target/debug/mayhem-dashboard-workbench --bind "$bind" >"$log" 2>&1 &
+          workbench_pid=$!
+
+          cleanup() {
+            status=$?
+            kill "$workbench_pid" 2>/dev/null || true
+            wait "$workbench_pid" 2>/dev/null || true
+
+            if [ "$status" -ne 0 ]; then
+              echo "::group::Dashboard workbench log"
+              cat "$log"
+              echo "::endgroup::"
+            fi
+          }
+          trap cleanup EXIT
+
+          node scripts/dashboard-workbench-smoke.mjs \
+            --base-url "http://$bind" \
+            --timeout-ms 30000
+
+          node crates/mayhem-gateway/tests/dashboard-browser-smoke.mjs \
+            --base-url "http://$bind"

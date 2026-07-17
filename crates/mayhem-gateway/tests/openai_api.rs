@@ -14,11 +14,11 @@ use mayhem_gateway::openai::{
     GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult, GatewayCanaryModelConfig,
     GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
     GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
-    GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel, GatewayRouteCandidate,
-    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
-    GatewaySessionResult, GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput,
-    ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt,
-    SamplingProfile, ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewayMarketInfo, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
+    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
+    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, SamplingProfile,
+    ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, audio_fingerprint, image_average_hash_hex, normalize_rate_map,
@@ -1357,7 +1357,7 @@ async fn models_endpoint_lists_empty_canonical_market_without_routing_or_billing
 }
 
 #[tokio::test]
-async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availability() {
+async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_availability() {
     let providers = ["91".repeat(32), "92".repeat(32)];
     let mut model = routed_test_model_with_providers(&providers);
     model.mayhem.adapter.specialities = vec![ModelSpecialityDescriptor {
@@ -1445,11 +1445,11 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
     let token_query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let user_path = format!("/mayhem/dashboard?{token_query}&speciality=reasoning_effort%3Dhigh");
-    let provider_path =
-        format!("/mayhem/dashboard/provider?{token_query}&speciality=reasoning_effort%3Dhigh");
-    let network_path =
-        format!("/mayhem/dashboard/network?{token_query}&speciality=reasoning_effort%3Dhigh");
+    let user_path = format!("/mayhem/dashboard/models?{token_query}");
+    let provider_path = format!("/mayhem/dashboard/earn/machines?{token_query}");
+    let network_path = format!("/mayhem/dashboard/network/models?{token_query}");
+    let evidence_path =
+        format!("/mayhem/dashboard/evidence?{token_query}&kind=model&id=mayhem%2Frouted-test");
     let app = openai_router(state);
 
     let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
@@ -1470,6 +1470,10 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
         "120"
     );
     assert_eq!(
+        availability["levels"]["high"]["expected_volume"]["expected_output_cost_usd_min"],
+        "$0.00000000000000012"
+    );
+    assert_eq!(
         body["data"][0]["mayhem"]["route_candidates"][1]["served_specialities"]["reasoning_effort"],
         json!(["low"])
     );
@@ -1484,8 +1488,8 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
     .await;
     assert_eq!(status, StatusCode::OK);
     let user_html = String::from_utf8(user_bytes).expect("user dashboard html");
-    assert!(user_html.contains("reasoning_effort=high"));
-    assert!(user_html.contains("2000 tokens"));
+    assert!(user_html.contains("reasoning_effort:low|high|xhigh"));
+    assert!(user_html.contains("data-evidence-url"));
 
     let (status, _, provider_bytes) = raw_request_with_headers(
         app.clone(),
@@ -1497,11 +1501,12 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
     .await;
     assert_eq!(status, StatusCode::OK);
     let provider_html = String::from_utf8(provider_bytes).expect("provider dashboard html");
-    assert!(provider_html.contains("reasoning_effort:low|high"));
-    assert!(provider_html.contains("Expected output cost"));
+    assert!(provider_html.contains("Machines and serving routes"));
+    assert!(provider_html.contains("No machine routes yet"));
+    assert!(!provider_html.contains("mayhem/routed-test"));
 
     let (status, _, network_bytes) = raw_request_with_headers(
-        app,
+        app.clone(),
         Method::GET,
         &network_path,
         None,
@@ -1510,12 +1515,29 @@ async fn models_endpoint_exposes_measured_speciality_cost_and_fresh_level_availa
     .await;
     assert_eq!(status, StatusCode::OK);
     let network_html = String::from_utf8(network_bytes).expect("network dashboard html");
-    assert!(network_html.contains("reasoning_effort=high"));
-    assert!(network_html.contains("1 live"));
-    assert!(network_html.contains("2000 tokens"));
-    assert!(network_html.contains("Expected output cost"));
-    assert!(network_html.contains("$0.00000000000000012"));
-    assert!(network_html.contains("reasoning_effort:low|high"));
+    assert!(network_html.contains("reasoning_effort:low|high|xhigh"));
+    assert!(network_html.contains("data-evidence-url"));
+
+    let (status, _, evidence_bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &evidence_path,
+        None,
+        &[("host", "127.0.0.1:11435"), ("accept", "application/json")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let evidence: Value = serde_json::from_slice(&evidence_bytes).expect("model evidence json");
+    assert_eq!(
+        evidence["raw"]["catalog_model"]["mayhem"]["speciality_calibrations"]["nvfp4"]
+            ["reasoning_effort"]["high"]["output_tokens_min"],
+        2_000
+    );
+    assert_eq!(
+        evidence["raw"]["catalog_model"]["mayhem"]["route_candidates"][0]["served_specialities"]
+            ["reasoning_effort"],
+        json!(["low", "high"])
+    );
     assert_no_external_urls(&user_html);
     assert_no_external_urls(&provider_html);
     assert_no_external_urls(&network_html);
@@ -5015,7 +5037,10 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("set-cookie").is_some());
     let body = String::from_utf8(bytes).expect("dashboard html");
-    assert!(body.contains("payment and routing evidence synced from Trac"));
+    assert!(body.contains(r#"class="app-shell""#));
+    assert!(body.contains(r#"href="/mayhem/dashboard/models""#));
+    assert!(body.contains(r#"href="/mayhem/dashboard/network""#));
+    assert!(body.contains("Browser session"));
     assert_no_external_urls(&body);
 
     let cookie = headers
@@ -5029,6 +5054,30 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
         "/mayhem/dashboard",
         None,
         &[("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let slash_path = format!("/mayhem/dashboard/{query}");
+    let (status, slash_headers, _) = raw_request(app.clone(), Method::GET, &slash_path, None).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        slash_headers
+            .get("location")
+            .and_then(|value| value.to_str().ok()),
+        Some("/mayhem/dashboard")
+    );
+    let slash_cookie = slash_headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("trailing-slash bootstrap sets a browser session cookie")
+        .to_owned();
+    let (status, _, _) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        "/mayhem/dashboard",
+        None,
+        &[("cookie", &slash_cookie)],
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -5056,13 +5105,12 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("dashboard html");
     for expected in [
-        "@font-face",
-        "/mayhem/dashboard/assets/exo-latin.woff2",
-        "--surface-card",
-        "class=\"wordmark\"",
-        "class=\"status-dot\"",
-        "class=\"copy-chip\"",
-        "class=\"count-chip\"",
+        r#"href="/mayhem/dashboard/assets/app.css""#,
+        r#"src="/mayhem/dashboard/assets/app.js""#,
+        r#"class="app-shell""#,
+        r#"class="app-brand""#,
+        r#"class="state-indicator"#,
+        "data-session-status",
     ] {
         assert!(body.contains(expected), "missing {expected}");
     }
@@ -5074,8 +5122,35 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
         .and_then(|value| value.to_str().ok())
         .expect("dashboard session cookie")
         .to_owned();
+    let (status, css_headers, css_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        "/mayhem/dashboard/assets/app.css",
+        None,
+        &[("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        css_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    let css = String::from_utf8(css_bytes).expect("dashboard CSS");
+    for expected in [
+        "@font-face",
+        "/mayhem/dashboard/assets/exo-latin.woff2",
+        "--app-panel",
+        ".app-shell",
+        "@media(max-width:780px)",
+    ] {
+        assert!(css.contains(expected), "missing {expected}");
+    }
+    assert_no_external_urls(&css);
+
     let (status, headers, bytes) = raw_request_with_headers(
-        app,
+        app.clone(),
         Method::GET,
         "/mayhem/dashboard/assets/exo-latin.woff2",
         None,
@@ -5090,52 +5165,6 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
         Some("font/woff2")
     );
     assert!(bytes.len() > 10_000);
-}
-
-#[tokio::test]
-async fn dashboard_price_chart_follow_list_persists_in_cookie() {
-    let state = test_gateway_state_from_models(vec![routed_test_model()]);
-    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
-    let dashboard_path = dashboard_url
-        .strip_prefix("http://127.0.0.1:11435")
-        .expect("dashboard url is rooted at gateway");
-    let pinned_path = format!("{dashboard_path}&pin=mayhem%2Frouted-test");
-    let app = openai_router(state);
-
-    let (status, headers, bytes) = raw_request(app.clone(), Method::GET, &pinned_path, None).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8(bytes).expect("dashboard html");
-    assert!(body.contains("price-chart-svg"));
-    assert!(body.contains("Following"));
-    let cookies = headers
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect::<Vec<_>>();
-    assert!(
-        cookies
-            .iter()
-            .any(|cookie| cookie.contains("mayhem_dashboard_user_pins=mayhem%2Frouted-test")),
-        "pin cookie missing from {cookies:?}"
-    );
-    let cookie_header = cookies
-        .iter()
-        .filter_map(|cookie| cookie.split(';').next())
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let (status, _, bytes) = raw_request_with_headers(
-        app,
-        Method::GET,
-        dashboard_path,
-        None,
-        &[("cookie", &cookie_header)],
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8(bytes).expect("dashboard html");
-    assert!(body.contains("Following"));
-    assert_no_external_urls(&body);
 }
 
 #[tokio::test]
@@ -5160,6 +5189,11 @@ async fn user_dashboard_renders_live_gateway_data() {
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
         .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard")
+        .expect("dashboard query");
+    let connect_path = format!("/mayhem/dashboard/connect{query}");
+    let models_path = format!("/mayhem/dashboard/models{query}");
     let app = openai_router(state);
     let model = first_model_id().await;
     let request = json!({
@@ -5171,7 +5205,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert_eq!(status, StatusCode::OK);
 
     let (status, _, bytes) = raw_request_with_headers(
-        app,
+        app.clone(),
         Method::GET,
         dashboard_path,
         None,
@@ -5180,27 +5214,46 @@ async fn user_dashboard_renders_live_gateway_data() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("dashboard html");
-    assert!(body.contains("User dashboard"));
+    assert!(body.contains(r#"class="app-shell""#));
+    assert!(body.contains("Ledger balance"));
     assert!(body.contains("$1.00"));
-    assert!(body.contains("TAP credit · $0.123456/TAP · uniswap-v2 · 12s old"));
-    assert!(body.contains("http://127.0.0.1:11435/v1"));
-    assert!(body.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
-    assert!(body.contains("Sessions"));
-    assert!(body.contains("Models"));
-    assert!(body.contains("Spend"));
-    assert!(body.contains("price-chart-svg"));
-    assert!(body.contains("Ctx bucket"));
-    assert!(body.contains("Timeframe"));
-    assert!(body.contains("Only Tier 3 keeps prompts private"));
-    assert!(body.contains("Tier 4 can still read prompts"));
-    assert!(body.contains("not a privacy ladder"));
-    assert!(body.contains(&model));
+    assert!(body.contains("Final receipts"));
+    assert!(body.contains("Recent activity"));
     assert!(!body.contains("1,240.00 TAP"));
     assert_no_external_urls(&body);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &connect_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let connect = String::from_utf8(bytes).expect("connect dashboard html");
+    assert!(connect.contains("Connection details"));
+    assert!(connect.contains("http://127.0.0.1:11435/v1"));
+    assert!(connect.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
+    assert_no_external_urls(&connect);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &models_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let models = String::from_utf8(bytes).expect("models dashboard html");
+    assert!(models.contains("Model catalog"));
+    assert!(models.contains(&model));
+    assert_no_external_urls(&models);
 }
 
 #[tokio::test]
-async fn user_dashboard_shows_model_worker_route_counts() {
+async fn models_dashboard_shows_canonical_route_count() {
     let providers = vec!["41".repeat(32), "42".repeat(32), "43".repeat(32)];
     let mut model = routed_test_model_with_providers(&providers);
     model.mayhem.providers_online = 2;
@@ -5209,20 +5262,103 @@ async fn user_dashboard_shows_model_worker_route_counts() {
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
         .expect("dashboard url is rooted at gateway");
+    let models_path = dashboard_path.replacen("/mayhem/dashboard?", "/mayhem/dashboard/models?", 1);
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
         app,
         Method::GET,
-        dashboard_path,
+        &models_path,
         None,
         &[("host", "127.0.0.1:11435")],
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8(bytes).expect("user dashboard html");
+    let body = String::from_utf8(bytes).expect("models dashboard html");
+    assert!(body.contains("Model catalog"));
     assert!(body.contains("mayhem/routed-test"));
-    assert!(body.contains("3 worker routes"));
+    assert!(body.contains("3 routes accepting work; 3 fresh"));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
+async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
+    let provider = "ab".repeat(32);
+    let seed = routed_test_model_with_providers(std::slice::from_ref(&provider));
+    let models = (0..82)
+        .map(|index| {
+            let mut model = seed.clone();
+            model.id = format!("mayhem/page-{index:03}");
+            model.mayhem.markets.clear();
+            model
+        })
+        .collect::<Vec<_>>();
+    let state = test_gateway_state_from_models(models);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let first_path = dashboard_url
+        .replacen("/mayhem/dashboard?", "/mayhem/dashboard/models?", 1)
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("models dashboard url is rooted at gateway")
+        .to_owned();
+    let second_path = format!("{first_path}&page=4");
+    let invalid_path = format!("{first_path}&page=not-a-page");
+    let out_of_range_path = format!("{first_path}&page=999");
+    let app = openai_router(state);
+
+    let (first_status, _, first_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &first_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    let first = String::from_utf8(first_bytes).expect("first models page html");
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert!(first.contains("mayhem/page-000"), "{first}");
+    assert!(!first.contains("mayhem/page-080"));
+    assert!(first.contains("Showing rows 1&ndash;25 of 82 catalog models. Page 1 of 4."));
+    assert!(first.contains(r#"rel="next" href="/mayhem/dashboard/models?page=2""#));
+
+    let (status, _, second_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &second_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = String::from_utf8(second_bytes).expect("second models page html");
+    assert!(!second.contains("mayhem/page-000"));
+    assert!(second.contains("mayhem/page-080"));
+    assert!(second.contains("mayhem/page-081"));
+    assert!(second.contains("Showing rows 76&ndash;82 of 82 catalog models. Page 4 of 4."));
+    assert!(second.contains(r#"rel="prev" href="/mayhem/dashboard/models?page=3""#));
+
+    let (_, _, invalid_bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &invalid_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    let invalid = String::from_utf8(invalid_bytes).expect("invalid models page html");
+    assert!(invalid.contains("mayhem/page-000"));
+    assert!(invalid.contains("Page 1 of 4."));
+
+    let (_, _, clamped_bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &out_of_range_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    let clamped = String::from_utf8(clamped_bytes).expect("clamped models page html");
+    assert!(clamped.contains("mayhem/page-081"));
+    assert!(clamped.contains("Page 4 of 4."));
 }
 
 #[tokio::test]
@@ -5233,6 +5369,7 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     )])
     .with_provider_earnings(vec![json!({
         "provider": provider,
+        "rail": "tap",
         "denom": "au_usd",
         "total_au": "2500000000000000000",
         "held_au": "500000000000000000",
@@ -5243,6 +5380,8 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
         "holdbacks": [{"epoch": 7, "au": "500000000000000000"}],
         "updated_epoch": 9_u64
     })])
+    .with_local_provider_id(provider.clone())
+    .with_receipt_rail("tap")
     .with_session_backend(Arc::new(TestDirectSessionBackend));
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -5251,7 +5390,9 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     let query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={}", provider);
+    let earn_path = format!("/mayhem/dashboard/earn?{query}");
+    let earnings_path = format!("/mayhem/dashboard/earn/earnings?{query}");
+    let activity_path = format!("/mayhem/dashboard/activity?{query}");
     let app = openai_router(state.clone());
     let request = json!({
         "model": "mayhem/routed-test",
@@ -5264,38 +5405,60 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert_eq!(state.receipts()[0].receipt.body.provider, provider);
 
     let (status, _, bytes) = raw_request_with_headers(
-        app,
+        app.clone(),
         Method::GET,
-        &provider_path,
+        &earn_path,
         None,
         &[("host", "127.0.0.1:11435")],
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8(bytes).expect("provider dashboard html");
-    assert!(body.contains("Provider dashboard"));
-    assert!(body.contains("matches mayhem earnings"));
-    assert!(body.contains("$2.50"));
+    let body = String::from_utf8(bytes).expect("earn dashboard html");
+    assert!(body.contains("Provider operations"));
+    assert!(body.contains("Provider identity:"));
+    assert!(!body.contains("Configured gateway identity:"));
+    assert!(body.contains("Settlement snapshot"));
     assert!(body.contains("$1.75"));
-    assert!(body.contains("$0.25"));
-    assert!(body.contains("mayhem/routed-test"));
-    assert!(body.contains("Enclaves"));
-    assert!(body.contains("Live sessions"));
-    assert!(body.contains("Earnings"));
-    assert!(body.contains("Reputation / Holdback"));
-    assert!(body.contains("Hardware / Health"));
-    assert!(body.contains("Workers"));
-    assert!(body.contains("Markets"));
-    assert!(body.contains("price-chart-svg"));
-    assert!(body.contains("Ctx bucket"));
-    assert!(body.contains("mayhem earnings --provider"));
-    assert!(body.contains("mayhem withdraw --claim-proof"));
-    assert!(!body.contains("ledger earnings not loaded"));
     assert_no_external_urls(&body);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &activity_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let activity = String::from_utf8(bytes).expect("activity dashboard html");
+    assert!(activity.contains("Session activity"));
+    assert!(activity.contains("mayhem/routed-test"));
+    assert!(activity.contains("Final receipt"));
+    assert_no_external_urls(&activity);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &earnings_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let earnings = String::from_utf8(bytes).expect("earnings dashboard html");
+    assert!(earnings.contains("Earnings records"));
+    assert!(earnings.contains("$2.50"));
+    assert!(earnings.contains("$0.50"));
+    assert!(earnings.contains("$1.75"));
+    assert!(earnings.contains("$0.25"));
+    assert!(earnings.contains("Ledger epoch"));
+    assert!(earnings.contains("<td>9</td>"));
+    assert!(earnings.contains("data-evidence-url"));
+    assert_no_external_urls(&earnings);
 }
 
 #[tokio::test]
-async fn provider_dashboard_counts_multi_enclave_workers_and_markets() {
+async fn network_provider_dashboard_counts_multi_enclave_routes() {
     let provider = "58".repeat(32);
     let mut chat = routed_test_model_with_providers(std::slice::from_ref(&provider));
     chat.id = "mayhem/chat-small".to_owned();
@@ -5316,7 +5479,7 @@ async fn provider_dashboard_counts_multi_enclave_workers_and_markets() {
     let query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let provider_path = format!("/mayhem/dashboard/network/providers?{query}");
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
@@ -5328,11 +5491,14 @@ async fn provider_dashboard_counts_multi_enclave_workers_and_markets() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8(bytes).expect("provider dashboard html");
-    assert!(body.contains(r#"<span class="label">Workers</span><p class="value mono">2</p>"#));
-    assert!(body.contains(r#"<span class="label">Markets</span><p class="value mono">2</p>"#));
+    let body = String::from_utf8(bytes).expect("network providers dashboard html");
+    assert!(body.contains(r#"id="provider-table""#));
+    assert!(body.contains(r#"id="provider-count">2 shown rows"#));
     assert!(body.contains("mayhem/chat-small"));
     assert!(body.contains("mayhem/embed-small"));
+    assert!(body.contains(&"11".repeat(32)));
+    assert!(body.contains(&"22".repeat(32)));
+    assert_no_external_urls(&body);
 }
 
 #[tokio::test]
@@ -5355,12 +5521,13 @@ async fn provider_dashboard_renders_local_load_progress() {
             "position": 42_u64,
             "total": 100_u64,
             "percent": 42_u64,
-            "updated_at_ms": 1_782_950_400_000_u64
+            "updated_at_ms": current_test_millis()
         }))
         .expect("progress json"),
     )
     .expect("write progress");
     let state = test_gateway_state_from_models(vec![model])
+        .with_local_provider_id(provider.clone())
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -5369,7 +5536,7 @@ async fn provider_dashboard_renders_local_load_progress() {
     let query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let provider_path = format!("/mayhem/dashboard/earn/machines?{query}");
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
@@ -5382,9 +5549,10 @@ async fn provider_dashboard_renders_local_load_progress() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("provider dashboard html");
-    assert!(body.contains("Loading"));
+    assert!(body.contains("Preparing model"));
+    assert!(body.contains("gguf-q4_k_m cached artifact"));
     assert!(body.contains("verify 42%"));
-    assert!(body.contains("style=\"--w:42%\""));
+    assert!(body.contains(r#"progress max="100" value="42" aria-label="verify progress""#));
     assert_no_external_urls(&body);
 }
 
@@ -5414,6 +5582,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     )
     .expect("write progress");
     let state = test_gateway_state_from_models(Vec::new())
+        .with_local_provider_id(provider.clone())
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -5422,7 +5591,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     let query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let provider_path = format!("/mayhem/dashboard/earn/machines?{query}");
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
@@ -5435,11 +5604,11 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("provider dashboard html");
-    assert!(body.contains("mayhem/loading-test"));
-    assert!(body.contains("pending"));
+    assert!(body.contains("Preparing a model"));
+    assert!(body.contains("gguf-q4_k_m artifact"));
     assert!(body.contains("download 70%"));
-    assert!(body.contains("Loading"));
-    assert!(!body.contains("No provider routes loaded"));
+    assert!(body.contains(r#"progress max="100" value="70" aria-label="download progress""#));
+    assert!(body.contains("No machine routes yet"));
     assert_no_external_urls(&body);
 }
 
@@ -5469,6 +5638,7 @@ async fn provider_dashboard_hides_stale_progress_before_route_exists() {
     )
     .expect("write progress");
     let state = test_gateway_state_from_models(Vec::new())
+        .with_local_provider_id(provider.clone())
         .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
@@ -5477,7 +5647,7 @@ async fn provider_dashboard_hides_stale_progress_before_route_exists() {
     let query = dashboard_path
         .strip_prefix("/mayhem/dashboard?")
         .expect("dashboard token query");
-    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let provider_path = format!("/mayhem/dashboard/earn?{query}");
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
@@ -5491,7 +5661,13 @@ async fn provider_dashboard_hides_stale_progress_before_route_exists() {
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("provider dashboard html");
     assert!(!body.contains("mayhem/stale-loading-test"));
-    assert!(body.contains("No provider routes loaded"));
+    assert!(!body.contains("download 70%"));
+    assert!(!body.contains("<progress"));
+    assert!(body.contains("Setup incomplete"));
+    assert!(
+        body.contains("No catalog route matches the provider identity configured on this gateway.")
+    );
+    assert!(body.contains("No serving routes yet"));
     assert_no_external_urls(&body);
 }
 
@@ -5502,68 +5678,6 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     let mut model = routed_test_model_with_providers(&[provider_a.clone(), provider_b.clone()]);
     model.mayhem.providers_online = 2;
     model.mayhem.rooms = 2;
-    model.mayhem.price_ref_au.derivation = Some(json!({
-        "type": "price_derivation",
-        "schema_version": 1,
-        "epoch": 12,
-        "enclave_id": model.mayhem.route_candidates[0].enclave_id,
-        "model_id": model.id,
-        "denom": "au_usd",
-        "price_ver": 7,
-        "price_source": "market_float",
-        "usage": {
-            "usage_root": "ab".repeat(32),
-            "active_demand_au": "2500000000000000000",
-            "session_count": 5u64
-        },
-        "controller": {
-            "source": "market_float",
-            "active_supply": 2u64,
-            "utilization_bps": 8_750u64,
-            "ema_utilization_bps": 8_320u64,
-            "multiplier_bps": 10_550u64,
-            "frozen": false,
-            "frozen_reason": null,
-            "constants": {
-                "target_utilization_bps": 8_500u64,
-                "max_step_bps": 1_000u64
-            }
-        },
-        "seed_price": { "ver": 1, "rate_map": [], "per_req_au": "0", "min_session_au": "0" },
-        "result_price": { "ver": 7, "rate_map": [], "per_req_au": "0", "min_session_au": "0" },
-        "derivation_hash": "cd".repeat(32),
-        "price_root": "ef".repeat(32)
-    }));
-    model.mayhem.route_candidates[0].accepted_rails = vec!["fiat".to_owned(), "tap".to_owned()];
-    model.mayhem.route_candidates[0].caps = json!({
-        "engine": "vllm",
-        "tools": true,
-        "json": true,
-        "ctx": 16384
-    });
-    model.mayhem.route_candidates[0].local_run = Some(GatewayLocalRunBadge {
-        marker: "◐".to_owned(),
-        status: "runs_reduced".to_owned(),
-        label: "runs reduced".to_owned(),
-        reason: "ctx auto-fallback matched provider load gate".to_owned(),
-        requested_ctx: 65_536,
-        served_ctx: 16_384,
-        estimated_tok_s: Some("42.5".to_owned()),
-        memory_required_human: "914.00 MiB".to_owned(),
-        memory_budget_human: "1.00 GiB".to_owned(),
-        download_human: "2.52 GiB".to_owned(),
-        eta: "measured after the first download chunk".to_owned(),
-    });
-    model.mayhem.route_candidates[1].accepted_rails = vec!["tnk".to_owned()];
-    model.mayhem.route_candidates[1].att_tier = 2;
-    model.mayhem.route_candidates[1].reputation_bps = 8_750;
-    model.mayhem.route_candidates[1].caps = json!({
-        "engine": "llama.cpp",
-        "tools": false,
-        "json": true,
-        "ctx": 4096
-    });
-
     let mut unavailable = model.clone();
     unavailable.id = "mayhem/unavailable-test".to_owned();
     unavailable.mayhem.source = "catalog".to_owned();
@@ -5588,10 +5702,20 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
         .strip_prefix("http://127.0.0.1:11435")
         .expect("network dashboard url is rooted at gateway")
         .to_owned();
+    let network_models_path = network_path.replacen(
+        "/mayhem/dashboard/network?",
+        "/mayhem/dashboard/network/models?",
+        1,
+    );
+    let network_providers_path = network_path.replacen(
+        "/mayhem/dashboard/network?",
+        "/mayhem/dashboard/network/providers?",
+        1,
+    );
     let app = openai_router(state);
 
     let (status, _, bytes) = raw_request_with_headers(
-        app,
+        app.clone(),
         Method::GET,
         &network_path,
         None,
@@ -5600,40 +5724,50 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("network dashboard html");
-    assert!(body.contains("Network explorer"));
-    assert!(body.contains("mayhem/routed-test"));
+    assert!(body.contains("Network health"));
+    assert!(body.contains("Catalog models"));
+    assert!(body.contains("Providers"));
+    assert!(body.contains("Fresh routes"));
+    assert!(body.contains("Supply exceptions"));
     assert!(body.contains("mayhem/unavailable-test"));
-    assert!(body.contains("price-chart-svg"));
-    assert!(body.contains("Timeframe"));
-    assert!(body.contains("vllm"));
-    assert!(body.contains("llama.cpp"));
-    assert!(body.contains("fiat, tap"));
-    assert!(body.contains("tnk"));
-    assert!(body.contains("Online"));
-    assert!(body.contains("Joined"));
-    assert!(body.contains("Unavailable"));
-    assert!(body.contains("sat 42%"));
-    assert!(body.contains("slots 2/4"));
-    assert!(body.contains("76.5 tok/s"));
-    assert!(body.contains("local ◐ runs reduced"));
-    assert!(body.contains("ctx 16384/65536"));
-    assert!(body.contains("42.5 tok/s est"));
-    assert!(body.contains("download 2.52 GiB"));
-    assert!(body.contains("ETA measured after the first download chunk"));
-    assert!(body.contains("T2"));
-    assert!(body.contains("rep 87.50%"));
-    assert!(body.contains("price = f(seed v1, U 87.50%, demand $2.50, 5 sessions, supply 2)"));
-    assert!(body.contains("epoch 12"));
-    assert!(body.contains("root efefefefe..."));
-    assert!(body.contains("leaf cdcdcdcdc..."));
-    assert!(body.contains("no canonical provider route"));
-    assert!(body.contains("ctx 16384"));
-    assert!(body.contains("ctx 4096"));
-    assert!(!body.contains(">vision<"));
-    assert!(!body.contains("1,240"));
-    assert!(!body.contains("42 tok/s"));
-    assert!(!body.contains("mx/s/session"));
     assert_no_external_urls(&body);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &network_models_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let models = String::from_utf8(bytes).expect("network models dashboard html");
+    assert!(models.contains("Network models"));
+    assert!(models.contains("mayhem/routed-test"));
+    assert!(models.contains("mayhem/unavailable-test"));
+    assert!(models.contains("Capacity advertised"));
+    assert!(models.contains("No provider route"));
+    assert_no_external_urls(&models);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &network_providers_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let providers = String::from_utf8(bytes).expect("network providers dashboard html");
+    assert!(providers.contains(r#"id="provider-table""#));
+    assert!(providers.contains(r#"id="provider-count">2 shown rows"#));
+    assert!(providers.contains(&provider_a));
+    assert!(providers.contains(&provider_b));
+    assert!(providers.contains("Capacity advertised"));
+    assert!(providers.contains("2 / 4 active · 1 free"));
+    assert!(providers.contains("321ms · 76.5 tok/s"));
+    assert!(providers.contains("data-evidence-url"));
+    assert_no_external_urls(&providers);
 }
 
 #[test]

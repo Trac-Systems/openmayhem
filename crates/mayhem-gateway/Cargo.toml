@@ -5,9 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+dashboard-workbench = []
+
 [[bin]]
 name = "mayhem-gateway"
 path = "src/main.rs"
+
+[[bin]]
+name = "mayhem-dashboard-workbench"
+path = "src/bin/mayhem-dashboard-workbench.rs"
+required-features = ["dashboard-workbench"]
 
 [lib]
 path = "src/lib.rs"

@@ -99,6 +99,23 @@ use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
 
+mod dashboard_ui;
+use dashboard_ui::{DASHBOARD_APP_CSS, DASHBOARD_APP_JS};
+
+mod dashboard_brand_assets;
+use dashboard_brand_assets::dashboard_brand_asset;
+
+mod dashboard_pages;
+use dashboard_pages::{
+    dashboard_evidence_payload, render_dashboard_evidence_page, render_dashboard_product_page,
+    DashboardProductPage,
+};
+
+#[cfg(feature = "dashboard-workbench")]
+mod dashboard_workbench;
+#[cfg(feature = "dashboard-workbench")]
+pub use dashboard_workbench::dashboard_workbench_router;
+
 trait RecoverMutex<T> {
     fn lock_recover(&self, label: &str) -> MutexGuard<'_, T>;
 }
@@ -165,6 +182,7 @@ const GATEWAY_MEDIA_SCHEMA_MAX_ITEMS: u32 = 1_024;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS: u64 = 1_000_000_000_000;
 const DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS: usize = 1_024;
+const DEFAULT_GATEWAY_MAX_STORED_RECEIPTS: usize = 4_096;
 const DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES: usize = 4_096;
 const DEFAULT_GATEWAY_MAX_STORED_JOBS: usize = 64;
 const DEFAULT_GATEWAY_MAX_STORED_JOB_BYTES: usize = 512 * 1024 * 1024;
@@ -183,30 +201,14 @@ const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
-const DASHBOARD_USER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_user_pins";
-const DASHBOARD_PROVIDER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_provider_pins";
-const DASHBOARD_NETWORK_PINS_COOKIE_NAME: &str = "mayhem_dashboard_network_pins";
-const DASHBOARD_PIN_COOKIE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS: u64 = 5 * 60 * 1000;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
-const DASHBOARD_CSS: &str = r#"
-@font-face{font-family:Exo;src:url('/mayhem/dashboard/assets/exo-latin.woff2') format('woff2');font-style:normal;font-weight:400 700;font-display:swap}
-:root{color-scheme:dark;--bg:rgb(11,11,12);--surface:rgb(22,22,26);--surface-card:rgb(24,24,27);--surface-raised:rgb(42,42,46);--border:rgb(42,42,46);--border-strong:rgb(41,41,41);--text-primary:rgb(229,231,235);--text-inverse:rgb(255,255,255);--text-muted:rgb(136,138,140);--accent-primary:rgb(197,68,89);--accent-primary-light:rgb(214,120,102);--accent-secondary:rgb(66,187,147);--radius-sm:6px;--radius-md:8px;--radius-pill:999px;--space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:20px;--space-6:24px}
-*{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
-"#;
-const DASHBOARD_USER_CSS: &str = r#"
-.update-banner{border:1px solid var(--accent-secondary);border-radius:var(--radius-md);background:rgba(66,187,147,.1);padding:14px 16px;margin:0 0 24px}.update-banner.required{border-color:var(--accent-primary);background:rgba(197,68,89,.12)}.update-banner .label{color:var(--text-primary)}.update-banner p{margin:5px 0 0;color:var(--text-primary);overflow-wrap:anywhere}.update-banner .mono{color:var(--text-muted)}
-.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid>.card{overflow-x:auto}.wide-grid.network .card{overflow-x:auto}.table{width:100%;min-width:560px;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table{min-width:0;table-layout:fixed;font-size:12px}.table th,.table td{padding:10px 5px}.table th:nth-child(3),.table td:nth-child(3){display:none}.table td:last-child,.table th:last-child{text-align:left}.overview-grid{gap:12px}}
-"#;
-const DASHBOARD_CHART_CSS: &str = r#"
-.capability-controls{display:grid;gap:8px;margin:0 0 24px;padding:14px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.capability-controls .segment{text-decoration:none}.capability-band{margin:0 0 24px}.section-heading{margin:0 0 12px}.section-heading h2{margin:3px 0 0;font-size:22px}.capability-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.capability-card{display:grid;align-content:start;min-height:220px}.capability-card .card-header h2{font-size:18px}.capability-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0 8px}.capability-metrics p{margin:4px 0 0;overflow-wrap:anywhere}.wide-grid.network{grid-template-columns:1fr}.wide-grid.network .table{min-width:900px;table-layout:auto}.wide-grid.network .table th,.wide-grid.network .table td{overflow-wrap:normal;word-break:normal}.wide-grid.network .table td:nth-child(4){min-width:260px}@media(max-width:900px){.capability-grid{grid-template-columns:1fr}.capability-metrics{grid-template-columns:1fr}}@media(max-width:640px){.wide-grid.network .table{min-width:900px;font-size:12px}.wide-grid.network .table th:nth-child(3),.wide-grid.network .table td:nth-child(3){display:table-cell}}
-.price-chart-grid{display:grid;grid-template-columns:1fr;gap:24px;margin:0 0 24px}.price-chart-card .card-header{align-items:flex-start}.price-chart-title{min-width:0}.price-chart-title h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.price-chart-toolbar{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin:0 0 14px}.price-chart-control{display:grid;gap:6px}.price-chart-control .segmented{gap:6px}.price-chart-control .segment{text-decoration:none}.price-chart-shell{border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.3),rgba(16,16,19,.42));overflow:hidden}.price-chart-svg{display:block;width:100%;height:auto}.price-grid-line{stroke:rgba(136,138,140,.16);stroke-width:1}.price-axis{fill:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}.price-step{fill:none;stroke:var(--accent-primary);stroke-width:2.4;stroke-linejoin:round;stroke-linecap:round}.price-overlay{fill:none;stroke:var(--accent-secondary);stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round;opacity:.65}.price-volume{fill:rgba(136,138,140,.36)}.price-candle .wick{stroke:var(--text-primary);stroke-width:1.4}.price-candle .body{stroke:transparent}.price-candle.up .body{fill:rgba(66,187,147,.76)}.price-candle.down .body{fill:rgba(197,68,89,.76)}.price-marker{fill:var(--surface-card);stroke:var(--accent-primary-light);stroke-width:1.4}.price-marker.pinned{stroke:var(--accent-secondary)}.price-chart-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.price-chart-empty{min-height:300px}.price-chart-footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--text-muted);font-size:13px}@media(max-width:640px){.price-chart-toolbar{gap:10px}.price-chart-title h2{white-space:normal}.price-chart-footer{display:grid}.price-axis{font-size:10px}}
-"#;
-
 #[derive(Clone, Debug)]
 pub struct GatewayState {
     models: Arc<Mutex<Arc<Vec<GatewayModel>>>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    dashboard_history_path: Arc<Option<PathBuf>>,
+    dashboard_history_write: Arc<Mutex<()>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
@@ -221,7 +223,8 @@ pub struct GatewayState {
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
-    provider_earnings: Arc<Vec<Value>>,
+    provider_earnings: Arc<Mutex<GatewayProviderEarningsSnapshot>>,
+    local_provider_id: Arc<Option<String>>,
     provider_load_progress_dir: Arc<Option<PathBuf>>,
     provider_table: Arc<Mutex<ProviderTable>>,
     modality_admission: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
@@ -239,6 +242,13 @@ pub struct GatewayState {
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
     media_limits: Arc<GatewayMediaLimits>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatewayProviderEarningsSnapshot {
+    entries: Vec<Value>,
+    refreshed_at_seconds: Option<u64>,
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -486,6 +496,7 @@ impl Drop for GatewayModalityAdmissionGuard {
 
 #[derive(Clone, Copy, Debug)]
 struct GatewayRetentionLimits {
+    receipts: usize,
     paused_sessions: usize,
     chat_affinities: usize,
     jobs: usize,
@@ -500,6 +511,10 @@ impl Default for GatewayRetentionLimits {
             DEFAULT_SESSION_MAX_ARTIFACT_BYTES,
         );
         Self {
+            receipts: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_RECEIPTS",
+                DEFAULT_GATEWAY_MAX_STORED_RECEIPTS,
+            ),
             paused_sessions: configured_positive_usize(
                 "MAYHEM_GATEWAY_MAX_STORED_PAUSED_SESSIONS",
                 DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS,
@@ -536,15 +551,22 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, max_items: usize) {
 
 #[derive(Clone)]
 struct DashboardSession {
-    token: String,
-    issued_at: Instant,
+    bootstrap_token: String,
+    browser: Arc<Mutex<DashboardBrowserSession>>,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+struct DashboardBrowserSession {
+    token: String,
+    last_seen: Instant,
 }
 
 impl fmt::Debug for DashboardSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DashboardSession")
-            .field("token", &"<redacted>")
+            .field("bootstrap_token", &"<redacted>")
+            .field("browser_token", &"<redacted>")
             .field("ttl", &self.ttl)
             .field("expires_in", &self.expires_in())
             .finish()
@@ -554,18 +576,43 @@ impl fmt::Debug for DashboardSession {
 impl DashboardSession {
     fn new() -> Self {
         Self {
-            token: new_dashboard_token(),
-            issued_at: Instant::now(),
+            bootstrap_token: new_dashboard_token(),
+            browser: Arc::new(Mutex::new(DashboardBrowserSession {
+                token: new_dashboard_token(),
+                last_seen: Instant::now(),
+            })),
             ttl: Duration::from_secs(DASHBOARD_SESSION_TTL_SECONDS),
         }
     }
 
     fn expires_in(&self) -> Duration {
-        self.ttl.saturating_sub(self.issued_at.elapsed())
+        self.ttl.saturating_sub(
+            self.browser
+                .lock_recover("dashboard browser session")
+                .last_seen
+                .elapsed(),
+        )
     }
 
-    fn is_valid(&self, token: &str) -> bool {
-        !self.expires_in().is_zero() && token == self.token
+    fn authorize_bootstrap(&self, token: &str) -> Option<String> {
+        if token != self.bootstrap_token {
+            return None;
+        }
+        let mut browser = self.browser.lock_recover("dashboard browser session");
+        if browser.last_seen.elapsed() >= self.ttl {
+            browser.token = new_dashboard_token();
+        }
+        browser.last_seen = Instant::now();
+        Some(browser.token.clone())
+    }
+
+    fn authorize_browser(&self, token: &str) -> Option<String> {
+        let mut browser = self.browser.lock_recover("dashboard browser session");
+        if browser.last_seen.elapsed() >= self.ttl || token != browser.token {
+            return None;
+        }
+        browser.last_seen = Instant::now();
+        Some(browser.token.clone())
     }
 }
 
@@ -971,7 +1018,7 @@ impl GatewayFailoverInvocation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredReceipt {
     pub rail: String,
     pub voucher: SpendVoucher,
@@ -1064,6 +1111,33 @@ impl GatewayTokenRecord {
         {
             GatewayTokenBudgetPeriod::Total => self.spent_total_au,
             GatewayTokenBudgetPeriod::Day | GatewayTokenBudgetPeriod::Month => self.spent_period_au,
+        }
+    }
+
+    fn current_period_spent_au(&self, now: u64) -> MoneyAu {
+        let Some(window_seconds) = self
+            .budget_period
+            .and_then(GatewayTokenBudgetPeriod::window_seconds)
+        else {
+            return self.spent_period_au;
+        };
+        let started_at = self.period_started_at.unwrap_or(self.created_at);
+        if now.saturating_sub(started_at) >= window_seconds {
+            0
+        } else {
+            self.spent_period_au
+        }
+    }
+
+    fn effective_spent_au_at(&self, now: u64) -> MoneyAu {
+        match self
+            .budget_period
+            .unwrap_or(GatewayTokenBudgetPeriod::Total)
+        {
+            GatewayTokenBudgetPeriod::Total => self.spent_total_au,
+            GatewayTokenBudgetPeriod::Day | GatewayTokenBudgetPeriod::Month => {
+                self.current_period_spent_au(now)
+            }
         }
     }
 }
@@ -1347,12 +1421,18 @@ impl GatewayAccessControl {
 
     fn summary(&self) -> Value {
         let now = now_secs();
-        let store = self.store.lock_recover("gateway token store");
+        let mut store = self.store.lock_recover("gateway token store");
+        let reload_error = self
+            .reload_store(&mut store)
+            .err()
+            .map(|error| error.message);
         let tokens = store
             .tokens
             .iter()
             .map(|token| {
                 let active = token.is_active(now);
+                let spent_period_au = token.current_period_spent_au(now);
+                let effective_spent_au = token.effective_spent_au_at(now);
                 json!({
                     "name": token.name,
                     "token_id": token.token_id,
@@ -1361,7 +1441,8 @@ impl GatewayAccessControl {
                     "budget_au": token.budget_au.map(money_au_json),
                     "budget_period": token.budget_period,
                     "spent_total_au": money_au_json(token.spent_total_au),
-                    "spent_period_au": money_au_json(token.spent_period_au),
+                    "spent_period_au": money_au_json(spent_period_au),
+                    "effective_spent_au": money_au_json(effective_spent_au),
                     "spent_total_usd": format_au_usd(token.spent_total_au),
                     "last_used_at": token.last_used_at,
                     "revoked_at": token.revoked_at,
@@ -1375,6 +1456,8 @@ impl GatewayAccessControl {
             "token_count": store.tokens.len(),
             "active_token_count": store.active_token_count(now),
             "tokens": tokens,
+            "store_status": if reload_error.is_some() { "error" } else { "current" },
+            "store_error": reload_error,
         })
     }
 
@@ -1476,7 +1559,7 @@ fn gateway_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError>
     Ok(Some(token.to_owned()))
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PausedSession {
     pub session_id: String,
     pub reason: String,
@@ -1500,6 +1583,20 @@ pub struct StoredProbeEvent {
     pub evidence_hash: String,
     pub evidence: Value,
     pub probe_command: Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct GatewayDashboardHistory {
+    #[serde(default = "default_gateway_dashboard_history_version")]
+    version: u32,
+    #[serde(default)]
+    receipts: Vec<StoredReceipt>,
+    #[serde(default)]
+    paused_sessions: Vec<PausedSession>,
+}
+
+fn default_gateway_dashboard_history_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2833,6 +2930,8 @@ impl GatewayState {
         Self {
             models: Arc::new(Mutex::new(Arc::new(models))),
             receipts: Arc::new(Mutex::new(Vec::new())),
+            dashboard_history_path: Arc::new(None),
+            dashboard_history_write: Arc::new(Mutex::new(())),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
@@ -2855,7 +2954,8 @@ impl GatewayState {
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
-            provider_earnings: Arc::new(Vec::new()),
+            provider_earnings: Arc::new(Mutex::new(GatewayProviderEarningsSnapshot::default())),
+            local_provider_id: Arc::new(None),
             provider_load_progress_dir: Arc::new(None),
             provider_table: Arc::new(Mutex::new(provider_table)),
             modality_admission: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3001,6 +3101,42 @@ impl GatewayState {
         self
     }
 
+    /// Restore and persist the bounded receipt/pause history used by the local
+    /// dashboard. The file contains signed metering records and local recovery
+    /// reasons, never prompts, model output, credentials, or wallet secrets.
+    pub fn with_dashboard_history_path(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<GatewayDashboardHistory>(&bytes) {
+                Ok(mut history) => {
+                    if history.receipts.len() > self.retention_limits.receipts {
+                        let remove = history.receipts.len() - self.retention_limits.receipts;
+                        history.receipts.drain(..remove);
+                    }
+                    if history.paused_sessions.len() > self.retention_limits.paused_sessions {
+                        let remove =
+                            history.paused_sessions.len() - self.retention_limits.paused_sessions;
+                        history.paused_sessions.drain(..remove);
+                    }
+                    *self.receipts.lock_recover("receipt store") = history.receipts;
+                    *self.paused_sessions.lock_recover("paused session store") =
+                        history.paused_sessions.into();
+                }
+                Err(err) => eprintln!(
+                    "Mayhem dashboard ignored unreadable history at {}: {err}",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "Mayhem dashboard could not read history at {}: {err}",
+                path.display()
+            ),
+        }
+        self.dashboard_history_path = Arc::new(Some(path));
+        self
+    }
+
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
         self
@@ -3050,8 +3186,44 @@ impl GatewayState {
     }
 
     pub fn with_provider_earnings(mut self, earnings: Vec<Value>) -> Self {
-        self.provider_earnings = Arc::new(earnings);
+        self.provider_earnings = Arc::new(Mutex::new(GatewayProviderEarningsSnapshot {
+            entries: earnings,
+            refreshed_at_seconds: Some(now_secs()),
+            last_error: None,
+        }));
         self
+    }
+
+    pub fn update_provider_earnings(&self, earnings: Vec<Value>) {
+        *self
+            .provider_earnings
+            .lock_recover("provider earnings store") = GatewayProviderEarningsSnapshot {
+            entries: earnings,
+            refreshed_at_seconds: Some(now_secs()),
+            last_error: None,
+        };
+    }
+
+    pub fn mark_provider_earnings_refresh_error(&self, error: impl Into<String>) {
+        self.provider_earnings
+            .lock_recover("provider earnings store")
+            .last_error = Some(error.into());
+    }
+
+    fn provider_earnings_snapshot(&self) -> GatewayProviderEarningsSnapshot {
+        self.provider_earnings
+            .lock_recover("provider earnings store")
+            .clone()
+    }
+
+    pub fn with_local_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        let provider_id = provider_id.into();
+        self.local_provider_id = Arc::new((!provider_id.trim().is_empty()).then_some(provider_id));
+        self
+    }
+
+    fn local_provider_id(&self) -> Option<&str> {
+        self.local_provider_id.as_deref()
     }
 
     pub fn with_provider_load_progress_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -3182,7 +3354,7 @@ impl GatewayState {
         format!(
             "{}/mayhem/dashboard?token={}",
             gateway_root.trim_end_matches('/'),
-            self.dashboard_session.token
+            self.dashboard_session.bootstrap_token
         )
     }
 
@@ -3254,6 +3426,25 @@ impl GatewayState {
         self.receipts.lock_recover("receipt store").len()
     }
 
+    #[cfg(any(test, feature = "dashboard-workbench"))]
+    fn record_workbench_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
+        {
+            let mut receipts = self.receipts.lock_recover("receipt store");
+            receipts.push(receipt);
+            if receipts.len() > self.retention_limits.receipts {
+                let remove = receipts.len() - self.retention_limits.receipts;
+                receipts.drain(..remove);
+            }
+        }
+        if let Err(err) = self.persist_dashboard_history() {
+            eprintln!(
+                "Mayhem dashboard workbench could not persist receipt history: {}",
+                err.message
+            );
+        }
+        Ok(())
+    }
+
     fn paused_session_count(&self) -> usize {
         self.paused_sessions
             .lock_recover("paused session store")
@@ -3282,6 +3473,55 @@ impl GatewayState {
             paused,
             self.retention_limits.paused_sessions,
         );
+        if let Err(err) = self.persist_dashboard_history() {
+            eprintln!(
+                "Mayhem dashboard could not persist paused-session history: {}",
+                err.message
+            );
+        }
+    }
+
+    fn persist_dashboard_history(&self) -> Result<(), ApiError> {
+        let Some(path) = self.dashboard_history_path.as_ref().as_ref() else {
+            return Ok(());
+        };
+        let _write_guard = self
+            .dashboard_history_write
+            .lock_recover("dashboard history write");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ApiError::internal_message(format!(
+                    "creating dashboard history directory {} failed: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let history = GatewayDashboardHistory {
+            version: default_gateway_dashboard_history_version(),
+            receipts: self.receipts(),
+            paused_sessions: self.paused_sessions(),
+        };
+        let bytes = serde_json::to_vec_pretty(&history).map_err(|err| {
+            ApiError::internal_message(format!("serializing dashboard history failed: {err}"))
+        })?;
+        let temp_path = path.with_extension(
+            path.extension()
+                .map(|extension| format!("{}.tmp", extension.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".to_owned()),
+        );
+        fs::write(&temp_path, bytes).map_err(|err| {
+            ApiError::internal_message(format!(
+                "writing dashboard history temporary file {} failed: {err}",
+                temp_path.display()
+            ))
+        })?;
+        fs::rename(&temp_path, path).map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            ApiError::internal_message(format!(
+                "installing dashboard history {} failed: {err}",
+                path.display()
+            ))
+        })
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
@@ -3402,13 +3642,28 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/reputation-events", get(mayhem_reputation_events))
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
+        .route("/mayhem/dashboard/", get(mayhem_dashboard_root_redirect))
         .route("/mayhem/dashboard/network", get(mayhem_dashboard_network))
         .route("/mayhem/dashboard/provider", get(mayhem_dashboard_provider))
+        .route("/mayhem/dashboard/evidence", get(mayhem_dashboard_evidence))
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .route(
             "/mayhem/dashboard/assets/exo-latin.woff2",
             get(mayhem_dashboard_exo_font),
         )
+        .route(
+            "/mayhem/dashboard/assets/app.css",
+            get(mayhem_dashboard_app_css),
+        )
+        .route(
+            "/mayhem/dashboard/assets/app.js",
+            get(mayhem_dashboard_app_js),
+        )
+        .route(
+            "/mayhem/dashboard/assets/brand/{asset}",
+            get(mayhem_dashboard_brand_asset),
+        )
+        .route("/mayhem/dashboard/{*page}", get(mayhem_dashboard_subpage))
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(ConcurrencyLimitLayer::new(max_inflight_requests))
         .with_state(Arc::new(state))
@@ -6005,107 +6260,18 @@ fn artifact_generation_raw_response(
     Ok(response)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct DashboardQuery {
     token: Option<String>,
+    page: Option<String>,
+    probe_page: Option<String>,
+    kind: Option<String>,
+    id: Option<String>,
     provider: Option<String>,
-    tier: Option<String>,
-    tf: Option<String>,
-    bucket: Option<String>,
-    quant: Option<String>,
-    unit: Option<String>,
-    speciality: Option<String>,
-    pin: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DashboardChartSurface {
-    User,
-    Provider,
-    Network,
-}
-
-impl DashboardChartSurface {
-    fn base_path(self) -> &'static str {
-        match self {
-            Self::User => "/mayhem/dashboard",
-            Self::Provider => "/mayhem/dashboard/provider",
-            Self::Network => "/mayhem/dashboard/network",
-        }
-    }
-
-    fn pin_cookie_name(self) -> &'static str {
-        match self {
-            Self::User => DASHBOARD_USER_PINS_COOKIE_NAME,
-            Self::Provider => DASHBOARD_PROVIDER_PINS_COOKIE_NAME,
-            Self::Network => DASHBOARD_NETWORK_PINS_COOKIE_NAME,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DashboardPriceTimeframe {
-    H1,
-    H4,
-    D1,
-    W1,
-}
-
-impl DashboardPriceTimeframe {
-    fn from_query(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("4h") => Self::H4,
-            Some("1d") | Some("d1") | Some("day") => Self::D1,
-            Some("1w") | Some("w1") | Some("week") => Self::W1,
-            _ => Self::H1,
-        }
-    }
-
-    fn code(self) -> &'static str {
-        match self {
-            Self::H1 => "1h",
-            Self::H4 => "4h",
-            Self::D1 => "1d",
-            Self::W1 => "1w",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::H1 => "1h",
-            Self::H4 => "4h",
-            Self::D1 => "1D",
-            Self::W1 => "1W",
-        }
-    }
-
-    fn window_epochs(self) -> u64 {
-        match self {
-            Self::H1 => 1,
-            Self::H4 => 4,
-            Self::D1 => 24,
-            Self::W1 => 168,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct DashboardChartOptions {
-    surface: DashboardChartSurface,
-    selected_tier: Option<String>,
-    selected_timeframe: DashboardPriceTimeframe,
-    selected_bucket: Option<String>,
-    selected_quant: Option<String>,
-    selected_unit: Option<String>,
-    selected_speciality: Option<(String, String)>,
-    pinned_models: Vec<String>,
-    provider_filter: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct DashboardPinState {
-    models: Vec<String>,
-    set_cookie: Option<String>,
+    model: Option<String>,
+    enclave: Option<String>,
+    room: Option<String>,
+    rail: Option<String>,
 }
 
 async fn mayhem_dashboard(
@@ -6113,27 +6279,89 @@ async fn mayhem_dashboard(
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
-        return dashboard_html_response(
-            StatusCode::UNAUTHORIZED,
-            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
-            None,
-        );
+    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Home)
+}
+
+async fn mayhem_dashboard_root_redirect(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let browser_token = dashboard_request_authorized(&state, &headers, query.token.as_deref());
+    let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_static("/mayhem/dashboard"),
+    );
+    if let Some(browser_token) = browser_token {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(&browser_token)) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
-    let (chart_options, pin_cookie) =
-        dashboard_chart_options(DashboardChartSurface::User, &query, &headers);
-    let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response_with_extra_cookie(
-        StatusCode::OK,
-        dashboard_user_html(
-            &state,
-            state.dashboard_session.expires_in().as_secs(),
-            &origin,
-            &chart_options,
-        ),
-        Some(&state.dashboard_session.token),
-        pin_cookie.as_deref(),
-    )
+    with_dashboard_security_headers(response)
+}
+
+async fn mayhem_dashboard_evidence(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let wants_json = dashboard_wants_json(&headers);
+    let Some(browser_token) =
+        dashboard_request_authorized(&state, &headers, query.token.as_deref())
+    else {
+        return if wants_json {
+            dashboard_json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"ok": false, "error": "dashboard_session_required"}),
+                None,
+            )
+        } else {
+            dashboard_html_response(
+                StatusCode::UNAUTHORIZED,
+                dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+                None,
+            )
+        };
+    };
+    let Some(payload) = dashboard_evidence_payload(&state, &query) else {
+        return if wants_json {
+            dashboard_json_response(
+                StatusCode::NOT_FOUND,
+                json!({"ok": false, "error": "dashboard_evidence_not_found"}),
+                Some(&browser_token),
+            )
+        } else {
+            dashboard_html_response(
+                StatusCode::NOT_FOUND,
+                dashboard_html_document(
+                    "Evidence not found",
+                    r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">&mdash;</div><h1>Evidence not found</h1><p>The requested snapshot is no longer present in this gateway process.</p><a class="primary-button" href="/mayhem/dashboard">Return home</a></div></div></section></main>"#,
+                ),
+                Some(&browser_token),
+            )
+        };
+    };
+    if wants_json {
+        dashboard_json_response(StatusCode::OK, payload, Some(&browser_token))
+    } else {
+        dashboard_html_response(
+            StatusCode::OK,
+            render_dashboard_evidence_page(&payload),
+            Some(&browser_token),
+        )
+    }
+}
+
+fn dashboard_wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().starts_with("application/json"))
+        })
 }
 
 async fn mayhem_dashboard_provider(
@@ -6141,28 +6369,7 @@ async fn mayhem_dashboard_provider(
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
-        return dashboard_html_response(
-            StatusCode::UNAUTHORIZED,
-            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
-            None,
-        );
-    }
-    let (chart_options, pin_cookie) =
-        dashboard_chart_options(DashboardChartSurface::Provider, &query, &headers);
-    let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response_with_extra_cookie(
-        StatusCode::OK,
-        dashboard_provider_html(
-            &state,
-            state.dashboard_session.expires_in().as_secs(),
-            &origin,
-            query.provider.as_deref(),
-            &chart_options,
-        ),
-        Some(&state.dashboard_session.token),
-        pin_cookie.as_deref(),
-    )
+    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Earn)
 }
 
 async fn mayhem_dashboard_network(
@@ -6170,26 +6377,62 @@ async fn mayhem_dashboard_network(
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Network)
+}
+
+async fn mayhem_dashboard_subpage(
+    State(state): State<SharedState>,
+    Path(page): Path<String>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(page) = DashboardProductPage::from_path(&page) else {
+        let Some(browser_token) =
+            dashboard_request_authorized(&state, &headers, query.token.as_deref())
+        else {
+            return dashboard_html_response(
+                StatusCode::UNAUTHORIZED,
+                dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+                None,
+            );
+        };
+        return dashboard_html_response(
+            StatusCode::NOT_FOUND,
+            dashboard_html_document(
+                "Not found",
+                r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">&mdash;</div><h1>Dashboard page not found</h1><p>The requested dashboard route does not exist.</p><a class="primary-button" href="/mayhem/dashboard">Return home</a></div></div></section></main>"#,
+            ),
+            Some(&browser_token),
+        );
+    };
+    dashboard_product_response(&state, &query, &headers, page)
+}
+
+fn dashboard_product_response(
+    state: &GatewayState,
+    query: &DashboardQuery,
+    headers: &HeaderMap,
+    page: DashboardProductPage,
+) -> Response {
+    let Some(browser_token) = dashboard_request_authorized(state, headers, query.token.as_deref())
+    else {
         return dashboard_html_response(
             StatusCode::UNAUTHORIZED,
             dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
             None,
         );
-    }
-    let (chart_options, pin_cookie) =
-        dashboard_chart_options(DashboardChartSurface::Network, &query, &headers);
-    let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response_with_extra_cookie(
+    };
+    let origin = dashboard_origin_from_headers(headers);
+    dashboard_html_response(
         StatusCode::OK,
-        dashboard_network_html(
-            &state,
+        render_dashboard_product_page(
+            state,
             state.dashboard_session.expires_in().as_secs(),
             &origin,
-            &chart_options,
+            query,
+            page,
         ),
-        Some(&state.dashboard_session.token),
-        pin_cookie.as_deref(),
+        Some(&browser_token),
     )
 }
 
@@ -6198,7 +6441,9 @@ async fn mayhem_dashboard_session(
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+    let Some(browser_token) =
+        dashboard_request_authorized(&state, &headers, query.token.as_deref())
+    else {
         return dashboard_json_response(
             StatusCode::UNAUTHORIZED,
             json!({
@@ -6207,7 +6452,7 @@ async fn mayhem_dashboard_session(
             }),
             None,
         );
-    }
+    };
     dashboard_json_response(
         StatusCode::OK,
         json!({
@@ -6223,22 +6468,49 @@ async fn mayhem_dashboard_session(
                 "balance": "/mayhem/balance",
             },
         }),
-        Some(&state.dashboard_session.token),
+        Some(&browser_token),
     )
 }
 
-async fn mayhem_dashboard_exo_font(
-    State(state): State<SharedState>,
-    Query(query): Query<DashboardQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
-        return with_dashboard_security_headers(StatusCode::UNAUTHORIZED.into_response());
-    }
+async fn mayhem_dashboard_exo_font() -> Response {
     let mut response = Response::new(Body::from(DASHBOARD_EXO_LATIN_WOFF2.to_vec()));
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("font/woff2"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    with_dashboard_security_headers(response)
+}
+
+async fn mayhem_dashboard_app_css() -> Response {
+    dashboard_asset_response("text/css; charset=utf-8", DASHBOARD_APP_CSS)
+}
+
+async fn mayhem_dashboard_app_js() -> Response {
+    dashboard_asset_response("text/javascript; charset=utf-8", DASHBOARD_APP_JS)
+}
+
+async fn mayhem_dashboard_brand_asset(Path(asset): Path<String>) -> Response {
+    let Some((content_type, bytes)) = dashboard_brand_asset(&asset) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = Response::new(Body::from(bytes));
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    with_dashboard_security_headers(response)
+}
+
+fn dashboard_asset_response(content_type: &'static str, content: &'static str) -> Response {
+    let mut response = Response::new(Body::from(content));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -6323,126 +6595,16 @@ fn dashboard_request_authorized(
     state: &GatewayState,
     headers: &HeaderMap,
     query_token: Option<&str>,
-) -> bool {
-    query_token
+) -> Option<String> {
+    let bootstrap = query_token
         .into_iter()
         .chain(dashboard_header_token(headers))
         .chain(dashboard_bearer_token(headers))
-        .chain(dashboard_cookie_token(headers))
-        .any(|token| state.dashboard_session.is_valid(token))
-}
-
-fn dashboard_chart_options(
-    surface: DashboardChartSurface,
-    query: &DashboardQuery,
-    headers: &HeaderMap,
-) -> (DashboardChartOptions, Option<String>) {
-    let pins = dashboard_pin_state_from_request(headers, surface, query.pin.as_deref());
-    (
-        DashboardChartOptions {
-            surface,
-            selected_tier: dashboard_normalize_tier(query.tier.as_deref()),
-            selected_timeframe: DashboardPriceTimeframe::from_query(query.tf.as_deref()),
-            selected_bucket: query
-                .bucket
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-            selected_quant: query
-                .quant
-                .as_deref()
-                .map(normalize_quant_bucket)
-                .and_then(Result::ok),
-            selected_unit: query
-                .unit
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-            selected_speciality: dashboard_parse_speciality_filter(query.speciality.as_deref()),
-            pinned_models: pins.models,
-            provider_filter: query
-                .provider
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-        },
-        pins.set_cookie,
-    )
-}
-
-fn dashboard_parse_speciality_filter(value: Option<&str>) -> Option<(String, String)> {
-    let value = value?.trim();
-    let (name, level) = value.split_once('=')?;
-    let name = name.trim();
-    let level = level.trim();
-    let valid = |component: &str| {
-        !component.is_empty()
-            && component.len() <= 128
-            && component
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    };
-    if !valid(name) || !valid(level) || level.contains('=') {
-        return None;
-    }
-    Some((name.to_owned(), level.to_owned()))
-}
-
-fn dashboard_pin_state_from_request(
-    headers: &HeaderMap,
-    surface: DashboardChartSurface,
-    query_pin: Option<&str>,
-) -> DashboardPinState {
-    if let Some(query_pin) = query_pin {
-        let models = dashboard_parse_pin_list(query_pin);
-        return DashboardPinState {
-            set_cookie: Some(dashboard_pin_cookie_value(surface, &models)),
-            models,
-        };
-    }
-    let models = dashboard_cookie_named(headers, surface.pin_cookie_name())
-        .map(dashboard_parse_pin_list)
-        .unwrap_or_default();
-    DashboardPinState {
-        models,
-        set_cookie: None,
-    }
-}
-
-fn dashboard_parse_pin_list(value: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    value
-        .split(',')
-        .filter_map(|entry| {
-            let decoded = dashboard_url_decode(entry);
-            let trimmed = decoded.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("clear") {
-                return None;
-            }
-            let model = trimmed.chars().take(160).collect::<String>();
-            if seen.insert(model.clone()) {
-                Some(model)
-            } else {
-                None
-            }
-        })
-        .take(12)
-        .collect()
-}
-
-fn dashboard_pin_cookie_value(surface: DashboardChartSurface, models: &[String]) -> String {
-    let value = models
-        .iter()
-        .map(|model| dashboard_url_encode(model))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{}={value}; Path=/mayhem/dashboard; Max-Age={DASHBOARD_PIN_COOKIE_MAX_AGE_SECONDS}; SameSite=Strict",
-        surface.pin_cookie_name()
-    )
+        .find_map(|token| state.dashboard_session.authorize_bootstrap(token));
+    bootstrap.or_else(|| {
+        dashboard_cookie_token(headers)
+            .and_then(|token| state.dashboard_session.authorize_browser(token))
+    })
 }
 
 fn dashboard_header_token(headers: &HeaderMap) -> Option<&str> {
@@ -6480,15 +6642,6 @@ fn dashboard_cookie_named<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Opti
 }
 
 fn dashboard_html_response(status: StatusCode, body: String, token: Option<&str>) -> Response {
-    dashboard_html_response_with_extra_cookie(status, body, token, None)
-}
-
-fn dashboard_html_response_with_extra_cookie(
-    status: StatusCode,
-    body: String,
-    token: Option<&str>,
-    extra_cookie: Option<&str>,
-) -> Response {
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -6496,11 +6649,6 @@ fn dashboard_html_response_with_extra_cookie(
     );
     if let Some(token) = token {
         if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
-    }
-    if let Some(cookie) = extra_cookie {
-        if let Ok(value) = HeaderValue::from_str(cookie) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
@@ -6531,7 +6679,15 @@ fn with_dashboard_security_headers(mut response: Response) -> Response {
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
     response
 }
 
@@ -6540,45 +6696,39 @@ fn dashboard_origin_from_headers(headers: &HeaderMap) -> String {
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-        .filter(|host| host.starts_with("127.0.0.1"))
+        .filter(|host| dashboard_host_is_loopback(host))
         .map(|host| format!("http://{host}"))
         .unwrap_or_else(|| "http://127.0.0.1".to_owned())
+}
+
+fn dashboard_host_is_loopback(host: &str) -> bool {
+    let valid_port = |suffix: &str| {
+        suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok())
+    };
+    if let Some(suffix) = host.strip_prefix("127.0.0.1") {
+        return valid_port(suffix);
+    }
+    if host
+        .get(.."localhost".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("localhost"))
+    {
+        return valid_port(&host["localhost".len()..]);
+    }
+    if let Some(suffix) = host.strip_prefix("[::1]") {
+        return valid_port(suffix);
+    }
+    false
 }
 
 fn dashboard_locked_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Locked",
         &format!(
-            r#"<main class="dashboard"><section class="card strong"><span class="label">Local session</span><h1 class="wordmark compact">MAY<span class="hem">HEM</span></h1><p class="muted">Dashboard token required.</p><p class="mono">expires in {expires_in_seconds}s</p></section></main>"#
+            r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">M</div><h1>Dashboard locked</h1><p>Reopen the copy-and-paste dashboard URL printed by <code>mayhem up</code> to start a fresh browser session.</p><span class="status-badge warn mono">Browser idle window {expires_in_seconds}s</span></div></div></section></main>"#
         ),
-    )
-}
-
-fn dashboard_tier_tooltip() -> &'static str {
-    "Tier 1: runs Mayhem software; trust is economic. Tier 2: proven Apple or NVIDIA hardware running the real app. Tier 3: Only Tier 3 keeps prompts private from the provider's own machine. Tier 4: admin-verified business identity, not prompt privacy; Tier 4 can still read prompts. Higher numbers are not a privacy ladder."
-}
-
-fn dashboard_update_banner(notice: Option<&GatewayUpdateNotice>) -> String {
-    let Some(notice) = notice else {
-        return String::new();
-    };
-    let class = if notice.level == "required" {
-        "update-banner required"
-    } else {
-        "update-banner"
-    };
-    let label = if notice.level == "required" {
-        "Update required"
-    } else {
-        "Update available"
-    };
-    format!(
-        r#"<section class="{class}" role="status"><span class="label">{}</span><p>{}</p><p class="mono">installed v{} / catalog min v{} / {} affected model(s)</p></section>"#,
-        html_escape(label),
-        html_escape(&notice.message),
-        html_escape(&notice.installed_app_version),
-        html_escape(&notice.required_min_app_version),
-        notice.affected_model_count,
     )
 }
 
@@ -6697,443 +6847,6 @@ fn gateway_update_model_message(
     )
 }
 
-fn dashboard_payment_status(state: &GatewayState) -> String {
-    let rail = state.receipt_config.rail.as_str();
-    let Some(directory) = state.payment_directory() else {
-        return html_escape(&format!(
-            "{} credit · ledger directory unavailable",
-            rail.to_uppercase()
-        ));
-    };
-    let text = match rail {
-        "tap" | "tnk" => {
-            let rate = directory.get("rates").and_then(|rates| rates.get(rail));
-            let usd = rate
-                .and_then(|rate| rate.get("usd"))
-                .and_then(Value::as_str)
-                .unwrap_or("unavailable");
-            let source = rate
-                .and_then(|rate| rate.get("source"))
-                .and_then(Value::as_str)
-                .unwrap_or("ledger");
-            let age = rate
-                .and_then(|rate| rate.get("age_seconds"))
-                .and_then(Value::as_u64)
-                .map(|value| format!(" · {value}s old"))
-                .unwrap_or_default();
-            format!(
-                "{} credit · ${}/{} · {}{}",
-                rail.to_uppercase(),
-                usd,
-                rail.to_uppercase(),
-                source,
-                age
-            )
-        }
-        "fiat" => {
-            let currencies = directory
-                .pointer("/payments/fiat/currencies")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_uppercase)
-                        .collect::<Vec<_>>()
-                        .join("/")
-                })
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "USD/EUR".to_owned());
-            format!("Fiat credit · Stripe hosted checkout · {currencies}")
-        }
-        other => format!("{} credit · canonical Trac ledger", other.to_uppercase()),
-    };
-    html_escape(&text)
-}
-
-fn dashboard_user_html(
-    state: &GatewayState,
-    expires_in_seconds: u64,
-    origin: &str,
-    chart_options: &DashboardChartOptions,
-) -> String {
-    let entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table.entries(now_millis_u64())
-    };
-    let models = dashboard_filtered_models(
-        &state.models_snapshot(),
-        &entries,
-        chart_options.selected_speciality.as_ref(),
-    );
-    let receipts = state.receipts();
-    let latest_receipts = dashboard_latest_receipts(&receipts);
-    let active_sessions = latest_receipts
-        .iter()
-        .filter(|receipt| !receipt.receipt.body.final_receipt)
-        .count()
-        .saturating_add(state.paused_session_count());
-    let lifetime_spend_au = latest_receipts
-        .iter()
-        .map(|receipt| receipt.receipt.body.au_owed_cum)
-        .sum::<MoneyAu>();
-    let gateway_root = origin.trim_end_matches('/');
-    let openai_base_url = format!("{gateway_root}/v1");
-    let session_rows = dashboard_session_rows(&latest_receipts);
-    let model_rows = dashboard_model_rows(&models, &entries);
-    let spend_body = dashboard_spend_body(&latest_receipts);
-    let speciality_controls =
-        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
-    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
-    let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
-    let access_summary = state.access_summary();
-    let token_rows = dashboard_access_token_rows(&access_summary);
-    let token_count = access_summary
-        .get("token_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let auth_mode = if access_summary
-        .get("require_auth")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        "Required"
-    } else {
-        "Optional local"
-    };
-    let balance_usd = format_au_usd(state.ledger_balance_au());
-    let payment_status = dashboard_payment_status(state);
-    let lifetime_spend = format_au_usd(lifetime_spend_au);
-    let api_key_masked = "mayhem-local";
-    let tier_tooltip = html_escape(dashboard_tier_tooltip());
-    let update_notice = state.update_notice();
-    let update_banner = dashboard_update_banner(update_notice.as_ref());
-    dashboard_html_document(
-        "User Dashboard",
-        &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">{payment_status}</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
-OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Local gateway · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
-            receipt_count = receipts.len(),
-        ),
-    )
-}
-
-fn dashboard_access_token_rows(access_summary: &Value) -> String {
-    let Some(tokens) = access_summary.get("tokens").and_then(Value::as_array) else {
-        return r#"<tr><td colspan="4"><span class="privacy-note">No gateway access tokens</span></td></tr>"#
-            .to_owned();
-    };
-    if tokens.is_empty() {
-        return r#"<tr><td colspan="4"><span class="privacy-note">No gateway access tokens</span></td></tr>"#
-            .to_owned();
-    }
-    tokens
-        .iter()
-        .map(|token| {
-            let name = token.get("name").and_then(Value::as_str).unwrap_or("token");
-            let token_id = token
-                .get("token_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let spend = token
-                .get("spent_total_au")
-                .and_then(value_as_money_au)
-                .map(format_au_usd)
-                .unwrap_or_else(|| "$0.000000".to_owned());
-            let last_used = token
-                .get("last_used_at")
-                .and_then(Value::as_u64)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "never".to_owned());
-            let active = token
-                .get("active")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let status = if active {
-                r#"<span class="status-dot">Active</span>"#
-            } else {
-                r#"<span class="status-dot muted">Inactive</span>"#
-            };
-            format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span></td><td><span class="mono">{}</span></td><td>{}</td></tr>"#,
-                html_escape(short_text(name, 24).as_ref()),
-                html_escape(short_text(token_id, 18).as_ref()),
-                html_escape(&spend),
-                html_escape(&last_used),
-                status,
-            )
-        })
-        .collect::<String>()
-}
-
-fn dashboard_provider_html(
-    state: &GatewayState,
-    expires_in_seconds: u64,
-    origin: &str,
-    provider_filter: Option<&str>,
-    chart_options: &DashboardChartOptions,
-) -> String {
-    let entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table.entries(now_millis_u64())
-    };
-    let models = dashboard_filtered_models(
-        &state.models_snapshot(),
-        &entries,
-        chart_options.selected_speciality.as_ref(),
-    );
-    let receipts = state.receipts();
-    let latest_receipts = dashboard_latest_receipts(&receipts);
-    let probes = state.probes();
-    let candidates = dashboard_provider_candidates(&models, provider_filter);
-    let provider_scope = dashboard_provider_scope(
-        provider_filter,
-        &candidates,
-        &latest_receipts,
-        &probes,
-        state.provider_earnings.as_ref(),
-    );
-    let earning_totals =
-        dashboard_provider_earning_totals(state.provider_earnings.as_ref(), &provider_scope);
-    let local_earned_au = dashboard_provider_receipt_au(&latest_receipts, &provider_scope);
-    let earned_au = if earning_totals.loaded {
-        earning_totals.total_au
-    } else {
-        local_earned_au
-    };
-    let claimable_value = if earning_totals.loaded {
-        format_au_usd(earning_totals.claimable_au)
-    } else {
-        "not loaded".to_owned()
-    };
-    let active_sessions = latest_receipts
-        .iter()
-        .filter(|receipt| {
-            dashboard_provider_in_scope(&provider_scope, &receipt.receipt.body.provider)
-                && !receipt.receipt.body.final_receipt
-        })
-        .count();
-    let saturation_pct = dashboard_provider_saturation_pct(active_sessions, candidates.len());
-    let reputation = dashboard_provider_reputation_bps(&latest_receipts, &probes, &provider_scope)
-        .map(format_bps_percent)
-        .unwrap_or_else(|| "not loaded".to_owned());
-    let gateway_root = origin.trim_end_matches('/');
-    let provider_scope_label = dashboard_provider_scope_label(provider_filter, &provider_scope);
-    let provider_query = provider_filter
-        .map(|provider| format!("?provider={}", html_escape(provider)))
-        .unwrap_or_default();
-    let load_progress = dashboard_provider_load_progress(state);
-    let now_ms = now_millis_u64();
-    let loading_rows =
-        dashboard_provider_loading_row_count(&candidates, &load_progress, provider_filter, now_ms);
-    let enclave_rows = dashboard_provider_enclave_rows(
-        &candidates,
-        &latest_receipts,
-        &load_progress,
-        provider_filter,
-        now_ms,
-    );
-    let live_session_rows =
-        dashboard_provider_live_session_rows(&latest_receipts, &candidates, &provider_scope);
-    let earnings_body =
-        dashboard_provider_earnings_body(&latest_receipts, &provider_scope, &earning_totals);
-    let holdback_body = dashboard_provider_holdback_body(&earning_totals);
-    let hardware_body = dashboard_provider_hwprobe_body(&candidates, &probes, &provider_scope);
-    let claim_body =
-        dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
-    let speciality_controls =
-        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
-    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
-    let price_charts = dashboard_price_chart_cards(&models, chart_options, Some(&provider_scope));
-    let update_notice = state.update_notice();
-    let update_banner = dashboard_update_banner(update_notice.as_ref());
-    dashboard_html_document(
-        "Provider Dashboard",
-        &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s · payment and routing evidence synced from Trac.</span><span class="mono">127.0.0.1</span></footer>"#,
-            earned = format_au_usd(earned_au),
-            earned_source = if earning_totals.loaded {
-                "ledger earn/* rows"
-            } else {
-                "local receipts only"
-            },
-            paid = format_au_usd(earning_totals.paid_au),
-            earnings_source = if earning_totals.loaded {
-                "matches mayhem earnings"
-            } else {
-                "ledger earnings not loaded"
-            },
-            epoch_label = earning_totals
-                .updated_epoch
-                .map(|epoch| format!("epoch {epoch}"))
-                .unwrap_or_else(|| "epoch not loaded".to_owned()),
-            hardware_status_class = if candidates.is_empty() {
-                if loading_rows > 0 {
-                    "status-dot"
-                } else {
-                    "status-dot muted"
-                }
-            } else {
-                "status-dot"
-            },
-            hardware_status = if candidates.is_empty() {
-                if loading_rows > 0 {
-                    "Loading"
-                } else {
-                    "No route"
-                }
-            } else {
-                "Healthy"
-            },
-            candidate_count = candidates.len() + loading_rows,
-            receipt_count = latest_receipts
-                .iter()
-                .filter(|receipt| dashboard_provider_in_scope(
-                    &provider_scope,
-                    &receipt.receipt.body.provider
-                ))
-                .count(),
-        ),
-    )
-}
-
-fn dashboard_network_html(
-    state: &GatewayState,
-    expires_in_seconds: u64,
-    origin: &str,
-    chart_options: &DashboardChartOptions,
-) -> String {
-    let entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table.entries(now_millis_u64())
-    };
-    let models = dashboard_filtered_models(
-        &state.models_snapshot(),
-        &entries,
-        chart_options.selected_speciality.as_ref(),
-    );
-    let provider_count = models
-        .iter()
-        .flat_map(|model| model.mayhem.route_candidates.iter())
-        .map(|candidate| candidate.provider.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let route_count = models
-        .iter()
-        .map(|model| model.mayhem.route_candidates.len())
-        .sum::<usize>();
-    let live_count = models
-        .iter()
-        .flat_map(|model| model.mayhem.route_candidates.iter())
-        .filter(|candidate| {
-            dashboard_entry_for_route(&entries, candidate)
-                .is_some_and(dashboard_entry_has_live_heartbeat)
-        })
-        .count();
-    let unavailable_models = models
-        .iter()
-        .filter(|model| !dashboard_model_has_live_provider(model, &entries))
-        .count();
-    let gateway_root = origin.trim_end_matches('/');
-    let model_rows = dashboard_network_model_rows(&models, &entries);
-    let provider_rows = dashboard_network_provider_rows(&models, &entries);
-    let speciality_controls =
-        dashboard_speciality_controls(&state.models_snapshot(), &entries, chart_options);
-    let capability_cards = dashboard_speciality_volume_cards(&models, &entries, chart_options);
-    let price_charts = dashboard_price_chart_cards(&models, chart_options, None);
-    dashboard_html_document(
-        "Network Explorer",
-        &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section>{speciality_controls}{capability_cards}{price_charts}<section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
-            model_count = models.len(),
-        ),
-    )
-}
-
-fn dashboard_network_model_rows(models: &[GatewayModel], entries: &[ProviderTableEntry]) -> String {
-    if models.is_empty() {
-        return r#"<tr><td colspan="5"><span class="privacy-note">No catalog models loaded</span></td></tr>"#
-            .to_owned();
-    }
-    models
-        .iter()
-        .map(|model| {
-            let route_count = model.mayhem.route_candidates.len();
-            let room_count = model
-                .mayhem
-                .route_candidates
-                .iter()
-                .map(|candidate| candidate.room_id.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            let live_count = model
-                .mayhem
-                .route_candidates
-                .iter()
-                .filter(|candidate| {
-                    dashboard_entry_for_route(entries, candidate)
-                        .is_some_and(dashboard_entry_has_live_heartbeat)
-                })
-                .count();
-            let availability = if live_count > 0 {
-                format!(r#"<span class="status-dot">Online</span><p class="privacy-note">{live_count}/{route_count} providers live</p>"#)
-            } else if route_count > 0 {
-                format!(r#"<span class="status-dot muted">Unavailable</span><p class="privacy-note">{route_count} joined; heartbeat pending</p>"#)
-            } else {
-                r#"<span class="status-dot muted">Unavailable</span><p class="privacy-note">no canonical provider route</p>"#
-                    .to_owned()
-            };
-            let constraints = dashboard_model_constraints(model, route_count, room_count);
-            format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td>{availability}</td><td>{}</td><td><span class="mono">{}</span><p class="privacy-note">price v{} · {}</p></td><td>{constraints}</td></tr>"#,
-                html_escape(short_text(&model.id, 34).as_ref()),
-                html_escape(&model.mayhem.source),
-                dashboard_badges(&dashboard_model_abilities(model), "badge"),
-                html_escape(&dashboard_model_price(model)),
-                model.mayhem.price_ref_au.ver,
-                html_escape(&dashboard_model_price_derivation(model)),
-            )
-        })
-        .collect::<String>()
-}
-
-fn dashboard_network_provider_rows(
-    models: &[GatewayModel],
-    entries: &[ProviderTableEntry],
-) -> String {
-    let mut rows = String::new();
-    for model in models {
-        for candidate in &model.mayhem.route_candidates {
-            let entry = dashboard_entry_for_route(entries, candidate);
-            let backend = dashboard_route_engine(model, candidate);
-            let rails = dashboard_route_rails(candidate);
-            let quality = dashboard_route_quality(entry);
-            let status = dashboard_route_status(model, candidate, entry);
-            let price = route_price_ref_au(model, Some(candidate));
-            rows.push_str(&format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">room {}</p></td><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">{} · price v{}</p></td><td>{}<p class="privacy-note">{}</p></td></tr>"#,
-                html_escape(short_text(&candidate.provider, 18).as_ref()),
-                html_escape(short_text(&candidate.enclave_id, 18).as_ref()),
-                html_escape(short_text(&model.id, 28).as_ref()),
-                html_escape(short_text(&candidate.room_id, 14).as_ref()),
-                html_escape(&backend),
-                dashboard_badges(&dashboard_route_abilities(model, candidate, entry), "badge"),
-                html_escape(&rails),
-                html_escape(&dashboard_price(price)),
-                price.ver,
-                status,
-                html_escape(&quality),
-            ));
-        }
-    }
-    if rows.is_empty() {
-        r#"<tr><td colspan="5"><span class="privacy-note">No canonical provider routes loaded</span></td></tr>"#
-            .to_owned()
-    } else {
-        rows
-    }
-}
-
 fn dashboard_entry_for_route<'a>(
     entries: &'a [ProviderTableEntry],
     candidate: &GatewayRouteCandidate,
@@ -7145,217 +6858,19 @@ fn dashboard_entry_for_route<'a>(
     })
 }
 
-fn dashboard_entry_has_live_heartbeat(entry: &ProviderTableEntry) -> bool {
-    entry
-        .heartbeat
-        .as_ref()
-        .is_some_and(|heartbeat| !heartbeat.sig.trim().is_empty())
-}
-
-fn dashboard_model_has_live_provider(model: &GatewayModel, entries: &[ProviderTableEntry]) -> bool {
-    model.mayhem.route_candidates.iter().any(|candidate| {
-        dashboard_entry_for_route(entries, candidate)
-            .is_some_and(dashboard_entry_has_live_heartbeat)
-    })
-}
-
-fn dashboard_model_has_live_speciality(
-    model: &GatewayModel,
-    entries: &[ProviderTableEntry],
-    speciality: &(String, String),
-) -> bool {
-    gateway_speciality_availability(model, entries)
-        .get(&speciality.0)
-        .and_then(|entry| entry.levels.get(&speciality.1))
-        .is_some_and(|level| level.available)
-}
-
-fn dashboard_filtered_models(
-    models: &[GatewayModel],
-    entries: &[ProviderTableEntry],
-    speciality: Option<&(String, String)>,
-) -> Vec<GatewayModel> {
-    models
-        .iter()
-        .filter(|model| {
-            speciality
-                .is_none_or(|filter| dashboard_model_has_live_speciality(model, entries, filter))
-        })
-        .cloned()
-        .collect()
-}
-
-fn dashboard_speciality_controls(
-    models: &[GatewayModel],
-    entries: &[ProviderTableEntry],
-    options: &DashboardChartOptions,
-) -> String {
-    let mut live_providers = BTreeMap::<(String, String), BTreeSet<String>>::new();
-    let mut defaults = BTreeSet::new();
-    for model in models {
-        for (name, speciality) in gateway_speciality_availability(model, entries) {
-            defaults.insert((name.clone(), speciality.default_level.clone()));
-            for (level, availability) in speciality.levels {
-                live_providers
-                    .entry((name.clone(), level))
-                    .or_default()
-                    .extend(availability.live_providers);
-            }
-        }
-    }
-    if live_providers.is_empty() {
-        return String::new();
-    }
-    let clear = {
-        let mut next = options.clone();
-        next.selected_speciality = None;
-        let selected_tier = next.selected_tier.clone();
-        let selected_bucket = next.selected_bucket.clone();
-        let selected_quant = next.selected_quant.clone();
-        let selected_unit = next.selected_unit.clone();
-        dashboard_chart_href(
-            &next,
-            selected_tier.as_deref(),
-            next.selected_timeframe,
-            selected_bucket.as_deref(),
-            selected_quant.as_deref(),
-            selected_unit.as_deref(),
-            None,
-        )
-    };
-    let mut links = dashboard_segment_link("All", &clear, options.selected_speciality.is_none());
-    for ((name, level), providers) in live_providers {
-        let mut next = options.clone();
-        next.selected_speciality = Some((name.clone(), level.clone()));
-        let selected_tier = next.selected_tier.clone();
-        let selected_bucket = next.selected_bucket.clone();
-        let selected_quant = next.selected_quant.clone();
-        let selected_unit = next.selected_unit.clone();
-        let href = dashboard_chart_href(
-            &next,
-            selected_tier.as_deref(),
-            next.selected_timeframe,
-            selected_bucket.as_deref(),
-            selected_quant.as_deref(),
-            selected_unit.as_deref(),
-            None,
-        );
-        let default = if defaults.contains(&(name.clone(), level.clone())) {
-            " · default"
+// Humanize raw token counts for dashboard copy: 262144 -> "262k".
+pub(crate) fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        let millions = value as f64 / 1_000_000.0;
+        if (millions - millions.round()).abs() < 0.05 {
+            format!("{}M", millions.round() as u64)
         } else {
-            ""
-        };
-        links.push_str(&dashboard_segment_link(
-            &format!("{name}={level} · {} live{default}", providers.len()),
-            &href,
-            options
-                .selected_speciality
-                .as_ref()
-                .is_some_and(|selected| selected.0 == name && selected.1 == level),
-        ));
-    }
-    format!(
-        r#"<section class="capability-controls"><span class="label">Capability filter</span><div class="segmented">{links}</div></section>"#
-    )
-}
-
-fn dashboard_speciality_volume_cards(
-    models: &[GatewayModel],
-    entries: &[ProviderTableEntry],
-    options: &DashboardChartOptions,
-) -> String {
-    let mut cards = String::new();
-    for model in models {
-        for (name, speciality) in gateway_speciality_availability(model, entries) {
-            for (level, availability) in speciality.levels {
-                if options
-                    .selected_speciality
-                    .as_ref()
-                    .is_some_and(|selected| selected.0 != name || selected.1 != level)
-                {
-                    continue;
-                }
-                let status = if availability.available {
-                    format!(
-                        r#"<span class="status-dot">{} live</span>"#,
-                        availability.live_provider_count
-                    )
-                } else {
-                    r#"<span class="status-dot muted">0 live</span>"#.to_owned()
-                };
-                let expected = availability
-                    .expected_volume
-                    .as_ref()
-                    .map(|volume| {
-                        let output = dashboard_u64_range(
-                            volume.output_tokens_min,
-                            volume.output_tokens_max,
-                        );
-                        let reasoning = dashboard_u64_range(
-                            volume.reasoning_tokens_min,
-                            volume.reasoning_tokens_max,
-                        );
-                        let cost = match (
-                            volume.expected_output_cost_usd_min.as_deref(),
-                            volume.expected_output_cost_usd_max.as_deref(),
-                        ) {
-                            (Some(minimum), Some(maximum)) if minimum == maximum => {
-                                minimum.to_owned()
-                            }
-                            (Some(minimum), Some(maximum)) => format!("{minimum} - {maximum}"),
-                            _ => "rate unavailable".to_owned(),
-                        };
-                        format!(
-                            r#"<div class="capability-metrics"><div><span class="label">Measured output</span><p class="mono">{} tokens</p></div><div><span class="label">Reasoning attribution</span><p class="mono">{} tokens</p></div><div><span class="label">Expected output cost</span><p class="mono">{}</p></div></div><p class="privacy-note">{} signed artifact calibration row(s)</p>"#,
-                            html_escape(&output),
-                            html_escape(&reasoning),
-                            html_escape(&cost),
-                            volume.calibration_artifacts,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        r#"<p class="privacy-note">Expected volume unavailable: signed calibration pending</p>"#
-                            .to_owned()
-                    });
-                let output_cap = availability
-                    .default_max_output_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unset".to_owned());
-                let reasoning_cap = availability
-                    .max_reasoning_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unset".to_owned());
-                let default = if speciality.default_level == level {
-                    r#"<span class="badge good">default</span>"#
-                } else {
-                    ""
-                };
-                cards.push_str(&format!(
-                    r#"<article class="card capability-card"><div class="card-header"><div><span class="label">{}</span><h2 class="mono">{}</h2></div>{status}</div><div class="badge-row"><span class="badge">{}={}</span>{default}<span class="badge">{} canonical</span></div>{expected}<p class="privacy-note">caps: output {} · reasoning {}</p></article>"#,
-                    html_escape(short_text(&model.id, 42).as_ref()),
-                    html_escape(&level),
-                    html_escape(&name),
-                    html_escape(&level),
-                    availability.canonical_provider_count,
-                    html_escape(&output_cap),
-                    html_escape(&reasoning_cap),
-                ));
-            }
+            format!("{millions:.1}M")
         }
-    }
-    if cards.is_empty() {
-        return String::new();
-    }
-    format!(
-        r#"<section class="capability-band"><div class="section-heading"><span class="label">Volume plane</span><h2>Capability cost</h2></div><div class="capability-grid">{cards}</div></section>"#
-    )
-}
-
-fn dashboard_u64_range(minimum: u64, maximum: u64) -> String {
-    if minimum == maximum {
-        minimum.to_string()
+    } else if value >= 1_000 {
+        format!("{}k", (value + 500) / 1_000)
     } else {
-        format!("{minimum}-{maximum}")
+        value.to_string()
     }
 }
 
@@ -7411,234 +6926,11 @@ fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
                 .join("|")
         ));
     }
-    abilities.insert(format!("ctx {}", model.mayhem.caps.ctx));
+    abilities.insert(format!(
+        "ctx {}",
+        format_token_count(u64::from(model.mayhem.caps.ctx))
+    ));
     abilities.into_iter().collect()
-}
-
-fn dashboard_route_abilities(
-    model: &GatewayModel,
-    candidate: &GatewayRouteCandidate,
-    entry: Option<&ProviderTableEntry>,
-) -> Vec<String> {
-    let caps = entry
-        .and_then(|entry| {
-            entry
-                .heartbeat
-                .as_ref()
-                .map(|heartbeat| heartbeat.caps.clone())
-        })
-        .unwrap_or_else(|| heartbeat_caps_for_route(model, candidate));
-    let mut abilities = BTreeSet::new();
-    if caps.tools {
-        abilities.insert("tools".to_owned());
-    }
-    if caps.json {
-        abilities.insert("json".to_owned());
-    }
-    if caps.vision {
-        abilities.insert("vision".to_owned());
-    }
-    for modality in &caps.served_modalities {
-        if !modality.trim().is_empty() {
-            abilities.insert(modality.trim().to_owned());
-        }
-    }
-    for (name, levels) in &caps.served_specialities {
-        abilities.insert(format!("{name}:{}", levels.join("|")));
-    }
-    abilities.insert(format!("ctx {}", caps.ctx));
-    abilities.into_iter().collect()
-}
-
-fn dashboard_model_constraints(
-    model: &GatewayModel,
-    route_count: usize,
-    room_count: usize,
-) -> String {
-    let mut constraints = Vec::new();
-    constraints.push(format!("{} routes", route_count));
-    constraints.push(format!("{} rooms", room_count));
-    constraints.push(dashboard_attestation_summary(model));
-    if !model.mayhem.kyb_identities.is_empty() {
-        constraints.push(format!("{} KYB", model.mayhem.kyb_identities.len()));
-    }
-    if let Some(min_app) = &model.mayhem.min_app_version {
-        constraints.push(format!("min app {min_app}"));
-    }
-    dashboard_badges(&constraints, "badge")
-}
-
-fn dashboard_attestation_summary(model: &GatewayModel) -> String {
-    let labels = model
-        .mayhem
-        .attestation_tier_labels
-        .iter()
-        .map(|(tier, label)| format!("{tier}:{label}"))
-        .collect::<Vec<_>>();
-    if !labels.is_empty() {
-        return labels.join(", ");
-    }
-    let tiers = model
-        .mayhem
-        .attestation_tiers
-        .iter()
-        .map(|(tier, count)| format!("{tier}:{count}"))
-        .collect::<Vec<_>>();
-    if tiers.is_empty() {
-        "T1".to_owned()
-    } else {
-        tiers.join(", ")
-    }
-}
-
-fn dashboard_route_engine(model: &GatewayModel, candidate: &GatewayRouteCandidate) -> String {
-    candidate
-        .caps
-        .get("engine")
-        .or_else(|| candidate.caps.get("backend"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| primary_endpoint_family(&model.mayhem.adapter))
-        .to_owned()
-}
-
-fn primary_endpoint_family(adapter: &ShapeAdapterInfo) -> &str {
-    adapter
-        .endpoint_families
-        .first()
-        .map(|contract| contract.family.as_str())
-        .unwrap_or("invalid-missing-endpoint-family")
-}
-
-fn dashboard_route_rails(candidate: &GatewayRouteCandidate) -> String {
-    if candidate.accepted_rails.is_empty() {
-        "not advertised".to_owned()
-    } else {
-        candidate.accepted_rails.join(", ")
-    }
-}
-
-fn dashboard_route_quality(entry: Option<&ProviderTableEntry>) -> String {
-    let Some(entry) = entry else {
-        return "no provider-table entry".to_owned();
-    };
-    if !dashboard_entry_has_live_heartbeat(entry) {
-        return "live heartbeat pending".to_owned();
-    }
-    let Some(heartbeat) = entry.heartbeat.as_ref() else {
-        return "live heartbeat pending".to_owned();
-    };
-    let mut parts = vec![
-        format!("sat {:.0}%", heartbeat.sat.clamp(0.0, 1.0) * 100.0),
-        format!("slots {}/{}", heartbeat.slots.active, heartbeat.slots.max),
-        format!("ttft {}ms", heartbeat.perf.ttft_ms),
-    ];
-    if let Some(tok_s) = heartbeat.perf.tok_s.filter(|value| value.is_finite()) {
-        parts.push(format!("{tok_s:.1} tok/s"));
-    }
-    if let Some(age) = entry.heartbeat_age_millis {
-        parts.push(format!("age {}ms", age));
-    }
-    parts.join(", ")
-}
-
-fn dashboard_route_status(
-    model: &GatewayModel,
-    candidate: &GatewayRouteCandidate,
-    entry: Option<&ProviderTableEntry>,
-) -> String {
-    let mut details = vec![
-        format!("T{}", candidate.att_tier),
-        candidate.quant.clone(),
-        format!(
-            "rep {}",
-            format_bps_percent(candidate.reputation_bps.min(10_000))
-        ),
-    ];
-    if candidate.kyb.is_some() {
-        details.push("KYB".to_owned());
-    }
-    if candidate
-        .probation
-        .as_ref()
-        .is_some_and(|probation| probation.active)
-    {
-        details.push("probation".to_owned());
-    }
-    let att = entry
-        .and_then(|entry| entry.attestation_head.as_ref())
-        .map(|_| "attested")
-        .unwrap_or("attestation pending");
-    details.push(att.to_owned());
-    let label = if entry
-        .and_then(|entry| entry.heartbeat.as_ref())
-        .is_some_and(|heartbeat| !heartbeat.accepting_new)
-    {
-        r#"<span class="status-dot muted">Draining</span>"#
-    } else if entry.is_some_and(dashboard_entry_has_live_heartbeat) {
-        r#"<span class="status-dot">Online</span>"#
-    } else if model.mayhem.route_candidates.is_empty() {
-        r#"<span class="status-dot muted">Unavailable</span>"#
-    } else {
-        r#"<span class="status-dot muted">Joined</span>"#
-    };
-    let local_run = dashboard_local_run_status(candidate.local_run.as_ref());
-    format!(
-        "{label}<span class=\"privacy-note\">{}</span>{local_run}",
-        html_escape(&details.join(", "))
-    )
-}
-
-fn dashboard_local_run_status(local_run: Option<&GatewayLocalRunBadge>) -> String {
-    let Some(local_run) = local_run else {
-        return String::new();
-    };
-    let tok_s = local_run
-        .estimated_tok_s
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!(" · {value} tok/s est"))
-        .unwrap_or_default();
-    format!(
-        r#"<span class="privacy-note">local {} {} · ctx {}/{}{} · mem {}/{} · download {} · ETA {}</span>"#,
-        html_escape(&local_run.marker),
-        html_escape(&local_run.label),
-        local_run.served_ctx,
-        local_run.requested_ctx,
-        html_escape(&tok_s),
-        html_escape(&local_run.memory_required_human),
-        html_escape(&local_run.memory_budget_human),
-        html_escape(&local_run.download_human),
-        html_escape(&local_run.eta),
-    )
-}
-
-fn dashboard_badges(values: &[String], class_name: &str) -> String {
-    if values.is_empty() {
-        return r#"<span class="privacy-note">none advertised</span>"#.to_owned();
-    }
-    let badges = values
-        .iter()
-        .map(|value| {
-            format!(
-                r#"<span class="{class_name}">{}</span>"#,
-                html_escape(value)
-            )
-        })
-        .collect::<String>();
-    format!(r#"<div class="badge-row">{badges}</div>"#)
-}
-
-#[derive(Clone, Debug)]
-struct DashboardProviderCandidate {
-    provider: String,
-    model_id: String,
-    enclave_id: String,
-    room_id: String,
-    backend: String,
-    served_specialities: BTreeMap<String, Vec<String>>,
-    att_tier: u8,
-    kyb: Option<ProviderKybInfo>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -7650,13 +6942,13 @@ struct DashboardProviderLoadProgress {
     #[serde(default)]
     enclave_id: String,
     #[serde(default)]
-    artifact: String,
-    #[serde(default)]
     label: String,
     #[serde(default)]
     phase: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    error: Option<String>,
     #[serde(default)]
     position: Option<u64>,
     #[serde(default)]
@@ -7665,42 +6957,6 @@ struct DashboardProviderLoadProgress {
     percent: Option<u64>,
     #[serde(default)]
     updated_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-struct DashboardProviderEarningTotals {
-    loaded: bool,
-    total_au: MoneyAu,
-    held_au: MoneyAu,
-    paid_au: MoneyAu,
-    claimable_au: MoneyAu,
-    updated_epoch: Option<u64>,
-    holdback_count: usize,
-}
-
-fn dashboard_provider_candidates(
-    models: &[GatewayModel],
-    provider_filter: Option<&str>,
-) -> Vec<DashboardProviderCandidate> {
-    let mut out = Vec::new();
-    for model in models {
-        for candidate in &model.mayhem.route_candidates {
-            if provider_filter.is_some_and(|provider| provider != candidate.provider) {
-                continue;
-            }
-            out.push(DashboardProviderCandidate {
-                provider: candidate.provider.clone(),
-                model_id: model.id.clone(),
-                enclave_id: candidate.enclave_id.clone(),
-                room_id: candidate.room_id.clone(),
-                backend: primary_endpoint_family(&model.mayhem.adapter).to_owned(),
-                served_specialities: candidate.served_specialities.clone(),
-                att_tier: candidate.att_tier,
-                kyb: candidate.kyb.clone(),
-            });
-        }
-    }
-    out
 }
 
 fn dashboard_provider_load_progress(
@@ -7741,518 +6997,6 @@ fn dashboard_provider_load_progress(
     out
 }
 
-fn dashboard_provider_scope(
-    provider_filter: Option<&str>,
-    candidates: &[DashboardProviderCandidate],
-    receipts: &[StoredReceipt],
-    probes: &[StoredProbeEvent],
-    earnings: &[Value],
-) -> BTreeSet<String> {
-    let mut scope = BTreeSet::new();
-    if let Some(provider) = provider_filter {
-        scope.insert(provider.to_owned());
-        return scope;
-    }
-    for candidate in candidates {
-        scope.insert(candidate.provider.clone());
-    }
-    for receipt in receipts {
-        scope.insert(receipt.receipt.body.provider.clone());
-    }
-    for probe in probes {
-        scope.insert(probe.provider.clone());
-    }
-    for entry in earnings {
-        if let Some(provider) = entry.get("provider").and_then(Value::as_str) {
-            scope.insert(provider.to_owned());
-        }
-    }
-    scope
-}
-
-fn dashboard_provider_in_scope(scope: &BTreeSet<String>, provider: &str) -> bool {
-    scope.is_empty() || scope.contains(provider)
-}
-
-fn dashboard_provider_scope_label(
-    provider_filter: Option<&str>,
-    scope: &BTreeSet<String>,
-) -> String {
-    if let Some(provider) = provider_filter {
-        return format!(
-            "provider {}",
-            html_escape(short_text(provider, 34).as_ref())
-        );
-    }
-    if scope.is_empty() {
-        "all local providers".to_owned()
-    } else {
-        format!("all local providers ({})", scope.len())
-    }
-}
-
-fn dashboard_provider_earning_totals(
-    earnings: &[Value],
-    scope: &BTreeSet<String>,
-) -> DashboardProviderEarningTotals {
-    let mut totals = DashboardProviderEarningTotals {
-        loaded: !earnings.is_empty(),
-        ..DashboardProviderEarningTotals::default()
-    };
-    for entry in earnings {
-        let provider = entry.get("provider").and_then(Value::as_str).unwrap_or("");
-        if !provider.is_empty() && !dashboard_provider_in_scope(scope, provider) {
-            continue;
-        }
-        totals.total_au = totals.total_au.saturating_add(
-            entry
-                .get("total_au")
-                .and_then(value_as_money_au)
-                .unwrap_or(0),
-        );
-        totals.held_au = totals.held_au.saturating_add(
-            entry
-                .get("held_au")
-                .and_then(value_as_money_au)
-                .unwrap_or(0),
-        );
-        totals.paid_au = totals.paid_au.saturating_add(
-            entry
-                .get("paid_cum_au")
-                .and_then(value_as_money_au)
-                .unwrap_or(0),
-        );
-        totals.claimable_au = totals.claimable_au.saturating_add(
-            entry
-                .get("claimable_au")
-                .and_then(value_as_money_au)
-                .unwrap_or(0),
-        );
-        totals.updated_epoch = entry
-            .get("updated_epoch")
-            .and_then(Value::as_u64)
-            .or(totals.updated_epoch)
-            .max(totals.updated_epoch);
-        totals.holdback_count = totals.holdback_count.saturating_add(
-            entry
-                .get("holdbacks")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
-        );
-    }
-    totals
-}
-
-fn dashboard_provider_receipt_au(receipts: &[StoredReceipt], scope: &BTreeSet<String>) -> MoneyAu {
-    receipts
-        .iter()
-        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
-        .map(|receipt| receipt.receipt.body.au_owed_cum)
-        .sum()
-}
-
-fn dashboard_provider_saturation_pct(active_sessions: usize, candidate_count: usize) -> u64 {
-    if candidate_count == 0 {
-        return 0;
-    }
-    ((active_sessions as u64).saturating_mul(100) / candidate_count as u64).min(100)
-}
-
-fn dashboard_provider_reputation_bps(
-    receipts: &[StoredReceipt],
-    probes: &[StoredProbeEvent],
-    scope: &BTreeSet<String>,
-) -> Option<u32> {
-    let mut total = 0_u32;
-    let mut score = 0_u32;
-    for receipt in receipts {
-        if !dashboard_provider_in_scope(scope, &receipt.receipt.body.provider) {
-            continue;
-        }
-        total = total.saturating_add(1);
-        score = score.saturating_add(if receipt.receipt.body.final_receipt {
-            10_000
-        } else {
-            5_000
-        });
-    }
-    for probe in probes {
-        if !dashboard_provider_in_scope(scope, &probe.provider) {
-            continue;
-        }
-        total = total.saturating_add(1);
-        score = score.saturating_add(if probe.pass { 10_000 } else { 0 });
-    }
-    if total == 0 {
-        None
-    } else {
-        Some(score / total)
-    }
-}
-
-fn dashboard_provider_enclave_rows(
-    candidates: &[DashboardProviderCandidate],
-    receipts: &[StoredReceipt],
-    load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
-    provider_filter: Option<&str>,
-    now_ms: u64,
-) -> String {
-    let mut seen = BTreeSet::new();
-    let mut rows = candidates
-        .iter()
-        .take(10)
-        .map(|candidate| {
-            seen.insert((candidate.provider.clone(), candidate.enclave_id.clone()));
-            let active = receipts
-                .iter()
-                .filter(|receipt| {
-                    receipt.receipt.body.provider == candidate.provider
-                        && receipt.receipt.body.model_id == candidate.model_id
-                        && !receipt.receipt.body.final_receipt
-                })
-                .count();
-            let saturation = dashboard_provider_saturation_pct(active, 1);
-            let kyb = candidate
-                .kyb
-                .as_ref()
-                .map(|identity| {
-                    format!(
-                        " · KYB {} ({})",
-                        html_escape(&identity.legal_name),
-                        html_escape(&identity.jurisdiction)
-                    )
-                })
-                .unwrap_or_default();
-            let status = dashboard_provider_enclave_status(load_progress.get(&(
-                candidate.provider.clone(),
-                candidate.enclave_id.clone(),
-            )));
-            let speciality_badges = dashboard_badges(
-                &candidate
-                    .served_specialities
-                    .iter()
-                    .map(|(name, levels)| format!("{name}:{}", levels.join("|")))
-                    .collect::<Vec<_>>(),
-                "badge",
-            );
-            format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span>{speciality_badges}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td>{}</td></tr>"#,
-                html_escape(short_text(&candidate.model_id, 30).as_ref()),
-                html_escape(short_text(&candidate.enclave_id, 22).as_ref()),
-                html_escape(&candidate.backend),
-                candidate.att_tier,
-                kyb,
-                saturation,
-                saturation,
-                status,
-            )
-        })
-        .collect::<String>();
-    let remaining = 10_usize.saturating_sub(seen.len());
-    for ((_, _), progress) in load_progress
-        .iter()
-        .filter(|((provider, enclave_id), _)| {
-            provider_filter.map_or(true, |filter| filter == provider)
-                && !seen.contains(&(provider.clone(), enclave_id.clone()))
-        })
-        .filter(|(_, progress)| dashboard_provider_progress_only_fresh(progress, now_ms))
-        .take(remaining)
-    {
-        rows.push_str(&dashboard_provider_progress_only_row(progress));
-    }
-    if rows.is_empty() {
-        return r#"<tr><td colspan="5"><span class="privacy-note">No provider routes loaded</span></td></tr>"#
-            .to_owned();
-    }
-    rows
-}
-
-fn dashboard_provider_loading_row_count(
-    candidates: &[DashboardProviderCandidate],
-    load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
-    provider_filter: Option<&str>,
-    now_ms: u64,
-) -> usize {
-    let seen = candidates
-        .iter()
-        .map(|candidate| (candidate.provider.clone(), candidate.enclave_id.clone()))
-        .collect::<BTreeSet<_>>();
-    load_progress
-        .iter()
-        .filter(|((provider, enclave_id), _)| {
-            provider_filter.map_or(true, |filter| filter == provider)
-                && !seen.contains(&(provider.clone(), enclave_id.clone()))
-        })
-        .filter(|(_, progress)| dashboard_provider_progress_only_fresh(progress, now_ms))
-        .count()
-}
-
-fn dashboard_provider_progress_only_fresh(
-    progress: &DashboardProviderLoadProgress,
-    now_ms: u64,
-) -> bool {
-    progress.updated_at_ms > 0
-        && now_ms.saturating_sub(progress.updated_at_ms) <= DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS
-}
-
-fn dashboard_provider_progress_only_row(progress: &DashboardProviderLoadProgress) -> String {
-    let model = if progress.model_id.trim().is_empty() {
-        "local provider load"
-    } else {
-        progress.model_id.trim()
-    };
-    let backend = if progress.artifact.trim().is_empty() {
-        "loading"
-    } else {
-        progress.artifact.trim()
-    };
-    format!(
-        r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">pending</td><td><div class="mini-bar"><span style="--w:0%"></span></div><span class="privacy-note">0%</span></td><td>{}</td></tr>"#,
-        html_escape(short_text(model, 30).as_ref()),
-        html_escape(short_text(&progress.enclave_id, 22).as_ref()),
-        html_escape(backend),
-        dashboard_provider_enclave_status(Some(progress)),
-    )
-}
-
-fn dashboard_provider_enclave_status(progress: Option<&DashboardProviderLoadProgress>) -> String {
-    let Some(progress) = progress else {
-        return r#"<span class="status-dot">Serving</span>"#.to_owned();
-    };
-    let phase = progress.phase.trim();
-    let status = progress.status.trim();
-    if status == "complete" && (phase == "serving" || phase == "joined") {
-        let label = if phase == "joined" {
-            "Joined"
-        } else {
-            "Serving"
-        };
-        return format!(r#"<span class="status-dot">{label}</span>"#);
-    }
-    if status == "error" {
-        let detail = non_empty_load_label(progress);
-        return format!(
-            r#"<div class="load-cell"><span class="status-dot muted">Load failed</span><span class="privacy-note">{}</span></div>"#,
-            html_escape(&detail),
-        );
-    }
-    let percent = progress
-        .percent
-        .or_else(|| dashboard_provider_progress_percent(progress.position, progress.total))
-        .unwrap_or(0)
-        .min(100);
-    let phase_label = if phase.is_empty() { "load" } else { phase };
-    let headline = if status == "complete" {
-        "Ready"
-    } else {
-        "Loading"
-    };
-    format!(
-        r#"<div class="load-cell"><span class="status-dot">{headline}</span><div class="mini-bar"><span style="--w:{percent}%"></span></div><span class="privacy-note">{} {}%</span></div>"#,
-        html_escape(phase_label),
-        percent,
-    )
-}
-
-fn dashboard_provider_progress_percent(position: Option<u64>, total: Option<u64>) -> Option<u64> {
-    match (position, total) {
-        (Some(position), Some(total)) if total > 0 => {
-            Some(((u128::from(position) * 100) / u128::from(total)).min(100) as u64)
-        }
-        _ => None,
-    }
-}
-
-fn non_empty_load_label(progress: &DashboardProviderLoadProgress) -> String {
-    if progress.phase.trim().is_empty() {
-        progress.label.clone()
-    } else {
-        progress.phase.clone()
-    }
-}
-
-fn dashboard_provider_live_session_rows(
-    receipts: &[StoredReceipt],
-    candidates: &[DashboardProviderCandidate],
-    scope: &BTreeSet<String>,
-) -> String {
-    let scoped = receipts
-        .iter()
-        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
-        .take(8)
-        .collect::<Vec<_>>();
-    if scoped.is_empty() {
-        return r#"<tr><td colspan="5"><span class="privacy-note">No served sessions yet</span></td></tr>"#
-            .to_owned();
-    }
-    scoped
-        .into_iter()
-        .map(|receipt| {
-            let body = &receipt.receipt.body;
-            let room = candidates
-                .iter()
-                .find(|candidate| {
-                    candidate.provider == body.provider
-                        && candidate.model_id == body.model_id
-                        && candidate.enclave_id == body.enclave_id
-                })
-                .map(|candidate| candidate.room_id.as_str())
-                .unwrap_or("room not loaded");
-            let status = if body.final_receipt {
-                r#"<span class="status-dot muted">Completed</span>"#
-            } else {
-                r#"<span class="status-dot">Streaming</span>"#
-            };
-            format!(
-                r#"<tr><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}</td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
-                html_escape(short_text(room, 18).as_ref()),
-                html_escape(short_text(&body.model_id, 24).as_ref()),
-                body.usage.prompt_tokens(),
-                body.usage.output_tokens(),
-                format_elapsed_since(body.ts),
-            )
-        })
-        .collect::<String>()
-}
-
-fn dashboard_provider_earnings_body(
-    receipts: &[StoredReceipt],
-    scope: &BTreeSet<String>,
-    totals: &DashboardProviderEarningTotals,
-) -> String {
-    if totals.loaded {
-        let max = totals
-            .total_au
-            .max(totals.held_au)
-            .max(totals.paid_au)
-            .max(totals.claimable_au)
-            .max(1);
-        let bars = [
-            ("total", totals.total_au),
-            ("held", totals.held_au),
-            ("paid", totals.paid_au),
-            ("claimable", totals.claimable_au),
-        ]
-        .into_iter()
-        .map(|(label, value)| {
-            let height = 8 + value.saturating_mul(92) / max;
-            format!(
-                r#"<span class="bar" style="--h:{height}%" title="{label} {}"></span>"#,
-                format_au_usd(value)
-            )
-        })
-        .collect::<String>();
-        return format!(r#"<div class="spend-bars">{bars}</div>"#);
-    }
-    let scoped = receipts
-        .iter()
-        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
-        .cloned()
-        .collect::<Vec<_>>();
-    dashboard_spend_body(&scoped)
-}
-
-fn dashboard_provider_holdback_body(totals: &DashboardProviderEarningTotals) -> String {
-    if !totals.loaded {
-        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>Ledger holdback not loaded</p></div></div>"#
-            .to_owned();
-    }
-    let held_pct = if totals.total_au == 0 {
-        0
-    } else {
-        totals.held_au.saturating_mul(100) / totals.total_au
-    };
-    format!(
-        r#"<div class="detail-grid"><div><span class="label">Held</span><p class="value mono">{}</p></div><div><span class="label">Release buckets</span><p class="value mono">{}</p></div><div><span class="label">Released</span><p class="value mono">{}</p></div><div><span class="label">Claim model</span><p class="value mono">TAP claim</p></div></div><div class="mini-bar"><span style="--w:{}%"></span></div>"#,
-        format_au_usd(totals.held_au),
-        totals.holdback_count,
-        format_au_usd(totals.claimable_au),
-        held_pct.min(100),
-    )
-}
-
-fn dashboard_provider_hwprobe_body(
-    candidates: &[DashboardProviderCandidate],
-    probes: &[StoredProbeEvent],
-    scope: &BTreeSet<String>,
-) -> String {
-    let last_probe = probes
-        .iter()
-        .filter(|probe| dashboard_provider_in_scope(scope, &probe.provider))
-        .max_by_key(|probe| {
-            probe
-                .evidence
-                .get("at")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-        });
-    let max_tier = candidates
-        .iter()
-        .map(|candidate| candidate.att_tier)
-        .max()
-        .unwrap_or(0);
-    let max_tier_label = if max_tier == 0 {
-        "not loaded".to_owned()
-    } else {
-        format!("T{max_tier}")
-    };
-    let workers = candidates
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.provider.as_str(),
-                candidate.enclave_id.as_str(),
-                candidate.room_id.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len();
-    let markets = candidates
-        .iter()
-        .map(|candidate| candidate.model_id.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let last_probe_label = last_probe
-        .map(|probe| {
-            if probe.pass {
-                format!("probe ok {}", format_bps_percent(probe.match_bps))
-            } else {
-                format!("probe fail {}", format_bps_percent(probe.match_bps))
-            }
-        })
-        .unwrap_or_else(|| "no probe evidence".to_owned());
-    format!(
-        r#"<div class="detail-grid"><div><span class="label">Workers</span><p class="value mono">{workers}</p></div><div><span class="label">Markets</span><p class="value mono">{markets}</p></div><div><span class="label">Max tier</span><p class="value mono">{}</p></div><div><span class="label">Last probe</span><p class="value mono">{}</p></div></div>"#,
-        html_escape(&max_tier_label),
-        html_escape(&last_probe_label),
-    )
-}
-
-fn dashboard_provider_claim_body(
-    provider_filter: Option<&str>,
-    scope: &BTreeSet<String>,
-    totals: &DashboardProviderEarningTotals,
-) -> String {
-    let provider_arg = provider_filter
-        .or_else(|| scope.iter().next().map(String::as_str))
-        .map(|provider| format!(" --provider {}", shell_single_quote_dashboard(provider)))
-        .unwrap_or_default();
-    let claimable = if totals.loaded {
-        format_au_usd(totals.claimable_au)
-    } else {
-        "not loaded".to_owned()
-    };
-    format!(
-        r#"<div class="detail-grid"><div><span class="label">Claimable</span><p class="value mono">{claimable}</p></div><div><span class="label">Payout target</span><p class="value mono">claim proof required</p></div></div><pre>mayhem earnings{provider_arg} --json
-mayhem withdraw --claim-proof &lt;claim-proof.json&gt; --account &lt;tap-account&gt; --json</pre>"#
-    )
-}
-
-fn format_bps_percent(bps: u32) -> String {
-    format!("{}.{:02}%", bps / 100, bps % 100)
-}
-
 fn format_elapsed_since(ts: u64) -> String {
     let age = now_secs().saturating_sub(ts);
     if age < 60 {
@@ -8262,10 +7006,6 @@ fn format_elapsed_since(ts: u64) -> String {
     } else {
         format!("{}h", age / 3_600)
     }
-}
-
-fn shell_single_quote_dashboard(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn dashboard_latest_receipts(receipts: &[StoredReceipt]) -> Vec<StoredReceipt> {
@@ -8291,1422 +7031,63 @@ fn dashboard_latest_receipts(receipts: &[StoredReceipt]) -> Vec<StoredReceipt> {
     out
 }
 
-fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
-    if receipts.is_empty() {
-        return r#"<tr><td colspan="5"><span class="privacy-note">No sessions yet</span></td></tr>"#
-            .to_owned();
-    }
-    receipts
-        .iter()
-        .take(8)
-        .map(|receipt| {
-            let body = &receipt.receipt.body;
-            let status = if body.final_receipt {
-                r#"<span class="status-dot muted">Completed</span>"#
-            } else {
-                r#"<span class="status-dot">Running</span>"#
-            };
-            let attribution = if body.usage_attribution.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    r#"<p class="privacy-note">{}</p>"#,
-                    html_escape(
-                        &body
-                            .usage_attribution
-                            .iter()
-                            .map(|(axis, units)| format!("{axis} {units}"))
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    )
-                )
-            };
-            format!(
-                r#"<tr><td class="mono">{}</td><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td><span class="mono">{}/{}</span>{attribution}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
-                html_escape(short_text(&body.model_id, 28).as_ref()),
-                html_escape(short_text(&body.provider, 18).as_ref()),
-                body.usage.prompt_tokens(),
-                body.usage.output_tokens(),
-                format_au_usd(body.au_owed_cum),
-            )
-        })
-        .collect::<String>()
-}
-
-fn dashboard_model_rows(models: &[GatewayModel], entries: &[ProviderTableEntry]) -> String {
-    if models.is_empty() {
-        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No models loaded</p></div></div>"#
-            .to_owned();
-    }
-    let tier_tooltip = html_escape(dashboard_tier_tooltip());
-    models
-        .iter()
-        .take(6)
-        .map(|model| {
-            let route_count = model.mayhem.route_candidates.len();
-            let worker_label = match route_count {
-                0 => "0 worker routes".to_owned(),
-                1 => "1 worker route".to_owned(),
-                count => format!("{count} worker routes"),
-            };
-            let availability = if dashboard_model_has_live_provider(model, entries) {
-                r#"<span class="status-dot">Online</span>"#
-            } else {
-                r#"<span class="status-dot muted">Offline</span>"#
-            };
-            let max_tier = model
-                .mayhem
-                .attestation_tiers
-                .values()
-                .copied()
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            let kyb = model
-                .mayhem
-                .kyb_identities
-                .first()
-                .map(|identity| {
-                    format!(
-                        " · verified: {} ({})",
-                        html_escape(&identity.legal_name),
-                        html_escape(&identity.jurisdiction)
-                    )
-                })
-                .unwrap_or_default();
-            let abilities = dashboard_badges(&dashboard_model_abilities(model), "badge");
-            format!(
-                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {} · {}</div>{abilities}</div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
-                html_escape(&model.id),
-                tier_tooltip,
-                tier_tooltip,
-                html_escape(&model.mayhem.model_class),
-                html_escape(&dashboard_model_price(model)),
-                max_tier,
-                kyb,
-                html_escape(&worker_label),
-                availability,
-            )
-        })
-        .collect::<String>()
-}
-
 fn dashboard_model_price(model: &GatewayModel) -> String {
     dashboard_price(&model.mayhem.price_ref_au)
 }
 
-#[derive(Clone, Debug)]
-struct DashboardPricePoint {
-    epoch: u64,
-    price_au: MoneyAu,
-    volume_au: MoneyAu,
-    pinned: bool,
-    ctx_bracket: String,
-    title: String,
-}
-
-#[derive(Clone, Debug)]
-struct DashboardPriceSeries {
-    tier: String,
-    quant: String,
-    unit: String,
-    granularity: u64,
-    ctx_bracket: String,
-    price_ver: u64,
-    points: Vec<DashboardPricePoint>,
-}
-
-#[derive(Clone, Debug)]
-struct DashboardPriceCandle {
-    start_epoch: u64,
-    end_epoch: u64,
-    open_au: MoneyAu,
-    high_au: MoneyAu,
-    low_au: MoneyAu,
-    close_au: MoneyAu,
-    volume_au: MoneyAu,
-    pinned: bool,
-    title: String,
-}
-
-fn dashboard_price_chart_cards(
-    models: &[GatewayModel],
-    options: &DashboardChartOptions,
-    provider_scope: Option<&BTreeSet<String>>,
-) -> String {
-    let mut ordered = models
-        .iter()
-        .filter(|model| match provider_scope {
-            Some(scope) => model
-                .mayhem
-                .route_candidates
-                .iter()
-                .any(|candidate| dashboard_provider_in_scope(scope, &candidate.provider)),
-            None => true,
-        })
-        .collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        let left_pin = dashboard_pin_rank(options, &left.id);
-        let right_pin = dashboard_pin_rank(options, &right.id);
-        left_pin
-            .cmp(&right_pin)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    if ordered.is_empty() {
-        return r#"<section class="price-chart-grid"><article class="card price-chart-card price-chart-empty"><div class="empty-state"><div><div class="empty-icon"></div><p>No price markets loaded</p></div></div></article></section>"#
-            .to_owned();
-    }
-    let cards = ordered
-        .into_iter()
-        .map(|model| dashboard_price_chart_card(model, options, provider_scope))
-        .collect::<String>();
-    format!(r#"<section class="price-chart-grid">{cards}</section>"#)
-}
-
-fn dashboard_pin_rank(options: &DashboardChartOptions, model_id: &str) -> (bool, usize) {
-    options
-        .pinned_models
-        .iter()
-        .position(|model| model == model_id)
-        .map(|index| (false, index))
-        .unwrap_or((true, usize::MAX))
-}
-
-fn dashboard_price_chart_card(
-    model: &GatewayModel,
-    options: &DashboardChartOptions,
-    provider_scope: Option<&BTreeSet<String>>,
-) -> String {
-    let series = dashboard_model_price_series(model, provider_scope);
-    let pinned = options.pinned_models.iter().any(|id| id == &model.id);
-    let mut next_pins = options.pinned_models.clone();
-    next_pins.retain(|id| id != &model.id);
-    let pin_label = if pinned {
-        "Following"
-    } else {
-        next_pins.insert(0, model.id.clone());
-        "Follow"
+fn dashboard_rate_price(entry: &mayhem_proto::RateMapEntry) -> String {
+    let token_label = match entry.unit.as_str() {
+        "input_token" => Some("input tokens"),
+        "cached_input_token" => Some("cached input tokens"),
+        "output_token" => Some("output tokens"),
+        _ => None,
     };
-    let fallback_tier = options.selected_tier.as_deref().unwrap_or("T1");
-    let fallback_quant = options
-        .selected_quant
-        .as_deref()
-        .unwrap_or(DEFAULT_QUANT_BUCKET);
-    let fallback_unit = options
-        .selected_unit
-        .as_deref()
-        .unwrap_or(USAGE_INPUT_TOKEN);
-    let fallback_bucket = options.selected_bucket.as_deref().unwrap_or("base");
-    let empty_pin_href = dashboard_chart_href(
-        options,
-        Some(fallback_tier),
-        options.selected_timeframe,
-        Some(fallback_bucket),
-        Some(fallback_quant),
-        Some(fallback_unit),
-        Some(&next_pins),
-    );
-    if series.is_empty() {
-        return format!(
-            r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2></div><a class="copy-chip" href="{}">{pin_label}</a></div><div class="empty-state price-chart-empty"><div><div class="empty-icon"></div><p>Price history pending</p></div></div></article>"#,
-            html_escape(&model.id),
-            html_escape(&empty_pin_href),
-        );
+    if let Some(label) = token_label {
+        let granularity = u128::from(entry.granularity);
+        if granularity > 0 && 1_000_000_u128 % granularity == 0 {
+            let multiplier = 1_000_000_u128 / granularity;
+            if let Some(display_price) = entry.per_unit_au.checked_mul(multiplier) {
+                return format!("{} / 1M {label}", format_au_usd(display_price));
+            }
+        }
     }
-
-    let tiers = dashboard_unique_series_values(series.iter().map(|entry| entry.tier.as_str()));
-    let selected_tier = options
-        .selected_tier
-        .as_ref()
-        .filter(|tier| tiers.iter().any(|entry| entry == *tier))
-        .cloned()
-        .unwrap_or_else(|| tiers.first().cloned().unwrap_or_else(|| "T1".to_owned()));
-    let tier_series = series
-        .iter()
-        .filter(|entry| entry.tier == selected_tier)
-        .collect::<Vec<_>>();
-    let quants =
-        dashboard_unique_series_values(tier_series.iter().map(|entry| entry.quant.as_str()));
-    let selected_quant = options
-        .selected_quant
-        .as_ref()
-        .filter(|quant| quants.iter().any(|entry| entry == *quant))
-        .cloned()
-        .unwrap_or_else(|| {
-            quants
-                .first()
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned())
-        });
-    let quant_series = tier_series
-        .into_iter()
-        .filter(|entry| entry.quant == selected_quant)
-        .collect::<Vec<_>>();
-    let units =
-        dashboard_unique_series_values(quant_series.iter().map(|entry| entry.unit.as_str()));
-    let selected_unit = options
-        .selected_unit
-        .as_ref()
-        .filter(|unit| units.iter().any(|entry| entry == *unit))
-        .cloned()
-        .unwrap_or_else(|| {
-            units
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "request".to_owned())
-        });
-    let unit_series = quant_series
-        .into_iter()
-        .filter(|entry| entry.unit == selected_unit)
-        .collect::<Vec<_>>();
-    let buckets =
-        dashboard_unique_series_values(unit_series.iter().map(|entry| entry.ctx_bracket.as_str()));
-    let selected_bucket = options
-        .selected_bucket
-        .as_ref()
-        .filter(|bucket| buckets.iter().any(|entry| entry == *bucket))
-        .cloned()
-        .unwrap_or_else(|| {
-            buckets
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "base".to_owned())
-        });
-    let selected = unit_series
-        .iter()
-        .find(|entry| entry.ctx_bracket == selected_bucket)
-        .copied()
-        .unwrap_or(unit_series[0]);
-    let overlays = unit_series
-        .iter()
-        .filter(|entry| entry.ctx_bracket != selected.ctx_bracket)
-        .copied()
-        .collect::<Vec<_>>();
-    let pin_href = dashboard_chart_href(
-        options,
-        Some(&selected_tier),
-        options.selected_timeframe,
-        Some(&selected_bucket),
-        Some(&selected_quant),
-        Some(&selected_unit),
-        Some(&next_pins),
-    );
-    let controls = dashboard_price_chart_controls(
-        options,
-        &tiers,
-        &selected_tier,
-        &quants,
-        &selected_quant,
-        &units,
-        &selected_unit,
-        &buckets,
-        &selected_bucket,
-    );
-    let chart = dashboard_price_chart_svg(selected, &overlays, options.selected_timeframe);
-    let latest = selected.points.last();
-    let latest_epoch = latest
-        .map(|point| point.epoch.to_string())
-        .unwrap_or_else(|| "?".to_owned());
-    let latest_price = latest
-        .map(|point| {
-            format!(
-                "{} / {} {}",
-                format_au_usd(point.price_au),
-                selected.granularity,
-                selected.unit
-            )
-        })
-        .unwrap_or_else(|| "pending".to_owned());
-    let volume = latest
-        .map(|point| format!("{} volume", format_au_usd(point.volume_au)))
-        .unwrap_or_else(|| "$0.00 volume".to_owned());
     format!(
-        r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {} · {} per {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{} / {}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
-        html_escape(&model.id),
-        html_escape(&selected_tier),
-        html_escape(&selected_quant),
-        html_escape(&selected.ctx_bracket),
-        selected.granularity,
-        html_escape(&selected.unit),
-        html_escape(&pin_href),
-        html_escape(&selected.unit),
-        selected.granularity,
-        html_escape(options.selected_timeframe.label()),
-        html_escape(&selected.ctx_bracket),
-        html_escape(&format!("price v{}", selected.price_ver)),
-        if latest.is_some_and(|point| point.pinned) {
-            "pinned/no-volume"
-        } else {
-            "settled"
-        },
+        "{} / {} {}",
+        format_au_usd(entry.per_unit_au),
+        entry.granularity,
+        entry.unit.replace('_', " ")
     )
-}
-
-fn dashboard_unique_series_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
-    values
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn dashboard_price_chart_controls(
-    options: &DashboardChartOptions,
-    tiers: &[String],
-    selected_tier: &str,
-    quants: &[String],
-    selected_quant: &str,
-    units: &[String],
-    selected_unit: &str,
-    buckets: &[String],
-    selected_bucket: &str,
-) -> String {
-    let tier_links = tiers
-        .iter()
-        .map(|tier| {
-            let href = dashboard_chart_href(
-                options,
-                Some(tier),
-                options.selected_timeframe,
-                Some(selected_bucket),
-                Some(selected_quant),
-                Some(selected_unit),
-                None,
-            );
-            dashboard_segment_link(tier, &href, tier == selected_tier)
-        })
-        .collect::<String>();
-    let time_links = [
-        DashboardPriceTimeframe::H1,
-        DashboardPriceTimeframe::H4,
-        DashboardPriceTimeframe::D1,
-        DashboardPriceTimeframe::W1,
-    ]
-    .into_iter()
-    .map(|timeframe| {
-        let href = dashboard_chart_href(
-            options,
-            Some(selected_tier),
-            timeframe,
-            Some(selected_bucket),
-            Some(selected_quant),
-            Some(selected_unit),
-            None,
-        );
-        dashboard_segment_link(
-            timeframe.label(),
-            &href,
-            timeframe == options.selected_timeframe,
-        )
-    })
-    .collect::<String>();
-    let quant_links = quants
-        .iter()
-        .map(|quant| {
-            let href = dashboard_chart_href(
-                options,
-                Some(selected_tier),
-                options.selected_timeframe,
-                Some(selected_bucket),
-                Some(quant),
-                Some(selected_unit),
-                None,
-            );
-            dashboard_segment_link(quant, &href, quant == selected_quant)
-        })
-        .collect::<String>();
-    let unit_links = units
-        .iter()
-        .map(|unit| {
-            let href = dashboard_chart_href(
-                options,
-                Some(selected_tier),
-                options.selected_timeframe,
-                Some(selected_bucket),
-                Some(selected_quant),
-                Some(unit),
-                None,
-            );
-            dashboard_segment_link(unit, &href, unit == selected_unit)
-        })
-        .collect::<String>();
-    let bucket_links = buckets
-        .iter()
-        .map(|bucket| {
-            let href = dashboard_chart_href(
-                options,
-                Some(selected_tier),
-                options.selected_timeframe,
-                Some(bucket),
-                Some(selected_quant),
-                Some(selected_unit),
-                None,
-            );
-            dashboard_segment_link(bucket, &href, bucket == selected_bucket)
-        })
-        .collect::<String>();
-    format!(
-        r#"<div class="price-chart-toolbar"><div class="price-chart-control"><span class="label">Tier</span><div class="segmented">{tier_links}</div></div><div class="price-chart-control"><span class="label">Timeframe</span><div class="segmented">{time_links}</div></div><div class="price-chart-control"><span class="label">Quant</span><div class="segmented">{quant_links}</div></div><div class="price-chart-control"><span class="label">Unit</span><div class="segmented">{unit_links}</div></div><div class="price-chart-control"><span class="label">Ctx bucket</span><div class="segmented">{bucket_links}</div></div></div>"#
-    )
-}
-
-fn dashboard_segment_link(label: &str, href: &str, active: bool) -> String {
-    let class = if active { "segment active" } else { "segment" };
-    format!(
-        r#"<a class="{class}" href="{}">{}</a>"#,
-        html_escape(href),
-        html_escape(label),
-    )
-}
-
-fn dashboard_chart_href(
-    options: &DashboardChartOptions,
-    tier: Option<&str>,
-    timeframe: DashboardPriceTimeframe,
-    bucket: Option<&str>,
-    quant: Option<&str>,
-    unit: Option<&str>,
-    pin_override: Option<&[String]>,
-) -> String {
-    let mut query = Vec::new();
-    if let Some(provider) = options.provider_filter.as_deref() {
-        query.push(format!("provider={}", dashboard_url_encode(provider)));
-    }
-    if let Some(tier) = tier {
-        query.push(format!("tier={}", dashboard_url_encode(tier)));
-    }
-    query.push(format!("tf={}", timeframe.code()));
-    if let Some(bucket) = bucket.filter(|value| !value.is_empty()) {
-        query.push(format!("bucket={}", dashboard_url_encode(bucket)));
-    }
-    if let Some(quant) = quant.filter(|value| !value.is_empty()) {
-        query.push(format!("quant={}", dashboard_url_encode(quant)));
-    }
-    if let Some(unit) = unit.filter(|value| !value.is_empty()) {
-        query.push(format!("unit={}", dashboard_url_encode(unit)));
-    }
-    if let Some((name, level)) = options.selected_speciality.as_ref() {
-        query.push(format!(
-            "speciality={}",
-            dashboard_url_encode(&format!("{name}={level}"))
-        ));
-    }
-    let pins = pin_override.unwrap_or(&options.pinned_models);
-    if pin_override.is_some() {
-        if pins.is_empty() {
-            query.push("pin=clear".to_owned());
-        } else {
-            query.push(format!(
-                "pin={}",
-                pins.iter()
-                    .map(|pin| dashboard_url_encode(pin))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-        }
-    } else if !pins.is_empty() {
-        query.push(format!(
-            "pin={}",
-            pins.iter()
-                .map(|pin| dashboard_url_encode(pin))
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    format!("{}?{}", options.surface.base_path(), query.join("&"))
-}
-
-fn dashboard_model_price_series(
-    model: &GatewayModel,
-    provider_scope: Option<&BTreeSet<String>>,
-) -> Vec<DashboardPriceSeries> {
-    let mut by_key: BTreeMap<(String, String, String, String), DashboardPriceSeries> =
-        BTreeMap::new();
-    if provider_scope.is_none() {
-        for market in &model.mayhem.markets {
-            let tier = format!("T{}", market.att_tier.max(1));
-            let quant = normalize_quant_bucket(&market.quant)
-                .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
-            for mut series in dashboard_price_series_from_price(&market.price_ref_au, &tier, &quant)
-            {
-                if let Some(ctx_bracket) = market.ctx_bracket.as_ref() {
-                    if series.ctx_bracket == "base" {
-                        series.ctx_bracket = ctx_bracket.clone();
-                    }
-                    for point in &mut series.points {
-                        if point.ctx_bracket == "base" {
-                            point.ctx_bracket = ctx_bracket.clone();
-                        }
-                    }
-                }
-                let key = (
-                    series.tier.clone(),
-                    series.quant.clone(),
-                    series.unit.clone(),
-                    series.ctx_bracket.clone(),
-                );
-                by_key.insert(key, series);
-            }
-        }
-    }
-    for candidate in &model.mayhem.route_candidates {
-        if let Some(scope) = provider_scope {
-            if !dashboard_provider_in_scope(scope, &candidate.provider) {
-                continue;
-            }
-        }
-        let price = route_price_ref_au(model, Some(candidate));
-        let tier = format!("T{}", candidate.att_tier.max(1));
-        let quant = normalize_quant_bucket(&candidate.quant)
-            .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
-        for series in dashboard_price_series_from_price(price, &tier, &quant) {
-            let key = (
-                series.tier.clone(),
-                series.quant.clone(),
-                series.unit.clone(),
-                series.ctx_bracket.clone(),
-            );
-            by_key
-                .entry(key)
-                .and_modify(|existing| {
-                    if series.points.len() > existing.points.len() {
-                        *existing = series.clone();
-                    }
-                })
-                .or_insert(series);
-        }
-    }
-    if by_key.is_empty() && provider_scope.is_none() {
-        let tier = model
-            .mayhem
-            .attestation_tiers
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "T1".to_owned());
-        let quant = model
-            .mayhem
-            .quant_buckets
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned());
-        for series in dashboard_price_series_from_price(&model.mayhem.price_ref_au, &tier, &quant) {
-            by_key.insert(
-                (
-                    series.tier.clone(),
-                    series.quant.clone(),
-                    series.unit.clone(),
-                    series.ctx_bracket.clone(),
-                ),
-                series,
-            );
-        }
-    }
-    by_key.into_values().collect()
-}
-
-fn dashboard_price_series_from_price(
-    price: &PriceRefAu,
-    tier: &str,
-    quant: &str,
-) -> Vec<DashboardPriceSeries> {
-    let fallback;
-    let rate_map = if price.rate_map.is_empty() {
-        fallback = vec![RateMapEntry {
-            unit: "request".to_owned(),
-            per_unit_au: price.per_req_au.max(price.min_session_au).max(1),
-            granularity: 1,
-        }];
-        fallback.as_slice()
-    } else {
-        price.rate_map.as_slice()
-    };
-    rate_map
-        .iter()
-        .filter(|rate| !rate.unit.trim().is_empty() && rate.granularity > 0)
-        .map(|rate| dashboard_price_series_for_unit(price, tier, quant, rate))
-        .collect()
-}
-
-fn dashboard_price_series_for_unit(
-    price: &PriceRefAu,
-    tier: &str,
-    quant: &str,
-    rate: &RateMapEntry,
-) -> DashboardPriceSeries {
-    let mut points = dashboard_price_points_from_price(price, rate);
-    points.sort_by_key(|point| point.epoch);
-    let ctx_bracket = points
-        .last()
-        .map(|point| point.ctx_bracket.clone())
-        .or_else(|| {
-            price
-                .derivation
-                .as_ref()
-                .and_then(dashboard_ctx_bracket_from_derivation)
-        })
-        .unwrap_or_else(|| "base".to_owned());
-    DashboardPriceSeries {
-        tier: tier.to_owned(),
-        quant: quant.to_owned(),
-        unit: rate.unit.clone(),
-        granularity: rate.granularity,
-        ctx_bracket,
-        price_ver: price.ver,
-        points,
-    }
-}
-
-fn dashboard_price_points_from_price(
-    price: &PriceRefAu,
-    rate: &RateMapEntry,
-) -> Vec<DashboardPricePoint> {
-    let fallback_price = rate.per_unit_au.max(1);
-    let history = if price.history.is_empty() {
-        price.derivation.iter().collect::<Vec<_>>()
-    } else {
-        price.history.iter().collect::<Vec<_>>()
-    };
-    let mut points = history
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, derivation)| {
-            let (historical_price, historical_granularity) =
-                dashboard_derivation_unit_rate(derivation, &rate.unit)?;
-            let volume_au = dashboard_derivation_volume_au(derivation);
-            let pinned = dashboard_derivation_pinned(derivation, volume_au);
-            Some(DashboardPricePoint {
-                epoch: derivation_u64(derivation, &["epoch"]).unwrap_or(index as u64),
-                price_au: dashboard_normalize_unit_rate(
-                    historical_price,
-                    historical_granularity,
-                    rate.granularity,
-                )
-                .max(1),
-                volume_au,
-                pinned,
-                ctx_bracket: dashboard_ctx_bracket_from_derivation(derivation)
-                    .unwrap_or_else(|| "base".to_owned()),
-                title: format!(
-                    "{} · {} / {} {}",
-                    dashboard_price_derivation_summary(derivation),
-                    format_au_usd(historical_price),
-                    historical_granularity,
-                    rate.unit
-                ),
-            })
-        })
-        .collect::<Vec<_>>();
-    if points.is_empty() {
-        points.push(DashboardPricePoint {
-            epoch: price.ver,
-            price_au: fallback_price,
-            volume_au: 0,
-            pinned: true,
-            ctx_bracket: "base".to_owned(),
-            title: format!(
-                "price v{} · {} / {} {} · derivation pending",
-                price.ver,
-                format_au_usd(fallback_price),
-                rate.granularity,
-                rate.unit
-            ),
-        });
-    }
-    points
-}
-
-fn dashboard_derivation_unit_rate(derivation: &Value, unit: &str) -> Option<(MoneyAu, u64)> {
-    for path in [
-        &["result_price", "rate_map"][..],
-        &["rate_map"][..],
-        &["seed_price", "rate_map"][..],
-    ] {
-        if let Some(rate) = derivation_value(derivation, path)
-            .and_then(dashboard_rate_map_from_value)
-            .and_then(|rates| rates.into_iter().find(|rate| rate.unit == unit))
-        {
-            return Some((rate.per_unit_au, rate.granularity));
-        }
-    }
-    if matches!(
-        unit,
-        USAGE_INPUT_TOKEN | USAGE_CACHED_INPUT_TOKEN | USAGE_OUTPUT_TOKEN
-    ) {
-        let input = derivation_value(derivation, &["result_price", "in_per_1k"])
-            .and_then(value_as_money_au)?;
-        let output = derivation_value(derivation, &["result_price", "out_per_1k"])
-            .and_then(value_as_money_au)
-            .unwrap_or(0);
-        let rate = text_generation_rate_map(input, output)
-            .into_iter()
-            .find(|rate| rate.unit == unit)?;
-        return Some((rate.per_unit_au, rate.granularity));
-    }
-    if unit == "request" {
-        for path in [
-            &["result_price", "per_req_au"][..],
-            &["result_price", "min_session_au"][..],
-            &["per_req_au"][..],
-            &["min_session_au"][..],
-        ] {
-            if let Some(value) = derivation_value(derivation, path).and_then(value_as_money_au) {
-                return Some((value, 1));
-            }
-        }
-    }
-    None
-}
-
-fn dashboard_normalize_unit_rate(
-    price_au: MoneyAu,
-    from_granularity: u64,
-    to_granularity: u64,
-) -> MoneyAu {
-    if price_au == 0 || from_granularity == 0 || to_granularity == 0 {
-        return price_au;
-    }
-    price_au
-        .saturating_mul(u128::from(to_granularity))
-        .div_ceil(u128::from(from_granularity))
-}
-
-fn dashboard_rate_map_from_value(value: &Value) -> Option<Vec<RateMapEntry>> {
-    let rate_map = value
-        .as_array()?
-        .iter()
-        .filter_map(|entry| {
-            Some(RateMapEntry {
-                unit: entry.get("unit")?.as_str()?.to_owned(),
-                per_unit_au: entry.get("per_unit_au").and_then(value_as_money_au)?,
-                granularity: entry.get("granularity")?.as_u64()?,
-            })
-        })
-        .collect::<Vec<_>>();
-    (!rate_map.is_empty()).then(|| normalize_rate_map(rate_map))
-}
-
-fn dashboard_derivation_volume_au(derivation: &Value) -> MoneyAu {
-    [
-        &["usage", "settled_au"][..],
-        &["usage", "settled_work_au"][..],
-        &["usage", "active_demand_au"][..],
-        &["settled_au"][..],
-        &["volume_au"][..],
-        &["active_demand_au"][..],
-        &["demand_au"][..],
-    ]
-    .into_iter()
-    .find_map(|path| derivation_value(derivation, path).and_then(value_as_money_au))
-    .unwrap_or(0)
-}
-
-fn dashboard_derivation_pinned(derivation: &Value, volume_au: MoneyAu) -> bool {
-    if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) || volume_au == 0 {
-        return true;
-    }
-    let source = derivation_str(derivation, &["controller", "source"])
-        .or_else(|| derivation_str(derivation, &["price_source"]))
-        .unwrap_or("");
-    source.contains("cold_start") || source.contains("pinned") || source.contains("seed")
-}
-
-fn dashboard_ctx_bracket_from_derivation(derivation: &Value) -> Option<String> {
-    derivation_str(derivation, &["ctx_bracket"])
-        .or_else(|| derivation_str(derivation, &["result_price", "ctx_bracket"]))
-        .or_else(|| derivation_str(derivation, &["seed_price", "ctx_bracket"]))
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn dashboard_price_chart_svg(
-    selected: &DashboardPriceSeries,
-    overlays: &[&DashboardPriceSeries],
-    timeframe: DashboardPriceTimeframe,
-) -> String {
-    if selected.points.is_empty() {
-        return r#"<div class="empty-state price-chart-empty"><div><div class="empty-icon"></div><p>Price history pending</p></div></div>"#
-            .to_owned();
-    }
-    let width = 760.0;
-    let left = 54.0;
-    let right = 18.0;
-    let plot_top = 20.0;
-    let plot_bottom = 214.0;
-    let volume_top = 234.0;
-    let volume_bottom = 292.0;
-    let inner_right = width - right;
-    let window_epochs = timeframe.window_epochs();
-    let selected_candles = (timeframe != DashboardPriceTimeframe::H1)
-        .then(|| dashboard_price_candles(&selected.points, window_epochs))
-        .unwrap_or_default();
-    let overlay_candles = overlays
-        .iter()
-        .map(|series| dashboard_price_candles(&series.points, window_epochs))
-        .collect::<Vec<_>>();
-    let (min_epoch, max_epoch) = dashboard_chart_epoch_bounds(
-        selected,
-        overlays,
-        &selected_candles,
-        &overlay_candles,
-        timeframe,
-    );
-    let (min_price, max_price) = dashboard_chart_price_bounds(
-        selected,
-        overlays,
-        &selected_candles,
-        &overlay_candles,
-        timeframe,
-    );
-    let max_volume = if timeframe == DashboardPriceTimeframe::H1 {
-        selected
-            .points
-            .iter()
-            .map(|point| point.volume_au)
-            .max()
-            .unwrap_or(0)
-    } else {
-        selected_candles
-            .iter()
-            .map(|candle| candle.volume_au)
-            .max()
-            .unwrap_or(0)
-    };
-    let x_for_epoch =
-        |epoch: u64| dashboard_chart_x(epoch, min_epoch, max_epoch, left, inner_right);
-    let y_for_price =
-        |price: MoneyAu| dashboard_chart_y(price, min_price, max_price, plot_top, plot_bottom);
-    let mut body = String::new();
-    for i in 0..=4 {
-        let y = plot_top + (plot_bottom - plot_top) * f64::from(i) / 4.0;
-        body.push_str(&format!(
-            r#"<line class="price-grid-line" x1="{left}" y1="{}" x2="{inner_right}" y2="{}"/>"#,
-            svg_num(y),
-            svg_num(y),
-        ));
-    }
-    for i in 0..=4 {
-        let x = left + (inner_right - left) * f64::from(i) / 4.0;
-        body.push_str(&format!(
-            r#"<line class="price-grid-line" x1="{}" y1="{plot_top}" x2="{}" y2="{volume_bottom}"/>"#,
-            svg_num(x),
-            svg_num(x),
-        ));
-    }
-    let mid_price = min_price.saturating_add(max_price.saturating_sub(min_price) / 2);
-    for (label, y) in [
-        (max_price, y_for_price(max_price)),
-        (mid_price, y_for_price(mid_price)),
-        (min_price, y_for_price(min_price)),
-    ] {
-        body.push_str(&format!(
-            r#"<text class="price-axis" x="8" y="{}">{}au</text>"#,
-            svg_num(y + 4.0),
-            label,
-        ));
-    }
-    body.push_str(&format!(
-        r#"<text class="price-axis" x="{left}" y="304">epoch {min_epoch}</text><text class="price-axis" x="{}" y="304" text-anchor="end">epoch {max_epoch}</text>"#,
-        inner_right,
-    ));
-
-    if timeframe == DashboardPriceTimeframe::H1 {
-        for overlay in overlays {
-            let path = dashboard_price_line_path(
-                overlay
-                    .points
-                    .iter()
-                    .map(|point| (point.epoch, point.price_au)),
-                &x_for_epoch,
-                &y_for_price,
-            );
-            if !path.is_empty() {
-                body.push_str(&format!(
-                    r#"<path class="price-overlay" d="{}"><title>{}</title></path>"#,
-                    html_escape(&path),
-                    html_escape(&format!("{} {}", overlay.ctx_bracket, overlay.quant)),
-                ));
-            }
-        }
-        let path = dashboard_price_step_path(&selected.points, &x_for_epoch, &y_for_price);
-        if !path.is_empty() {
-            body.push_str(&format!(
-                r#"<path class="price-step" d="{}"/>"#,
-                html_escape(&path)
-            ));
-        }
-        for point in &selected.points {
-            body.push_str(&dashboard_volume_bar(
-                x_for_epoch(point.epoch),
-                9.0,
-                point.volume_au,
-                max_volume,
-                volume_top,
-                volume_bottom,
-                &point.title,
-            ));
-            if point.pinned {
-                body.push_str(&dashboard_price_marker(
-                    x_for_epoch(point.epoch),
-                    y_for_price(point.price_au),
-                    "pinned",
-                    &point.title,
-                ));
-            }
-        }
-    } else {
-        for (overlay, candles) in overlays.iter().zip(overlay_candles.iter()) {
-            let path = dashboard_price_line_path(
-                candles
-                    .iter()
-                    .map(|candle| (candle.end_epoch, candle.close_au)),
-                &x_for_epoch,
-                &y_for_price,
-            );
-            if !path.is_empty() {
-                body.push_str(&format!(
-                    r#"<path class="price-overlay" d="{}"><title>{}</title></path>"#,
-                    html_escape(&path),
-                    html_escape(&format!("{} {}", overlay.ctx_bracket, overlay.quant)),
-                ));
-            }
-        }
-        let candle_width =
-            ((inner_right - left) / (selected_candles.len().max(1) as f64) * 0.5).clamp(5.0, 16.0);
-        for candle in &selected_candles {
-            let x = x_for_epoch(candle.end_epoch);
-            body.push_str(&dashboard_volume_bar(
-                x,
-                candle_width,
-                candle.volume_au,
-                max_volume,
-                volume_top,
-                volume_bottom,
-                &candle.title,
-            ));
-            body.push_str(&dashboard_price_candle_svg(
-                candle,
-                x,
-                candle_width,
-                &y_for_price,
-            ));
-            if candle.pinned {
-                body.push_str(&dashboard_price_marker(
-                    x,
-                    y_for_price(candle.close_au),
-                    "pinned",
-                    &candle.title,
-                ));
-            }
-        }
-    }
-
-    format!(
-        r#"<svg class="price-chart-svg" viewBox="0 0 760 310" role="img" aria-label="{} {} {} price chart">{body}</svg>"#,
-        html_escape(&selected.tier),
-        html_escape(&selected.ctx_bracket),
-        html_escape(&selected.unit),
-    )
-}
-
-fn dashboard_price_candles(
-    points: &[DashboardPricePoint],
-    window_epochs: u64,
-) -> Vec<DashboardPriceCandle> {
-    let mut buckets: BTreeMap<u64, Vec<&DashboardPricePoint>> = BTreeMap::new();
-    for point in points {
-        let start = (point.epoch / window_epochs.max(1)) * window_epochs.max(1);
-        buckets.entry(start).or_default().push(point);
-    }
-    buckets
-        .into_iter()
-        .map(|(start_epoch, mut points)| {
-            points.sort_by_key(|point| point.epoch);
-            let first = points[0];
-            let last = points[points.len() - 1];
-            let high_au = points
-                .iter()
-                .map(|point| point.price_au)
-                .max()
-                .unwrap_or(first.price_au);
-            let low_au = points
-                .iter()
-                .map(|point| point.price_au)
-                .min()
-                .unwrap_or(first.price_au);
-            let volume_au = points
-                .iter()
-                .map(|point| point.volume_au)
-                .fold(0_u128, MoneyAu::saturating_add);
-            let pinned = volume_au == 0 || points.iter().all(|point| point.pinned);
-            let end_epoch = start_epoch
-                .saturating_add(window_epochs.max(1))
-                .saturating_sub(1);
-            DashboardPriceCandle {
-                start_epoch,
-                end_epoch,
-                open_au: first.price_au,
-                high_au,
-                low_au,
-                close_au: last.price_au,
-                volume_au,
-                pinned,
-                title: format!(
-                    "epoch {}-{} OHLC {}/{}/{}/{} volume {} | {}",
-                    start_epoch,
-                    end_epoch,
-                    format_au_usd(first.price_au),
-                    format_au_usd(high_au),
-                    format_au_usd(low_au),
-                    format_au_usd(last.price_au),
-                    format_au_usd(volume_au),
-                    last.title
-                ),
-            }
-        })
-        .collect()
-}
-
-fn dashboard_chart_epoch_bounds(
-    selected: &DashboardPriceSeries,
-    overlays: &[&DashboardPriceSeries],
-    selected_candles: &[DashboardPriceCandle],
-    overlay_candles: &[Vec<DashboardPriceCandle>],
-    timeframe: DashboardPriceTimeframe,
-) -> (u64, u64) {
-    let mut epochs = Vec::new();
-    if timeframe == DashboardPriceTimeframe::H1 {
-        epochs.extend(selected.points.iter().map(|point| point.epoch));
-        for overlay in overlays {
-            epochs.extend(overlay.points.iter().map(|point| point.epoch));
-        }
-    } else {
-        epochs.extend(
-            selected_candles
-                .iter()
-                .flat_map(|candle| [candle.start_epoch, candle.end_epoch]),
-        );
-        for candles in overlay_candles {
-            epochs.extend(
-                candles
-                    .iter()
-                    .flat_map(|candle| [candle.start_epoch, candle.end_epoch]),
-            );
-        }
-    }
-    let min = epochs.iter().copied().min().unwrap_or(0);
-    let max = epochs
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(min.saturating_add(1));
-    if min == max {
-        (min, min.saturating_add(1))
-    } else {
-        (min, max)
-    }
-}
-
-fn dashboard_chart_price_bounds(
-    selected: &DashboardPriceSeries,
-    overlays: &[&DashboardPriceSeries],
-    selected_candles: &[DashboardPriceCandle],
-    overlay_candles: &[Vec<DashboardPriceCandle>],
-    timeframe: DashboardPriceTimeframe,
-) -> (MoneyAu, MoneyAu) {
-    let mut prices = Vec::new();
-    if timeframe == DashboardPriceTimeframe::H1 {
-        prices.extend(selected.points.iter().map(|point| point.price_au));
-        for overlay in overlays {
-            prices.extend(overlay.points.iter().map(|point| point.price_au));
-        }
-    } else {
-        for candle in selected_candles {
-            prices.push(candle.open_au);
-            prices.push(candle.high_au);
-            prices.push(candle.low_au);
-            prices.push(candle.close_au);
-        }
-        for candles in overlay_candles {
-            prices.extend(candles.iter().map(|candle| candle.close_au));
-        }
-    }
-    let min = prices.iter().copied().min().unwrap_or(1);
-    let max = prices
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(min.saturating_add(1));
-    if min == max {
-        let pad = min.max(10) / 10;
-        (
-            min.saturating_sub(pad.max(1)),
-            max.saturating_add(pad.max(1)),
-        )
-    } else {
-        let pad = max.saturating_sub(min).max(10) / 10;
-        (min.saturating_sub(pad), max.saturating_add(pad))
-    }
-}
-
-fn dashboard_chart_x(epoch: u64, min_epoch: u64, max_epoch: u64, left: f64, right: f64) -> f64 {
-    let span = max_epoch.saturating_sub(min_epoch).max(1) as f64;
-    left + (epoch.saturating_sub(min_epoch) as f64 / span) * (right - left)
-}
-
-fn dashboard_chart_y(
-    price: MoneyAu,
-    min_price: MoneyAu,
-    max_price: MoneyAu,
-    top: f64,
-    bottom: f64,
-) -> f64 {
-    let span = max_price.saturating_sub(min_price).max(1) as f64;
-    bottom - (price.saturating_sub(min_price) as f64 / span) * (bottom - top)
-}
-
-fn dashboard_price_line_path<'a>(
-    pairs: impl Iterator<Item = (u64, MoneyAu)> + 'a,
-    x_for_epoch: &impl Fn(u64) -> f64,
-    y_for_price: &impl Fn(MoneyAu) -> f64,
-) -> String {
-    let mut path = String::new();
-    for (index, (epoch, price)) in pairs.enumerate() {
-        let x = svg_num(x_for_epoch(epoch));
-        let y = svg_num(y_for_price(price));
-        if index == 0 {
-            path.push_str(&format!("M{x} {y}"));
-        } else {
-            path.push_str(&format!(" L{x} {y}"));
-        }
-    }
-    path
-}
-
-fn dashboard_price_step_path(
-    points: &[DashboardPricePoint],
-    x_for_epoch: &impl Fn(u64) -> f64,
-    y_for_price: &impl Fn(MoneyAu) -> f64,
-) -> String {
-    if points.is_empty() {
-        return String::new();
-    }
-    if points.len() == 1 {
-        let y = svg_num(y_for_price(points[0].price_au));
-        return format!("M54 {y} H742");
-    }
-    let mut path = String::new();
-    for (index, point) in points.iter().enumerate() {
-        let x = svg_num(x_for_epoch(point.epoch));
-        let y = svg_num(y_for_price(point.price_au));
-        if index == 0 {
-            path.push_str(&format!("M{x} {y}"));
-        } else {
-            path.push_str(&format!(" H{x} V{y}"));
-        }
-    }
-    path
-}
-
-fn dashboard_volume_bar(
-    x: f64,
-    width: f64,
-    volume_au: MoneyAu,
-    max_volume: MoneyAu,
-    top: f64,
-    bottom: f64,
-    title: &str,
-) -> String {
-    let height = if max_volume == 0 {
-        0.0
-    } else {
-        (volume_au as f64 / max_volume as f64) * (bottom - top)
-    };
-    let y = bottom - height;
-    format!(
-        r#"<rect class="price-volume" x="{}" y="{}" width="{}" height="{}"><title>{}</title></rect>"#,
-        svg_num(x - width / 2.0),
-        svg_num(y),
-        svg_num(width.max(2.0)),
-        svg_num(height.max(1.0)),
-        html_escape(title),
-    )
-}
-
-fn dashboard_price_candle_svg(
-    candle: &DashboardPriceCandle,
-    x: f64,
-    width: f64,
-    y_for_price: &impl Fn(MoneyAu) -> f64,
-) -> String {
-    let open_y = y_for_price(candle.open_au);
-    let close_y = y_for_price(candle.close_au);
-    let high_y = y_for_price(candle.high_au);
-    let low_y = y_for_price(candle.low_au);
-    let top = open_y.min(close_y);
-    let height = (open_y - close_y).abs().max(2.0);
-    let class = if candle.close_au >= candle.open_au {
-        "price-candle up"
-    } else {
-        "price-candle down"
-    };
-    format!(
-        r#"<g class="{class}"><title>{}</title><line class="wick" x1="{}" y1="{}" x2="{}" y2="{}"/><rect class="body" x="{}" y="{}" width="{}" height="{}" rx="2"/></g>"#,
-        html_escape(&candle.title),
-        svg_num(x),
-        svg_num(high_y),
-        svg_num(x),
-        svg_num(low_y),
-        svg_num(x - width / 2.0),
-        svg_num(top),
-        svg_num(width.max(3.0)),
-        svg_num(height),
-    )
-}
-
-fn dashboard_price_marker(x: f64, y: f64, class_suffix: &str, title: &str) -> String {
-    format!(
-        r#"<path class="price-marker {class_suffix}" d="M{} {} L{} {} L{} {} L{} {} Z"><title>{}</title></path>"#,
-        svg_num(x),
-        svg_num(y - 5.0),
-        svg_num(x + 5.0),
-        svg_num(y),
-        svg_num(x),
-        svg_num(y + 5.0),
-        svg_num(x - 5.0),
-        svg_num(y),
-        html_escape(title),
-    )
-}
-
-fn svg_num(value: f64) -> String {
-    let mut text = format!("{value:.1}");
-    if text.ends_with(".0") {
-        text.truncate(text.len() - 2);
-    }
-    text
 }
 
 fn dashboard_price(price: &PriceRefAu) -> String {
-    let entries = price
-        .rate_map
-        .iter()
-        .take(3)
-        .map(|entry| {
-            format!(
-                "{} / {} {}",
-                format_au_usd(entry.per_unit_au),
-                entry.granularity,
-                entry.unit
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    if price.per_req_au > 0 {
+        entries.push(format!("{} / request", format_au_usd(price.per_req_au)));
+    }
+    if price.min_session_au > 0 {
+        entries.push(format!(
+            "{} minimum / session",
+            format_au_usd(price.min_session_au)
+        ));
+    }
+    let shown_rate_count = 3_usize.saturating_sub(entries.len());
+    entries.extend(
+        price
+            .rate_map
+            .iter()
+            .take(shown_rate_count)
+            .map(dashboard_rate_price),
+    );
     if entries.is_empty() {
         "unpriced".to_owned()
     } else {
-        entries.join(" + ")
+        let omitted = price.rate_map.len().saturating_sub(shown_rate_count);
+        if omitted == 0 {
+            entries.join(" + ")
+        } else {
+            format!("{} (+{omitted} more rates)", entries.join(" + "))
+        }
     }
-}
-
-fn dashboard_model_price_derivation(model: &GatewayModel) -> String {
-    let Some(derivation) = model.mayhem.price_ref_au.derivation.as_ref() else {
-        return "derivation pending".to_owned();
-    };
-    dashboard_price_derivation_summary(derivation)
-}
-
-fn dashboard_price_derivation_summary(derivation: &Value) -> String {
-    let epoch = derivation_u64(derivation, &["epoch"])
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "?".to_owned());
-    let seed_ver = derivation_u64(derivation, &["seed_price", "ver"])
-        .map(|value| format!("v{value}"))
-        .unwrap_or_else(|| "?".to_owned());
-    let result_ver = derivation_u64(derivation, &["result_price", "ver"])
-        .or_else(|| derivation_u64(derivation, &["price_ver"]))
-        .map(|value| format!("v{value}"))
-        .unwrap_or_else(|| "price".to_owned());
-    let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
-        .map(format_bps)
-        .unwrap_or_else(|| "?".to_owned());
-    let demand = derivation_money_au(derivation, &["usage", "active_demand_au"])
-        .map(format_au_usd)
-        .unwrap_or_else(|| "unknown demand".to_owned());
-    let sessions = derivation_u64(derivation, &["usage", "session_count"])
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "?".to_owned());
-    let supply = derivation_u64(derivation, &["controller", "active_supply"])
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "?".to_owned());
-    let source = derivation_str(derivation, &["controller", "source"])
-        .or_else(|| derivation_str(derivation, &["price_source"]))
-        .unwrap_or("market");
-    let frozen = if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) {
-        " · frozen"
-    } else {
-        ""
-    };
-    let root = derivation_str(derivation, &["price_root"])
-        .map(|value| format!(" · root {}", short_text(value, 12)))
-        .unwrap_or_default();
-    let leaf = derivation_str(derivation, &["derivation_hash"])
-        .map(|value| format!(" · leaf {}", short_text(value, 12)))
-        .unwrap_or_default();
-    format!(
-        "price = f(seed {seed_ver}, U {utilization}, demand {demand}, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
-    )
-}
-
-fn derivation_u64<'a>(value: &'a Value, path: &[&str]) -> Option<u64> {
-    derivation_value(value, path)?.as_u64()
-}
-
-fn derivation_money_au<'a>(value: &'a Value, path: &[&str]) -> Option<MoneyAu> {
-    derivation_value(value, path).and_then(value_as_money_au)
-}
-
-fn derivation_bool<'a>(value: &'a Value, path: &[&str]) -> Option<bool> {
-    derivation_value(value, path)?.as_bool()
-}
-
-fn derivation_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
-    derivation_value(value, path)?.as_str()
-}
-
-fn derivation_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    Some(current)
-}
-
-fn format_bps(value: u64) -> String {
-    format!("{}.{:02}%", value / 100, value % 100)
-}
-
-fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
-    if receipts.is_empty() {
-        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No spend yet</p></div></div>"#
-            .to_owned();
-    }
-    let max = receipts
-        .iter()
-        .map(|receipt| receipt.receipt.body.au_owed_cum)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let bars = receipts
-        .iter()
-        .take(12)
-        .map(|receipt| {
-            let height = 8 + (receipt.receipt.body.au_owed_cum.saturating_mul(92) / max);
-            format!(r#"<span class="bar" style="--h:{height}%"></span>"#)
-        })
-        .collect::<String>();
-    format!(r#"<div class="spend-bars">{bars}</div>"#)
 }
 
 fn format_au_usd(au: MoneyAu) -> String {
@@ -9756,16 +7137,6 @@ fn short_text(value: &str, max: usize) -> String {
     format!("{}...", value.chars().take(keep).collect::<String>())
 }
 
-fn dashboard_normalize_tier(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let tier = value.trim_start_matches(['T', 't']);
-    let tier = tier.parse::<u8>().ok()?.clamp(1, 9);
-    Some(format!("T{tier}"))
-}
-
 fn dashboard_url_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -9776,45 +7147,6 @@ fn dashboard_url_encode(value: &str) -> String {
         }
     }
     out
-}
-
-fn dashboard_url_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hi = hex_nibble(bytes[index + 1]);
-                let lo = hex_nibble(bytes[index + 2]);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi << 4) | lo);
-                    index += 3;
-                } else {
-                    out.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn html_escape(value: &str) -> String {
@@ -9834,7 +7166,7 @@ fn html_escape(value: &str) -> String {
 
 fn dashboard_html_document(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}{DASHBOARD_USER_CSS}{DASHBOARD_CHART_CSS}</style></head><body>{body}</body></html>"#
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0c0e"><title>Mayhem {title}</title><link rel="stylesheet" href="/mayhem/dashboard/assets/app.css"><script src="/mayhem/dashboard/assets/app.js"></script></head><body>{body}<div class="toast-region" data-toast-region role="status" aria-live="polite" aria-atomic="true"></div></body></html>"##
     )
 }
 
@@ -29532,7 +26864,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_gateway_auth_accepts_openai_client_placeholder_tokens() {
+    fn disabled_gateway_auth_accepts_unrecognized_openai_client_tokens() {
         let access = GatewayAccessControl::disabled();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -29542,7 +26874,7 @@ mod tests {
 
         assert!(access
             .authorize(&headers, Some("mayhem/dev-chat-tools"))
-            .expect("optional auth accepts an unrecognized client placeholder")
+            .expect("optional auth accepts an unrecognized client credential")
             .is_none());
     }
 
@@ -29717,6 +27049,48 @@ mod tests {
             .expect("token attribution");
         assert_eq!(attribution.name, "opencode-local");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gateway_access_summary_rolls_idle_budget_windows_at_read_time() {
+        let old_window = now_secs().saturating_sub(31 * 24 * 60 * 60);
+        let token = |name: &str, period| GatewayTokenRecord {
+            name: name.to_owned(),
+            token_hash: gateway_token_hash(name),
+            token_id: format!("tok_{name}"),
+            created_at: old_window,
+            expires_at: None,
+            budget_au: Some(10_000),
+            budget_period: Some(period),
+            spent_total_au: 9_000,
+            spent_period_au: 7_000,
+            period_started_at: Some(old_window),
+            max_rate_per_minute: None,
+            models: Vec::new(),
+            last_used_at: Some(old_window),
+            revoked_at: None,
+        };
+        let access = GatewayAccessControl::new(
+            true,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![
+                    token("day", GatewayTokenBudgetPeriod::Day),
+                    token("month", GatewayTokenBudgetPeriod::Month),
+                    token("total", GatewayTokenBudgetPeriod::Total),
+                ],
+            },
+            None,
+        );
+
+        let summary = access.summary();
+        let tokens = summary["tokens"].as_array().expect("token summary");
+        for token in &tokens[..2] {
+            assert_eq!(token["spent_period_au"], "0");
+            assert_eq!(token["effective_spent_au"], "0");
+        }
+        assert_eq!(tokens[2]["spent_total_au"], "9000");
+        assert_eq!(tokens[2]["effective_spent_au"], "9000");
     }
 
     #[test]
@@ -30910,10 +28284,6 @@ mod tests {
         assert_eq!(models[0].mayhem.rooms, 1);
         assert_eq!(models[0].mayhem.markets.len(), 1);
         assert!(models[0].mayhem.route_candidates.is_empty());
-        let series = dashboard_model_price_series(&models[0], None);
-        assert!(!series.is_empty());
-        assert!(series.iter().all(|entry| entry.tier == "T2"));
-        assert!(series.iter().all(|entry| entry.ctx_bracket == "le8k"));
     }
 
     #[test]
@@ -31189,35 +28559,28 @@ mod tests {
                 ),
             },
         ]);
-        let chart_options = DashboardChartOptions {
-            surface: DashboardChartSurface::User,
-            selected_tier: None,
-            selected_timeframe: DashboardPriceTimeframe::H1,
-            selected_bucket: None,
-            selected_quant: None,
-            selected_unit: None,
-            selected_speciality: None,
-            pinned_models: Vec::new(),
-            provider_filter: None,
-        };
-
-        let user_html = dashboard_user_html(&state, 60, "http://127.0.0.1:11435", &chart_options);
-        assert!(user_html.contains("update-banner required"));
-        assert!(user_html.contains("Update required"));
-        assert!(user_html.contains("catalog min v9999.0.0"));
-
-        let mut provider_chart_options = chart_options.clone();
-        provider_chart_options.surface = DashboardChartSurface::Provider;
-        let provider_html = dashboard_provider_html(
+        let user_html = render_dashboard_product_page(
             &state,
             60,
             "http://127.0.0.1:11435",
-            None,
-            &provider_chart_options,
+            &DashboardQuery::default(),
+            DashboardProductPage::Home,
         );
-        assert!(provider_html.contains("update-banner required"));
+        assert!(user_html.contains("attention-card danger"));
+        assert!(user_html.contains("Update required"));
+        assert!(user_html.contains("catalog minimum 9999.0.0"));
+
+        let provider_html = render_dashboard_product_page(
+            &state,
+            60,
+            "http://127.0.0.1:11435",
+            &DashboardQuery::default(),
+            DashboardProductPage::Earn,
+        );
+        assert!(provider_html.contains("attention-card danger"));
         assert!(provider_html.contains("Update required"));
-        assert!(provider_html.contains("catalog min v9999.0.0"));
+        assert!(provider_html.contains("minimum 9999.0.0"));
+        assert!(!provider_html.contains("Blocked by update"));
     }
 
     #[test]
@@ -34870,56 +32233,91 @@ mod tests {
             history: Vec::new(),
         };
         let label = dashboard_price(&price);
-        assert!(label.contains("$0.00000000001 / 1000 input_token"));
+        assert!(label.contains("$0.00000001 / 1M input tokens"));
         assert!(!label.contains("au/"));
     }
 
     #[test]
-    fn dashboard_keeps_multi_unit_prices_separate_and_exposes_endpoint_families() {
-        let price = PriceRefAu {
-            denom: "au_usd".to_owned(),
-            ver: 4,
-            rate_map: vec![
-                RateMapEntry {
-                    unit: USAGE_IMAGE.to_owned(),
-                    per_unit_au: 500,
-                    granularity: 1,
-                },
-                RateMapEntry {
-                    unit: USAGE_STEP.to_owned(),
-                    per_unit_au: 2,
-                    granularity: 1,
-                },
-            ],
-            per_req_au: 0,
-            min_session_au: 0,
-            derivation: None,
-            history: vec![json!({
-                "epoch": 3,
-                "ctx_bracket": "base",
-                "result_price": {
-                    "rate_map": [
-                        {"unit": USAGE_IMAGE, "per_unit_au": "450", "granularity": 1},
-                        {"unit": USAGE_STEP, "per_unit_au": "3", "granularity": 1}
-                    ]
-                },
-                "usage": {"settled_au": "10"}
-            })],
-        };
-        let series = dashboard_price_series_from_price(&price, "T1", "int4");
-        assert_eq!(series.len(), 2);
-        let image = series
-            .iter()
-            .find(|series| series.unit == USAGE_IMAGE)
-            .unwrap();
-        let step = series
-            .iter()
-            .find(|series| series.unit == USAGE_STEP)
-            .unwrap();
-        assert_eq!(image.points[0].price_au, 450);
-        assert_eq!(step.points[0].price_au, 3);
-        assert_ne!(image.points[0].price_au, step.points[0].price_au);
+    fn dashboard_origin_accepts_only_exact_loopback_hosts() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:11435",
+            "localhost",
+            "LOCALHOST:8080",
+            "[::1]",
+            "[::1]:11435",
+        ] {
+            assert!(dashboard_host_is_loopback(host), "expected {host} to pass");
+        }
+        for host in [
+            "127.0.0.10",
+            "127.0.0.1.example.com",
+            "localhost.example.com",
+            "[::1].example.com",
+            "127.0.0.1:not-a-port",
+            "example.com",
+        ] {
+            assert!(!dashboard_host_is_loopback(host), "expected {host} to fail");
+        }
+    }
 
+    #[test]
+    fn dashboard_session_slides_and_bootstrap_recovers_after_idle_expiry() {
+        let session = DashboardSession::new();
+        let bootstrap_token = session.bootstrap_token.clone();
+        let first_browser_token = session
+            .authorize_bootstrap(&bootstrap_token)
+            .expect("bootstrap token opens a browser session");
+        assert_ne!(first_browser_token, bootstrap_token);
+
+        {
+            let mut browser = session.browser.lock_recover("dashboard browser session");
+            browser.last_seen = Instant::now()
+                .checked_sub(Duration::from_secs(30))
+                .expect("test clock can move backwards");
+        }
+        let before_refresh = session.expires_in();
+        assert_eq!(
+            session.authorize_browser(&first_browser_token),
+            Some(first_browser_token.clone())
+        );
+        assert!(session.expires_in() > before_refresh);
+
+        {
+            let mut browser = session.browser.lock_recover("dashboard browser session");
+            browser.last_seen = Instant::now()
+                .checked_sub(session.ttl + Duration::from_secs(1))
+                .expect("test clock can move beyond the idle timeout");
+        }
+        assert_eq!(session.authorize_browser(&first_browser_token), None);
+
+        let reopened_browser_token = session
+            .authorize_bootstrap(&bootstrap_token)
+            .expect("bootstrap token reopens an expired browser session");
+        assert_ne!(reopened_browser_token, first_browser_token);
+        assert_eq!(session.authorize_browser(&first_browser_token), None);
+        assert_eq!(
+            session.authorize_browser(&reopened_browser_token),
+            Some(reopened_browser_token)
+        );
+    }
+
+    #[test]
+    fn dashboard_document_loads_the_single_responsive_app_bundle() {
+        let html = dashboard_html_document("Responsive fixture", "<main></main>");
+        assert!(html.contains("viewport-fit=cover"));
+        assert!(html.contains(r#"href="/mayhem/dashboard/assets/app.css""#));
+        assert!(html.contains(r#"src="/mayhem/dashboard/assets/app.js""#));
+        assert!(!html.contains("<style>"));
+        assert!(DASHBOARD_APP_CSS.contains(".app-shell{min-height:100vh"));
+        assert!(DASHBOARD_APP_CSS.contains("@media(max-width:780px)"));
+        assert!(DASHBOARD_APP_CSS.contains(".data-table-wrap{width:100%;overflow:auto"));
+        assert!(DASHBOARD_APP_JS.contains("recordDashboardSessionActivity"));
+        assert!(!DASHBOARD_APP_JS.contains("document.addEventListener('visibilitychange'"));
+    }
+
+    #[test]
+    fn dashboard_exposes_endpoint_families() {
         let mut model = test_model();
         model.mayhem.adapter.endpoint_families = vec![
             mayhem_proto::endpoint_family_contract_template(
