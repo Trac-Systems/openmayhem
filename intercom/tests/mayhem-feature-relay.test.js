@@ -10,6 +10,7 @@ import MayhemFeature, {
   serviceSigningMessage,
 } from '../features/mayhem/index.js';
 import {
+  adminWriterDiagnostics,
   createServer,
   requestStripeCheckout,
   requestStripeConnect,
@@ -944,6 +945,52 @@ test('admin-writer RPC keeps the local append path', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.relayed, undefined);
   assert.equal(appendCalls, 1);
+});
+
+test('admin writer diagnostics expose transition state without key material', () => {
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.base.opened = true;
+  writer.peer.base.isIndexer = true;
+  writer.peer.base.signedLength = 12;
+  writer.peer.base.length = 13;
+  writer.peer.base.local = { length: 4 };
+  writer.peer.base._caughtup = true;
+  writer.peer.base._appending = [{ op: 'pending' }];
+  writer.peer.base._appended = 3;
+  writer.peer.base.localWriter = {
+    isRemoved: false,
+    isActiveIndexer: true,
+    length: 4,
+    available: 4,
+    seenLength: 4,
+    idle: () => true,
+    flushed: () => true,
+    core: {
+      length: 4,
+      writable: true,
+      opened: true,
+      core: { upgrading: false },
+    },
+  };
+  writer.peer.base._applyState = {
+    opened: true,
+    applying: false,
+    indexedLength: 12,
+    isLocalIndexer: () => true,
+    isLocalPendingIndexer: () => false,
+    system: {
+      indexers: [{ length: 4 }],
+      pendingIndexers: [],
+      indexerUpdate: false,
+    },
+  };
+
+  const report = adminWriterDiagnostics(writer.peer);
+  assert.equal(report.base.writable, true);
+  assert.equal(report.base.appending_count, 1);
+  assert.equal(report.local_writer.active_indexer, true);
+  assert.deepEqual(report.apply_state.indexer_lengths, [4]);
+  assert.doesNotMatch(JSON.stringify(report), new RegExp(adminKey));
 });
 
 test('an admin-added cross-signing writer still relays participant features to the admin appender', async () => {

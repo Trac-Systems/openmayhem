@@ -8,6 +8,69 @@ import { readJsonBody } from '../trac/trac-peer/rpc/utils/body.js';
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
+const safeBooleanCall = (target, method) => {
+  try {
+    return typeof target?.[method] === 'function' ? target[method]() === true : null;
+  } catch {
+    return null;
+  }
+};
+
+export const adminWriterDiagnostics = (peer) => {
+  const base = peer?.base;
+  const writer = base?.localWriter;
+  const writerCore = writer?.core;
+  const applyState = base?._applyState;
+  const system = applyState?.system;
+  return {
+    base: {
+      writable: base?.writable === true,
+      is_indexer: base?.isIndexer === true,
+      opened: base?.opened === true,
+      closing: base?.closing === true,
+      paused: base?.paused === true,
+      caught_up: base?._caughtup === true,
+      draining: base?._draining === true,
+      advancing: base?._advancing != null,
+      appending_count: Array.isArray(base?._appending) ? base._appending.length : 0,
+      appended_count: Number(base?._appended ?? 0),
+      signed_length: Number(base?.signedLength ?? 0),
+      length: Number(base?.length ?? 0),
+      local_length: Number(base?.local?.length ?? 0),
+      needs_wakeup: base?._needsWakeup === true,
+      wakeup_hint_count: Number(base?._wakeupHints?.size ?? 0),
+    },
+    local_writer: writer ? {
+      removed: writer.isRemoved === true,
+      active_indexer: writer.isActiveIndexer === true,
+      idle: safeBooleanCall(writer, 'idle'),
+      flushed: safeBooleanCall(writer, 'flushed'),
+      length: Number(writer.length ?? 0),
+      available: Number(writer.available ?? 0),
+      seen_length: Number(writer.seenLength ?? 0),
+      core_length: Number(writerCore?.length ?? 0),
+      core_writable: writerCore?.writable === true,
+      core_opened: writerCore?.opened === true,
+      core_upgrading: writerCore?.core?.upgrading === true,
+    } : null,
+    apply_state: applyState ? {
+      opened: applyState.opened === true,
+      applying: applyState.applying === true,
+      local_indexer: safeBooleanCall(applyState, 'isLocalIndexer'),
+      local_pending_indexer: safeBooleanCall(applyState, 'isLocalPendingIndexer'),
+      indexed_length: Number(applyState.indexedLength ?? 0),
+      indexer_count: Array.isArray(system?.indexers) ? system.indexers.length : 0,
+      pending_indexer_count: Array.isArray(system?.pendingIndexers)
+        ? system.pendingIndexers.length
+        : 0,
+      indexer_lengths: Array.isArray(system?.indexers)
+        ? system.indexers.map((entry) => Number(entry?.length ?? 0))
+        : [],
+      indexers_updated: system?.indexerUpdate === true,
+    } : null,
+  };
+};
+
 export async function submitMayhemFeature(peer, body) {
   if (!isObject(body)) throw new Error('Missing JSON body.');
   const feature = String(body.feature ?? 'mayhem').trim();
@@ -27,7 +90,17 @@ export async function submitMayhemFeature(peer, body) {
   const selfKey = normalizeKey(peer.wallet?.publicKey);
   const isAdminWriter = peer.base?.writable === true && (!adminKey || adminKey === selfKey);
   if (isAdminWriter) {
-    return await contractFeature(peer, { feature, key, value: body.value });
+    const watchdog = setTimeout(() => {
+      console.error(
+        'Mayhem admin feature append stalled:',
+        JSON.stringify(adminWriterDiagnostics(peer))
+      );
+    }, 5_000);
+    try {
+      return await contractFeature(peer, { feature, key, value: body.value });
+    } finally {
+      clearTimeout(watchdog);
+    }
   }
   if (feature !== 'mayhem' || typeof registered.relay !== 'function') {
     throw new Error('Peer subnet is not writable.');
