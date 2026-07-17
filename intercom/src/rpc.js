@@ -22,7 +22,11 @@ export const adminWriterDiagnostics = (peer) => {
   const writerCore = writer?.core;
   const applyState = base?._applyState;
   const system = applyState?.system;
+  const applyStage = peer?.contract?.instance?._mayhemApplyStage;
   return {
+    contract: {
+      apply_stage: typeof applyStage === 'string' ? applyStage : null,
+    },
     base: {
       writable: base?.writable === true,
       is_indexer: base?.isIndexer === true,

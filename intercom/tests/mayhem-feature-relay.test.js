@@ -984,8 +984,10 @@ test('admin writer diagnostics expose transition state without key material', ()
       indexerUpdate: false,
     },
   };
+  writer.peer.contract = { instance: { _mayhemApplyStage: 'rate:key:hash' } };
 
   const report = adminWriterDiagnostics(writer.peer);
+  assert.equal(report.contract.apply_stage, 'rate:key:hash');
   assert.equal(report.base.writable, true);
   assert.equal(report.base.appending_count, 1);
   assert.equal(report.local_writer.active_indexer, true);

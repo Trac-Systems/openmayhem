@@ -563,6 +563,7 @@ class MayhemContract extends Contract {
   constructor(protocol, options = {}) {
     super(protocol, options);
     const self = this;
+    this._mayhemApplyStage = null;
 
     this.addFeature('mayhem_feature', async function () {
       return await self.mayhemFeature();
@@ -1220,11 +1221,15 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    const isRateFeature = value.op === 'rate_oracle' || value.op === 'tap_rate_oracle';
+    if (isRateFeature) this._mayhemApplyStage = 'rate:require-admin';
     const adminError = await this.requireAdmin(this.address);
     if (adminError) {
+      if (isRateFeature) this._mayhemApplyStage = null;
       this._mayhemLastFeatureResult = adminError;
       return adminError;
     }
+    if (isRateFeature) this._mayhemApplyStage = 'rate:admin-verified';
     if (value.op === 'epoch_apply') {
       const result = await this.applyEpochApplyFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -1237,6 +1242,7 @@ class MayhemContract extends Contract {
     }
     if (value.op === 'rate_oracle' || value.op === 'tap_rate_oracle') {
       const result = await this.applyRateOracleFeature(key, value);
+      this._mayhemApplyStage = null;
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1676,6 +1682,7 @@ class MayhemContract extends Contract {
   }
 
   async applyRateOracleFeature(key, value) {
+    this._mayhemApplyStage = 'rate:key';
     const expectedKey = await this.rateFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
     if (key !== expectedKey) return;
@@ -1683,6 +1690,7 @@ class MayhemContract extends Contract {
     const previousTx = this.tx;
     this.tx = key;
     try {
+      this._mayhemApplyStage = 'rate:dispatch';
       if (value.op === 'rate_oracle') return await this.rateOracle();
       if (value.op === 'tap_rate_oracle') return await this.tapRateOracle();
       return;
@@ -5101,12 +5109,14 @@ class MayhemContract extends Contract {
   }
 
   async rateOracle() {
+    this._mayhemApplyStage = 'rate:contract:require-admin';
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     const shapeError = this.validateRateOracleValue(this.value);
     if (shapeError) return shapeError;
     if (!RATE_SOURCES.has(this.value.source)) return new Error('Unsupported rate source.');
 
+    this._mayhemApplyStage = 'rate:contract:read-latest';
     const current = await this.get('rate/latest');
     if (current && this.value.ts < current.ts) {
       return new Error('Rate timestamp must not decrease.');
@@ -5121,22 +5131,29 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    this._mayhemApplyStage = 'rate:contract:read-history';
     const history = await this.get(this.tx);
     if (history && stableJson(history) !== stableJson(record)) {
       return new Error('TNK rate oracle history collision.');
     }
-    if (!history) await this.put(this.tx, record);
+    if (!history) {
+      this._mayhemApplyStage = 'rate:contract:write-history';
+      await this.put(this.tx, record);
+    }
+    this._mayhemApplyStage = 'rate:contract:write-latest';
     await this.put('rate/latest', record);
     console.log('mayhem rateOracle', record);
     return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
   }
 
   async tapRateOracle() {
+    this._mayhemApplyStage = 'rate:contract:require-admin';
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     const shapeError = this.validateTapRateOracleValue(this.value);
     if (shapeError) return shapeError;
 
+    this._mayhemApplyStage = 'rate:contract:read-latest';
     const current = await this.get('tap/rate/latest');
     if (current && this.value.ts < current.ts) {
       return new Error('TAP rate timestamp must not decrease.');
@@ -5151,6 +5168,7 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    this._mayhemApplyStage = 'rate:contract:write-latest';
     await this.put('tap/rate/latest', record);
     console.log('mayhem tapRateOracle', record);
     return { ok: true, op: 'tapRateOracle', ts: record.ts, source: record.source };
@@ -12749,6 +12767,7 @@ class MayhemContract extends Contract {
     } else {
       return new Error('Unsupported rate feature op.');
     }
+    this._mayhemApplyStage = 'rate:key:hash';
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
         domain: 'mayhem-rate-feature-v1',
@@ -12756,6 +12775,7 @@ class MayhemContract extends Contract {
       }))),
       'hex'
     );
+    this._mayhemApplyStage = 'rate:key:hashed';
     return `rate/${kind}/${value.ts}/${digest}`;
   }
 
