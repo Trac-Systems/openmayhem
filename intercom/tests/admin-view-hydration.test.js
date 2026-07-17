@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
 import {
+  attachAutobaseWakeup,
   hydrateAdminWriterViews,
   joinCanonicalPeers,
 } from '../src/admin-view-hydration.js';
@@ -76,4 +77,52 @@ test('canonical peer joins reject malformed keys', () => {
     () => joinCanonicalPeers({ swarm: { joinPeer() {} } }, ['not-a-key']),
     /32-byte public key/
   );
+});
+
+test('Autobase wakeup attaches to existing and future replication connections', () => {
+  const existing = {};
+  const future = {};
+  const streams = new Set();
+  let onConnection = null;
+  const peer = {
+    base: {
+      wakeupProtocol: {
+        hasStream: (connection) => streams.has(connection),
+        addStream: (connection) => streams.add(connection),
+      },
+    },
+    swarm: {
+      connections: new Set([existing]),
+      on(event, listener) {
+        if (event === 'connection') onConnection = listener;
+      },
+    },
+  };
+
+  assert.equal(attachAutobaseWakeup(peer), 1);
+  assert.equal(streams.has(existing), true);
+  onConnection(future);
+  onConnection(future);
+  assert.equal(streams.has(future), true);
+  assert.equal(streams.size, 2);
+});
+
+test('Autobase wakeup does not attach a stream already owned by the base', () => {
+  const existing = {};
+  const peer = {
+    base: {
+      wakeupProtocol: {
+        hasStream: () => true,
+        addStream() {
+          assert.fail('already-attached wakeup stream must not be added twice');
+        },
+      },
+    },
+    swarm: {
+      connections: new Set([existing]),
+      on() {},
+    },
+  };
+
+  assert.equal(attachAutobaseWakeup(peer), 0);
 });
