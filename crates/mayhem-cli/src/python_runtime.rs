@@ -13,6 +13,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const VLLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/vllm.txt");
 const TRT_LLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/trt-llm.txt");
 const MLX_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/mlx.txt");
+const TRANSFORMERS_ASR_REQUIREMENTS: &[u8] =
+    include_bytes!("../resources/python/transformers-asr.txt");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PythonRuntime {
@@ -232,6 +234,26 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             extra_index_urls: &[],
             min_free_bytes: 2 * GIB,
         }),
+        "transformers-asr" => Some(PythonRuntimeSpec {
+            backend: "transformers-asr",
+            override_env: "MAYHEM_TRANSFORMERS_ASR_PYTHON",
+            distribution: "transformers",
+            required_imports: &[
+                "transformers",
+                "transformers.models.parakeet.modeling_parakeet",
+                "torch",
+                "tokenizers",
+                "safetensors",
+                "numpy",
+                "soundfile",
+                "soxr",
+            ],
+            version: "5.14.1",
+            requirements: TRANSFORMERS_ASR_REQUIREMENTS,
+            requirements_sha256: "40aea5afdff6383d8cd1dc53faea4fb1413f0833628bb3a61afd18cd27e36684",
+            extra_index_urls: &[],
+            min_free_bytes: 8 * GIB,
+        }),
         _ => None,
     }
 }
@@ -412,7 +434,7 @@ mod tests {
 
     #[test]
     fn backend_requirements_are_exact_and_checksummed() {
-        for backend in ["vllm", "trt-llm", "mlx"] {
+        for backend in ["vllm", "trt-llm", "mlx", "transformers-asr"] {
             let spec = python_runtime_spec(backend).expect("known backend");
             verify_requirements(&spec).expect("requirements verify");
             let pairs = exact_requirement_pairs(std::str::from_utf8(spec.requirements).unwrap())
@@ -425,6 +447,27 @@ mod tests {
             exact_requirement_pairs(std::str::from_utf8(vllm.requirements).unwrap())
                 .unwrap()
                 .contains(&("av".to_owned(), "18.0.0".to_owned()))
+        );
+
+        let transformers_asr =
+            python_runtime_spec("transformers-asr").expect("Transformers ASR runtime");
+        assert!(transformers_asr
+            .required_imports
+            .contains(&"transformers.models.parakeet.modeling_parakeet"));
+        assert!(transformers_asr.required_imports.contains(&"soundfile"));
+        assert!(transformers_asr.required_imports.contains(&"soxr"));
+        assert_eq!(
+            exact_requirement_pairs(std::str::from_utf8(transformers_asr.requirements).unwrap())
+                .unwrap(),
+            vec![
+                ("transformers".to_owned(), "5.14.1".to_owned()),
+                ("torch".to_owned(), "2.13.0".to_owned()),
+                ("tokenizers".to_owned(), "0.22.2".to_owned()),
+                ("safetensors".to_owned(), "0.8.0".to_owned()),
+                ("numpy".to_owned(), "2.2.6".to_owned()),
+                ("soundfile".to_owned(), "0.14.0".to_owned()),
+                ("soxr".to_owned(), "1.1.0".to_owned()),
+            ]
         );
     }
 
@@ -449,6 +492,10 @@ mod tests {
             python_runtime_spec("mlx").map(|spec| spec.override_env),
             Some("MAYHEM_MLX_PYTHON")
         );
+        assert_eq!(
+            python_runtime_spec("transformers-asr").map(|spec| spec.override_env),
+            Some("MAYHEM_TRANSFORMERS_ASR_PYTHON")
+        );
         assert!(python_runtime_spec("llama.cpp").is_none());
     }
 
@@ -459,6 +506,10 @@ mod tests {
             .extra_index_urls
             .is_empty());
         assert!(python_runtime_spec("mlx")
+            .unwrap()
+            .extra_index_urls
+            .is_empty());
+        assert!(python_runtime_spec("transformers-asr")
             .unwrap()
             .extra_index_urls
             .is_empty());

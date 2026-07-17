@@ -14,6 +14,8 @@ pub const CRATE_NAME: &str = "mayhem-hwprobe";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
+const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 
 #[derive(Debug, Clone)]
 pub struct ProbeOptions {
@@ -296,6 +298,7 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
         stable_diffusion_cpp_verdict(profile),
+        transformers_asr_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
     ]
@@ -750,6 +753,117 @@ fn stable_diffusion_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
                 .unwrap_or(profile.memory.total_bytes)
                 / 5,
         }
+    }
+}
+
+fn transformers_asr_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.memory.total_bytes < TRANSFORMERS_ASR_RAM_FLOOR {
+        return insufficient(
+            "transformers-asr",
+            "less than 8 GiB RAM available for float32 transformers ASR serving",
+        );
+    }
+
+    let cuda_memory = matches!(profile.host.os.as_str(), "linux" | "windows")
+        .then(|| {
+            profile
+                .gpus
+                .iter()
+                .filter(|gpu| gpu.vendor == GpuVendor::Nvidia && gpu.backend == GpuBackend::Nvml)
+                .map(|gpu| {
+                    if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+                        gpu.memory_bytes.unwrap_or_else(|| {
+                            profile
+                                .memory
+                                .available_bytes
+                                .unwrap_or(profile.memory.total_bytes)
+                        })
+                    } else {
+                        gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+                    }
+                })
+                .max()
+        })
+        .flatten();
+    if cuda_memory.is_some_and(|memory| memory >= TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR) {
+        return BackendVerdict {
+            backend: "transformers-asr".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(
+                "CUDA accelerator has enough usable device memory for transformers ASR".to_owned(),
+            ),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: profile
+                .memory
+                .available_bytes
+                .unwrap_or(profile.memory.total_bytes)
+                / 8,
+        };
+    }
+
+    let has_mps = profile.host.os == "macos"
+        && profile.gpus.iter().any(|gpu| {
+            gpu.vendor == GpuVendor::Apple
+                && gpu.backend == GpuBackend::Metal
+                && gpu.unified_memory
+                && gpu.memory_bytes.unwrap_or(profile.memory.total_bytes)
+                    >= TRANSFORMERS_ASR_RAM_FLOOR
+        });
+    if has_mps {
+        return BackendVerdict {
+            backend: "transformers-asr".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(
+                "Apple Metal/MPS unified-memory acceleration available for transformers ASR"
+                    .to_owned(),
+            ),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: profile
+                .memory
+                .available_bytes
+                .unwrap_or(profile.memory.total_bytes)
+                / 8,
+        };
+    }
+
+    if !matches!(profile.host.os.as_str(), "linux" | "windows" | "macos") {
+        return insufficient(
+            "transformers-asr",
+            "transformers ASR CPU serving is supported only on Linux, Windows, and macOS",
+        );
+    }
+
+    let accelerator_note =
+        if cuda_memory.is_some_and(|memory| memory < TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR) {
+            "CUDA device detected but usable device memory is below 4 GiB; "
+        } else {
+            ""
+        };
+    let simd = if profile.cpu.flags.avx2 {
+        " with AVX2"
+    } else if profile.cpu.flags.neon {
+        " with NEON"
+    } else {
+        ""
+    };
+    BackendVerdict {
+        backend: "transformers-asr".to_owned(),
+        status: VerdictStatus::CpuOnly,
+        reason: Some(format!(
+            "{accelerator_note}transformers ASR will use CPU execution{simd}"
+        )),
+        est_tok_s: None,
+        n_layers_gpu: Some(0),
+        max_sessions: 1,
+        kv_cache_bytes_budget: profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes)
+            / 8,
     }
 }
 
@@ -2144,6 +2258,83 @@ mod tests {
             .unwrap();
 
         assert!(large_layers > small_layers);
+    }
+
+    #[test]
+    fn transformers_asr_uses_cuda_on_linux_and_windows() {
+        for os in ["linux", "windows"] {
+            let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+            profile.host.os = os.to_owned();
+            profile.host.family = if os == "windows" { "windows" } else { "unix" }.to_owned();
+            profile.gpus.truncate(1);
+            profile.gpus[0].memory_bytes = Some(4 * GIB);
+            profile.gpus[0].dedicated_memory_bytes = Some(4 * GIB);
+
+            let verdict = transformers_asr_verdict(&profile);
+
+            assert_eq!(verdict.status, VerdictStatus::FullOffload, "{os}");
+            assert!(verdict.reason.unwrap_or_default().contains("CUDA"), "{os}");
+            assert_eq!(verdict.max_sessions, 1, "{os}");
+            assert_eq!(verdict.n_layers_gpu, None, "{os}");
+        }
+    }
+
+    #[test]
+    fn transformers_asr_uses_mps_only_for_apple_unified_metal() {
+        let profile = fixture_profile(FixtureProfile::AppleSilicon, Path::new("."));
+
+        let verdict = transformers_asr_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::FullOffload);
+        assert!(verdict.reason.unwrap_or_default().contains("Metal/MPS"));
+        assert_eq!(verdict.max_sessions, 1);
+        assert_eq!(verdict.n_layers_gpu, None);
+    }
+
+    #[test]
+    fn transformers_asr_supports_desktop_cpu_execution() {
+        for os in ["linux", "windows", "macos"] {
+            let mut profile = fixture_profile(FixtureProfile::CpuOnly, Path::new("."));
+            profile.host.os = os.to_owned();
+            profile.host.family = if os == "windows" { "windows" } else { "unix" }.to_owned();
+
+            let verdict = transformers_asr_verdict(&profile);
+
+            assert_eq!(verdict.status, VerdictStatus::CpuOnly, "{os}");
+            assert!(verdict.reason.unwrap_or_default().contains("CPU execution"));
+            assert_eq!(verdict.max_sessions, 1, "{os}");
+            assert_eq!(verdict.n_layers_gpu, Some(0), "{os}");
+        }
+    }
+
+    #[test]
+    fn transformers_asr_enforces_float32_host_ram_floor() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.memory.total_bytes = TRANSFORMERS_ASR_RAM_FLOOR - 1;
+        profile.memory.available_bytes = Some(TRANSFORMERS_ASR_RAM_FLOOR - 1);
+
+        let verdict = transformers_asr_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::Insufficient);
+        assert_eq!(verdict.max_sessions, 0);
+        assert!(verdict.reason.unwrap_or_default().contains("8 GiB RAM"));
+    }
+
+    #[test]
+    fn transformers_asr_does_not_count_wddm_shared_memory_as_cuda_capacity() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.host.os = "windows".to_owned();
+        profile.host.family = "windows".to_owned();
+        profile.gpus.truncate(1);
+        profile.gpus[0].memory_bytes = Some(3 * GIB);
+        profile.gpus[0].dedicated_memory_bytes = Some(3 * GIB);
+        profile.gpus[0].shared_memory_bytes = Some(32 * GIB);
+
+        let verdict = transformers_asr_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::CpuOnly);
+        assert_eq!(verdict.n_layers_gpu, Some(0));
+        assert!(verdict.reason.unwrap_or_default().contains("below 4 GiB"));
     }
 
     #[test]

@@ -223,7 +223,9 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "stream",
             ],
             &["file", "model"],
-            &["text", "usage", "mayhem"],
+            &[
+                "text", "task", "language", "duration", "words", "segments", "usage", "mayhem",
+            ],
         ),
         ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => (
             &[
@@ -438,6 +440,9 @@ fn endpoint_response_attribute_optional(family: &str, path: &str) -> bool {
         ) | (
             ENDPOINT_OPENAI_VIDEOS,
             "completed_at" | "expires_at" | "error"
+        ) | (
+            ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+            "task" | "language" | "duration" | "words" | "segments"
         ) | (ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, "chunks")
     )
 }
@@ -729,6 +734,12 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             1,
             2,
         ),
+        "parameters.return_timestamps" if family == ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+            enum_spec(
+                None,
+                &[json!(false), json!(true), json!("word"), json!("segment")],
+            )
+        }
         "size" if family == ENDPOINT_OPENAI_VIDEOS => enum_spec(
             Some(json!("720x1280")),
             &[
@@ -795,14 +806,17 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
 fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
     let leaf = path.rsplit('.').next().unwrap_or(path);
     let spec = match leaf {
-        "id" | "object" | "model" | "status" | "content_type" | "text" | "audio" | "music"
-        | "image" | "video" | "size" | "seconds" | "quality" | "output_format" | "prompt"
-        | "background" => string_spec(0, 512 * 1024 * 1024, json!("$RESPONSE_VALUE")),
+        "id" | "object" | "model" | "status" | "content_type" | "text" | "task" | "language"
+        | "audio" | "music" | "image" | "video" | "size" | "seconds" | "quality"
+        | "output_format" | "prompt" | "background" => {
+            string_spec(0, 512 * 1024 * 1024, json!("$RESPONSE_VALUE"))
+        }
+        "duration" => number_spec(0.0, 86_400.0, 1.0),
         "sampling_rate" => integer_spec(1.0, 1_000_000.0, 16_000),
         "created" | "created_at" | "completed_at" | "expires_at" | "progress" => {
             integer_spec(0.0, u64::MAX as f64, 1)
         }
-        "choices" | "data" | "output" | "embeddings" | "chunks" => {
+        "choices" | "data" | "output" | "embeddings" | "chunks" | "words" | "segments" => {
             array_spec(0, 1_000_000, json!([]))
         }
         "usage" | "mayhem" => object_spec(json!({})),

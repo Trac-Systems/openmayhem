@@ -80,12 +80,12 @@ use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
     metered_output_units, payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
-    EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    stable_json_bytes, validate_transcription_result, AttestationReport, CheckpointPolicy,
+    CtxBracketSchedule, EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, VisibleToolCall, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, TranscriptionResult, TranscriptionResultLimits,
+    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
@@ -2579,7 +2579,11 @@ fn audio_speech_job_result(output: &AudioSpeechOutput) -> Value {
 fn audio_transcription_job_result(output: &AudioTranscriptionOutput) -> Value {
     json!({
         "kind": "audio_transcription",
-        "text": output.text,
+        "text": output.transcription.text,
+        "language": output.transcription.detected_language,
+        "duration": output.transcription.duration_seconds,
+        "words": output.transcription.words,
+        "segments": output.transcription.segments,
         "usage": output.usage,
     })
 }
@@ -2767,7 +2771,7 @@ pub struct AudioSpeechOutput {
 
 #[derive(Clone, Debug)]
 pub struct AudioTranscriptionOutput {
-    pub text: String,
+    pub transcription: TranscriptionResult,
     pub usage: ReceiptUsage,
 }
 
@@ -5580,8 +5584,7 @@ async fn create_audio_transcription(
             })
             .await
             {
-                Ok(value) => {
-                    let mut response = Json(value).into_response();
+                Ok(mut response) => {
                     attach_gateway_job_headers(&mut response, &job.id);
                     response
                 }
@@ -5682,8 +5685,7 @@ async fn execute_hf_inference_job(
         }
         mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
             let request = hf_audio_transcription_request(&model_id, raw_request)?;
-            let value = build_audio_transcription(&state, request, options).await?;
-            Ok(Json(value).into_response())
+            build_audio_transcription(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
             let request = artifact_generation_request(&model_id, &endpoint_family, raw_request)?;
@@ -5956,6 +5958,19 @@ fn hf_audio_transcription_request(
     let temperature = raw_request
         .pointer("/parameters/generation_parameters/temperature")
         .and_then(Value::as_f64);
+    let timestamp_granularities = match raw_request.pointer("/parameters/return_timestamps") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Vec::new(),
+        Some(Value::Bool(true)) => vec!["segment".to_owned()],
+        Some(Value::String(granularity)) if matches!(granularity.as_str(), "word" | "segment") => {
+            vec![granularity.clone()]
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "parameters.return_timestamps must be false, true, word, or segment",
+                Some("parameters.return_timestamps"),
+            ))
+        }
+    };
     Ok(AudioTranscriptionRequest {
         model: model_id.to_owned(),
         audio,
@@ -5965,7 +5980,7 @@ fn hf_audio_transcription_request(
         language: None,
         prompt: None,
         temperature,
-        timestamp_granularities: Vec::new(),
+        timestamp_granularities,
         stream: false,
         endpoint_family: mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION.to_owned(),
         contract_request: raw_request,
@@ -11278,7 +11293,10 @@ fn session_delta_payload_key(request_id: &str, field: &str, payload_id: &str) ->
 }
 
 fn valid_session_delta_ref_field(field: &str) -> bool {
-    matches!(field, "tools" | "embeddings" | "token_ids")
+    matches!(
+        field,
+        "tools" | "embeddings" | "token_ids" | "transcription"
+    )
 }
 
 fn collect_session_delta_chunk(
@@ -11393,6 +11411,55 @@ fn resolve_session_delta_ref_field(
     collector.finish_json(&manifest).map(Some).map_err(|err| {
         GatewaySessionError::new(format!("reassembling s.delta {ref_key} failed: {err}"))
     })
+}
+
+fn transcription_result_limits() -> TranscriptionResultLimits {
+    let defaults = TranscriptionResultLimits::default();
+    TranscriptionResultLimits {
+        max_bytes: configured_positive_usize(
+            "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
+            defaults.max_bytes,
+        ),
+        max_timestamp_entries: configured_positive_usize(
+            "MAYHEM_SESSION_MAX_TRANSCRIPTION_TIMESTAMPS",
+            defaults.max_timestamp_entries,
+        ),
+    }
+}
+
+fn transcription_from_session_delta(
+    frame: &Value,
+    pending: &mut SessionDeltaPayloadChunks,
+) -> Result<Option<TranscriptionResult>, GatewaySessionError> {
+    let inline = frame
+        .get("transcription")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let has_ref = frame.get("transcription_ref").is_some();
+    if inline.is_some() && has_ref {
+        return Err(GatewaySessionError::new(
+            "provider s.delta included both transcription and transcription_ref",
+        ));
+    }
+    let value = match inline {
+        Some(value) => Some(value),
+        None => resolve_session_delta_ref_field(frame, "transcription", pending)?,
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if frame.get("fin").and_then(Value::as_str).is_none() {
+        return Err(GatewaySessionError::new(
+            "provider transcription result must be carried by the final s.delta",
+        ));
+    }
+    let result: TranscriptionResult = serde_json::from_value(value).map_err(|err| {
+        GatewaySessionError::new(format!("invalid provider transcription result: {err}"))
+    })?;
+    validate_transcription_result(&result, transcription_result_limits()).map_err(|err| {
+        GatewaySessionError::new(format!("invalid provider transcription result: {err}"))
+    })?;
+    Ok(Some(result))
 }
 
 async fn collect_direct_session_output(
@@ -12385,10 +12452,12 @@ async fn collect_direct_session_audio_transcription_output(
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectAudioTranscriptionSessionCollected, GatewaySessionError> {
     let mut content = String::new();
+    let mut transcription = None;
     let mut finish_seen = false;
     let mut usage = None;
     let mut provider_receipt = None;
     let mut provider_quality = None;
+    let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
     let mut delta_sequence = SessionDeltaSequence::default();
     let max_text_bytes = configured_positive_usize(
         "MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES",
@@ -12412,7 +12481,13 @@ async fn collect_direct_session_audio_transcription_output(
             session_id,
             expected_remote,
             remaining_millis.map(Duration::from_millis),
-            &["s.delta", "s.receipt", "s.error", "s.close"],
+            &[
+                "s.delta",
+                "s.delta_chunk",
+                "s.receipt",
+                "s.error",
+                "s.close",
+            ],
             if finish_seen {
                 None
             } else {
@@ -12428,6 +12503,13 @@ async fn collect_direct_session_audio_transcription_output(
             }
         })?;
         match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta_chunk")
+                if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
+            {
+                delta_sequence.observe(&frame)?;
+                watchdog.record_delta(now_millis_u64());
+                collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
+            }
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
                 watchdog.record_delta(now_millis_u64());
@@ -12438,6 +12520,15 @@ async fn collect_direct_session_audio_transcription_output(
                         max_text_bytes,
                         "audio transcription output",
                     )?;
+                }
+                if let Some(result) =
+                    transcription_from_session_delta(&frame, &mut delta_payload_chunks)?
+                {
+                    if transcription.replace(result).is_some() {
+                        return Err(GatewaySessionError::new(
+                            "provider sent more than one transcription result",
+                        ));
+                    }
                 }
                 if frame.get("fin").and_then(Value::as_str).is_some() {
                     finish_seen = true;
@@ -12479,12 +12570,33 @@ async fn collect_direct_session_audio_transcription_output(
         }
     }
 
-    let text = content.trim().to_owned();
-    if text.is_empty() {
-        return Err(GatewaySessionError::new(format!(
-            "provider audio transcription session {session_id} finished with empty transcript"
-        )));
+    if !delta_payload_chunks.chunks.is_empty() {
+        return Err(GatewaySessionError::new(
+            "provider audio transcription session ended with unreferenced payload chunks",
+        ));
     }
+    let streamed_text = content.trim();
+    let transcription = match transcription {
+        Some(transcription)
+            if !streamed_text.is_empty() && transcription.text.trim() != streamed_text =>
+        {
+            return Err(GatewaySessionError::new(format!(
+                "provider audio transcription session {session_id} final result did not match streamed text"
+            )));
+        }
+        Some(transcription) => transcription,
+        None => {
+            let transcription = TranscriptionResult::text(streamed_text);
+            validate_transcription_result(&transcription, transcription_result_limits()).map_err(
+                |err| {
+                    GatewaySessionError::new(format!(
+                        "provider audio transcription session {session_id} returned an invalid transcript: {err}"
+                    ))
+                },
+            )?;
+            transcription
+        }
+    };
     let completed_at_millis = now_millis_u64();
     let usage = usage.unwrap_or_else(|| audio_transcription_usage_for_request(request));
     let quality = provider_quality.or_else(|| {
@@ -12505,7 +12617,10 @@ async fn collect_direct_session_audio_transcription_output(
         ))
     })?;
     Ok(DirectAudioTranscriptionSessionCollected {
-        output: AudioTranscriptionOutput { text, usage },
+        output: AudioTranscriptionOutput {
+            transcription,
+            usage,
+        },
         provider_receipt,
         quality,
     })
@@ -19868,7 +19983,7 @@ async fn build_audio_transcription(
     state: &GatewayState,
     request: AudioTranscriptionRequest,
     options: GatewayRequestOptions,
-) -> Result<Value, ApiError> {
+) -> Result<Response, ApiError> {
     let model = require_model(state, &request.model)?;
     if !model_supports_stt(&model) {
         return Err(ApiError::bad_request(
@@ -19876,13 +19991,7 @@ async fn build_audio_transcription(
             Some("model"),
         ));
     }
-    let response_format = request.response_format.as_deref().unwrap_or("json");
-    if response_format != "json" {
-        return Err(ApiError::bad_request(
-            "only response_format=json is supported",
-            Some("response_format"),
-        ));
-    }
+    validate_audio_transcription_response_request(&request)?;
     let GatewayAudioTranscriptionRun {
         result:
             GatewayAudioTranscriptionResult {
@@ -19896,6 +20005,14 @@ async fn build_audio_transcription(
         metering_request,
         metering_output,
     } = run_audio_transcription_with_route_retry(state, &model, &request, options).await?;
+    validate_transcription_result(&output.transcription, transcription_result_limits()).map_err(
+        |err| {
+            ApiError::bad_gateway(
+                format!("provider returned invalid transcription metadata: {err}"),
+                Some("model"),
+            )
+        },
+    )?;
     let receipt = if state.dev_session_shim {
         None
     } else {
@@ -19911,6 +20028,30 @@ async fn build_audio_transcription(
             .await;
         Some(receipt_summary(&receipt))
     };
+    let mayhem = json!({
+        "backend": backend,
+        "direct_session": direct_session,
+        "billable": !state.dev_session_shim,
+        "dev_session": state.dev_session_shim,
+        "quality": quality.map(|quality| json!({
+            "ttft_ms": quality.ttft_ms,
+            "tok_s": quality.tok_s,
+        })),
+        "receipt": receipt.clone(),
+    });
+    let mut response =
+        if request.endpoint_family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+            hf_audio_transcription_response(&request, &output, mayhem)?
+        } else {
+            openai_audio_transcription_response(&request, &output, mayhem)?
+        };
+    attach_audio_transcription_response_headers(
+        &mut response,
+        &output,
+        &backend,
+        direct_session,
+        receipt.as_ref(),
+    )?;
     if let Some(job) = invocation.job.as_ref() {
         job.persist_completed_if_active(
             audio_transcription_job_result(&output),
@@ -19919,21 +20060,304 @@ async fn build_audio_transcription(
         )
         .await?;
     }
-    Ok(json!({
-        "text": output.text,
-        "usage": output.usage,
-        "mayhem": {
-            "backend": backend,
-            "direct_session": direct_session,
-            "billable": !state.dev_session_shim,
-            "dev_session": state.dev_session_shim,
-            "quality": quality.map(|quality| json!({
-                "ttft_ms": quality.ttft_ms,
-                "tok_s": quality.tok_s,
-            })),
-            "receipt": receipt,
-        },
-    }))
+    Ok(response)
+}
+
+fn validate_audio_transcription_response_request(
+    request: &AudioTranscriptionRequest,
+) -> Result<(), ApiError> {
+    if request.stream {
+        return Err(ApiError::bad_request(
+            "streaming audio transcription is not supported",
+            Some("stream"),
+        ));
+    }
+    let mut granularities = BTreeSet::new();
+    for granularity in &request.timestamp_granularities {
+        if !matches!(granularity.as_str(), "word" | "segment") {
+            return Err(ApiError::bad_request(
+                "timestamp_granularities must contain only word or segment",
+                Some("timestamp_granularities"),
+            ));
+        }
+        if !granularities.insert(granularity.as_str()) {
+            return Err(ApiError::bad_request(
+                "timestamp_granularities must not contain duplicates",
+                Some("timestamp_granularities"),
+            ));
+        }
+    }
+    if request.endpoint_family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+        if request.timestamp_granularities.len() > 1 {
+            return Err(ApiError::bad_request(
+                "HF automatic-speech-recognition accepts one timestamp granularity",
+                Some("parameters.return_timestamps"),
+            ));
+        }
+        return Ok(());
+    }
+    let response_format = request.response_format.as_deref().unwrap_or("json");
+    if !matches!(
+        response_format,
+        "json" | "text" | "verbose_json" | "srt" | "vtt"
+    ) {
+        return Err(ApiError::bad_request(
+            "response_format must be json, text, verbose_json, srt, or vtt",
+            Some("response_format"),
+        ));
+    }
+    if !request.timestamp_granularities.is_empty() && response_format != "verbose_json" {
+        return Err(ApiError::bad_request(
+            "timestamp_granularities is supported only with response_format=verbose_json",
+            Some("timestamp_granularities"),
+        ));
+    }
+    Ok(())
+}
+
+fn openai_audio_transcription_response(
+    request: &AudioTranscriptionRequest,
+    output: &AudioTranscriptionOutput,
+    mayhem: Value,
+) -> Result<Response, ApiError> {
+    let response_format = request.response_format.as_deref().unwrap_or("json");
+    match response_format {
+        "json" => Ok(Json(json!({
+            "text": output.transcription.text,
+            "usage": output.usage,
+            "mayhem": mayhem,
+        }))
+        .into_response()),
+        "text" => Ok(audio_transcription_text_response(
+            output.transcription.text.clone(),
+            "text/plain; charset=utf-8",
+        )),
+        "verbose_json" => {
+            let granularities = if request.timestamp_granularities.is_empty() {
+                vec!["segment"]
+            } else {
+                request
+                    .timestamp_granularities
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            };
+            let mut body = Map::from_iter([
+                ("task".to_owned(), json!("transcribe")),
+                ("text".to_owned(), json!(output.transcription.text)),
+                ("usage".to_owned(), json!(output.usage)),
+                ("mayhem".to_owned(), mayhem),
+            ]);
+            if let Some(language) = &output.transcription.detected_language {
+                body.insert("language".to_owned(), json!(language));
+            }
+            if let Some(duration) = output.transcription.duration_seconds {
+                body.insert("duration".to_owned(), json!(duration));
+            }
+            for granularity in granularities {
+                match granularity {
+                    "word" => {
+                        require_transcription_timestamps(
+                            !output.transcription.words.is_empty(),
+                            "word",
+                        )?;
+                        body.insert(
+                            "words".to_owned(),
+                            json!(output
+                                .transcription
+                                .words
+                                .iter()
+                                .map(|word| json!({
+                                    "word": word.text,
+                                    "start": word.start,
+                                    "end": word.end,
+                                }))
+                                .collect::<Vec<_>>()),
+                        );
+                    }
+                    "segment" => {
+                        require_transcription_timestamps(
+                            !output.transcription.segments.is_empty(),
+                            "segment",
+                        )?;
+                        body.insert(
+                            "segments".to_owned(),
+                            json!(output
+                                .transcription
+                                .segments
+                                .iter()
+                                .enumerate()
+                                .map(|(id, segment)| json!({
+                                    "id": id,
+                                    "text": segment.text,
+                                    "start": segment.start,
+                                    "end": segment.end,
+                                }))
+                                .collect::<Vec<_>>()),
+                        );
+                    }
+                    _ => unreachable!("timestamp granularities were validated"),
+                }
+            }
+            Ok(Json(Value::Object(body)).into_response())
+        }
+        "srt" | "vtt" => {
+            require_transcription_timestamps(!output.transcription.segments.is_empty(), "segment")?;
+            let body =
+                subtitle_transcription(&output.transcription.segments, response_format == "vtt")?;
+            let content_type = if response_format == "vtt" {
+                "text/vtt; charset=utf-8"
+            } else {
+                "application/x-subrip; charset=utf-8"
+            };
+            Ok(audio_transcription_text_response(body, content_type))
+        }
+        _ => unreachable!("response format was validated"),
+    }
+}
+
+fn hf_audio_transcription_response(
+    request: &AudioTranscriptionRequest,
+    output: &AudioTranscriptionOutput,
+    mayhem: Value,
+) -> Result<Response, ApiError> {
+    let mut body = Map::from_iter([
+        ("text".to_owned(), json!(output.transcription.text)),
+        ("usage".to_owned(), json!(output.usage)),
+        ("mayhem".to_owned(), mayhem),
+    ]);
+    if let Some(granularity) = request.timestamp_granularities.first() {
+        let chunks = match granularity.as_str() {
+            "word" => {
+                require_transcription_timestamps(!output.transcription.words.is_empty(), "word")?;
+                output
+                    .transcription
+                    .words
+                    .iter()
+                    .map(|word| {
+                        json!({
+                            "text": word.text,
+                            "timestamp": [word.start, word.end],
+                        })
+                    })
+                    .collect()
+            }
+            "segment" => {
+                require_transcription_timestamps(
+                    !output.transcription.segments.is_empty(),
+                    "segment",
+                )?;
+                output
+                    .transcription
+                    .segments
+                    .iter()
+                    .map(|segment| {
+                        json!({
+                            "text": segment.text,
+                            "timestamp": [segment.start, segment.end],
+                        })
+                    })
+                    .collect()
+            }
+            _ => unreachable!("timestamp granularity was validated"),
+        };
+        body.insert("chunks".to_owned(), Value::Array(chunks));
+    }
+    Ok(Json(Value::Object(body)).into_response())
+}
+
+fn require_transcription_timestamps(available: bool, granularity: &str) -> Result<(), ApiError> {
+    if available {
+        Ok(())
+    } else {
+        Err(ApiError::bad_gateway(
+            format!("provider did not return requested {granularity} timestamps"),
+            Some("model"),
+        ))
+    }
+}
+
+fn subtitle_transcription(
+    segments: &[mayhem_proto::TranscriptionTimestamp],
+    webvtt: bool,
+) -> Result<String, ApiError> {
+    let mut body = if webvtt {
+        "WEBVTT\n\n".to_owned()
+    } else {
+        String::new()
+    };
+    for (index, segment) in segments.iter().enumerate() {
+        if !webvtt {
+            body.push_str(&(index + 1).to_string());
+            body.push('\n');
+        }
+        body.push_str(&subtitle_timestamp(segment.start, webvtt)?);
+        body.push_str(" --> ");
+        body.push_str(&subtitle_timestamp(segment.end, webvtt)?);
+        body.push('\n');
+        body.push_str(&segment.text);
+        body.push_str("\n\n");
+    }
+    Ok(body)
+}
+
+fn subtitle_timestamp(seconds: f64, webvtt: bool) -> Result<String, ApiError> {
+    let millis = (seconds * 1000.0).round();
+    if !millis.is_finite() || millis < 0.0 || millis > u64::MAX as f64 {
+        return Err(ApiError::bad_gateway(
+            "provider returned a timestamp outside the subtitle range",
+            Some("model"),
+        ));
+    }
+    let millis = millis as u64;
+    let hours = millis / 3_600_000;
+    let minutes = millis / 60_000 % 60;
+    let seconds = millis / 1_000 % 60;
+    let millis = millis % 1_000;
+    let separator = if webvtt { '.' } else { ',' };
+    Ok(format!(
+        "{hours:02}:{minutes:02}:{seconds:02}{separator}{millis:03}"
+    ))
+}
+
+fn audio_transcription_text_response(body: String, content_type: &'static str) -> Response {
+    let mut response = Body::from(body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+}
+
+fn attach_audio_transcription_response_headers(
+    response: &mut Response,
+    output: &AudioTranscriptionOutput,
+    backend: &str,
+    direct_session: bool,
+    receipt: Option<&Value>,
+) -> Result<(), ApiError> {
+    response.headers_mut().insert(
+        "x-mayhem-backend",
+        HeaderValue::from_str(backend)
+            .map_err(|err| ApiError::bad_gateway(format!("invalid backend header: {err}"), None))?,
+    );
+    response.headers_mut().insert(
+        "x-mayhem-direct-session",
+        HeaderValue::from_static(if direct_session { "true" } else { "false" }),
+    );
+    response.headers_mut().insert(
+        "x-mayhem-usage",
+        HeaderValue::from_str(&serde_json::to_string(&output.usage).map_err(ApiError::internal)?)
+            .map_err(|err| ApiError::bad_gateway(format!("invalid usage header: {err}"), None))?,
+    );
+    if let Some(receipt) = receipt {
+        response.headers_mut().insert(
+            "x-mayhem-receipt",
+            HeaderValue::from_str(&receipt.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid receipt header: {err}"), None)
+            })?,
+        );
+    }
+    Ok(())
 }
 
 fn model_supports_embeddings(model: &GatewayModel) -> bool {
@@ -21671,7 +22095,8 @@ impl GatewayState {
                 .run_audio_transcription(model, &request, &invocation)
                 .await
                 .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
-            observed_transcripts.insert(prompt.id.clone(), result.output.text.clone());
+            observed_transcripts
+                .insert(prompt.id.clone(), result.output.transcription.text.clone());
             let receipt = self.meter_audio_transcription_session(
                 model,
                 &request,
@@ -21685,7 +22110,7 @@ impl GatewayState {
             prompt_reports.push(json!({
                 "prompt_id": prompt.id,
                 "request": direct_session_audio_transcription_request_body(&request),
-                "transcript": result.output.text,
+                "transcript": result.output.transcription.text,
                 "session_id": invocation.session_id,
                 "receipt_hash": receipt_hash,
             }));
@@ -30122,7 +30547,7 @@ mod tests {
 
         let audio = GatewayAudioTranscriptionResult {
             output: AudioTranscriptionOutput {
-                text: "hello".to_owned(),
+                transcription: TranscriptionResult::text("hello"),
                 usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 6)]),
             },
             backend: "direct".to_owned(),
@@ -31928,7 +32353,7 @@ mod tests {
     }
 
     #[test]
-    fn session_delta_refs_reassemble_large_tool_embeddings_and_token_ids() {
+    fn session_delta_refs_reassemble_large_structured_outputs() {
         let mut pending = SessionDeltaPayloadChunks::default();
         let tools = json!([
             {
@@ -31944,10 +32369,24 @@ mod tests {
         ]);
         let embeddings = json!([vec![0.25_f32; 2048], vec![0.5_f32; 2048]]);
         let token_ids = json!((0..4096).collect::<Vec<i32>>());
+        let transcription = json!({
+            "v": mayhem_proto::TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+            "text": "hello mayhem",
+            "detected_language": "en",
+            "duration_seconds": 2.0,
+            "words": [
+                {"text": "hello", "start": 0.0, "end": 0.8},
+                {"text": "mayhem", "start": 1.0, "end": 2.0}
+            ],
+            "segments": [
+                {"text": "hello mayhem", "start": 0.0, "end": 2.0}
+            ]
+        });
         let fields = [
             ("tools", tools.clone()),
             ("embeddings", embeddings.clone()),
             ("token_ids", token_ids.clone()),
+            ("transcription", transcription.clone()),
         ];
         let mut manifests = BTreeMap::new();
         for (field, value) in fields {
@@ -31976,6 +32415,9 @@ mod tests {
             "embeddings_ref": manifests["embeddings"],
             "token_ids": null,
             "token_ids_ref": manifests["token_ids"],
+            "transcription": null,
+            "transcription_ref": manifests["transcription"],
+            "fin": "stop",
         });
 
         let restored_tools = tool_calls_from_session_delta_resolving(&frame, &mut pending)
@@ -31985,6 +32427,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let restored_token_ids = token_ids_ref_from_session_delta(&frame, &mut pending)
+            .unwrap()
+            .unwrap();
+        let restored_transcription = transcription_from_session_delta(&frame, &mut pending)
             .unwrap()
             .unwrap();
 
@@ -32001,6 +32446,10 @@ mod tests {
         assert_eq!(restored_embeddings.len(), 2);
         assert_eq!(restored_embeddings[0].len(), 2048);
         assert_eq!(restored_token_ids.len(), 4096);
+        assert_eq!(
+            serde_json::to_value(restored_transcription).unwrap(),
+            transcription
+        );
         assert!(pending.chunks.is_empty());
     }
 

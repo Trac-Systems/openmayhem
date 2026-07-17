@@ -17,7 +17,7 @@
     },
     "subnet": {
       "channel": "mayhem-router-subnet",
-      "bootstrap": "de05c29747ad223881cab6e7b6791a38ad19cab805d21ba9da1b968dbf356203"
+      "bootstrap": "2bd91db6dcc2bfc518ead2440739cbfca7055c095b2e7c2bf96349783a876e67"
     },
     "dht": {
       "peer_bootstrap": [

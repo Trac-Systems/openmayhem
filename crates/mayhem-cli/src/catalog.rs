@@ -2843,6 +2843,7 @@ fn validate_artifact(
             | "diffusers"
             | "stable-diffusion.cpp"
             | "comfyui"
+            | "transformers-asr"
             | "whisper.cpp"
             | "piper"
             | "kokoro"

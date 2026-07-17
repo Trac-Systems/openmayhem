@@ -956,6 +956,228 @@ pub fn stable_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_jso
     serde_json::to_vec(&stable_json_value(value))
 }
 
+pub const TRANSCRIPTION_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_TIMESTAMP_ENTRIES: usize = 1_000_000;
+pub const TRANSCRIPTION_RESULT_MAX_LANGUAGE_BYTES: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptionResult {
+    #[serde(rename = "v")]
+    pub schema_version: u32,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<TranscriptionTimestamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<TranscriptionTimestamp>,
+}
+
+impl TranscriptionResult {
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            schema_version: TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+            text: text.into(),
+            detected_language: None,
+            duration_seconds: None,
+            words: Vec::new(),
+            segments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptionTimestamp {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptionResultLimits {
+    pub max_bytes: usize,
+    pub max_timestamp_entries: usize,
+}
+
+impl Default for TranscriptionResultLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_TRANSCRIPTION_RESULT_MAX_BYTES,
+            max_timestamp_entries: DEFAULT_TRANSCRIPTION_RESULT_MAX_TIMESTAMP_ENTRIES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranscriptionResultError {
+    UnsupportedSchemaVersion(u32),
+    InvalidText,
+    InvalidLanguage,
+    TooManyTimestampEntries {
+        max: u64,
+        got: u64,
+    },
+    InvalidTimestamp {
+        kind: &'static str,
+        index: u64,
+        reason: &'static str,
+    },
+    PayloadTooLarge {
+        max: u64,
+        got: u64,
+    },
+    LengthOverflow,
+    Json(String),
+    Payload(PayloadChunkError),
+}
+
+impl fmt::Display for TranscriptionResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(f, "unsupported transcription result schema version {version}")
+            }
+            Self::InvalidText => write!(f, "transcription result text must not be empty"),
+            Self::InvalidLanguage => write!(
+                f,
+                "transcription result language must contain 1..={TRANSCRIPTION_RESULT_MAX_LANGUAGE_BYTES} bytes"
+            ),
+            Self::TooManyTimestampEntries { max, got } => write!(
+                f,
+                "transcription result has {got} timestamp entries, exceeding the {max}-entry limit"
+            ),
+            Self::InvalidTimestamp {
+                kind,
+                index,
+                reason,
+            } => write!(
+                f,
+                "transcription result {kind} timestamp {index} is invalid: {reason}"
+            ),
+            Self::PayloadTooLarge { max, got } => write!(
+                f,
+                "transcription result is {got} bytes, exceeding the {max}-byte limit"
+            ),
+            Self::LengthOverflow => write!(f, "transcription result length overflowed"),
+            Self::Json(message) => write!(f, "transcription result JSON error: {message}"),
+            Self::Payload(error) => write!(f, "transcription result payload error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TranscriptionResultError {}
+
+impl From<PayloadChunkError> for TranscriptionResultError {
+    fn from(error: PayloadChunkError) -> Self {
+        Self::Payload(error)
+    }
+}
+
+pub fn validate_transcription_result(
+    result: &TranscriptionResult,
+    limits: TranscriptionResultLimits,
+) -> Result<(), TranscriptionResultError> {
+    if result.schema_version != TRANSCRIPTION_RESULT_SCHEMA_VERSION {
+        return Err(TranscriptionResultError::UnsupportedSchemaVersion(
+            result.schema_version,
+        ));
+    }
+    if result.text.trim().is_empty() {
+        return Err(TranscriptionResultError::InvalidText);
+    }
+    if result.detected_language.as_ref().is_some_and(|language| {
+        language.trim().is_empty() || language.len() > TRANSCRIPTION_RESULT_MAX_LANGUAGE_BYTES
+    }) {
+        return Err(TranscriptionResultError::InvalidLanguage);
+    }
+    if result
+        .duration_seconds
+        .is_some_and(|duration| !duration.is_finite() || duration < 0.0)
+    {
+        return Err(TranscriptionResultError::InvalidTimestamp {
+            kind: "duration",
+            index: 0,
+            reason: "duration must be finite and non-negative",
+        });
+    }
+    let timestamp_entries = result
+        .words
+        .len()
+        .checked_add(result.segments.len())
+        .ok_or(TranscriptionResultError::LengthOverflow)?;
+    if timestamp_entries > limits.max_timestamp_entries {
+        return Err(TranscriptionResultError::TooManyTimestampEntries {
+            max: u64::try_from(limits.max_timestamp_entries)
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+            got: u64::try_from(timestamp_entries)
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+        });
+    }
+    validate_transcription_timestamps(
+        "word",
+        result
+            .words
+            .iter()
+            .map(|word| (word.text.as_str(), word.start, word.end)),
+    )?;
+    validate_transcription_timestamps(
+        "segment",
+        result
+            .segments
+            .iter()
+            .map(|segment| (segment.text.as_str(), segment.start, segment.end)),
+    )?;
+    let bytes = serde_json::to_vec(result)
+        .map_err(|error| TranscriptionResultError::Json(error.to_string()))?;
+    if bytes.len() > limits.max_bytes {
+        return Err(TranscriptionResultError::PayloadTooLarge {
+            max: u64::try_from(limits.max_bytes)
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+            got: u64::try_from(bytes.len())
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+        });
+    }
+    Ok(())
+}
+
+fn validate_transcription_timestamps<'a>(
+    kind: &'static str,
+    entries: impl IntoIterator<Item = (&'a str, f64, f64)>,
+) -> Result<(), TranscriptionResultError> {
+    let mut previous_start = 0.0;
+    for (index, (text, start, end)) in entries.into_iter().enumerate() {
+        let index = u64::try_from(index).map_err(|_| TranscriptionResultError::LengthOverflow)?;
+        let reason = if text.trim().is_empty() {
+            Some("text must not be empty")
+        } else if !start.is_finite() || !end.is_finite() {
+            Some("start and end must be finite")
+        } else if start < 0.0 || end < 0.0 {
+            Some("start and end must be non-negative")
+        } else if end < start {
+            Some("end must not precede start")
+        } else if start < previous_start {
+            Some("entries must be ordered by start time")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(TranscriptionResultError::InvalidTimestamp {
+                kind,
+                index,
+                reason,
+            });
+        }
+        previous_start = start;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PayloadChunkManifest {
     #[serde(rename = "v")]
@@ -1346,6 +1568,29 @@ pub fn reassemble_json_payload(
 ) -> Result<serde_json::Value, PayloadChunkError> {
     let bytes = reassemble_payload_chunks(manifest, chunks)?;
     serde_json::from_slice(&bytes).map_err(|err| PayloadChunkError::Json(err.to_string()))
+}
+
+pub fn chunk_transcription_result(
+    result: &TranscriptionResult,
+    chunk_size: usize,
+    limits: TranscriptionResultLimits,
+) -> Result<(PayloadChunkManifest, Vec<PayloadChunk>), TranscriptionResultError> {
+    validate_transcription_result(result, limits)?;
+    let value = serde_json::to_value(result)
+        .map_err(|error| TranscriptionResultError::Json(error.to_string()))?;
+    chunk_json_payload(&value, chunk_size).map_err(TranscriptionResultError::from)
+}
+
+pub fn reassemble_transcription_result(
+    manifest: &PayloadChunkManifest,
+    chunks: &[PayloadChunk],
+    limits: TranscriptionResultLimits,
+) -> Result<TranscriptionResult, TranscriptionResultError> {
+    let value = reassemble_json_payload(manifest, chunks)?;
+    let result = serde_json::from_value(value)
+        .map_err(|error| TranscriptionResultError::Json(error.to_string()))?;
+    validate_transcription_result(&result, limits)?;
+    Ok(result)
 }
 
 pub fn chunk_payload_bytes(
@@ -2192,6 +2437,78 @@ mod tests {
         assert_eq!(manifest.chunk_count, chunks.len() as u64);
         let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
         assert_eq!(restored, stable_json_value(&value));
+    }
+
+    #[test]
+    fn transcription_result_roundtrips_through_bounded_chunks() {
+        let result = TranscriptionResult {
+            schema_version: TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+            text: "hello mayhem".to_owned(),
+            detected_language: Some("en".to_owned()),
+            duration_seconds: Some(1.5),
+            words: vec![
+                TranscriptionTimestamp {
+                    text: "hello".to_owned(),
+                    start: 0.0,
+                    end: 0.6,
+                },
+                TranscriptionTimestamp {
+                    text: "mayhem".to_owned(),
+                    start: 0.7,
+                    end: 1.5,
+                },
+            ],
+            segments: vec![TranscriptionTimestamp {
+                text: "hello mayhem".to_owned(),
+                start: 0.0,
+                end: 1.5,
+            }],
+        };
+        let limits = TranscriptionResultLimits {
+            max_bytes: 4096,
+            max_timestamp_entries: 8,
+        };
+
+        let (manifest, chunks) = chunk_transcription_result(&result, 32, limits).unwrap();
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            reassemble_transcription_result(&manifest, &chunks, limits).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn transcription_result_rejects_unbounded_or_invalid_timestamps() {
+        let mut result = TranscriptionResult::text("hello mayhem");
+        result.words = vec![
+            TranscriptionTimestamp {
+                text: "mayhem".to_owned(),
+                start: 1.0,
+                end: 1.5,
+            },
+            TranscriptionTimestamp {
+                text: "hello".to_owned(),
+                start: 0.0,
+                end: 0.5,
+            },
+        ];
+        assert!(matches!(
+            validate_transcription_result(&result, TranscriptionResultLimits::default()),
+            Err(TranscriptionResultError::InvalidTimestamp { .. })
+        ));
+
+        result.words.truncate(1);
+        assert!(matches!(
+            validate_transcription_result(
+                &result,
+                TranscriptionResultLimits {
+                    max_bytes: 4096,
+                    max_timestamp_entries: 0,
+                },
+            ),
+            Err(TranscriptionResultError::TooManyTimestampEntries { .. })
+        ));
     }
 
     #[test]

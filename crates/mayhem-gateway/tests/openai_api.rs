@@ -30,9 +30,10 @@ use mayhem_proto::{
     catalog_enclave_id, endpoint_request_fingerprint, receipt_signing_bytes,
     CatalogEnclaveIdentity, EndpointAttributeSpec, EndpointSpecialityMapping,
     EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor, ModelSpecialityLevel,
-    ReceiptBody, ReceiptUsage, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    ReceiptBody, ReceiptUsage, TranscriptionResult, TranscriptionTimestamp, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+    USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use std::{
@@ -445,7 +446,81 @@ impl GatewaySessionBackend for AudioTranscriptionDirectSessionBackend {
                 signed_audio_transcription_provider_receipt(model, request, invocation, &usage)?;
             Ok(GatewayAudioTranscriptionResult {
                 output: AudioTranscriptionOutput {
-                    text: "hello mayhem".to_owned(),
+                    transcription: test_transcription_result(),
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+fn test_transcription_result() -> TranscriptionResult {
+    TranscriptionResult {
+        schema_version: TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+        text: "hello mayhem".to_owned(),
+        detected_language: Some("en".to_owned()),
+        duration_seconds: Some(2.0),
+        words: vec![
+            TranscriptionTimestamp {
+                text: "hello".to_owned(),
+                start: 0.0,
+                end: 0.8,
+            },
+            TranscriptionTimestamp {
+                text: "mayhem".to_owned(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ],
+        segments: vec![
+            TranscriptionTimestamp {
+                text: "hello".to_owned(),
+                start: 0.0,
+                end: 0.9,
+            },
+            TranscriptionTimestamp {
+                text: "mayhem".to_owned(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ],
+    }
+}
+
+#[derive(Debug)]
+struct TextOnlyAudioTranscriptionBackend;
+
+impl GatewaySessionBackend for TextOnlyAudioTranscriptionBackend {
+    fn name(&self) -> &str {
+        "test-text-only-audio-transcription"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_audio_transcription<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a AudioTranscriptionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioTranscriptionFuture<'a> {
+        Box::pin(async move {
+            let usage = audio_transcription_usage_for_test(request);
+            let provider_receipt =
+                signed_audio_transcription_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayAudioTranscriptionResult {
+                output: AudioTranscriptionOutput {
+                    transcription: TranscriptionResult::text("hello mayhem"),
                     usage,
                 },
                 backend: self.name().to_owned(),
@@ -1230,6 +1305,28 @@ async fn raw_bytes_request_with_headers(
         .expect("response body bytes")
         .to_vec();
     (parts.status, parts.headers, bytes)
+}
+
+fn audio_transcription_multipart(fields: &[(&str, &str)]) -> (String, Vec<u8>) {
+    let boundary = "mayhem-transcription-boundary";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&tiny_wav_bytes(32_000));
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary.to_owned(), body)
 }
 
 async fn first_model_id() -> String {
@@ -2296,6 +2393,211 @@ async fn audio_transcription_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.price_ver, 6);
     assert_eq!(receipt.body.usage.get(USAGE_AUDIO_SECOND), 2);
     assert_eq!(receipt.body.au_owed_cum, 500);
+}
+
+#[tokio::test]
+async fn audio_transcription_verbose_json_returns_requested_source_timestamps() {
+    let state = test_gateway_state_from_models(vec![routed_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state);
+    let (boundary, body) = audio_transcription_multipart(&[
+        ("model", "admin/stt-fixture"),
+        ("response_format", "verbose_json"),
+        ("timestamp_granularities[]", "word"),
+        ("timestamp_granularities[]", "segment"),
+    ]);
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+
+    let (status, headers, bytes) = raw_bytes_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/audio/transcriptions",
+        body,
+        &[("content-type", &content_type)],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("application/json"));
+    let body: Value = serde_json::from_slice(&bytes).expect("verbose transcription JSON");
+    assert_eq!(body["task"], "transcribe");
+    assert_eq!(body["text"], "hello mayhem");
+    assert_eq!(body["language"], "en");
+    assert_eq!(body["duration"], 2.0);
+    assert_eq!(
+        body["words"],
+        json!([
+            {"word": "hello", "start": 0.0, "end": 0.8},
+            {"word": "mayhem", "start": 1.0, "end": 2.0}
+        ])
+    );
+    assert_eq!(
+        body["segments"],
+        json!([
+            {"id": 0, "text": "hello", "start": 0.0, "end": 0.9},
+            {"id": 1, "text": "mayhem", "start": 1.0, "end": 2.0}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn audio_transcription_returns_native_text_srt_and_vtt_formats() {
+    let state = test_gateway_state_from_models(vec![routed_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state);
+
+    for (format, expected_content_type, expected_body) in [
+        ("text", "text/plain", "hello mayhem".to_owned()),
+        (
+            "srt",
+            "application/x-subrip",
+            concat!(
+                "1\n00:00:00,000 --> 00:00:00,900\nhello\n\n",
+                "2\n00:00:01,000 --> 00:00:02,000\nmayhem\n\n"
+            )
+            .to_owned(),
+        ),
+        (
+            "vtt",
+            "text/vtt",
+            concat!(
+                "WEBVTT\n\n",
+                "00:00:00.000 --> 00:00:00.900\nhello\n\n",
+                "00:00:01.000 --> 00:00:02.000\nmayhem\n\n"
+            )
+            .to_owned(),
+        ),
+    ] {
+        let (boundary, body) = audio_transcription_multipart(&[
+            ("model", "admin/stt-fixture"),
+            ("response_format", format),
+        ]);
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+
+        let (status, headers, bytes) = raw_bytes_request_with_headers(
+            app.clone(),
+            Method::POST,
+            "/v1/audio/transcriptions",
+            body,
+            &[("content-type", &content_type)],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "response_format={format}");
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .contains(expected_content_type),
+            "response_format={format}"
+        );
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            expected_body,
+            "response_format={format}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audio_transcription_rejects_unavailable_or_inapplicable_timestamps() {
+    let model = routed_audio_transcription_test_model();
+    let state = test_gateway_state_from_models(vec![model.clone()])
+        .with_session_backend(Arc::new(TextOnlyAudioTranscriptionBackend));
+    let app = openai_router(state);
+    let (boundary, body) = audio_transcription_multipart(&[
+        ("model", "admin/stt-fixture"),
+        ("response_format", "verbose_json"),
+        ("timestamp_granularities[]", "word"),
+    ]);
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+
+    let (status, _, bytes) = raw_bytes_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/audio/transcriptions",
+        body,
+        &[("content-type", &content_type)],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let body: Value = serde_json::from_slice(&bytes).expect("timestamp error JSON");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not return requested word timestamps"));
+
+    let state = test_gateway_state_from_models(vec![model])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let (boundary, body) = audio_transcription_multipart(&[
+        ("model", "admin/stt-fixture"),
+        ("response_format", "json"),
+        ("timestamp_granularities[]", "word"),
+    ]);
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+
+    let (status, _, bytes) = raw_bytes_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/audio/transcriptions",
+        body,
+        &[("content-type", &content_type)],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&bytes).expect("timestamp format error JSON");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("supported only with response_format=verbose_json"));
+    assert!(state.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn hf_audio_transcription_returns_requested_timestamp_chunks() {
+    let state = test_gateway_state_from_models(vec![routed_hf_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(32_000));
+
+    for (return_timestamps, expected_chunks) in [
+        (
+            json!(true),
+            json!([
+                {"text": "hello", "timestamp": [0.0, 0.9]},
+                {"text": "mayhem", "timestamp": [1.0, 2.0]}
+            ]),
+        ),
+        (
+            json!("word"),
+            json!([
+                {"text": "hello", "timestamp": [0.0, 0.8]},
+                {"text": "mayhem", "timestamp": [1.0, 2.0]}
+            ]),
+        ),
+    ] {
+        let request = json!({
+            "inputs": encoded,
+            "parameters": {"return_timestamps": return_timestamps}
+        });
+        let (status, body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/hf-inference/models/admin/stt-fixture",
+            request,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["text"], "hello mayhem");
+        assert_eq!(body["chunks"], expected_chunks);
+    }
 }
 
 #[tokio::test]
@@ -3630,6 +3932,15 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
             "output_modalities": ["text"]
         });
     }
+    model
+}
+
+fn routed_hf_audio_transcription_test_model() -> GatewayModel {
+    let mut model = routed_audio_transcription_test_model();
+    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+    )
+    .unwrap()];
     model
 }
 

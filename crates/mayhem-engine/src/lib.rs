@@ -20,7 +20,12 @@ pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_UBATCH_SIZE: u32 = 512;
 pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
-#[cfg(any(feature = "mlx", feature = "vllm", feature = "trt-llm"))]
+#[cfg(any(
+    feature = "mlx",
+    feature = "vllm",
+    feature = "trt-llm",
+    feature = "transformers-asr"
+))]
 const WORKER_STDOUT_QUEUE_CAPACITY: usize = 64;
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -55,6 +60,8 @@ pub enum EngineError {
     TrtLlm(String),
     #[error("vLLM backend error: {0}")]
     Vllm(String),
+    #[error("Transformers ASR backend error: {0}")]
+    TransformersAsr(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
     StableDiffusionCpp(String),
     #[error("whisper.cpp backend error: {0}")]
@@ -193,6 +200,7 @@ pub enum ArtifactFormat {
     MlxSafetensors,
     TensorRtLlmCheckpoint,
     VllmSafetensors,
+    TransformersSafetensors,
     StableDiffusionCheckpoint,
     WhisperGgml,
     PiperVoice,
@@ -206,6 +214,7 @@ impl ArtifactFormat {
             Self::MlxSafetensors => b"",
             Self::TensorRtLlmCheckpoint => b"",
             Self::VllmSafetensors => b"",
+            Self::TransformersSafetensors => b"",
             Self::StableDiffusionCheckpoint => b"",
             Self::WhisperGgml => b"",
             Self::PiperVoice => b"",
@@ -219,6 +228,7 @@ impl ArtifactFormat {
             Self::MlxSafetensors => "MLX safetensors",
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
             Self::VllmSafetensors => "vLLM safetensors",
+            Self::TransformersSafetensors => "Transformers safetensors",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
             Self::WhisperGgml => "whisper.cpp ggml model",
             Self::PiperVoice => "Piper voice",
@@ -295,6 +305,14 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::VllmSafetensors,
+            sha256: None,
+        }
+    }
+
+    pub fn transformers_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::TransformersSafetensors,
             sha256: None,
         }
     }
@@ -414,6 +432,13 @@ impl LoadConfig {
     pub fn vllm_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::vllm_safetensors(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn transformers_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::transformers_safetensors(path),
             ..Self::default()
         }
     }
@@ -898,6 +923,21 @@ pub struct AudioTranscriptionRequest {
 pub struct AudioTranscriptionOutput {
     pub text: String,
     pub audio_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<AudioTranscriptionTimestamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<AudioTranscriptionTimestamp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioTranscriptionTimestamp {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1388,6 +1428,11 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             verify_safetensors_header_as(&payload, artifact.format.label())?;
             payload
         }
+        ArtifactFormat::TransformersSafetensors => {
+            let payload = transformers_safetensors_payload_path(&artifact.path)?;
+            verify_safetensors_header_as(&payload, artifact.format.label())?;
+            payload
+        }
         ArtifactFormat::StableDiffusionCheckpoint => {
             let payload = stable_diffusion_payload_path(&artifact.path)?;
             if payload.extension().is_some_and(|ext| ext == "safetensors") {
@@ -1600,6 +1645,73 @@ fn vllm_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
         EngineError::InvalidConfig(format!(
             "vLLM artifact directory {} contains no .safetensors payload",
             path.display()
+        ))
+    })
+}
+
+fn transformers_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
+    let model_dir = if path.is_file() {
+        path.parent().ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Transformers weights path {} has no parent",
+                path.display()
+            ))
+        })?
+    } else if path.is_dir() {
+        path
+    } else {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    };
+
+    for sidecar in [
+        "config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        let candidate = model_dir.join(sidecar);
+        if !candidate.is_file() {
+            return Err(EngineError::InvalidConfig(format!(
+                "Transformers ASR artifact {} is missing required sidecar {sidecar}",
+                model_dir.display()
+            )));
+        }
+        let value: Value = serde_json::from_reader(File::open(&candidate)?)?;
+        if !value.is_object() {
+            return Err(EngineError::InvalidConfig(format!(
+                "Transformers ASR sidecar {} is not a JSON object",
+                candidate.display()
+            )));
+        }
+    }
+
+    if path.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "safetensors")
+    {
+        return Ok(path.to_path_buf());
+    }
+    for name in ["model.safetensors", "model-00001-of-00001.safetensors"] {
+        let candidate = model_dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    let mut candidates = std::fs::read_dir(model_dir)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .extension()
+                .is_some_and(|extension| extension == "safetensors")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "Transformers ASR artifact {} contains no .safetensors weights",
+            model_dir.display()
         ))
     })
 }
@@ -1856,6 +1968,9 @@ pub use trt_llm_backend::TrtLlmBackend;
 #[cfg(feature = "vllm")]
 pub use vllm_backend::VllmBackend;
 
+#[cfg(feature = "transformers-asr")]
+pub use transformers_asr_backend::TransformersAsrBackend;
+
 #[cfg(feature = "vllm")]
 pub fn discover_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
     vllm_backend::resolve_vllm_cuda_home(python)
@@ -1941,6 +2056,481 @@ fn parse_cuda_major_minor(value: &str) -> Option<(u32, u32)> {
 pub use piper_backend::PiperBackend;
 pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
 pub use whisper_cpp_backend::WhisperCppBackend;
+
+#[cfg(feature = "transformers-asr")]
+mod transformers_asr_backend {
+    use super::{
+        attach_worker_containment, engine_worker_command, transformers_safetensors_payload_path,
+        validate_load_config, verify_artifact, ArtifactFormat, AudioTranscriptionOutput,
+        AudioTranscriptionRequest, CancellationToken, EngineBackend, EngineError, GenerateOutput,
+        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
+        WorkerContainment,
+    };
+    use base64::Engine as _;
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::env;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    const WORKER: &str = include_str!("transformers_asr_worker.py");
+    const PYTHON_ENV: &str = "MAYHEM_TRANSFORMERS_ASR_PYTHON";
+
+    pub struct TransformersAsrBackend {
+        python: PathBuf,
+        worker: Option<TransformersAsrWorker>,
+        loaded: Option<LoadedModelInfo>,
+        config: Option<LoadConfig>,
+        next_id: u64,
+    }
+
+    impl TransformersAsrBackend {
+        pub fn new() -> Result<Self> {
+            let python = env::var_os(PYTHON_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_python(python)
+        }
+
+        pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
+            Ok(Self {
+                python: python.into(),
+                worker: None,
+                loaded: None,
+                config: None,
+                next_id: 1,
+            })
+        }
+
+        fn ensure_worker_loaded(&mut self) -> Result<()> {
+            if self.worker.is_some() {
+                return Ok(());
+            }
+            let config = self.config.clone().ok_or(EngineError::NotLoaded)?;
+            self.worker = Some(TransformersAsrWorker::spawn(
+                &self.python,
+                config.memory_limit_bytes,
+                config.backend_cache_dir.as_deref(),
+            )?);
+            let model_path = transformers_model_dir(&config.artifact.path)?;
+            let _: WorkerLoadInfo =
+                self.call_existing("load", json!({ "path": model_path }), None)?;
+            Ok(())
+        }
+
+        fn call<T>(
+            &mut self,
+            operation: &str,
+            payload: Value,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            self.ensure_worker_loaded()?;
+            self.call_existing(operation, payload, cancellation)
+        }
+
+        fn call_existing<T>(
+            &mut self,
+            operation: &str,
+            payload: Value,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            self.worker_mut()?.send(id, operation, payload)?;
+            loop {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    self.stop_worker();
+                    return Err(EngineError::Cancelled);
+                }
+                let message = match self.worker_mut()?.read_message(Duration::from_millis(25)) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        self.stop_worker();
+                        return Err(error);
+                    }
+                };
+                if message.id != id {
+                    self.stop_worker();
+                    return Err(EngineError::TransformersAsr(format!(
+                        "worker response id {} did not match request id {id}",
+                        message.id
+                    )));
+                }
+                if message.ok {
+                    return Ok(serde_json::from_value(
+                        message.result.unwrap_or(Value::Null),
+                    )?);
+                }
+                return Err(EngineError::TransformersAsr(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
+        }
+
+        fn worker_mut(&mut self) -> Result<&mut TransformersAsrWorker> {
+            self.worker
+                .as_mut()
+                .ok_or_else(|| EngineError::TransformersAsr("ASR worker is not running".to_owned()))
+        }
+
+        fn stop_worker(&mut self) {
+            if let Some(mut worker) = self.worker.take() {
+                worker.stop();
+            }
+        }
+    }
+
+    impl EngineBackend for TransformersAsrBackend {
+        fn backend_id(&self) -> &'static str {
+            "transformers-asr"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::TransformersSafetensors {
+                return Err(EngineError::InvalidConfig(format!(
+                    "Transformers ASR requires Transformers safetensors artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+            self.stop_worker();
+            self.config = Some(config.clone());
+            self.worker = Some(TransformersAsrWorker::spawn(
+                &self.python,
+                config.memory_limit_bytes,
+                config.backend_cache_dir.as_deref(),
+            )?);
+            let model_path = transformers_model_dir(&config.artifact.path)?;
+            let worker_info: WorkerLoadInfo =
+                self.call_existing("load", json!({ "path": model_path }), None)?;
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: worker_info.n_ctx_train,
+                n_vocab: worker_info.n_vocab,
+            };
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+
+        fn component_healthy(&mut self) -> bool {
+            match self.worker.as_mut() {
+                Some(worker) => matches!(worker.child.try_wait(), Ok(None)),
+                None => self.loaded.is_none(),
+            }
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.worker
+                .as_ref()
+                .map(|worker| vec![worker.child.id()])
+                .unwrap_or_default()
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            Ok(Tokenization {
+                token_ids: text
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, _)| i32::try_from(index).unwrap_or(i32::MAX))
+                    .collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
+        ) -> Result<GenerateOutput> {
+            Err(EngineError::InvalidConfig(
+                "Transformers ASR transcribes audio; use transcribe".to_owned(),
+            ))
+        }
+
+        fn transcribe(
+            &mut self,
+            request: AudioTranscriptionRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<AudioTranscriptionOutput> {
+            cancellation.check()?;
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            if request.audio.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "audio transcription input cannot be empty".to_owned(),
+                ));
+            }
+            if request
+                .language
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                return Err(EngineError::InvalidConfig(
+                    "this Transformers TDT model detects language automatically and does not accept language forcing"
+                        .to_owned(),
+                ));
+            }
+            if request
+                .prompt
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                return Err(EngineError::InvalidConfig(
+                    "this Transformers TDT model does not support transcription prompts".to_owned(),
+                ));
+            }
+            let audio_base64 = base64::engine::general_purpose::STANDARD.encode(request.audio);
+            self.call(
+                "transcribe",
+                json!({
+                    "audio_base64": audio_base64,
+                    "content_type": request.content_type,
+                }),
+                Some(cancellation),
+            )
+        }
+    }
+
+    impl Drop for TransformersAsrBackend {
+        fn drop(&mut self) {
+            self.stop_worker();
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerLoadInfo {
+        n_ctx_train: u32,
+        n_vocab: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerMessage {
+        id: u64,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        result: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    struct TransformersAsrWorker {
+        child: Child,
+        _containment: WorkerContainment,
+        stdin: ChildStdin,
+        stdout_rx: Option<Receiver<WorkerRead>>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl TransformersAsrWorker {
+        fn spawn(
+            python: &Path,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
+            let mut command = engine_worker_command(python, memory_limit_bytes);
+            configure_worker_environment(&mut command, python, cache_root)?;
+            command
+                .arg("-u")
+                .arg("-c")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            let mut child = command.spawn().map_err(|error| {
+                EngineError::TransformersAsr(format!(
+                    "spawning Transformers ASR worker with {} failed: {error}",
+                    python.display()
+                ))
+            })?;
+            let stdin = child.stdin.take().ok_or_else(|| {
+                EngineError::TransformersAsr("opening ASR worker stdin failed".to_owned())
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                EngineError::TransformersAsr("opening ASR worker stdout failed".to_owned())
+            })?;
+            let containment =
+                attach_worker_containment(&child, memory_limit_bytes).map_err(|error| {
+                    EngineError::TransformersAsr(format!(
+                        "applying ASR worker containment failed: {error}"
+                    ))
+                })?;
+            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
+            let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
+            Ok(Self {
+                child,
+                _containment: containment,
+                stdin,
+                stdout_rx: Some(stdout_rx),
+                reader: Some(reader),
+            })
+        }
+
+        fn send(&mut self, id: u64, operation: &str, payload: Value) -> Result<()> {
+            serde_json::to_writer(
+                &mut self.stdin,
+                &json!({
+                    "id": id,
+                    "op": operation,
+                    "payload": payload,
+                }),
+            )?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            Ok(())
+        }
+
+        fn read_message(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
+            let read = match self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::TransformersAsr("ASR worker stdout reader is closed".to_owned())
+                })?
+                .recv_timeout(wait)
+            {
+                Ok(read) => read,
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EngineError::TransformersAsr(
+                        "ASR worker stdout reader stopped".to_owned(),
+                    ))
+                }
+            };
+            let line = match read {
+                WorkerRead::Line(line) => line,
+                WorkerRead::Eof => {
+                    return Err(EngineError::TransformersAsr(
+                        "ASR worker exited before replying".to_owned(),
+                    ))
+                }
+                WorkerRead::Error(error) => return Err(EngineError::TransformersAsr(error)),
+            };
+            serde_json::from_str(line.trim_end())
+                .map(Some)
+                .map_err(Into::into)
+        }
+
+        fn stop(&mut self) {
+            let _ = self.send(0, "shutdown", Value::Null);
+            self.stdout_rx.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    fn configure_worker_environment(
+        command: &mut std::process::Command,
+        python: &Path,
+        cache_root: Option<&Path>,
+    ) -> Result<()> {
+        let cache_root = cache_root
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                env::var_os("MAYHEM_HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("cache/transformers-asr"))
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".mayhem/cache/transformers-asr"))
+            })
+            .unwrap_or_else(|| env::temp_dir().join("mayhem-transformers-asr-cache"));
+        for (name, default_path) in [
+            ("XDG_CACHE_HOME", cache_root.join("xdg")),
+            ("HF_HOME", cache_root.join("huggingface")),
+            ("HF_HUB_CACHE", cache_root.join("huggingface/hub")),
+            ("TRANSFORMERS_CACHE", cache_root.join("transformers")),
+        ] {
+            let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+            fs::create_dir_all(&path).map_err(|error| {
+                EngineError::TransformersAsr(format!(
+                    "creating ASR cache directory {} failed: {error}",
+                    path.display()
+                ))
+            })?;
+            command.env(name, path);
+        }
+        command
+            .env("HF_HUB_OFFLINE", "1")
+            .env("HF_DATASETS_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .env("HF_HUB_DISABLE_TELEMETRY", "1")
+            .env("TOKENIZERS_PARALLELISM", "false");
+        if let Some(python_bin) = python.parent() {
+            let mut paths = vec![python_bin.to_path_buf()];
+            if let Some(current) = env::var_os("PATH") {
+                paths.extend(env::split_paths(&current));
+            }
+            if let Ok(path) = env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+        Ok(())
+    }
+
+    fn transformers_model_dir(path: &Path) -> Result<PathBuf> {
+        let payload = transformers_safetensors_payload_path(path)?;
+        payload.parent().map(Path::to_path_buf).ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Transformers ASR weights path {} has no parent",
+                payload.display()
+            ))
+        })
+    }
+
+    enum WorkerRead {
+        Line(String),
+        Eof,
+        Error(String),
+    }
+
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(WorkerRead::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(WorkerRead::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(WorkerRead::Error(format!(
+                        "reading ASR worker stdout failed: {error}"
+                    )));
+                    return;
+                }
+            }
+        }
+    }
+}
 
 mod whisper_cpp_backend {
     use std::env;
@@ -2105,6 +2695,10 @@ mod whisper_cpp_backend {
             Ok(AudioTranscriptionOutput {
                 text,
                 audio_seconds: wav_duration_seconds_ceil(&request.audio).unwrap_or(1),
+                duration_seconds: None,
+                detected_language: request.language,
+                words: Vec::new(),
+                segments: Vec::new(),
             })
         }
     }

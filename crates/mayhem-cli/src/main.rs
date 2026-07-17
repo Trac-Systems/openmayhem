@@ -99,7 +99,8 @@ use mayhem_proto::{
     stable_json_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
     CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
     MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SpendVoucher, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    ReceiptUsage, SpendVoucher, TranscriptionResult, TranscriptionResultLimits,
+    TranscriptionTimestamp, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
@@ -2721,7 +2722,7 @@ struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, whisper.cpp, or piper.
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
@@ -5441,7 +5442,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -5618,7 +5619,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -6849,6 +6850,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "vllm"
                 | "trt-llm"
                 | "stable-diffusion.cpp"
+                | "transformers-asr"
                 | "whisper.cpp"
                 | "piper"
         ),
@@ -7782,6 +7784,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
         "stable-diffusion.cpp" => {
             "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
+        }
+        "transformers-asr" => {
+            "Transformers ASR requires at least 8 GiB RAM and supports CUDA, Metal/MPS, or CPU execution"
         }
         "whisper.cpp" => "whisper.cpp requires enough local RAM and CPU SIMD support",
         "piper" => "Piper requires enough local RAM for the voice artifact",
@@ -13736,9 +13741,19 @@ fn calibration_endpoint_attribute_is_handled(
                 | "parameters.seed"
         ),
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => {
-            matches!(path, "file" | "model" | "language" | "prompt")
+            matches!(
+                path,
+                "file"
+                    | "model"
+                    | "language"
+                    | "prompt"
+                    | "response_format"
+                    | "timestamp_granularities"
+            )
         }
-        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => path == "inputs",
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+            matches!(path, "inputs" | "parameters.return_timestamps")
+        }
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => matches!(
             path,
             "model" | "input" | "voice" | "response_format" | "speed"
@@ -13777,6 +13792,7 @@ fn provider_session_output_fingerprint(output: &ProviderSessionOutput) -> String
         "content": output.content,
         "tools": output.tools,
         "embeddings": output.embeddings,
+        "transcription": output.transcription,
         "artifacts": output.artifacts.iter().map(|artifact| json!({
             "id": artifact.id,
             "content_type": artifact.content_type,
@@ -13907,16 +13923,90 @@ fn catalog_endpoint_calibration_response(
                 "mayhem": mayhem,
             }))
         }
-        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => Ok(json!({
-            "text": output.content,
-            "usage": usage,
-            "mayhem": mayhem,
-        })),
-        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => Ok(json!({
-            "text": output.content,
-            "usage": usage,
-            "mayhem": mayhem,
-        })),
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS => {
+            let transcription = output
+                .transcription
+                .as_ref()
+                .context("STT backend produced no typed transcription metadata")?;
+            let mut response = json!({
+                "text": transcription.text,
+                "task": "transcribe",
+                "words": transcription.words.iter().map(|word| json!({
+                    "word": word.text,
+                    "start": word.start,
+                    "end": word.end,
+                })).collect::<Vec<_>>(),
+                "segments": transcription.segments.iter().map(|segment| json!({
+                    "text": segment.text,
+                    "start": segment.start,
+                    "end": segment.end,
+                })).collect::<Vec<_>>(),
+                "usage": usage,
+                "mayhem": mayhem,
+            });
+            if let Some(language) = &transcription.detected_language {
+                response["language"] = json!(language);
+            }
+            if let Some(duration) = transcription.duration_seconds {
+                response["duration"] = json!(duration);
+            }
+            Ok(response)
+        }
+        mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+            let transcription = output
+                .transcription
+                .as_ref()
+                .context("STT backend produced no typed transcription metadata")?;
+            let return_timestamps = request.pointer("/parameters/return_timestamps");
+            let chunks = match return_timestamps {
+                Some(Value::Bool(true)) => Some(
+                    transcription
+                        .segments
+                        .iter()
+                        .map(|segment| {
+                            json!({
+                                "text": segment.text,
+                                "timestamp": [segment.start, segment.end],
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                Some(Value::String(value)) if value == "segment" => Some(
+                    transcription
+                        .segments
+                        .iter()
+                        .map(|segment| {
+                            json!({
+                                "text": segment.text,
+                                "timestamp": [segment.start, segment.end],
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                Some(Value::String(value)) if value == "word" => Some(
+                    transcription
+                        .words
+                        .iter()
+                        .map(|word| {
+                            json!({
+                                "text": word.text,
+                                "timestamp": [word.start, word.end],
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            };
+            let mut response = json!({
+                "text": transcription.text,
+                "usage": usage,
+                "mayhem": mayhem,
+            });
+            if let Some(chunks) = chunks {
+                response["chunks"] = json!(chunks);
+            }
+            Ok(response)
+        }
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
             let artifact = output
                 .artifacts
@@ -14129,6 +14219,22 @@ fn verify_calibration_sidecars_match_catalog(
             ensure!(
                 paths.contains_key(required),
                 "split stable-diffusion.cpp calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+    }
+    if artifact.engine == "transformers-asr" {
+        for (required, filename) in TRANSFORMERS_ASR_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("Transformers ASR calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.path == *filename,
+                "Transformers ASR sidecar {required} must use path {filename}, got {}",
+                sidecar.path
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "Transformers ASR calibration requires --artifact-sidecar {required}=PATH"
             );
         }
     }
@@ -16329,7 +16435,12 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                     .join(safe_path_component(artifact_name))
             });
             let calibration_status = match artifact.engine.as_str() {
-                "llama.cpp" | "mlx" | "stable-diffusion.cpp" | "whisper.cpp" | "piper" => "ready",
+                "llama.cpp"
+                | "mlx"
+                | "stable-diffusion.cpp"
+                | "transformers-asr"
+                | "whisper.cpp"
+                | "piper" => "ready",
                 "trt-llm" => "requires-prebuilt-trt-engine",
                 "vllm" => "requires-vllm-reference-host",
                 other => {
@@ -17159,7 +17270,26 @@ fn catalog_calibration_backend(
     sidecar_paths: &BTreeMap<String, PathBuf>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
-    let managed_runtime = if matches!(artifact.engine.as_str(), "mlx" | "trt-llm" | "vllm") {
+    let materialized_artifact_path;
+    let artifact_path = if artifact.engine == "transformers-asr" {
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_transformers_asr_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.artifact_root,
+            artifact,
+            &paths,
+        )?;
+        materialized_artifact_path.as_path()
+    } else {
+        artifact_path
+    };
+    let managed_runtime = if matches!(
+        artifact.engine.as_str(),
+        "mlx" | "transformers-asr" | "trt-llm" | "vllm"
+    ) {
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let home = absolutize(home)?;
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -17181,6 +17311,7 @@ fn catalog_calibration_backend(
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
@@ -17315,6 +17446,19 @@ fn catalog_calibration_backend(
                 .context("loading stable-diffusion.cpp canary calibration artifact")?;
             Ok(Box::new(backend))
         }
+        "transformers-asr" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("Transformers ASR calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::TransformersAsrBackend::with_python(python)
+                .context("initializing Transformers ASR backend")?;
+            backend
+                .load(config)
+                .context("loading Transformers ASR canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
         "whisper.cpp" => {
             let mut backend = mayhem_engine::WhisperCppBackend::new()
                 .context("initializing whisper.cpp backend")?;
@@ -17434,6 +17578,10 @@ fn calibrate_token_canary_prompt_with_speciality(
         perceptual_hash: None,
         embedding_vector: None,
         transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
         audio_fingerprint: None,
         resource_items: calibration_chat_resource_items(&body)?,
         calibration_baseline_memory_bytes: 0,
@@ -17514,6 +17662,10 @@ fn calibrate_image_perceptual_hash_prompt(
         perceptual_hash: Some(perceptual_hash),
         embedding_vector: None,
         transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
         audio_fingerprint: None,
         resource_items,
         calibration_baseline_memory_bytes: 0,
@@ -17569,6 +17721,10 @@ fn calibrate_embedding_cosine_prompt(
         perceptual_hash: None,
         embedding_vector: Some(vector),
         transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
         audio_fingerprint: None,
         resource_items,
         calibration_baseline_memory_bytes: 0,
@@ -17619,6 +17775,10 @@ fn calibrate_transcript_match_prompt(
         perceptual_hash: None,
         embedding_vector: None,
         transcript: Some(output.text.clone()),
+        detected_language: output.detected_language.clone(),
+        transcription_duration_seconds: output.duration_seconds,
+        word_timestamps: output.words.clone(),
+        segment_timestamps: output.segments.clone(),
         audio_fingerprint: None,
         resource_items,
         calibration_baseline_memory_bytes: 0,
@@ -17683,6 +17843,10 @@ fn calibrate_audio_fingerprint_prompt(
         perceptual_hash: None,
         embedding_vector: None,
         transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
         audio_fingerprint: Some(fingerprint),
         resource_items,
         calibration_baseline_memory_bytes: 0,
@@ -17912,11 +18076,34 @@ fn canary_audio_transcription_request(
         .audio_b64
         .as_deref()
         .with_context(|| format!("STT canary prompt {} missing audio_b64", prompt.id))?;
-    let audio = base64::engine::general_purpose::STANDARD
+    let mut audio = base64::engine::general_purpose::STANDARD
         .decode(audio_b64)
         .with_context(|| format!("decoding STT canary prompt {} audio_b64", prompt.id))?;
     if audio.is_empty() {
         bail!("STT canary prompt {} audio fixture is empty", prompt.id);
+    }
+    let repeat_count = prompt.audio_repeat_count.unwrap_or(1);
+    ensure!(
+        (1..=4_096).contains(&repeat_count),
+        "STT canary prompt {} audio_repeat_count must be between 1 and 4096",
+        prompt.id
+    );
+    if repeat_count > 1 {
+        ensure!(
+            prompt
+                .content_type
+                .as_deref()
+                .unwrap_or("audio/wav")
+                .eq_ignore_ascii_case("audio/wav"),
+            "STT canary prompt {} can repeat only a WAV fixture",
+            prompt.id
+        );
+        audio = repeat_wav_audio(&audio, repeat_count).with_context(|| {
+            format!(
+                "expanding STT canary prompt {} WAV fixture {} times",
+                prompt.id, repeat_count
+            )
+        })?;
     }
     Ok(EngineAudioTranscriptionRequest {
         audio,
@@ -20517,7 +20704,7 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 }
 
 fn backend_supports_tool_calls(backend: &str) -> bool {
-    !matches!(backend, "mlx" | "trt-llm")
+    !matches!(backend, "mlx" | "transformers-asr" | "trt-llm")
 }
 
 #[derive(Debug)]
@@ -30606,6 +30793,8 @@ struct CanaryPrompt {
     #[serde(default)]
     audio_b64: Option<String>,
     #[serde(default)]
+    audio_repeat_count: Option<u32>,
+    #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
     filename: Option<String>,
@@ -30699,6 +30888,14 @@ struct CanaryCalibrationPromptReport {
     embedding_vector: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detected_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcription_duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    word_timestamps: Vec<mayhem_engine::AudioTranscriptionTimestamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segment_timestamps: Vec<mayhem_engine::AudioTranscriptionTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audio_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -40255,6 +40452,9 @@ fn provider_backend_runtime_child_env(
             insert_path("MAYHEM_TRTLLM_CUDA_HOME", runtime.cuda_home.as_deref());
         }
         "mlx" => insert_path("MAYHEM_MLX_PYTHON", runtime.python.as_deref()),
+        "transformers-asr" => {
+            insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
+        }
         "stable-diffusion.cpp" => {
             insert_path(
                 "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
@@ -40428,7 +40628,7 @@ fn provider_backend_runtime_preflight_for_backend(
 ) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
-        "vllm" | "trt-llm" | "mlx" => {
+        "vllm" | "trt-llm" | "mlx" | "transformers-asr" => {
             let python = python_runtime::ensure_backend_python(home, backend)
                 .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
@@ -48166,6 +48366,7 @@ fn backend_rank(backend: &str) -> u8 {
         "vllm" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
+        "transformers-asr" => 2,
         "llama.cpp" => 1,
         "stable-diffusion.cpp" | "whisper.cpp" | "piper" => 0,
         _ => 0,
@@ -53228,6 +53429,7 @@ async fn send_provider_session_final_output_frames(
         "d": "",
         "tools": null,
         "embeddings": null,
+        "transcription": null,
         "fin": output.finish_reason,
         "usage": output.usage,
         "usage_attribution": output.usage_attribution,
@@ -53257,6 +53459,20 @@ async fn send_provider_session_final_output_frames(
             &mut final_frame,
             "embeddings",
             serde_json::to_value(embeddings).context("serializing provider embeddings")?,
+            &mut next_index,
+            max_frame_bytes,
+        )
+        .await?;
+    }
+    if let Some(transcription) = &output.transcription {
+        attach_or_stream_provider_delta_field(
+            bridge,
+            active,
+            request_id,
+            &mut final_frame,
+            "transcription",
+            serde_json::to_value(transcription)
+                .context("serializing provider transcription output")?,
             &mut next_index,
             max_frame_bytes,
         )
@@ -53371,6 +53587,7 @@ fn provider_session_final_delta_frames(
         "d": "",
         "tools": (!output.tools.is_empty()).then_some(&output.tools),
         "embeddings": output.embeddings.as_ref(),
+        "transcription": output.transcription.as_ref(),
         "fin": output.finish_reason,
         "usage": output.usage,
         "quality": provider_quality,
@@ -53402,6 +53619,17 @@ fn provider_session_final_delta_frames(
             request_id,
             "embeddings",
             json!(embeddings),
+            &mut next_index,
+            max_frame_bytes,
+        )?;
+    }
+    if let Some(transcription) = &output.transcription {
+        provider_session_add_delta_ref_frames(
+            &mut frames,
+            &mut final_frame,
+            request_id,
+            "transcription",
+            json!(transcription),
             &mut next_index,
             max_frame_bytes,
         )?;
@@ -54344,6 +54572,23 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "transformers-asr" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("Transformers ASR runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::TransformersAsrBackend::with_python(python)
+                .context("initializing Transformers ASR provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "Transformers ASR engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading Transformers ASR provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         "whisper.cpp" => {
             let binary = ctx
                 .backend_runtime
@@ -54800,6 +55045,8 @@ fn provider_engine_load_config(
         materialized_trt_engine_dir = Some(layout.engine_dir);
     } else if selected.artifact.engine == "vllm" {
         artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "transformers-asr" {
+        artifact_path_buf = materialize_transformers_asr_artifacts(selected, artifact_paths)?;
     }
     let artifact_path = artifact_path_buf.as_path();
     let artifact = match selected.artifact.engine.as_str() {
@@ -54808,6 +55055,7 @@ fn provider_engine_load_config(
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
+        "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
         "piper" => ModelArtifact::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -54823,6 +55071,7 @@ fn provider_engine_load_config(
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -54931,6 +55180,14 @@ const VLLM_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("vllm_tokenizer_config", "tokenizer_config.json"),
 ];
 
+const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("transformers_config", "config.json"),
+    ("transformers_generation_config", "generation_config.json"),
+    ("transformers_processor_config", "processor_config.json"),
+    ("transformers_tokenizer_json", "tokenizer.json"),
+    ("transformers_tokenizer_config", "tokenizer_config.json"),
+];
+
 fn materialize_vllm_artifacts(
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
@@ -54985,6 +55242,62 @@ fn materialize_vllm_artifacts(
         })?;
     }
     Ok(checkpoint_dir)
+}
+
+fn materialize_transformers_asr_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    materialize_transformers_asr_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+    )
+}
+
+fn materialize_transformers_asr_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let model_dir = transformers_asr_checkpoint_cache_dir(&artifact_paths.primary, artifact_name);
+    fs::create_dir_all(&model_dir).with_context(|| {
+        format!(
+            "creating Transformers ASR model layout {}",
+            model_dir.display()
+        )
+    })?;
+    let payload_name = catalog_path_file_name(&artifact.path, "Transformers ASR primary artifact")?;
+    link_or_copy_file(&artifact_paths.primary, &model_dir.join(payload_name))?;
+    for (sidecar_name, filename) in TRANSFORMERS_ASR_REQUIRED_SIDECARS {
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!(
+                "Transformers ASR artifact {label} requires admin catalog sidecar {sidecar_name}"
+            )
+        })?;
+        ensure!(
+            sidecar.path == *filename,
+            "Transformers ASR artifact {label} sidecar {} must use path {}, got {}",
+            sidecar_name,
+            filename,
+            sidecar.path
+        );
+        let source = artifact_paths.sidecars.get(*sidecar_name).with_context(|| {
+            format!(
+                "downloaded Transformers ASR artifact {label} is missing admin sidecar {sidecar_name}"
+            )
+        })?;
+        link_or_copy_file(source, &model_dir.join(filename)).with_context(|| {
+            format!(
+                "materializing Transformers ASR sidecar {} at {}",
+                sidecar_name,
+                model_dir.join(filename).display()
+            )
+        })?;
+    }
+    Ok(model_dir)
 }
 
 fn materialize_trt_llm_artifacts(
@@ -55204,6 +55517,19 @@ fn vllm_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathB
             .unwrap_or_else(|| PathBuf::from("."))
     };
     base.join(".vllm-checkpoints")
+        .join(safe_path_component(artifact_name))
+}
+
+fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
 }
 
@@ -55975,6 +56301,7 @@ struct ProviderSessionOutput {
     reasoning_evidence: String,
     tools: Vec<Value>,
     embeddings: Option<Vec<Vec<f32>>>,
+    transcription: Option<TranscriptionResult>,
     artifacts: Vec<ProviderSessionArtifact>,
     finish_reason: String,
     prompt_tokens: u64,
@@ -56102,6 +56429,20 @@ fn validate_provider_session_output(
         ensure!(
             provider_session_serialized_len(embeddings)? <= payload_limit,
             "provider embeddings exceed the session payload budget"
+        );
+    }
+    if let Some(transcription) = output.transcription.as_ref() {
+        mayhem_proto::validate_transcription_result(
+            transcription,
+            TranscriptionResultLimits {
+                max_bytes: payload_limit,
+                ..TranscriptionResultLimits::default()
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("provider transcription output is invalid: {err}"))?;
+        ensure!(
+            transcription.text.trim() == output.content.trim(),
+            "provider transcription metadata does not match streamed transcript text"
         );
     }
     let max_artifacts = provider_session_configured_limit(
@@ -56593,11 +56934,36 @@ fn provider_engine_session_response_with_sampling_bounded(
         let output = backend
             .transcribe(request.engine, cancellation)
             .context("transcribing provider session audio with mayhem-engine")?;
+        let transcription = TranscriptionResult {
+            schema_version: mayhem_proto::TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+            text: output.text.clone(),
+            detected_language: output.detected_language,
+            duration_seconds: output.duration_seconds,
+            words: output
+                .words
+                .into_iter()
+                .map(|word| TranscriptionTimestamp {
+                    text: word.text,
+                    start: word.start,
+                    end: word.end,
+                })
+                .collect(),
+            segments: output
+                .segments
+                .into_iter()
+                .map(|segment| TranscriptionTimestamp {
+                    text: segment.text,
+                    start: segment.start,
+                    end: segment.end,
+                })
+                .collect(),
+        };
         return Ok(ProviderSessionOutput {
-            content: output.text,
+            content: transcription.text.clone(),
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: Some(transcription),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
@@ -56635,6 +57001,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts,
             finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
@@ -56685,6 +57052,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts,
             finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
@@ -56744,6 +57112,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts,
             finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
@@ -56821,6 +57190,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts,
             finish_reason: "stop".to_owned(),
             prompt_tokens: 0,
@@ -56853,6 +57223,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: Some(output.embeddings),
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens,
@@ -56988,6 +57359,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         reasoning_evidence: filtered_output.hidden,
         tools,
         embeddings: None,
+        transcription: None,
         artifacts,
         finish_reason,
         prompt_tokens: billed_prompt_tokens,
@@ -58462,6 +58834,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens,
@@ -58481,6 +58854,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             })],
             finish_reason: "tool_calls".to_owned(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
@@ -58500,6 +58874,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             })],
             finish_reason: "tool_calls".to_owned(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
@@ -58530,6 +58905,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         reasoning_evidence: String::new(),
         tools: Vec::new(),
         embeddings: None,
+        transcription: None,
         artifacts: Vec::new(),
         finish_reason: "stop".to_owned(),
         prompt_tokens,
@@ -58940,6 +59316,87 @@ fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     Some(data_len.div_ceil(bytes_per_second).max(1))
+}
+
+fn repeat_wav_audio(bytes: &[u8], repeat_count: u32) -> Result<Vec<u8>> {
+    ensure!(
+        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "audio fixture is not a RIFF/WAVE file"
+    );
+    ensure!(repeat_count > 0, "WAV repeat count must be positive");
+    if repeat_count == 1 {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut offset = 12usize;
+    let mut data_chunk = None;
+    while offset
+        .checked_add(8)
+        .is_some_and(|chunk_header_end| chunk_header_end <= bytes.len())
+    {
+        let chunk_len = usize::try_from(u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .context("WAV chunk length is malformed")?,
+        ))
+        .context("WAV chunk length overflowed usize")?;
+        let chunk_start = offset
+            .checked_add(8)
+            .context("WAV chunk start overflowed")?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_len)
+            .context("WAV chunk end overflowed")?;
+        ensure!(chunk_end <= bytes.len(), "WAV chunk exceeds file length");
+        let padded_end = chunk_end
+            .checked_add(chunk_len % 2)
+            .context("WAV padded chunk end overflowed")?;
+        ensure!(padded_end <= bytes.len(), "WAV chunk padding is truncated");
+        if &bytes[offset..offset + 4] == b"data" {
+            ensure!(data_chunk.is_none(), "WAV fixture has multiple data chunks");
+            data_chunk = Some((offset, chunk_start, chunk_end, padded_end));
+        }
+        offset = padded_end;
+    }
+    let (data_header, data_start, data_end, padded_end) =
+        data_chunk.context("WAV fixture has no data chunk")?;
+    let source_data = &bytes[data_start..data_end];
+    ensure!(!source_data.is_empty(), "WAV fixture data chunk is empty");
+    let repeated_len = source_data
+        .len()
+        .checked_mul(usize::try_from(repeat_count).context("WAV repeat count overflowed usize")?)
+        .context("repeated WAV data length overflowed")?;
+    let repeated_len_u32 =
+        u32::try_from(repeated_len).context("repeated WAV data exceeds the RIFF 32-bit limit")?;
+    let repeated_padded_len = repeated_len
+        .checked_add(repeated_len % 2)
+        .context("repeated WAV padded length overflowed")?;
+    let output_len = data_start
+        .checked_add(repeated_padded_len)
+        .and_then(|len| len.checked_add(bytes.len().saturating_sub(padded_end)))
+        .context("repeated WAV file length overflowed")?;
+    ensure!(
+        output_len <= 256 * 1024 * 1024,
+        "repeated WAV fixture exceeds the 256 MiB calibration limit"
+    );
+
+    let mut output = Vec::with_capacity(output_len);
+    output.extend_from_slice(&bytes[..data_start]);
+    for _ in 0..repeat_count {
+        output.extend_from_slice(source_data);
+    }
+    if repeated_len % 2 == 1 {
+        output.push(0);
+    }
+    output.extend_from_slice(&bytes[padded_end..]);
+    output[data_header + 4..data_header + 8].copy_from_slice(&repeated_len_u32.to_le_bytes());
+    let riff_len = u32::try_from(output.len().saturating_sub(8))
+        .context("repeated WAV RIFF length exceeds the 32-bit limit")?;
+    output[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    ensure!(
+        wav_duration_seconds_ceil(&output).is_some(),
+        "repeated WAV fixture failed duration validation"
+    );
+    Ok(output)
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -60412,6 +60869,25 @@ mod tests {
                 transcription_output: mayhem_engine::AudioTranscriptionOutput {
                     text: "hello mayhem".to_owned(),
                     audio_seconds: 2,
+                    duration_seconds: Some(2.0),
+                    detected_language: Some("en".to_owned()),
+                    words: vec![
+                        mayhem_engine::AudioTranscriptionTimestamp {
+                            text: "hello".to_owned(),
+                            start: 0.0,
+                            end: 0.8,
+                        },
+                        mayhem_engine::AudioTranscriptionTimestamp {
+                            text: "mayhem".to_owned(),
+                            start: 1.0,
+                            end: 2.0,
+                        },
+                    ],
+                    segments: vec![mayhem_engine::AudioTranscriptionTimestamp {
+                        text: "hello mayhem".to_owned(),
+                        start: 0.0,
+                        end: 2.0,
+                    }],
                 },
                 speech_audio_seconds: 3,
                 artifact_chunks: Vec::new(),
@@ -60634,6 +61110,24 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
         )
+    }
+
+    #[test]
+    fn repeated_wav_canary_fixture_is_bounded_and_updates_lengths() {
+        let source = tiny_wav_bytes(16_000);
+        let repeated = repeat_wav_audio(&source, 130).unwrap();
+
+        assert_eq!(wav_duration_seconds_ceil(&source), Some(1));
+        assert_eq!(wav_duration_seconds_ceil(&repeated), Some(130));
+        assert_eq!(
+            u32::from_le_bytes(repeated[4..8].try_into().unwrap()) as usize,
+            repeated.len() - 8
+        );
+        assert_eq!(
+            u32::from_le_bytes(repeated[40..44].try_into().unwrap()) as usize,
+            (source.len() - 44) * 130
+        );
+        assert_eq!(source.len(), 32_044);
     }
 
     #[test]
@@ -68565,6 +69059,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 3,
@@ -68986,6 +69481,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 2,
@@ -70546,6 +71042,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 1);
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
+        let transcription = output
+            .transcription
+            .as_ref()
+            .expect("typed transcription metadata");
+        assert_eq!(transcription.detected_language.as_deref(), Some("en"));
+        assert_eq!(transcription.duration_seconds, Some(2.0));
+        assert_eq!(transcription.words.len(), 2);
+        assert_eq!(transcription.segments.len(), 1);
         let request = backend
             .last_transcription_request
             .expect("audio transcription request");
@@ -70728,6 +71232,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 reasoning_evidence: String::new(),
                 tools: Vec::new(),
                 embeddings: None,
+                transcription: None,
                 artifacts: vec![ProviderSessionArtifact {
                     id: "calibration-artifact".to_owned(),
                     content_type: content_type.to_owned(),
@@ -72060,6 +72565,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "length".to_owned(),
             prompt_tokens: 0,
@@ -72103,6 +72609,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             reasoning_evidence: "r".repeat(128),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "length".to_owned(),
             prompt_tokens: 5,
@@ -72150,6 +72657,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 }),
             ],
             embeddings: Some(vec![vec![0.25_f32; 2048], vec![0.5_f32; 2048]]),
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "tool_calls".to_owned(),
             prompt_tokens: 3,
@@ -72217,6 +72725,71 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn provider_session_final_delta_frames_chunk_transcription_metadata() {
+        let words = (0..1_000)
+            .map(|index| TranscriptionTimestamp {
+                text: format!("word-{index}"),
+                start: f64::from(index),
+                end: f64::from(index) + 0.5,
+            })
+            .collect::<Vec<_>>();
+        let text = words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output = ProviderSessionOutput {
+            content: text.clone(),
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: Some(TranscriptionResult {
+                schema_version: mayhem_proto::TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+                text,
+                detected_language: Some("en".to_owned()),
+                duration_seconds: Some(1_000.0),
+                words,
+                segments: Vec::new(),
+            }),
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 1_000)]),
+            usage_attribution: BTreeMap::new(),
+        };
+        let max_frame_bytes = 12 * 1024;
+
+        let frames = provider_session_final_delta_frames(
+            "rid-transcription",
+            0,
+            &output,
+            false,
+            &json!({"unit": "audio_rtf"}),
+            max_frame_bytes,
+        )
+        .unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames
+            .iter()
+            .all(|frame| provider_session_frame_json_len(frame).unwrap() <= max_frame_bytes));
+        let final_frame = frames.last().unwrap();
+        assert!(final_frame["transcription"].is_null());
+        let manifest: PayloadChunkManifest =
+            serde_json::from_value(final_frame["transcription_ref"].clone()).unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .filter(|frame| frame.get("field").and_then(Value::as_str) == Some("transcription"))
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored: TranscriptionResult =
+            serde_json::from_value(reassemble_json_payload(&manifest, &chunks).unwrap()).unwrap();
+        assert_eq!(restored, output.transcription.unwrap());
     }
 
     #[test]
@@ -72362,6 +72935,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
+            transcription: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 60_003,
@@ -74856,6 +75430,7 @@ State initialization...
             prompt: None,
             input: None,
             audio_b64: None,
+            audio_repeat_count: None,
             content_type: None,
             filename: None,
             language: None,
@@ -75780,6 +76355,10 @@ State initialization...
             perceptual_hash: None,
             embedding_vector: Some(vector.clone()),
             transcript: None,
+            detected_language: None,
+            transcription_duration_seconds: None,
+            word_timestamps: Vec::new(),
+            segment_timestamps: Vec::new(),
             audio_fingerprint: None,
             resource_items: BTreeMap::new(),
             calibration_baseline_memory_bytes: 1,
@@ -78469,6 +79048,10 @@ State initialization...
             perceptual_hash: None,
             embedding_vector: None,
             transcript: None,
+            detected_language: None,
+            transcription_duration_seconds: None,
+            word_timestamps: Vec::new(),
+            segment_timestamps: Vec::new(),
             audio_fingerprint: None,
             resource_items: BTreeMap::new(),
             calibration_baseline_memory_bytes: 1,
