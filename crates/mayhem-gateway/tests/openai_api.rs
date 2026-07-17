@@ -3626,6 +3626,10 @@ fn signed_image_provider_receipt(
     let body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: invocation.session_id.clone(),
+        billing_id: invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: invocation.spend_voucher.body.billing_attempt,
+        billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),
@@ -3704,6 +3708,10 @@ fn signed_provider_receipt_for_test(
     let body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: invocation.session_id.clone(),
+        billing_id: invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: invocation.spend_voucher.body.billing_attempt,
+        billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),

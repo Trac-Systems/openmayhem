@@ -103,6 +103,10 @@ const receiptBundle = (user, provider, overrides = {}) => ({
     {
       schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
       session_id: 'session-payout-rollup-1',
+      billing_id: 'd'.repeat(64),
+      billing_attempt: 0,
+      billing_prior_usage: {},
+      billing_prior_au_owed_cum: '0',
       seq: 1,
       final: true,
       rail: 'fiat',

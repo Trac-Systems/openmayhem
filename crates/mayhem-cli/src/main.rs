@@ -68,8 +68,8 @@ use mayhem_engine::{
 };
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
-    heartbeat_signing_payload, image_average_hash_hex, normalize_canary_transcript,
-    normalize_rate_map,
+    heartbeat_signing_payload, image_average_hash_hex, logical_cumulative_priced_usage_au,
+    normalize_canary_transcript, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
@@ -80,9 +80,9 @@ use mayhem_gateway::{
         ScBridgeGatewaySessionConfig, ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS,
         MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
-    priced_usage_au, rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
-    text_rate_per_1k_au, HardwareQuoteVerifierCommand, HeartbeatModalityCapacity,
-    HeartbeatReceiver, ModalityRequestLoad, ProviderProbation, RateMapEntry,
+    rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
+    HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
+    ModalityRequestLoad, ProviderProbation, RateMapEntry,
     DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
     DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
     MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
@@ -96,14 +96,16 @@ use mayhem_proto::{
     ctx_bracket_table_at, default_ctx_bracket_schedule, payload_chunk_at, payload_chunk_manifest,
     reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
     session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
-    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    validate_ctx_bracket_schedule, visible_output_units, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SpendVoucher, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -38944,6 +38946,10 @@ struct ActiveProviderSession {
     remote: String,
     user_pubkey: String,
     session_id: String,
+    billing_id: String,
+    billing_attempt: u32,
+    billing_prior_usage: ReceiptUsage,
+    billing_prior_au_owed_cum: MoneyAu,
     rail: String,
     price_ver: u64,
     locked_rate_map: Vec<RateMapEntry>,
@@ -38955,6 +38961,7 @@ struct ActiveProviderSession {
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
+    max_spend_au: MoneyAu,
     accept_replay: Option<ProviderSessionAcceptReplay>,
 }
 
@@ -50939,6 +50946,10 @@ async fn handle_provider_session_frame(
                             .unwrap_or_default()
                             .to_owned(),
                         session_id: session_id.clone(),
+                        billing_id: spend_voucher.body.billing_id.clone(),
+                        billing_attempt: spend_voucher.body.billing_attempt,
+                        billing_prior_usage: spend_voucher.body.billing_prior_usage.clone(),
+                        billing_prior_au_owed_cum: spend_voucher.body.billing_prior_au_owed_cum,
                         price_ver: spend_voucher.body.price_ver,
                         locked_rate_map: normalize_rate_map(
                             spend_voucher.body.locked_rate_map.clone(),
@@ -50951,6 +50962,7 @@ async fn handle_provider_session_frame(
                         ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                         ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                         checkpoint_every,
+                        max_spend_au: spend_voucher.body.max_spend_au,
                         accept_replay: None,
                     };
                     let ts = unix_epoch_millis()?;
@@ -51262,12 +51274,13 @@ async fn handle_provider_session_frame(
                 )
             });
             let response = contain_provider_request(|| {
-                let output = responder.respond_streaming(
+                let mut output = responder.respond_streaming(
                     terms,
                     &body,
                     live_stream.as_mut(),
                     &cancellation,
                 )?;
+                normalize_provider_visible_output_usage(&body, &mut output)?;
                 cancellation
                     .check()
                     .context("provider request cancelled before response publication")?;
@@ -51622,8 +51635,8 @@ fn provider_bridge_error_missing_direct_connection(error: &BridgeError) -> bool 
 struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_tokens: u64,
-    delivered_tokens: u64,
+    last_checkpoint_visible_units: u64,
+    delivered_visible_units: u64,
     prompt_tokens: u64,
 }
 
@@ -51638,15 +51651,17 @@ struct ProviderSessionLiveStream<'a> {
     heartbeat_load: ProviderHeartbeatLoad,
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_tokens: u64,
+    last_checkpoint_visible_units: u64,
     first_ttft_ms: Option<u64>,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
-    delivered_tokens: u64,
+    generated_tokens: u64,
+    delivered_visible_units: u64,
     prompt_tokens: u64,
     streamed_any: bool,
     pending_text: String,
     pending_token_ids: Vec<i32>,
+    visible_text: String,
 }
 
 const PROVIDER_REASONING_OPEN_TAG: &str = "<think>";
@@ -51837,15 +51852,17 @@ impl<'a> ProviderSessionLiveStream<'a> {
             heartbeat_load,
             next_index: 0,
             receipt_seq: 1,
-            last_checkpoint_tokens: 0,
+            last_checkpoint_visible_units: 0,
             first_ttft_ms: None,
             first_token_at: None,
             last_token_at: None,
-            delivered_tokens: 0,
+            generated_tokens: 0,
+            delivered_visible_units: 0,
             prompt_tokens: 0,
             streamed_any: false,
             pending_text: String::new(),
             pending_token_ids: Vec::new(),
+            visible_text: String::new(),
         }
     }
 
@@ -51861,17 +51878,19 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.last_token_at = Some(token_at);
         provider_session_debug(format!(
             "live buffering token #{} for session {} request {}",
-            self.delivered_tokens, self.active.session_id, self.request_id
+            self.generated_tokens, self.active.session_id, self.request_id
         ));
         self.pending_text.push_str(&chunk.text);
         self.pending_token_ids.push(chunk.token_id);
-        self.delivered_tokens = self.delivered_tokens.saturating_add(1);
+        self.visible_text.push_str(&chunk.text);
+        self.generated_tokens = self.generated_tokens.saturating_add(1);
+        self.delivered_visible_units = visible_output_units(&self.visible_text, &[]);
         self.streamed_any = true;
 
         let checkpoint_due = provider_session_checkpoint_due(
-            self.delivered_tokens,
+            self.delivered_visible_units,
             u64::MAX,
-            self.last_checkpoint_tokens,
+            self.last_checkpoint_visible_units,
             provider_session_checkpoint_tokens(self.active),
         );
         if self.next_index == 0
@@ -51883,7 +51902,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
         }
 
         if checkpoint_due {
-            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_tokens);
+            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_visible_units);
             let receipt = provider_session_receipt_for_usage(
                 self.terms,
                 self.active,
@@ -51914,7 +51933,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_tokens = self.delivered_tokens;
+            self.last_checkpoint_visible_units = self.delivered_visible_units;
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
@@ -51923,6 +51942,9 @@ impl<'a> ProviderSessionLiveStream<'a> {
 
     fn append_visible_text(&mut self, text: &str) {
         self.pending_text.push_str(text);
+        self.visible_text.push_str(text);
+        self.delivered_visible_units = visible_output_units(&self.visible_text, &[]);
+        self.streamed_any |= !text.is_empty();
     }
 
     fn first_ttft_ms(&self) -> Option<u64> {
@@ -51930,7 +51952,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn measured_generation_tok_s(&self) -> Option<f64> {
-        let token_intervals = self.delivered_tokens.checked_sub(1)?;
+        let token_intervals = self.generated_tokens.checked_sub(1)?;
         if token_intervals == 0 {
             return None;
         }
@@ -51946,10 +51968,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn cancellation_receipt_state(&self) -> (ReceiptUsage, u64) {
-        let usage = if self.last_checkpoint_tokens == 0 {
+        let usage = if self.last_checkpoint_visible_units == 0 {
             ReceiptUsage::default()
         } else {
-            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_tokens)
+            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_visible_units)
         };
         (usage, self.receipt_seq)
     }
@@ -52039,10 +52061,12 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
-        if self.delivered_tokens == 0 || self.delivered_tokens == self.last_checkpoint_tokens {
+        if self.delivered_visible_units == 0
+            || self.delivered_visible_units == self.last_checkpoint_visible_units
+        {
             return Ok(());
         }
-        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_tokens);
+        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_visible_units);
         let receipt = provider_session_receipt_for_usage(
             self.terms,
             self.active,
@@ -52073,7 +52097,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 Ok::<(), anyhow::Error>(())
             })
         })?;
-        self.last_checkpoint_tokens = self.delivered_tokens;
+        self.last_checkpoint_visible_units = self.delivered_visible_units;
         self.receipt_seq = self.receipt_seq.saturating_add(1);
         Ok(())
     }
@@ -52082,8 +52106,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.streamed_any.then_some(ProviderSessionLiveStreamState {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
-            last_checkpoint_tokens: self.last_checkpoint_tokens,
-            delivered_tokens: self.delivered_tokens,
+            last_checkpoint_visible_units: self.last_checkpoint_visible_units,
+            delivered_visible_units: self.delivered_visible_units,
             prompt_tokens: self.prompt_tokens,
         })
     }
@@ -52176,9 +52200,9 @@ async fn send_provider_session_output(
         .map(|state| state.receipt_seq)
         .unwrap_or(1);
     let checkpoint_tokens = provider_session_checkpoint_tokens(active);
-    let mut last_checkpoint_tokens = live_stream_state
+    let mut last_checkpoint_visible_units = live_stream_state
         .as_ref()
-        .map(|state| state.last_checkpoint_tokens)
+        .map(|state| state.last_checkpoint_visible_units)
         .unwrap_or(0);
     let mut token_ids_sent_in_deltas = live_stream_state.is_some();
     if output.tools.is_empty() && live_stream_state.is_none() {
@@ -52192,8 +52216,7 @@ async fn send_provider_session_output(
             .len()
             .div_ceil(PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA);
         let part_count = parts.len().max(token_part_count);
-        let mut delivered_token_ids = 0_usize;
-        let mut delivered_rough_tokens = IncrementalRoughTokenCounter::default();
+        let mut delivered_visible_bytes = 0_u64;
         for part_index in 0..part_count {
             let part = parts.get(part_index).copied().unwrap_or("");
             provider_session_debug(format!(
@@ -52218,20 +52241,20 @@ async fn send_provider_session_output(
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
-            delivered_token_ids = delivered_token_ids.saturating_add(token_ids_delta.len());
-            delivered_rough_tokens.observe(part);
-            let delivered_tokens = if output.token_ids.is_empty() {
-                delivered_rough_tokens.count
+            delivered_visible_bytes = delivered_visible_bytes
+                .saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+            let delivered_visible_units = if delivered_visible_bytes == 0 {
+                0
             } else {
-                u64::try_from(delivered_token_ids).unwrap_or(u64::MAX)
+                delivered_visible_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
             };
             if provider_session_checkpoint_due(
-                delivered_tokens,
+                delivered_visible_units,
                 output.usage.output_tokens(),
-                last_checkpoint_tokens,
+                last_checkpoint_visible_units,
                 checkpoint_tokens,
             ) {
-                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_tokens);
+                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_visible_units);
                 let receipt = provider_session_receipt_for_usage(
                     terms,
                     active,
@@ -52258,7 +52281,7 @@ async fn send_provider_session_output(
                 )
                 .await
                 .context("waiting for checkpoint receipt ack")?;
-                last_checkpoint_tokens = delivered_tokens;
+                last_checkpoint_visible_units = delivered_visible_units;
                 receipt_seq = receipt_seq.saturating_add(1);
             }
         }
@@ -52339,8 +52362,10 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    if state.delivered_tokens > 0 && state.delivered_tokens != state.last_checkpoint_tokens {
-        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_tokens);
+    if state.delivered_visible_units > 0
+        && state.delivered_visible_units != state.last_checkpoint_visible_units
+    {
+        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_visible_units);
         let receipt = provider_session_receipt_for_usage(
             terms,
             active,
@@ -53213,9 +53238,23 @@ fn provider_session_receipt_for_usage_attribution(
     final_receipt: bool,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
+    let usage = provider_session_logical_usage(active, &usage);
+    let au_owed_cum = provider_session_au_owed(active, &usage)
+        .context("logical receipt usage regressed from its signed billing baseline")?;
+    let incremental_au = au_owed_cum
+        .checked_sub(active.billing_prior_au_owed_cum)
+        .context("logical receipt amount regressed from its signed billing baseline")?;
+    ensure!(
+        incremental_au <= active.max_spend_au,
+        "provider receipt exceeds the signed incremental spend maximum"
+    );
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
+        billing_id: active.billing_id.clone(),
+        billing_attempt: active.billing_attempt,
+        billing_prior_usage: active.billing_prior_usage.clone(),
+        billing_prior_au_owed_cum: active.billing_prior_au_owed_cum,
         seq,
         final_receipt,
         rail: active.rail.clone(),
@@ -53233,7 +53272,7 @@ fn provider_session_receipt_for_usage_attribution(
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
         usage_attribution,
-        au_owed_cum: provider_session_au_owed(active, &usage),
+        au_owed_cum,
         prompt_hash: provider_session_prompt_hash(body),
         ts: unix_epoch_millis()?,
     };
@@ -53244,11 +53283,38 @@ fn provider_session_receipt_for_usage_attribution(
     })
 }
 
-fn provider_session_au_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> MoneyAu {
-    priced_usage_au(
+fn provider_session_logical_usage(
+    active: &ActiveProviderSession,
+    attempt_usage: &ReceiptUsage,
+) -> ReceiptUsage {
+    if active.billing_prior_au_owed_cum == 0 {
+        return attempt_usage.clone();
+    }
+    let incremental = ReceiptUsage::from_units(
+        attempt_usage
+            .units()
+            .iter()
+            .filter(|(unit, _)| {
+                !matches!(
+                    unit.as_str(),
+                    USAGE_INPUT_TOKEN | USAGE_CACHED_INPUT_TOKEN | USAGE_INPUT_CHARACTER
+                )
+            })
+            .map(|(unit, count)| (unit.clone(), *count)),
+    );
+    active.billing_prior_usage.saturating_add(&incremental)
+}
+
+fn provider_session_au_owed(
+    active: &ActiveProviderSession,
+    usage: &ReceiptUsage,
+) -> Option<MoneyAu> {
+    logical_cumulative_priced_usage_au(
         &active.locked_rate_map,
         active.locked_per_req_au,
         active.locked_min_session_au,
+        &active.billing_prior_usage,
+        active.billing_prior_au_owed_cum,
         usage,
     )
 }
@@ -54949,6 +55015,29 @@ fn provider_session_open_decision(
     if voucher.body.session_id.as_str() != session_id {
         return reject("VOUCHER", "voucher session_id mismatch".to_owned());
     }
+    if !is_hex_len(&voucher.body.billing_id, 64) {
+        return reject(
+            "VOUCHER",
+            "voucher billing_id must be 32 bytes of hex".to_owned(),
+        );
+    }
+    if voucher.body.billing_attempt == 0
+        && (voucher.body.billing_prior_usage != ReceiptUsage::default()
+            || voucher.body.billing_prior_au_owed_cum != 0)
+    {
+        return reject(
+            "VOUCHER",
+            "initial billing attempt must have an empty cumulative baseline".to_owned(),
+        );
+    }
+    if voucher.body.billing_prior_au_owed_cum == 0
+        && voucher.body.billing_prior_usage != ReceiptUsage::default()
+    {
+        return reject(
+            "VOUCHER",
+            "billing prior usage requires a nonzero cumulative amount".to_owned(),
+        );
+    }
     if voucher.body.rail.as_str() != rail {
         return reject("VOUCHER", "voucher rail mismatch".to_owned());
     }
@@ -55161,6 +55250,73 @@ struct ProviderSessionOutput {
     usage_attribution: BTreeMap<String, u64>,
 }
 
+fn provider_visible_tool_calls(tools: &[Value]) -> Result<Vec<VisibleToolCall>> {
+    tools
+        .iter()
+        .map(|tool| {
+            Ok(VisibleToolCall {
+                id: tool
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing id")?
+                    .to_owned(),
+                name: tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing name")?
+                    .to_owned(),
+                arguments: tool
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .context("provider tool output missing arguments")?
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_provider_visible_output_usage(
+    body: &Value,
+    output: &mut ProviderSessionOutput,
+) -> Result<()> {
+    let endpoint_family = body
+        .get("mayhem_contract")
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    let is_text_generation = body.get("kind").is_none()
+        || matches!(
+            endpoint_family,
+            Some(
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            )
+        );
+    if !is_text_generation {
+        return Ok(());
+    }
+    let tools = provider_visible_tool_calls(&output.tools)?;
+    let visible_units = visible_output_units(&output.content, &tools);
+    output.completion_tokens = visible_units;
+    output.usage = ReceiptUsage::from_units(
+        output
+            .usage
+            .units()
+            .iter()
+            .filter(|(unit, _)| unit.as_str() != USAGE_OUTPUT_TOKEN)
+            .map(|(unit, count)| (unit.clone(), *count))
+            .chain([(USAGE_OUTPUT_TOKEN.to_owned(), visible_units)]),
+    );
+    if let Some(reasoning) = output.usage_attribution.get_mut("reasoning_output_tokens") {
+        *reasoning = (*reasoning).min(visible_units);
+        if *reasoning == 0 {
+            output.usage_attribution.remove("reasoning_output_tokens");
+        }
+    }
+    Ok(())
+}
+
 fn validate_provider_session_output(
     terms: &ProviderSessionTerms,
     body: &Value,
@@ -55172,25 +55328,18 @@ fn validate_provider_session_output(
     );
     if body.get("kind").and_then(Value::as_str).is_none() {
         let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
-        let max_output_tokens = body
-            .get("max_tokens")
-            .and_then(Value::as_u64)
+        let max_output_tokens = provider_requested_max_output_tokens(body)
             .unwrap_or(available_tokens)
             .min(available_tokens);
+        let max_visible_output_units =
+            max_output_tokens.saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN);
         ensure!(
-            output.completion_tokens <= max_output_tokens,
-            "provider output exceeded the selected session token budget"
+            output.completion_tokens <= max_visible_output_units,
+            "provider visible output exceeded the selected session byte-derived unit budget"
         );
         ensure!(
             u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
             "provider token ids exceeded the selected session token budget"
-        );
-        let max_text_bytes = usize::try_from(max_output_tokens)
-            .unwrap_or(usize::MAX / DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN)
-            .saturating_mul(DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN);
-        ensure!(
-            output.content.len() <= max_text_bytes,
-            "provider text output exceeded the selected session byte budget"
         );
     } else {
         ensure!(
@@ -56570,19 +56719,7 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.media = provider_engine_media_inputs(&messages);
     request.tools = template_tools;
     request.speciality_parameters = speciality_parameters;
-    if let Some(max_tokens) = body
-        .get("max_tokens")
-        .filter(|value| !value.is_null())
-        .or_else(|| {
-            body.get("max_completion_tokens")
-                .filter(|value| !value.is_null())
-        })
-        .or_else(|| {
-            body.get("max_output_tokens")
-                .filter(|value| !value.is_null())
-        })
-        .and_then(Value::as_u64)
-    {
+    if let Some(max_tokens) = provider_requested_max_output_tokens(body) {
         request.max_new_tokens = u32::try_from(max_tokens)
             .context("max_tokens exceeds provider engine request range")?;
     } else if let Some(default_cap) = speciality_output_cap {
@@ -56634,6 +56771,20 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         });
     }
     Ok(request)
+}
+
+fn provider_requested_max_output_tokens(body: &Value) -> Option<u64> {
+    body.get("max_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            body.get("max_completion_tokens")
+                .filter(|value| !value.is_null())
+        })
+        .or_else(|| {
+            body.get("max_output_tokens")
+                .filter(|value| !value.is_null())
+        })
+        .and_then(Value::as_u64)
 }
 
 fn provider_engine_template_messages(
@@ -63476,9 +63627,9 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 11);
+        assert_eq!(CONTRACT_VERSION, 12);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
-        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
 
     #[test]
@@ -67338,6 +67489,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -67349,6 +67504,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -67417,6 +67573,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -67428,6 +67588,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -67581,6 +67742,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -67592,6 +67757,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -67616,7 +67782,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(receipt.body.usage, usage);
         assert_eq!(
             receipt.body.au_owed_cum,
-            provider_session_au_owed(&active, &usage)
+            provider_session_au_owed(&active, &usage).expect("priced checkpoint usage")
         );
 
         let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
@@ -67631,6 +67797,65 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_redispatch_receipt_nets_prior_usage_and_fixed_floor() {
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.locked_rate_map = normalize_rate_map(vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 10,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 10,
+                granularity: 1,
+            },
+        ]);
+        active.locked_per_req_au = 500;
+        active.locked_min_session_au = 700;
+        active.billing_attempt = 1;
+        active.billing_prior_usage = ReceiptUsage::text(10, 2);
+        active.billing_prior_au_owed_cum = 700;
+        active.max_spend_au = 30;
+
+        let body = json!({
+            "messages": [{ "role": "user", "content": "retried prompt" }],
+            "max_tokens": 8,
+        });
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            ReceiptUsage::text(99, 3),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([19; 32]),
+        )
+        .expect("redispatch receipt should charge only the new visible output");
+
+        assert_eq!(receipt.body.billing_attempt, 1);
+        assert_eq!(receipt.body.billing_prior_usage, ReceiptUsage::text(10, 2));
+        assert_eq!(receipt.body.usage, ReceiptUsage::text(10, 5));
+        assert_eq!(receipt.body.billing_prior_au_owed_cum, 700);
+        assert_eq!(receipt.body.au_owed_cum, 730);
+
+        active.max_spend_au = 29;
+        assert!(provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            ReceiptUsage::text(99, 3),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([19; 32]),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("incremental spend maximum"));
+    }
+
+    #[test]
     fn provider_session_checkpoint_policy_bounds_unacked_output_window() {
         assert!(!provider_session_checkpoint_due(0, 10, 0, 2));
         assert!(!provider_session_checkpoint_due(1, 10, 0, 2));
@@ -67642,6 +67867,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: 1,
             locked_rate_map: text_generation_rate_map(1, 2),
@@ -67653,6 +67882,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         assert_eq!(
@@ -67680,6 +67910,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             remote: "peer-a".to_owned(),
             user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -67691,6 +67925,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         };
         let body = json!({
@@ -70226,6 +70461,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -70236,6 +70475,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -70276,6 +70516,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -70286,6 +70530,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -70325,6 +70570,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     rail: "tap".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    billing_id: "bb".repeat(32),
+                    billing_attempt: 0,
+                    billing_prior_usage: ReceiptUsage::default(),
+                    billing_prior_au_owed_cum: 0,
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_au: 0,
@@ -70335,6 +70584,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                    max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
                 },
             );
@@ -70687,9 +70937,33 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_session_output_budget_allows_large_valid_text_and_rejects_overrun() {
         let terms = test_provider_session_terms();
-        let body = json!({ "messages": [], "max_tokens": 8192 });
+        let max_tokens = 8192_u64;
+        let body = json!({ "messages": [], "max_tokens": max_tokens });
+        assert_eq!(
+            provider_requested_max_output_tokens(&body),
+            Some(max_tokens)
+        );
+        assert_eq!(
+            provider_requested_max_output_tokens(
+                &json!({ "messages": [], "max_completion_tokens": max_tokens })
+            ),
+            Some(max_tokens)
+        );
+        assert_eq!(
+            provider_requested_max_output_tokens(
+                &json!({ "messages": [], "max_output_tokens": max_tokens })
+            ),
+            Some(max_tokens)
+        );
+        let max_visible_bytes = max_tokens
+            .saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN)
+            .saturating_mul(VISIBLE_OUTPUT_BYTES_PER_UNIT);
+        assert_eq!(
+            max_visible_bytes,
+            max_tokens.saturating_mul(MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN)
+        );
         let mut output = ProviderSessionOutput {
-            content: "x".repeat(8192 * DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN),
+            content: "x".repeat(usize::try_from(max_visible_bytes).unwrap()),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -70700,13 +70974,15 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             usage: ReceiptUsage::text(0, 8192),
             usage_attribution: BTreeMap::new(),
         };
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
         validate_provider_session_output(&terms, &body, &output).unwrap();
 
         output.content.push('x');
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
         assert!(validate_provider_session_output(&terms, &body, &output)
             .unwrap_err()
             .to_string()
-            .contains("byte budget"));
+            .contains("byte-derived unit budget"));
 
         output.content.clear();
         output.completion_tokens = 0;
@@ -76635,6 +76911,10 @@ State initialization...
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
@@ -76646,6 +76926,7 @@ State initialization...
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+            max_spend_au: MoneyAu::MAX,
             accept_replay: None,
         }
     }
@@ -76656,6 +76937,10 @@ State initialization...
         let user = hex_encode(&user_key.verifying_key().to_bytes());
         let voucher_body = mayhem_proto::SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: "bb".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
@@ -76694,6 +76979,10 @@ State initialization...
             "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
             "voucher": {
                 "session_id": voucher_body.session_id,
+                "billing_id": voucher_body.billing_id,
+                "billing_attempt": voucher_body.billing_attempt,
+                "billing_prior_usage": voucher_body.billing_prior_usage,
+                "billing_prior_au_owed_cum": money_au_json(voucher_body.billing_prior_au_owed_cum),
                 "rail": voucher_body.rail,
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,

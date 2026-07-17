@@ -26,11 +26,12 @@ const versioningLockedRateMap = [
   { unit: 'input_token', per_unit_au: '100', granularity: 30 },
   { unit: 'output_token', per_unit_au: '100', granularity: 30 },
 ];
+const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 11);
+  assert.equal(CONTRACT_VERSION, 12);
   assert.deepEqual(signingMessageVersions(), [2]);
-  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 8);
+  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 9);
 });
 
 test('contract reports the exported contract version', async () => {
@@ -125,6 +126,10 @@ test('receipt verifier accepts only the current signing payload', async () => {
   const body = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'session-versioning',
+    billing_id: versioningBillingId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 1,
     final: true,
     rail: 'fiat',
@@ -166,6 +171,10 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   ];
   const voucher = {
     session_id: 'sess-au-roundtrip',
+    billing_id: '44'.repeat(32),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     rail: 'fiat',
     enclave_id: 'enclave-au-roundtrip',
     price_ver: 9,
@@ -181,7 +190,10 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedVoucher = [
     '{"domain":"mayhem-spend-voucher","signing_version":2,"body":{',
-    '"session_id":"sess-au-roundtrip","rail":"fiat","enclave_id":"enclave-au-roundtrip",',
+    '"session_id":"sess-au-roundtrip","billing_id":"',
+    '44'.repeat(32),
+    '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
+    '"rail":"fiat","enclave_id":"enclave-au-roundtrip",',
     '"price_ver":9,"locked_rate_map":[',
     '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
     '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
@@ -196,6 +208,10 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   const receipt = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'sess-au-roundtrip',
+    billing_id: '44'.repeat(32),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 2,
     final: true,
     rail: 'fiat',
@@ -218,7 +234,10 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedReceipt = [
     '{"domain":"mayhem-session-receipt","signing_version":2,"body":{',
-    '"schema_version":8,"session_id":"sess-au-roundtrip","seq":2,"final":true,',
+    '"schema_version":9,"session_id":"sess-au-roundtrip","billing_id":"',
+    '44'.repeat(32),
+    '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
+    '"seq":2,"final":true,',
     '"rail":"fiat","user":"',
     '11'.repeat(32),
     '","provider":"',
@@ -245,6 +264,10 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
   const body = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'session-schema-current',
+    billing_id: versioningBillingId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 1,
     final: true,
     rail: 'fiat',

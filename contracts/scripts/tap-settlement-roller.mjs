@@ -22,7 +22,7 @@ export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
 const PROVIDER_CAP_TOLERANCE_WEI = 0n;
-const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+const SESSION_RECEIPT_SCHEMA_VERSION = 9;
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
@@ -238,6 +238,10 @@ export function canonicalReceiptBody(body) {
   const canonical = {
     schema_version: body.schema_version,
     session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
     seq: body.seq,
     final: body.final,
     rail: body.rail,
@@ -255,6 +259,9 @@ export function canonicalReceiptBody(body) {
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
   canonical.usage = body.usage;
+  if (isObject(body.usage_attribution) && Object.keys(body.usage_attribution).length > 0) {
+    canonical.usage_attribution = body.usage_attribution;
+  }
   canonical.au_owed_cum = body.au_owed_cum;
   canonical.prompt_hash = body.prompt_hash;
   canonical.ts = body.ts;
@@ -291,6 +298,35 @@ export function verifyReceiptEnvelope(envelope) {
       throw new Error(`Invalid receipt ${field}`);
     }
   }
+  if (!isHexBytes(body.billing_id, 32) || body.billing_id !== body.billing_id.toLowerCase()) {
+    throw new Error('Invalid receipt billing id');
+  }
+  if (!Number.isSafeInteger(body.billing_attempt) || body.billing_attempt < 0) {
+    throw new Error('Invalid receipt billing attempt');
+  }
+  const billingPriorUsage = normalizeReceiptUsage(body.billing_prior_usage);
+  if (stableJson(billingPriorUsage) !== stableJson(body.billing_prior_usage)) {
+    throw new Error('receipt billing_prior_usage must be canonical');
+  }
+  const usage = normalizeReceiptUsage(body.usage);
+  if (stableJson(usage) !== stableJson(body.usage)) {
+    throw new Error('receipt usage must be canonical');
+  }
+  const billingPriorAu = safeAu(
+    body.billing_prior_au_owed_cum,
+    'receipt billing_prior_au_owed_cum',
+    { allowZero: true }
+  );
+  if (
+    body.billing_attempt === 0 &&
+    (Object.keys(billingPriorUsage).length > 0 || billingPriorAu !== 0n)
+  ) {
+    throw new Error('initial receipt billing attempt must have an empty baseline');
+  }
+  if (billingPriorAu === 0n && Object.keys(billingPriorUsage).length > 0) {
+    throw new Error('receipt billing prior usage requires a prior cumulative amount');
+  }
+  assertUsageMonotonic(billingPriorUsage, usage);
   if (!isHexBytes(body.user, 32)) throw new Error('Invalid receipt user public key');
   if (!isHexBytes(body.provider, 32)) throw new Error('Invalid receipt provider public key');
   if (!Number.isSafeInteger(body.seq) || body.seq < 0) throw new Error('Invalid receipt sequence');
@@ -301,13 +337,77 @@ export function verifyReceiptEnvelope(envelope) {
   if (!Number.isSafeInteger(body.ts) || body.ts < 0) throw new Error('Invalid receipt timestamp');
   safeAu(body.locked_per_req_au, 'receipt locked_per_req_au', { allowZero: true });
   safeAu(body.locked_min_session_au, 'receipt locked_min_session_au', { allowZero: true });
-  safeAu(body.au_owed_cum, 'receipt au_owed_cum');
+  const currentAu = safeAu(body.au_owed_cum, 'receipt au_owed_cum');
+  if (currentAu < billingPriorAu) {
+    throw new Error('receipt cumulative au regressed below its signed billing baseline');
+  }
   const enclaveKey = envelope.enclave_pubkey ?? (isHexBytes(body.enclave_id, 32) ? body.enclave_id : null);
   if (!enclaveKey) throw new Error('receipt enclave public key is required');
   const message = receiptMessage(body);
   verifyEd25519Hex(envelope.enclave_sig, message, enclaveKey, 'enclave');
   verifyEd25519Hex(envelope.user_sig, message, body.user, 'user');
   return true;
+}
+
+function canonicalUsageUnit(unit) {
+  switch (unit) {
+    case 'in':
+    case 'in_tokens':
+    case 'input':
+    case 'input_tokens':
+    case 'prompt_tokens':
+    case 'input_token':
+      return 'input_token';
+    case 'cached_input':
+    case 'cached_inputs':
+    case 'cached_input_tokens':
+    case 'cached_prompt_tokens':
+    case 'cached_tokens':
+    case 'cached_input_token':
+      return 'cached_input_token';
+    case 'out':
+    case 'out_tokens':
+    case 'output':
+    case 'output_tokens':
+    case 'completion_tokens':
+    case 'output_token':
+      return 'output_token';
+    case 'images':
+    case 'image':
+      return 'image';
+    case 'steps':
+    case 'step':
+      return 'step';
+    default:
+      return unit;
+  }
+}
+
+function normalizeReceiptUsage(source) {
+  if (!isObject(source)) throw new Error('receipt usage must be an object');
+  const usage = {};
+  for (const [rawUnit, count] of Object.entries(source)) {
+    if (typeof rawUnit !== 'string' || !/^[a-zA-Z0-9._:-]{1,128}$/.test(rawUnit)) {
+      throw new Error('receipt usage unit is invalid');
+    }
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error('receipt usage count must be a non-negative safe integer');
+    }
+    if (count === 0) continue;
+    const unit = canonicalUsageUnit(rawUnit);
+    const next = (usage[unit] ?? 0) + count;
+    if (!Number.isSafeInteger(next)) throw new Error('receipt usage count overflow');
+    usage[unit] = next;
+  }
+  return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function assertUsageMonotonic(previous, current) {
+  for (const [unit, previousCount] of Object.entries(previous)) {
+    if ((current[unit] ?? 0) < previousCount) {
+      throw new Error(`receipt cumulative usage regressed for ${unit}`);
+    }
+  }
 }
 
 export function auToTapWei(au, tapUsdAu) {
@@ -347,21 +447,73 @@ function receiptEnvelope(entry) {
   };
 }
 
-function receiptDeltaAu(entry, body, previousBySession) {
+function receiptDeltaAu(entry, body, billingStates) {
   const explicit = entry.settle_au ?? entry.au_delta;
   if (explicit !== undefined) {
     throw new Error('TAP settlement amount must derive from signed receipt cumulative amount');
   }
   const current = safeAu(body.au_owed_cum, 'receipt au_owed_cum');
-  const session = body.session_id;
-  if (typeof session !== 'string' || session.length === 0) throw new Error('receipt session_id is required');
-  const previous = safeAu(
-    entry.previous_au_owed_cum ?? previousBySession.get(session) ?? '0',
-    'receipt previous_au_owed_cum',
+  const signedPrior = safeAu(
+    body.billing_prior_au_owed_cum,
+    'receipt billing_prior_au_owed_cum',
     { allowZero: true }
   );
+  const state = billingStates.get(body.billing_id);
+  let previous = signedPrior;
+  let attemptPriorUsage = body.billing_prior_usage;
+  let attemptPriorAu = signedPrior;
+
+  if (!state && (signedPrior !== 0n || Object.keys(body.billing_prior_usage).length > 0)) {
+    throw new Error('receipt logical billing baseline has no prior signed receipt in the batch');
+  }
+  if (state) {
+    if (body.billing_attempt < state.attempt) {
+      throw new Error('receipt billing attempt regressed');
+    }
+    if (body.billing_attempt === state.attempt) {
+      if (body.session_id !== state.sessionId) {
+        throw new Error('receipt transport session changed within one billing attempt');
+      }
+      if (
+        signedPrior !== state.attemptPriorAu ||
+        stableJson(body.billing_prior_usage) !== stableJson(state.attemptPriorUsage)
+      ) {
+        throw new Error('receipt billing attempt baseline changed');
+      }
+      if (body.seq <= state.seq) throw new Error('receipt sequence did not advance');
+    } else if (
+      signedPrior !== state.currentAu ||
+      stableJson(body.billing_prior_usage) !== stableJson(state.currentUsage)
+    ) {
+      throw new Error('receipt redispatch baseline does not match prior logical settlement');
+    }
+    assertUsageMonotonic(state.currentUsage, body.usage);
+    previous = state.currentAu;
+    if (body.billing_attempt === state.attempt) {
+      attemptPriorUsage = state.attemptPriorUsage;
+      attemptPriorAu = state.attemptPriorAu;
+    }
+  }
+  if (entry.previous_au_owed_cum !== undefined) {
+    const declaredPrevious = safeAu(
+      entry.previous_au_owed_cum,
+      'receipt previous_au_owed_cum',
+      { allowZero: true }
+    );
+    if (declaredPrevious !== previous) {
+      throw new Error('receipt previous_au_owed_cum contradicts the signed logical billing chain');
+    }
+  }
   if (current < previous) throw new Error('receipt cumulative au regressed');
-  previousBySession.set(session, current.toString());
+  billingStates.set(body.billing_id, {
+    attempt: body.billing_attempt,
+    attemptPriorUsage,
+    attemptPriorAu,
+    sessionId: body.session_id,
+    seq: body.seq,
+    currentUsage: body.usage,
+    currentAu: current,
+  });
   return current - previous;
 }
 
@@ -650,7 +802,7 @@ export function buildTapSettlement({
     holdbackEpochs: tapSettlementHoldbackEpochs(inputBundle, holdbackEpochs),
   });
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
-  const previousBySession = new Map();
+  const billingStates = new Map();
   const perProvider = priorProviderMap(prior);
   const perBuyerRefund = priorRefundMap(prior);
   let cumulativeSpentWei = parseBigIntString(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei, 'prior cumulative spent wei');
@@ -662,13 +814,14 @@ export function buildTapSettlement({
   const sorted = input
     .map(receiptEnvelope)
     .sort((a, b) => (
-      String(a.body.session_id ?? '').localeCompare(String(b.body.session_id ?? '')) ||
+      String(a.body.billing_id ?? '').localeCompare(String(b.body.billing_id ?? '')) ||
+      Number(a.body.billing_attempt ?? 0) - Number(b.body.billing_attempt ?? 0) ||
       Number(a.body.seq ?? 0) - Number(b.body.seq ?? 0)
     ));
 
   for (const { entry, body, envelope } of sorted) {
     verifyReceiptEnvelope(envelope);
-    const deltaAu = receiptDeltaAu(entry, body, previousBySession);
+    const deltaAu = receiptDeltaAu(entry, body, billingStates);
     if (deltaAu === 0n) continue;
     const release = receiptReleaseInfo(entry, body, bundleEpoch, policy);
     if (!release.eligible) {

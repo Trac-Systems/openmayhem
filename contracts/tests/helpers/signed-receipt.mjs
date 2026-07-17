@@ -28,9 +28,14 @@ export function signedTapReceipt({
   extra = {},
 }) {
   const providerIdentity = provider ?? makeReceiptIdentity();
+  const billingId = crypto.createHash('sha256').update(String(session)).digest('hex');
   const body = {
-    schema_version: 8,
+    schema_version: 9,
     session_id: session,
+    billing_id: billingId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq,
     final: true,
     rail: 'tap',
@@ -46,7 +51,7 @@ export function signedTapReceipt({
     ctx_bracket: 'le32k',
     ctx_bracket_table_ver: 1,
     rules_ver: 1,
-    usage: { input_token: 1, output_token: 0 },
+    usage: { input_token: 1 },
     au_owed_cum: String(au),
     prompt_hash: 'a'.repeat(64),
     ts: 3_600,

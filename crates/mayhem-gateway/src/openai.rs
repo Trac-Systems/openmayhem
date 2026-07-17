@@ -36,8 +36,9 @@ use crate::{
         GatewayJobStatus, GatewayJobStore, StoredGatewayJob, StoredGatewayJobSummary,
     },
     pricing::{
-        cancellation_settlement_usage, normalize_rate_map, priced_usage_au, rate_gate_basis_au,
-        text_generation_rate_map, usage_units_au, RateMapEntry,
+        cancellation_settlement_usage, logical_cumulative_priced_usage_au, normalize_rate_map,
+        priced_usage_au, rate_gate_basis_au, text_generation_rate_map, usage_units_au,
+        RateMapEntry,
     },
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
@@ -78,13 +79,14 @@ use mayhem_proto::chunk_json_payload;
 use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
     payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, AttestationReport,
-    CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract, ModelSpecialityDescriptor,
-    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, visible_output_units,
+    AttestationReport, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
+    ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
+    ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
+    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
     USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
     USAGE_VIDEO_SECOND,
@@ -146,7 +148,9 @@ pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
-const DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET: usize = 256;
+const DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN: usize = 256;
+const DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN: usize =
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN as usize;
 const DEFAULT_GATEWAY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS: usize = 32;
 const DEFAULT_GATEWAY_MAX_CHAT_MEDIA_ITEMS: u32 = 16;
@@ -208,7 +212,7 @@ pub struct GatewayState {
     jobs: Arc<Mutex<GatewayJobStore>>,
     retention_limits: GatewayRetentionLimits,
     receipt_config: ReceiptConfig,
-    ledger_balance_au: Arc<Mutex<MoneyAu>>,
+    wallet_spend: Arc<Mutex<GatewayWalletSpendState>>,
     payment_directory: Arc<Mutex<Option<Value>>>,
     session_backend: Arc<dyn GatewaySessionBackend>,
     hardware_quote_trust: Arc<HardwareQuoteTrust>,
@@ -239,7 +243,82 @@ pub struct GatewayState {
 #[derive(Clone, Debug)]
 struct GatewayReceiptRecorder {
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    spend_reservation: GatewaySpendReservation,
+}
+
+#[derive(Debug)]
+struct GatewayWalletSpendState {
+    balance_au: MoneyAu,
+    reservations: BTreeMap<String, MoneyAu>,
+}
+
+#[derive(Debug)]
+struct GatewaySpendReservationInner {
+    id: String,
+    remaining_au: Mutex<Option<MoneyAu>>,
+    wallet_spend: Arc<Mutex<GatewayWalletSpendState>>,
     access_control: Arc<GatewayAccessControl>,
+    access_token: Option<GatewayTokenAttribution>,
+}
+
+impl GatewaySpendReservationInner {
+    fn settle(&self, delta_au: MoneyAu, terminal: bool) -> Result<(), ApiError> {
+        let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
+        let Some(current_remaining) = *remaining else {
+            return Ok(());
+        };
+        if delta_au > current_remaining {
+            return Err(ApiError::payment_required(
+                "signed settlement exceeds the reserved session maximum",
+                Some("model"),
+            ));
+        }
+        self.access_control
+            .settle_reservation(&self.access_token, &self.id, delta_au, terminal)?;
+        let next_remaining = current_remaining.saturating_sub(delta_au);
+        let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
+        wallet.balance_au = wallet.balance_au.saturating_sub(delta_au);
+        if terminal {
+            wallet.reservations.remove(&self.id);
+            *remaining = None;
+        } else {
+            wallet.reservations.insert(self.id.clone(), next_remaining);
+            *remaining = Some(next_remaining);
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
+        if remaining.take().is_none() {
+            return;
+        }
+        self.access_control
+            .release_reservation(&self.access_token, &self.id);
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .remove(&self.id);
+    }
+}
+
+impl Drop for GatewaySpendReservationInner {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatewaySpendReservation(Arc<GatewaySpendReservationInner>);
+
+impl GatewaySpendReservation {
+    fn settle(&self, delta_au: MoneyAu, terminal: bool) -> Result<(), ApiError> {
+        self.0.settle(delta_au, terminal)
+    }
+
+    fn release(&self) {
+        self.0.release();
+    }
 }
 
 impl GatewayReceiptRecorder {
@@ -257,28 +336,25 @@ impl GatewayReceiptRecorder {
                 None,
             ));
         }
-        let spend_delta = receipt.access_token.as_ref().and_then(|access_token| {
-            let session_id = receipt.receipt.body.session_id.as_str();
-            let cumulative = receipt.receipt.body.au_owed_cum;
-            let previous = receipts
-                .iter()
-                .filter(|existing| {
-                    existing.access_token.as_ref() == Some(access_token)
-                        && existing.receipt.body.session_id == session_id
-                })
-                .map(|existing| existing.receipt.body.au_owed_cum)
-                .max()
-                .unwrap_or(0);
-            cumulative
-                .checked_sub(previous)
-                .filter(|delta| *delta > 0)
-                .map(|delta| (access_token.clone(), delta))
-        });
-        if let Some((access_token, delta)) = spend_delta {
-            self.access_control.record_spend(&access_token, delta)?;
-        }
+        let billing_id = receipt.receipt.body.billing_id.as_str();
+        let cumulative = receipt.receipt.body.au_owed_cum;
+        let previous = receipts
+            .iter()
+            .filter(|existing| existing.receipt.body.billing_id == billing_id)
+            .map(|existing| existing.receipt.body.au_owed_cum)
+            .max()
+            .unwrap_or(0);
+        let spend_delta = cumulative.checked_sub(previous).ok_or_else(|| {
+            ApiError::conflict("logical billing cumulative amount regressed", None)
+        })?;
+        self.spend_reservation
+            .settle(spend_delta, receipt.receipt.body.final_receipt)?;
         receipts.push(receipt);
         Ok(())
+    }
+
+    fn release_reservation(&self) {
+        self.spend_reservation.release();
     }
 }
 
@@ -1050,6 +1126,7 @@ pub struct GatewayAccessControl {
     store_path: Option<PathBuf>,
     store: Arc<Mutex<GatewayTokenStore>>,
     rate_windows: Arc<Mutex<BTreeMap<String, GatewayTokenRateWindow>>>,
+    reservations: Arc<Mutex<BTreeMap<(String, String), MoneyAu>>>,
 }
 
 impl GatewayAccessControl {
@@ -1063,6 +1140,7 @@ impl GatewayAccessControl {
             store_path,
             store: Arc::new(Mutex::new(store.normalized())),
             rate_windows: Arc::new(Mutex::new(BTreeMap::new())),
+            reservations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1152,9 +1230,10 @@ impl GatewayAccessControl {
         Ok(Some(attribution))
     }
 
-    fn ensure_budget_allows(
+    fn reserve_budget(
         &self,
         attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
         max_spend_au: MoneyAu,
     ) -> Result<(), ApiError> {
         let Some(attribution) = attribution else {
@@ -1168,38 +1247,101 @@ impl GatewayAccessControl {
             .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
             .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
         token.reset_budget_window_if_needed(now);
+        let key = (attribution.token_id.clone(), reservation_id.to_owned());
+        let mut reservations = self.reservations.lock_recover("gateway token reservations");
+        if reservations.contains_key(&key) {
+            return Err(ApiError::conflict(
+                "session spend reservation already exists",
+                Some("model"),
+            ));
+        }
+        let reserved_au = reservations
+            .iter()
+            .filter(|((token_id, _), _)| token_id == &attribution.token_id)
+            .map(|(_, amount)| *amount)
+            .fold(0_u128, MoneyAu::saturating_add);
         if token.budget_au.is_some_and(|budget_au| {
-            token.effective_spent_au().saturating_add(max_spend_au) > budget_au
+            token
+                .effective_spent_au()
+                .saturating_add(reserved_au)
+                .saturating_add(max_spend_au)
+                > budget_au
         }) {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
                 Some("Authorization"),
             ));
         }
-        self.persist_store(&store)
+        self.persist_store(&store)?;
+        reservations.insert(key, max_spend_au);
+        Ok(())
     }
 
-    fn record_spend(
+    fn settle_reservation(
         &self,
-        attribution: &GatewayTokenAttribution,
+        attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
         spend_au_delta: MoneyAu,
+        terminal: bool,
     ) -> Result<(), ApiError> {
-        if spend_au_delta == 0 {
-            return Ok(());
-        }
-        let now = now_secs();
-        let mut store = self.store.lock_recover("gateway token store");
-        let Some(token) = store
-            .tokens
-            .iter_mut()
-            .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
-        else {
+        let Some(attribution) = attribution else {
             return Ok(());
         };
-        token.reset_budget_window_if_needed(now);
-        token.spent_total_au = token.spent_total_au.saturating_add(spend_au_delta);
-        token.spent_period_au = token.spent_period_au.saturating_add(spend_au_delta);
-        self.persist_store(&store)
+        let now = now_secs();
+        let mut store = self.store.lock_recover("gateway token store");
+        let Some(token_index) = store.tokens.iter().position(|token| {
+            token.name == attribution.name && token.token_id == attribution.token_id
+        }) else {
+            return Err(ApiError::unauthorized(
+                "reserved bearer token no longer exists",
+                Some("Authorization"),
+            ));
+        };
+        let key = (attribution.token_id.clone(), reservation_id.to_owned());
+        let mut reservations = self.reservations.lock_recover("gateway token reservations");
+        let remaining = reservations.get(&key).copied().ok_or_else(|| {
+            ApiError::conflict(
+                "session token reservation is missing",
+                Some("Authorization"),
+            )
+        })?;
+        if spend_au_delta > remaining {
+            return Err(ApiError::payment_required(
+                "signed settlement exceeds bearer token reservation",
+                Some("Authorization"),
+            ));
+        }
+        let previous_token = store.tokens[token_index].clone();
+        store.tokens[token_index].reset_budget_window_if_needed(now);
+        store.tokens[token_index].spent_total_au = store.tokens[token_index]
+            .spent_total_au
+            .saturating_add(spend_au_delta);
+        store.tokens[token_index].spent_period_au = store.tokens[token_index]
+            .spent_period_au
+            .saturating_add(spend_au_delta);
+        if let Err(error) = self.persist_store(&store) {
+            store.tokens[token_index] = previous_token;
+            return Err(error);
+        }
+        if terminal {
+            reservations.remove(&key);
+        } else {
+            reservations.insert(key, remaining.saturating_sub(spend_au_delta));
+        }
+        Ok(())
+    }
+
+    fn release_reservation(
+        &self,
+        attribution: &Option<GatewayTokenAttribution>,
+        reservation_id: &str,
+    ) {
+        let Some(attribution) = attribution else {
+            return;
+        };
+        self.reservations
+            .lock_recover("gateway token reservations")
+            .remove(&(attribution.token_id.clone(), reservation_id.to_owned()));
     }
 
     fn summary(&self) -> Value {
@@ -2676,7 +2818,10 @@ impl GatewayState {
             ))),
             retention_limits,
             receipt_config,
-            ledger_balance_au: Arc::new(Mutex::new(ledger_balance_au)),
+            wallet_spend: Arc::new(Mutex::new(GatewayWalletSpendState {
+                balance_au: ledger_balance_au,
+                reservations: BTreeMap::new(),
+            })),
             payment_directory: Arc::new(Mutex::new(None)),
             session_backend: Arc::new(NoProviderSessionBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
@@ -2740,7 +2885,9 @@ impl GatewayState {
 
     pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
         self.receipt_config.balance_au = balance_au;
-        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au = balance_au;
         self
     }
 
@@ -2752,14 +2899,66 @@ impl GatewayState {
     }
 
     pub fn update_ledger_payment_state(&self, balance_au: MoneyAu, payment_directory: Value) {
-        *self.ledger_balance_au.lock_recover("gateway balance store") = balance_au;
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au = balance_au;
         *self
             .payment_directory
             .lock_recover("gateway payment directory") = Some(payment_directory);
     }
 
     fn ledger_balance_au(&self) -> MoneyAu {
-        *self.ledger_balance_au.lock_recover("gateway balance store")
+        self.wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au
+    }
+
+    fn reserve_session_spend(
+        &self,
+        reservation_id: &str,
+        max_spend_au: MoneyAu,
+        access_token: &Option<GatewayTokenAttribution>,
+    ) -> Result<GatewaySpendReservation, ApiError> {
+        self.access_control
+            .reserve_budget(access_token, reservation_id, max_spend_au)?;
+        let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
+        let reserved_au = wallet
+            .reservations
+            .values()
+            .copied()
+            .fold(0_u128, MoneyAu::saturating_add);
+        if reserved_au.saturating_add(max_spend_au) > wallet.balance_au {
+            drop(wallet);
+            self.access_control
+                .release_reservation(access_token, reservation_id);
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        if wallet
+            .reservations
+            .insert(reservation_id.to_owned(), max_spend_au)
+            .is_some()
+        {
+            drop(wallet);
+            self.access_control
+                .release_reservation(access_token, reservation_id);
+            return Err(ApiError::conflict(
+                "session spend reservation already exists",
+                Some("model"),
+            ));
+        }
+        drop(wallet);
+        Ok(GatewaySpendReservation(Arc::new(
+            GatewaySpendReservationInner {
+                id: reservation_id.to_owned(),
+                remaining_au: Mutex::new(Some(max_spend_au)),
+                wallet_spend: self.wallet_spend.clone(),
+                access_control: self.access_control.clone(),
+                access_token: access_token.clone(),
+            },
+        )))
     }
 
     fn payment_directory(&self) -> Option<Value> {
@@ -3035,14 +3234,6 @@ impl GatewayState {
             .len()
     }
 
-    fn record_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
-        GatewayReceiptRecorder {
-            receipts: self.receipts.clone(),
-            access_control: self.access_control.clone(),
-        }
-        .record(receipt)
-    }
-
     fn record_probe(&self, probe: StoredProbeEvent) {
         self.probes.lock_recover("probe store").push(probe);
     }
@@ -3216,8 +3407,8 @@ fn gateway_request_body_limit(state: &GatewayState) -> usize {
         .max()
         .unwrap_or(0);
     let context_limit = usize::try_from(max_ctx)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
         .max(DEFAULT_GATEWAY_REQUEST_BODY_BYTES);
     let decoded_media_bytes = state
         .media_limits
@@ -9781,6 +9972,35 @@ struct ResponseMayhemMeta<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct GatewayBillingContext {
+    billing_id: String,
+    billing_attempt: u32,
+    prior_usage: ReceiptUsage,
+    prior_au_owed_cum: MoneyAu,
+}
+
+impl GatewayBillingContext {
+    fn initial(billing_id: String) -> Self {
+        Self {
+            billing_id,
+            billing_attempt: 0,
+            prior_usage: ReceiptUsage::default(),
+            prior_au_owed_cum: 0,
+        }
+    }
+
+    fn after_attempt(&self, receipt: Option<&ReceiptBody>) -> Self {
+        let mut next = self.clone();
+        next.billing_attempt = next.billing_attempt.saturating_add(1);
+        if let Some(receipt) = receipt {
+            next.prior_usage = receipt.usage.clone();
+            next.prior_au_owed_cum = receipt.au_owed_cum;
+        }
+        next
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
@@ -9793,6 +10013,7 @@ struct GatewayRequestOptions {
     access_token: Option<GatewayTokenAttribution>,
     client_cancellation: Option<GatewayRequestCancellation>,
     job: Option<GatewayJobHandle>,
+    billing: Option<GatewayBillingContext>,
 }
 
 impl Default for GatewayRequestOptions {
@@ -9809,6 +10030,7 @@ impl Default for GatewayRequestOptions {
             access_token: None,
             client_cancellation: None,
             job: None,
+            billing: None,
         }
     }
 }
@@ -10781,6 +11003,7 @@ impl GatewayRequestOptions {
             access_token: None,
             client_cancellation: None,
             job: None,
+            billing: None,
         })
     }
 }
@@ -13173,8 +13396,8 @@ fn direct_session_request_byte_limit_for_len(
     configured: Option<usize>,
 ) -> usize {
     let derived = usize::try_from(served_ctx)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN)
         .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES)
         .max(request_body_bytes);
     configured.unwrap_or(derived)
@@ -13456,6 +13679,21 @@ fn direct_session_throughput_floor_error(session_id: &str, tok_s: f64, min_tok_s
     )
 }
 
+fn visible_tool_calls(tool_calls: &[ToolCallOutput]) -> Vec<VisibleToolCall> {
+    tool_calls
+        .iter()
+        .map(|call| VisibleToolCall {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .collect()
+}
+
+fn visible_output_unit_count(content: &str, tool_calls: &[ToolCallOutput]) -> u64 {
+    visible_output_units(content, &visible_tool_calls(tool_calls))
+}
+
 fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
     if token_ids.is_empty() {
         rough_tokens(content)
@@ -13557,8 +13795,8 @@ fn direct_session_chat_output_byte_limit(
         .min(available_tokens)
         .max(1);
     let derived = usize::try_from(output_tokens)
-        .unwrap_or(usize::MAX / DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET)
-        .saturating_mul(DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET);
+        .unwrap_or(usize::MAX / DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN)
+        .saturating_mul(DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN);
     configured_optional_positive_usize("MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES").unwrap_or(derived)
 }
 
@@ -14077,7 +14315,7 @@ async fn collect_direct_session_output(
         }
     }
 
-    let mut usage = observed_chat_usage(request, &content, &token_ids);
+    let mut usage = observed_chat_usage(request, &content, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {session_id} ended without a final receipt"
@@ -14138,7 +14376,7 @@ async fn collect_direct_session_output(
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(&content, &token_ids),
                     first_delta_at_millis,
                     completed_at_millis,
                 ),
@@ -14169,9 +14407,13 @@ async fn collect_direct_session_output(
     })
 }
 
-fn observed_chat_usage(request: &ChatCompletionRequest, content: &str, token_ids: &[i32]) -> Usage {
+fn observed_chat_usage(
+    request: &ChatCompletionRequest,
+    content: &str,
+    tool_calls: &[ToolCallOutput],
+) -> Usage {
     let prompt_tokens = rough_tokens(&chat_prompt_text(request));
-    let completion_tokens = streamed_output_token_count(content, token_ids);
+    let completion_tokens = visible_output_unit_count(content, tool_calls);
     Usage {
         prompt_tokens,
         completion_tokens,
@@ -14888,7 +15130,7 @@ fn interrupted_direct_session_partial(
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
         tok_s: generated_tokens_per_second(
-            usage.completion_tokens,
+            streamed_output_token_count(content, token_ids),
             first_delta_at_millis,
             now_millis,
         ),
@@ -14963,11 +15205,11 @@ fn client_disconnect_direct_session_error(
     let Some(first_delta_at_millis) = watchdog.first_delta_at_millis else {
         return err;
     };
-    let usage = observed_chat_usage(request, content, token_ids);
+    let usage = observed_chat_usage(request, content, &tool_calls);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
         tok_s: generated_tokens_per_second(
-            usage.completion_tokens,
+            streamed_output_token_count(content, token_ids),
             first_delta_at_millis,
             now_millis,
         ),
@@ -14998,14 +15240,14 @@ fn direct_session_checkpoint_partial(
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
 ) -> GatewaySessionPartial {
-    let usage = observed_chat_usage(request, content, token_ids);
+    let usage = observed_chat_usage(request, content, &tool_calls);
     let quality =
         watchdog
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(content, token_ids),
                     first_delta_at_millis,
                     now_millis,
                 ),
@@ -15079,18 +15321,26 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     now_millis: u64,
     model: &GatewayModel,
 ) -> Result<Option<Value>, GatewaySessionError> {
-    let observed_usage = observed_chat_usage(request, content, token_ids);
+    let observed = observed_chat_usage(request, content, &tool_calls);
+    let observed_usage = expected_chat_usage_for_invocation(
+        request,
+        None,
+        observed.prompt_tokens,
+        observed.completion_tokens,
+        &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
+    )?;
     let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
     let claimed_output_tokens = receipt.body.usage.output_tokens();
-    if claimed_prompt_tokens != observed_usage.prompt_tokens {
+    if claimed_prompt_tokens != observed_usage.prompt_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt prompt usage mismatch",
         ));
     }
-    if claimed_output_tokens > observed_usage.completion_tokens {
+    if claimed_output_tokens > observed_usage.output_tokens() {
         return Ok(None);
     }
-    if claimed_output_tokens < observed_usage.completion_tokens {
+    if claimed_output_tokens < observed_usage.output_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt trails gateway-observed output",
         ));
@@ -15492,12 +15742,13 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let usage = expected_chat_usage_for_provider(
+    let usage = expected_chat_usage_for_invocation(
         request,
         Some(&provider_receipt.body.usage),
         output.usage.prompt_tokens,
         output.usage.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
     )?;
     let expected = ExpectedProviderReceipt {
         provider,
@@ -15507,7 +15758,7 @@ fn direct_session_receipt_ack(
         prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         usage,
     };
-    if expected.au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+    if locked_increment_exceeds_voucher(invocation, expected.au_owed_cum) {
         return Err(GatewaySessionError::new(
             "provider receipt exceeds signed spend voucher",
         ));
@@ -15682,7 +15933,7 @@ async fn record_cancelled_direct_session_receipt(
         )
     })?;
     let au_owed_cum = calculate_locked_au_owed(invocation, &expected_usage);
-    if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+    if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
         return Err(GatewaySessionError::new(
             "cancelled provider receipt exceeds signed spend voucher",
         ));
@@ -15822,15 +16073,16 @@ fn direct_session_partial_receipt_ack(
         ));
     }
     let body = &partial.provider_receipt.body;
-    let usage = expected_chat_usage_for_provider(
+    let usage = expected_chat_usage_for_invocation(
         request,
         Some(&partial.provider_receipt.body.usage),
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
+        invocation,
     )?;
     let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-    if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+    if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
         return Err(GatewaySessionError::new(
             "provider partial receipt exceeds signed spend voucher",
         ));
@@ -16018,6 +16270,46 @@ fn expected_chat_usage_for_provider(
     ]))
 }
 
+fn expected_chat_usage_for_invocation(
+    request: &ChatCompletionRequest,
+    provider_usage: Option<&ReceiptUsage>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
+    locked_rate_map: &[RateMapEntry],
+    invocation: &GatewaySessionInvocation,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let prior_usage = &invocation.spend_voucher.body.billing_prior_usage;
+    let prior_au_owed_cum = invocation.spend_voucher.body.billing_prior_au_owed_cum;
+    if prior_au_owed_cum == 0 && prior_usage != &ReceiptUsage::default() {
+        return Err(GatewaySessionError::new(
+            "billing prior usage requires a nonzero prior cumulative amount",
+        ));
+    }
+    if let Some(provider_usage) = provider_usage {
+        if !provider_usage.is_monotonic_from(prior_usage) {
+            return Err(GatewaySessionError::new(
+                "provider receipt usage regressed across logical billing attempts",
+            ));
+        }
+    }
+    let local_provider_usage = provider_usage
+        .filter(|_| prior_au_owed_cum == 0)
+        .map(|usage| ReceiptUsage::saturating_delta(prior_usage, usage));
+    let local_usage = expected_chat_usage_for_provider(
+        request,
+        local_provider_usage.as_ref(),
+        observed_prompt_tokens,
+        observed_completion_tokens,
+        locked_rate_map,
+    )?;
+    let increment = if prior_au_owed_cum == 0 {
+        local_usage
+    } else {
+        ReceiptUsage::from_units([(USAGE_OUTPUT_TOKEN, local_usage.output_tokens())])
+    };
+    Ok(prior_usage.saturating_add(&increment))
+}
+
 fn validate_provider_receipt(
     model: &GatewayModel,
     invocation: &GatewaySessionInvocation,
@@ -16035,6 +16327,23 @@ fn validate_provider_receipt(
         (
             body.session_id == invocation.session_id,
             "provider receipt session_id mismatch",
+        ),
+        (
+            body.billing_id == invocation.spend_voucher.body.billing_id,
+            "provider receipt billing_id mismatch",
+        ),
+        (
+            body.billing_attempt == invocation.spend_voucher.body.billing_attempt,
+            "provider receipt billing_attempt mismatch",
+        ),
+        (
+            body.billing_prior_usage == invocation.spend_voucher.body.billing_prior_usage,
+            "provider receipt billing prior usage mismatch",
+        ),
+        (
+            body.billing_prior_au_owed_cum
+                == invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            "provider receipt billing prior amount mismatch",
         ),
         (body.seq == expected.seq, "provider receipt seq mismatch"),
         (
@@ -16335,6 +16644,14 @@ async fn run_embedding_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &embedding_prompt_text(inputs),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -16346,7 +16663,7 @@ async fn run_embedding_with_route_retry(
             }
         };
         let invocation =
-            state.prepare_embedding_invocation_for_route(model, inputs, route, &options)?;
+            state.prepare_embedding_invocation_for_route(model, inputs, route, &attempt_options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -16372,6 +16689,8 @@ async fn run_embedding_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -16447,6 +16766,14 @@ async fn run_image_generation_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &image_generation_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -16457,8 +16784,12 @@ async fn run_image_generation_with_route_retry(
                 continue;
             }
         };
-        let invocation =
-            state.prepare_image_generation_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_image_generation_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -16488,6 +16819,8 @@ async fn run_image_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -16559,6 +16892,14 @@ async fn run_audio_speech_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &audio_speech_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -16569,8 +16910,12 @@ async fn run_audio_speech_with_route_retry(
                 continue;
             }
         };
-        let invocation =
-            state.prepare_audio_speech_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_audio_speech_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -16600,6 +16945,8 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -16675,6 +17022,14 @@ async fn run_audio_transcription_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &audio_transcription_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -16685,8 +17040,12 @@ async fn run_audio_transcription_with_route_retry(
                 continue;
             }
         };
-        let invocation = state
-            .prepare_audio_transcription_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_audio_transcription_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -16716,6 +17075,8 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -16799,6 +17160,14 @@ async fn run_artifact_generation_with_route_retry(
 
     let attempt_count =
         preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &artifact_generation_prompt_hash(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
@@ -16809,8 +17178,12 @@ async fn run_artifact_generation_with_route_retry(
                 continue;
             }
         };
-        let invocation = state
-            .prepare_artifact_generation_invocation_for_route(model, request, route, &options)?;
+        let invocation = state.prepare_artifact_generation_invocation_for_route(
+            model,
+            request,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -16839,6 +17212,8 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -18295,7 +18670,28 @@ async fn recover_live_direct_chat_after_retryable(
         "redispatch",
     )
     .await;
+    session.invocation.receipt_recorder.release_reservation();
 
+    let current_billing = GatewayBillingContext {
+        billing_id: session.invocation.spend_voucher.body.billing_id.clone(),
+        billing_attempt: session.invocation.spend_voucher.body.billing_attempt,
+        prior_usage: session
+            .invocation
+            .spend_voucher
+            .body
+            .billing_prior_usage
+            .clone(),
+        prior_au_owed_cum: session
+            .invocation
+            .spend_voucher
+            .body
+            .billing_prior_au_owed_cum,
+    };
+    let next_billing = current_billing.after_attempt(
+        partial
+            .as_ref()
+            .map(|partial| &partial.provider_receipt.body),
+    );
     let partials = partial.into_iter().collect::<Vec<_>>();
     let retry_request = if partials.is_empty() {
         session.request.clone()
@@ -18303,6 +18699,7 @@ async fn recover_live_direct_chat_after_retryable(
         redispatch_request_with_partials(&session.request, &partials)
     };
     let mut retry_options = session.options.clone();
+    retry_options.billing = Some(next_billing);
     if !partials.is_empty() {
         retry_options.min_ctx = Some(exact_conversation_floor_after_partials(
             &retry_request,
@@ -18772,7 +19169,7 @@ async fn run_live_direct_chat_sse_inner(
         }
     }
 
-    let mut usage = observed_chat_usage(&session.request, &content, &token_ids);
+    let mut usage = observed_chat_usage(&session.request, &content, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {} ended without a final receipt",
@@ -18834,7 +19231,7 @@ async fn run_live_direct_chat_sse_inner(
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
                 tok_s: generated_tokens_per_second(
-                    usage.completion_tokens,
+                    streamed_output_token_count(&content, &token_ids),
                     first_delta_at_millis,
                     completed_at_millis,
                 ),
@@ -19224,6 +19621,13 @@ async fn run_chat_with_route_retry(
     }
     let mut attempt_request = request.clone();
     let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &chat_prompt_text(request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let hedge_probe =
         run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, &options)
             .await?;
@@ -19312,6 +19716,8 @@ async fn run_chat_with_route_retry(
                             ),
                         );
                         last_retryable_error = Some(message);
+                        billing = billing.after_attempt(None);
+                        attempt_options.billing = Some(billing.clone());
                         continue;
                     }
                 }
@@ -19343,6 +19749,10 @@ async fn run_chat_with_route_retry(
                 if let Some(refusal) = terminal_balance_refusal(&err) {
                     return Err(refusal);
                 }
+                let billed_receipt = err
+                    .partial
+                    .as_ref()
+                    .map(|partial| partial.provider_receipt.body.clone());
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -19360,6 +19770,8 @@ async fn run_chat_with_route_retry(
                         options.min_ctx,
                     ));
                 }
+                billing = billing.after_attempt(billed_receipt.as_ref());
+                attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
@@ -24053,6 +24465,10 @@ impl GatewayState {
         let input_tokens = rough_tokens(&prompt_text);
         let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24083,22 +24499,20 @@ impl GatewayState {
             hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let served_ctx = self.served_ctx_for_route(model, route);
-        let max_spend_au = estimate_max_spend_au(price, request, served_ctx);
+        let max_spend_au = estimate_max_spend_au(price, request, served_ctx, &billing);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24141,7 +24555,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24162,6 +24576,10 @@ impl GatewayState {
             embedding_failover_work_units(inputs),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24193,20 +24611,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24249,7 +24665,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24270,6 +24686,10 @@ impl GatewayState {
             image_generation_failover_work_units(request)?,
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24301,20 +24721,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24357,7 +24775,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24378,6 +24796,10 @@ impl GatewayState {
             audio_speech_failover_work_units(request),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24409,20 +24831,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24465,7 +24885,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24486,6 +24906,10 @@ impl GatewayState {
             audio_transcription_failover_work_units(request),
         );
         let session_id = session_id_for(&model.id, &prompt_text);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24517,20 +24941,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24573,7 +24995,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24597,6 +25019,10 @@ impl GatewayState {
         .max(1);
         let failover = self.failover_thresholds_for_model(model, options, work_units);
         let session_id = session_id_for(&model.id, &prompt_hash);
+        let billing = options
+            .billing
+            .clone()
+            .unwrap_or_else(|| GatewayBillingContext::initial(session_id.clone()));
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
@@ -24628,20 +25054,18 @@ impl GatewayState {
         });
         let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
-        if max_spend_au > self.ledger_balance_au() {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-        self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_au)?;
+        let spend_reservation =
+            self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: billing.billing_id,
+            billing_attempt: billing.billing_attempt,
+            billing_prior_usage: billing.prior_usage,
+            billing_prior_au_owed_cum: billing.prior_au_owed_cum,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -24684,7 +25108,7 @@ impl GatewayState {
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: self.receipts.clone(),
-                access_control: self.access_control.clone(),
+                spend_reservation,
             },
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
@@ -24759,16 +25183,17 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let receipt = if let Some(provider_receipt) = provider_receipt {
             let seq = provider_receipt.body.seq;
-            let usage = expected_chat_usage_for_provider(
+            let usage = expected_chat_usage_for_invocation(
                 request,
                 Some(&provider_receipt.body.usage),
                 output.usage.prompt_tokens,
                 output.usage.completion_tokens,
                 &invocation.spend_voucher.body.locked_rate_map,
+                invocation,
             )
             .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+            if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -24788,14 +25213,17 @@ impl GatewayState {
                 },
             )?
         } else {
-            let usage = chat_receipt_usage(
+            let usage = expected_chat_usage_for_invocation(
                 request,
+                None,
                 output.usage.prompt_tokens,
                 output.usage.completion_tokens,
-                &self.media_limits,
-            );
+                &invocation.spend_voucher.body.locked_rate_map,
+                invocation,
+            )
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+            if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -24804,6 +25232,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -24847,7 +25279,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -24861,7 +25293,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -24901,6 +25333,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -24944,7 +25380,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -24958,7 +25394,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -24998,6 +25434,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -25041,7 +25481,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -25055,7 +25495,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -25094,6 +25534,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -25136,7 +25580,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -25162,12 +25606,17 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let body = &partial.provider_receipt.body;
-        let usage = ReceiptUsage::text(
+        let usage = expected_chat_usage_for_invocation(
+            request,
+            Some(&partial.provider_receipt.body.usage),
             partial.output.usage.prompt_tokens,
             partial.output.usage.completion_tokens,
-        );
+            &invocation.spend_voucher.body.locked_rate_map,
+            invocation,
+        )
+        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "provider partial receipt exceeds signed spend voucher",
                 Some("model"),
@@ -25198,7 +25647,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -25212,7 +25661,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -25252,6 +25701,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -25295,7 +25748,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -25309,7 +25762,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
-        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
+        if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -25349,6 +25802,10 @@ impl GatewayState {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -25392,7 +25849,7 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone())?;
+        invocation.receipt_recorder.record(stored.clone())?;
         Ok(stored)
     }
 
@@ -26916,12 +27373,30 @@ fn calculate_locked_au_owed(
     invocation: &GatewaySessionInvocation,
     usage: &ReceiptUsage,
 ) -> MoneyAu {
-    priced_usage_au(
+    logical_cumulative_priced_usage_au(
         &invocation.spend_voucher.body.locked_rate_map,
         invocation.spend_voucher.body.locked_per_req_au,
         invocation.spend_voucher.body.locked_min_session_au,
+        &invocation.spend_voucher.body.billing_prior_usage,
+        invocation.spend_voucher.body.billing_prior_au_owed_cum,
         usage,
     )
+    .unwrap_or(MoneyAu::MAX)
+}
+
+fn locked_incremental_au_owed(
+    invocation: &GatewaySessionInvocation,
+    cumulative_au_owed: MoneyAu,
+) -> Option<MoneyAu> {
+    cumulative_au_owed.checked_sub(invocation.spend_voucher.body.billing_prior_au_owed_cum)
+}
+
+fn locked_increment_exceeds_voucher(
+    invocation: &GatewaySessionInvocation,
+    cumulative_au_owed: MoneyAu,
+) -> bool {
+    locked_incremental_au_owed(invocation, cumulative_au_owed)
+        .is_none_or(|increment| increment > invocation.spend_voucher.body.max_spend_au)
 }
 
 fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
@@ -26935,6 +27410,24 @@ fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
 
 fn session_id_for(model_id: &str, prompt_text: &str) -> String {
     blake3_hex(format!("{model_id}:{prompt_text}:{}", now_millis()).as_bytes())
+}
+
+fn logical_billing_id_for(model_id: &str, prompt_text: &str) -> String {
+    let mut random = [0_u8; 32];
+    if getrandom::fill(&mut random).is_ok() {
+        return hex_encode(&random);
+    }
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    blake3_hex(
+        format!(
+            "mayhem-logical-billing:{model_id}:{prompt_text}:{now_nanos}:{}",
+            random.as_ptr() as usize
+        )
+        .as_bytes(),
+    )
 }
 
 fn enclave_id_for_model(model_id: &str) -> String {
@@ -27690,6 +28183,7 @@ fn estimate_max_spend_au(
     price: &PriceRefAu,
     request: &ChatCompletionRequest,
     served_ctx: u32,
+    billing: &GatewayBillingContext,
 ) -> MoneyAu {
     let served_ctx = u64::from(served_ctx).max(1);
     let max_output_tokens = request
@@ -27697,8 +28191,30 @@ fn estimate_max_spend_au(
         .max(request.max_completion_tokens)
         .unwrap_or(1024)
         .max(1);
-    let usage = ReceiptUsage::text(served_ctx, u64::from(max_output_tokens).min(served_ctx));
-    calculate_au_owed(price, &usage).max(1_000)
+    let max_visible_output_units = u64::from(max_output_tokens)
+        .min(served_ctx)
+        .saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN);
+    let usage = if billing.prior_au_owed_cum == 0 {
+        ReceiptUsage::text(served_ctx, max_visible_output_units)
+    } else {
+        billing
+            .prior_usage
+            .saturating_add(&ReceiptUsage::from_units([(
+                USAGE_OUTPUT_TOKEN,
+                max_visible_output_units,
+            )]))
+    };
+    logical_cumulative_priced_usage_au(
+        &price.rate_map,
+        price.per_req_au,
+        price.min_session_au,
+        &billing.prior_usage,
+        billing.prior_au_owed_cum,
+        &usage,
+    )
+    .and_then(|cumulative| cumulative.checked_sub(billing.prior_au_owed_cum))
+    .unwrap_or(MoneyAu::MAX)
+    .max(1_000)
 }
 
 fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
@@ -28592,7 +29108,10 @@ mod tests {
             .expect("multimodal request receives a context-bounded voucher");
         let full_context_bound = calculate_au_owed(
             &model.mayhem.price_ref_au,
-            &ReceiptUsage::text(u64::from(model.mayhem.caps.ctx), 2_048),
+            &ReceiptUsage::text(
+                u64::from(model.mayhem.caps.ctx),
+                2_048 * MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+            ),
         )
         .max(1_000);
         let provider_media_receipt =
@@ -29050,6 +29569,16 @@ mod tests {
             .with_access_control(GatewayAccessControl::new(false, store, None));
         let mut invocation = test_invocation();
         invocation.access_token = Some(access_token);
+        invocation.receipt_recorder = GatewayReceiptRecorder {
+            receipts: state.receipts.clone(),
+            spend_reservation: state
+                .reserve_session_spend(
+                    &invocation.session_id,
+                    invocation.spend_voucher.body.max_spend_au,
+                    &invocation.access_token,
+                )
+                .expect("test spend reservation"),
+        };
 
         let stored = state
             .meter_chat_session(&model, &request, &output, &invocation, None)
@@ -29062,8 +29591,9 @@ mod tests {
             .unwrap();
         assert_eq!(spent, stored.receipt.body.au_owed_cum);
 
-        state
-            .record_receipt(stored.clone())
+        invocation
+            .receipt_recorder
+            .record(stored.clone())
             .expect("duplicate cumulative receipt is accepted");
         assert_eq!(state.receipt_count(), 1);
         let access = state.access_summary();
@@ -29079,11 +29609,160 @@ mod tests {
         let mut conflicting = stored;
         conflicting.receipt.body.au_owed_cum =
             conflicting.receipt.body.au_owed_cum.saturating_add(1);
-        let error = state
-            .record_receipt(conflicting)
+        let error = invocation
+            .receipt_recorder
+            .record(conflicting)
             .expect_err("same receipt sequence cannot be replaced");
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(state.receipt_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_wallet_and_bearer_reservations_cannot_overspend_and_release_exactly() {
+        let wallet_state =
+            GatewayState::from_models(vec![test_model()]).with_receipt_balance_au(100);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let state = wallet_state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.reserve_session_spend(&format!("wallet-{index}"), 70, &None)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut admitted = Vec::new();
+        let mut refused = Vec::new();
+        for handle in handles {
+            match handle.join().expect("wallet reservation thread") {
+                Ok(reservation) => admitted.push(reservation),
+                Err(error) => refused.push(error),
+            }
+        }
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].status, StatusCode::PAYMENT_REQUIRED);
+        {
+            let wallet = wallet_state
+                .wallet_spend
+                .lock_recover("gateway wallet spend state");
+            assert_eq!(wallet.balance_au, 100);
+            assert_eq!(wallet.reservations.values().copied().sum::<MoneyAu>(), 70);
+        }
+        admitted
+            .pop()
+            .expect("one wallet reservation")
+            .settle(30, true)
+            .expect("terminal wallet settlement");
+        assert_eq!(wallet_state.ledger_balance_au(), 70);
+        assert!(wallet_state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
+        let exact_remainder = wallet_state
+            .reserve_session_spend("wallet-exact", 70, &None)
+            .expect("the exact released remainder is available");
+        assert_eq!(
+            wallet_state
+                .reserve_session_spend("wallet-over", 71, &None)
+                .expect_err("one atto above the remaining wallet balance must fail")
+                .status,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        exact_remainder.release();
+        let full_balance = wallet_state
+            .reserve_session_spend("wallet-after-redispatch", 70, &None)
+            .expect("explicit redispatch release makes the full remainder available");
+        drop(full_balance);
+
+        let attribution = GatewayTokenAttribution {
+            name: "atomic-agent".to_owned(),
+            token_id: "tok_atomic".to_owned(),
+        };
+        let access = GatewayAccessControl::new(
+            false,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![GatewayTokenRecord {
+                    name: attribution.name.clone(),
+                    token_hash: gateway_token_hash("sk-mayhem-atomic"),
+                    token_id: attribution.token_id.clone(),
+                    created_at: 1,
+                    expires_at: None,
+                    budget_au: Some(100),
+                    budget_period: Some(GatewayTokenBudgetPeriod::Total),
+                    spent_total_au: 0,
+                    spent_period_au: 0,
+                    period_started_at: Some(1),
+                    max_rate_per_minute: None,
+                    models: Vec::new(),
+                    last_used_at: None,
+                    revoked_at: None,
+                }],
+            },
+            None,
+        );
+        let token_state = GatewayState::from_models(vec![test_model()])
+            .with_receipt_balance_au(1_000)
+            .with_access_control(access);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let state = token_state.clone();
+                let barrier = barrier.clone();
+                let attribution = Some(attribution.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.reserve_session_spend(&format!("token-{index}"), 70, &attribution)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut admitted = Vec::new();
+        let mut refused = Vec::new();
+        for handle in handles {
+            match handle.join().expect("bearer reservation thread") {
+                Ok(reservation) => admitted.push(reservation),
+                Err(error) => refused.push(error),
+            }
+        }
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].status, StatusCode::PAYMENT_REQUIRED);
+        admitted
+            .pop()
+            .expect("one bearer reservation")
+            .settle(30, true)
+            .expect("terminal bearer settlement");
+        assert_eq!(
+            token_state.access_summary()["tokens"][0]["spent_total_au"],
+            "30"
+        );
+        let exact_remainder = token_state
+            .reserve_session_spend("token-exact", 70, &Some(attribution.clone()))
+            .expect("the exact released bearer remainder is available");
+        assert_eq!(
+            token_state
+                .reserve_session_spend("token-over", 71, &Some(attribution))
+                .expect_err("one atto above the remaining bearer budget must fail")
+                .status,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        exact_remainder.release();
+        let full_budget = token_state
+            .reserve_session_spend(
+                "token-after-redispatch",
+                70,
+                &Some(GatewayTokenAttribution {
+                    name: "atomic-agent".to_owned(),
+                    token_id: "tok_atomic".to_owned(),
+                }),
+            )
+            .expect("explicit redispatch release makes the full bearer budget available");
+        drop(full_budget);
     }
 
     #[test]
@@ -29576,7 +30255,7 @@ mod tests {
         assert_eq!(interrupted.token_ids, vec![1, 2, 3]);
         assert_eq!(
             interrupted.output.usage,
-            observed_chat_usage(&request, output.content.as_deref().unwrap(), &[1, 2, 3])
+            observed_chat_usage(&request, output.content.as_deref().unwrap(), &[])
         );
     }
 
@@ -29607,10 +30286,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_variable_only_disconnects_settle_one_quantum_once_per_session() {
         let model = test_model();
-        let recorder = GatewayReceiptRecorder {
-            receipts: Arc::new(Mutex::new(Vec::new())),
-            access_control: Arc::new(GatewayAccessControl::disabled()),
-        };
+        let receipts = Arc::new(Mutex::new(Vec::new()));
         let cancellation_usage = ReceiptUsage::from_units([(USAGE_STEP, 1)]);
         let rate_map = vec![RateMapEntry {
             unit: USAGE_STEP.to_owned(),
@@ -29623,6 +30299,10 @@ mod tests {
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
+                billing_id: invocation.spend_voucher.body.billing_id.clone(),
+                billing_attempt: invocation.spend_voucher.body.billing_attempt,
+                billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+                billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29655,7 +30335,11 @@ mod tests {
         first.spend_voucher.body.locked_rate_map = rate_map.clone();
         first.spend_voucher.body.locked_per_req_au = 0;
         first.spend_voucher.body.locked_min_session_au = 0;
-        first.receipt_recorder = recorder.clone();
+        first.receipt_recorder = test_receipt_recorder(
+            receipts.clone(),
+            &first.session_id,
+            first.spend_voucher.body.max_spend_au,
+        );
         let first_receipt = receipt_for(&first);
         record_cancelled_direct_session_receipt(
             &model,
@@ -29683,10 +30367,15 @@ mod tests {
         let mut second = test_invocation();
         second.session_id = "bb".repeat(32);
         second.spend_voucher.body.session_id = second.session_id.clone();
+        second.spend_voucher.body.billing_id = second.session_id.clone();
         second.spend_voucher.body.locked_rate_map = rate_map;
         second.spend_voucher.body.locked_per_req_au = 0;
         second.spend_voucher.body.locked_min_session_au = 0;
-        second.receipt_recorder = recorder.clone();
+        second.receipt_recorder = test_receipt_recorder(
+            receipts.clone(),
+            &second.session_id,
+            second.spend_voucher.body.max_spend_au,
+        );
         let second_receipt = receipt_for(&second);
         record_cancelled_direct_session_receipt(
             &model,
@@ -29700,7 +30389,7 @@ mod tests {
         .await
         .expect("second disconnect settles");
 
-        let receipts = recorder.receipts.lock_recover("receipt store");
+        let receipts = receipts.lock_recover("receipt store");
         assert_eq!(receipts.len(), 2);
         assert!(receipts
             .iter()
@@ -29798,6 +30487,30 @@ mod tests {
         );
     }
 
+    fn test_spend_reservation(id: String, max_spend_au: MoneyAu) -> GatewaySpendReservation {
+        GatewaySpendReservation(Arc::new(GatewaySpendReservationInner {
+            id: id.clone(),
+            remaining_au: Mutex::new(Some(max_spend_au)),
+            wallet_spend: Arc::new(Mutex::new(GatewayWalletSpendState {
+                balance_au: MoneyAu::MAX,
+                reservations: BTreeMap::from([(id, max_spend_au)]),
+            })),
+            access_control: Arc::new(GatewayAccessControl::disabled()),
+            access_token: None,
+        }))
+    }
+
+    fn test_receipt_recorder(
+        receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+        id: &str,
+        max_spend_au: MoneyAu,
+    ) -> GatewayReceiptRecorder {
+        GatewayReceiptRecorder {
+            receipts,
+            spend_reservation: test_spend_reservation(id.to_owned(), max_spend_au),
+        }
+    }
+
     fn test_invocation() -> GatewaySessionInvocation {
         let identity = test_identity();
         let session_id = "aa".repeat(32);
@@ -29817,6 +30530,10 @@ mod tests {
         };
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            billing_id: session_id.clone(),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: enclave_id.clone(),
             price_ver: 7,
@@ -29867,7 +30584,7 @@ mod tests {
             job: None,
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: Arc::new(Mutex::new(Vec::new())),
-                access_control: Arc::new(GatewayAccessControl::disabled()),
+                spend_reservation: test_spend_reservation("aa".repeat(32), 1_000),
             },
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
@@ -30547,15 +31264,17 @@ mod tests {
                     attempts.len()
                 };
                 if attempt == 1 {
+                    let completion_tokens = visible_output_unit_count("hello ", &[]);
+                    let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                     let output = ChatOutput {
                         content: Some("hello ".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
                         finish_reason: "interrupted".to_owned(),
                         usage: Usage {
-                            prompt_tokens: rough_tokens(&chat_prompt_text(request)),
-                            completion_tokens: 1,
-                            total_tokens: rough_tokens(&chat_prompt_text(request)) + 1,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens: prompt_tokens + completion_tokens,
                         },
                     };
                     let provider_receipt = test_provider_receipt_with_finality(
@@ -30583,15 +31302,17 @@ mod tests {
                     }),
                     "redispatch request should include the checkpointed assistant prefix"
                 );
+                let completion_tokens = visible_output_unit_count("world", &[]);
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let output = ChatOutput {
                     content: Some("world".to_owned()),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
-                        prompt_tokens: rough_tokens(&chat_prompt_text(request)),
-                        completion_tokens: 1,
-                        total_tokens: rough_tokens(&chat_prompt_text(request)) + 1,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
                     },
                 };
                 Ok(GatewaySessionResult {
@@ -30605,6 +31326,63 @@ mod tests {
                     quality: Some(GatewaySessionQuality {
                         ttft_ms: 30,
                         tok_s: Some(25.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PaddedTokenIdsToolBackend;
+
+    impl GatewaySessionBackend for PaddedTokenIdsToolBackend {
+        fn name(&self) -> &str {
+            "test-padded-token-ids-tools"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let tool_calls = vec![
+                    ToolCallOutput {
+                        id: "call_alpha".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: r#"{"path":"alpha.txt"}"#.to_owned(),
+                    },
+                    ToolCallOutput {
+                        id: "call_beta".to_owned(),
+                        name: "write_file".to_owned(),
+                        arguments: r#"{"path":"beta.txt","content":"done"}"#.to_owned(),
+                    },
+                ];
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                let completion_tokens = visible_output_unit_count("", &tool_calls);
+                let output = ChatOutput {
+                    content: None,
+                    tool_calls,
+                    artifacts: Vec::new(),
+                    finish_reason: "tool_calls".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                    },
+                };
+                Ok(GatewaySessionResult {
+                    output: output.clone(),
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: Some(test_provider_receipt(
+                        model, request, &output, invocation,
+                    )),
+                    token_ids: vec![7; 4_096],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(100.0),
                     }),
                 })
             })
@@ -31833,8 +32611,8 @@ mod tests {
             derivation: None,
             history: Vec::new(),
         });
-        let state =
-            test_gateway_state_from_models(vec![model.clone()]).with_receipt_balance_au(10_000);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_receipt_balance_au(MoneyAu::MAX);
 
         let selected = ordered_route_candidates_for_request_with_max_price_seed(
             &state,
@@ -32136,7 +32914,21 @@ mod tests {
 
     #[tokio::test]
     async fn route_retry_records_partial_receipt_and_redispatches_remaining_history() {
-        let model = test_routed_model(2);
+        let mut model = test_routed_model(2);
+        model.mayhem.price_ref_au.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 20,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 60,
+                granularity: 1,
+            },
+        ];
+        model.mayhem.price_ref_au.per_req_au = 500;
+        model.mayhem.price_ref_au.min_session_au = 700;
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let providers = Arc::new(Mutex::new(Vec::new()));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
@@ -32154,7 +32946,7 @@ mod tests {
                 .expect("redispatch should recover");
 
         assert_eq!(run.result.output.content.as_deref(), Some("hello world"));
-        assert_eq!(run.result.output.usage.completion_tokens, 2);
+        assert_eq!(run.result.output.usage.completion_tokens, 4);
         assert_eq!(run.result.token_ids, vec![11, 22]);
         assert_eq!(run.metering_output.content.as_deref(), Some("world"));
         assert!(run
@@ -32175,7 +32967,7 @@ mod tests {
         let partial_receipts = state.receipts();
         assert_eq!(partial_receipts.len(), 1);
         assert!(!partial_receipts[0].receipt.body.final_receipt);
-        assert_eq!(partial_receipts[0].receipt.body.usage.output_tokens(), 1);
+        assert_eq!(partial_receipts[0].receipt.body.usage.output_tokens(), 2);
 
         state
             .meter_chat_session(
@@ -32189,7 +32981,87 @@ mod tests {
         let receipts = state.receipts();
         assert_eq!(receipts.len(), 2);
         assert!(receipts[1].receipt.body.final_receipt);
-        assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 1);
+        assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 4);
+        let first = &receipts[0].receipt.body;
+        let second = &receipts[1].receipt.body;
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.billing_id, second.billing_id);
+        assert_eq!(first.billing_attempt, 0);
+        assert_eq!(second.billing_attempt, 1);
+        assert_eq!(first.billing_prior_usage, ReceiptUsage::default());
+        assert_eq!(first.billing_prior_au_owed_cum, 0);
+        assert_eq!(second.billing_prior_usage, first.usage);
+        assert_eq!(second.billing_prior_au_owed_cum, first.au_owed_cum);
+        assert_ne!(first.provider, second.provider);
+        assert_eq!(first.au_owed_cum, 700);
+        assert_eq!(second.au_owed_cum, 820);
+        assert_eq!(second.au_owed_cum - first.au_owed_cum, 2 * 60);
+    }
+
+    #[tokio::test]
+    async fn visible_output_billing_ignores_padded_token_ids_and_counts_every_tool_call() {
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(Arc::new(PaddedTokenIdsToolBackend));
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("tool-call request succeeds");
+        assert_eq!(run.result.token_ids.len(), 4_096);
+        assert_eq!(
+            streamed_output_token_count("", &run.result.token_ids),
+            4_096
+        );
+        assert_eq!(run.result.output.tool_calls.len(), 2);
+        let expected_units = visible_output_unit_count("", &run.result.output.tool_calls);
+        let first_call_units = visible_output_unit_count("", &run.result.output.tool_calls[..1]);
+        assert!(expected_units > first_call_units);
+        assert_ne!(expected_units, run.result.token_ids.len() as u64);
+
+        let stored = state
+            .meter_chat_session(
+                &model,
+                &run.metering_request,
+                &run.metering_output,
+                &run.invocation,
+                run.result.provider_receipt.as_ref(),
+            )
+            .expect("visible tool output receipt is accepted");
+        assert_eq!(stored.receipt.body.usage.output_tokens(), expected_units);
+        assert_ne!(
+            stored.receipt.body.usage.output_tokens(),
+            run.result.token_ids.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn production_providerless_request_hard_refuses_before_the_dev_shim() {
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        assert!(!state.dev_session_shim);
+
+        let error = match run_chat_with_route_retry(
+            &state,
+            &model,
+            &test_chat_request(&model.id),
+            GatewayRequestOptions::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("production must not create a providerless invocation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("production gateway"));
+        assert_eq!(state.receipt_count(), 0);
+        assert!(state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
     }
 
     #[tokio::test]
@@ -33579,7 +34451,7 @@ mod tests {
 
         assert_eq!(
             direct_session_chat_output_byte_limit(&request, &invocation),
-            100_000 * DEFAULT_SESSION_BYTES_PER_TOKEN_BUDGET
+            100_000 * DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN
         );
         let mut output = String::new();
         append_session_text(
@@ -33851,6 +34723,10 @@ mod tests {
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: invocation.session_id.clone(),
+            billing_id: invocation.spend_voucher.body.billing_id.clone(),
+            billing_attempt: invocation.spend_voucher.body.billing_attempt,
+            billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+            billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
             seq: 1,
             final_receipt: true,
             rail: invocation.rail.clone(),
@@ -33887,10 +34763,27 @@ mod tests {
         seq: u64,
         final_receipt: bool,
     ) -> ProviderSignedReceipt {
-        let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+        let attempt_usage =
+            ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+        let usage = if invocation.spend_voucher.body.billing_prior_au_owed_cum == 0 {
+            attempt_usage
+        } else {
+            invocation
+                .spend_voucher
+                .body
+                .billing_prior_usage
+                .saturating_add(&ReceiptUsage::from_units([(
+                    USAGE_OUTPUT_TOKEN,
+                    attempt_usage.output_tokens(),
+                )]))
+        };
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: invocation.session_id.clone(),
+            billing_id: invocation.spend_voucher.body.billing_id.clone(),
+            billing_attempt: invocation.spend_voucher.body.billing_attempt,
+            billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+            billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
             seq,
             final_receipt,
             rail: invocation.rail.clone(),

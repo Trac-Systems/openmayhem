@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 11;
+export const CONTRACT_VERSION = 12;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -57,7 +57,7 @@ const MIN_TAP_CONFIRMATION_DEPTH = 12;
 const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 9;
 const CTX_BRACKET_TABLE_VERSION = 1;
 const CTX_BRACKETS = Object.freeze([
   { id: 'le8k', max_ctx: 8_192 },
@@ -371,6 +371,10 @@ const canonicalSpendVoucherBody = (body) => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const canonical = {
     session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
     rail: body.rail,
     enclave_id: body.enclave_id,
     price_ver: body.price_ver,
@@ -397,6 +401,10 @@ const canonicalReceiptBody = (body) => {
   const canonical = {
     schema_version: body.schema_version,
     session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
     seq: body.seq,
     final: body.final,
     rail: body.rail,
@@ -9614,6 +9622,10 @@ class MayhemContract extends Contract {
   async normalizeSpendVoucherForReserve(voucher) {
     const voucherFields = [
       'session_id',
+      'billing_id',
+      'billing_attempt',
+      'billing_prior_usage',
+      'billing_prior_au_owed_cum',
       'rail',
       'enclave_id',
       'price_ver',
@@ -9644,6 +9656,31 @@ class MayhemContract extends Contract {
     const rail = this.normalizeLedgerRail(voucher.rail, 'spend voucher rail');
     if (rail instanceof Error) return rail;
     if (!this.isHexBytes(voucher.session_id, 32)) return new Error('Invalid spend voucher session id.');
+    if (!this.isHexBytes(voucher.billing_id, 32)) return new Error('Invalid spend voucher billing id.');
+    if (!Number.isSafeInteger(voucher.billing_attempt) || voucher.billing_attempt < 0) {
+      return new Error('Invalid spend voucher billing attempt.');
+    }
+    const billingPriorUsage = this.normalizeReceiptUsage(voucher.billing_prior_usage);
+    if (billingPriorUsage instanceof Error) return billingPriorUsage;
+    if (stableJson(billingPriorUsage) !== stableJson(voucher.billing_prior_usage)) {
+      return new Error('Spend voucher billing prior usage must be canonical.');
+    }
+    const billingPriorAuOwedCum = this.normalizeAu(
+      voucher.billing_prior_au_owed_cum,
+      'spend voucher billing prior cumulative amount'
+    );
+    if (billingPriorAuOwedCum instanceof Error) {
+      return new Error('Invalid spend voucher billing prior cumulative amount.');
+    }
+    if (
+      voucher.billing_attempt === 0 &&
+      (Object.keys(billingPriorUsage).length > 0 || !this.isZeroAu(billingPriorAuOwedCum))
+    ) {
+      return new Error('Initial spend voucher billing attempt must have an empty baseline.');
+    }
+    if (this.isZeroAu(billingPriorAuOwedCum) && Object.keys(billingPriorUsage).length > 0) {
+      return new Error('Spend voucher billing prior usage requires a prior cumulative amount.');
+    }
     if (!this.isHexBytes(voucher.enclave_id, 32)) return new Error('Invalid spend voucher enclave id.');
     if (!Number.isSafeInteger(voucher.price_ver) || voucher.price_ver < 1) {
       return new Error('Invalid spend voucher price version.');
@@ -9701,6 +9738,10 @@ class MayhemContract extends Contract {
     if (!this.isHexBytes(voucher.user_sig, 64)) return new Error('Invalid spend voucher user signature.');
     const body = {
       session_id: voucher.session_id.toLowerCase(),
+      billing_id: voucher.billing_id.toLowerCase(),
+      billing_attempt: voucher.billing_attempt,
+      billing_prior_usage: billingPriorUsage,
+      billing_prior_au_owed_cum: billingPriorAuOwedCum,
       rail,
       enclave_id: voucher.enclave_id.toLowerCase(),
       price_ver: voucher.price_ver,
@@ -9862,6 +9903,10 @@ class MayhemContract extends Contract {
       max_spend_au: maxSpendAu,
       voucher: {
         session_id: voucher.body.session_id,
+        billing_id: voucher.body.billing_id,
+        billing_attempt: voucher.body.billing_attempt,
+        billing_prior_usage: voucher.body.billing_prior_usage,
+        billing_prior_au_owed_cum: voucher.body.billing_prior_au_owed_cum,
         rail: voucher.body.rail,
         enclave_id: voucher.body.enclave_id,
         price_ver: voucher.body.price_ver,
@@ -11373,6 +11418,10 @@ class MayhemContract extends Contract {
     const body = {
       schema_version: bodySource.schema_version,
       session_id: bodySource.session_id,
+      billing_id: bodySource.billing_id,
+      billing_attempt: bodySource.billing_attempt,
+      billing_prior_usage: cloneValue(bodySource.billing_prior_usage),
+      billing_prior_au_owed_cum: bodySource.billing_prior_au_owed_cum,
       seq: bodySource.seq,
       final: bodySource.final,
       rail: bodySource.rail,
@@ -11428,6 +11477,31 @@ class MayhemContract extends Contract {
       if (typeof body[field] !== 'string' || body[field].length === 0 || body[field].length > 256) {
         return new Error(`Invalid receipt ${field}.`);
       }
+    }
+    if (!this.isHexBytes(body.billing_id, 32)) return new Error('Invalid receipt billing id.');
+    if (!Number.isSafeInteger(body.billing_attempt) || body.billing_attempt < 0) {
+      return new Error('Invalid receipt billing attempt.');
+    }
+    const billingPriorUsage = this.normalizeReceiptUsage(body.billing_prior_usage);
+    if (billingPriorUsage instanceof Error) return billingPriorUsage;
+    if (stableJson(billingPriorUsage) !== stableJson(body.billing_prior_usage)) {
+      return new Error('Receipt billing prior usage must be canonical.');
+    }
+    const billingPriorAuOwedCum = this.normalizeAu(
+      body.billing_prior_au_owed_cum,
+      'receipt billing prior cumulative amount'
+    );
+    if (billingPriorAuOwedCum instanceof Error) {
+      return new Error('Invalid receipt billing prior cumulative amount.');
+    }
+    if (
+      body.billing_attempt === 0 &&
+      (Object.keys(billingPriorUsage).length > 0 || !this.isZeroAu(billingPriorAuOwedCum))
+    ) {
+      return new Error('Initial receipt billing attempt must have an empty baseline.');
+    }
+    if (this.isZeroAu(billingPriorAuOwedCum) && Object.keys(billingPriorUsage).length > 0) {
+      return new Error('Receipt billing prior usage requires a prior cumulative amount.');
     }
     if (!this.isHexBytes(body.user, 32)) return new Error('Invalid receipt user public key.');
     if (!this.isHexBytes(body.provider, 32)) return new Error('Invalid receipt provider public key.');
@@ -11491,11 +11565,13 @@ class MayhemContract extends Contract {
     if (auOwedCum instanceof Error) {
       return new Error('Invalid receipt cumulative amount.');
     }
-    const lockedAu = this.usageAuForLockedTerms(
+    const lockedAu = this.logicalCumulativeAuForLockedTerms(
       body.locked_rate_map,
       lockedPerReqAu,
       lockedMinSessionAu,
-      body.usage
+      billingPriorUsage,
+      billingPriorAuOwedCum,
+      usage
     );
     if (lockedAu instanceof Error) return lockedAu;
     if (this.compareAu(auOwedCum, lockedAu) !== 0) {
@@ -12117,6 +12193,36 @@ class MayhemContract extends Contract {
     const subtotal = this.safeAddAu(usageAu, normalizedPerReqAu);
     if (subtotal instanceof Error) return subtotal;
     return this.maxAu(subtotal, normalizedMinSessionAu);
+  }
+
+  receiptUsageDelta(previous, current) {
+    const delta = {};
+    for (const [unit, previousCount] of Object.entries(previous)) {
+      const currentCount = current[unit] ?? 0;
+      if (currentCount < previousCount) return new Error('Receipt cumulative usage regressed.');
+    }
+    for (const [unit, currentCount] of Object.entries(current)) {
+      const count = currentCount - (previous[unit] ?? 0);
+      if (count > 0) delta[unit] = count;
+    }
+    return delta;
+  }
+
+  logicalCumulativeAuForLockedTerms(
+    rateMap,
+    perReqAu,
+    minSessionAu,
+    priorUsage,
+    priorAuOwedCum,
+    currentUsage
+  ) {
+    const delta = this.receiptUsageDelta(priorUsage, currentUsage);
+    if (delta instanceof Error) return delta;
+    const increment = this.isZeroAu(priorAuOwedCum)
+      ? this.usageAuForLockedTerms(rateMap, perReqAu, minSessionAu, delta)
+      : this.usageAuForRateMap(rateMap, delta);
+    if (increment instanceof Error) return increment;
+    return this.safeAddAu(priorAuOwedCum, increment);
   }
 
   ceilDivBigInt(value, divisor) {

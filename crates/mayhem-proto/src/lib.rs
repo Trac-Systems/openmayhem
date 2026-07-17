@@ -17,10 +17,10 @@ pub use endpoint_contract::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 11;
+pub const CONTRACT_VERSION: u32 = 12;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 9;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
@@ -30,6 +30,10 @@ pub const CTX_BRACKETS: &[(u32, &str)] = &[
     (262_144, "le256k"),
 ];
 pub type MoneyAu = u128;
+pub const VISIBLE_OUTPUT_BYTES_PER_UNIT: u64 = 4;
+pub const MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN: u64 = 256;
+pub const MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN: u64 =
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN / VISIBLE_OUTPUT_BYTES_PER_UNIT;
 
 pub mod decimal_u128 {
     use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
@@ -536,6 +540,11 @@ pub struct RateMapEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpendVoucherBody {
     pub session_id: String,
+    pub billing_id: String,
+    pub billing_attempt: u32,
+    pub billing_prior_usage: ReceiptUsage,
+    #[serde(with = "decimal_u128")]
+    pub billing_prior_au_owed_cum: MoneyAu,
     pub rail: String,
     pub enclave_id: String,
     pub price_ver: u64,
@@ -653,11 +662,48 @@ impl ReceiptUsage {
         Self { units }
     }
 
+    pub fn saturating_add(&self, increment: &Self) -> Self {
+        let mut units = self.units.clone();
+        for (unit, count) in increment.units() {
+            let next = units.get(unit).copied().unwrap_or(0).saturating_add(*count);
+            if next > 0 {
+                units.insert(unit.clone(), next);
+            }
+        }
+        Self { units }
+    }
+
     pub fn is_monotonic_from(&self, previous: &Self) -> bool {
         previous
             .units()
             .iter()
             .all(|(unit, previous_count)| self.get(unit) >= *previous_count)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VisibleToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+pub fn visible_output_units(content: &str, tool_calls: &[VisibleToolCall]) -> u64 {
+    let text_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    let tool_bytes = if tool_calls.is_empty() {
+        0
+    } else {
+        serde_json::to_value(tool_calls)
+            .ok()
+            .and_then(|value| stable_json_bytes(&value).ok())
+            .and_then(|bytes| u64::try_from(bytes.len()).ok())
+            .unwrap_or(u64::MAX)
+    };
+    let bytes = text_bytes.saturating_add(tool_bytes);
+    if bytes == 0 {
+        0
+    } else {
+        bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
     }
 }
 
@@ -707,6 +753,11 @@ pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
 pub struct ReceiptBody {
     pub schema_version: u32,
     pub session_id: String,
+    pub billing_id: String,
+    pub billing_attempt: u32,
+    pub billing_prior_usage: ReceiptUsage,
+    #[serde(with = "decimal_u128")]
+    pub billing_prior_au_owed_cum: MoneyAu,
     pub seq: u64,
     #[serde(rename = "final")]
     pub final_receipt: bool,
@@ -1730,6 +1781,10 @@ mod tests {
     fn voucher_and_receipt_signing_payloads_are_bound_to_terms() {
         let voucher = SpendVoucherBody {
             session_id: "sess".to_owned(),
+            billing_id: "11".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
@@ -1763,6 +1818,10 @@ mod tests {
         let receipt = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
+            billing_id: voucher.billing_id.clone(),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             seq: 1,
             final_receipt: false,
             rail: "fiat".to_owned(),
@@ -1843,6 +1902,10 @@ mod tests {
     fn signing_payloads_use_current_version_only() {
         let voucher = SpendVoucherBody {
             session_id: "sess".to_owned(),
+            billing_id: "11".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
@@ -1868,6 +1931,10 @@ mod tests {
         let receipt = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
+            billing_id: voucher.billing_id.clone(),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             seq: 1,
             final_receipt: false,
             rail: "fiat".to_owned(),
@@ -1911,6 +1978,10 @@ mod tests {
         ];
         let voucher = SpendVoucherBody {
             session_id: "sess-au-roundtrip".to_owned(),
+            billing_id: "44".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             rail: "fiat".to_owned(),
             enclave_id: "enclave-au-roundtrip".to_owned(),
             price_ver: 9,
@@ -1930,7 +2001,10 @@ mod tests {
         };
         let expected_voucher = concat!(
             "{\"domain\":\"mayhem-spend-voucher\",\"signing_version\":2,\"body\":{",
-            "\"session_id\":\"sess-au-roundtrip\",\"rail\":\"fiat\",\"enclave_id\":\"enclave-au-roundtrip\",",
+            "\"session_id\":\"sess-au-roundtrip\",",
+            "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+            "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
+            "\"rail\":\"fiat\",\"enclave_id\":\"enclave-au-roundtrip\",",
             "\"price_ver\":9,\"locked_rate_map\":[",
             "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
             "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
@@ -1948,6 +2022,10 @@ mod tests {
         let receipt = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess-au-roundtrip".to_owned(),
+            billing_id: "44".repeat(32),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             seq: 2,
             final_receipt: true,
             rail: "fiat".to_owned(),
@@ -1971,7 +2049,10 @@ mod tests {
         };
         let expected_receipt = concat!(
             "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":8,\"session_id\":\"sess-au-roundtrip\",\"seq\":2,\"final\":true,",
+            "\"schema_version\":9,\"session_id\":\"sess-au-roundtrip\",",
+            "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+            "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
+            "\"seq\":2,\"final\":true,",
             "\"rail\":\"fiat\",\"user\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
             "\"provider\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
             "\"enclave_id\":\"enclave-au-roundtrip\",\"model_id\":\"model/atto-roundtrip\",",

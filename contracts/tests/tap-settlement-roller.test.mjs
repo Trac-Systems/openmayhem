@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -21,6 +22,7 @@ import {
   guardianPreSignReport,
   auToTapWei,
   providerShareWei,
+  receiptMessage,
   resolveProviderAccountsFromLedger,
   resolveTapSettlementRate,
   resolveTapSettlementEpochPolicy,
@@ -470,6 +472,109 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   assert.equal(replay.blocked, undefined);
   assert.equal(replay.operator_fee.completed, true);
   assert.equal(replay.burn.completed, true);
+});
+
+test('TAP settlement nets one logical bill across provider redispatch attempts', () => {
+  const user = makeReceiptIdentity();
+  const enclave = makeReceiptIdentity();
+  const providerA = makeReceiptIdentity();
+  const providerB = makeReceiptIdentity();
+  const accountA = '0x1111111111111111111111111111111111111111';
+  const accountB = '0x2222222222222222222222222222222222222222';
+  const billingId = '7'.repeat(64);
+  const lockedRateMap = [
+    { unit: 'input_token', per_unit_au: '100', granularity: 1 },
+    { unit: 'output_token', per_unit_au: '50', granularity: 1 },
+  ];
+  const first = receipt({
+    session: 'tap-logical-a',
+    user,
+    enclave,
+    provider: providerA,
+    au: '100',
+    extraBody: {
+      billing_id: billingId,
+      billing_attempt: 0,
+      billing_prior_usage: {},
+      billing_prior_au_owed_cum: '0',
+      final: false,
+      locked_rate_map: lockedRateMap,
+      usage: { input_token: 1 },
+      au_owed_cum: '100',
+    },
+  });
+  const second = receipt({
+    session: 'tap-logical-b',
+    user,
+    enclave,
+    provider: providerB,
+    au: '200',
+    extraBody: {
+      billing_id: billingId,
+      billing_attempt: 1,
+      billing_prior_usage: { input_token: 1 },
+      billing_prior_au_owed_cum: '100',
+      final: true,
+      locked_rate_map: lockedRateMap,
+      usage: { input_token: 1, output_token: 2 },
+      au_owed_cum: '200',
+    },
+  });
+  const providerAccounts = {
+    [providerA.publicKeyHex]: accountA,
+    [providerB.publicKeyHex]: accountB,
+  };
+
+  const settlement = buildTapSettlement({
+    bundle: { epoch: 1, receipts: [second, first] },
+    providerAccounts,
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
+  });
+  assert.equal(settlement.receipt_count, 2);
+  assert.equal(settlement.spent_au, '200');
+  assert.equal(settlement.cumulative_spent_wei, '200');
+  assert.deepEqual(
+    Object.fromEntries(settlement.providers.map((entry) => [entry.account, entry.cumulative_wei])),
+    {
+      [accountA.toLowerCase()]: '75',
+      [accountB.toLowerCase()]: '75',
+    }
+  );
+
+  const wrongAmount = structuredClone(second);
+  wrongAmount.receipt.body.billing_prior_au_owed_cum = '99';
+  wrongAmount.receipt.enclave_sig = crypto.sign(
+    null,
+    Buffer.from(receiptMessage(wrongAmount.receipt.body)),
+    enclave.privateKey
+  ).toString('hex');
+  wrongAmount.receipt.user_sig = crypto.sign(
+    null,
+    Buffer.from(receiptMessage(wrongAmount.receipt.body)),
+    user.privateKey
+  ).toString('hex');
+  assert.throws(
+    () => buildTapSettlement({
+      bundle: { epoch: 1, receipts: [first, wrongAmount] },
+      providerAccounts,
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      settleThroughEpoch: 7,
+    }),
+    /redispatch baseline does not match prior logical settlement/
+  );
+  assert.throws(
+    () => buildTapSettlement({
+      bundle: { epoch: 1, receipts: [second] },
+      providerAccounts,
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      settleThroughEpoch: 7,
+    }),
+    /logical billing baseline has no prior signed receipt/
+  );
 });
 
 test('TAP settlement roller resumes fee and burn after an exact root-only partial run', async () => {

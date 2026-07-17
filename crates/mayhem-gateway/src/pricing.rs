@@ -83,6 +83,29 @@ pub fn priced_usage_au(
         .max(min_session_au)
 }
 
+pub fn logical_cumulative_priced_usage_au(
+    rate_map: &[RateMapEntry],
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+    prior_usage: &ReceiptUsage,
+    prior_au_owed_cum: MoneyAu,
+    current_usage: &ReceiptUsage,
+) -> Option<MoneyAu> {
+    if !current_usage.is_monotonic_from(prior_usage) {
+        return None;
+    }
+    if prior_au_owed_cum == 0 && prior_usage != &ReceiptUsage::default() {
+        return None;
+    }
+    let increment = ReceiptUsage::saturating_delta(prior_usage, current_usage);
+    let increment_au = if prior_au_owed_cum == 0 {
+        priced_usage_au(rate_map, per_req_au, min_session_au, &increment)
+    } else {
+        usage_map_au(rate_map, &increment)
+    };
+    prior_au_owed_cum.checked_add(increment_au)
+}
+
 /// Returns the cumulative usage a cancelled, already-dispatched request must settle.
 ///
 /// Fixed floors and previously metered work remain authoritative. For a variable-only

@@ -540,6 +540,10 @@ test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
   }));
   const voucher = {
     session_id: '11'.repeat(32),
+    billing_id: '66'.repeat(32),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     rail: 'tap',
     enclave_id: '22'.repeat(32),
     price_ver: Number.MAX_SAFE_INTEGER,
@@ -556,7 +560,7 @@ test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
   };
   const value = {
     op: 'spend_reserve',
-    contract_version: 11,
+    contract_version: 12,
     session_id: voucher.session_id,
     epoch: Number.MAX_SAFE_INTEGER,
     at: Number.MAX_SAFE_INTEGER,

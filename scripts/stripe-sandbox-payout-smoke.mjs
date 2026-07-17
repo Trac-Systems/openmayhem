@@ -720,6 +720,10 @@ async function seedSettlementState({ harness, admin, provider, account, args, us
   const receipt = {
     schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: sessionId,
+    billing_id: randomBytes(32).toString('hex'),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     seq: 1,
     final: true,
     rail: 'fiat',

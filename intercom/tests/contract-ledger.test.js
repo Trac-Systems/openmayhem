@@ -296,6 +296,10 @@ function signedSpendReservation(
   const lockedMinSessionAuString = auString(lockedMinSessionAu);
   const voucherBody = {
     session_id: sessionId,
+    billing_id: sessionId,
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
     rail: 'fiat',
     enclave_id: enclaveId,
     price_ver: priceVer,
