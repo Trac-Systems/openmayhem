@@ -796,6 +796,7 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
 .pg-ratio-field>div{display:grid;grid-template-columns:repeat(4,1fr);gap:.35rem}
 .pg-ratio-field button{min-height:2.2rem;border:1px solid var(--pg-line);border-radius:.45rem;background:transparent;color:var(--pg-dim);display:flex;align-items:center;justify-content:center;gap:.4rem;font-size:.64rem}
 .pg-ratio-field button.is-active{border-color:rgba(214,120,102,.45);background:rgba(197,68,89,.12);color:var(--pg-snow)}
+.pg-ratio-field button:disabled{cursor:not-allowed;opacity:.36}.pg-ratio-field legend em{font-style:normal;font-weight:500}
 .pg-ratio-glyph{height:.72rem;border:1px solid currentColor;border-radius:2px}.pg-ratio-glyph.ratio-1-1{aspect-ratio:1}.pg-ratio-glyph.ratio-4-3{aspect-ratio:4/3}.pg-ratio-glyph.ratio-3-4{aspect-ratio:3/4}.pg-ratio-glyph.ratio-16-9{aspect-ratio:16/9}
 .pg-voice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.4rem}
 .pg-voice-option{min-width:0;min-height:3.1rem;padding:.5rem .6rem;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(229,231,235,.012);display:flex;align-items:center;gap:.5rem;cursor:pointer}
@@ -1278,6 +1279,48 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       safeQuery('[data-playground-model]')?.selectedOptions?.[0]?.dataset.playgroundMode ||
       'chat';
 
+    const selectedPlaygroundImageConfig = (scope = document) => {
+      const option = safeQuery('[data-playground-model]', scope)?.selectedOptions?.[0];
+      if (!option || option.dataset.playgroundMode !== 'image') return null;
+      let sizes = {};
+      try {
+        const parsed = JSON.parse(option.dataset.imageSizes || '{}');
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) sizes = parsed;
+      } catch (_) {}
+      const ratio = safeQuery('[data-playground-aspect-ratio][aria-pressed="true"]', scope)?.dataset.playgroundAspectRatio || '1:1';
+      return {
+        dimensionMode: option.dataset.imageDimensionMode || 'size',
+        ratio,
+        size: typeof sizes[ratio] === 'string' ? sizes[ratio] : '',
+        sizes
+      };
+    };
+
+    const syncPlaygroundImageSizes = () => {
+      const select = safeQuery('[data-playground-model]');
+      if (!select || select.selectedOptions[0]?.dataset.playgroundMode !== 'image') return;
+      const option = select.selectedOptions[0];
+      let sizes = {};
+      try {
+        const parsed = JSON.parse(option.dataset.imageSizes || '{}');
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) sizes = parsed;
+      } catch (_) {}
+      const buttons = Array.from(document.querySelectorAll('[data-playground-aspect-ratio]'));
+      let selected = buttons.find((button) => button.getAttribute('aria-pressed') === 'true' && sizes[button.dataset.playgroundAspectRatio]);
+      if (!selected) selected = buttons.find((button) => sizes[button.dataset.playgroundAspectRatio]);
+      buttons.forEach((button) => {
+        const ratio = button.dataset.playgroundAspectRatio || '';
+        const size = typeof sizes[ratio] === 'string' ? sizes[ratio] : '';
+        button.disabled = !size;
+        button.classList.toggle('is-active', button === selected);
+        button.setAttribute('aria-pressed', String(button === selected));
+        button.title = size ? `${size.replace('x', '\u00d7')} for this model` : 'This aspect ratio is unavailable for this model';
+      });
+      const sizeLabel = safeQuery('[data-playground-image-size]');
+      const selectedSize = selected ? sizes[selected.dataset.playgroundAspectRatio] : '';
+      if (sizeLabel) sizeLabel.textContent = selectedSize ? selectedSize.replace('x', '\u00d7') : 'No compatible dimensions';
+    };
+
     const playgroundOptionsForMode = (mode) =>
       Array.from(safeQuery('[data-playground-model]')?.options || [])
         .filter((option) => option.dataset.playgroundMode === mode);
@@ -1332,6 +1375,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       });
       const modelFact = safeQuery('[data-playground-fact="model"]');
       if (modelFact) modelFact.textContent = selected?.value || name;
+      syncPlaygroundImageSizes();
     };
 
     const syncPlaygroundInputs = () => {
@@ -1350,7 +1394,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const busy = Boolean(playgroundController);
       const imageButton = safeQuery('[data-playground-generate-image]');
       const speechButton = safeQuery('[data-playground-generate-speech]');
-      if (imageButton) imageButton.disabled = !imagePrompt?.value.trim() || busy;
+      if (imageButton) imageButton.disabled = !imagePrompt?.value.trim() || busy || !selectedPlaygroundImageConfig()?.size;
       if (speechButton) speechButton.disabled = !speechText?.value.trim() || busy;
     };
 
@@ -2165,8 +2209,24 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (playgroundController) { announce('A request is already in progress.', true); return; }
       const controls = playgroundRequestControls(form);
       if (!controls) return;
-      const ratio = safeQuery('[data-playground-aspect-ratio][aria-pressed="true"]')?.dataset.playgroundAspectRatio || '1:1';
-      const size = { '1:1': '512x512', '4:3': '640x480', '3:4': '480x640', '16:9': '768x432' }[ratio] || '512x512';
+      const imageConfig = selectedPlaygroundImageConfig(form);
+      if (!imageConfig?.size) {
+        announce('The selected model does not publish compatible dimensions for this aspect ratio.', true);
+        return;
+      }
+      const { ratio, size } = imageConfig;
+      const [width, height] = size.split('x').map((value) => Number.parseInt(value, 10));
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+        announce('The selected model published invalid image dimensions.', true);
+        return;
+      }
+      const requestBody = { model: model.value, prompt: promptValue, n: 1, response_format: 'b64_json' };
+      if (imageConfig.dimensionMode === 'width-height') {
+        requestBody.width = width;
+        requestBody.height = height;
+      } else {
+        requestBody.size = size;
+      }
       const controller = new AbortController();
       playgroundController = controller;
       playgroundBusy(true);
@@ -2179,7 +2239,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         setPlaygroundNetwork('matching', { mode: 'image', model: model.value });
         const response = await fetch('/v1/images/generations', {
           method: 'POST', credentials: 'same-origin', headers: playgroundHeaders(form, controls),
-          body: JSON.stringify({ model: model.value, prompt: promptValue, n: 1, size, response_format: 'b64_json' }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal
         });
         if (!response.ok) throw new Error(await playgroundFailureMessage(response));
@@ -2196,7 +2256,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         output.replaceChildren();
         const result = document.createElement('div');
         result.className = 'pg-image-result';
-        result.innerHTML = `<div class="pg-image-frame ratio-${ratio.replace(':', '-')}"><img class="pg-generated-image" alt="" width="${size.split('x')[0]}" height="${size.split('x')[1]}"></div><p class="pg-image-meta"></p><div class="pg-output-actions"><a class="pg-text-action" download></a><button class="pg-text-action" type="button" data-copy data-copy-value="">Copy prompt</button><button class="pg-text-action" type="button" data-playground-generate-image>Retry</button><button class="pg-text-action" type="button" data-playground-clear-image>Clear</button></div>`;
+        result.innerHTML = `<div class="pg-image-frame ratio-${ratio.replace(':', '-')}"><img class="pg-generated-image" alt="" width="${width}" height="${height}"></div><p class="pg-image-meta"></p><div class="pg-output-actions"><a class="pg-text-action" download></a><button class="pg-text-action" type="button" data-copy data-copy-value="">Copy prompt</button><button class="pg-text-action" type="button" data-playground-generate-image>Retry</button><button class="pg-text-action" type="button" data-playground-clear-image>Clear</button></div>`;
         const generated = safeQuery('img', result);
         generated.src = source;
         generated.alt = `Generated image: ${promptValue.slice(0, 180)}`;
@@ -2814,6 +2874,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           button.classList.toggle('is-active', selected);
           button.setAttribute('aria-pressed', String(selected));
         });
+        syncPlaygroundImageSizes();
+        syncPlaygroundInputs();
         savePlaygroundDraft();
         return;
       }
