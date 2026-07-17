@@ -7,6 +7,24 @@ const coreIdentity = (core, fallback) => {
   return fallback;
 };
 
+export const joinCanonicalPeers = (peer, publicKeys) => {
+  if (!Array.isArray(publicKeys) || publicKeys.length === 0) return 0;
+  if (typeof peer?.swarm?.joinPeer !== 'function') {
+    throw new Error('Canonical direct peers require an active Hyperswarm.');
+  }
+  let joined = 0;
+  for (const publicKey of publicKeys) {
+    const normalized = String(publicKey ?? '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error('Canonical direct peer must be a 32-byte public key.');
+    }
+    if (normalized === String(peer?.wallet?.publicKey ?? '').toLowerCase()) continue;
+    peer.swarm.joinPeer(b4a.from(normalized, 'hex'));
+    joined += 1;
+  }
+  return joined;
+};
+
 export const canonicalAdminViewCores = (peer) => {
   const applyState = peer?.base?._applyState;
   const candidates = [

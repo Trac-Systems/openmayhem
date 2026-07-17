@@ -6,7 +6,7 @@ import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
 import { createServer as createRpcServer } from './rpc.js';
-import { hydrateAdminWriterViews } from './admin-view-hydration.js';
+import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
@@ -463,6 +463,13 @@ const peerReplicateFlushTimeoutMs = parseInteger(
   flagValue('peer-replicate-flush-timeout-ms', env.PEER_REPLICATE_FLUSH_TIMEOUT_MS || ''),
   headless ? 5_000 : 0
 );
+const peerDirectPeers = parseCsvList(
+  flagValue('peer-direct-peer', env.PEER_DIRECT_PEERS || '')
+) || [];
+if (peerDirectPeers.length > 16 ||
+    peerDirectPeers.some((key) => !/^[0-9a-fA-F]{64}$/.test(key))) {
+  throw new Error('Invalid --peer-direct-peer. Expected at most 16 comma-separated 32-byte public keys.');
+}
 const keepAlive = parseBool(flagValue('keep-alive', env.MAYHEM_KEEP_ALIVE || ''), headless);
 
 const peerStoreName =
@@ -1085,6 +1092,7 @@ const peer = new Peer({
   contract: MayhemContract,
 });
 await peer.ready();
+joinCanonicalPeers(peer, peerDirectPeers);
 await hydrateAdminWriterViews(peer);
 
 let mayhemFeature = null;

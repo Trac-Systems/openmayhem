@@ -4,6 +4,7 @@ import b4a from 'b4a';
 import {
   canonicalAdminViewCores,
   hydrateAdminWriterViews,
+  joinCanonicalPeers,
 } from '../src/admin-view-hydration.js';
 
 const fakeCore = (keyByte, length, contiguousLength) => ({
@@ -74,4 +75,23 @@ test('canonical core discovery deduplicates sessions sharing one key', () => {
   const peer = fakePeer();
   const cores = canonicalAdminViewCores(peer);
   assert.deepEqual(cores.map(({ name }) => name), ['public', 'system']);
+});
+
+test('canonical peers are joined explicitly without joining self', () => {
+  const self = '11'.repeat(32);
+  const remote = '22'.repeat(32);
+  const joined = [];
+  const count = joinCanonicalPeers({
+    wallet: { publicKey: self },
+    swarm: { joinPeer: (key) => joined.push(b4a.toString(key, 'hex')) },
+  }, [self, remote]);
+  assert.equal(count, 1);
+  assert.deepEqual(joined, [remote]);
+});
+
+test('canonical peer joins reject malformed keys', () => {
+  assert.throws(
+    () => joinCanonicalPeers({ swarm: { joinPeer() {} } }, ['not-a-key']),
+    /32-byte public key/
+  );
 });
