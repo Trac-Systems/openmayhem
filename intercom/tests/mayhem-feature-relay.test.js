@@ -945,6 +945,7 @@ test('admin-writer RPC keeps the local append path', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.relayed, undefined);
   assert.equal(appendCalls, 1);
+  assert.equal(writer.flushes.length, 1);
 });
 
 test('admin writer diagnostics expose transition state without key material', () => {

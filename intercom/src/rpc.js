@@ -136,7 +136,9 @@ export async function submitMayhemFeature(peer, body) {
       );
     }, 5_000);
     try {
-      return await contractFeature(peer, { feature, key, value: body.value });
+      const result = await contractFeature(peer, { feature, key, value: body.value });
+      await peer.base.append(null);
+      return result;
     } finally {
       clearTimeout(watchdog);
     }
