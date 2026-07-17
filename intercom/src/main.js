@@ -6,6 +6,7 @@ import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
 import { createServer as createRpcServer } from './rpc.js';
+import { hydrateAdminWriterViews } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
@@ -1084,6 +1085,7 @@ const peer = new Peer({
   contract: MayhemContract,
 });
 await peer.ready();
+await hydrateAdminWriterViews(peer);
 
 let mayhemFeature = null;
 {
