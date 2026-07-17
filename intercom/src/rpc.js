@@ -23,6 +23,7 @@ export const adminWriterDiagnostics = (peer) => {
   const applyState = base?._applyState;
   const system = applyState?.system;
   const applyStage = peer?.contract?.instance?._mayhemApplyStage;
+  const viewCore = base?.view?.core;
   return {
     contract: {
       apply_stage: typeof applyStage === 'string' ? applyStage : null,
@@ -44,6 +45,15 @@ export const adminWriterDiagnostics = (peer) => {
       needs_wakeup: base?._needsWakeup === true,
       wakeup_hint_count: Number(base?._wakeupHints?.size ?? 0),
     },
+    view: viewCore ? {
+      writable: viewCore.writable === true,
+      opened: viewCore.opened === true,
+      closing: viewCore.closing === true,
+      length: Number(viewCore.length ?? 0),
+      fork: Number(viewCore.fork ?? 0),
+      signed_length: Number(viewCore.signedLength ?? 0),
+      upgrading: viewCore?.core?.upgrading === true,
+    } : null,
     local_writer: writer ? {
       removed: writer.isRemoved === true,
       active_indexer: writer.isActiveIndexer === true,

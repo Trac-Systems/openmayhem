@@ -984,12 +984,25 @@ test('admin writer diagnostics expose transition state without key material', ()
       indexerUpdate: false,
     },
   };
+  writer.peer.base.view = {
+    core: {
+      writable: false,
+      opened: true,
+      closing: false,
+      length: 9,
+      fork: 0,
+      signedLength: 9,
+      core: { upgrading: true },
+    },
+  };
   writer.peer.contract = { instance: { _mayhemApplyStage: 'rate:key:hash' } };
 
   const report = adminWriterDiagnostics(writer.peer);
   assert.equal(report.contract.apply_stage, 'rate:key:hash');
   assert.equal(report.base.writable, true);
   assert.equal(report.base.appending_count, 1);
+  assert.equal(report.view.writable, false);
+  assert.equal(report.view.upgrading, true);
   assert.equal(report.local_writer.active_indexer, true);
   assert.deepEqual(report.apply_state.indexer_lengths, [4]);
   assert.doesNotMatch(JSON.stringify(report), new RegExp(adminKey));
