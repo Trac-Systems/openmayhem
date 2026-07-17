@@ -988,6 +988,7 @@ test('admin writer diagnostics expose transition state without key material', ()
         writable: true,
         opened: true,
         length: 10,
+        contiguousLength: 10,
         signedLength: 9,
         core: { upgrading: false },
       },
@@ -1000,6 +1001,7 @@ test('admin writer diagnostics expose transition state without key material', ()
         writable: true,
         opened: true,
         length: 10,
+        contiguousLength: 10,
         signedLength: 9,
         core: { upgrading: false },
       },
@@ -1011,6 +1013,7 @@ test('admin writer diagnostics expose transition state without key material', ()
       opened: true,
       closing: false,
       length: 9,
+      contiguousLength: 8,
       fork: 0,
       signedLength: 9,
       core: { upgrading: true },
@@ -1023,8 +1026,10 @@ test('admin writer diagnostics expose transition state without key material', ()
   assert.equal(report.base.writable, true);
   assert.equal(report.base.appending_count, 1);
   assert.equal(report.view.writable, false);
+  assert.equal(report.view.contiguous_length, 8);
   assert.equal(report.view.upgrading, true);
   assert.equal(report.apply_state.view.writable, true);
+  assert.equal(report.apply_state.view.contiguous_length, 10);
   assert.equal(report.apply_state.views[0].core_length, 10);
   assert.equal(report.local_writer.active_indexer, true);
   assert.deepEqual(report.apply_state.indexer_lengths, [4]);

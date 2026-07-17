@@ -51,6 +51,7 @@ export const adminWriterDiagnostics = (peer) => {
       opened: viewCore.opened === true,
       closing: viewCore.closing === true,
       length: Number(viewCore.length ?? 0),
+      contiguous_length: Number(viewCore.contiguousLength ?? 0),
       fork: Number(viewCore.fork ?? 0),
       signed_length: Number(viewCore.signedLength ?? 0),
       upgrading: viewCore?.core?.upgrading === true,
@@ -87,6 +88,7 @@ export const adminWriterDiagnostics = (peer) => {
         opened: applyViewCore.opened === true,
         closing: applyViewCore.closing === true,
         length: Number(applyViewCore.length ?? 0),
+        contiguous_length: Number(applyViewCore.contiguousLength ?? 0),
         fork: Number(applyViewCore.fork ?? 0),
         signed_length: Number(applyViewCore.signedLength ?? 0),
         upgrading: applyViewCore?.core?.upgrading === true,
@@ -99,6 +101,7 @@ export const adminWriterDiagnostics = (peer) => {
           core_writable: entry?.core?.writable === true,
           core_opened: entry?.core?.opened === true,
           core_length: Number(entry?.core?.length ?? 0),
+          core_contiguous_length: Number(entry?.core?.contiguousLength ?? 0),
           core_signed_length: Number(entry?.core?.signedLength ?? 0),
           core_upgrading: entry?.core?.core?.upgrading === true,
         }))
