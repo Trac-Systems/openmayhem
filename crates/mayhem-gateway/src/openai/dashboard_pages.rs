@@ -70,7 +70,7 @@ impl DashboardProductPage {
             Self::Earn => "Earn",
             Self::EarnJobs => "Jobs",
             Self::EarnMachines => "Machines",
-            Self::EarnOpportunities => "Model fit",
+            Self::EarnOpportunities => "Model opportunities",
             Self::EarnEarnings => "Earnings and payouts",
             Self::EarnReliability => "Reliability",
             Self::Network => "Network",
@@ -1087,7 +1087,7 @@ fn volatile_page_status_marker(
             | "No advertised capacity"
             | "Routes unavailable"
             | "Supply exceptions"
-            | "Route snapshot"
+            | "Route status"
             | "Online and accepting work"
             | "Online with route issues"
             | "Online with preparation issue"
@@ -1317,44 +1317,38 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
         .is_some_and(|notice| notice.level == "required");
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
     let funding_needed = data.payment_directory.is_some() && data.balance_au == 0;
-    let (heading, summary, status, tone) = if required_update {
+    let (summary, status, tone) = if required_update {
         (
-            "Update required",
             "The gateway is running, but one or more catalog routes are blocked until Mayhem is updated.",
             "Update required",
             "danger",
         )
     } else if credential_needed {
         (
-            "Create a gateway credential",
             "This gateway requires an active access token before Playground or connected apps can send requests.",
             "Credential needed",
             "warn",
         )
     } else if funding_needed {
         (
-            "Add funds for your first request",
             "The gateway and model catalog are ready, but the current ledger balance is empty.",
             "Funding needed",
             "warn",
         )
     } else if accepting_models > 0 {
         (
-            "Mayhem is ready to try",
             "At least one provider is online with free capacity right now. Final price and eligibility are confirmed when you send.",
             "Capacity advertised",
             "good",
         )
     } else if data.models.is_empty() {
         (
-            "Set up your first model",
             "The gateway is running — it just has no models in its catalog yet.",
             "No models yet",
             "warn",
         )
     } else {
         (
-            "Gateway ready, routes unavailable",
             "This gateway is running, but no model currently has a fresh provider advertising free capacity.",
             "No advertised capacity",
             "warn",
@@ -1416,7 +1410,7 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
         expires,
         DashboardAppPage::Home,
         "Overview",
-        heading,
+        "Overview",
         summary,
         status,
         tone,
@@ -2317,14 +2311,14 @@ fn models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>)
         "models",
     );
     let content = format!(
-        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Model catalog</h2><p>Compare capabilities, cost, protection, context, and advertised capacity.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="models-table"><caption class="sr-only">Models in this gateway catalog</caption><thead><tr><th>Model</th><th>Advertised capacity</th><th>Capabilities</th><th>Catalog price</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}<a href="/mayhem/dashboard/network/models">Open network models</a></footer></section>"##,
+        r##"<section class="panel model-catalog-panel"><header class="panel-head"><div class="panel-title"><h2>Model catalog</h2><p>Compare what each model does, whether it is available, and its starting catalog rates.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table model-catalog-table" id="models-table"><caption class="sr-only">Models in this gateway catalog</caption><colgroup><col class="model-col"><col class="availability-col"><col class="capabilities-col"><col class="price-col"><col class="action-col"></colgroup><thead><tr><th>Model</th><th>Availability</th><th>Capabilities</th><th>Starting price</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}<a href="/mayhem/dashboard/network/models">Open network models</a></footer></section>"##,
     );
     shell_wide(
         data,
         expires,
         DashboardAppPage::Models,
         "Use AI",
-        "Choose by what the work needs",
+        "Model catalog",
         "Compare models by capability, context, protection, and price. Final price and eligibility are confirmed when you send.",
         if data.accepting_models() > 0 { "Capacity advertised" } else { "No advertised capacity" },
         if data.accepting_models() > 0 { "good" } else { "warn" },
@@ -2358,25 +2352,19 @@ fn model_rows(data: &DashboardData, page: PageWindow) -> String {
         .take(page.len())
         .map(|model| {
             let availability = model_availability(data, model);
+            let lab = dashboard_model_lab(model);
+            let lab_icon = dashboard_model_lab_icon(&lab);
             let ability_values = dashboard_model_abilities(model)
                 .into_iter()
                 .filter(|value| !value.starts_with("api:"))
                 .collect::<Vec<_>>();
             let ability_filter = ability_values.join(" ");
             let ability_export = ability_values.join(" / ");
-            let shown_abilities = ability_values.iter().take(4).cloned().collect::<Vec<_>>();
-            let omitted_abilities = ability_values.len().saturating_sub(shown_abilities.len());
-            let abilities = if omitted_abilities == 0 {
-                shown_abilities.join(" / ")
-            } else {
-                format!(
-                    "{} (+{} more)",
-                    shown_abilities.join(" / "),
-                    omitted_abilities
-                )
-            };
+            let abilities = model_catalog_capabilities_html(&ability_values);
+            let catalog_price = model_catalog_price_html(model);
+            let evidence_url = evidence_href("model", &[("id", model.id.as_str())]);
             let evidence = evidence_link(
-                &evidence_href("model", &[("id", model.id.as_str())]),
+                &evidence_url,
                 "Verify",
                 &model.id,
             );
@@ -2386,27 +2374,233 @@ fn model_rows(data: &DashboardData, page: PageWindow) -> String {
                     volatile_text(&availability.explanation, window, "Refresh to reconfirm")
                 },
             );
+            let display_name = dashboard_model_name(model);
+            let (model_type, purpose) = match model.mayhem.model_class.as_str() {
+                "image-generation" => ("Image generation", "Create images from written prompts."),
+                "tts" => ("Text to speech", "Turn written text into generated speech."),
+                "embedding" => ("Embeddings", "Create vector representations for search and retrieval."),
+                "reranking" => ("Reranking", "Reorder candidate results by relevance."),
+                _ => ("Text generation", "Chat, writing, reasoning, and structured model responses."),
+            };
+            let detail_template = format!(
+                r##"<template data-model-detail-template><article class="model-detail-content"><header class="model-detail-hero"><span class="model-detail-logo">{}</span><div class="model-detail-identity"><span class="model-detail-lab">{}</span><h3>{}</h3><code>{}</code></div><span class="status-badge {}"><span class="status-dot" aria-hidden="true"></span>{}</span></header><p class="model-detail-purpose">{purpose}</p><dl class="model-detail-facts"><div><dt>Model type</dt><dd>{model_type}</dd></div><div><dt>Context window</dt><dd>{} tokens</dd></div><div><dt>Current availability</dt><dd>{}</dd><small>{}</small></div></dl><section class="model-detail-section"><div class="model-detail-section-head"><div><span>What it supports</span><h4>Capabilities</h4></div><span>{} total</span></div><div class="model-detail-capabilities">{}</div></section><section class="model-detail-section"><div class="model-detail-section-head"><div><span>Reference terms</span><h4>Catalog pricing</h4></div></div><div class="model-detail-price" data-money>{}</div><p>Final price and route eligibility are confirmed when you send.</p></section><footer class="model-detail-actions"><a class="primary-button" href="/mayhem/dashboard/playground?model={}">Use in Playground</a><a class="quiet-button" href="{}">Verify evidence</a></footer></article></template>"##,
+                lab_icon,
+                html_escape(&lab.name),
+                html_escape(&display_name),
+                html_escape(&model.id),
+                availability.tone,
+                html_escape(availability.label),
+                format_token_count(u64::from(model.mayhem.caps.ctx)),
+                html_escape(availability.label),
+                availability_explanation,
+                ability_values.len(),
+                model_detail_capabilities_html(&ability_values),
+                model_catalog_price_html_with_limit(model, None),
+                dashboard_url_encode(&model.id),
+                html_escape(&evidence_url),
+            );
             format!(
-                r##"<tr data-filter-row data-filter-text="{} {} {} {}"><th scope="row"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></th><td><span class="status-badge {}">{}</span><span class="table-secondary">{}</span></td><td data-export-value="{}" data-sort-value="{}">{}</td><td><span class="table-primary mono">{}</span></td><td class="table-action"><div class="inline-actions"><a class="quiet-button" href="/mayhem/dashboard/playground?model={}" aria-label="Use {} in Playground">Use</a>{}</div></td></tr>"##,
+                r##"<tr data-filter-row data-filter-text="{} {} {} {} {}"><th scope="row" data-export-value="{}"><button class="catalog-model catalog-model-button" type="button" data-model-detail-open aria-haspopup="dialog" aria-controls="model-detail-dialog" aria-label="View details for {}"><span class="catalog-model-logo">{}</span><span class="catalog-model-copy"><span class="catalog-model-lab">{}</span><span class="catalog-model-name">{}</span><span class="catalog-model-id mono">{}</span></span><svg class="catalog-model-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button>{}</th><td><span class="status-badge {}"><span class="status-dot" aria-hidden="true"></span>{}</span><span class="table-secondary catalog-availability-detail">{}</span></td><td data-export-value="{}" data-sort-value="{}"><div class="catalog-capabilities">{}</div></td><td data-money data-export-value="{}"><div class="catalog-price">{}</div></td><td class="table-action"><div class="inline-actions catalog-actions"><a class="quiet-button" href="/mayhem/dashboard/playground?model={}" aria-label="Use {} in Playground">Use</a>{}</div></td></tr>"##,
                 html_escape(&model.id),
                 html_escape(&model.mayhem.family),
+                html_escape(&lab.name),
                 html_escape(availability.label),
                 html_escape(&ability_filter),
                 html_escape(&model.id),
-                html_escape(if model.mayhem.family.is_empty() { &model.mayhem.source } else { &model.mayhem.family }),
+                html_escape(&model.id),
+                lab_icon,
+                html_escape(&lab.name),
+                html_escape(&display_name),
+                html_escape(&model.id),
+                detail_template,
                 availability.tone,
                 html_escape(availability.label),
                 availability_explanation,
                 html_escape(&ability_export),
                 html_escape(&ability_export),
-                html_escape(&abilities),
-                money_html(&dashboard_model_price(model)),
+                abilities,
+                html_escape(&dashboard_model_price(model)),
+                catalog_price,
                 dashboard_url_encode(&model.id),
                 html_escape(&model.id),
                 evidence,
             )
         })
         .collect()
+}
+
+fn model_catalog_capability_label(value: &str) -> String {
+    if let Some(context) = value.strip_prefix("ctx ") {
+        return format!("{context} context");
+    }
+    if let Some((name, levels)) = value.split_once(':') {
+        let name = humanize_model_label(name);
+        let options = levels
+            .split('|')
+            .map(|level| {
+                let level = if name.to_ascii_lowercase().ends_with("budget") {
+                    level.strip_prefix("budget ").unwrap_or(level)
+                } else {
+                    level
+                };
+                humanize_model_label(level)
+            })
+            .collect::<Vec<_>>()
+            .join(" / ");
+        return format!("{name}: {options}");
+    }
+    match value {
+        "tools" => "Tool use".to_owned(),
+        "json" => "Structured JSON".to_owned(),
+        "tts" => "Text to speech".to_owned(),
+        _ => humanize_model_label(&value.replace('_', " ")),
+    }
+}
+
+fn model_catalog_capabilities_html(values: &[String]) -> String {
+    let mut ordered = values.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|value| if value.starts_with("ctx ") { 0 } else { 1 });
+    let shown_count = ordered.len().min(4);
+    let omitted = ordered.len().saturating_sub(shown_count);
+    let mut html = ordered
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let class = if value.starts_with("ctx ") {
+                "catalog-capability is-context"
+            } else {
+                "catalog-capability"
+            };
+            format!(
+                r#"<span class="{class}{}"{}>{}</span>"#,
+                if index >= shown_count {
+                    " catalog-capability-extra"
+                } else {
+                    ""
+                },
+                if index >= shown_count { " hidden" } else { "" },
+                html_escape(&model_catalog_capability_label(value))
+            )
+        })
+        .collect::<String>();
+    if omitted > 0 {
+        html.push_str(&format!(
+            r#"<button class="catalog-capability-more" type="button" data-catalog-capabilities-toggle data-collapsed-label="+{omitted} more" aria-expanded="false"><span data-catalog-capabilities-label>+{omitted} more</span></button>"#,
+        ));
+    }
+    html
+}
+
+fn model_detail_capabilities_html(values: &[String]) -> String {
+    let mut ordered = values.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|value| if value.starts_with("ctx ") { 0 } else { 1 });
+    ordered
+        .iter()
+        .map(|value| {
+            format!(
+                r#"<span class="model-detail-capability{}">{}</span>"#,
+                if value.starts_with("ctx ") {
+                    " is-context"
+                } else {
+                    ""
+                },
+                html_escape(&model_catalog_capability_label(value)),
+            )
+        })
+        .collect()
+}
+
+fn compact_catalog_money(value: u128) -> String {
+    let exact = format_au_usd(value);
+    if exact.len() <= 10 {
+        return exact;
+    }
+    let Some(number) = exact
+        .strip_prefix('$')
+        .and_then(|value| value.parse::<f64>().ok())
+    else {
+        return exact;
+    };
+    if number > 0.0 && number < 0.000_001 {
+        return "<$0.000001".to_owned();
+    }
+    let rounded = format!("{number:.6}");
+    format!("${}", rounded.trim_end_matches('0').trim_end_matches('.'))
+}
+
+fn model_catalog_rate_unit(unit: &str, granularity: u64) -> String {
+    let token_label = match unit {
+        "input_token" => Some("input tokens"),
+        "cached_input_token" => Some("cached input tokens"),
+        "output_token" => Some("output tokens"),
+        _ => None,
+    };
+    if let Some(label) = token_label {
+        let granularity = u128::from(granularity);
+        if granularity > 0 && 1_000_000_u128 % granularity == 0 {
+            return format!("per 1M {label}");
+        }
+    }
+    let mut label = unit.replace('_', " ");
+    if granularity == 1 {
+        format!("per {label}")
+    } else {
+        if !label.ends_with('s') {
+            label.push('s');
+        }
+        format!("per {granularity} {label}")
+    }
+}
+
+fn model_catalog_price_html(model: &GatewayModel) -> String {
+    model_catalog_price_html_with_limit(model, Some(3))
+}
+
+fn model_catalog_price_html_with_limit(model: &GatewayModel, limit: Option<usize>) -> String {
+    let price = &model.mayhem.price_ref_au;
+    let mut entries = Vec::new();
+    if price.per_req_au > 0 {
+        entries.push((
+            compact_catalog_money(price.per_req_au),
+            "per request".to_owned(),
+        ));
+    }
+    if price.min_session_au > 0 {
+        entries.push((
+            compact_catalog_money(price.min_session_au),
+            "minimum per session".to_owned(),
+        ));
+    }
+    entries.extend(price.rate_map.iter().map(|rate| {
+        (
+            compact_catalog_money(rate.per_unit_au),
+            model_catalog_rate_unit(&rate.unit, rate.granularity),
+        )
+    }));
+    if entries.is_empty() {
+        return r#"<span class="catalog-price-unavailable">Not priced</span>"#.to_owned();
+    }
+    let shown_count = limit.unwrap_or(entries.len()).min(entries.len());
+    let omitted = entries.len().saturating_sub(shown_count);
+    let mut html = entries
+        .iter()
+        .take(shown_count)
+        .enumerate()
+        .map(|(index, (amount, unit))| {
+            format!(
+                r#"<span class="catalog-price-line{}"><span class="money-value catalog-price-amount">{}</span><span class="catalog-price-unit">{}</span></span>"#,
+                if index == 0 { " is-primary" } else { "" },
+                html_escape(amount),
+                html_escape(unit),
+            )
+        })
+        .collect::<String>();
+    if omitted > 0 {
+        html.push_str(&format!(
+            r#"<span class="catalog-price-more">+{omitted} other rates</span>"#
+        ));
+    }
+    html
 }
 
 fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
@@ -2736,11 +2930,6 @@ fn connect_page(
 ) -> String {
     let root = origin.trim_end_matches('/');
     let base_url = format!("{root}/v1");
-    let auth = if data.requires_auth() {
-        "Required"
-    } else {
-        "Optional"
-    };
     let token_count = data.active_token_count();
     let credential_ready = !data.requires_auth() || token_count > 0;
     let accepting_models = data.accepting_models();
@@ -2799,65 +2988,78 @@ fn connect_page(
     } else {
         r##"<a class="primary-button" href="/mayhem/dashboard/playground">Test with Playground</a>"##
     };
-    let content = format!(
-        r##"<section class="metric-grid">{}{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>OpenAI-compatible connection</h2><p>Works with clients that accept a custom base URL.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">1. Copy the base URL</span><div class="code-block"><code id="gateway-base-url">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-base-url" data-product-event="integration_base_url_copied" aria-label="Copy base URL"><span data-copy-label>Copy</span></button></div></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Configure your app</span><pre class="code-block"><code id="gateway-env">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-env" data-product-event="integration_environment_copied" aria-label="Copy environment variables"><span data-copy-label>Copy</span></button></pre></div></div><footer class="panel-footer"><span>The API key value is ignored when gateway authentication is optional.</span><button class="quiet-button js-only" type="button" data-connection-test data-result-target="#connection-result">Verify dashboard access</button></footer></section><div class="notice" id="connection-result" hidden></div></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Prove inference</h2><p>What each successful step shows</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step done"><span class="check-mark">&#10003;</span><div class="check-copy"><strong>Dashboard access</strong><span>This gateway dashboard is reachable.</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Gateway credential</strong><span>{}</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Inference route</strong><span>{}</span></div></div></div></div></section></aside></section>{token_store_notice}<section class="panel section-gap" id="access-tokens"><header class="panel-head"><div class="panel-title"><h2>Access tokens</h2><p>Names and budgets are visible; token secrets are not recoverable here.</p></div>{token_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="access-tokens-table"><caption class="sr-only">Gateway access tokens, budgets, scopes, and status</caption><thead><tr><th>Name</th><th>Budget use</th><th>Last used</th><th>Scope</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></div>{token_filter_empty}</div><footer class="panel-footer"><span>Create and revoke with <code>mayhem tokens</code>. Never paste tokens into support messages.</span><span>{token_summary}</span>{token_pagination}</footer></section>"##,
-        metric_status(
-            "Endpoint",
-            &status_badge("OpenAI-compatible", "info"),
-            "The base URL below comes from this dashboard's address.",
-            "Gateway"
-        ),
-        metric_status(
-            "Authentication",
-            &status_badge(auth, if data.requires_auth() { "info" } else { "good" }),
-            if data.requires_auth() {
-                "Requests need an active access token."
-            } else {
-                "Requests work without a key on this gateway."
-            },
-            "Access"
-        ),
-        metric(
-            "Active tokens",
-            &token_count.to_string(),
-            "Token secrets stay in the apps that hold them",
-            "Current"
-        ),
-        html_escape(&base_url),
-        html_escape(&env_block),
-        if credential_ready { "done" } else { "active" },
+    let connection_title = if credential_ready {
+        "Ready to connect"
+    } else {
+        "API key needed"
+    };
+    let connection_tone = if credential_ready { "good" } else { "warn" };
+    let connection_mark = if credential_ready { "&#10003;" } else { "!" };
+    let auth_summary = if data.requires_auth() {
+        "API key required"
+    } else {
+        "No API key required"
+    };
+    let active_token_summary = if token_count == 1 {
+        "1 active access token".to_owned()
+    } else {
+        format!("{token_count} active access tokens")
+    };
+    let local_scope_copy = if root.contains("127.0.0.1") || root.contains("localhost") {
+        "This address works only for applications running on this computer."
+    } else {
+        "Use this address in applications that can reach this gateway."
+    };
+    let api_key_copy = if data.requires_auth() {
+        "Authentication is enabled. Paste an active Mayhem access token into your app's API-key field."
+    } else {
+        "No API key is required. Some apps still require text in the API-key field, so use not-required as a harmless placeholder."
+    };
+    let credential_class = if credential_ready { "done" } else { "active" };
+    let credential_mark = if credential_ready { "&#10003;" } else { "2" };
+    let credential_copy = if data.requires_auth() {
         if credential_ready {
-            "&#10003;"
+            "An active Mayhem token is available for authenticated requests."
         } else {
-            "&rarr;"
-        },
-        if data.requires_auth() {
-            "Use an active token created by the CLI."
-        } else {
-            "No credential is required for requests to this gateway."
-        },
-        if credential_ready { "active" } else { "" },
-        if credential_ready { "&rarr;" } else { "" },
-        if !credential_ready {
-            "Available after a gateway credential is active."
-        } else if data.models.is_empty() {
-            "Inspect the catalog before attempting inference."
-        } else if accepting_models == 0 {
-            "Inspect model availability before attempting inference."
-        } else {
-            "Send a Playground request to test a model and provider."
-        },
+            "Create an active Mayhem token before connecting an app."
+        }
+    } else {
+        "This gateway accepts requests without an API key."
+    };
+    let request_copy = if !credential_ready {
+        "Available after an API key is configured."
+    } else if data.models.is_empty() {
+        "Inspect the catalog before sending a test request."
+    } else if accepting_models == 0 {
+        "Wait for model capacity before sending a test request."
+    } else {
+        "Not tested yet. Send one Playground request to confirm a model route."
+    };
+    let token_panel_open = if !credential_ready { " open" } else { "" };
+    let token_scope_copy = if data.requires_auth() {
+        "View API keys used by connected apps and learn how to create or revoke them."
+    } else {
+        "Optional here; useful for shared apps, budgets, and usage tracking."
+    };
+    let base_url_html = html_escape(&base_url);
+    let env_block_html = html_escape(&env_block);
+    let content = format!(
+        r##"<section class="connect-ready {connection_tone}"><span class="connect-ready-mark" aria-hidden="true">{connection_mark}</span><div class="connect-ready-copy"><span>Connection status</span><h2>{connection_title}</h2><p>{auth_summary}<span aria-hidden="true"> &middot; </span>{active_token_summary}</p></div><span class="status-badge info">OpenAI-compatible</span></section><section class="dashboard-layout connect-layout"><div class="stack"><section class="panel connect-setup"><header class="panel-head"><div class="panel-title"><h2>Connection details</h2><p>Use these values in an app that accepts a custom OpenAI API address.</p></div></header><div class="panel-body connect-steps"><section class="connect-step"><div class="connect-step-heading"><span aria-hidden="true">1</span><div><h3>Copy your Mayhem address</h3><p>This tells the app where to send AI requests.</p></div></div><div class="code-block"><code id="gateway-base-url">{base_url_html}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-base-url" data-product-event="integration_base_url_copied" aria-label="Copy Mayhem API address"><span data-copy-label>Copy</span></button></div><p class="connect-helper"><strong>On this device:</strong> {local_scope_copy}</p></section><section class="connect-step"><div class="connect-step-heading"><span aria-hidden="true">2</span><div><h3>Paste the values into your app</h3><p>Apps may call these fields Base URL and API key.</p></div></div><pre class="code-block"><code id="gateway-env">{env_block_html}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-env" data-product-event="integration_environment_copied" aria-label="Copy connection values"><span data-copy-label>Copy</span></button></pre><p class="connect-helper">{api_key_copy}</p></section><section class="connect-step"><div class="connect-step-heading"><span aria-hidden="true">3</span><div><h3>Send a test request</h3><p>Check the gateway, then use Playground to confirm a real model route.</p></div></div><div class="connect-step-actions"><button class="quiet-button js-only" type="button" data-connection-test data-result-target="#connection-result">Check gateway connection</button>{connection_action}</div><div class="notice" id="connection-result" hidden></div></section></div></section></div><aside class="stack"><section class="panel connect-checklist"><header class="panel-head"><div class="panel-title"><h2>Connection checklist</h2><p>Three clear checks before using another app.</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step done"><span class="check-mark">&#10003;</span><div class="check-copy"><strong>Gateway connection</strong><span>This dashboard can reach the Mayhem gateway.</span></div></div><div class="check-step {credential_class}"><span class="check-mark">{credential_mark}</span><div class="check-copy"><strong>API key</strong><span>{credential_copy}</span></div></div><div class="check-step pending"><span class="check-mark">3</span><div class="check-copy"><strong>Model request</strong><span>{request_copy}</span></div></div></div></div></section></aside></section>{token_store_notice}<details class="panel disclosure-panel token-management section-gap" id="access-tokens"{token_panel_open}><summary><span class="token-management-summary"><strong>Access tokens</strong><small>{token_scope_copy}</small></span><span class="status-badge">{token_count} active &middot; {token_total} total</span></summary><div class="token-management-content"><section class="token-create-guide" aria-labelledby="token-create-title"><div class="token-create-copy"><span class="token-create-kicker">Terminal setup</span><h2 id="token-create-title">Need a new token?</h2><p>Run this command in a terminal where Mayhem is installed. Give each app its own descriptive name.</p></div><div class="code-block token-create-command"><code id="token-create-command">mayhem tokens create --name my-app --budget 10/day --max-rate 60</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#token-create-command" data-product-event="access_token_command_copied" aria-label="Copy access token creation command"><span data-copy-label>Copy</span></button></div><div class="token-secret-note"><span aria-hidden="true">!</span><p><strong>Copy the generated token immediately.</strong> The <code>sk-mayhem-...</code> secret is shown only once. Paste it into your app's API-key field and keep it private.</p></div></section><header class="panel-head"><div class="panel-title"><h2>Existing tokens</h2><p>This dashboard is read-only. It shows names, limits, and usage&mdash;never token secrets.</p></div>{token_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="access-tokens-table"><caption class="sr-only">Gateway access tokens, budgets, scopes, and status</caption><thead><tr><th>Name</th><th>Budget use</th><th>Last used</th><th>Scope</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></div>{token_filter_empty}</div><footer class="panel-footer"><span>List with <code>mayhem tokens list</code> or revoke with <code>mayhem tokens revoke &lt;name&gt;</code>.</span><span>{token_summary}</span>{token_pagination}</footer></div></details>"##,
     );
     shell(
         data,
         expires,
         DashboardAppPage::Connect,
         "Integrations",
-        "Connect the tools you already use",
-        "Use one base URL for OpenAI-compatible apps, then confirm inference separately from gateway reachability.",
-        if credential_ready { "Connection ready" } else { "Credential needed" },
+        "Connect another AI app",
+        "Use OpenMayhem from any app that supports a custom OpenAI API address.",
+        if credential_ready {
+            "Connection ready"
+        } else {
+            "Credential needed"
+        },
         if credential_ready { "good" } else { "warn" },
-        connection_action,
+        "",
         &content,
     )
 }
@@ -3102,19 +3304,12 @@ fn earn_overview_page(
         html_escape(claimable.basis),
         activation = provider_activation_panel(data, &state, &entries),
     );
-    // A healthy page keeps a stable name; degraded states keep their status as
-    // the heading so the problem is impossible to miss.
-    let heading = if state.kind == RouteStateKind::Accepting {
-        "Earn with this machine"
-    } else {
-        state.label
-    };
     shell(
         data,
         expires,
         DashboardAppPage::Earn,
         "Provider operations",
-        heading,
+        "Provider overview",
         &state.explanation,
         state.label,
         state.tone,
@@ -3560,7 +3755,7 @@ fn earn_opportunities_page(
         expires,
         DashboardAppPage::Earn,
         "Provider planning",
-        "Model fit",
+        "Model opportunities",
         "Which catalog models this machine can run, next to what the network currently supplies.",
         state.label,
         state.tone,
@@ -3831,7 +4026,7 @@ fn network_overview_page(data: &DashboardData, expires: u64) -> String {
     } else {
         ("Supply exceptions", "warn")
     };
-    shell_wide(data, expires, DashboardAppPage::Network, "Explore", "Network health without the noise", "Current advertised capacity and anything missing it, with model, provider, market, and evidence views one tab away.", status, tone, "", &content)
+    shell_wide(data, expires, DashboardAppPage::Network, "Explore", "Network health", "Current provider capacity, route availability, market conditions, and supporting evidence.", status, tone, "", &content)
 }
 
 fn network_models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
@@ -4048,7 +4243,7 @@ fn network_activity_page(
         expires,
         DashboardAppPage::Network,
         "Network analysis",
-        "Route snapshot",
+        "Route status",
         "Every observed route, ordered by heartbeat freshness.",
         "Snapshot",
         "",
@@ -4201,23 +4396,23 @@ fn network_evidence_page(
 
 fn help_page(data: &DashboardData, expires: u64) -> String {
     let provider_start = if data.local_provider_id.is_some() {
-        r##"<a class="soft-button" href="/mayhem/dashboard/earn">Open Earn</a>"##
+        r##"<a class="soft-button" href="/mayhem/dashboard/earn">Open Provider overview</a>"##
     } else {
         r##"<a class="soft-button" href="/mayhem/dashboard/earn">Start provider setup</a>"##
     };
     let content = format!(
-        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Choose what you want to do</h2><p>Each path ends in evidence you can inspect.</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step active"><span class="check-mark" aria-hidden="true">1</span><div class="check-copy"><strong>Use a model in the browser</strong><span>Choose a model, send a real request, then inspect its final or incomplete record.</span><a class="soft-button" href="/mayhem/dashboard/playground">Open Playground</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">2</span><div class="check-copy"><strong>Connect an OpenAI-compatible app</strong><span>Copy the base URL, understand authentication, then test inference separately.</span><a class="soft-button" href="/mayhem/dashboard/connect">Open Integrations</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">3</span><div class="check-copy"><strong>Provide compute</strong><span>Scope Earn to this gateway's provider identity, then inspect preparation, routes, and ledger records.</span>{provider_start}</div></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>What the dashboard can prove</h2><p>Labels stay tied to their source.</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Catalog</span><strong>Models, capabilities, routes, and reference prices</strong></div><div class="fact"><span>Heartbeat</span><strong>Recent advertised acceptance, slots, queue, and performance</strong></div><div class="fact"><span>Receipt</span><strong>Signed metering state recorded by this gateway</strong></div><div class="fact"><span>Ledger snapshot</span><strong>Last-known balance, earnings, holds, and payouts</strong></div></div><p class="notice section-gap"><strong>Read labels literally.</strong> Advertised capacity is not a promise that a request will route. A non-final receipt or retained pause is not proof that execution is still active. Refresh when a live-evidence label expires.</p></div></section></div><aside class="stack"><details class="panel disclosure-panel" open><summary>Essential terms</summary><div class="panel-body"><div class="checklist"><div class="check-step"><span class="check-mark" aria-hidden="true">A</span><div class="check-copy"><strong>Advertised capacity</strong><span>A fresh provider heartbeat reports acceptance and free capacity; live routing still checks price, policy, capability, reputation, and attestation.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">R</span><div class="check-copy"><strong>Final receipt</strong><span>The gateway recorded final metering evidence for a session. Settlement and provider-job state remain separate.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">E</span><div class="check-copy"><strong>Evidence</strong><span>Verify opens structured facts and the raw gateway snapshot only when requested.</span></div></div></div></div></details><details class="panel disclosure-panel"><summary>Attestation tiers</summary><div class="panel-body"><p class="notice"><strong>Tiers are different evidence classes, not privacy supersets.</strong> A higher number can satisfy the gateway's numeric minimum without inheriting every lower tier's protection. Verify the route evidence for the property you need.</p></div></details><details class="panel disclosure-panel"><summary>Money and privacy</summary><div class="panel-body"><p>Hide amounts masks dashboard text and redacts money cells from shown-page CSV exports. It does not change gateway data, transaction state, or previously saved files.</p></div></details></aside></section>"##,
+        r##"<section class="dashboard-layout help-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Get started</h2><p>Choose the path that matches what you want to do.</p></div></header><div class="panel-body"><div class="checklist help-paths"><div class="check-step active"><span class="check-mark" aria-hidden="true">1</span><div class="check-copy"><strong>Use AI</strong><span>Choose a model, send a request, and review its result and receipt.</span><a class="soft-button" href="/mayhem/dashboard/playground">Open Playground</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">2</span><div class="check-copy"><strong>Connect an app</strong><span>Copy the Mayhem API address and add it to an OpenAI-compatible application.</span><a class="soft-button" href="/mayhem/dashboard/connect">Open Integrations</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">3</span><div class="check-copy"><strong>Provide compute</strong><span>Set up this machine, monitor its serving routes, and review earnings.</span>{provider_start}</div></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Common problems</h2><p>Start with the symptom you can see.</p></div></header><div class="help-problems"><details class="help-problem"><summary><span>No models are available</span><small>Check catalog and provider availability</small></summary><div><p>A usable model needs both a catalog entry and a fresh provider advertising capacity. Review availability before retrying.</p><a class="soft-button" href="/mayhem/dashboard/models">Review models</a></div></details><details class="help-problem"><summary><span>A request failed or remains open</span><small>Inspect its latest recorded state</small></summary><div><p>Activity shows the final receipt or latest open record. An open record does not prove that execution is still running.</p><a class="soft-button" href="/mayhem/dashboard/activity">Open Activity</a></div></details><details class="help-problem"><summary><span>I need to add funds</span><small>Check the ledger balance and deposit flow</small></summary><div><p>Billing shows the last-known ledger balance and the commands needed to start or confirm a deposit.</p><a class="soft-button" href="/mayhem/dashboard/wallet">Open Billing</a></div></details><details class="help-problem"><summary><span>My API key is rejected</span><small>Confirm whether authentication is required</small></summary><div><p>Integrations shows the current authentication requirement and explains how to create and use a Mayhem access token.</p><a class="soft-button" href="/mayhem/dashboard/connect#access-tokens">Review access tokens</a></div></details><details class="help-problem"><summary><span>My provider receives no work</span><small>Check heartbeat, capacity, and route state</small></summary><div><p>A configured provider also needs a fresh heartbeat, free slots, and an accepting serving route.</p><a class="soft-button" href="/mayhem/dashboard/earn/machines">Inspect serving routes</a></div></details></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>What dashboard data means</h2><p>Every label has a source and a limit.</p></div></header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table help-meaning-table"><caption class="sr-only">Dashboard data sources, meanings, and limitations</caption><thead><tr><th>Source</th><th>What it tells you</th><th>What it does not guarantee</th></tr></thead><tbody><tr><th scope="row">Catalog</th><td>Model capabilities and reference terms</td><td>A final price or an available provider</td></tr><tr><th scope="row">Heartbeat</th><td>A provider recently advertised its state and capacity</td><td>That your next request will route</td></tr><tr><th scope="row">Receipt</th><td>The gateway recorded a request and its metering state</td><td>That payment settlement is complete</td></tr><tr><th scope="row">Ledger</th><td>The last-known balance, earnings, holds, and payouts</td><td>That the values remain current after freshness expires</td></tr></tbody></table></div></div><footer class="panel-footer"><span>Refresh expired live data and verify important claims at their source.</span><a href="/mayhem/dashboard/network/evidence">Open network evidence</a></footer></section></div><aside class="stack help-reference"><details class="panel disclosure-panel" open><summary>Essential terms</summary><div class="panel-body"><div class="checklist help-terms"><div class="check-step"><span class="check-mark" aria-hidden="true">A</span><div class="check-copy"><strong>Advertised capacity</strong><span>A provider recently reported that it is accepting work and has free capacity. Routing still checks price, policy, capabilities, reputation, and verification requirements.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">R</span><div class="check-copy"><strong>Final receipt</strong><span>The gateway finished recording the request's usage and outcome. Payment settlement is a separate state.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">E</span><div class="check-copy"><strong>Evidence</strong><span>The exact structured facts and raw gateway snapshot supporting a dashboard claim.</span></div></div></div></div></details><details class="panel disclosure-panel"><summary>Advanced verification</summary><div class="panel-body help-disclosure-copy"><h3>Attestation is a compatibility check</h3><p>A higher tier number does not automatically include every protection from a lower tier. Check the route evidence for the exact property your application requires.</p><a class="soft-button" href="/mayhem/dashboard/network/evidence">Review network evidence</a></div></details><details class="panel disclosure-panel"><summary>Privacy and exports</summary><div class="panel-body help-disclosure-copy"><p>Hide amounts masks dashboard text and redacts money cells from new shown-page CSV exports. It does not change gateway data, transactions, or files you already saved.</p><a class="soft-button" href="/mayhem/dashboard/settings">Review privacy settings</a></div></details></aside></section>"##,
     );
     shell(
         data,
         expires,
         DashboardAppPage::Help,
-        "Learn Mayhem",
-        "How Mayhem works",
-        "Three short paths, a small glossary, and what each label proves — with evidence one click away.",
-        "Reference",
+        "Support",
+        "Help",
+        "Start using Mayhem, connect an app, provide compute, or troubleshoot a request.",
+        "Guidance",
         "",
-        r##"<a class="primary-button" href="/mayhem/dashboard/playground">Open Playground</a>"##,
+        "",
         &content,
     )
 }
@@ -5319,7 +5514,7 @@ fn earn_subnav(active: DashboardProductPage) -> String {
         DashboardProductPage::EarnOpportunities | DashboardProductPage::EarnReliability
     );
     format!(
-        r##"{}<details class="subnav-advanced"{}><summary>Advanced provider analysis</summary><div><a href="/mayhem/dashboard/earn/opportunities"{}>Model fit</a><a href="/mayhem/dashboard/earn/reliability"{}>Reliability</a></div></details>"##,
+        r##"{}<details class="subnav-advanced"{}><summary>Advanced provider analysis</summary><div><a href="/mayhem/dashboard/earn/opportunities"{}>Model opportunities</a><a href="/mayhem/dashboard/earn/reliability"{}>Reliability</a></div></details>"##,
         contextual_nav("Earn", active, &links),
         if advanced_open { " open" } else { "" },
         if active == DashboardProductPage::EarnOpportunities {
@@ -6711,9 +6906,7 @@ mod tests {
             None,
         );
         assert!(current.contains("dashboard-new-token"));
-        assert!(current.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">1</div>"#
-        ));
+        assert!(current.contains("1 active access token"));
         assert!(current.contains("$1.00 / $10.00"));
         assert!(current.contains("lifetime total"));
 
@@ -6725,9 +6918,7 @@ mod tests {
             "http://127.0.0.1:11435",
             None,
         );
-        assert!(revoked.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">0</div>"#
-        ));
+        assert!(revoked.contains("0 active access tokens"));
         assert!(revoked.contains(">Inactive<"));
         let _ = fs::remove_file(path);
     }

@@ -1854,7 +1854,7 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Mayhem is ready to try"));
+        assert!(html.contains("<h1>Overview</h1>"));
         assert!(html.contains(r#"class="app-shell""#));
         assert!(html.contains("Recent activity"));
         assert!(html.contains(r#"<body class="has-workbench">"#));
@@ -1867,7 +1867,8 @@ mod tests {
     async fn auth_required_first_use_flow_stops_before_inference() {
         let app = dashboard_workbench_router().expect("workbench router");
         let home = rendered_workbench_page(&app, "/mayhem/dashboard?scenario=auth-required").await;
-        assert!(home.contains("<h1>Create a gateway credential</h1>"));
+        assert!(home.contains("<h1>Overview</h1>"));
+        assert!(home.contains("Credential needed"));
         assert!(home.contains(
             r#"href="/mayhem/dashboard/connect" data-product-event="use_ai_path_opened">Set up access"#
         ));

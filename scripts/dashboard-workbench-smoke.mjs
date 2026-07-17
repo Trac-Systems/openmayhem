@@ -55,6 +55,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard',
     title: 'Mayhem Home',
     pageLabel: 'Home',
+    heading: 'Overview',
     primaryPath: '/mayhem/dashboard',
     markers: ['aria-label="Current gateway summary"', 'aria-label="Next actions"'],
   },
@@ -71,7 +72,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/models',
     title: 'Mayhem Models',
     pageLabel: 'Model catalog',
-    heading: 'Choose by what the work needs',
+    heading: 'Model catalog',
     primaryPath: '/mayhem/dashboard/models',
     markers: ['id="models-table"', '<caption class="sr-only">Models in this gateway catalog</caption>'],
   },
@@ -98,7 +99,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/connect',
     title: 'Mayhem Connect',
     pageLabel: 'Integrations',
-    heading: 'Connect the tools you already use',
+    heading: 'Connect another AI app',
     primaryPath: '/mayhem/dashboard/connect',
     markers: ['id="gateway-base-url"', 'id="connection-result"', 'data-connection-test'],
   },
@@ -134,9 +135,9 @@ const PRODUCT_ROUTES = [
   {
     id: 'earn-opportunities',
     path: '/mayhem/dashboard/earn/opportunities',
-    title: 'Mayhem Model fit',
+    title: 'Mayhem Model opportunities',
     pageLabel: 'Earn',
-    heading: 'Model fit',
+    heading: 'Model opportunities',
     primaryPath: '/mayhem/dashboard/earn',
     context: 'Earn',
     markers: ['id="model-fit-table"'],
@@ -166,7 +167,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/network',
     title: 'Mayhem Network',
     pageLabel: 'Network',
-    heading: 'Network health without the noise',
+    heading: 'Network health',
     primaryPath: '/mayhem/dashboard/network',
     context: 'Network',
     markers: ['<table class="data-table">'],
@@ -206,7 +207,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/network/activity',
     title: 'Mayhem Network activity',
     pageLabel: 'Network',
-    heading: 'Route snapshot',
+    heading: 'Route status',
     primaryPath: '/mayhem/dashboard/network',
     context: 'Network',
     markers: ['id="network-activity-table"'],
@@ -226,9 +227,9 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/help',
     title: 'Mayhem Help',
     pageLabel: 'Help',
-    heading: 'How Mayhem works',
+    heading: 'Help',
     primaryPath: '/mayhem/dashboard/help',
-    markers: ['Choose what you want to do', 'Essential terms', 'Attestation tiers'],
+    markers: ['Get started', 'Common problems', 'What dashboard data means', 'Advanced verification'],
   },
   {
     id: 'settings',
@@ -790,7 +791,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
       );
     }
     if (route.id === 'models') {
-      report.includes(html, '<th scope="row">', scope, 'uses model names as row headers');
+      report.includes(html, 'data-model-detail-open', scope, 'opens model details from the model identity');
       report.includes(html, 'aria-label="Use ', scope, 'gives repeated Use links model-specific names');
     }
     if (route.id === 'earn-reliability') {
@@ -822,7 +823,8 @@ function checkScenarioSemantics(report, scenario, route, html) {
 
   if (scenario === 'auth-required') {
     if (route.id === 'home') {
-      report.includes(html, '<h1>Create a gateway credential</h1>', scope, 'surfaces the missing credential as the next setup step');
+      report.includes(html, '<h1>Overview</h1>', scope, 'keeps a stable page title when a credential is missing');
+      report.includes(html, 'Credential needed', scope, 'surfaces the missing credential as the current status');
       report.includes(
         html,
         'href="/mayhem/dashboard/connect" data-product-event="use_ai_path_opened">Set up access',
@@ -849,13 +851,14 @@ function checkScenarioSemantics(report, scenario, route, html) {
       report.includes(html, 'Credential needed', scope, 'reports the connection blocker');
       report.includes(html, 'No gateway tokens', scope, 'explains how to create the first token');
       report.includes(html, 'class="primary-button" href="#access-tokens">Set up credential', scope, 'keeps the primary action on credential setup');
-      report.includes(html, 'Available after a gateway credential is active.', scope, 'keeps inference pending behind the credential step');
+      report.includes(html, 'Available after an API key is configured.', scope, 'keeps inference pending behind the credential step');
     }
   }
 
   if (scenario === 'empty') {
     if (route.id === 'home') {
-      report.includes(html, '<h1>Set up your first model</h1>', scope, 'frames the empty catalog as a setup step');
+      report.includes(html, '<h1>Overview</h1>', scope, 'keeps a stable page title for the empty catalog');
+      report.includes(html, 'No models yet', scope, 'identifies the empty catalog in the page status');
     }
     if (route.id === 'playground') {
       report.includes(html, 'class="empty-block"', scope, 'renders a purposeful empty state');
@@ -894,17 +897,20 @@ function checkScenarioSemantics(report, scenario, route, html) {
 
   if (scenario === 'loading') {
     if (route.id === 'home') {
-      report.includes(html, '<h1>Gateway ready, routes unavailable</h1>', scope, 'keeps route unavailability explicit while loading');
+      report.includes(html, '<h1>Overview</h1>', scope, 'keeps a stable page title while routes load');
+      report.includes(html, 'No advertised capacity', scope, 'keeps route unavailability explicit while loading');
       report.includes(html, 'No provider advertises accepting capacity', scope, 'does not treat preparation progress as available capacity');
     }
     if (route.id === 'earn') {
-      report.includes(html, '<h1>Preparing a model</h1>', scope, 'names the active preparation state');
+      report.includes(html, '<h1>Provider overview</h1>', scope, 'keeps a stable provider page title during preparation');
+      report.includes(html, 'Preparing a model', scope, 'names the active preparation state');
       report.includes(html, 'Download is 68% complete', scope, 'exposes deterministic preparation progress');
     }
   }
 
   if (scenario === 'failure' && route.id === 'earn') {
-    report.includes(html, '<h1>Setup blocked by model failure</h1>', scope, 'names the failed preparation state');
+    report.includes(html, '<h1>Provider overview</h1>', scope, 'keeps a stable provider page title after a setup failure');
+    report.includes(html, 'Setup blocked by model failure', scope, 'names the failed preparation state');
     report.includes(html, ': verify catalog artifact', scope, 'qualifies the failure with its model');
     report.includes(html, 'artifact signature mismatch', scope, 'surfaces the actionable failure reason');
   }
@@ -917,7 +923,8 @@ function checkScenarioSemantics(report, scenario, route, html) {
 
   if (scenario === 'offline') {
     if (route.id === 'home') {
-      report.includes(html, '<h1>Gateway ready, routes unavailable</h1>', scope, 'surfaces that routes are unavailable');
+      report.includes(html, '<h1>Overview</h1>', scope, 'keeps a stable page title while routes are offline');
+      report.includes(html, 'No advertised capacity', scope, 'surfaces that routes are unavailable');
       report.includes(html, 'No provider advertises accepting capacity', scope, 'does not treat offline routes as accepting capacity');
     }
     if (route.id === 'network') {
@@ -1342,9 +1349,8 @@ async function exerciseWorkbench(baseUrl, options) {
         'does not embed per-row evidence dialogs or payload IDs',
       );
       const evidenceLinkCount = countOccurrences(response.text, 'data-evidence-url');
-      report.equal(
-        countOccurrences(response.text, 'href="/mayhem/dashboard/evidence?'),
-        evidenceLinkCount,
+      report.check(
+        countOccurrences(response.text, 'href="/mayhem/dashboard/evidence?') >= evidenceLinkCount,
         scope,
         'backs every evidence trigger with a progressively enhanced link',
       );

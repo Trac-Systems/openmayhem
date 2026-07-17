@@ -5232,7 +5232,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let connect = String::from_utf8(bytes).expect("connect dashboard html");
-    assert!(connect.contains("OpenAI-compatible connection"));
+    assert!(connect.contains("Connection details"));
     assert!(connect.contains("http://127.0.0.1:11435/v1"));
     assert!(connect.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
     assert_no_external_urls(&connect);
@@ -5723,7 +5723,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("network dashboard html");
-    assert!(body.contains("Network health without the noise"));
+    assert!(body.contains("Network health"));
     assert!(body.contains("Catalog models"));
     assert!(body.contains("Canonical providers"));
     assert!(body.contains("Fresh routes"));

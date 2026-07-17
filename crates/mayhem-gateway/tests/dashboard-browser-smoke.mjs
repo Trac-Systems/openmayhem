@@ -151,6 +151,17 @@ try {
           .filter((element) => visible(element) && !element.closest('[data-workbench-chrome]'))
           .filter((element) => element.getBoundingClientRect().height < 43.5)
           .map((element) => `${element.tagName}:${(element.textContent || element.getAttribute('aria-label') || '').trim()}`);
+        const misalignedCodeCopies = [...document.querySelectorAll('.code-block .copy-corner')]
+          .filter((element) => visible(element) && !element.closest('[data-workbench-chrome]'))
+          .filter((element) => {
+            const button = element.getBoundingClientRect();
+            const block = element.closest('.code-block').getBoundingClientRect();
+            const clipped = button.top < block.top || button.bottom > block.bottom;
+            const singleLineOffCenter = block.height <= 64
+              && Math.abs((button.top + button.bottom - block.top - block.bottom) / 2) > 1.5;
+            return clipped || singleLineOffCenter;
+          })
+          .map((element) => (element.textContent || element.getAttribute('aria-label') || '').trim());
         const mobileNav = document.querySelector('.mobile-bottom-nav');
         const topStatus = document.querySelector('.topbar-status');
         return {
@@ -160,6 +171,7 @@ try {
           duplicateIds: ids.length - new Set(ids).size,
           unnamed: interactive.filter((element) => !accessibleName(element)).length,
           undersized,
+          misalignedCodeCopies,
           mobileNavVisible: mobileNav ? visible(mobileNav) : false,
           topStatusVisible: topStatus ? visible(topStatus) : false,
           openDialogs: [...document.querySelectorAll('dialog')].filter((dialog) => dialog.open).length,
@@ -176,6 +188,12 @@ try {
         'keeps visible application targets at least 44px high',
         audit.undersized.join(' | '),
       );
+      check(
+        audit.misalignedCodeCopies.length === 0,
+        scope,
+        'keeps command copy buttons centered and inside their code blocks',
+        audit.misalignedCodeCopies.join(' | '),
+      );
       equal(audit.openDialogs, 0, scope, 'does not open a dialog on navigation');
       if (viewport.width <= 780) {
         check(audit.mobileNavVisible, scope, 'shows compact mobile navigation');
@@ -185,6 +203,47 @@ try {
       }
     }
   }
+
+  const professionalHeadings = [
+    ['/mayhem/dashboard', 'Overview'],
+    ['/mayhem/dashboard/models', 'Model catalog'],
+    ['/mayhem/dashboard/earn', 'Provider overview'],
+    ['/mayhem/dashboard/earn/opportunities', 'Model opportunities'],
+    ['/mayhem/dashboard/network', 'Network health'],
+    ['/mayhem/dashboard/network/activity', 'Route status'],
+  ];
+  for (const [path, heading] of professionalHeadings) {
+    await open(path);
+    equal(await page.locator('h1').innerText(), heading, 'page naming', `uses the descriptive heading for ${path}`);
+  }
+  for (const scenario of ['auth-required', 'empty', 'loading', 'failure', 'offline', 'update-required']) {
+    await open('/mayhem/dashboard', scenario);
+    equal(await page.locator('h1').innerText(), 'Overview', 'page naming', `keeps the Home heading stable in ${scenario}`);
+    await open('/mayhem/dashboard/earn', scenario);
+    equal(await page.locator('h1').innerText(), 'Provider overview', 'page naming', `keeps the Provider heading stable in ${scenario}`);
+  }
+
+  await open('/mayhem/dashboard/settings');
+  const settingsNavIcon = page.locator('.app-nav a[href="/mayhem/dashboard/settings"] .nav-icon svg');
+  equal(await settingsNavIcon.count(), 1, 'navigation icons', 'renders one Settings navigation icon');
+  equal(await settingsNavIcon.locator('circle').count(), 1, 'navigation icons', 'uses a centered hub in the Settings gear');
+  check(
+    (await settingsNavIcon.locator('path').getAttribute('d'))?.startsWith('M12.22 2h-.44'),
+    'navigation icons',
+    'uses a complete gear outline for Settings',
+  );
+
+  await open('/mayhem/dashboard/help');
+  equal(await page.locator('h1').innerText(), 'Help', 'Help experience', 'uses a stable page title');
+  equal(await page.locator('.page-head-actions').locator('a,button').count(), 0, 'Help experience', 'does not duplicate a task action in the page header');
+  equal(await page.getByRole('link', { name: 'Open Playground' }).count(), 1, 'Help experience', 'offers the Playground action only in its relevant path');
+  equal(await page.locator('.help-problem').count(), 5, 'Help experience', 'covers the five launch-critical recovery paths');
+  equal(await page.locator('.help-meaning-table tbody tr').count(), 4, 'Help experience', 'maps every dashboard data source to its meaning and limitation');
+  check(Number.parseFloat(await page.locator('.help-terms .check-copy span').first().evaluate((element) => getComputedStyle(element).fontSize)) >= 13, 'Help experience', 'keeps explanatory terms readable');
+  const accessTokenProblem = page.locator('.help-problem').filter({ hasText: 'My API key is rejected' });
+  await accessTokenProblem.locator('summary').click();
+  equal(await accessTokenProblem.getByRole('link', { name: 'Review access tokens' }).getAttribute('href'), '/mayhem/dashboard/connect#access-tokens', 'Help experience', 'routes rejected credentials to the relevant recovery section');
+  check(await page.getByText('Advanced verification', { exact: true }).isVisible(), 'Help experience', 'keeps attestation guidance under an advanced disclosure');
 
   await page.setViewportSize({ width: 320, height: 568 });
   await open('/mayhem/dashboard');
@@ -210,6 +269,46 @@ try {
   check(!new URL(page.url()).searchParams.has('q'), 'table filter', 'Escape removes the persisted query');
   check(await page.locator('.pagination a').evaluateAll((links) => links.every((link) => !new URL(link.href).searchParams.has('q'))), 'table filter', 'Escape resynchronizes pagination links');
 
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open('/mayhem/dashboard/models');
+  const catalogAudit = await page.locator('#models-table').evaluate((table) => {
+    const wrap = table.closest('.data-table-wrap');
+    const rows = [...table.querySelectorAll('tbody tr')];
+    const logos = [...table.querySelectorAll('.catalog-model-logo img')];
+    return {
+      rowCount: rows.length,
+      unloadedLogos: logos.filter((logo) => !logo.complete || logo.naturalWidth === 0).map((logo) => logo.getAttribute('src')),
+      rowsWithoutCapabilities: rows.filter((row) => !row.querySelector('.catalog-capability')).length,
+      rowsWithoutStructuredPrices: rows.filter((row) => !row.querySelector('.catalog-price-line')).length,
+      internalOverflow: wrap ? Math.ceil(wrap.scrollWidth - wrap.clientWidth) : Number.POSITIVE_INFINITY,
+    };
+  });
+  check(catalogAudit.rowCount > 0, 'model catalog', 'renders catalog rows');
+  equal(catalogAudit.unloadedLogos.length, 0, 'model catalog', 'loads every visible lab logo');
+  equal(catalogAudit.rowsWithoutCapabilities, 0, 'model catalog', 'groups capabilities into scannable labels');
+  equal(catalogAudit.rowsWithoutStructuredPrices, 0, 'model catalog', 'separates price amounts from billing units');
+  check(catalogAudit.internalOverflow <= 1, 'model catalog', 'fits the comparison list without desktop horizontal scrolling', `${catalogAudit.internalOverflow}px overflow`);
+  const capabilityDisclosure = page.locator('[data-catalog-capabilities-toggle]').first();
+  check(await capabilityDisclosure.count() === 1, 'model catalog capabilities', 'offers an explicit control for additional capabilities');
+  if (await capabilityDisclosure.count()) {
+    await capabilityDisclosure.click();
+    equal(await capabilityDisclosure.getAttribute('aria-expanded'), 'true', 'model catalog capabilities', 'expands additional capabilities');
+    check(await page.locator('#models-table tbody tr').first().locator('.catalog-capability-extra:not([hidden])').count() > 0, 'model catalog capabilities', 'shows every additional capability inline');
+    equal((await capabilityDisclosure.innerText()).trim(), 'Show less', 'model catalog capabilities', 'offers a clear collapse action');
+    await capabilityDisclosure.click();
+    equal(await capabilityDisclosure.getAttribute('aria-expanded'), 'false', 'model catalog capabilities', 'collapses additional capabilities');
+  }
+  const modelDetailTrigger = page.locator('[data-model-detail-open]').first();
+  await modelDetailTrigger.click();
+  const modelDetailDialog = page.locator('#model-detail-dialog');
+  check(await modelDetailDialog.evaluate((element) => element.open), 'model details', 'opens from the model identity');
+  check(await modelDetailDialog.locator('.model-detail-capability').count() > 4, 'model details', 'shows the complete capability set');
+  check(await modelDetailDialog.locator('.model-detail-price .catalog-price-line').count() > 0, 'model details', 'shows structured catalog pricing');
+  check(await modelDetailDialog.getByRole('link', { name: 'Use in Playground' }).count() === 1, 'model details', 'offers the primary Playground action');
+  check(await modelDetailDialog.getByRole('link', { name: 'Verify evidence' }).count() === 1, 'model details', 'keeps evidence as a separate secondary action');
+  await modelDetailDialog.getByRole('button', { name: 'Close model details' }).click();
+  check(await modelDetailTrigger.evaluate((trigger) => trigger === document.activeElement), 'model details', 'returns focus to the model identity');
+
   await page.setViewportSize({ width: 390, height: 844 });
   await open('/mayhem/dashboard/models', 'scale');
   const evidenceTrigger = page.locator('[data-evidence-url]').first();
@@ -221,6 +320,26 @@ try {
     return facts && (facts.textContent || '').trim().length > 0;
   });
   check(await dialog.locator('[data-evidence-facts]').innerText().then((text) => text.trim().length > 0), 'evidence dialog', 'renders structured facts');
+  check(await dialog.locator('[data-evidence-fact-count]').innerText().then((text) => /\d+ facts?/.test(text)), 'evidence dialog', 'summarizes the number of human-readable facts');
+  check(await dialog.locator('[data-evidence-interpretation]').innerText().then((text) => text.trim().length > 0), 'evidence dialog', 'separates interpretation guidance from the evidence identifier');
+  const evidenceLayout = await dialog.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const actions = [...element.querySelectorAll('.verify-action-button')].map((button) => button.getBoundingClientRect().height);
+    return {
+      insideViewport: rect.left >= 0 && rect.right <= innerWidth && rect.top >= 0 && rect.bottom <= innerHeight,
+      undersizedActions: actions.filter((height) => height < 43.5).length,
+    };
+  });
+  check(evidenceLayout.insideViewport, 'evidence dialog', 'fits inside the mobile viewport');
+  equal(evidenceLayout.undersizedActions, 0, 'evidence dialog', 'keeps evidence actions at least 44px high');
+  const disclosure = dialog.locator('[data-evidence-raw-toggle]');
+  if (await disclosure.isVisible()) {
+    await disclosure.click();
+    equal(await disclosure.getAttribute('aria-expanded'), 'true', 'evidence dialog', 'expands raw JSON on request');
+    check(await dialog.locator('[data-evidence-raw]').isVisible(), 'evidence dialog', 'shows the raw payload after disclosure');
+    await disclosure.click();
+    equal(await disclosure.getAttribute('aria-expanded'), 'false', 'evidence dialog', 'collapses raw JSON again');
+  }
   await dialog.getByRole('button', { name: 'Close evidence' }).click();
   check(await evidenceTrigger.evaluate((trigger) => trigger === document.activeElement), 'evidence dialog', 'returns focus to its trigger');
   await page.getByRole('button', { name: 'Hide amounts' }).click();
@@ -381,11 +500,21 @@ try {
   await page.locator('[data-connection-test]').click();
   await page.waitForFunction(() => document.querySelector('#connection-result')?.textContent?.includes('Workbench dashboard session is reachable'));
   check((await page.locator('#connection-result').innerText()).includes('Production API credentials and inference are intentionally not exercised'), 'connection workflow', 'labels the dashboard-session check without implying an API or inference test');
-  const copyBaseUrl = page.getByRole('button', { name: 'Copy base URL' });
+  check(await page.getByRole('heading', { name: 'Ready to connect' }).count() === 1, 'connection workflow', 'summarizes readiness once');
+  check((await page.locator('.connect-helper').first().innerText()).includes('only for applications running on this computer'), 'connection workflow', 'explains the localhost boundary');
+  equal(await page.locator('#access-tokens').getAttribute('open'), null, 'connection workflow', 'keeps optional token administration secondary');
+  check((await page.locator('#access-tokens > summary').innerText()).includes('Access tokens'), 'connection workflow', 'labels the read-only token section without implying browser editing');
+  const copyBaseUrl = page.getByRole('button', { name: 'Copy Mayhem API address' });
   await copyBaseUrl.click();
   const copiedFeedback = await page.waitForFunction(() => document.querySelector('[data-copy-target="#gateway-base-url"] [data-copy-label]')?.textContent === 'Copied');
   equal(await copiedFeedback.jsonValue(), true, 'connection workflow', 'confirms the copied integration value');
   equal(await page.evaluate(() => navigator.clipboard.readText()), await page.locator('#gateway-base-url').innerText(), 'connection workflow', 'copies the exact local base URL');
+  await page.locator('#access-tokens > summary').click();
+  check(await page.getByRole('heading', { name: 'Need a new token?' }).isVisible(), 'connection workflow', 'explains how to create a token');
+  check((await page.locator('.token-secret-note').innerText()).includes('shown only once'), 'connection workflow', 'warns that the generated secret cannot be recovered');
+  const copyTokenCommand = page.getByRole('button', { name: 'Copy access token creation command' });
+  await copyTokenCommand.click();
+  equal(await page.evaluate(() => navigator.clipboard.readText()), await page.locator('#token-create-command').innerText(), 'connection workflow', 'copies the complete constrained token command');
   const privateExportPromise = page.waitForEvent('download');
   await page.locator('[data-export-table="#access-tokens-table"]').click();
   const privateExport = await privateExportPromise;
@@ -394,6 +523,10 @@ try {
   for await (const chunk of privateExportStream) privateExportCsv += chunk.toString('utf8');
   check(privateExportCsv.includes('"Hidden"'), 'financial privacy', 'redacts money cells in CSV while amounts are hidden');
   check(!privateExportCsv.includes('$9.73') && !privateExportCsv.includes('$50.00'), 'financial privacy', 'does not leak raw token budgets through CSV export');
+
+  await open('/mayhem/dashboard/connect', 'auth-required');
+  check(await page.getByRole('heading', { name: 'API key needed' }).count() === 1, 'connection workflow', 'makes required authentication explicit');
+  equal(await page.locator('#access-tokens').getAttribute('open'), '', 'connection workflow', 'opens token administration when a credential is required');
 
   const tableSurfaces = [
     ['/mayhem/dashboard/connect', '#access-tokens-table', 50],
@@ -404,6 +537,9 @@ try {
   ];
   for (const [path, tableSelector, rowLimit] of tableSurfaces) {
     await open(path, 'scale');
+    if (path === '/mayhem/dashboard/connect' && await page.locator('#access-tokens').getAttribute('open') === null) {
+      await page.locator('#access-tokens > summary').click();
+    }
     const scope = `shown-page tools ${path}`;
     const table = page.locator(tableSelector);
     const filter = page.locator(`[data-table-filter="${tableSelector}"]`);

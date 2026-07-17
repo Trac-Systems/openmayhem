@@ -86,7 +86,7 @@ impl DashboardAppPage {
                 r#"<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.7 9a2.5 2.5 0 1 1 3.4 2.3c-.9.4-1.1 1-1.1 1.7v.5M12 17h.01"/></svg>"#
             }
             Self::Settings => {
-                r#"<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>"#
+                r#"<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.74v.5a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#
             }
         }
     }
@@ -180,7 +180,7 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
   </div>
 </div>
 <nav class="mobile-bottom-nav" aria-label="Mobile primary"><a href="/mayhem/dashboard"{mobile_home}>Home</a><a href="/mayhem/dashboard/playground"{mobile_playground}>Playground</a><a href="/mayhem/dashboard/activity"{mobile_activity}>Activity</a><a href="/mayhem/dashboard/earn"{mobile_earn}>Earn</a><a href="/mayhem/dashboard/wallet"{mobile_wallet}>Billing</a></nav>
-<dialog class="verify-dialog" id="dashboard-evidence-dialog" aria-labelledby="dashboard-evidence-title"><header class="verify-head"><div><h2 id="dashboard-evidence-title" data-evidence-title>Evidence</h2><p data-evidence-summary>Loading the requested snapshot&hellip;</p></div><div class="verify-actions"><button class="quiet-button js-only" type="button" data-copy data-copy-target="[data-evidence-raw]" data-evidence-copy disabled><span data-copy-label>Copy raw JSON</span></button><button class="quiet-button js-only" type="button" data-evidence-download disabled>Download evidence</button><button class="icon-button" type="button" data-dialog-close aria-label="Close evidence">&times;</button></div></header><div class="verify-body" data-evidence-body><p class="notice" data-evidence-state role="status">Loading evidence&hellip;</p><section class="verify-level" data-evidence-facts-section hidden><h3>Structured facts</h3><div class="verify-grid" data-evidence-facts></div></section><section class="verify-level" data-evidence-raw-section hidden><h3>Raw gateway snapshot</h3><button class="quiet-button js-only" type="button" data-evidence-raw-toggle hidden>Show raw JSON</button><pre class="raw-evidence" data-evidence-raw></pre></section></div></dialog>"##,
+<dialog class="verify-dialog" id="dashboard-evidence-dialog" aria-labelledby="dashboard-evidence-title"><header class="verify-head"><div class="verify-head-copy"><span class="verify-eyebrow"><span class="verify-eyebrow-mark" aria-hidden="true"></span>Gateway evidence</span><h2 id="dashboard-evidence-title" data-evidence-title>Evidence</h2><p class="verify-subject" data-evidence-summary>Loading the requested snapshot&hellip;</p><p class="verify-interpretation" data-evidence-interpretation hidden></p></div><button class="icon-button verify-close" type="button" data-dialog-close aria-label="Close evidence"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="verify-toolbar"><p class="verify-source"><span class="verify-source-dot" aria-hidden="true"></span><span data-evidence-meta>Requested from this gateway</span></p><div class="verify-actions"><button class="quiet-button verify-action-button js-only" type="button" data-copy data-copy-target="[data-evidence-raw]" data-evidence-copy disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span data-copy-label>Copy JSON</span></button><button class="quiet-button verify-action-button js-only" type="button" data-evidence-download disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 20h14"/></svg><span>Download</span></button></div></div><div class="verify-body" data-evidence-body><p class="notice verify-state" data-evidence-state role="status">Loading evidence&hellip;</p><section class="verify-level" data-evidence-facts-section hidden><div class="verify-section-head"><div><span>Human-readable view</span><h3>Evidence summary</h3></div><span class="verify-section-count" data-evidence-fact-count></span></div><div class="verify-grid" data-evidence-facts></div></section><section class="verify-level verify-raw-level" data-evidence-raw-section hidden><div class="verify-section-head"><div><span>Complete source data</span><h3>Raw gateway snapshot</h3></div></div><p class="verify-section-description">Use this when you need the exact machine-readable payload for an audit or support investigation.</p><button class="verify-raw-toggle js-only" type="button" data-evidence-raw-toggle aria-expanded="false" hidden><span class="verify-raw-icon" aria-hidden="true">&#123; &#125;</span><span class="verify-raw-toggle-copy"><strong data-evidence-raw-toggle-label>Show raw JSON</strong><small>Technical details</small></span><span class="verify-raw-size" data-evidence-raw-size></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button><pre class="raw-evidence" data-evidence-raw></pre></section></div></dialog><dialog class="model-detail-dialog" id="model-detail-dialog" aria-labelledby="model-detail-title"><header class="model-detail-shell-head"><div><span>Model catalog</span><h2 id="model-detail-title">Model details</h2></div><button class="icon-button model-detail-close" type="button" data-dialog-close aria-label="Close model details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="model-detail-body" data-model-detail-content></div></dialog>"##,
         navigation = navigation,
         advanced_navigation = advanced_navigation,
         advanced_open = if advanced_open { " open" } else { "" },
@@ -413,9 +413,33 @@ html.js-ready .icon-button.mobile-menu-button.js-only,html.js-ready .nav-scrim{d
 .check-mark{width:24px;height:24px;border:1px solid var(--app-border-strong);border-radius:8px;display:grid;place-items:center;color:var(--app-text-muted);font-size:12px;font-weight:900}
 .check-step.done .check-mark{border-color:rgba(88,214,168,.5);background:rgba(88,214,168,.12);color:var(--app-good)}
 .check-step.active .check-mark{border-color:rgba(255,107,122,.5);background:rgba(255,107,122,.12);color:var(--app-accent-strong)}
+.check-step.pending .check-mark{border-color:rgba(110,168,255,.3);background:rgba(110,168,255,.07);color:var(--app-info)}
 .check-copy strong{display:block;font-size:13px}
 .check-copy span{display:block;margin-top:2px;color:var(--app-text-muted);font-size:12px}
 .check-copy .soft-button{margin-top:9px}
+.help-layout{align-items:start}
+.help-paths{gap:18px}
+.help-paths .check-copy span,.help-terms .check-copy span{font-size:13px;line-height:1.52;color:var(--app-text-soft)}
+.help-problems{display:grid}
+.help-problem{border-top:1px solid var(--app-border)}
+.help-problem:first-child{border-top:0}
+.help-problem>summary{min-height:68px;padding:13px 18px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:3px 16px;cursor:pointer;list-style:none}
+.help-problem>summary::-webkit-details-marker{display:none}
+.help-problem>summary::after{content:"+";grid-column:2;grid-row:1/3;color:var(--app-text-muted);font-size:20px;font-weight:400}
+.help-problem[open]>summary::after{content:"−"}
+.help-problem>summary:hover{background:rgba(255,255,255,.025)}
+.help-problem>summary>span{color:var(--app-text);font-size:13px;font-weight:800}
+.help-problem>summary>small{color:var(--app-text-muted);font-size:12px;line-height:1.4}
+.help-problem>div{padding:0 54px 16px 18px;display:grid;gap:11px}
+.help-problem>div p{margin:0;color:var(--app-text-soft);font-size:13px;line-height:1.55}
+.help-problem>div .soft-button{justify-self:start}
+.help-meaning-table{min-width:760px}
+.help-meaning-table tbody th{width:130px;color:var(--app-text);font-size:13px}
+.help-meaning-table tbody td{color:var(--app-text-soft);font-size:13px;line-height:1.5}
+.help-terms{gap:16px}
+.help-disclosure-copy h3{margin:0;color:var(--app-text);font-size:14px}
+.help-disclosure-copy p{margin:7px 0 0;color:var(--app-text-soft);font-size:13px;line-height:1.58}
+.help-disclosure-copy .soft-button{margin-top:14px}
 
 progress{width:100%;height:8px;border:0;border-radius:999px;overflow:hidden;background:#242830;color:var(--app-info);accent-color:var(--app-info)}
 progress::-webkit-progress-bar{background:#242830;border-radius:999px}
@@ -439,6 +463,47 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .data-table tbody tr:hover{background:rgba(255,255,255,.018)}
 .table-primary{font-weight:700}
 .table-secondary{display:block;margin-top:2px;color:var(--app-text-muted);font-size:12px}
+.model-catalog-panel{overflow:hidden}
+.model-catalog-table{min-width:920px;table-layout:fixed}
+.model-catalog-table .model-col{width:23%}.model-catalog-table .availability-col{width:16%}.model-catalog-table .capabilities-col{width:23%}.model-catalog-table .price-col{width:25%}.model-catalog-table .action-col{width:13%}
+.model-catalog-table th,.model-catalog-table td{padding:17px 16px;vertical-align:top}
+.model-catalog-table thead th{padding-top:13px;padding-bottom:13px}
+.model-catalog-table tbody tr{transition:background var(--app-fast) ease,box-shadow var(--app-fast) ease}
+.model-catalog-table tbody tr:hover{background:rgba(255,255,255,.024);box-shadow:inset 3px 0 0 rgba(255,107,122,.56)}
+.catalog-model{min-width:0;display:flex;align-items:flex-start;gap:12px}
+.catalog-model-button{width:100%;min-height:52px;margin:-5px;padding:5px;border:0;border-radius:13px;background:transparent;color:inherit;text-align:left;cursor:pointer;transition:background var(--app-fast) ease}
+.catalog-model-button:hover{background:rgba(255,255,255,.035)}
+.catalog-model-button:focus-visible{outline:3px solid var(--app-focus);outline-offset:1px}
+.catalog-model-logo{width:42px;height:42px;flex:0 0 auto;display:block}
+.catalog-model-logo .model-lab-mark{width:42px;height:42px;border-radius:12px}
+.catalog-model-logo .model-lab-mark svg{width:22px;height:22px}
+.catalog-model-logo .model-lab--hauhau svg{width:40px;height:40px;border-radius:11px}
+.catalog-model-copy{min-width:0;display:flex;flex-direction:column;align-items:flex-start}
+.catalog-model-lab{margin-bottom:3px;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}
+.catalog-model-name{max-width:100%;color:var(--app-text);font-size:14px;font-weight:800;line-height:1.3;overflow-wrap:anywhere}
+.catalog-model-id{max-width:100%;margin-top:4px;color:var(--app-text-muted);font-size:10px;font-weight:500;line-height:1.35;overflow-wrap:anywhere}
+.catalog-model-chevron{width:17px;height:17px;margin:auto 0 auto auto;flex:0 0 auto;fill:none;stroke:var(--app-text-muted);stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;opacity:.55;transition:transform var(--app-fast) ease,color var(--app-fast) ease,opacity var(--app-fast) ease}
+.catalog-model-button:hover .catalog-model-chevron{color:var(--app-text-soft);opacity:1;transform:translateX(2px)}
+.status-badge .status-dot{width:6px;height:6px;border-radius:999px;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 13%,transparent)}
+.catalog-availability-detail{max-width:190px;margin-top:7px;line-height:1.42}
+.catalog-capabilities{display:flex;align-items:center;align-content:flex-start;gap:6px;flex-wrap:wrap}
+.catalog-capability,.catalog-capability-more{min-height:27px;padding:5px 8px;border:1px solid var(--app-border);border-radius:8px;background:rgba(255,255,255,.026);color:var(--app-text-soft);font-size:11px;font-weight:700;line-height:1.25;display:inline-flex;align-items:center}
+.catalog-capability.is-context{border-color:rgba(110,168,255,.24);background:rgba(110,168,255,.08);color:#a9c8ff}
+.catalog-capability-extra[hidden]{display:none}
+.catalog-capability-more{min-height:44px;margin-block:-9px;padding-inline:8px;border-style:dashed;background:transparent;color:var(--app-text-muted);cursor:pointer}
+.catalog-capability-more:hover,.catalog-capability-more[aria-expanded="true"]{border-color:var(--app-border-strong);background:rgba(255,255,255,.035);color:var(--app-text-soft)}
+.catalog-price{display:grid;gap:5px}
+.catalog-price-line{min-width:0;display:grid;grid-template-columns:minmax(64px,max-content) minmax(0,1fr);align-items:baseline;gap:8px;color:var(--app-text-muted);font-size:11px;line-height:1.35}
+.catalog-price-line.is-primary{margin-bottom:2px;color:var(--app-text-soft);font-size:12px}
+.catalog-price-amount{color:var(--app-text-soft);font:700 11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.catalog-price-line.is-primary .catalog-price-amount{color:var(--app-text);font-size:14px}
+.catalog-price-unit{min-width:0;overflow-wrap:anywhere}
+.catalog-price-unavailable{color:var(--app-text-muted);font-size:12px}
+.catalog-price-more{margin-top:1px;color:var(--app-text-muted);font-size:10px;font-weight:700}
+.catalog-actions{justify-content:flex-end;gap:6px;flex-wrap:nowrap}
+.catalog-actions .quiet-button{min-width:48px;padding-inline:8px}
+.catalog-actions .quiet-button:first-child{border-color:rgba(110,168,255,.28);background:rgba(110,168,255,.07);color:#b7d1ff}
+.catalog-actions .quiet-button:first-child:hover{border-color:rgba(110,168,255,.5);background:rgba(110,168,255,.13);color:var(--app-text)}
 .status-badge{display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:4px 9px;border:1px solid var(--app-border);border-radius:999px;color:var(--app-text-soft);font-size:12px;font-weight:700;white-space:nowrap}
 .status-badge.good{border-color:rgba(88,214,168,.32);background:rgba(88,214,168,.08);color:var(--app-good)}
 .status-badge.info{border-color:rgba(110,168,255,.32);background:rgba(110,168,255,.08);color:var(--app-info)}
@@ -474,8 +539,46 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .notice.good{border-color:rgba(88,214,168,.28);background:rgba(88,214,168,.06)}
 .notice.warn{border-color:rgba(245,184,92,.3);background:rgba(245,184,92,.07)}
 .notice.danger{border-color:rgba(255,84,73,.3);background:rgba(255,84,73,.07)}
-.code-block{position:relative;margin:0;padding:15px 54px 15px 15px;border:1px solid var(--app-border);border-radius:13px;background:#0b0d10;color:#cdd3db;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}
+.code-block{position:relative;min-height:62px;margin:0;padding:20px 72px 20px 15px;border:1px solid var(--app-border);border-radius:13px;background:#0b0d10;color:#cdd3db;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}
 .code-block .copy-corner{position:absolute;right:8px;top:8px}
+.connect-ready{margin-bottom:24px;padding:17px 18px;border:1px solid var(--app-border);border-radius:16px;background:linear-gradient(120deg,rgba(88,214,168,.07),rgba(255,255,255,.015) 58%);display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:14px}
+.connect-ready.warn{background:linear-gradient(120deg,rgba(245,184,92,.08),rgba(255,255,255,.015) 58%)}
+.connect-ready-mark{width:42px;height:42px;border:1px solid rgba(88,214,168,.34);border-radius:13px;background:rgba(88,214,168,.09);color:var(--app-good);font-size:18px;font-weight:900;display:grid;place-items:center}
+.connect-ready.warn .connect-ready-mark{border-color:rgba(245,184,92,.34);background:rgba(245,184,92,.09);color:var(--app-warn)}
+.connect-ready-copy{min-width:0}
+.connect-ready-copy>span{display:block;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+.connect-ready-copy h2{margin:2px 0 0;font-size:18px}
+.connect-ready-copy p{margin:3px 0 0;color:var(--app-text-muted);font-size:11px}
+.connect-layout{align-items:start}
+.connect-setup{overflow:hidden}
+.connect-steps{padding-top:4px;padding-bottom:4px}
+.connect-step{padding:16px 0;display:grid;gap:12px}
+.connect-step+.connect-step{border-top:1px solid var(--app-border)}
+.connect-step-heading{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:11px}
+.connect-step-heading>span{width:28px;height:28px;border:1px solid rgba(110,168,255,.3);border-radius:9px;background:rgba(110,168,255,.08);color:#a9c8ff;font-size:11px;font-weight:900;display:grid;place-items:center}
+.connect-step-heading h3{margin:1px 0 0;font-size:14px}
+.connect-step-heading p{margin:3px 0 0;color:var(--app-text-muted);font-size:11px;line-height:1.4}
+.connect-helper{margin:-2px 0 0;color:var(--app-text-muted);font-size:11px;line-height:1.5}
+.connect-helper strong{color:var(--app-text-soft)}
+.connect-step-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.connect-step-actions .primary-button,.connect-step-actions .quiet-button{min-width:170px}
+.connect-step #connection-result{margin:0}
+.connect-checklist .checklist{gap:16px}
+.token-management>summary{padding:17px 18px}
+.token-management-summary{min-width:0;flex:1;display:grid;gap:3px}
+.token-management-summary strong{color:var(--app-text);font-size:14px}
+.token-management-summary small{color:var(--app-text-muted);font-size:11px;font-weight:500;line-height:1.4}
+.token-management-content>.panel-head{border-top:0}
+.token-create-guide{padding:18px;border-bottom:1px solid var(--app-border);background:linear-gradient(120deg,rgba(110,168,255,.055),transparent 58%);display:grid;grid-template-columns:minmax(220px,.72fr) minmax(360px,1.28fr);gap:14px 22px;align-items:center}
+.token-create-copy{min-width:0}
+.token-create-kicker{display:block;margin-bottom:5px;color:#8db8ff;font-size:10px;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.token-create-copy h2{margin:0;font-size:16px}
+.token-create-copy p{margin:5px 0 0;color:var(--app-text-muted);font-size:11px;line-height:1.5}
+.token-create-command{min-height:58px;padding-top:18px;padding-bottom:18px}
+.token-create-command .copy-corner{top:50%;transform:translateY(-50%)}
+.token-secret-note{grid-column:1/-1;padding:11px 12px;border:1px solid rgba(245,184,92,.24);border-radius:11px;background:rgba(245,184,92,.055);display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:9px;color:var(--app-text-muted);font-size:11px;line-height:1.48}
+.token-secret-note>span{width:20px;height:20px;border-radius:7px;background:rgba(245,184,92,.13);color:var(--app-warn);font-weight:900;display:grid;place-items:center}
+.token-secret-note p{margin:1px 0 0}.token-secret-note strong{color:var(--app-text-soft)}.token-secret-note code{color:var(--app-text-soft)}
 .field{display:grid;gap:7px;min-width:0}
 .field>label,.field-label{color:var(--app-text-soft);font-size:12px;font-weight:700}
 .optional-label{margin-left:6px;color:var(--app-text-muted);font-weight:500}
@@ -792,22 +895,84 @@ html.motion-reduced .pg-page *{animation-duration:.01ms!important;animation-iter
 .app-footer-inner{max-width:1560px;margin-inline:auto;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .app-footer-inner--wide{max-width:1880px}
 
-.verify-dialog{width:min(700px,calc(100vw - 28px));max-height:min(84vh,900px);padding:0;border:1px solid var(--app-border-strong);border-radius:22px;background:var(--app-panel);color:var(--app-text);box-shadow:var(--app-shadow);overflow:hidden}
-.verify-dialog::backdrop{background:rgba(4,5,7,.72);backdrop-filter:blur(5px)}
-.verify-head{padding:18px 20px;border-bottom:1px solid var(--app-border);display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
-.verify-head h2{margin:0;font-size:20px}
-.verify-head p{margin:4px 0 0;color:var(--app-text-muted);font-size:12px}
-.verify-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-.verify-body{padding:20px;overflow:auto;max-height:calc(84vh - 145px)}
-.verify-level{padding:15px 0;border-bottom:1px solid var(--app-border)}
-.verify-level:first-child{padding-top:0}.verify-level:last-child{border-bottom:0;padding-bottom:0}
-.verify-level h3{margin:0 0 9px;font-size:14px}
-.verify-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.verify-fact{padding:11px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-soft)}
-.verify-fact span{display:block;color:var(--app-text-muted);font-size:12px}
-.verify-fact strong{display:block;margin-top:4px;overflow-wrap:anywhere;font-size:13px}
-.verify-fact small{display:block;margin-top:6px;color:var(--app-text-muted);font-size:11px;line-height:1.35}
-.raw-evidence{margin:0;padding:13px;border:1px solid var(--app-border);border-radius:12px;background:#0b0d10;color:#c8d0da;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+.verify-dialog{width:min(820px,calc(100vw - 28px));max-height:min(88vh,960px);padding:0;border:1px solid var(--app-border-strong);border-radius:22px;background:linear-gradient(180deg,#16191f 0,var(--app-panel) 180px);color:var(--app-text);box-shadow:0 28px 90px rgba(0,0,0,.58),0 0 0 1px rgba(255,255,255,.025);overflow:hidden}
+.verify-dialog[open]{display:flex;flex-direction:column}
+.verify-dialog::backdrop{background:rgba(4,5,7,.76);backdrop-filter:blur(8px) saturate(.8)}
+.verify-head{position:relative;padding:24px 72px 19px 26px;display:block}
+.verify-head-copy{min-width:0}
+.verify-eyebrow{margin-bottom:8px;color:var(--app-good);font-size:10px;font-weight:900;letter-spacing:.11em;text-transform:uppercase;display:flex;align-items:center;gap:7px}
+.verify-eyebrow-mark{width:7px;height:7px;border-radius:999px;background:var(--app-good);box-shadow:0 0 0 4px rgba(88,214,168,.1),0 0 16px rgba(88,214,168,.22)}
+.verify-head h2{margin:0;font-size:clamp(21px,2.8vw,26px);line-height:1.15;letter-spacing:-.025em}
+.verify-subject{margin:7px 0 0;color:var(--app-text-soft);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.verify-interpretation{max-width:680px;margin:12px 0 0;padding-left:11px;border-left:2px solid rgba(110,168,255,.42);color:var(--app-text-muted);font-size:12px;line-height:1.52}
+.verify-close{position:absolute;top:20px;right:20px;background:rgba(255,255,255,.025)}
+.verify-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.verify-toolbar{min-height:58px;padding:7px 18px 7px 26px;border-top:1px solid var(--app-border);border-bottom:1px solid var(--app-border);background:rgba(8,10,13,.28);display:flex;align-items:center;justify-content:space-between;gap:14px}
+.verify-source{min-width:0;margin:0;color:var(--app-text-muted);font-size:11px;display:flex;align-items:center;gap:8px}
+.verify-source-dot{width:6px;height:6px;flex:0 0 auto;border-radius:999px;background:var(--app-good)}
+.verify-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:nowrap}
+.verify-action-button{min-height:44px;padding:7px 10px;gap:7px}
+.verify-action-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round}
+.verify-body{min-height:0;padding:23px 26px 26px;overflow:auto;flex:1;scrollbar-gutter:stable}
+.verify-state{margin:0}
+.verify-level{padding:22px 0;border-bottom:1px solid var(--app-border)}
+.verify-level:first-of-type{padding-top:0}.verify-level:last-child{border-bottom:0;padding-bottom:0}
+.verify-section-head{margin-bottom:13px;display:flex;align-items:flex-end;justify-content:space-between;gap:16px}
+.verify-section-head>div>span{display:block;margin-bottom:3px;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+.verify-section-head h3{margin:0;font-size:16px;line-height:1.3}
+.verify-section-count{padding:4px 8px;border:1px solid var(--app-border);border-radius:999px;color:var(--app-text-muted);font-size:10px;font-weight:700;white-space:nowrap}
+.verify-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.verify-fact{min-height:116px;padding:14px;border:1px solid var(--app-border);border-radius:14px;background:linear-gradient(145deg,rgba(255,255,255,.027),rgba(255,255,255,.012));display:flex;flex-direction:column}
+.verify-fact span{display:block;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.055em;text-transform:uppercase}
+.verify-fact strong{display:block;margin-top:7px;color:var(--app-text);overflow-wrap:anywhere;font-size:14px;line-height:1.38}
+.verify-fact small{display:block;margin-top:auto;padding-top:10px;color:var(--app-text-muted);font-size:10px;line-height:1.4}
+.verify-section-description{max-width:570px;margin:-5px 0 13px;color:var(--app-text-muted);font-size:11px;line-height:1.48}
+.verify-raw-toggle{width:100%;min-height:66px;padding:10px 12px;border:1px solid var(--app-border);border-radius:13px;background:var(--app-panel-soft);color:var(--app-text);display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:11px;text-align:left;cursor:pointer}
+.verify-raw-toggle:hover{border-color:var(--app-border-strong);background:rgba(255,255,255,.035)}
+.verify-raw-icon{width:38px;height:38px;border:1px solid rgba(110,168,255,.22);border-radius:10px;background:rgba(110,168,255,.07);color:#a9c8ff;font:700 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;display:grid;place-items:center}
+.verify-raw-toggle-copy{min-width:0;display:grid;gap:2px}
+.verify-raw-toggle-copy strong{font-size:12px}.verify-raw-toggle-copy small{color:var(--app-text-muted);font-size:10px}
+.verify-raw-size{padding:4px 7px;border-radius:7px;background:rgba(255,255,255,.04);color:var(--app-text-muted);font:10px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}
+.verify-raw-toggle>svg{width:18px;height:18px;fill:none;stroke:var(--app-text-muted);stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;transition:transform var(--app-fast) ease}
+.verify-raw-toggle[aria-expanded="true"]>svg{transform:rotate(180deg)}
+.raw-evidence{max-height:420px;margin:12px 0 0;padding:15px;border:1px solid var(--app-border);border-radius:13px;background:#0b0d10;color:#c8d0da;white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;font:11px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}
+.model-detail-dialog{width:min(760px,calc(100vw - 28px));max-height:min(88vh,920px);padding:0;border:1px solid var(--app-border-strong);border-radius:22px;background:linear-gradient(180deg,#16191f 0,var(--app-panel) 190px);color:var(--app-text);box-shadow:0 28px 90px rgba(0,0,0,.58),0 0 0 1px rgba(255,255,255,.025);overflow:hidden}
+.model-detail-dialog[open]{display:flex;flex-direction:column}
+.model-detail-dialog::backdrop{background:rgba(4,5,7,.76);backdrop-filter:blur(8px) saturate(.8)}
+.model-detail-shell-head{min-height:68px;padding:15px 18px 14px 22px;border-bottom:1px solid var(--app-border);display:flex;align-items:center;justify-content:space-between;gap:16px}
+.model-detail-shell-head>div>span{display:block;margin-bottom:2px;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.model-detail-shell-head h2{margin:0;font-size:18px}
+.model-detail-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.model-detail-body{min-height:0;padding:24px;overflow:auto;flex:1;scrollbar-gutter:stable}
+.model-detail-hero{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:14px}
+.model-detail-logo{width:58px;height:58px;display:block}
+.model-detail-logo .model-lab-mark{width:58px;height:58px;border-radius:16px}
+.model-detail-logo .model-lab-mark svg{width:29px;height:29px}
+.model-detail-logo .model-lab--hauhau svg{width:54px;height:54px;border-radius:15px}
+.model-detail-identity{min-width:0;display:grid;justify-items:start}
+.model-detail-lab{margin-bottom:3px;color:var(--app-text-muted);font-size:10px;font-weight:900;letter-spacing:.09em;text-transform:uppercase}
+.model-detail-identity h3{margin:0;font-size:22px;line-height:1.22;letter-spacing:-.02em}
+.model-detail-identity code{max-width:100%;margin-top:5px;color:var(--app-text-muted);font-size:10px;overflow-wrap:anywhere}
+.model-detail-purpose{max-width:610px;margin:18px 0 0;color:var(--app-text-soft);font-size:14px;line-height:1.55}
+.model-detail-facts{margin:20px 0 0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+.model-detail-facts>div{min-width:0;padding:12px;border:1px solid var(--app-border);border-radius:13px;background:rgba(255,255,255,.018)}
+.model-detail-facts dt{color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.055em;text-transform:uppercase}
+.model-detail-facts dd{margin:5px 0 0;color:var(--app-text);font-size:13px;font-weight:800;overflow-wrap:anywhere}
+.model-detail-facts small{display:block;margin-top:5px;color:var(--app-text-muted);font-size:10px;line-height:1.4}
+.model-detail-section{margin-top:22px;padding-top:20px;border-top:1px solid var(--app-border)}
+.model-detail-section-head{margin-bottom:12px;display:flex;align-items:flex-end;justify-content:space-between;gap:12px}
+.model-detail-section-head>div>span{display:block;margin-bottom:2px;color:var(--app-text-muted);font-size:10px;font-weight:800;letter-spacing:.065em;text-transform:uppercase}
+.model-detail-section-head h4{margin:0;font-size:16px}
+.model-detail-section-head>span{padding:4px 8px;border:1px solid var(--app-border);border-radius:999px;color:var(--app-text-muted);font-size:10px;font-weight:700}
+.model-detail-capabilities{display:flex;gap:7px;flex-wrap:wrap}
+.model-detail-capability{min-height:31px;padding:6px 9px;border:1px solid var(--app-border);border-radius:9px;background:rgba(255,255,255,.025);color:var(--app-text-soft);font-size:11px;font-weight:700;display:inline-flex;align-items:center}
+.model-detail-capability.is-context{border-color:rgba(110,168,255,.25);background:rgba(110,168,255,.08);color:#a9c8ff}
+.model-detail-price{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}
+.model-detail-price .catalog-price-line{min-height:42px;padding:8px 10px;border:1px solid var(--app-border);border-radius:10px;background:rgba(255,255,255,.018)}
+.model-detail-price .catalog-price-line.is-primary{margin:0}
+.model-detail-section>p{margin:10px 0 0;color:var(--app-text-muted);font-size:10px;line-height:1.45}
+.model-detail-actions{margin-top:22px;padding-top:20px;border-top:1px solid var(--app-border);display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.model-detail-actions .primary-button,.model-detail-actions .quiet-button{min-width:150px}
 .evidence-standalone{width:min(920px,calc(100% - 36px));margin:0 auto;padding:36px 0 72px}
 .evidence-page-body{max-height:none}
 .evidence-page-body .verify-level h2{margin:0 0 10px;font-size:15px}
@@ -866,6 +1031,9 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .launch-paths{grid-template-columns:1fr}
   .activation-grid{grid-template-columns:1fr}
   .verify-grid{grid-template-columns:1fr}
+  .model-detail-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .model-detail-facts>div:last-child{grid-column:1/-1}
+  .model-detail-price{grid-template-columns:1fr}
   .app-footer{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right));padding-bottom:calc(max(18px,env(safe-area-inset-bottom)) + 78px)}
   .app-footer-inner{align-items:flex-start;flex-direction:column}
   html.js-ready .mobile-bottom-nav{position:fixed;left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));z-index:18;min-height:60px;padding:6px;border:1px solid var(--app-border);border-radius:18px;background:rgba(18,20,25,.95);box-shadow:0 16px 50px rgba(0,0,0,.38);backdrop-filter:blur(18px);display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px}
@@ -905,8 +1073,34 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .settings-row{grid-template-columns:1fr;align-items:start}
   .session-expired{align-items:stretch;flex-direction:column}
   .session-expired-actions{justify-content:flex-end}
-  .verify-head{align-items:stretch;flex-direction:column}
-  .verify-actions{justify-content:flex-start}
+  .verify-dialog{width:calc(100vw - 12px);max-height:calc(100dvh - 12px);border-radius:18px}
+  .verify-head{padding:19px 62px 16px 18px}
+  .verify-close{top:14px;right:14px}
+  .verify-toolbar{padding:9px 14px 10px 18px;align-items:stretch;flex-direction:column;gap:8px}
+  .verify-actions{width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+  .verify-action-button{width:100%;justify-content:center}
+  .verify-body{padding:19px 18px 22px}
+  .verify-fact{min-height:0}
+  .verify-raw-toggle{grid-template-columns:auto minmax(0,1fr) auto;padding:9px}
+  .verify-raw-size{grid-column:2;justify-self:start}
+  .verify-raw-toggle>svg{grid-column:3;grid-row:1/3}
+  .connect-ready{grid-template-columns:auto minmax(0,1fr);padding:15px}
+  .connect-ready>.status-badge{grid-column:2;justify-self:start}
+  .connect-step-actions{display:grid;grid-template-columns:1fr}
+  .connect-step-actions .primary-button,.connect-step-actions .quiet-button{width:100%;min-width:0}
+  .token-management>summary{align-items:flex-start;flex-wrap:wrap}
+  .token-management>summary>.status-badge{margin-right:28px}
+  .token-create-guide{grid-template-columns:1fr;padding:16px}
+  .token-secret-note{grid-column:auto}
+  .model-detail-dialog{width:calc(100vw - 12px);max-height:calc(100dvh - 12px);border-radius:18px}
+  .model-detail-shell-head{padding-inline:18px 14px}
+  .model-detail-body{padding:19px 18px 22px}
+  .model-detail-hero{grid-template-columns:auto minmax(0,1fr)}
+  .model-detail-hero>.status-badge{grid-column:1/-1;justify-self:start}
+  .model-detail-facts{grid-template-columns:1fr}
+  .model-detail-facts>div:last-child{grid-column:auto}
+  .model-detail-actions{display:grid;grid-template-columns:1fr}
+  .model-detail-actions .primary-button,.model-detail-actions .quiet-button{width:100%;min-width:0}
 }
 
 @media(max-width:430px){
@@ -920,7 +1114,7 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
 
 @media(forced-colors:active){
   :focus-visible{outline:3px solid Highlight}
-  .app-sidebar,.app-topbar,.panel,.metric,.notice,.attention-card,.message,.mobile-bottom-nav,.verify-dialog{background:Canvas;color:CanvasText;box-shadow:none}
+  .app-sidebar,.app-topbar,.panel,.metric,.notice,.attention-card,.message,.mobile-bottom-nav,.verify-dialog,.model-detail-dialog{background:Canvas;color:CanvasText;box-shadow:none}
   .state-indicator,.state-indicator.good,.state-indicator.warn,.state-indicator.danger{background:CanvasText;box-shadow:none;border:1px solid Canvas}
   .status-badge,.status-badge.good,.status-badge.info,.status-badge.warn,.status-badge.danger,.check-mark{background:Canvas;color:CanvasText;border-color:CanvasText}
   .settings-control .switch-track{border-color:CanvasText}
@@ -2465,9 +2659,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     const openEvidence = async (link, dialog) => {
       const title = safeQuery('[data-evidence-title]', dialog);
       const summary = safeQuery('[data-evidence-summary]', dialog);
+      const interpretation = safeQuery('[data-evidence-interpretation]', dialog);
+      const meta = safeQuery('[data-evidence-meta]', dialog);
       const state = safeQuery('[data-evidence-state]', dialog);
       const factsSection = safeQuery('[data-evidence-facts-section]', dialog);
       const facts = safeQuery('[data-evidence-facts]', dialog);
+      const factCount = safeQuery('[data-evidence-fact-count]', dialog);
       const rawSection = safeQuery('[data-evidence-raw-section]', dialog);
       const raw = safeQuery('[data-evidence-raw]', dialog);
       const copyButton = safeQuery('[data-evidence-copy]', dialog);
@@ -2476,6 +2673,11 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
 
       title.textContent = 'Evidence';
       summary.textContent = 'Loading the requested snapshot…';
+      if (interpretation) {
+        interpretation.hidden = true;
+        interpretation.textContent = '';
+      }
+      if (meta) meta.textContent = 'Requesting a fresh gateway snapshot';
       state.hidden = false;
       state.className = 'notice';
       state.setAttribute('role', 'status');
@@ -2483,6 +2685,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       factsSection.hidden = true;
       rawSection.hidden = true;
       facts.replaceChildren();
+      if (factCount) factCount.textContent = '';
       raw.textContent = '';
       evidencePayloads.delete(dialog);
       if (copyButton) copyButton.disabled = true;
@@ -2506,8 +2709,14 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         title.textContent = typeof payload.title === 'string' ? payload.title : 'Evidence';
         const evidenceSummary = typeof payload.summary === 'string' ? payload.summary : 'Requested dashboard evidence';
         const evidenceInterpretation = typeof payload.interpretation === 'string' ? payload.interpretation : '';
-        summary.textContent = evidenceInterpretation ? `${evidenceSummary} \u2014 ${evidenceInterpretation}` : evidenceSummary;
+        summary.textContent = evidenceSummary;
+        if (interpretation) {
+          interpretation.textContent = evidenceInterpretation;
+          interpretation.hidden = !evidenceInterpretation;
+        }
+        if (meta) meta.textContent = 'Snapshot loaded from this gateway';
         const factItems = Array.isArray(payload.facts) ? payload.facts : [];
+        if (factCount) factCount.textContent = `${factItems.length} ${factItems.length === 1 ? 'fact' : 'facts'}`;
         factItems.forEach((fact) => {
           const item = document.createElement('div');
           item.className = 'verify-fact';
@@ -2530,11 +2739,15 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         // Very large snapshots stay one click away so the drawer opens light;
         // Copy and Download always act on the complete payload.
         const rawToggle = safeQuery('[data-evidence-raw-toggle]', dialog);
+        const rawToggleLabel = safeQuery('[data-evidence-raw-toggle-label]', dialog);
+        const rawSize = safeQuery('[data-evidence-raw-size]', dialog);
         const rawIsLarge = rawText.length > 60000;
         if (rawToggle) {
           rawToggle.hidden = !rawIsLarge;
-          rawToggle.textContent = `Show raw JSON (${Math.max(1, Math.round(rawText.length / 1024))} KB)`;
+          rawToggle.setAttribute('aria-expanded', String(!rawIsLarge));
         }
+        if (rawToggleLabel) rawToggleLabel.textContent = rawIsLarge ? 'Show raw JSON' : 'Raw JSON shown';
+        if (rawSize) rawSize.textContent = `${Math.max(1, Math.round(rawText.length / 1024))} KB`;
         raw.hidden = rawIsLarge;
         applyAmountPreference();
         if (copyButton) copyButton.disabled = false;
@@ -2545,6 +2758,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         state.setAttribute('role', 'alert');
         state.textContent = error instanceof Error ? error.message : 'Evidence could not be loaded.';
         summary.textContent = 'The requested snapshot could not be opened.';
+        if (interpretation) interpretation.hidden = true;
+        if (meta) meta.textContent = 'Snapshot unavailable';
         if (copyButton) copyButton.disabled = true;
         if (downloadButton) downloadButton.disabled = true;
       } finally {
@@ -2705,9 +2920,28 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const dialogHost = rawToggle.closest('dialog, .evidence-standalone');
         const rawNode = dialogHost ? safeQuery('[data-evidence-raw]', dialogHost) : null;
         if (rawNode) {
-          rawNode.hidden = false;
-          rawToggle.hidden = true;
+          const willOpen = rawNode.hidden;
+          rawNode.hidden = !willOpen;
+          rawToggle.setAttribute('aria-expanded', String(willOpen));
+          const label = safeQuery('[data-evidence-raw-toggle-label]', rawToggle);
+          if (label) label.textContent = willOpen ? 'Hide raw JSON' : 'Show raw JSON';
         }
+        return;
+      }
+
+      const capabilityToggle = event.target.closest('[data-catalog-capabilities-toggle]');
+      if (capabilityToggle) {
+        const capabilities = capabilityToggle.closest('.catalog-capabilities');
+        const expanded = capabilityToggle.getAttribute('aria-expanded') !== 'true';
+        capabilities?.querySelectorAll('.catalog-capability-extra').forEach((capability) => {
+          capability.hidden = !expanded;
+        });
+        capabilityToggle.setAttribute('aria-expanded', String(expanded));
+        const label = safeQuery('[data-catalog-capabilities-label]', capabilityToggle);
+        if (label) label.textContent = expanded
+          ? 'Show less'
+          : capabilityToggle.dataset.collapsedLabel || 'Show more';
+        announce(expanded ? 'All model capabilities shown' : 'Additional model capabilities hidden', false, false);
         return;
       }
 
@@ -2745,6 +2979,19 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         dialogTriggers.set(dialog, evidenceLink);
         dialog.showModal();
         await openEvidence(evidenceLink, dialog);
+        return;
+      }
+
+      const modelDetailOpen = event.target.closest('[data-model-detail-open]');
+      if (modelDetailOpen) {
+        const dialog = safeQuery('#model-detail-dialog');
+        const content = dialog ? safeQuery('[data-model-detail-content]', dialog) : null;
+        const template = modelDetailOpen.closest('th')?.querySelector('[data-model-detail-template]');
+        if (!dialog || !content || !(template instanceof HTMLTemplateElement) || typeof dialog.showModal !== 'function') return;
+        content.replaceChildren(template.content.cloneNode(true));
+        dialogTriggers.set(dialog, modelDetailOpen);
+        dialog.showModal();
+        applyAmountPreference();
         return;
       }
 
