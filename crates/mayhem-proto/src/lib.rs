@@ -689,8 +689,13 @@ pub struct VisibleToolCall {
     pub arguments: String,
 }
 
-pub fn visible_output_units(content: &str, tool_calls: &[VisibleToolCall]) -> u64 {
+pub fn metered_output_units(
+    content: &str,
+    hidden_reasoning: &str,
+    tool_calls: &[VisibleToolCall],
+) -> u64 {
     let text_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    let hidden_reasoning_bytes = u64::try_from(hidden_reasoning.len()).unwrap_or(u64::MAX);
     let tool_bytes = if tool_calls.is_empty() {
         0
     } else {
@@ -700,12 +705,18 @@ pub fn visible_output_units(content: &str, tool_calls: &[VisibleToolCall]) -> u6
             .and_then(|bytes| u64::try_from(bytes.len()).ok())
             .unwrap_or(u64::MAX)
     };
-    let bytes = text_bytes.saturating_add(tool_bytes);
+    let bytes = text_bytes
+        .saturating_add(hidden_reasoning_bytes)
+        .saturating_add(tool_bytes);
     if bytes == 0 {
         0
     } else {
         bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
     }
+}
+
+pub fn visible_output_units(content: &str, tool_calls: &[VisibleToolCall]) -> u64 {
+    metered_output_units(content, "", tool_calls)
 }
 
 impl Serialize for ReceiptUsage {

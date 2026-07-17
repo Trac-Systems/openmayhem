@@ -75,16 +75,17 @@ use futures_util::{stream, Stream};
 use image::ImageReader;
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 #[cfg(test)]
-use mayhem_proto::chunk_json_payload;
+use mayhem_proto::{chunk_json_payload, visible_output_units};
 use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
-    payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes, visible_output_units,
-    AttestationReport, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
-    ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
-    ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
-    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    metered_output_units, payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, VisibleToolCall, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
@@ -13715,6 +13716,7 @@ fn visible_tool_calls(tool_calls: &[ToolCallOutput]) -> Vec<VisibleToolCall> {
         .collect()
 }
 
+#[cfg(test)]
 fn visible_output_unit_count(content: &str, tool_calls: &[ToolCallOutput]) -> u64 {
     visible_output_units(content, &visible_tool_calls(tool_calls))
 }
@@ -13852,6 +13854,35 @@ fn session_delta_text(frame: &Value) -> Result<Option<&str>, GatewaySessionError
             "provider s.delta d field must be text or null",
         )),
     }
+}
+
+fn session_delta_reasoning_evidence(frame: &Value) -> Result<&str, GatewaySessionError> {
+    match frame.get("reasoning_evidence_delta") {
+        Some(Value::String(delta)) => Ok(delta.as_str()),
+        None => Err(GatewaySessionError::new(
+            "provider s.delta missing mandatory reasoning_evidence_delta field",
+        )),
+        Some(_) => Err(GatewaySessionError::new(
+            "provider s.delta reasoning_evidence_delta field must be text",
+        )),
+    }
+}
+
+fn ensure_metered_text_within_limit(
+    content: &str,
+    reasoning_evidence: &str,
+    max_bytes: usize,
+) -> Result<(), GatewaySessionError> {
+    let total = content
+        .len()
+        .checked_add(reasoning_evidence.len())
+        .ok_or_else(|| GatewaySessionError::new("metered chat output byte length overflow"))?;
+    if total > max_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "metered chat output exceeded the {max_bytes}-byte session output budget"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_session_token_ids_within_limit(
@@ -14046,6 +14077,7 @@ async fn collect_direct_session_output(
 ) -> Result<DirectSessionCollected, GatewaySessionError> {
     let failover = invocation.failover;
     let mut content = String::new();
+    let mut reasoning_evidence = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
@@ -14075,6 +14107,7 @@ async fn collect_direct_session_output(
                 retryable_interrupted_direct_session_error(
                     direct_session_timeout_error(kind, session_id),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -14111,6 +14144,7 @@ async fn collect_direct_session_output(
                 let mut disconnected = client_disconnect_direct_session_error(
                     request,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
@@ -14126,6 +14160,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     timeout,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -14142,6 +14177,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -14169,6 +14205,25 @@ async fn collect_direct_session_output(
                 watchdog.record_delta(now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
+                }
+                let delta = session_delta_reasoning_evidence(&frame)?;
+                if !delta.is_empty() {
+                    append_session_text(
+                        &mut reasoning_evidence,
+                        delta,
+                        max_text_bytes,
+                        "reasoning evidence",
+                    )?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
@@ -14190,6 +14245,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -14232,6 +14288,7 @@ async fn collect_direct_session_output(
                             direct_session_throughput_floor_error(session_id, tok_s, min_tok_s);
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -14269,6 +14326,7 @@ async fn collect_direct_session_output(
                         request,
                         invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -14298,6 +14356,7 @@ async fn collect_direct_session_output(
                 return Err(retryable_interrupted_direct_session_error(
                     GatewaySessionError::new(err),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -14321,6 +14380,7 @@ async fn collect_direct_session_output(
                     return Err(retryable_interrupted_direct_session_error(
                         GatewaySessionError::new(err),
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         latest_checkpoint_receipt.is_some()
@@ -14340,7 +14400,7 @@ async fn collect_direct_session_output(
         }
     }
 
-    let mut usage = observed_chat_usage(request, &content, &tool_calls);
+    let mut usage = observed_chat_usage(request, &content, &reasoning_evidence, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {session_id} ended without a final receipt"
@@ -14348,6 +14408,10 @@ async fn collect_direct_session_output(
     })?;
     validate_usage_attribution(
         &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    validate_reasoning_evidence_attribution(
+        &reasoning_evidence,
         &final_receipt.body.usage_attribution,
     )?;
     if claimed_usage_attribution
@@ -14435,10 +14499,12 @@ async fn collect_direct_session_output(
 fn observed_chat_usage(
     request: &ChatCompletionRequest,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: &[ToolCallOutput],
 ) -> Usage {
     let prompt_tokens = rough_tokens(&chat_prompt_text(request));
-    let completion_tokens = visible_output_unit_count(content, tool_calls);
+    let completion_tokens =
+        metered_output_units(content, reasoning_evidence, &visible_tool_calls(tool_calls));
     Usage {
         prompt_tokens,
         completion_tokens,
@@ -15139,6 +15205,7 @@ fn embeddings_from_session_delta(
 
 fn interrupted_direct_session_partial(
     content: &str,
+    _reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
@@ -15179,6 +15246,7 @@ fn interrupted_direct_session_partial(
 fn retryable_interrupted_direct_session_error(
     err: GatewaySessionError,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     receipt_seen: bool,
@@ -15189,6 +15257,7 @@ fn retryable_interrupted_direct_session_error(
 ) -> GatewaySessionError {
     if let Some(partial) = interrupted_direct_session_partial(
         content,
+        reasoning_evidence,
         tool_calls,
         provider_receipt,
         token_ids,
@@ -15207,6 +15276,7 @@ fn retryable_interrupted_direct_session_error(
 fn client_disconnect_direct_session_error(
     request: &ChatCompletionRequest,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
     token_ids: &[i32],
@@ -15216,6 +15286,7 @@ fn client_disconnect_direct_session_error(
     let err = retryable_interrupted_direct_session_error(
         GatewaySessionError::retryable("end-user disconnected before stream completed"),
         content,
+        reasoning_evidence,
         tool_calls.clone(),
         provider_receipt,
         provider_receipt.is_some(),
@@ -15230,7 +15301,7 @@ fn client_disconnect_direct_session_error(
     let Some(first_delta_at_millis) = watchdog.first_delta_at_millis else {
         return err;
     };
-    let usage = observed_chat_usage(request, content, &tool_calls);
+    let usage = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
         tok_s: generated_tokens_per_second(
@@ -15259,13 +15330,14 @@ fn client_disconnect_direct_session_error(
 fn direct_session_checkpoint_partial(
     request: &ChatCompletionRequest,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     provider_receipt: ProviderSignedReceipt,
     token_ids: &[i32],
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
 ) -> GatewaySessionPartial {
-    let usage = observed_chat_usage(request, content, &tool_calls);
+    let usage = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let quality =
         watchdog
             .first_delta_at_millis
@@ -15339,6 +15411,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
     content: &str,
+    reasoning_evidence: &str,
     tool_calls: Vec<ToolCallOutput>,
     receipt: &ProviderSignedReceipt,
     token_ids: &[i32],
@@ -15346,7 +15419,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     now_millis: u64,
     model: &GatewayModel,
 ) -> Result<Option<Value>, GatewaySessionError> {
-    let observed = observed_chat_usage(request, content, &tool_calls);
+    let observed = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let observed_usage = expected_chat_usage_for_invocation(
         request,
         None,
@@ -15357,6 +15430,8 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     )?;
     let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
     let claimed_output_tokens = receipt.body.usage.output_tokens();
+    validate_usage_attribution(&receipt.body.usage, &receipt.body.usage_attribution)?;
+    validate_reasoning_evidence_attribution(reasoning_evidence, &receipt.body.usage_attribution)?;
     if claimed_prompt_tokens != observed_usage.prompt_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt prompt usage mismatch",
@@ -15374,6 +15449,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     let partial = direct_session_checkpoint_partial(
         request,
         content,
+        reasoning_evidence,
         tool_calls,
         receipt.clone(),
         token_ids,
@@ -16602,6 +16678,24 @@ fn validate_usage_attribution(
     {
         return Err(GatewaySessionError::new(
             "provider media attribution exceeds billed input tokens",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reasoning_evidence_attribution(
+    reasoning_evidence: &str,
+    attribution: &BTreeMap<String, u64>,
+) -> Result<(), GatewaySessionError> {
+    let observed = metered_output_units("", reasoning_evidence, &[]);
+    if attribution
+        .get("reasoning_output_tokens")
+        .copied()
+        .unwrap_or(0)
+        != observed
+    {
+        return Err(GatewaySessionError::new(
+            "provider reasoning attribution did not match gateway-observed reasoning evidence",
         ));
     }
     Ok(())
@@ -18813,6 +18907,7 @@ async fn run_live_direct_chat_sse_inner(
     }
 
     let mut content = String::new();
+    let mut reasoning_evidence = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
@@ -18844,6 +18939,7 @@ async fn run_live_direct_chat_sse_inner(
                 retryable_interrupted_direct_session_error(
                     direct_session_timeout_error(kind, &session.invocation.session_id),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -18869,6 +18965,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(client_disconnect_direct_session_error(
                     &session.request,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     &token_ids,
@@ -18912,6 +19009,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     timeout,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -18928,6 +19026,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     err,
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -18961,6 +19060,25 @@ async fn run_live_direct_chat_sse_inner(
                 watchdog.record_delta(now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
+                }
+                let delta = session_delta_reasoning_evidence(&frame)?;
+                if !delta.is_empty() {
+                    append_session_text(
+                        &mut reasoning_evidence,
+                        delta,
+                        max_text_bytes,
+                        "reasoning evidence",
+                    )?;
+                    ensure_metered_text_within_limit(
+                        &content,
+                        &reasoning_evidence,
+                        max_text_bytes,
+                    )?;
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame)? {
                     token_ids = ids;
@@ -18996,6 +19114,7 @@ async fn run_live_direct_chat_sse_inner(
                         return Err(client_disconnect_direct_session_error(
                             &session.request,
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -19012,6 +19131,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -19047,6 +19167,7 @@ async fn run_live_direct_chat_sse_inner(
                             return Err(client_disconnect_direct_session_error(
                                 &session.request,
                                 &content,
+                                &reasoning_evidence,
                                 tool_calls.clone(),
                                 latest_checkpoint_receipt.as_ref(),
                                 &token_ids,
@@ -19078,6 +19199,7 @@ async fn run_live_direct_chat_sse_inner(
                         );
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
+                            &reasoning_evidence,
                             tool_calls.clone(),
                             latest_checkpoint_receipt.as_ref(),
                             &token_ids,
@@ -19118,6 +19240,7 @@ async fn run_live_direct_chat_sse_inner(
                         &session.request,
                         &session.invocation,
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         &receipt,
                         &token_ids,
@@ -19150,6 +19273,7 @@ async fn run_live_direct_chat_sse_inner(
                 return Err(retryable_interrupted_direct_session_error(
                     GatewaySessionError::new(err),
                     &content,
+                    &reasoning_evidence,
                     tool_calls.clone(),
                     latest_checkpoint_receipt.as_ref(),
                     latest_checkpoint_receipt.is_some()
@@ -19174,6 +19298,7 @@ async fn run_live_direct_chat_sse_inner(
                     return Err(retryable_interrupted_direct_session_error(
                         GatewaySessionError::new(err),
                         &content,
+                        &reasoning_evidence,
                         tool_calls.clone(),
                         latest_checkpoint_receipt.as_ref(),
                         latest_checkpoint_receipt.is_some()
@@ -19194,7 +19319,8 @@ async fn run_live_direct_chat_sse_inner(
         }
     }
 
-    let mut usage = observed_chat_usage(&session.request, &content, &tool_calls);
+    let mut usage =
+        observed_chat_usage(&session.request, &content, &reasoning_evidence, &tool_calls);
     let final_receipt = final_provider_receipt.as_ref().ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {} ended without a final receipt",
@@ -19203,6 +19329,10 @@ async fn run_live_direct_chat_sse_inner(
     })?;
     validate_usage_attribution(
         &final_receipt.body.usage,
+        &final_receipt.body.usage_attribution,
+    )?;
+    validate_reasoning_evidence_attribution(
+        &reasoning_evidence,
         &final_receipt.body.usage_attribution,
     )?;
     if claimed_usage_attribution
@@ -28454,6 +28584,29 @@ mod tests {
     };
 
     #[test]
+    fn reasoning_evidence_is_mandatory_and_independently_metered() {
+        let missing = session_delta_reasoning_evidence(&json!({ "d": "" }))
+            .expect_err("reasoning evidence must be explicit on every delta");
+        assert!(missing.message.contains("mandatory"));
+        assert_eq!(
+            session_delta_reasoning_evidence(&json!({ "d": "", "reasoning_evidence_delta": "" }))
+                .unwrap(),
+            ""
+        );
+
+        let request = test_chat_request("mayhem/reasoning");
+        let reasoning = "r".repeat(128);
+        let usage = observed_chat_usage(&request, "", &reasoning, &[]);
+        assert_eq!(usage.completion_tokens, 32);
+
+        let exact = BTreeMap::from([("reasoning_output_tokens".to_owned(), 32)]);
+        validate_reasoning_evidence_attribution(&reasoning, &exact).unwrap();
+        let understated = BTreeMap::from([("reasoning_output_tokens".to_owned(), 31)]);
+        assert!(validate_reasoning_evidence_attribution(&reasoning, &understated).is_err());
+        assert!(validate_reasoning_evidence_attribution("", &exact).is_err());
+    }
+
+    #[test]
     fn sc_bridge_accepts_exactly_one_authenticated_transport_kind() {
         assert!(sc_bridge_session_transport_valid(&json!({
             "direct": true,
@@ -30274,6 +30427,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
+            "",
             Vec::new(),
             Some(&provider_receipt),
             &[1, 2, 3],
@@ -30311,6 +30465,7 @@ mod tests {
         let err = client_disconnect_direct_session_error(
             &request,
             output.content.as_deref().unwrap(),
+            "",
             Vec::new(),
             None,
             &[1, 2, 3],
@@ -30332,7 +30487,7 @@ mod tests {
         assert_eq!(interrupted.token_ids, vec![1, 2, 3]);
         assert_eq!(
             interrupted.output.usage,
-            observed_chat_usage(&request, output.content.as_deref().unwrap(), &[])
+            observed_chat_usage(&request, output.content.as_deref().unwrap(), "", &[])
         );
     }
 
@@ -33189,6 +33344,7 @@ mod tests {
         let pre_output = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
             "",
+            "",
             Vec::new(),
             None,
             false,
@@ -33203,6 +33359,7 @@ mod tests {
 
         let receipt_seen = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
+            "",
             "",
             Vec::new(),
             None,
@@ -33220,6 +33377,7 @@ mod tests {
         let output_started = retryable_interrupted_direct_session_error(
             GatewaySessionError::new("provider closed"),
             "partial output",
+            "",
             Vec::new(),
             None,
             false,

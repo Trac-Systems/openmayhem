@@ -93,10 +93,10 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
-    ctx_bracket_table_at, default_ctx_bracket_schedule, payload_chunk_at, payload_chunk_manifest,
-    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
-    validate_ctx_bracket_schedule, visible_output_units, AttestationRuntimeConfig,
+    ctx_bracket_table_at, default_ctx_bracket_schedule, metered_output_units, payload_chunk_at,
+    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
     CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
     MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
     ReceiptUsage, SpendVoucher, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
@@ -51815,10 +51815,10 @@ async fn handle_provider_session_frame(
                             ));
                             engine_recovery.mark_failed(reason);
                         }
-                        let (usage, receipt_seq) = live_stream
+                        let (usage, usage_attribution, receipt_seq) = live_stream
                             .as_ref()
                             .map(|stream| stream.cancellation_receipt_state())
-                            .unwrap_or_else(|| (ReceiptUsage::default(), 1));
+                            .unwrap_or_else(|| (ReceiptUsage::default(), BTreeMap::new(), 1));
                         match settle_cancelled_provider_session(
                             bridge,
                             &active,
@@ -51826,6 +51826,7 @@ async fn handle_provider_session_frame(
                             terms,
                             &body,
                             usage,
+                            usage_attribution,
                             receipt_seq,
                             runtime.runtime_keypair,
                         )
@@ -52077,8 +52078,9 @@ fn provider_bridge_error_missing_direct_connection(error: &BridgeError) -> bool 
 struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_visible_units: u64,
-    delivered_visible_units: u64,
+    last_checkpoint_metered_units: u64,
+    delivered_metered_units: u64,
+    reasoning_units: u64,
     prompt_tokens: u64,
 }
 
@@ -52093,17 +52095,19 @@ struct ProviderSessionLiveStream<'a> {
     heartbeat_load: ProviderHeartbeatLoad,
     next_index: u64,
     receipt_seq: u64,
-    last_checkpoint_visible_units: u64,
+    last_checkpoint_metered_units: u64,
     first_ttft_ms: Option<u64>,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
     generated_tokens: u64,
-    delivered_visible_units: u64,
+    delivered_metered_units: u64,
     prompt_tokens: u64,
     streamed_any: bool,
     pending_text: String,
+    pending_hidden_reasoning: String,
     pending_token_ids: Vec<i32>,
     visible_text: String,
+    hidden_reasoning: String,
 }
 
 const PROVIDER_REASONING_OPEN_TAG: &str = "<think>";
@@ -52148,6 +52152,19 @@ struct ProviderReasoningOutputFilter {
     delimiters: ProviderReasoningDelimiters,
 }
 
+#[derive(Default)]
+struct ProviderReasoningFilteredText {
+    visible: String,
+    hidden: String,
+}
+
+impl ProviderReasoningFilteredText {
+    fn extend(&mut self, next: Self) {
+        self.visible.push_str(&next.visible);
+        self.hidden.push_str(&next.hidden);
+    }
+}
+
 impl ProviderReasoningOutputFilter {
     #[cfg(test)]
     fn new(mode: ProviderReasoningOutputMode) -> Self {
@@ -52170,24 +52187,27 @@ impl ProviderReasoningOutputFilter {
         }
     }
 
-    fn push(&mut self, text: &str) -> String {
+    fn push_split(&mut self, text: &str) -> ProviderReasoningFilteredText {
         match self.state {
             ProviderReasoningStreamState::Preserve | ProviderReasoningStreamState::Passthrough => {
-                text.to_owned()
+                ProviderReasoningFilteredText {
+                    visible: text.to_owned(),
+                    hidden: String::new(),
+                }
             }
             ProviderReasoningStreamState::Probe => {
                 self.pending.push_str(text);
-                self.resolve_probe()
+                self.resolve_probe_split()
             }
             ProviderReasoningStreamState::Suppress => {
                 self.pending.push_str(text);
-                self.resolve_suppressed()
+                self.resolve_suppressed_split()
             }
-            ProviderReasoningStreamState::Boundary => self.resolve_boundary(text),
+            ProviderReasoningStreamState::Boundary => self.resolve_boundary_split(text),
         }
     }
 
-    fn finish(&mut self) -> String {
+    fn finish_split(&mut self) -> ProviderReasoningFilteredText {
         match self.state {
             ProviderReasoningStreamState::Probe => {
                 let trimmed = self.pending.trim_start();
@@ -52195,72 +52215,109 @@ impl ProviderReasoningOutputFilter {
                     && (self.delimiters.open.starts_with(trimmed)
                         || self.delimiters.close.starts_with(trimmed))
                 {
-                    self.pending.clear();
-                    return String::new();
+                    return ProviderReasoningFilteredText {
+                        visible: String::new(),
+                        hidden: std::mem::take(&mut self.pending),
+                    };
                 }
                 self.state = ProviderReasoningStreamState::Passthrough;
-                std::mem::take(&mut self.pending)
+                ProviderReasoningFilteredText {
+                    visible: std::mem::take(&mut self.pending),
+                    hidden: String::new(),
+                }
             }
-            ProviderReasoningStreamState::Suppress => {
-                self.pending.clear();
-                String::new()
-            }
+            ProviderReasoningStreamState::Suppress => ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden: std::mem::take(&mut self.pending),
+            },
             ProviderReasoningStreamState::Preserve
             | ProviderReasoningStreamState::Boundary
-            | ProviderReasoningStreamState::Passthrough => String::new(),
+            | ProviderReasoningStreamState::Passthrough => ProviderReasoningFilteredText::default(),
         }
     }
 
-    fn resolve_probe(&mut self) -> String {
+    fn resolve_probe_split(&mut self) -> ProviderReasoningFilteredText {
         let trimmed = self.pending.trim_start();
         if trimmed.is_empty()
             || self.delimiters.open.starts_with(trimmed)
             || self.delimiters.close.starts_with(trimmed)
         {
-            return String::new();
+            return ProviderReasoningFilteredText::default();
         }
         if let Some(rest) = trimmed.strip_prefix(self.delimiters.open) {
+            let consumed = self.pending.len() - rest.len();
+            let hidden = self.pending[..consumed].to_owned();
             self.pending = rest.to_owned();
             self.state = ProviderReasoningStreamState::Suppress;
-            return self.resolve_suppressed();
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_suppressed_split());
+            return filtered;
         }
         if let Some(rest) = trimmed.strip_prefix(self.delimiters.close) {
+            let consumed = self.pending.len() - rest.len();
+            let hidden = self.pending[..consumed].to_owned();
             let rest = rest.to_owned();
             self.pending.clear();
-            return self.resolve_boundary(&rest);
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_boundary_split(&rest));
+            return filtered;
         }
         self.state = ProviderReasoningStreamState::Passthrough;
-        std::mem::take(&mut self.pending)
+        ProviderReasoningFilteredText {
+            visible: std::mem::take(&mut self.pending),
+            hidden: String::new(),
+        }
     }
 
-    fn resolve_suppressed(&mut self) -> String {
+    fn resolve_suppressed_split(&mut self) -> ProviderReasoningFilteredText {
         if let Some(index) = self.pending.find(self.delimiters.close) {
-            let rest = self.pending[index + self.delimiters.close.len()..].to_owned();
+            let hidden_end = index + self.delimiters.close.len();
+            let hidden = self.pending[..hidden_end].to_owned();
+            let rest = self.pending[hidden_end..].to_owned();
             self.pending.clear();
-            return self.resolve_boundary(&rest);
+            let mut filtered = ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            };
+            filtered.extend(self.resolve_boundary_split(&rest));
+            return filtered;
         }
 
         let retained = (1..self.delimiters.close.len())
             .rev()
             .find(|length| self.pending.ends_with(&self.delimiters.close[..*length]))
             .unwrap_or(0);
-        if retained == 0 {
-            self.pending.clear();
-        } else {
-            let tail = self.pending.split_off(self.pending.len() - retained);
-            self.pending = tail;
+        let hidden_end = self.pending.len() - retained;
+        let hidden = self.pending[..hidden_end].to_owned();
+        let tail = self.pending[hidden_end..].to_owned();
+        self.pending = tail;
+        ProviderReasoningFilteredText {
+            visible: String::new(),
+            hidden,
         }
-        String::new()
     }
 
-    fn resolve_boundary(&mut self, text: &str) -> String {
+    fn resolve_boundary_split(&mut self, text: &str) -> ProviderReasoningFilteredText {
         let visible = trim_provider_reasoning_boundary(text);
+        let hidden = text[..text.len() - visible.len()].to_owned();
         if visible.is_empty() {
             self.state = ProviderReasoningStreamState::Boundary;
-            String::new()
+            ProviderReasoningFilteredText {
+                visible: String::new(),
+                hidden,
+            }
         } else {
             self.state = ProviderReasoningStreamState::Passthrough;
-            visible.to_owned()
+            ProviderReasoningFilteredText {
+                visible: visible.to_owned(),
+                hidden,
+            }
         }
     }
 }
@@ -52294,21 +52351,28 @@ impl<'a> ProviderSessionLiveStream<'a> {
             heartbeat_load,
             next_index: 0,
             receipt_seq: 1,
-            last_checkpoint_visible_units: 0,
+            last_checkpoint_metered_units: 0,
             first_ttft_ms: None,
             first_token_at: None,
             last_token_at: None,
             generated_tokens: 0,
-            delivered_visible_units: 0,
+            delivered_metered_units: 0,
             prompt_tokens: 0,
             streamed_any: false,
             pending_text: String::new(),
+            pending_hidden_reasoning: String::new(),
             pending_token_ids: Vec::new(),
             visible_text: String::new(),
+            hidden_reasoning: String::new(),
         }
     }
 
-    fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
+    fn on_token(
+        &mut self,
+        chunk: TokenChunk,
+        hidden_reasoning: &str,
+        prompt_tokens: u64,
+    ) -> Result<()> {
         self.prompt_tokens = prompt_tokens;
         let token_at = Instant::now();
         if self.first_ttft_ms.is_none() {
@@ -52323,16 +52387,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.generated_tokens, self.active.session_id, self.request_id
         ));
         self.pending_text.push_str(&chunk.text);
+        self.pending_hidden_reasoning.push_str(hidden_reasoning);
         self.pending_token_ids.push(chunk.token_id);
-        self.visible_text.push_str(&chunk.text);
         self.generated_tokens = self.generated_tokens.saturating_add(1);
-        self.delivered_visible_units = visible_output_units(&self.visible_text, &[]);
-        self.streamed_any = true;
 
         let checkpoint_due = provider_session_checkpoint_due(
-            self.delivered_visible_units,
+            self.projected_metered_units(),
             u64::MAX,
-            self.last_checkpoint_visible_units,
+            self.last_checkpoint_metered_units,
             provider_session_checkpoint_tokens(self.active),
         );
         if self.next_index == 0
@@ -52344,12 +52406,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
         }
 
         if checkpoint_due {
-            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_visible_units);
-            let receipt = provider_session_receipt_for_usage(
+            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_metered_units);
+            let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
+            let receipt = provider_session_receipt_for_usage_attribution(
                 self.terms,
                 self.active,
                 self.body,
                 usage,
+                usage_attribution,
                 self.receipt_seq,
                 false,
                 self.runtime_keypair,
@@ -52375,18 +52439,32 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_visible_units = self.delivered_visible_units;
+            self.last_checkpoint_metered_units = self.delivered_metered_units;
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
     }
 
-    fn append_visible_text(&mut self, text: &str) {
-        self.pending_text.push_str(text);
-        self.visible_text.push_str(text);
-        self.delivered_visible_units = visible_output_units(&self.visible_text, &[]);
-        self.streamed_any |= !text.is_empty();
+    fn append_filtered_text(&mut self, filtered: ProviderReasoningFilteredText) {
+        self.pending_text.push_str(&filtered.visible);
+        self.pending_hidden_reasoning.push_str(&filtered.hidden);
+    }
+
+    fn projected_metered_units(&self) -> u64 {
+        let bytes = self
+            .visible_text
+            .len()
+            .saturating_add(self.hidden_reasoning.len())
+            .saturating_add(self.pending_text.len())
+            .saturating_add(self.pending_hidden_reasoning.len());
+        if bytes == 0 {
+            0
+        } else {
+            u64::try_from(bytes)
+                .unwrap_or(u64::MAX)
+                .div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
+        }
     }
 
     fn first_ttft_ms(&self) -> Option<u64> {
@@ -52409,13 +52487,18 @@ impl<'a> ProviderSessionLiveStream<'a> {
         (tok_s.is_finite() && tok_s > 0.0).then_some(tok_s)
     }
 
-    fn cancellation_receipt_state(&self) -> (ReceiptUsage, u64) {
-        let usage = if self.last_checkpoint_visible_units == 0 {
+    fn cancellation_receipt_state(&self) -> (ReceiptUsage, BTreeMap<String, u64>, u64) {
+        let usage = if self.last_checkpoint_metered_units == 0 {
             ReceiptUsage::default()
         } else {
-            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_visible_units)
+            ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_metered_units)
         };
-        (usage, self.receipt_seq)
+        let usage_attribution = if self.last_checkpoint_metered_units == 0 {
+            BTreeMap::new()
+        } else {
+            provider_reasoning_usage_attribution(&self.hidden_reasoning)
+        };
+        (usage, usage_attribution, self.receipt_seq)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -52424,7 +52507,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn flush_pending_delta(&mut self) -> Result<()> {
-        if self.pending_text.is_empty() && self.pending_token_ids.is_empty() {
+        if self.pending_text.is_empty()
+            && self.pending_hidden_reasoning.is_empty()
+            && self.pending_token_ids.is_empty()
+        {
             return Ok(());
         }
         provider_session_debug(format!(
@@ -52439,6 +52525,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             "rid": self.request_id,
             "i": self.next_index,
             "d": &self.pending_text,
+            "reasoning_evidence_delta": &self.pending_hidden_reasoning,
             "token_ids_delta": &self.pending_token_ids,
             "tools": null,
             "fin": null,
@@ -52451,7 +52538,14 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("sending live token s.delta")
             })
         })?;
+        self.visible_text.push_str(&self.pending_text);
+        self.hidden_reasoning
+            .push_str(&self.pending_hidden_reasoning);
+        self.delivered_metered_units =
+            metered_output_units(&self.visible_text, &self.hidden_reasoning, &[]);
+        self.streamed_any = true;
         self.pending_text.clear();
+        self.pending_hidden_reasoning.clear();
         self.pending_token_ids.clear();
         self.next_index = self.next_index.saturating_add(1);
         Ok(())
@@ -52503,17 +52597,19 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
-        if self.delivered_visible_units == 0
-            || self.delivered_visible_units == self.last_checkpoint_visible_units
+        if self.delivered_metered_units == 0
+            || self.delivered_metered_units == self.last_checkpoint_metered_units
         {
             return Ok(());
         }
-        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_visible_units);
-        let receipt = provider_session_receipt_for_usage(
+        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_metered_units);
+        let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
+        let receipt = provider_session_receipt_for_usage_attribution(
             self.terms,
             self.active,
             self.body,
             usage,
+            usage_attribution,
             self.receipt_seq,
             false,
             self.runtime_keypair,
@@ -52539,7 +52635,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 Ok::<(), anyhow::Error>(())
             })
         })?;
-        self.last_checkpoint_visible_units = self.delivered_visible_units;
+        self.last_checkpoint_metered_units = self.delivered_metered_units;
         self.receipt_seq = self.receipt_seq.saturating_add(1);
         Ok(())
     }
@@ -52548,8 +52644,9 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.streamed_any.then_some(ProviderSessionLiveStreamState {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
-            last_checkpoint_visible_units: self.last_checkpoint_visible_units,
-            delivered_visible_units: self.delivered_visible_units,
+            last_checkpoint_metered_units: self.last_checkpoint_metered_units,
+            delivered_metered_units: self.delivered_metered_units,
+            reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
         })
     }
@@ -52562,6 +52659,7 @@ async fn settle_cancelled_provider_session(
     terms: &ProviderSessionTerms,
     body: &Value,
     usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
@@ -52570,6 +52668,7 @@ async fn settle_cancelled_provider_session(
         active,
         body,
         usage,
+        usage_attribution,
         receipt_seq,
         runtime_keypair,
     )
@@ -52599,6 +52698,7 @@ fn provider_cancelled_session_receipt(
     active: &ActiveProviderSession,
     body: &Value,
     metered_usage: ReceiptUsage,
+    usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
@@ -52611,11 +52711,12 @@ fn provider_cancelled_session_receipt(
     .context(
         "admin-locked price schedule has no nonzero fixed fee or billable cancellation quantum",
     )?;
-    provider_session_receipt_for_usage(
+    provider_session_receipt_for_usage_attribution(
         terms,
         active,
         body,
         usage,
+        usage_attribution,
         receipt_seq,
         true,
         runtime_keypair,
@@ -52642,25 +52743,30 @@ async fn send_provider_session_output(
         .map(|state| state.receipt_seq)
         .unwrap_or(1);
     let checkpoint_tokens = provider_session_checkpoint_tokens(active);
-    let mut last_checkpoint_visible_units = live_stream_state
+    let mut last_checkpoint_metered_units = live_stream_state
         .as_ref()
-        .map(|state| state.last_checkpoint_visible_units)
+        .map(|state| state.last_checkpoint_metered_units)
         .unwrap_or(0);
     let mut token_ids_sent_in_deltas = live_stream_state.is_some();
-    if output.tools.is_empty() && live_stream_state.is_none() {
+    if live_stream_state.is_none() {
         let max_frame_bytes = provider_session_max_frame_bytes();
-        let parts = provider_stream_parts(
-            &output.content,
-            provider_session_text_delta_bytes(max_frame_bytes),
-        );
+        let delta_bytes = provider_session_text_delta_bytes(max_frame_bytes);
+        let parts = if output.tools.is_empty() {
+            provider_stream_parts(&output.content, delta_bytes)
+        } else {
+            Vec::new()
+        };
+        let reasoning_parts = provider_stream_parts(&output.reasoning_evidence, delta_bytes);
         let token_part_count = output
             .token_ids
             .len()
             .div_ceil(PROVIDER_SESSION_MAX_TOKEN_IDS_PER_DELTA);
-        let part_count = parts.len().max(token_part_count);
-        let mut delivered_visible_bytes = 0_u64;
+        let part_count = parts.len().max(reasoning_parts.len()).max(token_part_count);
+        let mut delivered_metered_bytes = 0_u64;
+        let mut delivered_reasoning_bytes = 0_u64;
         for part_index in 0..part_count {
             let part = parts.get(part_index).copied().unwrap_or("");
+            let reasoning_part = reasoning_parts.get(part_index).copied().unwrap_or("");
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
                 active.session_id
@@ -52670,8 +52776,13 @@ async fn send_provider_session_output(
             if !token_ids_delta.is_empty() {
                 token_ids_sent_in_deltas = true;
             }
-            let frame =
-                provider_session_content_delta_frame(request_id, index, part, token_ids_delta);
+            let frame = provider_session_content_delta_frame(
+                request_id,
+                index,
+                part,
+                reasoning_part,
+                token_ids_delta,
+            );
             let frame_len = provider_session_frame_json_len(&frame)?;
             ensure!(
                 frame_len <= max_frame_bytes,
@@ -52683,25 +52794,36 @@ async fn send_provider_session_output(
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
-            delivered_visible_bytes = delivered_visible_bytes
-                .saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
-            let delivered_visible_units = if delivered_visible_bytes == 0 {
+            delivered_metered_bytes = delivered_metered_bytes
+                .saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(reasoning_part.len()).unwrap_or(u64::MAX));
+            delivered_reasoning_bytes = delivered_reasoning_bytes
+                .saturating_add(u64::try_from(reasoning_part.len()).unwrap_or(u64::MAX));
+            let delivered_metered_units = if delivered_metered_bytes == 0 {
                 0
             } else {
-                delivered_visible_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
+                delivered_metered_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT)
             };
             if provider_session_checkpoint_due(
-                delivered_visible_units,
+                delivered_metered_units,
                 output.usage.output_tokens(),
-                last_checkpoint_visible_units,
+                last_checkpoint_metered_units,
                 checkpoint_tokens,
             ) {
-                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_visible_units);
-                let receipt = provider_session_receipt_for_usage(
+                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_metered_units);
+                let reasoning_units =
+                    delivered_reasoning_bytes.div_ceil(VISIBLE_OUTPUT_BYTES_PER_UNIT);
+                let usage_attribution = if reasoning_units == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([("reasoning_output_tokens".to_owned(), reasoning_units)])
+                };
+                let receipt = provider_session_receipt_for_usage_attribution(
                     terms,
                     active,
                     body,
                     usage,
+                    usage_attribution,
                     receipt_seq,
                     false,
                     runtime_keypair,
@@ -52723,7 +52845,7 @@ async fn send_provider_session_output(
                 )
                 .await
                 .context("waiting for checkpoint receipt ack")?;
-                last_checkpoint_visible_units = delivered_visible_units;
+                last_checkpoint_metered_units = delivered_metered_units;
                 receipt_seq = receipt_seq.saturating_add(1);
             }
         }
@@ -52804,15 +52926,21 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    if state.delivered_visible_units > 0
-        && state.delivered_visible_units != state.last_checkpoint_visible_units
+    if state.delivered_metered_units > 0
+        && state.delivered_metered_units != state.last_checkpoint_metered_units
     {
-        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_visible_units);
-        let receipt = provider_session_receipt_for_usage(
+        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_metered_units);
+        let usage_attribution = if state.reasoning_units == 0 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("reasoning_output_tokens".to_owned(), state.reasoning_units)])
+        };
+        let receipt = provider_session_receipt_for_usage_attribution(
             terms,
             active,
             body,
             usage,
+            usage_attribution,
             state.receipt_seq,
             false,
             runtime_keypair,
@@ -52947,6 +53075,7 @@ async fn send_provider_session_final_output_frames(
         "usage_attribution": output.usage_attribution,
         "quality": provider_quality,
         "token_ids": null,
+        "reasoning_evidence_delta": "",
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
     if !output.tools.is_empty() {
@@ -53088,6 +53217,7 @@ fn provider_session_final_delta_frames(
         "usage": output.usage,
         "quality": provider_quality,
         "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
+        "reasoning_evidence_delta": "",
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
     if provider_session_frame_json_len(&final_frame)? <= max_frame_bytes {
@@ -53208,6 +53338,7 @@ fn provider_session_content_delta_frame(
     request_id: &str,
     index: u64,
     part: &str,
+    reasoning_evidence_delta: &str,
     token_ids_delta: &[i32],
 ) -> Value {
     json!({
@@ -53215,6 +53346,7 @@ fn provider_session_content_delta_frame(
         "rid": request_id,
         "i": index,
         "d": part,
+        "reasoning_evidence_delta": reasoning_evidence_delta,
         "token_ids_delta": token_ids_delta,
         "tools": null,
         "fin": null,
@@ -53414,6 +53546,7 @@ fn provider_session_artifact_delta_frame(
         "rid": request_id,
         "i": index,
         "d": "",
+        "reasoning_evidence_delta": "",
         "tools": null,
         "fin": null,
         "artifact": {
@@ -55681,6 +55814,7 @@ struct ProviderSessionArtifact {
 #[derive(Clone, Debug, PartialEq)]
 struct ProviderSessionOutput {
     content: String,
+    reasoning_evidence: String,
     tools: Vec<Value>,
     embeddings: Option<Vec<Vec<f32>>>,
     artifacts: Vec<ProviderSessionArtifact>,
@@ -55739,8 +55873,8 @@ fn normalize_provider_visible_output_usage(
         return Ok(());
     }
     let tools = provider_visible_tool_calls(&output.tools)?;
-    let visible_units = visible_output_units(&output.content, &tools);
-    output.completion_tokens = visible_units;
+    let metered_units = metered_output_units(&output.content, &output.reasoning_evidence, &tools);
+    output.completion_tokens = metered_units;
     output.usage = ReceiptUsage::from_units(
         output
             .usage
@@ -55748,15 +55882,26 @@ fn normalize_provider_visible_output_usage(
             .iter()
             .filter(|(unit, _)| unit.as_str() != USAGE_OUTPUT_TOKEN)
             .map(|(unit, count)| (unit.clone(), *count))
-            .chain([(USAGE_OUTPUT_TOKEN.to_owned(), visible_units)]),
+            .chain([(USAGE_OUTPUT_TOKEN.to_owned(), metered_units)]),
     );
-    if let Some(reasoning) = output.usage_attribution.get_mut("reasoning_output_tokens") {
-        *reasoning = (*reasoning).min(visible_units);
-        if *reasoning == 0 {
-            output.usage_attribution.remove("reasoning_output_tokens");
-        }
+    let reasoning_units = metered_output_units("", &output.reasoning_evidence, &[]);
+    if reasoning_units > 0 {
+        output
+            .usage_attribution
+            .insert("reasoning_output_tokens".to_owned(), reasoning_units);
+    } else {
+        output.usage_attribution.remove("reasoning_output_tokens");
     }
     Ok(())
+}
+
+fn provider_reasoning_usage_attribution(reasoning_evidence: &str) -> BTreeMap<String, u64> {
+    let reasoning_units = metered_output_units("", reasoning_evidence, &[]);
+    if reasoning_units == 0 {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([("reasoning_output_tokens".to_owned(), reasoning_units)])
+    }
 }
 
 fn validate_provider_session_output(
@@ -56176,10 +56321,18 @@ fn provider_reasoning_visible_output_with_delimiters(
     mode: ProviderReasoningOutputMode,
     delimiters: ProviderReasoningDelimiters,
 ) -> String {
+    provider_reasoning_output_parts_with_delimiters(text, mode, delimiters).visible
+}
+
+fn provider_reasoning_output_parts_with_delimiters(
+    text: &str,
+    mode: ProviderReasoningOutputMode,
+    delimiters: ProviderReasoningDelimiters,
+) -> ProviderReasoningFilteredText {
     let mut filter = ProviderReasoningOutputFilter::with_delimiters(mode, delimiters);
-    let mut visible = filter.push(text);
-    visible.push_str(&filter.finish());
-    visible
+    let mut filtered = filter.push_split(text);
+    filtered.extend(filter.finish_split());
+    filtered
 }
 
 fn provider_reasoning_delimiters(adapter: &catalog::CatalogAdapter) -> ProviderReasoningDelimiters {
@@ -56284,6 +56437,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("transcribing provider session audio with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: output.text,
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -56320,6 +56474,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -56369,6 +56524,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -56427,6 +56583,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         );
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -56503,6 +56660,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts,
@@ -56534,6 +56692,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             .context("generating provider session embeddings with mayhem-engine")?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: Some(output.embeddings),
             artifacts: Vec::new(),
@@ -56582,10 +56741,11 @@ fn provider_engine_session_response_with_sampling_bounded(
             &mut |chunk: mayhem_engine::TokenChunk| {
                 if tool_mode.is_none() {
                     if let Some(stream) = live_stream.as_deref_mut() {
+                        let filtered = reasoning_stream_filter.push_split(&chunk.text);
                         let mut visible_chunk = chunk.clone();
-                        visible_chunk.text = reasoning_stream_filter.push(&chunk.text);
+                        visible_chunk.text = filtered.visible;
                         stream
-                            .on_token(visible_chunk, prompt_tokens)
+                            .on_token(visible_chunk, &filtered.hidden, prompt_tokens)
                             .map_err(|err| {
                                 mayhem_engine::EngineError::InvalidConfig(format!(
                                     "provider live stream failed: {err:#}"
@@ -56604,10 +56764,10 @@ fn provider_engine_session_response_with_sampling_bounded(
         )
         .context("generating provider session response with mayhem-engine")?;
     if tool_mode.is_none() {
-        let trailing_visible_text = reasoning_stream_filter.finish();
-        if !trailing_visible_text.is_empty() {
+        let trailing = reasoning_stream_filter.finish_split();
+        if !trailing.visible.is_empty() || !trailing.hidden.is_empty() {
             if let Some(stream) = live_stream.as_deref_mut() {
-                stream.append_visible_text(&trailing_visible_text);
+                stream.append_filtered_text(trailing);
             }
         }
     }
@@ -56655,7 +56815,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     } else {
         "tool_calls".to_owned()
     };
-    let visible_output = provider_reasoning_visible_output_with_delimiters(
+    let filtered_output = provider_reasoning_output_parts_with_delimiters(
         &output.text,
         reasoning_output_mode,
         reasoning_delimiters,
@@ -56663,10 +56823,11 @@ fn provider_engine_session_response_with_sampling_bounded(
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: if tools.is_empty() {
-            visible_output
+            filtered_output.visible
         } else {
             String::new()
         },
+        reasoning_evidence: filtered_output.hidden,
         tools,
         embeddings: None,
         artifacts,
@@ -58140,6 +58301,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             completion_tokens,
             token_ids: synthetic_provider_token_ids(completion_tokens),
             content,
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -58153,6 +58315,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
                 "name": "bash",
@@ -58171,6 +58334,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         return ProviderSessionOutput {
             usage: provider_chat_receipt_usage(body, prompt_tokens, 1),
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
                 "name": tool_name,
@@ -58205,6 +58369,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         completion_tokens,
         token_ids: synthetic_provider_token_ids(completion_tokens),
         content,
+        reasoning_evidence: String::new(),
         tools: Vec::new(),
         embeddings: None,
         artifacts: Vec::new(),
@@ -68161,6 +68326,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -68285,6 +68451,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "contract_request": {"prompt": "cancelled render"},
             }),
             ReceiptUsage::default(),
+            BTreeMap::new(),
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -68325,6 +68492,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "contract_request": {"prompt": "cancelled render"},
             }),
             ReceiptUsage::default(),
+            BTreeMap::new(),
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -68579,6 +68747,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -69222,13 +69391,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "\npublic ",
             "answer",
         ];
-        let visible = chunks
-            .iter()
-            .map(|chunk| filter.push(chunk))
-            .collect::<String>();
+        let mut filtered = ProviderReasoningFilteredText::default();
+        for chunk in chunks {
+            filtered.extend(filter.push_split(chunk));
+        }
+        filtered.extend(filter.finish_split());
 
-        assert_eq!(visible, "public answer");
-        assert_eq!(filter.finish(), "");
+        assert_eq!(filtered.visible, "public answer");
+        assert_eq!(filtered.hidden, "private chain of thought</think>\n\n");
     }
 
     #[test]
@@ -70319,6 +70489,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             };
             let output = ProviderSessionOutput {
                 content: String::new(),
+                reasoning_evidence: String::new(),
                 tools: Vec::new(),
                 embeddings: None,
                 artifacts: vec![ProviderSessionArtifact {
@@ -71582,7 +71753,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         for (index, part) in parts.iter().enumerate() {
             token_counter.observe(part);
             let delta = provider_token_ids_delta_for_part(&token_ids, index, parts.len());
-            let frame = provider_session_content_delta_frame("rid", index as u64, part, delta);
+            let frame = provider_session_content_delta_frame("rid", index as u64, part, "", delta);
+            assert_eq!(frame["reasoning_evidence_delta"], "");
             observed.extend(
                 frame["token_ids_delta"]
                     .as_array()
@@ -71611,7 +71783,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut observed = Vec::new();
         for index in 0..part_count {
             let token_delta = provider_token_ids_delta_for_part(&token_ids, index, part_count);
-            let frame = provider_session_content_delta_frame("rid", index as u64, "", token_delta);
+            let frame =
+                provider_session_content_delta_frame("rid", index as u64, "", "", token_delta);
             assert!(provider_session_frame_json_len(&frame).unwrap() <= max_frame_bytes);
             observed.extend_from_slice(token_delta);
         }
@@ -71648,6 +71821,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         );
         let mut output = ProviderSessionOutput {
             content: "x".repeat(usize::try_from(max_visible_bytes).unwrap()),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
@@ -71686,9 +71860,47 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_reasoning_only_output_is_billed_from_evidence() {
+        let body = json!({ "messages": [], "max_tokens": 32 });
+        let mut output = ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: "r".repeat(128),
+            tools: Vec::new(),
+            embeddings: None,
+            artifacts: Vec::new(),
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 5,
+            completion_tokens: 32,
+            token_ids: vec![7; 32],
+            usage: ReceiptUsage::text(5, 32),
+            usage_attribution: BTreeMap::from([("reasoning_output_tokens".to_owned(), 31)]),
+        };
+
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
+
+        assert_eq!(output.usage.output_tokens(), 32);
+        assert_eq!(output.completion_tokens, 32);
+        assert_eq!(
+            output
+                .usage_attribution
+                .get("reasoning_output_tokens")
+                .copied(),
+            Some(32)
+        );
+
+        output.content = "public answer".to_owned();
+        output.reasoning_evidence.clear();
+        normalize_provider_visible_output_usage(&body, &mut output).unwrap();
+        assert!(!output
+            .usage_attribution
+            .contains_key("reasoning_output_tokens"));
+    }
+
+    #[test]
     fn provider_session_final_delta_frames_chunk_large_fields_under_transport_limit() {
         let output = ProviderSessionOutput {
             content: String::new(),
+            reasoning_evidence: String::new(),
             tools: vec![
                 json!({
                     "id": "call-large-1",
@@ -71911,6 +72123,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_text_throughput_excludes_prefill_and_ignores_one_token_turns() {
         let output = ProviderSessionOutput {
             content: "ok".to_owned(),
+            reasoning_evidence: String::new(),
             tools: Vec::new(),
             embeddings: None,
             artifacts: Vec::new(),
