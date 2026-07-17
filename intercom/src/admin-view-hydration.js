@@ -1,32 +1,5 @@
 import b4a from 'b4a';
 
-export const attachAutobaseWakeup = (peer) => {
-  const swarm = peer?.swarm;
-  const wakeup = peer?.base?.wakeupProtocol;
-  if (!swarm || typeof swarm.on !== 'function') {
-    throw new Error('Autobase wakeup integration requires an active Hyperswarm.');
-  }
-  if (!wakeup || typeof wakeup.addStream !== 'function') {
-    throw new Error('Autobase wakeup integration requires the base wakeup protocol.');
-  }
-
-  const attached = new WeakSet();
-  const attach = (connection) => {
-    if (!connection || attached.has(connection)) return false;
-    attached.add(connection);
-    if (typeof wakeup.hasStream === 'function' && wakeup.hasStream(connection)) return false;
-    wakeup.addStream(connection);
-    return true;
-  };
-
-  let existing = 0;
-  for (const connection of swarm.connections ?? []) {
-    if (attach(connection)) existing += 1;
-  }
-  swarm.on('connection', attach);
-  return existing;
-};
-
 export const joinCanonicalPeers = (peer, publicKeys) => {
   if (!Array.isArray(publicKeys) || publicKeys.length === 0) return 0;
   if (typeof peer?.swarm?.joinPeer !== 'function') {
