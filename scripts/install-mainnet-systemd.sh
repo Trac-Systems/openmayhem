@@ -51,6 +51,10 @@ append_default MAYHEM_REPO "$repo"
 append_default MAYHEM_ASSET_DIR "$repo"
 append_default MAYHEM_PEER_RPC 'http://127.0.0.1:49223/v1'
 append_default MAYHEM_CONTRACT_RPC_URL 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_RPC_URL 'http://127.0.0.1:49223/v1'
+append_default MAYHEM_GATEWAY_URL 'http://127.0.0.1:11435'
+append_default MAYHEM_ADMIN_HOME "$root/.mayhem-local/live-home"
+append_default MAYHEM_CADENCE_STATE_DIR "$root/.mayhem-local/settlement"
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_CONTRACT_DRY_RUN '0'
 append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
