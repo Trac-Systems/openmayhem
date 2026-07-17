@@ -148,8 +148,14 @@ mayhem models --gateway                    # live truth: models + live prices
 ```
 mayhem balance            # confirm credit landed
 ```
-Point any OpenAI client at `http://127.0.0.1:11435/v1`, or wire opencode (§4.3). Show the dashboard
-URL the command printed.
+Point any OpenAI client at `http://127.0.0.1:11435/v1`, or wire opencode (§4.3). Show the exact
+tokenized dashboard URLs printed by the command. The canonical default shapes are
+`http://127.0.0.1:11435/mayhem/dashboard?token=<generated-token>` and
+`http://127.0.0.1:11435/mayhem/dashboard/provider?token=<generated-token>`; the bare paths
+intentionally return `401`. For a remote terminal, print
+`ssh -N -L 11435:127.0.0.1:11435 user@remote-host` alongside the URLs. A tunnel does not replace
+the dashboard token, and an operational service on another port must not be presented as the
+canonical dashboard.
 
 **To switch rail later:** `mayhem down` then `mayhem up --rail <other> --yes`. Rails never convert
 into each other.

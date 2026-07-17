@@ -613,13 +613,31 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 
 ## Dashboards
 
-`mayhem up` serves local dashboards on loopback:
+`mayhem up` serves local dashboards on the gateway's canonical loopback origin,
+`http://127.0.0.1:11435`, and always prints the tokenized user and provider URLs. Open the exact
+printed URL: the bare paths intentionally return `401`.
 
 | Dashboard | Path | Shows |
 |-----------|------|-------|
 | User | `/mayhem/dashboard` | gateway readiness, model choice, Playground, receipts, balance, connection setup |
 | Provider | `/mayhem/dashboard/provider` | serving routes, preparation progress, current capacity, canonical earnings, reputation |
 | Network explorer | `/mayhem/dashboard/network` | bounded model, provider, market, route-activity, and evidence snapshots |
+
+The default copy/paste URL shapes are:
+
+```text
+http://127.0.0.1:11435/mayhem/dashboard?token=<generated-token>
+http://127.0.0.1:11435/mayhem/dashboard/provider?token=<generated-token>
+```
+
+When Mayhem runs on a remote machine, forward the same loopback port and then open the URL printed
+by `mayhem up`:
+
+```bash
+ssh -N -L 11435:127.0.0.1:11435 user@remote-host
+```
+
+The SSH tunnel only transports the connection; it does not replace the dashboard token.
 
 Production figures come from the current catalog, contract, ledger, gateway records, or provider heartbeats, with freshness and unavailable states kept explicit. Workbench fixtures are labelled and isolated from production data.
 
