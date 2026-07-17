@@ -27959,6 +27959,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .with_default_min_ctx(default_min_ctx)
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"))
+        .with_dashboard_history_path(home.join("gateway-dashboard-history.json"))
         .with_access_control(access_control);
     state
         .replace_preferred_providers(preferred_providers.clone())

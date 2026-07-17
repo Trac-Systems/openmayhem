@@ -95,6 +95,9 @@ type SharedState = Arc<GatewayState>;
 mod dashboard_ui;
 use dashboard_ui::{DASHBOARD_APP_CSS, DASHBOARD_APP_JS};
 
+mod dashboard_brand_assets;
+use dashboard_brand_assets::dashboard_brand_asset;
+
 mod dashboard_pages;
 use dashboard_pages::{
     dashboard_evidence_payload, render_dashboard_evidence_page, render_dashboard_product_page,
@@ -170,6 +173,7 @@ const GATEWAY_MEDIA_SCHEMA_MAX_ITEMS: u32 = 1_024;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEM_UNITS: u64 = 1_000_000_000_000;
 const DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS: usize = 1_024;
+const DEFAULT_GATEWAY_MAX_STORED_RECEIPTS: usize = 4_096;
 const DEFAULT_GATEWAY_MAX_CHAT_AFFINITIES: usize = 4_096;
 const DEFAULT_GATEWAY_MAX_STORED_VIDEO_JOBS: usize = 64;
 const DEFAULT_GATEWAY_MAX_STORED_VIDEO_BYTES: usize = 512 * 1024 * 1024;
@@ -194,6 +198,8 @@ const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0
 pub struct GatewayState {
     models: Arc<Mutex<Arc<Vec<GatewayModel>>>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    dashboard_history_path: Arc<Option<PathBuf>>,
+    dashboard_history_write: Arc<Mutex<()>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
@@ -363,6 +369,7 @@ impl Drop for GatewayModalityAdmissionGuard {
 
 #[derive(Clone, Copy, Debug)]
 struct GatewayRetentionLimits {
+    receipts: usize,
     paused_sessions: usize,
     chat_affinities: usize,
     video_jobs: usize,
@@ -377,6 +384,10 @@ impl Default for GatewayRetentionLimits {
             DEFAULT_SESSION_MAX_ARTIFACT_BYTES,
         );
         Self {
+            receipts: configured_positive_usize(
+                "MAYHEM_GATEWAY_MAX_STORED_RECEIPTS",
+                DEFAULT_GATEWAY_MAX_STORED_RECEIPTS,
+            ),
             paused_sessions: configured_positive_usize(
                 "MAYHEM_GATEWAY_MAX_STORED_PAUSED_SESSIONS",
                 DEFAULT_GATEWAY_MAX_STORED_PAUSED_SESSIONS,
@@ -950,7 +961,7 @@ impl GatewayFailoverInvocation {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredReceipt {
     pub rail: String,
     pub voucher: SpendVoucher,
@@ -1425,7 +1436,7 @@ fn gateway_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError>
     Ok(Some(token.to_owned()))
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PausedSession {
     pub session_id: String,
     pub reason: String,
@@ -1449,6 +1460,20 @@ pub struct StoredProbeEvent {
     pub evidence_hash: String,
     pub evidence: Value,
     pub probe_command: Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct GatewayDashboardHistory {
+    #[serde(default = "default_gateway_dashboard_history_version")]
+    version: u32,
+    #[serde(default)]
+    receipts: Vec<StoredReceipt>,
+    #[serde(default)]
+    paused_sessions: Vec<PausedSession>,
+}
+
+fn default_gateway_dashboard_history_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2491,6 +2516,8 @@ impl GatewayState {
         Self {
             models: Arc::new(Mutex::new(Arc::new(models))),
             receipts: Arc::new(Mutex::new(Vec::new())),
+            dashboard_history_path: Arc::new(None),
+            dashboard_history_write: Arc::new(Mutex::new(())),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
@@ -2577,6 +2604,42 @@ impl GatewayState {
             tokens: checkpoint_every.tokens.max(1),
             ms: checkpoint_every.ms,
         };
+        self
+    }
+
+    /// Restore and persist the bounded receipt/pause history used by the local
+    /// dashboard. The file contains signed metering records and local recovery
+    /// reasons, never prompts, model output, credentials, or wallet secrets.
+    pub fn with_dashboard_history_path(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<GatewayDashboardHistory>(&bytes) {
+                Ok(mut history) => {
+                    if history.receipts.len() > self.retention_limits.receipts {
+                        let remove = history.receipts.len() - self.retention_limits.receipts;
+                        history.receipts.drain(..remove);
+                    }
+                    if history.paused_sessions.len() > self.retention_limits.paused_sessions {
+                        let remove =
+                            history.paused_sessions.len() - self.retention_limits.paused_sessions;
+                        history.paused_sessions.drain(..remove);
+                    }
+                    *self.receipts.lock_recover("receipt store") = history.receipts;
+                    *self.paused_sessions.lock_recover("paused session store") =
+                        history.paused_sessions.into();
+                }
+                Err(err) => eprintln!(
+                    "Mayhem dashboard ignored unreadable history at {}: {err}",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "Mayhem dashboard could not read history at {}: {err}",
+                path.display()
+            ),
+        }
+        self.dashboard_history_path = Arc::new(Some(path));
         self
     }
 
@@ -2894,9 +2957,22 @@ impl GatewayState {
                 .filter(|delta| *delta > 0)
                 .map(|delta| (access_token.clone(), delta))
         });
-        self.receipts.lock_recover("receipt store").push(receipt);
+        {
+            let mut receipts = self.receipts.lock_recover("receipt store");
+            receipts.push(receipt);
+            if receipts.len() > self.retention_limits.receipts {
+                let remove = receipts.len() - self.retention_limits.receipts;
+                receipts.drain(..remove);
+            }
+        }
         if let Some((access_token, delta)) = spend_delta {
             self.access_control.record_spend(&access_token, delta)?;
+        }
+        if let Err(err) = self.persist_dashboard_history() {
+            eprintln!(
+                "Mayhem dashboard could not persist receipt history: {}",
+                err.message
+            );
         }
         Ok(())
     }
@@ -2923,6 +2999,55 @@ impl GatewayState {
             paused,
             self.retention_limits.paused_sessions,
         );
+        if let Err(err) = self.persist_dashboard_history() {
+            eprintln!(
+                "Mayhem dashboard could not persist paused-session history: {}",
+                err.message
+            );
+        }
+    }
+
+    fn persist_dashboard_history(&self) -> Result<(), ApiError> {
+        let Some(path) = self.dashboard_history_path.as_ref().as_ref() else {
+            return Ok(());
+        };
+        let _write_guard = self
+            .dashboard_history_write
+            .lock_recover("dashboard history write");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ApiError::internal_message(format!(
+                    "creating dashboard history directory {} failed: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let history = GatewayDashboardHistory {
+            version: default_gateway_dashboard_history_version(),
+            receipts: self.receipts(),
+            paused_sessions: self.paused_sessions(),
+        };
+        let bytes = serde_json::to_vec_pretty(&history).map_err(|err| {
+            ApiError::internal_message(format!("serializing dashboard history failed: {err}"))
+        })?;
+        let temp_path = path.with_extension(
+            path.extension()
+                .map(|extension| format!("{}.tmp", extension.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".to_owned()),
+        );
+        fs::write(&temp_path, bytes).map_err(|err| {
+            ApiError::internal_message(format!(
+                "writing dashboard history temporary file {} failed: {err}",
+                temp_path.display()
+            ))
+        })?;
+        fs::rename(&temp_path, path).map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            ApiError::internal_message(format!(
+                "installing dashboard history {} failed: {err}",
+                path.display()
+            ))
+        })
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
@@ -3049,6 +3174,10 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route(
             "/mayhem/dashboard/assets/app.js",
             get(mayhem_dashboard_app_js),
+        )
+        .route(
+            "/mayhem/dashboard/assets/brand/{asset}",
+            get(mayhem_dashboard_brand_asset),
         )
         .route("/mayhem/dashboard/{*page}", get(mayhem_dashboard_subpage))
         .layer(DefaultBodyLimit::max(request_body_limit))
@@ -4833,6 +4962,21 @@ async fn mayhem_dashboard_app_js() -> Response {
     dashboard_asset_response("text/javascript; charset=utf-8", DASHBOARD_APP_JS)
 }
 
+async fn mayhem_dashboard_brand_asset(Path(asset): Path<String>) -> Response {
+    let Some((content_type, bytes)) = dashboard_brand_asset(&asset) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = Response::new(Body::from(bytes));
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    with_dashboard_security_headers(response)
+}
+
 fn dashboard_asset_response(content_type: &'static str, content: &'static str) -> Response {
     let mut response = Response::new(Body::from(content));
     response
@@ -5185,6 +5329,22 @@ fn dashboard_entry_for_route<'a>(
     })
 }
 
+// Humanize raw token counts for dashboard copy: 262144 -> "262k".
+pub(crate) fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        let millions = value as f64 / 1_000_000.0;
+        if (millions - millions.round()).abs() < 0.05 {
+            format!("{}M", millions.round() as u64)
+        } else {
+            format!("{millions:.1}M")
+        }
+    } else if value >= 1_000 {
+        format!("{}k", (value + 500) / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
 fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
     let mut abilities = BTreeSet::new();
     for modality in model
@@ -5237,7 +5397,10 @@ fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
                 .join("|")
         ));
     }
-    abilities.insert(format!("ctx {}", model.mayhem.caps.ctx));
+    abilities.insert(format!(
+        "ctx {}",
+        format_token_count(u64::from(model.mayhem.caps.ctx))
+    ));
     abilities.into_iter().collect()
 }
 
@@ -24884,7 +25047,7 @@ mod tests {
         );
         assert!(provider_html.contains("attention-card danger"));
         assert!(provider_html.contains("Update required"));
-        assert!(provider_html.contains("catalog minimum 9999.0.0"));
+        assert!(provider_html.contains("minimum 9999.0.0"));
         assert!(!provider_html.contains("Blocked by update"));
     }
 

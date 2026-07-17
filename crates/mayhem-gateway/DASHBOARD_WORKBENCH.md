@@ -24,7 +24,7 @@ state.
 
 The workbench uses the same dashboard implementation as the gateway:
 
-- `dashboard_pages.rs` owns the 19 product routes, view construction, source
+- `dashboard_pages.rs` owns the 20 product routes, view construction, source
   labels, and freshness semantics.
 - `dashboard_ui.rs` owns the shared shell, responsive CSS, progressive-
   enhancement JavaScript, focus/dialog behavior, local preferences, exports,
@@ -34,8 +34,8 @@ The workbench uses the same dashboard implementation as the gateway:
 - `dashboard_workbench.rs` owns only the feature-gated local fixture router and
   its eight scenarios.
 
-The route set includes Home, Playground, Models, Activity, Wallet, Connect;
-Earn Overview, Machines, Opportunities, Earnings, and Reliability; Network
+The route set includes Home, Playground, Models, Activity, Billing, Integrations;
+Earn Overview, Jobs, Setup, Model fit, Earnings, and Reliability; Network
 Overview, Models, Providers, Markets, Activity, and Evidence; plus Help and
 Settings. Help is available at `/mayhem/dashboard/help`.
 
@@ -60,12 +60,16 @@ under the ignored `target/dashboard-workbench/` directory.
 
 ## Responsive layout contract
 
-Every product route uses the same full-width app shell, adaptive gutters, and
-bounded heading measure. The shell changes at three content-driven thresholds:
-wide layouts collapse secondary columns around 1120px, navigation becomes an
-accessible off-canvas drawer below 780px when JavaScript is available, and
-dense panels become single-column below 520px. Without JavaScript, the complete
-navigation remains in normal document flow.
+Every product route uses the same app shell with a bounded, centered content
+column: prose-led routes cap at the standard content tier and table-dense
+routes (catalog, activity, and the earn/network analysis pages) use a wider
+tier, while the topbar and footer rails stay full width. Paragraph measure is
+capped for readability, and the shell changes at four content-driven
+thresholds: launch-path cards stack their actions below 1360px, wide layouts
+collapse secondary columns around 1120px, navigation becomes an accessible
+off-canvas drawer below 780px when JavaScript is available, and dense panels
+become single-column below 520px. Without JavaScript, the complete navigation
+remains in normal document flow.
 
 Use the workbench scenarios to check at least these viewport classes during UI
 work: 320x568 and 390x844 phones, 844x390 short landscape, 768x1024 tablet,

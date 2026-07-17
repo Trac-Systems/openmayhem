@@ -15,7 +15,7 @@ pub(super) enum DashboardAppPage {
 }
 
 impl DashboardAppPage {
-    fn nav_items() -> [(Self, &'static str, &'static str); 8] {
+    fn nav_items() -> [(Self, &'static str, &'static str); 5] {
         [
             (Self::Home, "Home", "/mayhem/dashboard"),
             (
@@ -23,12 +23,21 @@ impl DashboardAppPage {
                 "Playground",
                 "/mayhem/dashboard/playground",
             ),
-            (Self::Models, "Models", "/mayhem/dashboard/models"),
             (Self::Activity, "Activity", "/mayhem/dashboard/activity"),
-            (Self::Wallet, "Wallet", "/mayhem/dashboard/wallet"),
-            (Self::Connect, "Connect", "/mayhem/dashboard/connect"),
             (Self::Earn, "Earn", "/mayhem/dashboard/earn"),
-            (Self::Network, "Network", "/mayhem/dashboard/network"),
+            (Self::Wallet, "Billing", "/mayhem/dashboard/wallet"),
+        ]
+    }
+
+    fn advanced_nav_items() -> [(Self, &'static str, &'static str); 3] {
+        [
+            (Self::Models, "Model catalog", "/mayhem/dashboard/models"),
+            (Self::Connect, "Integrations", "/mayhem/dashboard/connect"),
+            (
+                Self::Network,
+                "Network explorer",
+                "/mayhem/dashboard/network",
+            ),
         ]
     }
 
@@ -36,10 +45,10 @@ impl DashboardAppPage {
         match self {
             Self::Home => "Home",
             Self::Playground => "Playground",
-            Self::Models => "Models",
+            Self::Models => "Model catalog",
             Self::Activity => "Activity",
-            Self::Wallet => "Wallet",
-            Self::Connect => "Connect",
+            Self::Wallet => "Billing",
+            Self::Connect => "Integrations",
             Self::Earn => "Earn",
             Self::Network => "Network",
             Self::Help => "Help",
@@ -94,10 +103,29 @@ pub(super) struct DashboardShell<'a> {
     pub content: &'a str,
     pub footer: &'a str,
     pub expires_in_seconds: u64,
+    pub wide: bool,
 }
 
 pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
     let navigation = DashboardAppPage::nav_items()
+        .into_iter()
+        .map(|(page, label, href)| {
+            let current = if page == shell.page {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            format!(
+                r#"<a href="{href}" aria-label="{label}"{current}><span class="nav-icon">{icon}</span><span class="nav-text">{label}</span></a>"#,
+                icon = page.icon(),
+            )
+        })
+        .collect::<String>();
+    let advanced_open = matches!(
+        shell.page,
+        DashboardAppPage::Models | DashboardAppPage::Connect | DashboardAppPage::Network
+    );
+    let advanced_navigation = DashboardAppPage::advanced_nav_items()
         .into_iter()
         .map(|(page, label, href)| {
             let current = if page == shell.page {
@@ -125,6 +153,11 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         "good" | "warn" | "danger" => shell.status_tone,
         _ => "",
     };
+    let page_class = if shell.page == DashboardAppPage::Playground {
+        " app-main--playground"
+    } else {
+        ""
+    };
     let amount_control = if shell.content.contains("data-money")
         || shell.actions.contains("data-money")
     {
@@ -137,18 +170,20 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
 <div class="app-shell">
   <aside class="app-sidebar" id="app-navigation" aria-label="Mayhem navigation">
     <a class="app-brand" href="/mayhem/dashboard" aria-label="Mayhem Home"><span class="app-brand-mark" aria-hidden="true">M</span><span class="app-brand-text">MAY<span class="hem">HEM</span></span></a>
-    <nav class="app-nav" aria-label="Primary"><span class="app-nav-label">Workspace</span>{navigation}<span class="app-nav-label">System</span><a href="/mayhem/dashboard/help" aria-label="Help"{help_current}><span class="nav-icon">{help_icon}</span><span class="nav-text">Help</span></a><a href="/mayhem/dashboard/settings" aria-label="Settings"{settings_current}><span class="nav-icon">{settings_icon}</span><span class="nav-text">Settings</span></a></nav>
+    <nav class="app-nav" aria-label="Primary"><span class="app-nav-label">Workspace</span>{navigation}<details class="advanced-nav"{advanced_open}><summary><span class="nav-icon" aria-hidden="true">&#8943;</span><span class="nav-text">Advanced</span></summary><div class="advanced-nav-items">{advanced_navigation}</div></details><span class="app-nav-label">System</span><a href="/mayhem/dashboard/help" aria-label="Help"{help_current}><span class="nav-icon">{help_icon}</span><span class="nav-text">Help</span></a><a href="/mayhem/dashboard/settings" aria-label="Settings"{settings_current}><span class="nav-icon">{settings_icon}</span><span class="nav-text">Settings</span></a></nav>
   </aside>
   <button class="nav-scrim js-only" type="button" data-nav-close aria-label="Close navigation"></button>
   <div class="app-frame">
-    <header class="app-topbar"><div class="topbar-context"><button class="icon-button mobile-menu-button js-only" type="button" data-nav-toggle aria-label="Open navigation" aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">&#9776;</span></button><strong>{page_label}</strong><span class="topbar-status"><span class="state-indicator {status_tone}" aria-hidden="true"></span><span data-page-status-text>{status}</span></span></div><div class="topbar-actions"><button class="icon-button sidebar-collapse-button js-only" type="button" data-sidebar-toggle aria-label="Collapse navigation" aria-controls="app-navigation" aria-expanded="true"><span aria-hidden="true">&#8592;</span></button>{amount_control}</div></header>
-    <main class="app-main" id="main-content" tabindex="-1"><header class="page-head"><div><p class="page-eyebrow">{eyebrow}</p><h1>{heading}</h1><p class="page-summary">{summary}</p></div><div class="page-head-actions">{actions}</div></header>{content}</main>
-    <footer class="app-footer"><span>{footer}</span><span class="mono" data-session-seconds="{expires}" data-session-status>Browser session active</span></footer>
+    <header class="app-topbar"><div class="topbar-context"><button class="icon-button mobile-menu-button js-only" type="button" data-nav-toggle aria-label="Open navigation" aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">&#9776;</span></button><button class="icon-button sidebar-collapse-button js-only" type="button" data-sidebar-toggle aria-label="Collapse navigation" aria-controls="app-navigation" aria-expanded="true"><span aria-hidden="true">&#8592;</span></button><strong>{page_label}</strong><span class="topbar-status"><span class="state-indicator {status_tone}" aria-hidden="true"></span><span data-page-status-text>{status}</span></span></div><div class="topbar-actions">{amount_control}</div></header>
+    <main class="app-main{wide_class}{page_class}" id="main-content" tabindex="-1"><header class="page-head"><div><p class="page-eyebrow">{eyebrow}</p><h1>{heading}</h1><p class="page-summary">{summary}</p></div><div class="page-head-actions">{actions}</div></header>{content}</main>
+    <footer class="app-footer"><div class="app-footer-inner{wide_class_footer}"><span>{footer}</span><span class="mono" data-session-seconds="{expires}" data-session-status>Browser session active</span></div></footer>
   </div>
 </div>
-<nav class="mobile-bottom-nav" aria-label="Mobile primary"><a href="/mayhem/dashboard"{mobile_home}>Home</a><a href="/mayhem/dashboard/models"{mobile_models}>Models</a><a href="/mayhem/dashboard/activity"{mobile_activity}>Activity</a><a href="/mayhem/dashboard/earn"{mobile_earn}>Earn</a><button class="js-only" type="button" data-nav-toggle aria-label="Open all navigation" aria-controls="app-navigation" aria-expanded="false"{mobile_more}>More</button></nav>
-<dialog class="verify-dialog" id="dashboard-evidence-dialog" aria-labelledby="dashboard-evidence-title"><header class="verify-head"><div><h2 id="dashboard-evidence-title" data-evidence-title>Evidence</h2><p data-evidence-summary>Loading the requested snapshot&hellip;</p></div><div class="verify-actions"><button class="quiet-button js-only" type="button" data-copy data-copy-target="[data-evidence-raw]" data-evidence-copy disabled><span data-copy-label>Copy raw JSON</span></button><button class="quiet-button js-only" type="button" data-evidence-download disabled>Download evidence</button><button class="icon-button" type="button" data-dialog-close aria-label="Close evidence">&times;</button></div></header><div class="verify-body" data-evidence-body><p class="notice" data-evidence-state role="status">Loading evidence&hellip;</p><section class="verify-level" data-evidence-facts-section hidden><h3>Structured facts</h3><div class="verify-grid" data-evidence-facts></div></section><section class="verify-level" data-evidence-raw-section hidden><h3>Raw gateway snapshot</h3><pre class="raw-evidence" data-evidence-raw></pre></section></div></dialog>"##,
+<nav class="mobile-bottom-nav" aria-label="Mobile primary"><a href="/mayhem/dashboard"{mobile_home}>Home</a><a href="/mayhem/dashboard/playground"{mobile_playground}>Playground</a><a href="/mayhem/dashboard/activity"{mobile_activity}>Activity</a><a href="/mayhem/dashboard/earn"{mobile_earn}>Earn</a><a href="/mayhem/dashboard/wallet"{mobile_wallet}>Billing</a></nav>
+<dialog class="verify-dialog" id="dashboard-evidence-dialog" aria-labelledby="dashboard-evidence-title"><header class="verify-head"><div><h2 id="dashboard-evidence-title" data-evidence-title>Evidence</h2><p data-evidence-summary>Loading the requested snapshot&hellip;</p></div><div class="verify-actions"><button class="quiet-button js-only" type="button" data-copy data-copy-target="[data-evidence-raw]" data-evidence-copy disabled><span data-copy-label>Copy raw JSON</span></button><button class="quiet-button js-only" type="button" data-evidence-download disabled>Download evidence</button><button class="icon-button" type="button" data-dialog-close aria-label="Close evidence">&times;</button></div></header><div class="verify-body" data-evidence-body><p class="notice" data-evidence-state role="status">Loading evidence&hellip;</p><section class="verify-level" data-evidence-facts-section hidden><h3>Structured facts</h3><div class="verify-grid" data-evidence-facts></div></section><section class="verify-level" data-evidence-raw-section hidden><h3>Raw gateway snapshot</h3><button class="quiet-button js-only" type="button" data-evidence-raw-toggle hidden>Show raw JSON</button><pre class="raw-evidence" data-evidence-raw></pre></section></div></dialog>"##,
         navigation = navigation,
+        advanced_navigation = advanced_navigation,
+        advanced_open = if advanced_open { " open" } else { "" },
         help_current = help_current,
         settings_current = settings_current,
         status_tone = status_tone,
@@ -162,7 +197,7 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         } else {
             ""
         },
-        mobile_models = if shell.page == DashboardAppPage::Models {
+        mobile_playground = if shell.page == DashboardAppPage::Playground {
             r#" aria-current="page""#
         } else {
             ""
@@ -177,15 +212,7 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         } else {
             ""
         },
-        mobile_more = if matches!(
-            shell.page,
-            DashboardAppPage::Playground
-                | DashboardAppPage::Wallet
-                | DashboardAppPage::Connect
-                | DashboardAppPage::Network
-                | DashboardAppPage::Help
-                | DashboardAppPage::Settings
-        ) {
+        mobile_wallet = if shell.page == DashboardAppPage::Wallet {
             r#" aria-current="page""#
         } else {
             ""
@@ -197,6 +224,13 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         content = shell.content,
         footer = html_escape(shell.footer),
         expires = shell.expires_in_seconds,
+        wide_class = if shell.wide { " app-main--wide" } else { "" },
+        page_class = page_class,
+        wide_class_footer = if shell.wide {
+            " app-footer-inner--wide"
+        } else {
+            ""
+        },
     )
 }
 
@@ -218,7 +252,7 @@ pub(super) const DASHBOARD_APP_CSS: &str = r#"
   --app-good:#58d6a8;
   --app-info:#6ea8ff;
   --app-warn:#f5b85c;
-  --app-danger:#ff6678;
+  --app-danger:#ff5449;
   --app-focus:#9cc1ff;
   --app-radius-xs:8px;
   --app-radius-sm:12px;
@@ -232,7 +266,7 @@ pub(super) const DASHBOARD_APP_CSS: &str = r#"
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
 body{min-height:100vh;margin:0;background:radial-gradient(circle at 78% -20%,rgba(255,107,122,.1),transparent 34rem),var(--app-bg);color:var(--app-text);font:15px/1.5 Exo,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-a{color:var(--app-accent-strong)}
+a{color:var(--app-info)}
 .js-only{display:none!important}
 html.js-ready .js-only{display:initial!important}
 html.js-ready .soft-button.js-only,html.js-ready .icon-button.js-only,html.js-ready .primary-button.js-only,html.js-ready .quiet-button.js-only{display:inline-flex!important}
@@ -253,17 +287,23 @@ a,button{-webkit-tap-highlight-color:transparent}
 .app-brand{display:flex;align-items:center;gap:11px;padding:0 8px;color:var(--app-text);text-decoration:none;font-weight:800;letter-spacing:-.02em}
 .app-brand-mark{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(145deg,var(--app-accent),#b83c61);box-shadow:0 8px 24px rgba(255,107,122,.24);font-size:13px}
 .app-nav{display:grid;gap:4px}
-.app-nav-label{margin:11px 10px 5px;color:var(--app-text-muted);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+.app-nav-label{margin:11px 10px 5px;color:var(--app-text-muted);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
 .app-nav a{min-height:44px;display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid transparent;border-radius:12px;color:var(--app-text-soft);text-decoration:none;font-weight:600}
 .app-nav a:hover{background:var(--app-panel);color:var(--app-text)}
 .app-nav a[aria-current="page"]{background:linear-gradient(110deg,rgba(255,107,122,.15),rgba(255,107,122,.04));border-color:rgba(255,107,122,.25);color:var(--app-text)}
+.advanced-nav{margin-top:3px}
+.advanced-nav>summary{min-height:44px;display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid transparent;border-radius:12px;color:var(--app-text-muted);font-weight:600;cursor:pointer;list-style:none}
+.advanced-nav>summary::-webkit-details-marker{display:none}
+.advanced-nav>summary:hover,.advanced-nav[open]>summary{background:var(--app-panel);color:var(--app-text-soft)}
+.advanced-nav-items{display:grid;gap:3px;margin:3px 0 5px 14px;padding-left:10px;border-left:1px solid var(--app-border)}
+.advanced-nav-items a{min-height:40px;padding-block:7px;font-size:13px}
 .nav-icon{width:20px;height:20px;display:grid;place-items:center;color:var(--app-text-muted)}
 .nav-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .app-nav a[aria-current="page"] .nav-icon{color:var(--app-accent-strong)}
 .state-indicator{width:9px;height:9px;border-radius:999px;background:var(--app-text-muted);box-shadow:0 0 0 4px rgba(126,135,148,.1)}
 .state-indicator.good{background:var(--app-good);box-shadow:0 0 0 4px rgba(88,214,168,.1)}
 .state-indicator.warn{background:var(--app-warn);box-shadow:0 0 0 4px rgba(245,184,92,.1)}
-.state-indicator.danger{background:var(--app-danger);box-shadow:0 0 0 4px rgba(255,102,120,.1)}
+.state-indicator.danger{background:var(--app-danger);box-shadow:0 0 0 4px rgba(255,84,73,.1)}
 
 .app-frame{min-width:0}
 .app-topbar{position:sticky;top:0;z-index:15;min-height:68px;padding:max(12px,env(safe-area-inset-top)) max(clamp(18px,2.7vw,44px),env(safe-area-inset-right)) 12px max(clamp(18px,2.7vw,44px),env(safe-area-inset-left));display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid rgba(41,45,53,.78);background:rgba(11,12,14,.84);backdrop-filter:blur(18px)}
@@ -287,27 +327,45 @@ a,button{-webkit-tap-highlight-color:transparent}
 html.js-ready .icon-button.mobile-menu-button.js-only,html.js-ready .nav-scrim{display:none!important}
 .mobile-bottom-nav{display:none}
 
-.app-main{width:100%;padding:clamp(24px,3.7vw,56px) max(clamp(18px,3.1vw,52px),env(safe-area-inset-right)) 72px max(clamp(18px,3.1vw,52px),env(safe-area-inset-left))}
+.app-main{width:100%;max-width:1560px;margin-inline:auto;padding:clamp(24px,3.7vw,56px) max(clamp(18px,3.1vw,52px),env(safe-area-inset-right)) 72px max(clamp(18px,3.1vw,52px),env(safe-area-inset-left))}
+.app-main--wide{max-width:1880px}
+.app-main--playground{max-width:1180px;padding-top:clamp(24px,3vw,42px)}
+.app-main p{max-width:72ch}
+.app-main p.page-summary{max-width:720px}
+.check-copy span{max-width:62ch}
+.notice{max-width:78ch}
 .page-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:24px;align-items:end;margin:0 0 clamp(24px,3vw,42px)}
 .page-eyebrow{margin:0 0 7px;color:var(--app-accent-strong);font-size:12px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
 .page-head h1{max-width:850px;margin:0;font-size:clamp(32px,4vw,56px);line-height:1.03;letter-spacing:-.045em}
 .page-summary{max-width:720px;margin:13px 0 0;color:var(--app-text-soft);font-size:clamp(15px,1.25vw,18px)}
 .page-head-actions{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+.app-main--playground .page-head{width:min(100%,960px);margin:0 auto 18px;align-items:center}
+.app-main--playground .page-head h1{font-size:clamp(30px,3.2vw,42px)}
+.app-main--playground .page-summary{margin-top:8px}
 
 .attention-card{margin-bottom:24px;padding:17px 18px;border:1px solid rgba(110,168,255,.28);border-radius:16px;background:linear-gradient(110deg,rgba(110,168,255,.12),rgba(110,168,255,.035));display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:14px;align-items:center}
 .attention-card.warn{border-color:rgba(245,184,92,.35);background:linear-gradient(110deg,rgba(245,184,92,.13),rgba(245,184,92,.035))}
-.attention-card.danger{border-color:rgba(255,102,120,.35);background:linear-gradient(110deg,rgba(255,102,120,.13),rgba(255,102,120,.035))}
+.attention-card.danger{border-color:rgba(255,84,73,.35);background:linear-gradient(110deg,rgba(255,84,73,.13),rgba(255,84,73,.035))}
 .attention-icon{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;background:rgba(110,168,255,.13);color:var(--app-info);font-weight:900}
 .attention-card.warn .attention-icon{background:rgba(245,184,92,.13);color:var(--app-warn)}
-.attention-card.danger .attention-icon{background:rgba(255,102,120,.13);color:var(--app-danger)}
+.attention-card.danger .attention-icon{background:rgba(255,84,73,.13);color:var(--app-danger)}
 .attention-copy strong{display:block}
 .attention-copy p{margin:3px 0 0;color:var(--app-text-soft);font-size:13px}
 
+.launch-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:24px}
+.launch-path-card{min-width:0;padding:18px;border:1px solid var(--app-border);border-radius:18px;background:linear-gradient(145deg,rgba(23,26,32,.98),rgba(15,17,21,.98));display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:14px;align-items:center}
+.launch-path-card.is-ready{border-color:rgba(88,214,168,.3);background:linear-gradient(145deg,rgba(88,214,168,.08),rgba(18,20,25,.98))}
+.launch-path-icon{width:42px;height:42px;border:1px solid rgba(255,107,122,.25);border-radius:13px;display:grid;place-items:center;background:rgba(255,107,122,.09);color:var(--app-accent-strong);font-size:20px}
+.launch-path-copy h2{margin:8px 0 3px;font-size:18px}
+.launch-path-copy p{margin:0;color:var(--app-text-muted);font-size:12px;line-height:1.5}
+
 .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px}
+.metric-grid--three{grid-template-columns:repeat(3,minmax(0,1fr))}
 .metric{min-width:0;padding:17px;border:1px solid var(--app-border);border-radius:16px;background:linear-gradient(145deg,var(--app-panel-strong),var(--app-panel));box-shadow:0 14px 40px rgba(0,0,0,.12)}
 .metric-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .metric-label{color:var(--app-text-muted);font-size:12px;font-weight:700}
-.metric-state{font-size:11px;color:var(--app-text-muted)}
+.metric-state{font-size:12px;color:var(--app-text-muted)}
+.metric-status{margin:12px 0 6px;display:flex;align-items:center;min-height:34px}
 .metric-value{margin:10px 0 4px;font-size:clamp(22px,2.25vw,32px);font-weight:800;letter-spacing:-.035em;overflow-wrap:anywhere}
 .metric-meta{margin:0;color:var(--app-text-muted);font-size:12px}
 
@@ -325,12 +383,24 @@ html.js-ready .icon-button.mobile-menu-button.js-only,html.js-ready .nav-scrim{d
 .panel-footer>a:not(.icon-button):not(.soft-button):not(.primary-button):not(.quiet-button),.playground-meta>a{min-height:44px;display:inline-flex;align-items:center;padding:8px 4px}
 .pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.pagination .quiet-button{min-height:44px;padding:8px 10px;font-size:12px}.pagination-page{white-space:nowrap;color:var(--app-text-soft);font-variant-numeric:tabular-nums}.pagination-disabled{opacity:.48;cursor:not-allowed}.pagination-disabled:active{transform:none}
 
+.usage-chart{margin:0}
+.usage-chart .panel-head{min-height:58px;padding:14px 16px}
+.usage-chart .panel-head>strong{font-size:26px}
+.usage-chart .panel-body{padding:12px 16px 14px}
+.usage-bars{width:100%;max-width:1000px;height:clamp(155px,11vw,205px);margin:0 auto;padding:0;display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;align-items:end;list-style:none}
+.usage-bars li{height:100%;min-width:0;display:grid;grid-template-rows:minmax(0,1fr) auto auto;gap:5px;align-items:end;text-align:center}
+.usage-bar{height:100%;min-height:24px;display:flex;align-items:flex-end;justify-content:center}
+.usage-bar>span{width:min(34px,72%);min-height:4px;border-radius:7px 7px 3px 3px;background:linear-gradient(180deg,var(--app-info),rgba(110,168,255,.42));box-shadow:0 6px 20px rgba(110,168,255,.1)}
+.usage-bar.level-0>span{height:4px}.usage-bar.level-1>span{height:10%}.usage-bar.level-2>span{height:20%}.usage-bar.level-3>span{height:30%}.usage-bar.level-4>span{height:40%}.usage-bar.level-5>span{height:50%}.usage-bar.level-6>span{height:60%}.usage-bar.level-7>span{height:70%}.usage-bar.level-8>span{height:80%}.usage-bar.level-9>span{height:90%}.usage-bar.level-10>span{height:100%}
+.usage-bars strong{font-size:12px}
+.usage-bars small{color:var(--app-text-muted);font-size:11px;white-space:nowrap}
+
 .activity-list{display:grid}
 .activity-row{min-width:0;padding:14px 18px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:13px;align-items:center;border-bottom:1px solid var(--app-border)}
 .activity-row:last-child{border-bottom:0}
 .activity-state{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:rgba(88,214,168,.1);color:var(--app-good);font-weight:800}
 .activity-state.pending{background:rgba(110,168,255,.1);color:var(--app-info)}
-.activity-state.failed{background:rgba(255,102,120,.1);color:var(--app-danger)}
+.activity-state.failed{background:rgba(255,84,73,.1);color:var(--app-danger)}
 .activity-main{min-width:0}
 .activity-main strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .activity-main span{display:block;margin-top:3px;color:var(--app-text-muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -359,7 +429,7 @@ progress::-moz-progress-bar{border-radius:999px;background:linear-gradient(90deg
 .data-table-wrap:focus-visible{outline:3px solid var(--app-focus);outline-offset:-3px;box-shadow:inset 0 0 0 1px var(--app-focus)}
 .data-table{width:100%;border-collapse:collapse;min-width:680px}
 .data-table th,.data-table td{padding:13px 16px;border-bottom:1px solid var(--app-border);text-align:left;vertical-align:middle}
-.data-table thead th{position:sticky;top:0;background:var(--app-panel);color:var(--app-text-muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase;z-index:1}
+.data-table thead th{position:sticky;top:0;background:var(--app-panel);color:var(--app-text-muted);font-size:12px;letter-spacing:.06em;text-transform:uppercase;z-index:1}
 .table-sort-button{width:100%;min-height:44px;margin:-6px -8px;padding:6px 8px;border:0;border-radius:8px;background:transparent;color:inherit;text-align:left;text-transform:inherit;letter-spacing:inherit;font-weight:inherit;display:inline-flex;align-items:center;gap:6px}
 .table-sort-button:hover{background:rgba(255,255,255,.035);color:var(--app-text-soft)}
 .table-sort-button::after{content:"↕";opacity:.42;font-size:10px}
@@ -369,18 +439,30 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .data-table tbody tr:hover{background:rgba(255,255,255,.018)}
 .table-primary{font-weight:700}
 .table-secondary{display:block;margin-top:2px;color:var(--app-text-muted);font-size:12px}
-.status-badge{display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:4px 8px;border:1px solid var(--app-border);border-radius:999px;color:var(--app-text-soft);font-size:11px;font-weight:700;white-space:nowrap}
+.status-badge{display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:4px 9px;border:1px solid var(--app-border);border-radius:999px;color:var(--app-text-soft);font-size:12px;font-weight:700;white-space:nowrap}
 .status-badge.good{border-color:rgba(88,214,168,.32);background:rgba(88,214,168,.08);color:var(--app-good)}
 .status-badge.info{border-color:rgba(110,168,255,.32);background:rgba(110,168,255,.08);color:var(--app-info)}
 .status-badge.warn{border-color:rgba(245,184,92,.32);background:rgba(245,184,92,.08);color:var(--app-warn)}
-.status-badge.danger{border-color:rgba(255,102,120,.32);background:rgba(255,102,120,.08);color:var(--app-danger)}
+.status-badge.danger{border-color:rgba(255,84,73,.32);background:rgba(255,84,73,.08);color:var(--app-danger)}
 
 .search-field{min-height:44px;min-width:min(260px,100%);padding:9px 12px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-soft);color:var(--app-text)}
 
-.subnav{margin:-10px 0 24px;display:flex;gap:6px;overflow-x:auto;scrollbar-width:thin;padding:4px 0}
+.subnav{margin:-10px 0 24px;display:flex;gap:6px;overflow-x:auto;overscroll-behavior-inline:contain;scrollbar-width:thin;scrollbar-color:var(--app-border-strong) transparent;padding:4px 0}
+.subnav::-webkit-scrollbar{height:4px}
+.subnav::-webkit-scrollbar-track{background:transparent}
+.subnav::-webkit-scrollbar-thumb{border-radius:999px;background:var(--app-border-strong)}
 .subnav a{min-height:44px;padding:10px 11px;border:1px solid transparent;border-radius:10px;color:var(--app-text-muted);font-size:12px;font-weight:700;text-decoration:none;white-space:nowrap;display:inline-flex;align-items:center}
 .subnav a:hover{color:var(--app-text);background:var(--app-panel)}
 .subnav a[aria-current="page"]{border-color:var(--app-border);background:var(--app-panel-strong);color:var(--app-text)}
+.subnav-advanced{margin:-17px 0 24px;color:var(--app-text-muted);font-size:12px}
+.subnav-advanced>summary{min-height:44px;width:max-content;padding:7px 9px;border-radius:9px;cursor:pointer;font-weight:700;display:flex;align-items:center;gap:7px;list-style:none}
+.subnav-advanced>summary::-webkit-details-marker{display:none}
+.subnav-advanced>summary::after{content:"\25BE";font-size:12px;color:var(--app-text-muted);transition:transform var(--app-fast) ease}
+.subnav-advanced[open]>summary::after{transform:rotate(180deg)}
+.subnav-advanced>summary:hover{background:var(--app-panel);color:var(--app-text-soft)}
+.subnav-advanced>div{display:flex;gap:6px;padding:5px 0}
+.subnav-advanced a{min-height:44px;padding:8px 10px;border:1px solid var(--app-border);border-radius:9px;color:var(--app-text-muted);text-decoration:none;font-weight:700;display:inline-flex;align-items:center}
+.subnav-advanced a[aria-current="page"]{background:var(--app-panel-strong);color:var(--app-text)}
 .inline-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .disclosure-panel>summary{min-height:56px;padding:16px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;font-weight:700;list-style:none}
 .disclosure-panel>summary::-webkit-details-marker{display:none}
@@ -391,7 +473,7 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .notice strong{color:var(--app-text)}
 .notice.good{border-color:rgba(88,214,168,.28);background:rgba(88,214,168,.06)}
 .notice.warn{border-color:rgba(245,184,92,.3);background:rgba(245,184,92,.07)}
-.notice.danger{border-color:rgba(255,102,120,.3);background:rgba(255,102,120,.07)}
+.notice.danger{border-color:rgba(255,84,73,.3);background:rgba(255,84,73,.07)}
 .code-block{position:relative;margin:0;padding:15px 54px 15px 15px;border:1px solid var(--app-border);border-radius:13px;background:#0b0d10;color:#cdd3db;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}
 .code-block .copy-corner{position:absolute;right:8px;top:8px}
 .field{display:grid;gap:7px;min-width:0}
@@ -404,15 +486,47 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .form-grid .span-all{grid-column:1/-1}
 .preflight{padding:12px 14px;border:1px solid var(--app-border);border-radius:13px;background:var(--app-panel-soft);display:flex;gap:9px 16px;align-items:center;flex-wrap:wrap;color:var(--app-text-muted);font-size:12px}
 .preflight strong{color:var(--app-text-soft)}
-.playground-layout{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(270px,.6fr);gap:18px;align-items:start}
-html.js-ready .playground-interactive.js-only{display:block!important}
-.playground-thread{min-height:280px;max-height:52vh;padding:18px;overflow:auto;display:grid;align-content:start;gap:13px;background:linear-gradient(180deg,rgba(9,10,13,.45),rgba(16,18,23,.5))}
+.playground-layout{width:min(100%,960px);margin-inline:auto}
+.playground-panel{overflow:hidden}
+html.js-ready .playground-interactive.js-only{display:flex!important;flex-direction:column}
+html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
+.playground-composer{min-height:0;flex:1;display:flex;flex-direction:column}
+.playground-toolbar{min-height:64px;padding:10px 16px;border-bottom:1px solid var(--app-border);display:flex;align-items:center;justify-content:space-between;gap:14px;background:var(--app-panel-soft)}
+.model-picker{position:relative;z-index:4;min-width:0;display:grid;grid-template-columns:auto minmax(220px,430px);align-items:center;gap:10px}
+.model-picker-label{color:var(--app-text-soft);font-size:12px;font-weight:700}
+.model-picker-trigger{min-width:0;min-height:48px;padding:5px 10px 5px 6px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-strong);color:var(--app-text);display:flex;align-items:center;gap:9px;text-align:left;cursor:pointer}
+.model-picker-trigger:hover,.model-picker-trigger[aria-expanded="true"]{border-color:var(--app-border-strong);background:rgba(255,255,255,.045)}
+.model-picker-trigger:disabled{cursor:not-allowed;opacity:.58}
+.model-picker-trigger-copy{min-width:0;flex:1;display:grid;gap:2px}
+.model-picker-trigger-copy strong,.model-picker-trigger-copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-picker-trigger-copy strong{font-size:13px}
+.model-picker-trigger-copy span{color:var(--app-text-muted);font-size:11px}
+.model-picker-chevron{width:20px;flex:0 0 auto;color:var(--app-text-muted);font-size:19px;line-height:1;transform:translateY(-2px);transition:transform var(--app-standard) cubic-bezier(.2,0,.38,.9)}
+.model-picker-trigger[aria-expanded="true"] .model-picker-chevron{transform:translateY(2px) rotate(180deg)}
+.model-lab-mark{width:36px;height:36px;flex:0 0 auto;border:1px solid rgba(255,255,255,.1);border-radius:10px;background:#111318;color:#d9dee6;display:grid;place-items:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);font-size:11px;font-weight:800;letter-spacing:-.03em}
+.model-lab-mark svg{width:20px;height:20px;fill:currentColor}
+.model-lab-image{width:100%;height:100%;border-radius:inherit;object-fit:cover}.model-lab-image--contain{width:62%;height:62%;object-fit:contain}
+.model-lab--hauhau svg{width:34px;height:34px;border-radius:9px}
+.model-lab--google,.model-lab--deepmind{color:#6ea8ff}.model-lab--deepseek{color:#7c98ff}.model-lab--mistral{color:#ff8d62}.model-lab--meta-ai{color:#b391ff}.model-lab--qwen{color:#8f8bff}.model-lab--minimax{color:#ff7890}.model-lab--moonshot-ai{color:#f0f2f5}.model-lab--nvidia{color:#93d329}.model-lab--z-ai{color:#c9cdd4}.model-lab--openai{color:#f0f2f5}.model-lab--huggingface{color:#ffd86a}.model-lab--hauhau{color:#f6e47b;background:linear-gradient(135deg,#7750c8,#a47225)}
+.model-picker-panel{position:absolute;z-index:40;top:calc(100% + 8px);left:46px;width:min(500px,calc(100vw - 72px));padding:7px;border:1px solid var(--app-border-strong);border-radius:15px;background:rgba(18,20,25,.985);box-shadow:0 28px 72px rgba(0,0,0,.52);animation:model-picker-in var(--app-standard) cubic-bezier(.2,0,.38,.9) both}
+@keyframes model-picker-in{from{opacity:0;transform:translateY(-5px) scale(.99)}to{opacity:1;transform:none}}
+.model-picker-panel>header{min-height:42px;padding:3px 6px 7px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.model-picker-panel>header>div{min-width:0;display:grid;gap:2px}.model-picker-panel>header strong{font-size:12px}.model-picker-panel>header span{color:var(--app-text-muted);font-size:11px}
+.model-picker-panel>header button{width:36px;height:36px;border:0;border-radius:9px;background:transparent;color:var(--app-text-muted);font-size:20px;cursor:pointer}.model-picker-panel>header button:hover{background:rgba(255,255,255,.05);color:var(--app-text)}
+.model-picker-list{max-height:min(360px,52vh);overflow:auto;overscroll-behavior:contain;display:grid;gap:5px;scrollbar-width:thin}
+.model-picker-option{width:100%;min-width:0;min-height:68px;padding:8px;border:1px solid transparent;border-radius:11px;background:rgba(255,255,255,.012);color:var(--app-text);display:flex;align-items:center;gap:10px;text-align:left;cursor:pointer}
+.model-picker-option:hover,.model-picker-option:focus-visible{border-color:var(--app-border);background:rgba(255,255,255,.04)}
+.model-picker-option[aria-selected="true"]{border-color:rgba(255,107,122,.34);background:rgba(255,107,122,.075)}
+.model-picker-option-copy{min-width:0;flex:1;display:grid;gap:2px}.model-picker-option-copy strong,.model-picker-option-copy span,.model-picker-option-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-picker-option-copy strong{font-size:13px}.model-picker-option-copy span{color:var(--app-text-soft);font-size:11px}.model-picker-option-copy small{color:var(--app-text-muted);font-size:10px}
+.model-picker-check{width:23px;height:23px;flex:0 0 auto;border:1px solid var(--app-border);border-radius:999px;color:transparent;display:grid;place-items:center;font-size:11px}.model-picker-option[aria-selected="true"] .model-picker-check{border-color:rgba(255,107,122,.5);background:rgba(255,107,122,.16);color:var(--app-accent-strong)}
+.playground-provider-note{flex:0 0 auto;color:var(--app-text-muted);font-size:12px;display:inline-flex;align-items:center;gap:7px}
+.playground-thread{min-height:280px;flex:1;padding:18px;overflow:auto;display:grid;align-content:start;gap:13px;background:linear-gradient(180deg,rgba(9,10,13,.45),rgba(16,18,23,.5))}
 .message{max-width:min(85%,720px);padding:12px 14px;border:1px solid var(--app-border);border-radius:15px;white-space:pre-wrap;overflow-wrap:anywhere}
 .message.user{justify-self:end;background:rgba(110,168,255,.1);border-color:rgba(110,168,255,.24)}
 .message.assistant{justify-self:start;background:var(--app-panel-strong)}
-.message.failed{border-color:rgba(255,102,120,.38);background:rgba(255,102,120,.08);color:var(--app-danger)}
+.message.failed{border-color:rgba(255,84,73,.38);background:rgba(255,84,73,.08);color:var(--app-danger)}
 .message.completed{animation:message-complete 420ms cubic-bezier(0,0,.38,.9) both}
-.message .message-label{display:block;margin-bottom:5px;color:var(--app-text-muted);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+.message .message-label{display:block;margin-bottom:5px;color:var(--app-text-muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
 .message .message-content{display:block}
 .message-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:9px;border-top:1px solid var(--app-border)}
 .message-actions .quiet-button{min-height:44px;padding:7px 10px;font-size:12px}
@@ -423,22 +537,240 @@ html.js-ready .playground-interactive.js-only{display:block!important}
 .message-details>summary:hover,.playground-composer details.field>summary:hover{background:rgba(255,255,255,.035);color:var(--app-text)}
 .message-details>.table-secondary{padding:2px 10px 8px;overflow-wrap:anywhere}
 .message.failed .message-result.incomplete{color:var(--app-danger)}
-.message.failed .message-result.incomplete .message-result-mark{background:rgba(255,102,120,.14)}
+.message.failed .message-result.incomplete .message-result-mark{background:rgba(255,84,73,.14)}
 .message-recovery-impact{margin:8px 0 0;color:var(--app-text-soft)}
 .recovery-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
 @keyframes message-complete{from{border-color:rgba(88,214,168,.55);background:rgba(88,214,168,.1);transform:translateY(4px)}to{border-color:var(--app-border);background:var(--app-panel-strong);transform:none}}
-.playground-empty{min-height:230px;display:grid;place-items:center;text-align:center;color:var(--app-text-muted)}
-.playground-composer{padding:15px;border-top:1px solid var(--app-border);display:grid;gap:11px}
+.playground-empty{min-height:150px;display:grid;place-items:center;text-align:center;color:var(--app-text-muted)}
+.playground-thread:has(>.playground-empty:only-child){min-height:0}
+.playground-empty strong{color:var(--app-text);font-size:18px}
+.playground-empty p{margin:7px 0 0;font-size:13px}
+.playground-input-shell{padding:14px 16px 10px;border-top:1px solid var(--app-border);display:grid;gap:8px;background:var(--app-panel-soft)}
+.playground-message-field textarea{min-height:72px;max-height:180px;font-size:15px}
+.playground-input-shell>.result-summary{margin:0}
+.request-settings{border-top:1px solid var(--app-border)}
+.request-settings>summary{min-height:48px;padding:9px 16px;border-radius:0;color:var(--app-text-soft);cursor:pointer;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.request-settings>summary:hover{background:rgba(255,255,255,.035)}
+.request-settings>summary .optional-label{min-width:0;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;font-weight:500}
+.playground-settings-body{padding:4px 16px 16px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.playground-settings-body>.field:first-child,.playground-settings-body>.preflight,.playground-settings-foot{grid-column:1/-1}
+.playground-settings-foot{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.playground-settings-foot p{margin:0}
+.playground-send-row{justify-content:flex-end}
+.playground-send-row [data-playground-clear]{margin-right:auto}
+.playground-send-row .primary-button{min-width:112px}
 .playground-meta{padding:13px 18px;border-top:1px solid var(--app-border);display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--app-text-muted);font-size:12px}
+
+/* Landing /playground port: the pg-* surface keeps the public experience and
+   gateway dashboard visually identical while the request wiring stays local. */
+.pg-page{
+  --pg-pit:#0d0e11;--pg-surface:#121419;--pg-raised:#1a1d23;
+  --pg-line:rgba(229,231,235,.12);--pg-line-soft:rgba(229,231,235,.075);
+  --pg-snow:#f4f5f7;--pg-fog:#b2b8c2;--pg-dim:#7e8794;
+  --pg-accent:#c54459;--pg-accent-soft:#d67866;--pg-accent-deep:#8e2e42;
+  --pg-live:#58d6a8;--pg-ease:cubic-bezier(.16,1,.3,1);
+  width:min(100%,1040px);margin-inline:auto
+}
+.pg-page button{font:inherit}
+.pg-page svg{width:1rem;height:1rem;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.playground-interactive,.playground-interactive>form{display:block!important;min-width:0}
+.pg-toolbar{position:relative;z-index:35;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.pg-mode-tabs{position:relative;display:inline-flex;align-items:center;gap:.25rem;padding:.28rem;border:1px solid var(--pg-line-soft);border-radius:.75rem;background:rgba(16,16,19,.85);box-shadow:inset 0 1px 0 rgba(229,231,235,.025)}
+.pg-mode-pill{position:absolute;top:.28rem;bottom:.28rem;left:.28rem;width:calc((100% - .56rem)/3);border-radius:.52rem;background:var(--pg-raised);box-shadow:inset 0 1px 0 rgba(229,231,235,.07),0 5px 14px -9px #000;transition:transform .34s var(--pg-ease)}
+.pg-page[data-playground-mode="image"] .pg-mode-pill{transform:translateX(100%)}
+.pg-page[data-playground-mode="speech"] .pg-mode-pill{transform:translateX(200%)}
+.pg-mode-tabs button{position:relative;z-index:1;min-width:6.2rem;min-height:2.75rem;padding:0 .9rem;border:0;border-radius:.52rem;background:transparent;color:var(--pg-dim);display:inline-flex;align-items:center;justify-content:center;gap:.45rem;font-size:.76rem;font-weight:700;transition:color .18s ease,transform .16s var(--pg-ease)}
+.pg-mode-tabs button:hover:not(:disabled),.pg-mode-tabs button.is-active{color:var(--pg-snow)}
+.pg-mode-tabs button.is-active svg{color:var(--app-accent-strong)}
+.pg-mode-tabs button:active:not(:disabled){transform:scale(.97)}
+.pg-mode-tabs button:disabled{cursor:not-allowed;opacity:.42}
+.pg-mode-soon{display:none;font-size:.5rem;font-weight:600}
+.pg-logo-tile{display:inline-flex;flex:none;align-items:center;justify-content:center;border:1px solid rgba(229,231,235,.1);border-radius:.55rem;color:var(--pg-snow);background:rgba(13,13,15,.85);box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.pg-logo-tile .model-lab-mark{width:100%;height:100%;border:0;border-radius:inherit;background:transparent}
+.pg-logo-tile .model-lab-mark svg{width:60%;height:60%;fill:currentColor;stroke:none}
+.pg-logo-tile .model-lab-mark img{width:100%;height:100%;border-radius:inherit;object-fit:cover}
+.pg-logo-tile .model-lab-mark .model-lab-image--contain{width:62%;height:62%;object-fit:contain}
+.pg-model{position:relative;min-width:0;width:min(22rem,44vw)}
+.pg-model-trigger{width:100%;min-height:3.35rem;padding:0 .75rem 0 .52rem;border:1px solid var(--pg-line);border-radius:.75rem;background:rgba(22,22,26,.9);color:var(--pg-snow);display:flex;align-items:center;gap:.7rem;text-align:left;box-shadow:inset 0 1px 0 rgba(229,231,235,.035);transition:border-color .2s ease,background .2s ease,transform .16s var(--pg-ease)}
+.pg-model-trigger:hover:not(:disabled){border-color:rgba(229,231,235,.22);background:rgba(26,27,32,.95)}
+.pg-model-trigger:active:not(:disabled){transform:translateY(1px)}
+.pg-model-trigger:disabled{cursor:not-allowed;opacity:.55}
+.pg-model-trigger-logo{width:2.2rem;height:2.2rem}
+.pg-model-trigger-copy{min-width:0;flex:1;display:flex;flex-direction:column;gap:.12rem}
+.pg-model-trigger-name,.pg-model-trigger-purpose{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pg-model-trigger-name{color:var(--pg-snow);font-size:.8rem;font-weight:700}
+.pg-model-trigger-purpose{color:var(--pg-dim);font-size:.65rem}
+.pg-model-trigger-chevron{flex:none;color:var(--pg-dim);transition:transform .22s var(--pg-ease)}
+.pg-model-trigger[aria-expanded="true"] .pg-model-trigger-chevron{transform:rotate(180deg)}
+.pg-model-backdrop{display:none}
+.pg-model-panel{position:absolute;z-index:45;top:calc(100% + .45rem);right:0;width:min(25rem,calc(100vw - 2rem));padding:.45rem;border:1px solid rgba(229,231,235,.14);border-radius:.95rem;background:rgba(15,15,18,.99);box-shadow:inset 0 1px 0 rgba(229,231,235,.05),0 34px 80px -34px #000;animation:pg-panel-in .24s var(--pg-ease) both}
+@keyframes pg-panel-in{from{opacity:0;transform:translateY(-5px) scale(.99)}to{opacity:1;transform:none}}
+.pg-model-panel-grip{display:none}
+.pg-model-panel-head{min-height:2.55rem;padding:.15rem .55rem .35rem;display:flex;align-items:center;justify-content:space-between;gap:.75rem}
+.pg-model-panel-head-copy{min-width:0;display:flex;flex-direction:column}
+.pg-model-panel-head-copy strong{color:var(--pg-fog);font-size:.7rem}
+.pg-model-panel-head-copy span{color:var(--pg-dim);font-size:.58rem}
+.pg-model-panel-head button{display:flex;width:2.1rem;height:2.1rem;border:0;border-radius:.55rem;background:transparent;color:var(--pg-dim);align-items:center;justify-content:center}
+.pg-model-panel-head button:hover{background:rgba(229,231,235,.06);color:var(--pg-snow)}
+.pg-model-list{max-height:min(23rem,54dvh);display:flex;flex-direction:column;gap:.3rem;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.pg-model-option{min-width:0;min-height:4.4rem;padding:.65rem;border:1px solid transparent;border-radius:.7rem;background:rgba(229,231,235,.012);color:var(--pg-snow);display:flex;align-items:center;gap:.75rem;text-align:left;transition:border-color .18s ease,background .18s ease,transform .15s var(--pg-ease)}
+.pg-model-option:hover,.pg-model-option:focus-visible{border-color:rgba(229,231,235,.1);background:rgba(229,231,235,.04)}
+.pg-model-option:active{transform:scale(.995)}
+.pg-model-option.is-selected{border-color:rgba(214,120,102,.28);background:rgba(197,68,89,.07)}
+.pg-model-option-logo{width:2.55rem;height:2.55rem;border-radius:.7rem}
+.pg-model-option-copy{min-width:0;flex:1;display:flex;flex-direction:column;gap:.13rem}
+.pg-model-option-name,.pg-model-option-purpose{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pg-model-option-name{font-size:.8rem;font-weight:700}
+.pg-model-option-purpose{color:var(--pg-fog);font-size:.68rem}
+.pg-model-option-meta{margin-top:.15rem;color:var(--pg-dim);display:flex;flex-wrap:wrap;gap:.25rem .6rem;font-size:.58rem}
+.pg-model-option-meta>span+span::before{content:"·";margin-right:.6rem;opacity:.6}
+.pg-model-option-check{width:1.45rem;height:1.45rem;flex:none;border:1px solid var(--pg-line);border-radius:50%;color:transparent;display:flex;align-items:center;justify-content:center}
+.pg-model-option-check svg{width:.85rem;height:.85rem}
+.pg-model-option.is-selected .pg-model-option-check{border-color:var(--pg-accent-soft);background:rgba(197,68,89,.18);color:var(--pg-snow)}
+.pg-meta-row{margin:1rem 0 .8rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.pg-preview-note{min-width:0;margin:0!important;color:var(--pg-dim);display:flex;align-items:center;gap:.5rem;font-size:.7rem;line-height:1.4}
+.pg-preview-note>span{width:.38rem;height:.38rem;flex:none;border-radius:50%;background:var(--app-good);box-shadow:0 0 0 4px rgba(88,214,168,.08)}
+.pg-evidence-link{min-height:2.3rem;flex:none;padding:.35rem .2rem;color:var(--pg-fog);display:inline-flex;align-items:center;font-size:.68rem;text-decoration:none}
+.pg-evidence-link:hover{color:var(--pg-snow)}
+.pg-surface{height:clamp(32rem,calc(100dvh - 19rem),42rem);min-height:32rem;overflow:hidden;border:1px solid rgba(229,231,235,.1);border-radius:1rem;background:var(--pg-surface);box-shadow:inset 0 1px 0 rgba(229,231,235,.04),0 28px 70px -42px #000}
+.pg-mode-stack,.pg-mode-panel{height:100%;min-height:0}
+.pg-mode-panel{animation:pg-mode-in .28s var(--pg-ease) backwards}
+@keyframes pg-mode-in{from{opacity:0;transform:translateY(6px) scale(.998)}to{opacity:1;transform:none}}
+.pg-chat{height:100%;min-height:0;display:flex;flex-direction:column}
+.pg-chat-thread{min-height:0;flex:1;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin}
+.pg-chat-thread.is-empty{display:grid;place-items:center;padding:3rem 1.5rem 2rem}
+.pg-chat-empty{width:min(100%,38rem);text-align:center}
+.pg-chat-empty h2,.pg-section-heading h2{margin:0;color:var(--pg-snow);font-size:clamp(1.45rem,3vw,1.85rem);font-weight:650;letter-spacing:-.04em}
+.pg-chat-empty>p:not(.pg-empty-model),.pg-section-heading p{margin:.55rem 0 0!important;color:var(--pg-fog);font-size:.82rem}
+.pg-empty-model{width:max-content;max-width:100%;margin:0 auto 1.15rem!important;padding:.3rem .8rem .3rem .34rem;border:1px solid var(--pg-line-soft);border-radius:999px;background:rgba(229,231,235,.02);color:var(--pg-fog);display:flex;align-items:center;gap:.5rem;font-size:.7rem;font-weight:650}
+.pg-empty-model-logo{width:1.65rem;height:1.65rem;border-radius:50%}
+.pg-empty-model em{padding-left:.6rem;border-left:1px solid var(--pg-line);color:var(--pg-fog);font-size:.6rem;font-style:normal}
+.pg-starters{margin-top:1.8rem;display:flex;flex-wrap:wrap;justify-content:center;gap:.45rem}
+.pg-starters button{min-height:2.75rem;padding:0 .9rem;border:1px solid var(--pg-line);border-radius:999px;background:rgba(229,231,235,.02);color:var(--pg-fog);font-size:.72rem;font-weight:650}
+.pg-starters button:hover{border-color:rgba(214,120,102,.3);background:rgba(229,231,235,.045);color:var(--pg-snow);transform:translateY(-1px)}
+.pg-messages{width:min(100%,48rem);margin:0 auto;padding:1.25rem 1.5rem 2.5rem}
+.pg-thread-actions{min-height:2.4rem;margin-bottom:1.5rem;border-bottom:1px solid var(--pg-line-soft);color:var(--pg-dim);display:flex;align-items:center;justify-content:space-between;gap:1rem;font-size:.68rem}
+.pg-thread-actions button{min-height:2.35rem;border:0;background:transparent;color:var(--pg-dim)}
+.pg-thread-actions button:hover{color:var(--pg-snow)}
+.pg-thread-model{min-width:0;color:var(--pg-fog);display:flex;align-items:center;gap:.45rem;font-weight:650}
+.pg-thread-model-logo{width:1.45rem;height:1.45rem;border-radius:.4rem}
+.pg-message{animation:pg-line-in .3s ease-out backwards}
+@keyframes pg-line-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.pg-message+.pg-message{margin-top:1.6rem}
+.pg-message.is-user{width:fit-content;max-width:min(88%,36rem);margin-left:auto}
+.pg-message-author{margin-bottom:.45rem;color:var(--pg-dim);display:flex;align-items:center;gap:.42rem;font-size:.65rem;font-weight:650}
+.pg-message.is-user .pg-message-author{justify-content:flex-end}
+.pg-message-logo{width:1.2rem;height:1.2rem;border-radius:.34rem}
+.pg-message-body{color:var(--pg-snow);font-size:.88rem;line-height:1.72;white-space:pre-wrap;overflow-wrap:anywhere}
+.pg-message.is-user .pg-message-body{padding:.7rem .9rem;border-radius:.7rem .7rem .18rem .7rem;background:var(--pg-raised);box-shadow:inset 0 1px 0 rgba(229,231,235,.05)}
+.pg-message-actions,.pg-output-actions{margin-top:.65rem;display:flex;flex-wrap:wrap;align-items:center;gap:.25rem}
+.pg-text-action{min-height:2.75rem;padding:0 .48rem;border:0;border-radius:.35rem;background:transparent;color:var(--pg-dim);display:inline-flex;align-items:center;gap:.35rem;font-size:.67rem;font-weight:650;text-decoration:none}
+.pg-text-action:hover:not(:disabled){background:var(--pg-pit);color:var(--pg-snow)}
+.pg-message.is-failed .pg-message-body{color:var(--app-danger)}
+.pg-typing{min-height:1.5rem;display:inline-flex;align-items:center;gap:.25rem}
+.pg-typing span{width:.3rem;height:.3rem;border-radius:50%;background:var(--pg-dim);animation:pg-typing 1.1s ease-in-out infinite}
+.pg-typing span:nth-child(2){animation-delay:120ms}.pg-typing span:nth-child(3){animation-delay:240ms}
+@keyframes pg-typing{0%,65%,100%{opacity:.28;transform:none}32%{opacity:1;transform:translateY(-2px)}}
+.pg-composer-wrap{position:relative;padding:.9rem 1rem .75rem;border-top:1px solid var(--pg-line-soft);background:var(--pg-pit)}
+.pg-composer{width:min(100%,48rem);min-height:3.15rem;margin:0 auto;padding:.42rem .42rem .42rem .9rem;border:1px solid var(--pg-line);border-radius:.65rem;background:var(--pg-surface);display:flex;align-items:flex-end;gap:.6rem;box-shadow:inset 0 1px 0 rgba(229,231,235,.03)}
+.pg-composer:focus-within{border-color:rgba(214,120,102,.55);box-shadow:0 0 0 3px rgba(197,68,89,.12)}
+.pg-composer textarea{min-height:2.2rem;max-height:7rem;flex:1;padding:.48rem 0;border:0;outline:0;resize:none;background:transparent;color:var(--pg-snow);font-size:.84rem;line-height:1.45}
+.pg-composer-wrap>p{width:min(100%,48rem);margin:.4rem auto 0!important;color:var(--pg-fog);font-size:.62rem}
+.pg-composer-count,.pg-count{color:var(--pg-dim);font-size:.6rem;font-style:normal;font-variant-numeric:tabular-nums}
+.pg-composer-count{align-self:center}
+.pg-send,.pg-stop,.pg-primary-action{border-radius:.48rem;display:inline-flex;align-items:center;justify-content:center;gap:.45rem;font-size:.73rem;font-weight:700}
+.pg-send{width:2.75rem;height:2.75rem;flex:none;border:0;background:var(--app-accent);color:#25090e;box-shadow:0 2px 0 #aa3e50}
+.pg-send:hover:not(:disabled){transform:translateY(-1px)}
+.pg-send:disabled,.pg-primary-action:disabled{cursor:not-allowed;opacity:.35;box-shadow:none}
+.pg-stop{min-height:2.3rem;padding:0 .7rem;border:1px solid var(--pg-line);background:transparent;color:var(--pg-fog)}
+.pg-media{height:100%;min-height:0;display:grid;grid-template-columns:minmax(18rem,23rem) minmax(0,1fr)}
+.pg-settings{padding:2rem;border-right:1px solid var(--pg-line-soft);background:var(--pg-pit);display:flex;flex-direction:column;overflow:auto}
+.pg-section-heading{margin-bottom:1.8rem}
+.pg-field{display:block}.pg-field>span,.pg-ratio-field legend,.pg-voice-field legend{margin-bottom:.5rem;color:var(--pg-fog);display:flex;align-items:baseline;justify-content:space-between;gap:.75rem;font-size:.68rem;font-weight:650}
+.pg-field textarea,.pg-field select{width:100%;padding:.75rem;border:1px solid var(--pg-line);border-radius:.5rem;outline:0;background:var(--pg-surface);color:var(--pg-snow);font-size:.8rem;line-height:1.6;box-shadow:inset 0 1px 0 rgba(229,231,235,.025)}
+.pg-field textarea{resize:vertical}.pg-field textarea:focus,.pg-field select:focus{border-color:rgba(214,120,102,.55);box-shadow:0 0 0 3px rgba(197,68,89,.12)}
+.pg-ratio-field,.pg-voice-field{min-width:0;margin:1rem 0 0;padding:0;border:0}
+.pg-ratio-field>div{display:grid;grid-template-columns:repeat(4,1fr);gap:.35rem}
+.pg-ratio-field button{min-height:2.2rem;border:1px solid var(--pg-line);border-radius:.45rem;background:transparent;color:var(--pg-dim);display:flex;align-items:center;justify-content:center;gap:.4rem;font-size:.64rem}
+.pg-ratio-field button.is-active{border-color:rgba(214,120,102,.45);background:rgba(197,68,89,.12);color:var(--pg-snow)}
+.pg-ratio-glyph{height:.72rem;border:1px solid currentColor;border-radius:2px}.pg-ratio-glyph.ratio-1-1{aspect-ratio:1}.pg-ratio-glyph.ratio-4-3{aspect-ratio:4/3}.pg-ratio-glyph.ratio-3-4{aspect-ratio:3/4}.pg-ratio-glyph.ratio-16-9{aspect-ratio:16/9}
+.pg-voice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.4rem}
+.pg-voice-option{min-width:0;min-height:3.1rem;padding:.5rem .6rem;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(229,231,235,.012);display:flex;align-items:center;gap:.5rem;cursor:pointer}
+.pg-voice-option:hover{border-color:rgba(229,231,235,.18)}.pg-voice-option.is-selected{border-color:rgba(214,120,102,.45);background:rgba(197,68,89,.1)}
+.pg-voice-copy{min-width:0;flex:1;display:flex;flex-direction:column}.pg-voice-copy strong{color:var(--pg-fog);font-size:.72rem}.pg-voice-copy em{color:var(--pg-dim);font-size:.6rem;font-style:normal}
+.pg-voice-check{width:1.15rem;height:1.15rem;border:1px solid var(--pg-line);border-radius:50%;color:transparent;display:flex;align-items:center;justify-content:center}.pg-voice-check svg{width:.7rem;height:.7rem}.pg-voice-option.is-selected .pg-voice-check{color:var(--pg-snow);border-color:var(--pg-accent-soft);background:rgba(197,68,89,.2)}
+.pg-primary-action{width:100%;min-height:2.75rem;margin-top:1.2rem;border:0;background:var(--app-accent);color:#25090e;box-shadow:0 3px 0 #aa3e50}
+.pg-output{min-width:0;min-height:0;padding:2rem;display:grid;place-items:center;overflow:auto}
+.pg-output-empty{max-width:23rem;color:var(--pg-dim);display:flex;flex-direction:column;align-items:center;text-align:center}.pg-output-empty>svg{width:3rem;height:3rem;padding:.75rem;margin-bottom:1rem;border:1px solid var(--pg-line);border-radius:.85rem}.pg-output-empty>strong{color:var(--pg-fog);font-size:.82rem}.pg-output-empty>span{margin-top:.35rem;font-size:.72rem}
+.pg-image-result{width:100%;display:flex;flex-direction:column;align-items:center}.pg-image-frame{width:min(100%,32rem);min-height:18rem;border:1px dashed rgba(229,231,235,.15);border-radius:.75rem;background:radial-gradient(ellipse 65% 75% at 50% 28%,rgba(197,68,89,.06),transparent 72%),var(--pg-pit);display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden}.pg-image-frame.ratio-4-3{aspect-ratio:4/3}.pg-image-frame.ratio-3-4{width:min(72%,24rem);aspect-ratio:3/4}.pg-image-frame.ratio-16-9{aspect-ratio:16/9}.pg-image-frame.ratio-1-1{width:min(86%,28rem);aspect-ratio:1}
+.pg-generated-image{width:100%;height:100%;object-fit:contain}.pg-image-meta{margin:.65rem 0 0!important;color:var(--pg-dim);font-size:.65rem}
+.pg-image-frame.is-pending{position:relative;border-style:solid;border-color:rgba(214,120,102,.25)}
+.pg-latent-grid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(5,1fr);opacity:.2}.pg-latent-grid span{border:1px solid rgba(214,120,102,.16);animation:pg-latent 1.8s ease-in-out infinite}.pg-latent-grid span:nth-child(3n){animation-delay:-.6s}.pg-latent-grid span:nth-child(4n){animation-delay:-1.2s}@keyframes pg-latent{50%{background:rgba(214,120,102,.18)}}
+.pg-generation-center{position:relative;z-index:1;padding:1rem;display:flex;flex-direction:column;align-items:center;text-align:center}.pg-generation-orb{width:3rem;height:3rem;margin-bottom:.8rem;border:1px solid rgba(214,120,102,.3);border-radius:50%;color:var(--app-accent-strong);display:grid;place-items:center;background:rgba(13,13,15,.78)}.pg-generation-center strong{font-size:.82rem}.pg-generation-detail,.pg-generation-kicker{margin-top:.35rem;color:var(--pg-dim);font-size:.65rem}.pg-generation-kicker{color:var(--pg-fog)}
+.pg-audio-result{width:min(100%,32rem);padding:1.1rem;border:1px solid var(--pg-line);border-radius:.65rem;background:var(--pg-pit);display:grid;grid-template-columns:auto 1fr;align-items:center;gap:.9rem}.pg-play{width:2.8rem;height:2.8rem;border:0;border-radius:50%;background:var(--pg-raised);color:var(--pg-fog);display:grid;place-items:center}.pg-audio-result strong,.pg-audio-result span{display:block}.pg-audio-result strong{font-size:.8rem}.pg-audio-result span{margin-top:.2rem;color:var(--pg-dim);font-size:.66rem}.pg-audio-result audio{width:100%;grid-column:1/-1;margin-top:.4rem}.pg-audio-result .pg-output-actions{grid-column:1/-1}
+.pg-waveform{height:3rem;grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:.2rem}.pg-waveform span{width:.18rem;height:var(--wave-height);border-radius:999px;background:var(--app-accent-strong);animation:pg-wave .9s ease-in-out infinite alternate;animation-delay:var(--wave-delay)}@keyframes pg-wave{to{height:20%;opacity:.45}}
+.pg-network{margin-top:.85rem;border:1px solid rgba(229,231,235,.1);border-radius:.85rem;background:rgba(16,16,19,.9);overflow:hidden;box-shadow:inset 0 1px 0 rgba(229,231,235,.04),0 20px 50px -38px #000}
+.pg-network-summary{width:100%;min-height:3.5rem;padding:0 1rem;border:0;background:transparent;color:var(--pg-snow);display:grid;grid-template-columns:auto auto 1fr auto auto;align-items:center;gap:.7rem;text-align:left}.pg-network-summary:hover{background:rgba(229,231,235,.02)}
+.pg-network-grip{display:none}.pg-network-dot{width:.45rem;height:.45rem;border-radius:50%;background:var(--pg-dim)}.pg-network.is-busy .pg-network-dot{background:var(--app-accent-strong);animation:pg-dot 1.6s ease-in-out infinite}.pg-network.is-complete .pg-network-dot{background:var(--pg-live)}@keyframes pg-dot{50%{opacity:.6;box-shadow:0 0 0 5px transparent}}
+.pg-network-labels{display:flex;flex-direction:column}.pg-network-title{font-size:.72rem;font-weight:700}.pg-network-state{color:var(--pg-dim);font-size:.61rem}.pg-network.is-complete .pg-network-state{color:var(--pg-live)}
+.pg-network-model{min-width:0;color:var(--pg-fog);display:flex;align-items:center;gap:.5rem;font-size:.68rem}.pg-network-model-logo{width:1.55rem;height:1.55rem}.pg-network-model>span:last-child{max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pg-network-chevron{color:var(--pg-dim);transition:transform .2s var(--pg-ease)}.pg-network-summary[aria-expanded="true"] .pg-network-chevron{transform:rotate(180deg)}
+.pg-network-body{padding:1rem;border-top:1px solid var(--pg-line-soft)}.pg-network-steps{margin:0;padding:0;display:grid;grid-template-columns:repeat(4,1fr);list-style:none}.pg-network-steps li{position:relative;min-width:0;display:flex;gap:.55rem}.pg-network-steps li:not(:last-child)::after{content:"";position:absolute;top:.55rem;left:1.1rem;right:0;height:1px;background:var(--pg-line)}.pg-step-marker{position:relative;z-index:1;width:1.1rem;height:1.1rem;flex:none;border:1px solid var(--pg-line);border-radius:50%;background:var(--pg-pit)}.pg-network-steps li.is-active .pg-step-marker{border-color:var(--app-accent-strong);box-shadow:0 0 0 4px rgba(255,107,122,.1)}.pg-network-steps li.is-done .pg-step-marker{border-color:var(--pg-live);background:var(--pg-live)}.pg-step-copy{min-width:0;display:flex;flex-direction:column}.pg-step-label{color:var(--pg-fog);font-size:.65rem;font-weight:700}.pg-step-detail{color:var(--pg-dim);font-size:.57rem}
+.pg-network-facts{margin:1rem 0 0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.55rem}.pg-network-facts div{min-width:0;padding:.65rem;border:1px solid var(--pg-line-soft);border-radius:.55rem}.pg-network-facts dt{color:var(--pg-dim);font-size:.56rem}.pg-network-facts dd{margin:.2rem 0 0;overflow-wrap:anywhere;color:var(--pg-fog);font-size:.63rem}.pg-network-footnote{margin:.8rem 0 0!important;color:var(--pg-dim);font-size:.6rem}
+.pg-advanced{margin-top:.85rem;border:1px solid var(--pg-line-soft);border-radius:.75rem;background:rgba(16,16,19,.55)}.pg-advanced>summary{min-height:3rem;padding:.65rem .9rem;color:var(--pg-fog);display:flex;align-items:center;justify-content:space-between;gap:1rem;cursor:pointer;font-size:.68rem;font-weight:700}.pg-advanced>summary span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-dim);font-weight:500}.pg-advanced-grid{padding:.2rem .9rem .9rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}.pg-advanced-field{min-width:0;display:flex;flex-direction:column;gap:.35rem}.pg-advanced-field>span{color:var(--pg-fog);font-size:.64rem;font-weight:650}.pg-advanced-field em,.pg-advanced-field small{color:var(--pg-dim);font-size:.58rem;font-style:normal}.pg-advanced-field input,.pg-advanced-field select,.pg-advanced-field textarea{width:100%;min-height:2.45rem;padding:.55rem .65rem;border:1px solid var(--pg-line);border-radius:.5rem;background:var(--pg-surface);color:var(--pg-snow);font-size:.7rem}.pg-advanced-field textarea{resize:vertical}.pg-advanced .preflight{padding:.65rem;border:1px solid var(--pg-line-soft);border-radius:.55rem}.pg-advanced .span-all{grid-column:1/-1}
+.pg-local-note{margin:.6rem .2rem 0!important;color:var(--pg-dim);font-size:.6rem;text-align:right}
+@media(max-width:780px){
+  .app-main--playground{padding-top:1.25rem}
+  .pg-toolbar{align-items:stretch;flex-direction:column-reverse}
+  .pg-model{width:100%}.pg-mode-tabs{width:100%}.pg-mode-tabs button{min-width:0;flex:1;padding-inline:.45rem}
+  .pg-model-backdrop:not([hidden]){position:fixed;inset:0;z-index:44;display:block;border:0;background:rgba(4,5,7,.68);backdrop-filter:blur(3px)}
+  .pg-model-panel{position:fixed;z-index:45;left:max(.65rem,env(safe-area-inset-left));right:max(.65rem,env(safe-area-inset-right));top:auto;bottom:max(.65rem,env(safe-area-inset-bottom));width:auto;max-height:min(78dvh,38rem);border-radius:1rem;padding:.55rem}
+  .pg-model-panel-grip{width:2.4rem;height:.23rem;margin:.1rem auto .45rem;border-radius:999px;background:var(--pg-line);display:block}
+  .pg-model-list{max-height:calc(78dvh - 4.8rem)}
+  .pg-meta-row{align-items:flex-start}.pg-evidence-link{display:none}
+  .pg-surface{height:clamp(31rem,calc(100dvh - 19rem),39rem);min-height:31rem}
+  .pg-media{grid-template-columns:1fr;overflow-y:auto}.pg-settings{border-right:0;border-bottom:1px solid var(--pg-line-soft)}.pg-output{min-height:22rem}
+  .pg-network-steps{grid-template-columns:1fr;gap:.8rem}.pg-network-steps li:not(:last-child)::after{top:1.1rem;bottom:-.8rem;left:.55rem;right:auto;width:1px;height:auto}
+  .pg-network-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:520px){
+  .app-main--playground .page-head{margin-bottom:1rem}.app-main--playground .page-summary{font-size:.82rem}
+  .pg-mode-tabs button{font-size:.7rem}.pg-mode-tabs button svg{display:none}.pg-mode-soon{display:none}
+  .pg-preview-note{font-size:.64rem}
+  .pg-chat-thread.is-empty{padding:2rem 1rem 1.5rem}.pg-starters{margin-top:1.25rem}.pg-starters button{min-height:2.75rem}
+  .pg-composer-wrap{padding:.75rem}.pg-messages{padding:1rem 1rem 2rem}
+  .pg-settings,.pg-output{padding:1.2rem}.pg-ratio-field>div{grid-template-columns:repeat(2,1fr)}.pg-voice-grid{grid-template-columns:1fr}
+  .pg-network-model{display:none}.pg-network-summary{grid-template-columns:auto auto 1fr auto}
+  .pg-network-facts,.pg-advanced-grid{grid-template-columns:1fr}.pg-advanced .span-all{grid-column:1}
+}
+html.motion-reduced .pg-page *{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+@media(prefers-reduced-motion:reduce){.pg-page *{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+
+.activation-panel{margin-bottom:24px}
+.activation-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(250px,.75fr);gap:22px;align-items:start}
+.activation-next{padding:15px;border:1px solid var(--app-border);border-radius:13px;background:var(--app-panel-soft)}
+.activation-next>strong{display:block}
+.activation-next>p{margin:6px 0 13px;color:var(--app-text-muted);font-size:12px;line-height:1.5}
+.provider-start-command{display:grid;gap:7px}
 .settings-list{display:grid}
 .settings-row{padding:16px 18px;border-bottom:1px solid var(--app-border);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:center}
 .settings-row:last-child{border-bottom:0}
 .settings-copy strong{display:block}
 .settings-copy span{display:block;margin-top:3px;color:var(--app-text-muted);font-size:12px}
-.settings-control[aria-pressed="true"]{border-color:rgba(88,214,168,.4);background:rgba(88,214,168,.09);color:var(--app-good)}
+.settings-control[aria-pressed="true"],.settings-control[aria-checked="true"]{border-color:rgba(88,214,168,.4);background:rgba(88,214,168,.09);color:var(--app-good)}
+.settings-control .switch-track{width:40px;height:24px;flex:0 0 auto;border-radius:999px;border:1px solid var(--app-border-strong);background:var(--app-panel-soft);position:relative;transition:background var(--app-fast) ease,border-color var(--app-fast) ease}
+.settings-control .switch-track::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:999px;background:var(--app-text-muted);transition:transform var(--app-standard) cubic-bezier(.2,0,.38,.9),background var(--app-fast) ease}
+.settings-control[aria-checked="true"] .switch-track{border-color:rgba(88,214,168,.5);background:rgba(88,214,168,.16)}
+.settings-control[aria-checked="true"] .switch-track::after{transform:translateX(16px);background:var(--app-good)}
+.settings-links{display:grid;gap:8px}
+.settings-link{min-height:64px;padding:12px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-soft);color:var(--app-text);text-decoration:none;display:grid;align-content:center}
+.settings-link:hover{border-color:var(--app-border-strong);background:var(--app-panel-strong)}
+.settings-link strong,.settings-link span{display:block}
+.settings-link span{margin-top:3px;color:var(--app-text-muted);font-size:12px}
 .fact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .fact{padding:12px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-soft)}
-.fact span{display:block;color:var(--app-text-muted);font-size:11px}
+.fact span{display:block;color:var(--app-text-muted);font-size:12px}
 .fact strong{display:block;margin-top:4px;overflow-wrap:anywhere;font-size:13px}
 .section-gap{margin-top:18px}
 .field-gap{height:12px}
@@ -456,7 +788,9 @@ html.js-ready .playground-interactive.js-only{display:block!important}
 .empty-block h3{margin:0;font-size:17px}
 .empty-block p{margin:7px 0 17px;color:var(--app-text-muted);font-size:13px}
 
-.app-footer{padding:18px max(clamp(18px,3.1vw,52px),env(safe-area-inset-right)) max(18px,env(safe-area-inset-bottom)) max(clamp(18px,3.1vw,52px),env(safe-area-inset-left));border-top:1px solid var(--app-border);display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--app-text-muted);font-size:12px}
+.app-footer{padding:18px max(clamp(18px,3.1vw,52px),env(safe-area-inset-right)) max(18px,env(safe-area-inset-bottom)) max(clamp(18px,3.1vw,52px),env(safe-area-inset-left));border-top:1px solid var(--app-border);color:var(--app-text-muted);font-size:12px}
+.app-footer-inner{max-width:1560px;margin-inline:auto;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.app-footer-inner--wide{max-width:1880px}
 
 .verify-dialog{width:min(700px,calc(100vw - 28px));max-height:min(84vh,900px);padding:0;border:1px solid var(--app-border-strong);border-radius:22px;background:var(--app-panel);color:var(--app-text);box-shadow:var(--app-shadow);overflow:hidden}
 .verify-dialog::backdrop{background:rgba(4,5,7,.72);backdrop-filter:blur(5px)}
@@ -470,9 +804,9 @@ html.js-ready .playground-interactive.js-only{display:block!important}
 .verify-level h3{margin:0 0 9px;font-size:14px}
 .verify-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .verify-fact{padding:11px;border:1px solid var(--app-border);border-radius:12px;background:var(--app-panel-soft)}
-.verify-fact span{display:block;color:var(--app-text-muted);font-size:11px}
+.verify-fact span{display:block;color:var(--app-text-muted);font-size:12px}
 .verify-fact strong{display:block;margin-top:4px;overflow-wrap:anywhere;font-size:13px}
-.verify-fact small{display:block;margin-top:6px;color:var(--app-text-muted);font-size:10px;line-height:1.35}
+.verify-fact small{display:block;margin-top:6px;color:var(--app-text-muted);font-size:11px;line-height:1.35}
 .raw-evidence{margin:0;padding:13px;border:1px solid var(--app-border);border-radius:12px;background:#0b0d10;color:#c8d0da;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
 .evidence-standalone{width:min(920px,calc(100% - 36px));margin:0 auto;padding:36px 0 72px}
 .evidence-page-body{max-height:none}
@@ -483,9 +817,15 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
 .app-toast{padding:11px 13px;border:1px solid var(--app-border-strong);border-radius:12px;background:var(--app-panel-strong);box-shadow:var(--app-shadow);color:var(--app-text);font-size:13px;animation:toast-in var(--app-standard) cubic-bezier(.2,0,.38,.9) both}
 @keyframes toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
+@media(max-width:1359px){
+  .launch-path-card{grid-template-columns:auto minmax(0,1fr)}
+  .launch-path-card>a{grid-column:1/-1;width:100%}
+}
+
 @media(max-width:1120px){
   .app-shell{grid-template-columns:218px minmax(0,1fr)}
   .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .metric-grid--three{grid-template-columns:repeat(3,minmax(0,1fr))}
   .dashboard-layout{grid-template-columns:1fr}
 }
 
@@ -493,8 +833,8 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   html.sidebar-collapsed .app-shell{grid-template-columns:84px minmax(0,1fr)}
   html.sidebar-collapsed .app-sidebar{padding-inline:14px;align-items:stretch}
   html.sidebar-collapsed .app-brand{justify-content:center;padding-inline:0}
-  html.sidebar-collapsed .app-brand-text,html.sidebar-collapsed .app-nav-label,html.sidebar-collapsed .app-nav .nav-text{display:none}
-  html.sidebar-collapsed .app-nav a{justify-content:center;padding-inline:10px}
+  html.sidebar-collapsed .app-brand-text,html.sidebar-collapsed .app-nav-label,html.sidebar-collapsed .app-nav .nav-text,html.sidebar-collapsed .advanced-nav-items{display:none}
+  html.sidebar-collapsed .app-nav a,html.sidebar-collapsed .advanced-nav>summary{justify-content:center;padding-inline:10px}
   html.sidebar-collapsed .sidebar-collapse-button span{transform:rotate(180deg)}
 }
 
@@ -511,7 +851,7 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .app-topbar{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right))}
   .topbar-context{flex:1;gap:8px;overflow:hidden}
   .topbar-context strong{max-width:min(26vw,130px)}
-  .topbar-context .topbar-status{display:inline-flex;min-width:0;max-width:min(42vw,240px);gap:6px;font-size:11px;overflow:hidden}
+  .topbar-context .topbar-status{display:inline-flex;min-width:0;max-width:min(42vw,240px);gap:6px;font-size:12px;overflow:hidden}
   .topbar-status .state-indicator{flex:0 0 auto}
   .topbar-status [data-page-status-text]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .topbar-actions{flex:0 0 auto}
@@ -522,20 +862,32 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .app-main{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right))}
   .app-main{padding-bottom:108px}
   .metric-grid{grid-template-columns:1fr 1fr}
+  .metric-grid--three{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .launch-paths{grid-template-columns:1fr}
+  .activation-grid{grid-template-columns:1fr}
   .verify-grid{grid-template-columns:1fr}
-  .app-footer{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right));align-items:flex-start;flex-direction:column}
+  .app-footer{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right));padding-bottom:calc(max(18px,env(safe-area-inset-bottom)) + 78px)}
+  .app-footer-inner{align-items:flex-start;flex-direction:column}
   html.js-ready .mobile-bottom-nav{position:fixed;left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));z-index:18;min-height:60px;padding:6px;border:1px solid var(--app-border);border-radius:18px;background:rgba(18,20,25,.95);box-shadow:0 16px 50px rgba(0,0,0,.38);backdrop-filter:blur(18px);display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px}
   .session-expired,.toast-region{bottom:calc(max(10px,env(safe-area-inset-bottom)) + 72px)}
   body.session-expired-visible .toast-region{bottom:calc(max(10px,env(safe-area-inset-bottom)) + 206px)}
-  .mobile-bottom-nav a,.mobile-bottom-nav button{min-width:0;border:0;border-radius:12px;background:transparent;color:var(--app-text-muted);display:grid;place-items:center;padding:8px 3px;text-decoration:none;font-size:11px;font-weight:700}
+  .mobile-bottom-nav a,.mobile-bottom-nav button{min-width:0;border:0;border-radius:12px;background:transparent;color:var(--app-text-muted);display:grid;place-items:center;padding:8px 3px;text-decoration:none;font-size:12px;font-weight:700}
   .mobile-bottom-nav a[aria-current="page"],.mobile-bottom-nav button[aria-current="page"]{background:rgba(255,107,122,.11);color:var(--app-accent-strong)}
   html.js-ready .mobile-bottom-nav .js-only{display:grid!important}
-  .playground-layout{grid-template-columns:1fr}
+  html.js-ready .playground-interactive.js-only{min-height:540px}
+  .playground-toolbar{align-items:stretch;flex-direction:column;gap:8px}
+  .model-picker{width:100%;grid-template-columns:auto minmax(0,1fr)}
+  .model-picker-panel{left:0;width:100%}
+  .playground-thread{min-height:180px}
+  .playground-empty{min-height:140px}
+  .playground-settings-body{grid-template-columns:1fr}
+  .playground-settings-body>.field,.playground-settings-body>.preflight,.playground-settings-foot{grid-column:1}
 }
 
 @media(max-width:520px){
   .topbar-actions .soft-button .button-label{display:none}
   .metric-grid{grid-template-columns:1fr}
+  .metric-grid--three{grid-template-columns:1fr}
   .metric{padding:15px}
   .page-head h1{font-size:34px}
   .panel-head{align-items:flex-start;flex-direction:column}
@@ -545,11 +897,20 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .activity-value{grid-column:2;text-align:left}
   .data-table{min-width:620px}
   .form-grid,.fact-grid{grid-template-columns:1fr}
+  .playground-settings-foot{align-items:stretch;flex-direction:column}
+  .playground-settings-foot .quiet-button{width:100%}
+  .launch-path-card{grid-template-columns:auto minmax(0,1fr)}
+  .launch-path-card>a{grid-column:1/-1;width:100%}
+  .usage-bars{height:145px;gap:4px}
   .settings-row{grid-template-columns:1fr;align-items:start}
   .session-expired{align-items:stretch;flex-direction:column}
   .session-expired-actions{justify-content:flex-end}
   .verify-head{align-items:stretch;flex-direction:column}
   .verify-actions{justify-content:flex-start}
+}
+
+@media(max-width:430px){
+  .usage-bars li:nth-child(even) small{visibility:hidden}
 }
 
 @media(max-width:360px){
@@ -562,6 +923,8 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .app-sidebar,.app-topbar,.panel,.metric,.notice,.attention-card,.message,.mobile-bottom-nav,.verify-dialog{background:Canvas;color:CanvasText;box-shadow:none}
   .state-indicator,.state-indicator.good,.state-indicator.warn,.state-indicator.danger{background:CanvasText;box-shadow:none;border:1px solid Canvas}
   .status-badge,.status-badge.good,.status-badge.info,.status-badge.warn,.status-badge.danger,.check-mark{background:Canvas;color:CanvasText;border-color:CanvasText}
+  .settings-control .switch-track{border-color:CanvasText}
+  .settings-control .switch-track::after{background:CanvasText}
   progress{border:1px solid CanvasText}
 }
 
@@ -608,6 +971,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     sidebar: 'mayhem.dashboard.sidebarCollapsed'
   };
   const playgroundDraftKey = 'mayhem.dashboard.playgroundDraft';
+  const playgroundConversationKey = 'mayhem.dashboard.playgroundConversation.v1';
+  const localProductEventsKey = 'mayhem.dashboard.localProductEvents.v1';
 
   root.classList.toggle('amounts-hidden', storage.get(preferenceKeys.amounts) === '1');
   root.classList.toggle('motion-reduced', storage.get(preferenceKeys.motion) === '1');
@@ -632,15 +997,52 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       try { return scope.querySelector(selector); } catch (_) { return null; }
     };
 
+    const readLocalProductEvents = () => {
+      const stored = storage.get(localProductEventsKey);
+      if (!stored) return [];
+      try {
+        const parsed = JSON.parse(stored);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (_) {
+        return [];
+      }
+    };
+
+    const updateLocalProductEventCount = () => {
+      const count = readLocalProductEvents().length;
+      document.querySelectorAll('[data-local-event-count]').forEach((node) => {
+        node.textContent = String(count);
+      });
+    };
+
+    const recordProductEvent = (name, details = {}) => {
+      if (!name) return;
+      const events = readLocalProductEvents();
+      events.push({
+        version: 1,
+        name: String(name).slice(0, 80),
+        at: new Date().toISOString(),
+        path: window.location.pathname,
+        details
+      });
+      storage.set(localProductEventsKey, JSON.stringify(events.slice(-200)));
+      updateLocalProductEventCount();
+    };
+
     const selectedPlaygroundPriceMode = (scope = document) => {
       const model = safeQuery('[data-playground-model]', scope);
       return model?.selectedOptions?.[0]?.dataset.priceMode === 'fixed' ? 'fixed' : 'rate';
     };
 
     const playgroundDraftSnapshot = () => ({
-      version: 2,
+      version: 3,
+      mode: safeQuery('[data-playground-mode]')?.dataset.playgroundMode || 'chat',
       model: safeQuery('[data-playground-model]')?.value || '',
       prompt: safeQuery('[data-playground-prompt]')?.value || '',
+      imagePrompt: safeQuery('[data-playground-image-prompt]')?.value || '',
+      speechText: safeQuery('[data-playground-speech-text]')?.value || '',
+      aspectRatio: safeQuery('[data-playground-aspect-ratio][aria-pressed="true"]')?.dataset.playgroundAspectRatio || '1:1',
+      voice: safeQuery('[data-playground-voice]:checked')?.value || 'af_heart',
       system: safeQuery('[data-playground-system]')?.value || '',
       maxTokens: safeQuery('[data-playground-max-tokens]')?.value || '512',
       maxPrice: safeQuery('[data-playground-max-price]')?.value || '',
@@ -662,6 +1064,201 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       } catch (_) {
         return { prompt: stored };
       }
+    };
+
+    const savePlaygroundConversation = () => {
+      if (!safeQuery('[data-playground-form]')) return;
+      const messages = playgroundConversation
+        .filter((message) => message && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
+        .slice(-20)
+        .map((message) => ({ role: message.role, content: message.content.slice(0, 50000) }));
+      storage.set(playgroundConversationKey, JSON.stringify({ version: 1, savedAt: Date.now(), messages }));
+    };
+
+    const playgroundModelOptionForValue = (value) =>
+      Array.from(document.querySelectorAll('[data-playground-model-option]'))
+        .find((option) => option.dataset.playgroundModelOption === value) || null;
+
+    const currentPlaygroundMode = () =>
+      safeQuery('[data-playground-mode]')?.dataset.playgroundMode ||
+      safeQuery('[data-playground-model]')?.selectedOptions?.[0]?.dataset.playgroundMode ||
+      'chat';
+
+    const playgroundOptionsForMode = (mode) =>
+      Array.from(safeQuery('[data-playground-model]')?.options || [])
+        .filter((option) => option.dataset.playgroundMode === mode);
+
+    const closePlaygroundModelPicker = (refocus = false) => {
+      const rootNode = safeQuery('[data-playground-model-picker]');
+      const trigger = safeQuery('[data-playground-model-trigger]', rootNode || document);
+      const panel = safeQuery('[data-playground-model-panel]', rootNode || document);
+      if (!trigger || !panel || panel.hidden) return;
+      panel.hidden = true;
+      safeQuery('.pg-model-backdrop', rootNode || document)?.setAttribute('hidden', '');
+      trigger.setAttribute('aria-expanded', 'false');
+      if (refocus) trigger.focus();
+    };
+
+    const syncPlaygroundModelPicker = () => {
+      const select = safeQuery('[data-playground-model]');
+      const rootNode = safeQuery('[data-playground-model-picker]');
+      const trigger = safeQuery('[data-playground-model-trigger]', rootNode || document);
+      if (!select || !rootNode || !trigger) return;
+      const card = playgroundModelOptionForValue(select.value);
+      const selected = select.selectedOptions[0];
+      const iconHost = safeQuery('[data-playground-model-trigger-icon]', trigger);
+      const icon = safeQuery('.model-lab-mark', card || document);
+      if (iconHost && icon) iconHost.replaceChildren(icon.cloneNode(true));
+      const name = selected?.dataset.modelName || selected?.value || 'Choose model';
+      const purpose = selected?.dataset.modelPurpose || 'Live provider route';
+      const nameNode = safeQuery('[data-playground-model-trigger-name]', trigger);
+      const metaNode = safeQuery('[data-playground-model-trigger-meta]', trigger);
+      if (nameNode) nameNode.textContent = name;
+      if (metaNode) metaNode.textContent = purpose;
+      trigger.setAttribute('aria-label', `Choose model, ${name} selected`);
+      document.querySelectorAll('[data-playground-model-option]').forEach((option) => {
+        const current = option === card;
+        const visible = option.dataset.playgroundMode === currentPlaygroundMode();
+        option.hidden = !visible;
+        option.classList.toggle('is-selected', current);
+        option.setAttribute('aria-selected', String(current));
+        option.tabIndex = current && visible ? 0 : -1;
+      });
+      const visibleCards = Array.from(document.querySelectorAll('[data-playground-model-option]')).filter((option) => !option.hidden);
+      const modeLabel = currentPlaygroundMode() === 'image' ? 'Image model' : currentPlaygroundMode() === 'speech' ? 'Speech model' : 'Text model';
+      const panelLabel = safeQuery('[data-playground-model-panel-label]');
+      const count = safeQuery('[data-playground-model-count]');
+      const listbox = safeQuery('#playground-model-list');
+      if (panelLabel) panelLabel.textContent = modeLabel;
+      if (count) count.textContent = String(visibleCards.length);
+      if (listbox) listbox.setAttribute('aria-label', modeLabel);
+      document.querySelectorAll('[data-playground-active-model-name], [data-playground-network-model]').forEach((node) => { node.textContent = name; });
+      document.querySelectorAll('[data-playground-active-model-icon], [data-playground-network-icon]').forEach((host) => {
+        if (icon) host.replaceChildren(icon.cloneNode(true));
+      });
+      const modelFact = safeQuery('[data-playground-fact="model"]');
+      if (modelFact) modelFact.textContent = selected?.value || name;
+    };
+
+    const syncPlaygroundInputs = () => {
+      const prompt = safeQuery('[data-playground-prompt]');
+      const imagePrompt = safeQuery('[data-playground-image-prompt]');
+      const speechText = safeQuery('[data-playground-speech-text]');
+      const chatCount = safeQuery('[data-playground-chat-count]');
+      const imageCount = safeQuery('[data-playground-image-count]');
+      const speechCount = safeQuery('[data-playground-speech-count]');
+      if (chatCount && prompt) {
+        chatCount.textContent = `${prompt.value.length}/1600`;
+        chatCount.hidden = prompt.value.length < 1360;
+      }
+      if (imageCount && imagePrompt) imageCount.textContent = `${imagePrompt.value.length}/1200`;
+      if (speechCount && speechText) speechCount.textContent = `${speechText.value.length}/800`;
+      const busy = Boolean(playgroundController);
+      const imageButton = safeQuery('[data-playground-generate-image]');
+      const speechButton = safeQuery('[data-playground-generate-speech]');
+      if (imageButton) imageButton.disabled = !imagePrompt?.value.trim() || busy;
+      if (speechButton) speechButton.disabled = !speechText?.value.trim() || busy;
+    };
+
+    const setPlaygroundMode = (mode, refocus = false) => {
+      const page = safeQuery('[data-playground-mode]');
+      const select = safeQuery('[data-playground-model]');
+      const available = playgroundOptionsForMode(mode);
+      if (!page || !select || !available.length || playgroundController) return;
+      page.dataset.playgroundMode = mode;
+      document.querySelectorAll('[data-playground-mode-tab]').forEach((tab) => {
+        const active = tab.dataset.playgroundModeTab === mode;
+        tab.classList.toggle('is-active', active);
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+        if (active && refocus) tab.focus();
+      });
+      document.querySelectorAll('[data-playground-mode-panel]').forEach((panel) => {
+        panel.hidden = panel.dataset.playgroundModePanel !== mode;
+      });
+      if (select.selectedOptions[0]?.dataset.playgroundMode !== mode) {
+        select.value = available[0].value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      closePlaygroundModelPicker(false);
+      syncPlaygroundModelPicker();
+      syncPlaygroundInputs();
+      savePlaygroundDraft();
+      recordProductEvent('playground_mode_selected', { mode, model: select.value });
+    };
+
+    const openPlaygroundModelPicker = () => {
+      const rootNode = safeQuery('[data-playground-model-picker]');
+      const trigger = safeQuery('[data-playground-model-trigger]', rootNode || document);
+      const panel = safeQuery('[data-playground-model-panel]', rootNode || document);
+      const select = safeQuery('[data-playground-model]');
+      if (!trigger || !panel || !select || trigger.disabled) return;
+      panel.hidden = false;
+      safeQuery('.pg-model-backdrop', rootNode || document)?.removeAttribute('hidden');
+      trigger.setAttribute('aria-expanded', 'true');
+      playgroundModelOptionForValue(select.value)?.focus();
+    };
+
+    const choosePlaygroundModel = (value) => {
+      const select = safeQuery('[data-playground-model]');
+      if (!select || !Array.from(select.options).some((option) => option.value === value)) return;
+      select.value = value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      closePlaygroundModelPicker(true);
+    };
+
+    const syncPlaygroundConversationUi = () => {
+      const clear = safeQuery('[data-playground-clear]');
+      if (clear) clear.hidden = !safeQuery('[data-playground-thread] .pg-message');
+      const thread = safeQuery('[data-playground-thread]');
+      if (thread) {
+        const hasMessages = Boolean(safeQuery('.pg-message', thread));
+        thread.classList.toggle('is-empty', !hasMessages);
+        thread.classList.toggle('has-messages', hasMessages);
+      }
+    };
+
+    const restorePlaygroundConversation = () => {
+      const thread = safeQuery('[data-playground-thread]');
+      if (!thread) return;
+      const stored = storage.get(playgroundConversationKey);
+      if (!stored) return;
+      let parsed;
+      try { parsed = JSON.parse(stored); } catch (_) { return; }
+      const messages = Array.isArray(parsed?.messages) ? parsed.messages.slice(-20) : [];
+      const safeMessages = messages.filter((message) =>
+        message && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string'
+      );
+      if (!safeMessages.length) return;
+      playgroundConversation.push(...safeMessages.map((message) => ({ role: message.role, content: message.content })));
+      const fragment = document.createDocumentFragment();
+      const messagesRoot = document.createElement('div');
+      messagesRoot.className = 'pg-messages';
+      const actions = document.createElement('div');
+      actions.className = 'pg-thread-actions';
+      actions.innerHTML = '<span class="pg-thread-model">Restored conversation</span><button type="button" data-playground-clear>Clear conversation</button>';
+      messagesRoot.append(actions);
+      safeMessages.forEach((entry, index) => {
+        const message = document.createElement('article');
+        message.className = `pg-message is-${entry.role}`;
+        message.setAttribute('role', 'article');
+        message.setAttribute('aria-label', entry.role === 'user' ? 'You' : 'Mayhem');
+        message.dataset.conversationOffset = String(index);
+        const label = document.createElement('span');
+        label.className = 'pg-message-author';
+        label.setAttribute('aria-hidden', 'true');
+        label.textContent = entry.role === 'user' ? 'You' : 'Mayhem';
+        const content = document.createElement('div');
+        content.className = 'pg-message-body';
+        content.textContent = entry.content;
+        message.append(label, content);
+        messagesRoot.append(message);
+      });
+      fragment.append(messagesRoot);
+      thread.replaceChildren(fragment);
+      syncPlaygroundConversationUi();
+      const metadata = safeQuery('[data-playground-meta]');
+      if (metadata) metadata.textContent = `Restored ${safeMessages.length} local conversation message${safeMessages.length === 1 ? '' : 's'}`;
     };
 
     const announce = (message, assertive = false, visual = true) => {
@@ -803,6 +1400,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const label = safeQuery('[data-hide-label]', button);
         if (label) label.textContent = actionLabel;
       });
+      updatePlaygroundControlSummary();
       root.classList.add('amounts-ready');
     };
 
@@ -815,7 +1413,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       document.querySelectorAll('[data-preference]').forEach((button) => {
         const value = states[button.getAttribute('data-preference')];
         if (typeof value === 'boolean') {
-          button.setAttribute('aria-pressed', String(value));
+          if (button.getAttribute('role') === 'switch') button.setAttribute('aria-checked', String(value));
+          else button.setAttribute('aria-pressed', String(value));
           const label = safeQuery('[data-preference-label]', button);
           if (label) label.textContent = value ? 'On' : 'Off';
         }
@@ -1222,9 +1821,9 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
 
     const addPromptAction = (message, promptValue, conversationOffset, label = 'Edit and resend') => {
       const actions = document.createElement('div');
-      actions.className = 'message-actions';
+      actions.className = 'pg-message-actions';
       const button = document.createElement('button');
-      button.className = 'quiet-button';
+      button.className = 'pg-text-action';
       button.type = 'button';
       button.dataset.playgroundReusePrompt = '';
       button.dataset.prompt = promptValue;
@@ -1236,7 +1835,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
 
     const addFailureRecovery = (message, status, technicalMessage, promptValue, partialText = '') => {
       const failure = classifyPlaygroundFailure(status, technicalMessage);
-      const content = safeQuery('.message-content', message);
+      const content = safeQuery('.pg-message-body', message);
       if (content && !partialText) content.textContent = failure.impact;
       if (partialText) {
         const incomplete = document.createElement('span');
@@ -1279,6 +1878,221 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       message.append(details, actions);
     };
 
+    const playgroundHeaders = (form, controls) => {
+      const headers = { 'content-type': 'application/json' };
+      const token = safeQuery('[data-playground-token]', form);
+      if (token?.value.trim()) headers.authorization = `Bearer ${token.value.trim()}`;
+      if (controls.maxPriceAu) headers['x-mayhem-max-price-au'] = controls.maxPriceAu;
+      if (controls.minAttTier) headers['x-mayhem-min-att-tier'] = controls.minAttTier;
+      return headers;
+    };
+
+    const playgroundFailureMessage = async (response) => {
+      let message = `Request failed (${response.status})`;
+      try {
+        const payload = await response.json();
+        message = payload?.error?.message || payload?.message || message;
+      } catch (_) {}
+      return message;
+    };
+
+    const setPlaygroundNetwork = (state, details = {}) => {
+      const network = safeQuery('[data-playground-network]');
+      if (!network) return;
+      network.classList.toggle('is-busy', ['submitting', 'matching', 'generating'].includes(state));
+      network.classList.toggle('is-complete', state === 'complete');
+      const labels = {
+        ready: 'Ready', submitting: 'Preparing request', matching: 'Opening provider route',
+        generating: 'Generating', complete: 'Complete', stopped: 'Stopped', failed: 'Needs attention'
+      };
+      const stateNode = safeQuery('[data-playground-network-state]', network);
+      if (stateNode) stateNode.textContent = labels[state] || 'Ready';
+      const stepState = {
+        ready: ['idle', 'idle', 'idle', 'idle'],
+        submitting: ['active', 'idle', 'idle', 'idle'],
+        matching: ['done', 'active', 'idle', 'idle'],
+        generating: ['done', 'done', 'active', 'idle'],
+        complete: ['done', 'done', 'done', details.receipt ? 'done' : 'idle'],
+        stopped: ['done', 'halted', 'halted', 'idle'],
+        failed: ['done', 'halted', 'halted', 'idle']
+      }[state] || ['idle', 'idle', 'idle', 'idle'];
+      const stepDetails = state === 'complete'
+        ? ['Accepted', 'Provider session completed', 'Response delivered', details.receipt ? 'Receipt issued' : 'Not returned']
+        : state === 'generating'
+          ? ['Accepted', 'Provider session opened', details.mode === 'image' ? 'Generating image' : details.mode === 'speech' ? 'Synthesizing audio' : 'Streaming response', 'Pending generation']
+          : state === 'matching'
+            ? ['Accepted', 'Opening an eligible route', 'Not started', 'Pending generation']
+            : state === 'submitting'
+              ? ['Validating request', 'Not started', 'Not started', 'Pending generation']
+              : state === 'failed'
+                ? ['Accepted', 'Route ended', 'Ended early', 'Not issued']
+                : state === 'stopped'
+                  ? ['Accepted', 'Route cancelled', 'Stopped', 'Not issued']
+                  : ['Waiting for input', 'Not started', 'Not started', 'Pending generation'];
+      Array.from(network.querySelectorAll('[data-playground-step]')).forEach((step, index) => {
+        step.className = `is-${stepState[index]}`;
+        const detail = safeQuery('.pg-step-detail', step);
+        if (detail) detail.textContent = stepDetails[index];
+      });
+      const assignFact = (name, value) => {
+        const node = safeQuery(`[data-playground-fact="${name}"]`, network);
+        if (node && value) node.textContent = value;
+      };
+      assignFact('model', details.model);
+      assignFact('provider', details.provider || (details.receipt ? 'Confirmed by receipt' : null));
+      assignFact('timing', details.timing);
+      assignFact('cost', details.cost);
+      assignFact('request', details.requestId);
+    };
+
+    const playgroundBusy = (busy) => {
+      const trigger = safeQuery('[data-playground-model-trigger]');
+      const imageButton = safeQuery('[data-playground-generate-image]');
+      const speechButton = safeQuery('[data-playground-generate-speech]');
+      document.querySelectorAll('[data-playground-mode-tab]').forEach((tab) => { tab.disabled = busy || tab.dataset.empty === 'true'; });
+      if (trigger) trigger.disabled = busy;
+      if (imageButton) imageButton.disabled = busy || !safeQuery('[data-playground-image-prompt]')?.value.trim();
+      if (speechButton) speechButton.disabled = busy || !safeQuery('[data-playground-speech-text]')?.value.trim();
+    };
+
+    const pendingImageMarkup = (ratio) => {
+      const cells = Array.from({ length: 15 }, () => '<span></span>').join('');
+      return `<div class="pg-image-result" role="status"><div class="pg-image-frame is-pending ratio-${ratio.replace(':', '-')}"><span class="pg-latent-grid" aria-hidden="true">${cells}</span><div class="pg-generation-center"><span class="pg-generation-orb" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"></rect><circle cx="9" cy="10" r="2"></circle><path d="m5 18 5-5 3 3 2-2 4 4"></path></svg></span><span class="pg-generation-kicker">Live provider request</span><strong>Generating image</strong><span class="pg-generation-detail">Waiting for confirmed output</span><button type="button" class="pg-stop" data-playground-stop><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>Stop</button></div></div></div>`;
+    };
+
+    const runPlaygroundImage = async (form) => {
+      const model = safeQuery('[data-playground-model]', form);
+      const prompt = safeQuery('[data-playground-image-prompt]', form);
+      const output = safeQuery('[data-playground-image-output]', form);
+      const metadata = safeQuery('[data-playground-meta]');
+      if (!model || !prompt || !output || model.selectedOptions[0]?.dataset.playgroundMode !== 'image') return;
+      const promptValue = prompt.value.trim();
+      if (!promptValue) { prompt.focus(); announce('Describe the image you want to generate.', true); return; }
+      if (playgroundController) { announce('A request is already in progress.', true); return; }
+      const controls = playgroundRequestControls(form);
+      if (!controls) return;
+      const ratio = safeQuery('[data-playground-aspect-ratio][aria-pressed="true"]')?.dataset.playgroundAspectRatio || '1:1';
+      const size = { '1:1': '512x512', '4:3': '640x480', '3:4': '480x640', '16:9': '768x432' }[ratio] || '512x512';
+      const controller = new AbortController();
+      playgroundController = controller;
+      playgroundBusy(true);
+      output.innerHTML = pendingImageMarkup(ratio);
+      if (metadata) metadata.textContent = 'Image request in progress';
+      const startedAt = Date.now();
+      setPlaygroundNetwork('submitting', { mode: 'image', model: model.value });
+      recordProductEvent('playground_request_started', { mode: 'image', model: model.value });
+      try {
+        setPlaygroundNetwork('matching', { mode: 'image', model: model.value });
+        const response = await fetch('/v1/images/generations', {
+          method: 'POST', credentials: 'same-origin', headers: playgroundHeaders(form, controls),
+          body: JSON.stringify({ model: model.value, prompt: promptValue, n: 1, size, response_format: 'b64_json' }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(await playgroundFailureMessage(response));
+        setPlaygroundNetwork('generating', { mode: 'image', model: model.value });
+        const payload = await response.json();
+        const image = payload?.data?.[0];
+        if (!image?.b64_json) throw new Error('The provider returned no image data.');
+        const contentType = image?.mayhem?.content_type || 'image/png';
+        const source = `data:${contentType};base64,${image.b64_json}`;
+        const receipt = payload?.mayhem?.receipt;
+        const elapsed = Math.max(.1, (Date.now() - startedAt) / 1000);
+        const artifact = image?.mayhem?.artifact_id || payload?.id || 'generated-image';
+        const extension = contentType.split('/')[1] || 'png';
+        output.replaceChildren();
+        const result = document.createElement('div');
+        result.className = 'pg-image-result';
+        result.innerHTML = `<div class="pg-image-frame ratio-${ratio.replace(':', '-')}"><img class="pg-generated-image" alt="" width="${size.split('x')[0]}" height="${size.split('x')[1]}"></div><p class="pg-image-meta"></p><div class="pg-output-actions"><a class="pg-text-action" download></a><button class="pg-text-action" type="button" data-copy data-copy-value="">Copy prompt</button><button class="pg-text-action" type="button" data-playground-generate-image>Retry</button><button class="pg-text-action" type="button" data-playground-clear-image>Clear</button></div>`;
+        const generated = safeQuery('img', result);
+        generated.src = source;
+        generated.alt = `Generated image: ${promptValue.slice(0, 180)}`;
+        const meta = safeQuery('.pg-image-meta', result);
+        if (meta) meta.textContent = `${size.replace('x', '×')} · ${artifact} · ${elapsed.toFixed(1)}s`;
+        const download = safeQuery('a[download]', result);
+        download.href = source; download.download = `openmayhem-${artifact}.${extension}`; download.textContent = 'Download image';
+        const copy = safeQuery('[data-copy]', result); copy.dataset.copyValue = promptValue;
+        output.append(result);
+        if (metadata) metadata.textContent = `Image generated with ${payload?.model || model.value}`;
+        const cost = receipt?.au_owed_cum != null ? formatAuUsd(receipt.au_owed_cum) : '';
+        setPlaygroundNetwork('complete', { mode: 'image', model: payload?.model || model.value, requestId: receipt?.session_id || payload?.id, timing: `${elapsed.toFixed(1)}s browser-observed`, cost: cost || 'See Activity', receipt: Boolean(receipt) });
+        recordProductEvent('playground_request_completed', { mode: 'image', model: payload?.model || model.value, durationMs: Date.now() - startedAt, receipt: Boolean(receipt) });
+        announcePlaygroundAnswer('Image generation complete.');
+      } catch (error) {
+        const aborted = error instanceof DOMException && error.name === 'AbortError';
+        const message = aborted ? 'Image generation stopped. Your prompt was kept.' : (error instanceof Error ? error.message : 'Image generation failed.');
+        output.innerHTML = `<div class="pg-output-empty"><strong>${aborted ? 'Generation stopped' : 'Image request failed'}</strong><span></span><button type="button" class="pg-text-action" data-playground-generate-image>Try again</button></div>`;
+        safeQuery('.pg-output-empty span', output).textContent = message;
+        setPlaygroundNetwork(aborted ? 'stopped' : 'failed', { mode: 'image', model: model.value, timing: `${Math.max(.1, (Date.now() - startedAt) / 1000).toFixed(1)}s` });
+        announce(message, !aborted);
+      } finally {
+        if (playgroundController === controller) { playgroundController = null; playgroundBusy(false); syncPlaygroundInputs(); }
+      }
+    };
+
+    let playgroundAudioUrl = null;
+    const runPlaygroundSpeech = async (form) => {
+      const model = safeQuery('[data-playground-model]', form);
+      const input = safeQuery('[data-playground-speech-text]', form);
+      const output = safeQuery('[data-playground-speech-output]', form);
+      const metadata = safeQuery('[data-playground-meta]');
+      if (!model || !input || !output || model.selectedOptions[0]?.dataset.playgroundMode !== 'speech') return;
+      const inputValue = input.value.trim();
+      if (!inputValue) { input.focus(); announce('Enter the text you want spoken.', true); return; }
+      if (playgroundController) { announce('A request is already in progress.', true); return; }
+      const controls = playgroundRequestControls(form);
+      if (!controls) return;
+      const voice = safeQuery('[data-playground-voice]:checked')?.value || 'af_heart';
+      const controller = new AbortController();
+      playgroundController = controller;
+      playgroundBusy(true);
+      const bars = [32,58,44,76,54,88,62,96,72,84,50,68,42,60,34].map((height,index) => `<span style="--wave-height:${height}%;--wave-delay:${index * -72}ms"></span>`).join('');
+      output.innerHTML = `<div class="pg-audio-result" role="status"><span class="pg-play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M11 5 6.6 8.5H3.8a.8.8 0 0 0-.8.8v5.4a.8.8 0 0 0 .8.8h2.8L11 19Z"></path><path d="M14.8 9.2a4.1 4.1 0 0 1 0 5.6"></path></svg></span><div><strong>Synthesizing speech</strong><span>Live provider request</span></div><div class="pg-waveform">${bars}</div><div class="pg-output-actions"><button type="button" class="pg-stop" data-playground-stop>Stop</button></div></div>`;
+      if (metadata) metadata.textContent = 'Speech request in progress';
+      const startedAt = Date.now();
+      setPlaygroundNetwork('submitting', { mode: 'speech', model: model.value });
+      recordProductEvent('playground_request_started', { mode: 'speech', model: model.value });
+      try {
+        setPlaygroundNetwork('matching', { mode: 'speech', model: model.value });
+        const response = await fetch('/v1/audio/speech', {
+          method: 'POST', credentials: 'same-origin', headers: playgroundHeaders(form, controls),
+          body: JSON.stringify({ model: model.value, input: inputValue, voice, response_format: 'wav' }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(await playgroundFailureMessage(response));
+        setPlaygroundNetwork('generating', { mode: 'speech', model: model.value });
+        const audio = await response.blob();
+        if (!audio.size) throw new Error('The provider returned no audio data.');
+        if (playgroundAudioUrl) URL.revokeObjectURL(playgroundAudioUrl);
+        playgroundAudioUrl = URL.createObjectURL(audio);
+        let receipt = null;
+        try { receipt = JSON.parse(response.headers.get('x-mayhem-receipt') || 'null'); } catch (_) {}
+        const elapsed = Math.max(.1, (Date.now() - startedAt) / 1000);
+        output.replaceChildren();
+        const result = document.createElement('div');
+        result.className = 'pg-audio-result';
+        result.innerHTML = `<span class="pg-play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m9 7 8 5-8 5Z"></path></svg></span><div><strong>Speech ready</strong><span></span></div><audio controls preload="metadata"></audio><div class="pg-output-actions"><a class="pg-text-action" download="openmayhem-speech.wav">Download audio</a><button class="pg-text-action" type="button" data-playground-generate-speech>Retry</button><button class="pg-text-action" type="button" data-playground-clear-speech>Clear</button></div>`;
+        safeQuery('.pg-audio-result>div span', result).textContent = `${voice} · ${elapsed.toFixed(1)}s`;
+        safeQuery('audio', result).src = playgroundAudioUrl;
+        safeQuery('a[download]', result).href = playgroundAudioUrl;
+        output.append(result);
+        const cost = receipt?.au_owed_cum != null ? formatAuUsd(receipt.au_owed_cum) : '';
+        const backend = response.headers.get('x-mayhem-backend') || 'Provider session completed';
+        setPlaygroundNetwork('complete', { mode: 'speech', model: model.value, provider: backend, requestId: receipt?.session_id || 'Completed', timing: `${elapsed.toFixed(1)}s browser-observed`, cost: cost || 'See Activity', receipt: Boolean(receipt) });
+        if (metadata) metadata.textContent = `Speech generated with ${model.value}`;
+        recordProductEvent('playground_request_completed', { mode: 'speech', model: model.value, durationMs: Date.now() - startedAt, receipt: Boolean(receipt) });
+        announcePlaygroundAnswer('Speech generation complete.');
+      } catch (error) {
+        const aborted = error instanceof DOMException && error.name === 'AbortError';
+        const message = aborted ? 'Speech generation stopped. Your text was kept.' : (error instanceof Error ? error.message : 'Speech generation failed.');
+        output.innerHTML = `<div class="pg-output-empty"><strong>${aborted ? 'Generation stopped' : 'Speech request failed'}</strong><span></span><button type="button" class="pg-text-action" data-playground-generate-speech>Try again</button></div>`;
+        safeQuery('.pg-output-empty span', output).textContent = message;
+        setPlaygroundNetwork(aborted ? 'stopped' : 'failed', { mode: 'speech', model: model.value, timing: `${Math.max(.1, (Date.now() - startedAt) / 1000).toFixed(1)}s` });
+        announce(message, !aborted);
+      } finally {
+        if (playgroundController === controller) { playgroundController = null; playgroundBusy(false); syncPlaygroundInputs(); }
+      }
+    };
+
     const runPlayground = async (form) => {
       const model = safeQuery('[data-playground-model]', form);
       const prompt = safeQuery('[data-playground-prompt]', form);
@@ -1287,6 +2101,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const thread = safeQuery('[data-playground-thread]');
       const send = safeQuery('[data-playground-send]', form);
       const stop = safeQuery('[data-playground-stop]', form);
+      const modelTrigger = safeQuery('[data-playground-model-trigger]', form);
       const metadata = safeQuery('[data-playground-meta]');
       if (!model || !prompt || !thread || !send || !stop) return;
       const promptValue = prompt.value.trim();
@@ -1311,16 +2126,25 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const empty = safeQuery('[data-playground-empty]', thread);
       if (empty) empty.remove();
       const makeMessage = (role, labelText, text) => {
-        const message = document.createElement('div');
-        message.className = `message ${role}`;
+        const message = document.createElement('article');
+        message.className = `pg-message is-${role}`;
         message.setAttribute('role', 'article');
         message.setAttribute('aria-label', labelText);
         const label = document.createElement('span');
-        label.className = 'message-label';
+        label.className = 'pg-message-author';
         label.setAttribute('aria-hidden', 'true');
         label.textContent = labelText;
-        const content = document.createElement('span');
-        content.className = 'message-content';
+        if (role === 'assistant') {
+          const icon = safeQuery('[data-playground-model-trigger-icon] .model-lab-mark');
+          if (icon) {
+            const tile = document.createElement('span');
+            tile.className = 'pg-logo-tile pg-message-logo';
+            tile.append(icon.cloneNode(true));
+            label.prepend(tile);
+          }
+        }
+        const content = document.createElement('div');
+        content.className = 'pg-message-body';
         content.textContent = text;
         message.append(label, content);
         return { message, content };
@@ -1335,21 +2159,34 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       assistantMessage.dataset.conversationOffset = String(conversationOffset);
       addPromptAction(userMessage, promptValue, conversationOffset);
       assistantMessage.setAttribute('aria-busy', 'true');
-      thread.append(userMessage, assistantMessage);
+      let messagesRoot = safeQuery('.pg-messages', thread);
+      if (!messagesRoot) {
+        messagesRoot = document.createElement('div');
+        messagesRoot.className = 'pg-messages';
+        const threadActions = document.createElement('div');
+        threadActions.className = 'pg-thread-actions';
+        const modelName = model.selectedOptions[0]?.dataset.modelName || model.value;
+        threadActions.innerHTML = '<span class="pg-thread-model"></span><button type="button" data-playground-clear>Clear conversation</button>';
+        safeQuery('.pg-thread-model', threadActions).textContent = modelName;
+        messagesRoot.append(threadActions);
+        thread.replaceChildren(messagesRoot);
+      }
+      messagesRoot.append(userMessage, assistantMessage);
+      syncPlaygroundConversationUi();
       thread.scrollTop = thread.scrollHeight;
       send.disabled = true;
       send.setAttribute('aria-busy', 'true');
+      if (modelTrigger) modelTrigger.disabled = true;
       stop.hidden = false;
       if (metadata) metadata.textContent = 'Request in progress';
+      playgroundBusy(true);
+      setPlaygroundNetwork('submitting', { mode: 'chat', model: model.value });
 
       const messages = [];
       if (system && system.value.trim()) messages.push({ role: 'system', content: system.value.trim() });
       messages.push(...playgroundConversation.slice(-16));
       messages.push({ role: 'user', content: promptValue });
-      const headers = { 'content-type': 'application/json' };
-      if (token && token.value.trim()) headers.authorization = `Bearer ${token.value.trim()}`;
-      if (requestControls.maxPriceAu) headers['x-mayhem-max-price-au'] = requestControls.maxPriceAu;
-      if (requestControls.minAttTier) headers['x-mayhem-min-att-tier'] = requestControls.minAttTier;
+      const headers = playgroundHeaders(form, requestControls);
       const requestedMaxTokens = requestControls.outputTokens;
       let assembled = '';
       let reportedModel = '';
@@ -1358,6 +2195,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       let reportedFinishReason = '';
       let failureStatus = 0;
       const startedAt = Date.now();
+      recordProductEvent('playground_request_started', { model: model.value });
       try {
         const response = await fetch('/v1/chat/completions', {
           method: 'POST',
@@ -1376,6 +2214,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           throw new Error(message);
         }
         if (!response.body) throw new Error('Streaming response body is unavailable');
+        setPlaygroundNetwork('generating', { mode: 'chat', model: model.value });
         assistantContent.textContent = '';
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -1437,7 +2276,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const assistantText = assembled || emptyResponse;
         assistantContent.textContent = assistantText;
         assistantMessage.removeAttribute('aria-busy');
-        if (stoppedNormally) assistantMessage.classList.add('completed');
+        if (stoppedNormally) assistantMessage.classList.add('is-complete');
         const result = document.createElement('span');
         result.className = 'message-result';
         result.dataset.finishReason = reportedFinishReason || 'unreported';
@@ -1460,9 +2299,9 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         }
         assistantMessage.append(result);
         const resultActions = document.createElement('div');
-        resultActions.className = 'message-actions';
+        resultActions.className = 'pg-message-actions';
         const copy = document.createElement('button');
-        copy.className = 'quiet-button';
+        copy.className = 'pg-text-action';
         copy.type = 'button';
         copy.dataset.copy = '';
         copy.dataset.copyValue = assistantText;
@@ -1475,7 +2314,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         if (outputLimitReached) {
           const continuation = document.createElement('button');
           const nextOutputLimit = Math.min(4096, Math.max(64, requestedMaxTokens * 2));
-          continuation.className = 'soft-button';
+          continuation.className = 'pg-text-action';
           continuation.type = 'button';
           continuation.dataset.playgroundContinue = '';
           continuation.dataset.nextMaxTokens = String(nextOutputLimit);
@@ -1486,7 +2325,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         }
         if (reportedSessionId) {
           const receipt = document.createElement('a');
-          receipt.className = 'quiet-button';
+          receipt.className = 'pg-text-action';
           receipt.href = `/mayhem/dashboard/evidence?kind=receipt&id=${encodeURIComponent(reportedSessionId)}`;
           receipt.dataset.evidenceUrl = '';
           receipt.textContent = 'View receipt';
@@ -1498,13 +2337,25 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           { role: 'user', content: promptValue },
           { role: 'assistant', content: assistantText }
         );
+        if (playgroundConversation.length > 20) playgroundConversation.splice(0, playgroundConversation.length - 20);
+        savePlaygroundConversation();
         prompt.value = '';
         savePlaygroundDraft();
         const promptHelp = safeQuery('#playground-prompt-help');
         if (promptHelp) promptHelp.textContent = 'Ask a question or describe a task.';
         if (metadata) metadata.textContent = `${finishLabel} with ${reportedModel || model.value}. Actual metering appears in Activity when the route supplies a receipt.`;
         announcePlaygroundAnswer(outputLimitReached ? 'Mayhem output limit reached.' : toolRequested ? 'Mayhem requested a tool.' : stoppedNormally ? 'Mayhem response complete.' : `Mayhem response ended: ${reportedFinishReason || 'finish reason unreported'}.`);
-        if (stoppedNormally) window.setTimeout(() => assistantMessage.classList.remove('completed'), 520);
+        if (stoppedNormally) window.setTimeout(() => assistantMessage.classList.remove('is-complete'), 520);
+        recordProductEvent('playground_request_completed', {
+          model: reportedModel || model.value,
+          finishReason: reportedFinishReason,
+          durationMs: Date.now() - startedAt,
+          receipt: Boolean(reportedSessionId)
+        });
+        setPlaygroundNetwork('complete', {
+          mode: 'chat', model: reportedModel || model.value, requestId: reportedSessionId || 'Completed',
+          timing: `${elapsed.toFixed(1)}s browser-observed`, cost: reportedCharge || 'See Activity', receipt: Boolean(reportedSessionId)
+        });
       } catch (error) {
         const aborted = error instanceof DOMException && error.name === 'AbortError';
         const technicalMessage = error instanceof Error ? error.message : 'Request failed';
@@ -1515,7 +2366,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
             ? assembled
             : technicalMessage;
         assistantMessage.removeAttribute('aria-busy');
-        assistantMessage.classList.toggle('failed', !aborted);
+        assistantMessage.classList.toggle('is-failed', !aborted);
         if (metadata) metadata.textContent = aborted ? 'Stopped by you' : 'Request needs attention';
         if (aborted) {
           addPromptAction(assistantMessage, promptValue, conversationOffset, 'Use message again');
@@ -1526,12 +2377,24 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
             ? 'Incomplete response preserved. The request can be retried.'
             : 'Request failed. Your message and settings are preserved.', true);
         }
+        recordProductEvent(aborted ? 'playground_request_stopped' : 'playground_request_failed', {
+          model: model.value,
+          status: failureStatus || null,
+          partialOutput: hasPartialOutput,
+          durationMs: Date.now() - startedAt
+        });
+        setPlaygroundNetwork(aborted ? 'stopped' : 'failed', {
+          mode: 'chat', model: model.value, timing: `${Math.max(.1, (Date.now() - startedAt) / 1000).toFixed(1)}s`
+        });
       } finally {
         if (playgroundController === controller) {
           send.disabled = false;
           send.removeAttribute('aria-busy');
+          if (modelTrigger) modelTrigger.disabled = false;
           stop.hidden = true;
           playgroundController = null;
+          playgroundBusy(false);
+          syncPlaygroundInputs();
         }
       }
     };
@@ -1559,8 +2422,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     };
 
     const updatePlaygroundControlSummary = () => {
-      const target = safeQuery('[data-playground-preflight]');
-      const summary = safeQuery('[data-playground-request-summary]', target || document);
+      const summary = safeQuery('[data-playground-request-summary]');
       if (!summary) return;
       const outputTokens = safeQuery('[data-playground-max-tokens]')?.value.trim() || '512';
       const maxPrice = safeQuery('[data-playground-max-price]')?.value.trim() || '';
@@ -1594,6 +2456,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         node.textContent = value;
         if (node.matches('.money-value')) node.dataset.moneyOriginal = value;
       });
+      syncPlaygroundModelPicker();
       updatePlaygroundPriceMode();
       updatePlaygroundControlSummary();
       applyAmountPreference();
@@ -1664,6 +2527,15 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         state.hidden = true;
         factsSection.hidden = false;
         rawSection.hidden = false;
+        // Very large snapshots stay one click away so the drawer opens light;
+        // Copy and Download always act on the complete payload.
+        const rawToggle = safeQuery('[data-evidence-raw-toggle]', dialog);
+        const rawIsLarge = rawText.length > 60000;
+        if (rawToggle) {
+          rawToggle.hidden = !rawIsLarge;
+          rawToggle.textContent = `Show raw JSON (${Math.max(1, Math.round(rawText.length / 1024))} KB)`;
+        }
+        raw.hidden = rawIsLarge;
         applyAmountPreference();
         if (copyButton) copyButton.disabled = false;
         if (downloadButton) downloadButton.disabled = false;
@@ -1681,6 +2553,86 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     };
 
     document.addEventListener('click', async (event) => {
+      const productEvent = event.target.closest('[data-product-event]');
+      if (productEvent) {
+        recordProductEvent(productEvent.dataset.productEvent, {
+          destination: productEvent.getAttribute('href') || null
+        });
+      }
+      const modelPickerTrigger = event.target.closest('[data-playground-model-trigger]');
+      if (modelPickerTrigger) {
+        if (modelPickerTrigger.getAttribute('aria-expanded') === 'true') closePlaygroundModelPicker(false);
+        else openPlaygroundModelPicker();
+        return;
+      }
+      const modelPickerOption = event.target.closest('[data-playground-model-option]');
+      if (modelPickerOption) {
+        choosePlaygroundModel(modelPickerOption.dataset.playgroundModelOption || '');
+        return;
+      }
+      if (event.target.closest('[data-playground-model-close]')) {
+        closePlaygroundModelPicker(true);
+        return;
+      }
+      if (!event.target.closest('[data-playground-model-picker]')) closePlaygroundModelPicker(false);
+      const modeTab = event.target.closest('[data-playground-mode-tab]');
+      if (modeTab) {
+        setPlaygroundMode(modeTab.dataset.playgroundModeTab || 'chat');
+        return;
+      }
+      const starter = event.target.closest('[data-playground-starter]');
+      if (starter) {
+        const form = starter.closest('[data-playground-form]');
+        const prompt = safeQuery('[data-playground-prompt]', form || document);
+        if (form && prompt) {
+          prompt.value = starter.dataset.playgroundStarterPrompt || '';
+          syncPlaygroundInputs();
+          if (typeof form.requestSubmit === 'function') form.requestSubmit();
+          else runPlayground(form);
+        }
+        return;
+      }
+      const ratioButton = event.target.closest('[data-playground-aspect-ratio]');
+      if (ratioButton) {
+        document.querySelectorAll('[data-playground-aspect-ratio]').forEach((button) => {
+          const selected = button === ratioButton;
+          button.classList.toggle('is-active', selected);
+          button.setAttribute('aria-pressed', String(selected));
+        });
+        savePlaygroundDraft();
+        return;
+      }
+      if (event.target.closest('[data-playground-generate-image]')) {
+        const form = safeQuery('[data-playground-form]');
+        if (form) await runPlaygroundImage(form);
+        return;
+      }
+      if (event.target.closest('[data-playground-generate-speech]')) {
+        const form = safeQuery('[data-playground-form]');
+        if (form) await runPlaygroundSpeech(form);
+        return;
+      }
+      if (event.target.closest('[data-playground-clear-image]')) {
+        const output = safeQuery('[data-playground-image-output]');
+        if (output) output.innerHTML = '<div class="pg-output-empty"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"></rect><circle cx="9" cy="10" r="2"></circle><path d="m5 18 5-5 3 3 2-2 4 4"></path></svg><strong>Image output</strong><span>Your generated image will appear here.</span></div>';
+        setPlaygroundNetwork('ready');
+        return;
+      }
+      if (event.target.closest('[data-playground-clear-speech]')) {
+        const output = safeQuery('[data-playground-speech-output]');
+        if (playgroundAudioUrl) { URL.revokeObjectURL(playgroundAudioUrl); playgroundAudioUrl = null; }
+        if (output) output.innerHTML = '<div class="pg-output-empty"><svg viewBox="0 0 24 24"><path d="M11 5 6.6 8.5H3.8a.8.8 0 0 0-.8.8v5.4a.8.8 0 0 0 .8.8h2.8L11 19Z"></path><path d="M14.8 9.2a4.1 4.1 0 0 1 0 5.6"></path></svg><strong>Audio output</strong><span>Generated speech will appear here.</span></div>';
+        setPlaygroundNetwork('ready');
+        return;
+      }
+      const networkToggle = event.target.closest('[data-playground-network-toggle]');
+      if (networkToggle) {
+        const body = safeQuery('[data-playground-network-body]');
+        const open = networkToggle.getAttribute('aria-expanded') !== 'true';
+        networkToggle.setAttribute('aria-expanded', String(open));
+        if (body) body.hidden = !open;
+        return;
+      }
       const menuButton = event.target.closest('[data-nav-toggle]');
       if (menuButton) {
         setDrawer(!body.classList.contains('nav-open'), menuButton);
@@ -1745,6 +2697,17 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (exportButton) {
         const table = safeQuery(exportButton.dataset.exportTable);
         if (table) exportShownTable(table);
+        return;
+      }
+
+      const rawToggle = event.target.closest('[data-evidence-raw-toggle]');
+      if (rawToggle) {
+        const dialogHost = rawToggle.closest('dialog, .evidence-standalone');
+        const rawNode = dialogHost ? safeQuery('[data-evidence-raw]', dialogHost) : null;
+        if (rawNode) {
+          rawNode.hidden = false;
+          rawToggle.hidden = true;
+        }
         return;
       }
 
@@ -1830,6 +2793,33 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         return;
       }
 
+      if (event.target.closest('[data-clear-playground-history]')) {
+        storage.remove(playgroundConversationKey);
+        playgroundConversation.length = 0;
+        announce('Playground conversation history cleared from this browser');
+        return;
+      }
+
+      if (event.target.closest('[data-clear-local-events]')) {
+        storage.remove(localProductEventsKey);
+        updateLocalProductEventCount();
+        announce('Local launch diagnostics cleared');
+        return;
+      }
+
+      if (event.target.closest('[data-export-local-events]')) {
+        const events = readLocalProductEvents();
+        const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), events }, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'mayhem-local-launch-diagnostics.json';
+        link.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        announce(`Exported ${events.length} local diagnostic event${events.length === 1 ? '' : 's'}`);
+        return;
+      }
+
       const connectionButton = event.target.closest('[data-connection-test]');
       if (connectionButton) {
         await testConnection(connectionButton);
@@ -1848,6 +2838,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         }
         const model = safeQuery('[data-playground-model]');
         const prompt = safeQuery('[data-playground-prompt]');
+        const imagePrompt = safeQuery('[data-playground-image-prompt]');
+        const speechText = safeQuery('[data-playground-speech-text]');
         const system = safeQuery('[data-playground-system]');
         const output = safeQuery('[data-playground-max-tokens]');
         const price = safeQuery('[data-playground-max-price]');
@@ -1857,16 +2849,29 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           if (Array.from(model.options).some((option) => option.value === defaultValue)) model.value = defaultValue;
         }
         if (prompt) prompt.value = '';
+        if (imagePrompt) imagePrompt.value = '';
+        if (speechText) speechText.value = '';
         if (system) system.value = '';
         if (output) output.value = '512';
         if (price) price.value = '';
         if (tier) tier.value = '';
+        document.querySelectorAll('[data-playground-aspect-ratio]').forEach((button) => {
+          const selected = button.dataset.playgroundAspectRatio === '1:1';
+          button.classList.toggle('is-active', selected);
+          button.setAttribute('aria-pressed', String(selected));
+        });
+        const defaultVoice = safeQuery('[data-playground-voice][value="af_heart"]');
+        if (defaultVoice) defaultVoice.checked = true;
         taskStorage.remove(playgroundDraftKey);
         const promptHelp = safeQuery('#playground-prompt-help');
         if (promptHelp) promptHelp.textContent = 'Ask a question or describe a task.';
         const metadata = safeQuery('[data-playground-meta]');
         if (metadata) metadata.textContent = 'Saved draft and controls reset';
         updatePreflight();
+        const defaultMode = model?.selectedOptions?.[0]?.dataset.playgroundMode || 'chat';
+        if (playgroundOptionsForMode(defaultMode).length) setPlaygroundMode(defaultMode);
+        syncPlaygroundInputs();
+        taskStorage.remove(playgroundDraftKey);
         announce('Saved Playground draft and controls reset. Access token unchanged.', false, false);
         return;
       }
@@ -1909,18 +2914,20 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const offset = Number.parseInt(reusedPrompt.dataset.conversationOffset || '', 10);
         if (Number.isInteger(offset) && offset >= 0) {
           playgroundConversation.splice(offset);
-          document.querySelectorAll('.message[data-conversation-offset]').forEach((message) => {
+          savePlaygroundConversation();
+          document.querySelectorAll('.pg-message[data-conversation-offset]').forEach((message) => {
             const messageOffset = Number.parseInt(message.dataset.conversationOffset || '', 10);
             if (Number.isInteger(messageOffset) && messageOffset >= offset) message.remove();
           });
           const thread = safeQuery('[data-playground-thread]');
-          if (thread && !safeQuery('.message', thread)) {
+          if (thread && !safeQuery('.pg-message', thread)) {
             const empty = document.createElement('div');
-            empty.className = 'playground-empty';
+            empty.className = 'pg-chat-empty';
             empty.dataset.playgroundEmpty = '';
-            empty.innerHTML = '<div><strong>Message ready to revise</strong><p>Edit it below, then send when ready.</p></div>';
+            empty.innerHTML = '<h2>Message ready to revise</h2><p>Edit it below, then send when ready.</p>';
             thread.append(empty);
           }
+          syncPlaygroundConversationUi();
         }
         if (prompt) {
           prompt.value = value;
@@ -1959,14 +2966,16 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           return;
         }
         playgroundConversation.length = 0;
+        storage.remove(playgroundConversationKey);
         const thread = safeQuery('[data-playground-thread]');
         if (thread) {
           const empty = document.createElement('div');
-          empty.className = 'playground-empty';
+          empty.className = 'pg-chat-empty';
           empty.dataset.playgroundEmpty = '';
-          empty.innerHTML = '<div><strong>Start with a real task</strong><p>Conversation context was cleared.</p></div>';
+          empty.innerHTML = '<h2>How can I help?</h2><p>Conversation context was cleared. Write a message below.</p>';
           thread.replaceChildren(empty);
         }
+        syncPlaygroundConversationUi();
         const answerStatus = safeQuery('[data-playground-answer-status]');
         if (answerStatus) answerStatus.textContent = '';
         const metadata = safeQuery('[data-playground-meta]');
@@ -2041,7 +3050,10 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const form = event.target.closest('[data-playground-form]');
       if (!form) return;
       event.preventDefault();
-      runPlayground(form);
+      const mode = currentPlaygroundMode();
+      if (mode === 'image') runPlaygroundImage(form);
+      else if (mode === 'speech') runPlaygroundSpeech(form);
+      else runPlayground(form);
     });
 
     document.addEventListener('close', (event) => {
@@ -2060,6 +3072,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         if (event.target.matches('[data-playground-model]')) return;
         savePlaygroundDraft();
         updatePreflight();
+        syncPlaygroundInputs();
       }
     });
 
@@ -2076,10 +3089,65 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         }
         updatePreflight();
         savePlaygroundDraft();
+        syncPlaygroundInputs();
+      }
+      if (event.target.matches('[data-playground-voice]')) {
+        document.querySelectorAll('.pg-voice-option').forEach((option) => {
+          option.classList.toggle('is-selected', Boolean(safeQuery('[data-playground-voice]', option)?.checked));
+        });
+        savePlaygroundDraft();
       }
     });
 
     document.addEventListener('keydown', (event) => {
+      const modelPickerOption = event.target.closest?.('[data-playground-model-option]');
+      if (modelPickerOption) {
+        const options = Array.from(document.querySelectorAll('[data-playground-model-option]')).filter((option) => !option.hidden);
+        const index = options.indexOf(modelPickerOption);
+        let next = null;
+        if (event.key === 'ArrowDown') next = Math.min(options.length - 1, index + 1);
+        else if (event.key === 'ArrowUp') next = Math.max(0, index - 1);
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = options.length - 1;
+        else if (event.key === 'Escape') {
+          event.preventDefault();
+          closePlaygroundModelPicker(true);
+          return;
+        } else if (event.key === 'Tab') {
+          closePlaygroundModelPicker(false);
+        }
+        if (next !== null && options[next]) {
+          event.preventDefault();
+          options[next].focus();
+          return;
+        }
+      }
+      const modelPickerTrigger = event.target.closest?.('[data-playground-model-trigger]');
+      if (modelPickerTrigger && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+        event.preventDefault();
+        openPlaygroundModelPicker();
+        return;
+      }
+      const modeTab = event.target.closest?.('[data-playground-mode-tab]');
+      if (modeTab && ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        const tabs = Array.from(document.querySelectorAll('[data-playground-mode-tab]:not(:disabled)'));
+        const current = tabs.indexOf(modeTab);
+        let next = current;
+        if (['ArrowRight', 'ArrowDown'].includes(event.key)) next = (current + 1) % tabs.length;
+        else if (['ArrowLeft', 'ArrowUp'].includes(event.key)) next = (current - 1 + tabs.length) % tabs.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = tabs.length - 1;
+        if (tabs[next]) {
+          event.preventDefault();
+          setPlaygroundMode(tabs[next].dataset.playgroundModeTab || 'chat', true);
+          return;
+        }
+      }
+      if (event.key === 'Escape' && safeQuery('[data-playground-model-trigger]')?.getAttribute('aria-expanded') === 'true') {
+        event.preventDefault();
+        closePlaygroundModelPicker(true);
+        return;
+      }
       if (event.key === 'Escape' && body.classList.contains('nav-open')) {
         event.preventDefault();
         setDrawer(false);
@@ -2248,10 +3316,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const seconds = Math.max(0, Math.floor(ageMillis / 1000));
       if (seconds < 60) return `${seconds}s ago`;
       const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return `${minutes}m ago`;
+      if (minutes < 60) return `${minutes} min ago`;
       const hours = Math.floor(minutes / 60);
       if (hours < 24) return `${hours}h ago`;
-      return `${Math.floor(hours / 24)}d ago`;
+      const days = Math.floor(hours / 24);
+      if (days < 14) return `${days}d ago`;
+      return `${Math.floor(days / 7)}w ago`;
     };
 
     const refreshVolatileEvidence = () => {
@@ -2267,7 +3337,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const expiredText = node.dataset.expiredText || 'Unavailable';
         node.textContent = expiredText;
         node.dataset.volatileExpired = 'true';
-        node.setAttribute('aria-label', `${expiredText}. Evidence expired; refresh to reconfirm.`);
+        const refreshHint = /refresh/i.test(expiredText) ? '' : '. Refresh to reconfirm.';
+        node.setAttribute('aria-label', `${expiredText}${refreshHint}`);
         const badge = node.closest('.status-badge');
         if (badge) {
           badge.classList.remove('good', 'info', 'danger');
@@ -2326,6 +3397,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     const savedDraft = readPlaygroundDraft();
     if (savedDraft) {
       const playgroundPrompt = safeQuery('[data-playground-prompt]');
+      const playgroundImagePrompt = safeQuery('[data-playground-image-prompt]');
+      const playgroundSpeechText = safeQuery('[data-playground-speech-text]');
       const playgroundSystem = safeQuery('[data-playground-system]');
       const playgroundMaxTokens = safeQuery('[data-playground-max-tokens]');
       const playgroundMaxPrice = safeQuery('[data-playground-max-price]');
@@ -2337,10 +3410,32 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         && Array.from(playgroundModel.options).some((option) => option.value === savedDraft.model)) {
         playgroundModel.value = savedDraft.model;
       }
+      const restoredMode = ['chat', 'image', 'speech'].includes(savedDraft.mode)
+        ? savedDraft.mode
+        : playgroundModel?.selectedOptions?.[0]?.dataset.playgroundMode;
+      if (restoredMode && playgroundOptionsForMode(restoredMode).length) setPlaygroundMode(restoredMode);
       if (playgroundPrompt && typeof savedDraft.prompt === 'string' && savedDraft.prompt && !playgroundPrompt.value) {
         playgroundPrompt.value = savedDraft.prompt;
         const help = safeQuery('#playground-prompt-help');
         if (help) help.textContent = 'Draft and request controls restored from this browser tab.';
+      }
+      if (playgroundImagePrompt && typeof savedDraft.imagePrompt === 'string') playgroundImagePrompt.value = savedDraft.imagePrompt;
+      if (playgroundSpeechText && typeof savedDraft.speechText === 'string') playgroundSpeechText.value = savedDraft.speechText;
+      if (['1:1', '4:3', '3:4', '16:9'].includes(savedDraft.aspectRatio)) {
+        document.querySelectorAll('[data-playground-aspect-ratio]').forEach((button) => {
+          const selected = button.dataset.playgroundAspectRatio === savedDraft.aspectRatio;
+          button.classList.toggle('is-active', selected);
+          button.setAttribute('aria-pressed', String(selected));
+        });
+      }
+      if (typeof savedDraft.voice === 'string') {
+        const voice = Array.from(document.querySelectorAll('[data-playground-voice]')).find((input) => input.value === savedDraft.voice);
+        if (voice) {
+          voice.checked = true;
+          document.querySelectorAll('.pg-voice-option').forEach((option) => {
+            option.classList.toggle('is-selected', Boolean(safeQuery('[data-playground-voice]', option)?.checked));
+          });
+        }
       }
       if (playgroundSystem && typeof savedDraft.system === 'string') playgroundSystem.value = savedDraft.system;
       if (playgroundMaxTokens && /^\d+$/.test(String(savedDraft.maxTokens || ''))) {
@@ -2360,6 +3455,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         playgroundMinAttTier.value = String(savedDraft.minAttTier ?? '');
       }
     }
+    restorePlaygroundConversation();
+    recordProductEvent('dashboard_page_view', { title: document.title });
     document.querySelectorAll('[data-table-filter]').forEach((input) => {
       enhanceTableTools(input);
       updateFilter(input);
@@ -2367,6 +3464,16 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     syncPaginationParameters();
     applyPreferenceButtons();
     updatePreflight();
+    syncPlaygroundInputs();
+    const activeSubnavItem = safeQuery('.subnav a[aria-current="page"]');
+    const activeSubnav = activeSubnavItem ? activeSubnavItem.closest('.subnav') : null;
+    if (activeSubnavItem && activeSubnav) {
+      window.requestAnimationFrame(() => {
+        const centered = activeSubnavItem.offsetLeft
+          - ((activeSubnav.clientWidth - activeSubnavItem.offsetWidth) / 2);
+        activeSubnav.scrollLeft = Math.max(0, centered);
+      });
+    }
   };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready, { once: true });

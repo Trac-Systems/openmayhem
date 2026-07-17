@@ -1,11 +1,11 @@
 use super::dashboard_ui::{dashboard_app_shell, DashboardAppPage, DashboardShell};
 use super::*;
 
-const MAX_ACTIVITY_ROWS: usize = 60;
-const MAX_MODEL_ROWS: usize = 80;
-const MAX_PROVIDER_ROWS: usize = 60;
-const MAX_EVIDENCE_ROWS: usize = 30;
-const MAX_TOKEN_ROWS: usize = 50;
+const MAX_ACTIVITY_ROWS: usize = 25;
+const MAX_MODEL_ROWS: usize = 25;
+const MAX_PROVIDER_ROWS: usize = 25;
+const MAX_EVIDENCE_ROWS: usize = 25;
+const MAX_TOKEN_ROWS: usize = 25;
 const PAYMENT_SNAPSHOT_FRESH_SECONDS: u64 = 30;
 const EARNINGS_SNAPSHOT_FRESH_SECONDS: u64 = 60;
 
@@ -18,6 +18,7 @@ pub(super) enum DashboardProductPage {
     Wallet,
     Connect,
     Earn,
+    EarnJobs,
     EarnMachines,
     EarnOpportunities,
     EarnEarnings,
@@ -41,6 +42,7 @@ impl DashboardProductPage {
             "wallet" => Some(Self::Wallet),
             "connect" => Some(Self::Connect),
             "earn" => Some(Self::Earn),
+            "earn/jobs" => Some(Self::EarnJobs),
             "earn/machines" => Some(Self::EarnMachines),
             "earn/opportunities" => Some(Self::EarnOpportunities),
             "earn/earnings" => Some(Self::EarnEarnings),
@@ -66,6 +68,7 @@ impl DashboardProductPage {
             Self::Wallet => "Wallet",
             Self::Connect => "Connect",
             Self::Earn => "Earn",
+            Self::EarnJobs => "Jobs",
             Self::EarnMachines => "Machines",
             Self::EarnOpportunities => "Model fit",
             Self::EarnEarnings => "Earnings and payouts",
@@ -85,6 +88,7 @@ impl DashboardProductPage {
 #[derive(Clone)]
 struct DashboardData {
     generated_at_millis: u64,
+    history_persistent: bool,
     provider_heartbeat_ttl_millis: u64,
     models: Arc<Vec<GatewayModel>>,
     entries: Vec<ProviderTableEntry>,
@@ -112,6 +116,7 @@ impl DashboardData {
         let all_receipts = state.receipts();
         Self {
             generated_at_millis,
+            history_persistent: state.dashboard_history_path.as_ref().is_some(),
             provider_heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
             models: state.models_snapshot(),
             entries,
@@ -213,6 +218,14 @@ impl DashboardData {
             .get("require_auth")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    fn history_scope(&self) -> &'static str {
+        if self.history_persistent {
+            "Durable gateway history"
+        } else {
+            "Current gateway run"
+        }
     }
 
     fn payment_observed_at(&self) -> Option<u64> {
@@ -566,6 +579,12 @@ pub(super) fn render_dashboard_product_page(
             query.provider.as_deref(),
             query.page.as_deref(),
         ),
+        DashboardProductPage::EarnJobs => earn_jobs_page(
+            &data,
+            expires_in_seconds,
+            query.provider.as_deref(),
+            query.page.as_deref(),
+        ),
         DashboardProductPage::EarnMachines => earn_machines_page(
             &data,
             expires_in_seconds,
@@ -670,8 +689,11 @@ pub(super) fn dashboard_evidence_payload(
                     (
                         "Fresh heartbeat coverage",
                         format!(
-                            "{matched_heartbeats} of {} canonical route(s)",
-                            model.mayhem.route_candidates.len()
+                            "{matched_heartbeats} of {}",
+                            count_noun(
+                                model.mayhem.route_candidates.len() as u64,
+                                "canonical route"
+                            )
                         ),
                         "Matching provider-table entries observed when this evidence payload was generated",
                     ),
@@ -1099,7 +1121,12 @@ fn volatile_page_status_marker(
             "Live capacity evidence expired in this tab. Refresh to reconfirm."
         };
         (Some(window), summary)
-    } else if page == DashboardAppPage::Wallet && status == "Ledger snapshot current" {
+    } else if page == DashboardAppPage::Wallet
+        && matches!(
+            status,
+            "Ledger snapshot current" | "Ready to use" | "Funding needed"
+        )
+    {
         (
             payment_freshness_window(data),
             "Ledger evidence expired in this tab. Refresh to reconfirm.",
@@ -1139,6 +1166,57 @@ fn shell(
     actions: &str,
     content: &str,
 ) -> String {
+    shell_impl(
+        data, expires, page, eyebrow, heading, summary, status, tone, actions, content, false,
+    )
+}
+
+// Table-dense routes get the wider content tier; prose routes keep the
+// bounded reading measure.
+#[allow(clippy::too_many_arguments)]
+fn shell_wide(
+    data: &DashboardData,
+    expires: u64,
+    page: DashboardAppPage,
+    eyebrow: &str,
+    heading: &str,
+    summary: &str,
+    status: &str,
+    tone: &str,
+    actions: &str,
+    content: &str,
+) -> String {
+    shell_impl(
+        data, expires, page, eyebrow, heading, summary, status, tone, actions, content, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shell_impl(
+    data: &DashboardData,
+    expires: u64,
+    page: DashboardAppPage,
+    eyebrow: &str,
+    heading: &str,
+    summary: &str,
+    status: &str,
+    tone: &str,
+    actions: &str,
+    content: &str,
+    wide: bool,
+) -> String {
+    // A required update renders a red banner; a green topbar dot beside it
+    // would send mixed signals, so the tone is capped at warn.
+    let tone = if tone == "good"
+        && data
+            .update_notice
+            .as_ref()
+            .is_some_and(|notice| notice.level == "required")
+    {
+        "warn"
+    } else {
+        tone
+    };
     let content = mark_volatile_capacity_badges(content, volatile_capacity_window(data));
     let status_freshness = volatile_page_status_marker(data, page, status);
     let content = if !matches!(page, DashboardAppPage::Home | DashboardAppPage::Settings) {
@@ -1162,6 +1240,7 @@ fn shell(
         content: &content,
         footer: "Controls and evidence belong to this gateway process.",
         expires_in_seconds: expires,
+        wide,
     })
 }
 
@@ -1219,10 +1298,10 @@ fn global_update_attention(data: &DashboardData) -> String {
             "Update available"
         },
         &format!(
-            "Installed {}; catalog minimum {} affects {} model(s).",
+            "Installed {}. A newer app version (minimum {}) is required for {}.",
             notice.installed_app_version,
             notice.required_min_app_version,
-            notice.affected_model_count
+            count_noun(notice.affected_model_count as u64, "model")
         ),
         Some(("Review update", "/mayhem/dashboard/settings")),
     )
@@ -1237,6 +1316,7 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
         .as_ref()
         .is_some_and(|notice| notice.level == "required");
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
+    let funding_needed = data.payment_directory.is_some() && data.balance_au == 0;
     let (heading, summary, status, tone) = if required_update {
         (
             "Update required",
@@ -1251,18 +1331,25 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
             "Credential needed",
             "warn",
         )
+    } else if funding_needed {
+        (
+            "Add funds for your first request",
+            "The gateway and model catalog are ready, but the current ledger balance is empty.",
+            "Funding needed",
+            "warn",
+        )
     } else if accepting_models > 0 {
         (
             "Mayhem is ready to try",
-            "The gateway is ready and at least one provider advertises fresh accepting capacity. Request-specific eligibility is checked when you send.",
+            "At least one provider is online with free capacity right now. Final price and eligibility are confirmed when you send.",
             "Capacity advertised",
             "good",
         )
     } else if data.models.is_empty() {
         (
-            "Catalog unavailable",
-            "This gateway is running, but it has no catalog models to route yet.",
-            "No models",
+            "Set up your first model",
+            "The gateway is running — it just has no models in its catalog yet.",
+            "No models yet",
             "warn",
         )
     } else {
@@ -1273,77 +1360,55 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
             "warn",
         )
     };
-    let primary_href = if required_update {
-        "/mayhem/dashboard/settings"
-    } else if credential_needed {
-        "/mayhem/dashboard/connect"
-    } else if accepting_models > 0 {
-        "/mayhem/dashboard/playground"
-    } else {
-        "/mayhem/dashboard/models"
-    };
-    let primary_label = if required_update {
-        "Review update"
-    } else if credential_needed {
-        "Set up access"
-    } else if accepting_models > 0 {
-        "Open Playground"
-    } else {
-        "Inspect models"
-    };
-    let (secondary_href, secondary_label) = if credential_needed {
-        ("/mayhem/dashboard/models", "Inspect models")
-    } else {
-        ("/mayhem/dashboard/connect", "Connect an app")
-    };
-    let actions = format!(
-        r##"<a class="primary-button" href="{primary_href}">{primary_label}</a><a class="quiet-button" href="{secondary_href}">{secondary_label}</a>"##
-    );
-
     let attention = home_attention(data, accepting_models);
-    let balance = data
-        .payment_directory
-        .as_ref()
-        .map(|_| money_html(&format_au_usd(data.balance_au)))
-        .unwrap_or_else(|| "Unavailable".to_owned());
+    let launch_paths = home_launch_paths(data);
     let payment_freshness = payment_freshness_markup(data);
-    let accepting_capacity = volatile_capacity_window(data).map_or_else(
-        || accepting_models.to_string(),
-        |window| volatile_text(&accepting_models.to_string(), window, "Unavailable"),
-    );
+    let balance_metric = if data.payment_directory.is_some() {
+        metric_with_meta_html(
+            "Ledger balance",
+            &money_html(&format_au_usd(data.balance_au)),
+            &payment_freshness,
+            "Ledger",
+        )
+    } else {
+        metric_status(
+            "Ledger balance",
+            &status_badge("Unavailable", "warn"),
+            "The payment directory has not answered yet.",
+            "Ledger",
+        )
+    };
     let metrics = format!(
-        r##"<section class="metric-grid" aria-label="Current gateway summary">{}{}{}{}</section>"##,
-        metric_with_meta_html("Ledger balance", &balance, &payment_freshness, "Ledger",),
+        r##"<section class="metric-grid metric-grid--three" aria-label="Current gateway summary">{balance_metric}{}{}</section>"##,
         metric(
-            "Final receipts",
+            "Completed requests",
             &completed.to_string(),
-            "Recorded in this gateway run",
-            "Receipts",
+            &format!(
+                "Final receipts in {}",
+                data.history_scope().to_ascii_lowercase()
+            ),
+            "Activity",
         ),
         metric(
-            "Models advertising capacity",
-            &accepting_capacity,
-            "Fresh routes with advertised capacity",
-            "Now",
-        ),
-        metric(
-            "Incomplete sessions",
+            "Open records",
             &incomplete.to_string(),
-            "Latest non-final receipt or retained pause record",
-            "Records",
+            "Sessions without a final receipt yet",
+            "Activity",
         ),
     );
     let activity = recent_activity_panel(data, 3);
+    let usage = home_usage_chart(data);
     let right = match home_secondary_panel(data) {
         HomeSecondaryPanel::Provider => provider_home_panel(data),
         HomeSecondaryPanel::FirstValue => activation_panel(data),
         HomeSecondaryPanel::None => String::new(),
     };
+    let main_stack = format!(r##"{usage}{activity}"##);
     let content = if right.is_empty() {
-        format!(r##"{attention}{metrics}{activity}"##)
+        format!(r##"{attention}{launch_paths}{metrics}{main_stack}"##)
     } else {
         format!(
-            r##"{attention}{metrics}<section class="dashboard-layout"><div class="stack">{activity}</div><aside class="stack" aria-label="Next actions">{right}</aside></section>"##
+            r##"{attention}{launch_paths}{metrics}<section class="dashboard-layout"><div class="stack">{main_stack}</div><aside class="stack" aria-label="Next actions">{right}</aside></section>"##
         )
     };
     shell(
@@ -1355,7 +1420,7 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
         summary,
         status,
         tone,
-        &actions,
+        "",
         &content,
     )
 }
@@ -1431,7 +1496,16 @@ fn home_attention(data: &DashboardData, accepting_models: usize) -> String {
                 notice.required_min_app_version,
                 notice.affected_model_count
             ),
-            None,
+            Some(("Review update", "/mayhem/dashboard/settings")),
+        );
+    }
+    if data.payment_directory.is_some() && data.balance_au == 0 {
+        return attention(
+            "warn",
+            "!",
+            "Your ledger balance is empty",
+            "Add funds before sending paid work. Billing shows the exact rail and a reviewable command without starting a transaction in the browser.",
+            Some(("Open Billing", "/mayhem/dashboard/wallet")),
         );
     }
     if accepting_models == 0 && !data.models.is_empty() {
@@ -1444,6 +1518,132 @@ fn home_attention(data: &DashboardData, accepting_models: usize) -> String {
         );
     }
     String::new()
+}
+
+fn home_launch_paths(data: &DashboardData) -> String {
+    let credential_ready = !data.requires_auth() || data.active_token_count() > 0;
+    let funds_ready = data.payment_directory.is_none() || data.balance_au > 0;
+    let capacity_ready = data.accepting_models() > 0;
+    let user_ready = credential_ready && funds_ready && capacity_ready;
+    let user_status = if !credential_ready {
+        (
+            "Credential needed",
+            "warn",
+            "/mayhem/dashboard/connect",
+            "Set up access",
+        )
+    } else if !funds_ready {
+        (
+            "Funding needed",
+            "warn",
+            "/mayhem/dashboard/wallet",
+            "Add funds",
+        )
+    } else if !capacity_ready {
+        (
+            "Waiting for capacity",
+            "warn",
+            "/mayhem/dashboard/models",
+            "Check availability",
+        )
+    } else {
+        (
+            "Ready",
+            "good",
+            "/mayhem/dashboard/playground",
+            if data.completed_requests() > 0 {
+                "Continue in Playground"
+            } else {
+                "Try your first request"
+            },
+        )
+    };
+    // A path that cannot currently succeed never gets the brightest button.
+    let user_button_class = if capacity_ready || !credential_ready || !funds_ready {
+        "primary-button"
+    } else {
+        "soft-button"
+    };
+    let entries = data.provider_entries(None);
+    let provider_state = provider_page_state(data, None, &entries);
+    let provider_started = data.local_provider_id.is_some() || data.has_provider_evidence();
+    let provider_status = if provider_started {
+        (
+            provider_state.label,
+            provider_state.tone,
+            "Open provider workspace",
+        )
+    } else {
+        ("Not set up", "", "Check this machine")
+    };
+    format!(
+        r##"<section class="launch-paths" aria-label="Choose what you want to do"><article class="launch-path-card {}"><div class="launch-path-icon" aria-hidden="true">&#10022;</div><div class="launch-path-copy"><span class="status-badge {}">{}</span><h2>Use AI</h2><p>Ask a question, get a useful result, and inspect its signed receipt.</p></div><a class="{user_button_class}" href="{}" data-product-event="use_ai_path_opened">{}</a></article><article class="launch-path-card"><div class="launch-path-icon" aria-hidden="true">&#9881;</div><div class="launch-path-copy"><span class="status-badge {}">{}</span><h2>Earn with this machine</h2><p>Run a model on this machine and watch each job through to settlement.</p></div><a class="soft-button" href="/mayhem/dashboard/earn" data-product-event="earn_path_opened">{}</a></article></section>"##,
+        if user_ready { "is-ready" } else { "" },
+        user_status.1,
+        html_escape(user_status.0),
+        user_status.2,
+        html_escape(user_status.3),
+        provider_status.1,
+        html_escape(provider_status.0),
+        html_escape(provider_status.2),
+    )
+}
+
+fn home_usage_chart(data: &DashboardData) -> String {
+    let today = now_secs() / 86_400;
+    let mut days = [0usize; 7];
+    for receipt in data
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.receipt.body.final_receipt)
+    {
+        let receipt_day = timestamp_seconds(receipt.receipt.body.ts) / 86_400;
+        let age = today.saturating_sub(receipt_day);
+        if age < 7 {
+            days[6 - age as usize] += 1;
+        }
+    }
+    let total = days.iter().sum::<usize>();
+    if total == 0 {
+        return String::new();
+    }
+    let max = days.iter().copied().max().unwrap_or(1).max(1);
+    let bars = days
+        .into_iter()
+        .enumerate()
+        .map(|(index, count)| {
+            let level = if count == 0 {
+                0
+            } else {
+                ((count * 10).div_ceil(max)).max(1)
+            };
+            let label = if index == 6 {
+                "Today".to_owned()
+            } else {
+                format!("{}d ago", 6 - index)
+            };
+            format!(
+                r##"<li aria-label="{label}: {count} completed request{}"><span class="usage-bar level-{level}"><span></span></span><strong>{count}</strong><small>{label}</small></li>"##,
+                if count == 1 { "" } else { "s" },
+            )
+        })
+        .collect::<String>();
+    // A near-empty week reads as intentional, not broken, when it is named.
+    let active_days = days.iter().filter(|count| **count > 0).count();
+    let caption = if active_days <= 1 {
+        format!(
+            "First requests this week &middot; last 7 calendar days from {}",
+            html_escape(&data.history_scope().to_ascii_lowercase())
+        )
+    } else {
+        format!(
+            "Last 7 calendar days from {}",
+            html_escape(&data.history_scope().to_ascii_lowercase())
+        )
+    };
+    format!(
+        r##"<figure class="panel usage-chart"><figcaption class="panel-head"><div class="panel-title"><h2>Completed requests</h2><p>{caption}</p></div><strong>{total}</strong></figcaption><div class="panel-body"><ol class="usage-bars">{bars}</ol></div></figure>"##,
+    )
 }
 
 fn activation_panel(data: &DashboardData) -> String {
@@ -1497,7 +1697,7 @@ fn activation_panel(data: &DashboardData) -> String {
         })
         .collect::<String>();
     format!(
-        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>First-value setup</h2><p>{done} of 4 confirmed from gateway state</p></div></header><div class="panel-body"><ol class="checklist">{steps}</ol></div><footer class="panel-footer"><span>The page-level action opens the most relevant available check.</span></footer></section>"##
+        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Getting started</h2><p>{done} of 4 confirmed from gateway state</p></div></header><div class="panel-body"><ol class="checklist">{steps}</ol></div><footer class="panel-footer"><span>Each step confirms itself from gateway evidence.</span></footer></section>"##
     )
 }
 
@@ -1518,13 +1718,13 @@ fn provider_home_panel(data: &DashboardData) -> String {
         |window| volatile_text(&state.explanation, window, "Refresh to reconfirm"),
     );
     format!(
-        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Configured provider</h2><p>Scoped to the provider identity attached to this gateway</p></div><span class="status-badge {}">{}</span></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Fresh slots</span><strong>{}</strong></div><div class="fact"><span>Fresh queue</span><strong>{}</strong></div></div>{coverage}<p class="notice">{}</p></div><footer class="panel-footer"><span>{} route(s)</span><a href="/mayhem/dashboard/earn">Open Earn</a></footer></section>"##,
+        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Your provider</h2><p>The provider identity attached to this gateway</p></div><span class="status-badge {}">{}</span></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Active slots</span><strong>{}</strong></div><div class="fact"><span>Queue</span><strong>{}</strong></div></div>{coverage}<p class="notice">{}</p></div><footer class="panel-footer"><span>{}</span><a href="/mayhem/dashboard/earn">Open Earn</a></footer></section>"##,
         state.tone,
         html_escape(state.label),
         current_slots,
         current_queue,
         explanation,
-        entries.len(),
+        count_noun(entries.len() as u64, "route"),
     )
 }
 
@@ -1547,13 +1747,13 @@ fn recent_activity_panel(data: &DashboardData, limit: usize) -> String {
         format!(r##"<div class="activity-list">{rows}</div>"##)
     };
     let stopping_cue = if data.incomplete_session_count() > 0 {
-        "Incomplete records need review"
+        "Open records listed first"
     } else {
-        "No incomplete records"
+        "No open records"
     };
     format!(
-        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Recorded activity</h2><p>Incomplete records first, then latest final receipt per session</p></div><a class="quiet-button" href="/mayhem/dashboard/activity">View all</a></header>{body}<footer class="panel-footer"><span>{} receipt checkpoint(s)</span><span>{stopping_cue}</span></footer></section>"##,
-        data.receipt_checkpoint_count,
+        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Recent activity</h2><p>Open records first, then the latest final receipt per session</p></div><a class="quiet-button" href="/mayhem/dashboard/activity">View all</a></header>{body}<footer class="panel-footer"><span>{}</span><span>{stopping_cue}</span></footer></section>"##,
+        count_noun(data.receipt_checkpoint_count as u64, "receipt record"),
     )
 }
 
@@ -1581,129 +1781,439 @@ fn activity_row(receipt: &StoredReceipt) -> String {
     )
 }
 
+#[derive(Clone)]
+struct DashboardModelLab {
+    key: &'static str,
+    name: String,
+    initials: String,
+}
+
+fn dashboard_model_lab(model: &GatewayModel) -> DashboardModelLab {
+    let search = format!("{} {} {}", model.id, model.mayhem.family, model.owned_by)
+        .to_ascii_lowercase();
+    let known = [
+        ("qwen", "Qwen", "Q", &["qwen", "tongyi-qianwen"] as &[&str]),
+        ("hauhau", "HauHau", "HH", &["hauhau", "hauhaucs"] as &[&str]),
+        ("deepmind", "Google DeepMind", "DM", &["deepmind"] as &[&str]),
+        ("google", "Google", "G", &["google", "gemma"] as &[&str]),
+        ("openai", "OpenAI", "OA", &["openai/", "gpt-", "o1-", "o3-"] as &[&str]),
+        ("deepseek", "DeepSeek", "DS", &["deepseek"] as &[&str]),
+        ("mistral", "Mistral AI", "M", &["mistral", "mixtral"] as &[&str]),
+        ("meta-ai", "Meta AI", "M", &["meta-llama", "meta/", "llama"] as &[&str]),
+        ("moonshot-ai", "Moonshot AI", "K", &["moonshot", "kimi"] as &[&str]),
+        ("minimax", "MiniMax", "MM", &["minimax"] as &[&str]),
+        ("nvidia", "NVIDIA", "N", &["nvidia", "nemotron"] as &[&str]),
+        ("z-ai", "Z.ai", "Z", &["z-ai", "zai", "glm-"] as &[&str]),
+        ("huggingface", "Hugging Face", "HF", &["huggingface", "smollm"] as &[&str]),
+        ("microsoft", "Microsoft", "MS", &["microsoft", "phi-"] as &[&str]),
+        ("black-forest-labs", "Black Forest Labs", "BFL", &["black-forest", "flux"] as &[&str]),
+        ("baai", "BAAI", "BA", &["baai", "bge-"] as &[&str]),
+        ("stability-ai", "Stability AI", "SA", &["stability", "stable-diffusion"] as &[&str]),
+        ("tencent", "Tencent Hunyuan", "T", &["tencent", "hunyuan"] as &[&str]),
+        ("jina-ai", "Jina AI", "J", &["jina"] as &[&str]),
+        ("nomic-ai", "Nomic AI", "N", &["nomic"] as &[&str]),
+        ("lightricks", "Lightricks", "L", &["lightricks", "ltx-"] as &[&str]),
+        ("resemble-ai", "Resemble AI", "R", &["resemble"] as &[&str]),
+        ("ace-step", "ACE-Step", "AS", &["ace-step"] as &[&str]),
+        ("deepreinforce", "DeepReinforce", "DR", &["deepreinforce"] as &[&str]),
+        ("empero-ai", "Empero AI", "E", &["empero"] as &[&str]),
+        ("hexgrad", "Hexgrad", "H", &["hexgrad"] as &[&str]),
+        ("huihui-ai", "Huihui AI", "H", &["huihui"] as &[&str]),
+        ("lodestones", "Lodestones", "L", &["lodestones"] as &[&str]),
+        (
+            "tongyi-mai",
+            "Tongyi-MAI",
+            "TM",
+            &["tongyi-mai", "tongyi/", "z-image"] as &[&str],
+        ),
+        ("wepiqx", "Wepiqx", "W", &["wepiqx"] as &[&str]),
+    ];
+    if let Some((key, name, initials, _)) = known
+        .iter()
+        .find(|(_, _, _, needles)| needles.iter().any(|needle| search.contains(needle)))
+    {
+        return DashboardModelLab {
+            key,
+            name: (*name).to_owned(),
+            initials: (*initials).to_owned(),
+        };
+    }
+
+    let raw_name = model
+        .id
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty() && *value != "workbench")
+        .unwrap_or("Independent lab");
+    let name = humanize_model_label(raw_name);
+    let initials = name
+        .split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    DashboardModelLab {
+        key: "other",
+        name,
+        initials: if initials.is_empty() { "AI".to_owned() } else { initials },
+    }
+}
+
+fn humanize_model_label(value: &str) -> String {
+    let mut label = value.replace(['-', '_'], " ");
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    label
+}
+
+fn dashboard_model_name(model: &GatewayModel) -> String {
+    let mut value = model.id.rsplit('/').next().unwrap_or(&model.id);
+    if model.id.starts_with("workbench/") {
+        if let Some((prefix, remainder)) = value.split_once('-') {
+            if prefix.chars().all(|character| character.is_ascii_digit()) {
+                value = remainder;
+            }
+        }
+        for prefix in ["hauhaucs-", "google-"] {
+            if let Some(remainder) = value.strip_prefix(prefix) {
+                value = remainder;
+                break;
+            }
+        }
+    }
+    humanize_model_label(value)
+}
+
+fn dashboard_model_lab_icon(lab: &DashboardModelLab) -> String {
+    let asset = match lab.key {
+        "openai" => Some("openai-symbol.svg"),
+        "ace-step" | "baai" | "black-forest-labs" | "deepreinforce" | "empero-ai"
+        | "hexgrad" | "huihui-ai" | "jina-ai" | "lightricks" | "lodestones"
+        | "microsoft" | "nomic-ai" | "resemble-ai" | "stability-ai" | "tencent"
+        | "tongyi-mai" | "wepiqx" => Some(match lab.key {
+            "ace-step" => "ace-step.webp",
+            "baai" => "baai.webp",
+            "black-forest-labs" => "black-forest-labs.webp",
+            "deepreinforce" => "deepreinforce.webp",
+            "empero-ai" => "empero-ai.webp",
+            "hexgrad" => "hexgrad.webp",
+            "huihui-ai" => "huihui-ai.webp",
+            "jina-ai" => "jina-ai.webp",
+            "lightricks" => "lightricks.webp",
+            "lodestones" => "lodestones.webp",
+            "microsoft" => "microsoft.webp",
+            "nomic-ai" => "nomic-ai.webp",
+            "resemble-ai" => "resemble-ai.webp",
+            "stability-ai" => "stability-ai.webp",
+            "tencent" => "tencent.webp",
+            "tongyi-mai" => "tongyi-mai.webp",
+            _ => "wepiqx.webp",
+        }),
+        "hauhau" => Some("hauhau.svg"),
+        "deepmind" => Some("deepmind.svg"),
+        "deepseek" => Some("deepseek.svg"),
+        "google" => Some("google.svg"),
+        "huggingface" => Some("huggingface.svg"),
+        "meta-ai" => Some("meta-ai.svg"),
+        "minimax" => Some("minimax.svg"),
+        "mistral" => Some("mistral.svg"),
+        "moonshot-ai" => Some("moonshot-ai.svg"),
+        "nvidia" => Some("nvidia.svg"),
+        "qwen" => Some("qwen.svg"),
+        "z-ai" => Some("z-ai.svg"),
+        _ => None,
+    };
+    let contents = asset.map_or_else(
+        || format!(r#"<span>{}</span>"#, html_escape(&lab.initials)),
+        |asset| {
+            let fit_class = if asset.ends_with(".svg") && lab.key != "hauhau" {
+                " model-lab-image--contain"
+            } else {
+                ""
+            };
+            format!(
+                r#"<img class="model-lab-image{fit_class}" src="/mayhem/dashboard/assets/brand/{asset}" alt="" width="32" height="32">"#
+            )
+        },
+    );
+    format!(
+        r#"<span class="model-lab-mark model-lab--{}" aria-hidden="true">{contents}</span>"#,
+        lab.key
+    )
+}
+
+fn playground_model_mode(model: &GatewayModel) -> Option<&'static str> {
+    match model.mayhem.model_class.as_str() {
+        DEFAULT_MODEL_CLASS => Some("chat"),
+        "image-generation" => Some("image"),
+        "tts" => Some("speech"),
+        _ => None,
+    }
+}
+
+fn playground_mode_icon(mode: &str) -> &'static str {
+    match mode {
+        "image" => {
+            r#"<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m5 18 5-5 3 3 2-2 4 4"/></svg>"#
+        }
+        "speech" => {
+            r#"<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6.6 8.5H3.8a.8.8 0 0 0-.8.8v5.4a.8.8 0 0 0 .8.8h2.8L11 19Z"/><path d="M14.8 9.2a4.1 4.1 0 0 1 0 5.6M17.6 6.5a8 8 0 0 1 0 11"/></svg>"#
+        }
+        _ => {
+            r#"<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15a4 4 0 0 1-4 4H8l-4 3v-7a4 4 0 0 1-1-2.6V7a4 4 0 0 1 4-4h9a4 4 0 0 1 4 4Z"/></svg>"#
+        }
+    }
+}
+
 fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&str>) -> String {
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
     let mut choices = data
         .models
         .iter()
+        .filter(|model| playground_model_mode(model).is_some())
         .map(|model| (model, model_availability(data, model)))
         .collect::<Vec<_>>();
     choices.sort_by_key(|(_, availability)| availability.tone != "good");
-    let explicit_selection =
-        selected_model.filter(|candidate| choices.iter().any(|(model, _)| model.id == *candidate));
-    let default_model_id = explicit_selection
-        .map(str::to_owned)
-        .or_else(|| choices.first().map(|(model, _)| model.id.clone()))
+
+    let explicit_selection = selected_model.filter(|candidate| {
+        choices
+            .iter()
+            .any(|(model, _)| model.id == *candidate)
+    });
+    let default_index = explicit_selection
+        .and_then(|candidate| choices.iter().position(|(model, _)| model.id == candidate))
+        .unwrap_or(0);
+    let default_model_id = choices
+        .get(default_index)
+        .map(|(model, _)| model.id.clone())
         .unwrap_or_default();
-    let options = choices
-        .into_iter()
-        .enumerate()
-        .map(|(index, (model, availability))| {
-            let selected = if explicit_selection
-                .is_some_and(|candidate| candidate == model.id)
-                || (explicit_selection.is_none() && index == 0)
-            {
-                " selected"
+    let active_mode = choices
+        .get(default_index)
+        .and_then(|(model, _)| playground_model_mode(model))
+        .unwrap_or("chat");
+
+    let mut mode_counts = [0usize; 3];
+    let mut options = String::new();
+    let mut model_cards = String::new();
+    let mut default_model_icon = String::new();
+    let mut default_model_name = String::new();
+    let mut default_model_meta = String::new();
+
+    for (index, (model, availability)) in choices.iter().enumerate() {
+        let Some(mode) = playground_model_mode(model) else {
+            continue;
+        };
+        match mode {
+            "image" => mode_counts[1] += 1,
+            "speech" => mode_counts[2] += 1,
+            _ => mode_counts[0] += 1,
+        }
+        let is_selected = index == default_index;
+        let selected = if is_selected { " selected" } else { "" };
+        let protection = if model.mayhem.attestation_tiers.is_empty() {
+            "No catalog attestation tier listed".to_owned()
+        } else {
+            format!(
+                "Catalog tiers {}",
+                model
+                    .mayhem
+                    .attestation_tiers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let price_mode = if model.mayhem.price_ref_au.rate_map.is_empty() {
+            "fixed"
+        } else {
+            "rate"
+        };
+        let lab = dashboard_model_lab(model);
+        let lab_icon = dashboard_model_lab_icon(&lab);
+        let display_name = dashboard_model_name(model);
+        let context = format_token_count(u64::from(model.mayhem.caps.ctx));
+        let purpose = match mode {
+            "image" => "Image generation",
+            "speech" => "Natural text to speech",
+            _ => "Chat and text generation",
+        };
+        options.push_str(&format!(
+            r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}"{selected}>{} &mdash; {}</option>"##,
+            html_escape(&model.id),
+            html_escape(availability.label),
+            html_escape(&dashboard_model_price(model)),
+            html_escape(&protection),
+            html_escape(&display_name),
+            html_escape(&lab.name),
+            html_escape(&model.id),
+            html_escape(availability.label),
+        ));
+        model_cards.push_str(&format!(
+            r##"<button class="pg-model-option{}" id="playground-model-option-{index}" type="button" role="option" aria-selected="{is_selected}" tabindex="{}" data-playground-model-option="{}" data-playground-mode="{mode}"{}><span class="pg-logo-tile pg-model-option-logo">{lab_icon}</span><span class="pg-model-option-copy"><span class="pg-model-option-name">{}</span><span class="pg-model-option-purpose">{purpose}</span><span class="pg-model-option-meta"><span class="pg-model-option-provider">{}</span><span class="pg-model-option-context">{context} context</span><span>{}</span></span></span><span class="pg-model-option-check" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span></button>"##,
+            if is_selected { " is-selected" } else { "" },
+            if is_selected { "0" } else { "-1" },
+            html_escape(&model.id),
+            if mode == active_mode { "" } else { " hidden" },
+            html_escape(&display_name),
+            html_escape(&lab.name),
+            html_escape(availability.label),
+        ));
+        if is_selected {
+            default_model_icon = lab_icon;
+            default_model_name = html_escape(&display_name);
+            default_model_meta = purpose.to_owned();
+        }
+    }
+
+    let mode_tab = |mode: &str, label: &str, count: usize| {
+        let selected = mode == active_mode;
+        let unavailable = count == 0;
+        format!(
+            r##"<button type="button" role="tab" data-playground-mode-tab="{mode}" data-empty="{unavailable}" aria-selected="{selected}" aria-controls="playground-{mode}-panel" aria-label="{}" tabindex="{}" class="{}"{}>{}<span class="pg-mode-label">{label}</span>{}</button>"##,
+            if unavailable {
+                format!("{label}, no compatible model")
+            } else {
+                label.to_owned()
+            },
+            if selected { "0" } else { "-1" },
+            if selected { "is-active" } else { "" },
+            if unavailable { " disabled" } else { "" },
+            playground_mode_icon(mode),
+            if unavailable {
+                r#"<span class="pg-mode-soon">Unavailable</span>"#
             } else {
                 ""
-            };
-            let protection = if model.mayhem.attestation_tiers.is_empty() {
-                "No catalog attestation tier listed".to_owned()
-            } else {
-                format!(
-                    "Catalog tiers {}",
-                    model
-                        .mayhem
-                        .attestation_tiers
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            let price_mode = if model.mayhem.price_ref_au.rate_map.is_empty() {
-                "fixed"
-            } else {
-                "rate"
-            };
-            format!(
-                r##"<option value="{}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {} catalog tokens"{selected}>{} — {}</option>"##,
-                html_escape(&model.id),
-                html_escape(availability.label),
-                html_escape(&dashboard_model_price(model)),
-                html_escape(&protection),
-                model.mayhem.caps.ctx,
-                html_escape(&model.id),
-                html_escape(availability.label),
-            )
-        })
-        .collect::<String>();
+            },
+        )
+    };
+    let mode_tabs = format!(
+        "{}{}{}",
+        mode_tab("chat", "Text", mode_counts[0]),
+        mode_tab("image", "Image", mode_counts[1]),
+        mode_tab("speech", "Speech", mode_counts[2]),
+    );
+    let mode_label = match active_mode {
+        "image" => "Image model",
+        "speech" => "Speech model",
+        _ => "Text model",
+    };
+    let active_model_count = match active_mode {
+        "image" => mode_counts[1],
+        "speech" => mode_counts[2],
+        _ => mode_counts[0],
+    };
     let default_model_value = html_escape(&default_model_id);
+
     let actions = if credential_needed {
         r##"<a class="primary-button" href="/mayhem/dashboard/connect">Set up access</a>"##
     } else {
         ""
     };
     let token_field = if data.requires_auth() {
-        r##"<div class="field span-all"><label for="playground-token">Access token</label><input id="playground-token" data-playground-token type="password" autocomplete="off" spellcheck="false" required><span class="result-summary">Paste an active gateway token. It stays only in this page's memory.</span></div>"##
+        r##"<label class="pg-advanced-field span-all" for="playground-token"><span>Access token</span><input id="playground-token" data-playground-token type="password" autocomplete="off" spellcheck="false" required><small>Kept only in this page's memory.</small></label>"##
     } else {
         r##"<input data-playground-token type="hidden" value="">"##
     };
+
+    let chat_hidden = if active_mode == "chat" { "" } else { " hidden" };
+    let image_hidden = if active_mode == "image" { "" } else { " hidden" };
+    let speech_hidden = if active_mode == "speech" { "" } else { " hidden" };
     let content = if credential_needed {
         page_empty_block(
             "Create an access token first",
             "This gateway requires authentication and currently has no active token, so a Playground request cannot succeed yet.",
             None,
         )
-    } else if options.is_empty() {
+    } else if choices.is_empty() {
         page_empty_block(
-            "No models available",
-            "The gateway catalog must load at least one model before Playground can send a request.",
+            "No compatible models available",
+            "Playground needs at least one text-generation, image-generation, or speech model in the gateway catalog.",
             Some(("Open Models", "/mayhem/dashboard/models")),
         )
     } else {
         format!(
-            r##"<section class="playground-layout">
-<div class="panel">
-  <noscript><div class="panel-body"><div class="notice warn"><strong>The in-browser Playground needs JavaScript.</strong><p>Use Connect for copyable client settings, or enable JavaScript and reload before entering a prompt or access token.</p><a href="/mayhem/dashboard/connect">Open Connect</a></div></div></noscript>
-  <div class="playground-interactive js-only">
-  <div class="playground-thread" data-playground-thread role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation"><div class="playground-empty" data-playground-empty><div><strong>Start with a real task</strong><p>Your prompt stays in the composer if routing fails.</p></div></div></div>
-  <form class="playground-composer" data-playground-form>
-    <div class="form-grid">
-      <div class="field"><label for="playground-model">Model</label><select id="playground-model" data-playground-model data-playground-draft data-default-value="{default_model_value}">{options}</select></div>
-      <details class="field"><summary class="field-label">Request controls <span class="optional-label">Optional</span></summary><div class="stack compact-stack">
-        <div class="field"><label for="playground-system">System instructions</label><textarea id="playground-system" data-playground-system data-playground-draft></textarea></div>
-        <div class="field"><label for="playground-max-tokens">Output limit</label><input id="playground-max-tokens" data-playground-max-tokens data-playground-draft type="number" inputmode="numeric" min="64" max="4096" step="64" value="512" aria-describedby="playground-max-tokens-help"><span class="result-summary" id="playground-max-tokens-help">Hard limit for this response: 64 to 4,096 tokens.</span></div>
-        <div class="field"><label for="playground-max-price"><span data-playground-price-label>Route price ceiling</span> <span class="optional-label" data-playground-price-unit>Selected-model basis</span></label><input id="playground-max-price" data-playground-max-price data-playground-draft data-money-input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" pattern="[0-9]+([.][0-9]{{1,18}})?" placeholder="0.50" aria-describedby="playground-max-price-help"><span class="result-summary" id="playground-max-price-help" data-playground-price-help>The selected model determines whether this ceiling uses a composite rate or fixed charge.</span></div>
-        <div class="field"><label for="playground-min-att-tier">Minimum attestation tier number <span class="optional-label">Advanced</span></label><select id="playground-min-att-tier" data-playground-min-att-tier data-playground-draft aria-describedby="playground-min-att-tier-help"><option value="">Gateway default</option><option value="1">At least T1 numerically</option><option value="2">At least T2 numerically</option><option value="3">At least T3 numerically</option><option value="4">T4 only</option></select><span class="result-summary" id="playground-min-att-tier-help">Hard numeric route filter, never downgraded. Tiers describe different evidence and are not privacy supersets: a T4 identity route can satisfy a T3 numeric minimum without providing T3 confidential-compute properties. Verify route evidence for the protection you need.</span></div>
-        <p class="result-summary">Draft, model, and request controls are saved only in this browser tab. The access token is never saved.</p><div class="inline-actions"><button class="quiet-button" type="button" data-playground-reset-draft>Reset saved draft and settings</button></div>
-      </div></details>{token_field}
-      <div class="field span-all"><label for="playground-prompt">Message</label><textarea id="playground-prompt" data-playground-prompt data-playground-draft aria-describedby="playground-prompt-help" required></textarea><span class="result-summary" id="playground-prompt-help">Ask a question or describe a task.</span></div>
+            r##"<section class="playground-layout pg-page" aria-label="AI Playground" data-playground-mode="{active_mode}">
+<noscript><div class="notice warn"><strong>The in-browser Playground needs JavaScript.</strong><p>Enable JavaScript and reload before entering a prompt or access token.</p></div></noscript>
+<div class="playground-interactive js-only">
+<form data-playground-form>
+  <div class="pg-toolbar">
+    <div class="pg-mode-tabs" role="tablist" aria-label="Playground mode"><span class="pg-mode-pill" aria-hidden="true"></span>{mode_tabs}</div>
+    <div class="pg-model" data-playground-model-picker>
+      <select id="playground-model" data-playground-model data-playground-draft data-default-value="{default_model_value}" hidden tabindex="-1" aria-hidden="true">{options}</select>
+      <button class="pg-model-trigger" type="button" data-playground-model-trigger aria-haspopup="listbox" aria-expanded="false" aria-controls="playground-model-list" aria-label="Choose model, {default_model_name} selected"><span class="pg-logo-tile pg-model-trigger-logo" data-playground-model-trigger-icon>{default_model_icon}</span><span class="pg-model-trigger-copy"><span class="pg-model-trigger-name" data-playground-model-trigger-name>{default_model_name}</span><span class="pg-model-trigger-purpose" data-playground-model-trigger-meta>{default_model_meta}</span></span><svg class="pg-model-trigger-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
+      <button class="pg-model-backdrop" type="button" data-playground-model-close aria-label="Close model list" hidden></button>
+      <div class="pg-model-panel" data-playground-model-panel hidden><span class="pg-model-panel-grip" aria-hidden="true"></span><header class="pg-model-panel-head"><div class="pg-model-panel-head-copy"><strong data-playground-model-panel-label>{mode_label}</strong><span><span data-playground-model-count>{active_model_count}</span> available</span></div><button type="button" data-playground-model-close aria-label="Close model list"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="pg-model-list" id="playground-model-list" role="listbox" aria-label="{mode_label}">{model_cards}</div></div>
     </div>
-    <div class="preflight" data-playground-preflight><span><strong>Advertised capacity:</strong> <span data-preflight-value="availability">Checking</span></span><span><strong>Execution:</strong> <span data-preflight-value="location">Network provider route</span></span><span><strong>Protection:</strong> <span data-preflight-value="protection">Checking catalog</span></span><span><strong>Context:</strong> <span data-preflight-value="context">Checking catalog</span></span><span><strong>Catalog rates:</strong> <span class="money-value" data-money data-preflight-value="price">Unavailable</span></span><span><strong>Your controls:</strong> <span data-playground-request-summary>512 output tokens &middot; gateway price/trust defaults</span></span><span>Actual charge is known only after metering.</span></div>
-    <div class="inline-actions"><button class="primary-button js-only" type="submit" data-playground-send>Send</button><button class="quiet-button js-only" type="button" data-playground-stop hidden>Stop</button><button class="quiet-button js-only" type="button" data-playground-clear>Clear conversation</button></div>
-  </form>
-  <div class="playground-meta"><span data-playground-meta>No request sent</span><a href="/mayhem/dashboard/activity">Receipts and evidence</a></div>
   </div>
+
+  <div class="pg-meta-row">
+    <p class="pg-preview-note" role="note"><span aria-hidden="true"></span>Live through this OpenMayhem gateway. Requests are processed by the selected provider.</p>
+    <a class="pg-evidence-link" href="/mayhem/dashboard/activity">Receipts and evidence</a>
+  </div>
+
+  <div class="pg-experience">
+    <div class="pg-surface">
+      <div class="pg-mode-stack">
+        <section id="playground-chat-panel" role="tabpanel" aria-label="Text playground" class="pg-mode-panel" data-playground-mode-panel="chat"{chat_hidden}>
+          <section class="pg-chat" aria-label="Text playground">
+            <div class="pg-chat-thread is-empty" data-playground-thread role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation">
+              <div class="pg-chat-empty" data-playground-empty>
+                <p class="pg-empty-model"><span class="pg-logo-tile pg-empty-model-logo" data-playground-active-model-icon>{default_model_icon}</span><span data-playground-active-model-name>{default_model_name}</span><em data-playground-active-model-context>Live route</em></p>
+                <h2>How can I help?</h2><p>Choose a starting point or write your own message.</p>
+                <div class="pg-starters"><button type="button" data-playground-starter data-playground-starter-prompt="Explain public-key cryptography with one concrete analogy and no jargon.">Explain a concept</button><button type="button" data-playground-starter data-playground-starter-prompt="Create a focused three-day plan for learning the basics of TypeScript.">Make a plan</button><button type="button" data-playground-starter data-playground-starter-prompt="Rewrite a short product announcement so it is clear, confident, and concise.">Improve writing</button></div>
+              </div>
+            </div>
+            <div class="pg-composer-wrap">
+              <div class="pg-composer"><label class="sr-only" for="playground-prompt">Message OpenMayhem</label><textarea id="playground-prompt" data-playground-prompt data-playground-draft maxlength="1600" rows="1" aria-describedby="playground-prompt-help" placeholder="Message OpenMayhem" required></textarea><span class="pg-composer-count" data-playground-chat-count hidden>0/1600</span><button class="pg-stop" type="button" data-playground-stop hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Stop</button><button class="pg-send" type="submit" data-playground-send aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></button></div>
+              <p id="playground-prompt-help">Live provider request. Do not enter sensitive information.</p>
+            </div>
+          </section>
+        </section>
+
+        <section id="playground-image-panel" role="tabpanel" aria-label="Image playground" class="pg-mode-panel" data-playground-mode-panel="image"{image_hidden}>
+          <section class="pg-media" aria-label="Image generation playground">
+            <div class="pg-settings"><div class="pg-section-heading"><h2>Generate an image</h2><p>Describe what you want to create.</p></div><label class="pg-field" for="playground-image-prompt"><span>Prompt <em class="pg-count" data-playground-image-count>0/1200</em></span><textarea id="playground-image-prompt" data-playground-image-prompt data-playground-draft maxlength="1200" rows="7" placeholder="A quiet observatory above a sea of clouds…"></textarea></label><fieldset class="pg-ratio-field"><legend>Aspect ratio</legend><div><button type="button" class="is-active" aria-pressed="true" data-playground-aspect-ratio="1:1"><span class="pg-ratio-glyph ratio-1-1" aria-hidden="true"></span>1:1</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="4:3"><span class="pg-ratio-glyph ratio-4-3" aria-hidden="true"></span>4:3</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="3:4"><span class="pg-ratio-glyph ratio-3-4" aria-hidden="true"></span>3:4</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="16:9"><span class="pg-ratio-glyph ratio-16-9" aria-hidden="true"></span>16:9</button></div></fieldset><button type="button" class="pg-primary-action" data-playground-generate-image disabled>{image_icon}<span>Generate image</span></button></div>
+            <div class="pg-output" data-playground-image-output aria-live="polite"><div class="pg-output-empty">{image_icon}<strong>Image output</strong><span>Your generated image will appear here.</span></div></div>
+          </section>
+        </section>
+
+        <section id="playground-speech-panel" role="tabpanel" aria-label="Speech playground" class="pg-mode-panel" data-playground-mode-panel="speech"{speech_hidden}>
+          <section class="pg-media" aria-label="Speech generation playground">
+            <div class="pg-settings"><div class="pg-section-heading"><h2>Generate speech</h2><p>Enter text and choose a voice.</p></div><label class="pg-field" for="playground-speech-text"><span>Text <em class="pg-count" data-playground-speech-count>0/800</em></span><textarea id="playground-speech-text" data-playground-speech-text data-playground-draft maxlength="800" rows="8" placeholder="Write a short passage to hear it spoken…"></textarea></label><fieldset class="pg-voice-field"><legend>Voice</legend><div class="pg-voice-grid"><label class="pg-voice-option is-selected"><input class="sr-only" data-playground-voice type="radio" name="pg-voice" value="af_heart" checked><span class="pg-voice-copy"><strong>Heart</strong><em>Warm American English</em></span><span class="pg-voice-check" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span></label><label class="pg-voice-option"><input class="sr-only" data-playground-voice type="radio" name="pg-voice" value="af_bella"><span class="pg-voice-copy"><strong>Bella</strong><em>Clear American English</em></span><span class="pg-voice-check" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span></label><label class="pg-voice-option"><input class="sr-only" data-playground-voice type="radio" name="pg-voice" value="bf_emma"><span class="pg-voice-copy"><strong>Emma</strong><em>Natural British English</em></span><span class="pg-voice-check" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span></label><label class="pg-voice-option"><input class="sr-only" data-playground-voice type="radio" name="pg-voice" value="bm_george"><span class="pg-voice-copy"><strong>George</strong><em>Measured British English</em></span><span class="pg-voice-check" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span></label></div></fieldset><button type="button" class="pg-primary-action" data-playground-generate-speech disabled>{speech_icon}<span>Generate speech</span></button></div>
+            <div class="pg-output" data-playground-speech-output aria-live="polite"><div class="pg-output-empty">{speech_icon}<strong>Audio output</strong><span>Generated speech will appear here.</span></div></div>
+          </section>
+        </section>
+      </div>
+    </div>
+
+    <section class="pg-network" data-playground-network>
+      <button type="button" class="pg-network-summary" data-playground-network-toggle aria-expanded="false" aria-controls="playground-network-body"><span class="pg-network-grip" aria-hidden="true"></span><span class="pg-network-dot" aria-hidden="true"></span><span class="pg-network-labels"><span class="pg-network-title">Network activity</span><span class="pg-network-state" data-playground-network-state>Ready</span></span><span class="pg-network-model"><span class="pg-logo-tile pg-network-model-logo" data-playground-network-icon>{default_model_icon}</span><span data-playground-network-model>{default_model_name}</span></span><svg class="pg-network-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
+      <div class="pg-network-body" id="playground-network-body" data-playground-network-body hidden><ol class="pg-network-steps" aria-label="Request progression"><li data-playground-step="request"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Request</span><span class="pg-step-detail">Waiting for input</span></span></li><li data-playground-step="provider"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Provider route</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="generate"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Generate</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="receipt"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Signed receipt</span><span class="pg-step-detail">Pending generation</span></span></li></ol><dl class="pg-network-facts"><div><dt>Model</dt><dd data-playground-fact="model">{default_model_name}</dd></div><div><dt>Provider</dt><dd data-playground-fact="provider">Revealed after receipt</dd></div><div><dt>Timing</dt><dd data-playground-fact="timing">Pending</dd></div><div><dt>Cost</dt><dd data-playground-fact="cost">Pending</dd></div><div><dt>Request ID</dt><dd data-playground-fact="request">Not started</dd></div></dl><p class="pg-network-footnote">Live values appear only as the gateway confirms them. Provider identity is revealed after a signed receipt is returned.</p></div>
+    </section>
+  </div>
+
+  <details class="pg-advanced" data-playground-request-settings><summary><span>Advanced request controls</span><span data-playground-request-summary>Gateway price and trust defaults</span></summary><div class="pg-advanced-grid">{token_field}<label class="pg-advanced-field span-all" for="playground-system"><span>System instructions <em>Text only</em></span><textarea id="playground-system" data-playground-system data-playground-draft rows="3"></textarea></label><label class="pg-advanced-field" for="playground-max-tokens"><span>Output limit <em>Text only</em></span><input id="playground-max-tokens" data-playground-max-tokens data-playground-draft type="number" inputmode="numeric" min="64" max="4096" step="64" value="512"></label><label class="pg-advanced-field" for="playground-max-price"><span><span data-playground-price-label>Route price ceiling</span><em data-playground-price-unit>USD</em></span><input id="playground-max-price" data-playground-max-price data-playground-draft data-money-input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" pattern="[0-9]+([.][0-9]{{1,18}})?" placeholder="Optional USD ceiling"></label><label class="pg-advanced-field" for="playground-min-att-tier"><span>Minimum attestation tier</span><select id="playground-min-att-tier" data-playground-min-att-tier data-playground-draft><option value="">Gateway default</option><option value="1">At least T1 numerically</option><option value="2">At least T2 numerically</option><option value="3">At least T3 numerically</option><option value="4">T4 only</option></select><small>Numeric identity tier does not promise confidential compute.</small></label><div class="preflight span-all" data-playground-preflight><span><strong>Capacity:</strong> <span data-preflight-value="availability">Checking</span></span><span><strong>Protection:</strong> <span data-preflight-value="protection">Checking catalog</span></span><span><strong>Context:</strong> <span data-preflight-value="context">Checking catalog</span></span><span><strong>Catalog rates:</strong> <span class="money-value" data-money data-preflight-value="price">Unavailable</span></span></div><button class="pg-text-action span-all" type="button" data-playground-reset-draft>Reset saved draft and settings</button></div></details>
+  <p class="pg-local-note" data-playground-meta>No request sent · drafts and history stay in this browser tab · access tokens are never saved</p>
+</form>
 </div>
-<aside class="stack"><div class="notice">Your prompt is sent to a selected network provider route. Same-origin access does not prove same-device execution or route privacy; inspect protection evidence before sending sensitive content.</div><details class="panel disclosure-panel"><summary>How routing and receipts work</summary><div class="panel-body"><div class="checklist"><div class="check-step done"><span class="check-mark">&#10003;</span><div class="check-copy"><strong>Gateway reached</strong><span>This control surface loaded from this gateway process.</span></div></div><div class="check-step active"><span class="check-mark">&rarr;</span><div class="check-copy"><strong>Eligibility is checked on Send</strong><span>Price, policy, capabilities, reputation, and attestation can still reject advertised capacity.</span></div></div><div class="check-step"><span class="check-mark"></span><div class="check-copy"><strong>Receipt follows completed work</strong><span>Actual units and metered charge appear in Activity.</span></div></div></div></div></details></aside>
-</section>"##
+</section>"##,
+            image_icon = playground_mode_icon("image"),
+            speech_icon = playground_mode_icon("speech"),
         )
     };
+
     shell(
         data,
         expires,
         DashboardAppPage::Playground,
         "Use AI",
+        "Playground",
         if credential_needed {
-            "Credential required before sending"
+            "Create a gateway token under Integrations, then return here to send a real request."
         } else {
-            "Ask, test, and verify"
-        },
-        if credential_needed {
-            "Create a gateway token under Connect, then return here to send a real request."
-        } else {
-            "A familiar chat flow backed by the same OpenAI-compatible gateway your apps use."
+            "Choose Text, Image, or Speech, then create through a live provider route."
         },
         if credential_needed {
             "Credential needed"
@@ -1737,15 +2247,15 @@ fn models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>)
         "models",
     );
     let content = format!(
-        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Model catalog</h2><p>Compare capabilities, cost, protection, context, and advertised capacity.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="models-table"><caption class="sr-only">Models in this gateway catalog</caption><thead><tr><th>Model</th><th>Advertised capacity</th><th>Capabilities</th><th>Catalog price</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}<a href="/mayhem/dashboard/network/models">Network detail</a></footer></section>"##,
+        r##"<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Model catalog</h2><p>Compare capabilities, cost, protection, context, and advertised capacity.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="models-table"><caption class="sr-only">Models in this gateway catalog</caption><thead><tr><th>Model</th><th>Advertised capacity</th><th>Capabilities</th><th>Catalog price</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}<a href="/mayhem/dashboard/network/models">Open network models</a></footer></section>"##,
     );
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Models,
         "Use AI",
         "Choose by what the work needs",
-        "Heartbeat state shows advertised acceptance and capacity; request-specific routing still checks price, policy, capabilities, reputation, and attestation when you send.",
+        "Compare models by capability, context, protection, and price. Final price and eligibility are confirmed when you send.",
         if data.accepting_models() > 0 { "Capacity advertised" } else { "No advertised capacity" },
         if data.accepting_models() > 0 { "good" } else { "warn" },
         if data.models.is_empty() {
@@ -1807,7 +2317,7 @@ fn model_rows(data: &DashboardData, page: PageWindow) -> String {
                 },
             );
             format!(
-                r##"<tr data-filter-row data-filter-text="{} {} {} {}"><th scope="row"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></th><td><span class="status-badge {}">{}</span><span class="table-secondary">{}</span></td><td data-export-value="{}" data-sort-value="{}">{}</td><td><span class="table-primary mono">{}</span><span class="table-secondary">catalog price v{}</span></td><td class="table-action"><div class="inline-actions"><a class="quiet-button" href="/mayhem/dashboard/playground?model={}" aria-label="Use {} in Playground">Use</a>{}</div></td></tr>"##,
+                r##"<tr data-filter-row data-filter-text="{} {} {} {}"><th scope="row"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></th><td><span class="status-badge {}">{}</span><span class="table-secondary">{}</span></td><td data-export-value="{}" data-sort-value="{}">{}</td><td><span class="table-primary mono">{}</span></td><td class="table-action"><div class="inline-actions"><a class="quiet-button" href="/mayhem/dashboard/playground?model={}" aria-label="Use {} in Playground">Use</a>{}</div></td></tr>"##,
                 html_escape(&model.id),
                 html_escape(&model.mayhem.family),
                 html_escape(availability.label),
@@ -1821,7 +2331,6 @@ fn model_rows(data: &DashboardData, page: PageWindow) -> String {
                 html_escape(&ability_export),
                 html_escape(&abilities),
                 money_html(&dashboard_model_price(model)),
-                model.mayhem.price_ref_au.ver,
                 dashboard_url_encode(&model.id),
                 html_escape(&model.id),
                 evidence,
@@ -1842,7 +2351,11 @@ fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str
             r##"<tr><td colspan="6">{}</td></tr>"##,
             empty_block(
                 "No activity yet",
-                "Requests recorded by this gateway run will appear here.",
+                if data.history_persistent {
+                    "Requests recorded by this gateway will remain available after restart."
+                } else {
+                    "Requests recorded by this gateway run will appear here."
+                },
                 None
             )
         )
@@ -1871,37 +2384,30 @@ fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str
         attention(
             "warn",
             "!",
-            "Incomplete records need review",
+            "Open records to review",
             &format!(
-                "{incomplete_count} session(s) have a latest non-final receipt or retained pause record. They are prioritized below, but do not prove that execution is still active."
+                "{} still waiting on a final receipt. Open records are listed first; an open record does not mean work is still running.",
+                count_noun(incomplete_count as u64, "session")
             ),
-            None,
+            Some(("Review open records", "#incomplete-activity")),
         )
     };
     let content = format!(
-        r##"{incomplete_attention}<section class="metric-grid" aria-label="Activity summary">{}{}{}</section><section class="panel" id="incomplete-activity"><header class="panel-head"><div class="panel-title"><h2>Session activity</h2><p>Incomplete records first, followed by latest final receipts; not a settlement, provider-job ledger, or live execution view.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="activity-table"><caption class="sr-only">Prioritized incomplete records, final receipts, and retained pause records from this gateway process</caption><thead><tr><th>Session</th><th>Model</th><th>Usage</th><th>Charge</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{activity_summary}</span>{pagination}</footer></section>"##,
+        r##"{incomplete_attention}<section class="metric-grid" aria-label="Activity summary">{}{}</section><section class="panel" id="incomplete-activity"><header class="panel-head"><div class="panel-title"><h2>Session activity</h2><p>Open records first, then the latest final receipt per session.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="activity-table"><caption class="sr-only">Prioritized incomplete records, final receipts, and retained pause records from this gateway process</caption><thead><tr><th>Session</th><th>Model</th><th>Usage</th><th>Charge</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{activity_summary}</span>{pagination}</footer></section>"##,
         metric(
             "Final receipts",
             &data.completed_requests().to_string(),
-            "Final metering receipts",
-            "This run"
+            "Requests with a signed final receipt",
+            data.history_scope()
         ),
         metric(
-            "Incomplete sessions",
+            "Open records",
             &incomplete_count.to_string(),
-            "Latest non-final receipt or retained pause record",
+            "Sessions without a final receipt yet",
             "Records"
         ),
-        metric(
-            "Checkpoints",
-            &data.receipt_checkpoint_count.to_string(),
-            "Raw gateway receipt records",
-            "This run"
-        ),
     );
-    let action = if incomplete_count > 0 {
-        r##"<a class="primary-button" href="#incomplete-activity">Review incomplete records</a>"##
-    } else if data.requires_auth() && data.active_token_count() == 0 {
+    let action = if data.requires_auth() && data.active_token_count() == 0 {
         r##"<a class="primary-button" href="/mayhem/dashboard/connect">Set up access</a>"##
     } else if data.models.is_empty() {
         r##"<a class="primary-button" href="/mayhem/dashboard/models">Inspect catalog</a>"##
@@ -1910,14 +2416,14 @@ fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str
     } else {
         r##"<a class="primary-button" href="/mayhem/dashboard/playground">New request</a>"##
     };
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Activity,
         "Use AI",
-        "Recorded requests and retained state",
-        "Receipts are signed metering evidence; pause-only rows are local gateway records. Neither is presented as settlement or a claim that work is still running.",
-        if incomplete_count > 0 { "Review incomplete records" } else { "Caught up" },
+        "Requests and receipts",
+        "Every request ends in a signed receipt. Open records are listed first — an open record does not mean work is still running.",
+        if incomplete_count > 0 { "Open records to review" } else { "Caught up" },
         if incomplete_count > 0 { "warn" } else { "good" },
         action,
         &content,
@@ -1937,10 +2443,11 @@ fn activity_table_row(receipt: &StoredReceipt, _index: usize) -> String {
         "Non-final receipt"
     };
     let tone = if body.final_receipt { "good" } else { "info" };
-    let status_detail = if body.final_receipt {
-        String::new()
+    let status_detail = String::new();
+    let metered_note = if body.final_receipt {
+        "metered total"
     } else {
-        r#"<span class="table-secondary">Execution state unknown</span>"#.to_owned()
+        "metered so far"
     };
     let access = receipt
         .access_token
@@ -1948,7 +2455,7 @@ fn activity_table_row(receipt: &StoredReceipt, _index: usize) -> String {
         .map(|token| token.name.as_str())
         .unwrap_or("Direct gateway use");
     format!(
-        r##"<tr data-filter-row data-filter-text="{} {} {} {} {}"><td data-export-value="{}"><span class="table-primary mono">{}</span><span class="table-secondary">{} ago &middot; {}</span></td><td data-export-value="{} / provider {}"><span class="table-primary">{}</span><span class="table-secondary">provider {}</span></td><td><span class="table-primary mono">{} in / {} out</span><span class="table-secondary">sequence {}</span></td><td data-money><span class="table-primary mono money-value">{}</span><span class="table-secondary">metered cumulative</span></td><td><span class="status-badge {tone}">{status}</span>{status_detail}</td><td>{}</td></tr>"##,
+        r##"<tr data-filter-row data-filter-text="{} {} {} {} {}"><td data-export-value="{}"><span class="table-primary mono">{}</span><span class="table-secondary">{} ago &middot; {}</span></td><td data-export-value="{} / provider {}"><span class="table-primary">{}</span><span class="table-secondary">provider {}</span></td><td><span class="table-primary mono">{} in / {} out</span><span class="table-secondary">receipt #{}</span></td><td data-money><span class="table-primary mono money-value">{}</span><span class="table-secondary">{metered_note}</span></td><td><span class="status-badge {tone}">{status}</span>{status_detail}</td><td>{}</td></tr>"##,
         html_escape(&body.session_id),
         html_escape(&body.model_id),
         html_escape(&body.provider),
@@ -2036,11 +2543,6 @@ fn wallet_deposit_status_command(rail: &str) -> String {
 }
 
 fn wallet_page(data: &DashboardData, expires: u64) -> String {
-    let balance = data
-        .payment_directory
-        .as_ref()
-        .map(|_| money_html(&format_au_usd(data.balance_au)))
-        .unwrap_or_else(|| "Unavailable".to_owned());
     let rail = data.rail.to_ascii_uppercase();
     let funding = wallet_funding_guide(&data.rail);
     let funding_label = privacy_amount_text(funding.label, funding.label_amount);
@@ -2052,35 +2554,90 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
         .as_ref()
         .and_then(|value| value.get("ok"))
         .and_then(Value::as_bool);
-    let (status, tone) = match (payment_ok, data.payment_snapshot_is_fresh()) {
+    let balance_ready = data.payment_directory.is_some() && data.balance_au > 0;
+    let funding_needed = data.payment_directory.is_some() && data.balance_au == 0;
+    let (ledger_status, ledger_tone) = match (payment_ok, data.payment_snapshot_is_fresh()) {
         (Some(true), Some(true)) => ("Ledger snapshot current", "good"),
         (Some(false), _) => ("Payment rates stale", "warn"),
         (Some(true), Some(false)) => ("Ledger snapshot out of date", "warn"),
         (Some(true), None) => ("Ledger freshness unavailable", "warn"),
         (None, _) => ("Payment directory unavailable", "warn"),
     };
-    let payment_state = if status == "Ledger snapshot current" {
+    let (status, tone) = if funding_needed {
+        ("Funding needed", "warn")
+    } else if balance_ready {
+        ("Ready to use", "good")
+    } else {
+        (ledger_status, ledger_tone)
+    };
+    let ledger_status_badge = if ledger_status == "Ledger snapshot current" {
         payment_freshness_window(data).map_or_else(
-            || html_escape(status),
-            |window| volatile_text(status, window, "Refresh to reconfirm"),
+            || status_badge("Current", "good"),
+            |window| volatile_status_badge("Current", "good", window, "Refresh to reconfirm"),
         )
     } else {
-        html_escape(status)
+        let label = match ledger_status {
+            "Ledger snapshot out of date" => "Refresh to reconfirm",
+            "Payment rates stale" => "Rates stale",
+            "Ledger freshness unavailable" => "Freshness unknown",
+            _ => "Directory unavailable",
+        };
+        status_badge(label, "warn")
+    };
+    let ledger_status_meta = match ledger_status {
+        "Ledger snapshot current" => "The balance above matches the latest confirmed snapshot.",
+        "Ledger snapshot out of date" => {
+            "The balance above is the last confirmed snapshot. Refresh before sending."
+        }
+        _ => "The balance above cannot be confirmed right now.",
+    };
+    let next_step = if funding_needed {
+        attention(
+            "warn",
+            "1",
+            "Fund, confirm, then send",
+            "Copy the funding command below, complete it in the CLI, then refresh this page until the ledger balance updates. The dashboard never starts a transaction without your review.",
+            Some(("View funding command", "#wallet-funding-command")),
+        )
+    } else if balance_ready {
+        attention(
+            "good",
+            "✓",
+            "Balance observed",
+            "The last ledger snapshot shows funds. Refresh this page if its freshness state expires before you send; the final signed receipt records the metered charge.",
+            Some(("Open Playground", "/mayhem/dashboard/playground")),
+        )
+    } else {
+        attention(
+            "warn",
+            "!",
+            "Confirm the payment directory first",
+            "Funding guidance is shown, but this gateway cannot currently confirm the canonical balance or payment freshness.",
+            None,
+        )
     };
     let content = format!(
-        r##"<section class="metric-grid">{}{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Funding and balance</h2><p>Actions remain in the CLI until the dashboard has a reviewable transaction workflow.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">{}</span><pre class="code-block"><code id="wallet-funding-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-funding-command" aria-label="Copy funding command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">{} This page does not start a transaction.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">Check a pending deposit</span><pre class="code-block"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Reads the configured rail's canonical ledger state without changing it.</p></div></div></section></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Recovery readiness</h2><p>Secret material is never rendered in this dashboard.</p></div></header><div class="panel-body"><p class="notice warn"><strong>Backup status is not exposed to the gateway.</strong> Check it on the gateway host before relying on this wallet for provider payouts.</p><pre class="code-block"><code id="wallet-backup-command">mayhem wallet backup</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-backup-command" aria-label="Copy wallet backup command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">The CLI requires explicit confirmation before revealing a mnemonic. Anyone who sees it can restore the wallet.</p></div></section></aside></section>"##,
-        metric_with_meta_html("Ledger balance", &balance, &observed, &rail),
-        metric(
-            "Active rail",
-            &html_escape(&rail),
-            "Configured for gateway receipts",
-            "Config"
-        ),
-        metric(
-            "Payment state",
-            &payment_state,
-            "Canonical directory snapshot",
-            "Ledger"
+        r##"{next_step}<section class="metric-grid">{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Fund your requests</h2><p>Three steps: fund in the CLI, confirm the ledger, then return to Playground.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">1. {}</span><pre class="code-block"><code id="wallet-funding-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-funding-command" data-product-event="billing_funding_command_copied" aria-label="Copy funding command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">{} This page does not start a transaction.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Check a pending deposit</span><pre class="code-block"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" data-product-event="billing_deposit_check_copied" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Reads the configured rail's canonical ledger state without changing it. Refresh this page after confirmation.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">3. Send a request</span><p class="result-summary">Once the balance appears above, open Playground. The receipt—not an estimate—shows the metered result.</p><a class="soft-button" href="/mayhem/dashboard/playground" data-product-event="billing_to_playground">Open Playground</a></div></div></section></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Recovery readiness</h2><p>Secret material is never rendered in this dashboard.</p></div></header><div class="panel-body"><p class="notice warn"><strong>Backup status is not exposed to the gateway.</strong> Check it on the gateway host before relying on this wallet for provider payouts.</p><pre class="code-block"><code id="wallet-backup-command">mayhem wallet backup</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-backup-command" aria-label="Copy wallet backup command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">The CLI requires explicit confirmation before revealing a mnemonic. Anyone who sees it can restore the wallet.</p></div></section></aside></section>"##,
+        if data.payment_directory.is_some() {
+            metric_with_meta_html(
+                "Ledger balance",
+                &money_html(&format_au_usd(data.balance_au)),
+                &observed,
+                &rail,
+            )
+        } else {
+            metric_status(
+                "Ledger balance",
+                &status_badge("Unavailable", "warn"),
+                "The payment directory has not answered yet.",
+                &rail,
+            )
+        },
+        metric_status(
+            "Ledger status",
+            &ledger_status_badge,
+            ledger_status_meta,
+            "Ledger",
         ),
         funding_label,
         funding_command,
@@ -2091,9 +2648,9 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
         data,
         expires,
         DashboardAppPage::Wallet,
-        "Funds",
-        "Balance, funding, and recovery",
-        "Money states are labelled by source and freshness. Secrets remain outside the browser.",
+        "Billing",
+        "Billing",
+        "Fund requests, verify the ledger, and keep secret material outside the browser.",
         status,
         tone,
         "",
@@ -2112,7 +2669,7 @@ fn connect_page(
     let auth = if data.requires_auth() {
         "Required"
     } else {
-        "Optional on this gateway"
+        "Optional"
     };
     let token_count = data.active_token_count();
     let credential_ready = !data.requires_auth() || token_count > 0;
@@ -2173,19 +2730,28 @@ fn connect_page(
         r##"<a class="primary-button" href="/mayhem/dashboard/playground">Test with Playground</a>"##
     };
     let content = format!(
-        r##"<section class="metric-grid">{}{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>OpenAI-compatible connection</h2><p>Works with clients that accept a custom base URL.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">Base URL</span><div class="code-block"><code id="gateway-base-url">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-base-url" aria-label="Copy base URL"><span data-copy-label>Copy</span></button></div></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">Environment</span><pre class="code-block"><code id="gateway-env">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-env" aria-label="Copy environment variables"><span data-copy-label>Copy</span></button></pre></div></div><footer class="panel-footer"><span>The API key value is ignored when gateway authentication is optional.</span><button class="quiet-button js-only" type="button" data-connection-test data-result-target="#connection-result">Check dashboard session</button></footer></section><div class="notice" id="connection-result" hidden></div></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Connection checklist</h2><p>Know what each successful step proves</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step done"><span class="check-mark">&#10003;</span><div class="check-copy"><strong>Dashboard session</strong><span>This gateway dashboard is reachable.</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Gateway credential</strong><span>{}</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Inference route</strong><span>{}</span></div></div></div></div></section></aside></section>{token_store_notice}<section class="panel section-gap" id="access-tokens"><header class="panel-head"><div class="panel-title"><h2>Access tokens</h2><p>Names and budgets are visible; token secrets are not recoverable here.</p></div>{token_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="access-tokens-table"><caption class="sr-only">Gateway access tokens, budgets, scopes, and status</caption><thead><tr><th>Name</th><th>Budget use</th><th>Last used</th><th>Scope</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></div>{token_filter_empty}</div><footer class="panel-footer"><span>Create and revoke with <code>mayhem tokens</code>. Never paste tokens into support messages.</span><span>{token_summary}</span>{token_pagination}</footer></section>"##,
-        metric(
+        r##"<section class="metric-grid">{}{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>OpenAI-compatible connection</h2><p>Works with clients that accept a custom base URL.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">1. Copy the base URL</span><div class="code-block"><code id="gateway-base-url">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-base-url" data-product-event="integration_base_url_copied" aria-label="Copy base URL"><span data-copy-label>Copy</span></button></div></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Configure your app</span><pre class="code-block"><code id="gateway-env">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#gateway-env" data-product-event="integration_environment_copied" aria-label="Copy environment variables"><span data-copy-label>Copy</span></button></pre></div></div><footer class="panel-footer"><span>The API key value is ignored when gateway authentication is optional.</span><button class="quiet-button js-only" type="button" data-connection-test data-result-target="#connection-result">Verify dashboard access</button></footer></section><div class="notice" id="connection-result" hidden></div></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Prove inference</h2><p>What each successful step shows</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step done"><span class="check-mark">&#10003;</span><div class="check-copy"><strong>Dashboard access</strong><span>This gateway dashboard is reachable.</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Gateway credential</strong><span>{}</span></div></div><div class="check-step {}"><span class="check-mark">{}</span><div class="check-copy"><strong>Inference route</strong><span>{}</span></div></div></div></div></section></aside></section>{token_store_notice}<section class="panel section-gap" id="access-tokens"><header class="panel-head"><div class="panel-title"><h2>Access tokens</h2><p>Names and budgets are visible; token secrets are not recoverable here.</p></div>{token_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="access-tokens-table"><caption class="sr-only">Gateway access tokens, budgets, scopes, and status</caption><thead><tr><th>Name</th><th>Budget use</th><th>Last used</th><th>Scope</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></div>{token_filter_empty}</div><footer class="panel-footer"><span>Create and revoke with <code>mayhem tokens</code>. Never paste tokens into support messages.</span><span>{token_summary}</span>{token_pagination}</footer></section>"##,
+        metric_status(
             "Endpoint",
-            "OpenAI API",
-            "URL derived from this dashboard request origin",
-            "Gateway origin"
+            &status_badge("OpenAI-compatible", "info"),
+            "The base URL below comes from this dashboard's address.",
+            "Gateway"
         ),
-        metric("Authentication", auth, "Bearer token policy", "Access"),
+        metric_status(
+            "Authentication",
+            &status_badge(auth, if data.requires_auth() { "info" } else { "good" }),
+            if data.requires_auth() {
+                "Requests need an active access token."
+            } else {
+                "Requests work without a key on this gateway."
+            },
+            "Access"
+        ),
         metric(
             "Active tokens",
             &token_count.to_string(),
-            "Secrets remain in their clients",
-            "Now"
+            "Token secrets stay in the apps that hold them",
+            "Current"
         ),
         html_escape(&base_url),
         html_escape(&env_block),
@@ -2346,7 +2912,6 @@ fn earn_overview_page(
     );
     let free_capacity = provider_current_value(slots.free.to_string(), &slots, freshness);
     let queue_backlog = provider_current_value(slots.backlog.to_string(), &slots, freshness);
-    let heartbeat_basis = provider_metric_basis(&slots);
     let coverage = provider_coverage_notice(&slots, freshness);
     // Route inspection may be requested from the URL, but money is private to the
     // provider identity configured by this gateway process.
@@ -2361,33 +2926,67 @@ fn earn_overview_page(
     };
     let reliability = provider_reliability_range(&entries);
     let claimable = provider_claimable(data, provider_id);
-    let metrics = format!(
-        r##"<section class="metric-grid">{}{}{}{}</section>"##,
-        metric(
-            "Active slots",
-            &active_slots,
-            &heartbeat_basis,
-            "Fresh heartbeat"
-        ),
-        metric(
-            "Free capacity",
-            &free_capacity,
-            &heartbeat_basis,
-            "Fresh heartbeat"
-        ),
-        metric(
-            "Queue backlog",
-            &queue_backlog,
-            &heartbeat_basis,
-            "Fresh heartbeat"
-        ),
-        metric(
-            "Lowest contract reputation",
-            &reliability,
-            "Protocol field shown without inventing a time window",
-            "Contract"
-        ),
-    );
+    let heartbeat_metrics_available = slots.total_routes > 0 && slots.fresh_routes > 0;
+    let metrics = if heartbeat_metrics_available {
+        format!(
+            r##"<section class="metric-grid">{}{}{}{}</section>"##,
+            metric(
+                "Active slots",
+                &active_slots,
+                "Jobs running now out of the advertised maximum",
+                "Fresh heartbeat"
+            ),
+            metric(
+                "Free capacity",
+                &free_capacity,
+                "Open slots advertised to the network",
+                "Fresh heartbeat"
+            ),
+            metric(
+                "Queue backlog",
+                &queue_backlog,
+                "Requests waiting across fresh routes",
+                "Fresh heartbeat"
+            ),
+            metric(
+                "Lowest route reputation",
+                &reliability,
+                "The weakest reputation among this provider's contracts",
+                "Contract"
+            ),
+        )
+    } else {
+        let (waiting_label, waiting_meta) = if slots.total_routes == 0 {
+            (
+                "No routes yet",
+                "Slots, capacity, and queue totals appear once a route is configured and sends a heartbeat.",
+            )
+        } else {
+            (
+                "Waiting for fresh heartbeat",
+                "Slots, capacity, and queue totals return with the next fresh heartbeat.",
+            )
+        };
+        let reputation_metric = if reliability == "Unavailable" {
+            String::new()
+        } else {
+            metric(
+                "Lowest route reputation",
+                &reliability,
+                "The weakest reputation among this provider's contracts",
+                "Contract",
+            )
+        };
+        format!(
+            r##"<section class="metric-grid">{}{reputation_metric}</section>"##,
+            metric_status(
+                "Live route metrics",
+                &status_badge(waiting_label, "warn"),
+                waiting_meta,
+                "Fresh heartbeat"
+            ),
+        )
+    };
     let metrics = format!("{metrics}{coverage}");
     let route_page = PageWindow::from_query(entries.len(), MAX_PROVIDER_ROWS, requested_page);
     let route_rows = provider_route_rows(data, &entries, route_page);
@@ -2422,32 +3021,361 @@ fn earn_overview_page(
         earnings_freshness_window(&data.earnings).map_or_else(
             || html_escape(&claimable.freshness),
             |window| {
-                volatile_relative_label(
-                    "Refreshed",
-                    window,
-                    "Snapshot expired; refresh to reconfirm",
-                )
+                volatile_relative_label("Refreshed", window, "Refresh to reconfirm amounts")
             },
         )
     } else {
         html_escape(&claimable.freshness)
     };
     let content = format!(
-        r##"{subnav}{identity_attention}{metrics}<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Serving routes</h2><p>Every status combines heartbeat freshness, acceptance, and slot capacity.</p></div>{route_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="earn-routes-table"><caption class="sr-only">Configured provider serving routes and current capacity</caption><thead><tr><th>Model / room</th><th>State</th><th>Slots</th><th>Queue</th><th>Performance</th></tr></thead><tbody>{route_rows}</tbody></table></div>{route_filter_empty}</div><footer class="panel-footer"><span>{route_summary}</span>{route_pagination}</footer></section></div><aside class="stack">{action}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Settlement snapshot</h2><p>Last-known canonical ledger fields with explicit freshness</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Last known claimable on {}</span><strong data-money><span class="money-value">{}</span></strong></div><div class="fact"><span>Refresh</span><strong>{claimable_freshness}</strong></div></div></div><footer class="panel-footer"><span>{}</span></footer></section></aside></section>"##,
+        r##"{subnav}{identity_attention}{activation}{metrics}<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Serving routes</h2><p>Every status combines heartbeat freshness, acceptance, and slot capacity.</p></div>{route_filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="earn-routes-table"><caption class="sr-only">Configured provider serving routes and current capacity</caption><thead><tr><th>Model / room</th><th>State</th><th>Slots</th><th>Queue</th><th>Performance</th></tr></thead><tbody>{route_rows}</tbody></table></div>{route_filter_empty}</div><footer class="panel-footer"><span>{route_summary}</span>{route_pagination}</footer></section></div><aside class="stack">{action}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Settlement snapshot</h2><p>Last-known canonical ledger fields with explicit freshness</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Last known claimable on {}</span><strong data-money><span class="money-value">{}</span></strong></div><div class="fact"><span>Refresh</span><strong>{claimable_freshness}</strong></div></div></div><footer class="panel-footer"><span>{}</span><a href="/mayhem/dashboard/earn/earnings">Open earnings</a></footer></section></aside></section>"##,
         html_escape(&data.rail.to_ascii_uppercase()),
         html_escape(&claimable.value),
         html_escape(claimable.basis),
+        activation = provider_activation_panel(data, &state, &entries),
     );
+    // A healthy page keeps a stable name; degraded states keep their status as
+    // the heading so the problem is impossible to miss.
+    let heading = if state.kind == RouteStateKind::Accepting {
+        "Earn with this machine"
+    } else {
+        state.label
+    };
     shell(
         data,
         expires,
         DashboardAppPage::Earn,
         "Provider operations",
-        state.label,
+        heading,
         &state.explanation,
         state.label,
         state.tone,
         primary_action,
+        &content,
+    )
+}
+
+fn provider_job_records<'a>(
+    data: &'a DashboardData,
+    provider: Option<&str>,
+) -> Vec<&'a StoredReceipt> {
+    let Some(provider) = provider else {
+        return Vec::new();
+    };
+    data.receipts
+        .iter()
+        .filter(|receipt| receipt.receipt.body.provider == provider)
+        .collect()
+}
+
+fn provider_jobs_chart(data: &DashboardData, jobs: &[&StoredReceipt]) -> String {
+    let today = now_secs() / 86_400;
+    let mut days = [0usize; 7];
+    for receipt in jobs
+        .iter()
+        .filter(|receipt| receipt.receipt.body.final_receipt)
+    {
+        let receipt_day = timestamp_seconds(receipt.receipt.body.ts) / 86_400;
+        let age = today.saturating_sub(receipt_day);
+        if age < 7 {
+            days[6 - age as usize] += 1;
+        }
+    }
+    let total = days.iter().sum::<usize>();
+    if total == 0 {
+        return String::new();
+    }
+    let max = days.iter().copied().max().unwrap_or(1).max(1);
+    let bars = days
+        .into_iter()
+        .enumerate()
+        .map(|(index, count)| {
+            let level = if count == 0 {
+                0
+            } else {
+                ((count * 10).div_ceil(max)).max(1)
+            };
+            let label = if index == 6 {
+                "Today".to_owned()
+            } else {
+                format!("{}d ago", 6 - index)
+            };
+            format!(
+                r##"<li aria-label="{label}: {count} completed provider job{}"><span class="usage-bar level-{level}"><span></span></span><strong>{count}</strong><small>{label}</small></li>"##,
+                if count == 1 { "" } else { "s" },
+            )
+        })
+        .collect::<String>();
+    format!(
+        r##"<figure class="panel usage-chart section-gap"><figcaption class="panel-head"><div class="panel-title"><h2>Completed provider work</h2><p>Last 7 calendar days from {}; receipt evidence, not payout state</p></div><strong>{total}</strong></figcaption><div class="panel-body"><ol class="usage-bars">{bars}</ol></div></figure>"##,
+        html_escape(&data.history_scope().to_ascii_lowercase()),
+    )
+}
+
+fn provider_activation_panel(
+    data: &DashboardData,
+    state: &RouteState,
+    entries: &[&ProviderTableEntry],
+) -> String {
+    let provider = data.local_provider_id.as_deref();
+    let progress = provider.and_then(|provider| latest_provider_progress(data, provider));
+    let identity_done = provider.is_some();
+    let prepared_done = !entries.is_empty() || progress.is_some_and(progress_is_terminal);
+    let route_done = !entries.is_empty();
+    let fresh_done = provider_freshness_window(data, entries).is_some();
+    let first_job_done = provider_job_records(data, provider)
+        .iter()
+        .any(|receipt| receipt.receipt.body.final_receipt);
+    let earnings_done = provider.is_some_and(|provider| {
+        data.earnings
+            .entries
+            .iter()
+            .any(|entry| entry.get("provider").and_then(Value::as_str) == Some(provider))
+    });
+    let steps = [
+        (
+            identity_done,
+            "Provider identity",
+            "This gateway can scope machine state and private earnings to the configured provider.",
+        ),
+        (
+            prepared_done,
+            "Model prepared",
+            "The provider reports completed preparation or has already published a matching route.",
+        ),
+        (
+            route_done && fresh_done,
+            "Route confirmed",
+            "A matching route is published and this gateway has current heartbeat evidence.",
+        ),
+        (
+            first_job_done,
+            "First completed job",
+            if data.history_persistent {
+                "A final signed receipt for this provider is present in durable gateway history."
+            } else {
+                "A final signed receipt for this provider is present in the current gateway run."
+            },
+        ),
+        (
+            earnings_done,
+            "Earnings record",
+            "The canonical ledger exposes an earnings record for this provider identity.",
+        ),
+    ];
+    let current = steps.iter().position(|(done, _, _)| !done);
+    let complete = steps.iter().filter(|(done, _, _)| *done).count();
+    let step_markup = steps
+        .into_iter()
+        .enumerate()
+        .map(|(index, (done, label, detail))| {
+            let class_name = if done {
+                "done"
+            } else if Some(index) == current {
+                "active"
+            } else {
+                ""
+            };
+            let marker = if done {
+                "&#10003;".to_owned()
+            } else {
+                (index + 1).to_string()
+            };
+            let state_label = if done {
+                "Complete"
+            } else if Some(index) == current {
+                "Current"
+            } else {
+                "Not started"
+            };
+            format!(
+                r##"<li class="check-step {class_name}"><span class="check-mark" aria-hidden="true">{marker}</span><div class="check-copy"><span class="sr-only">{state_label}: </span><strong>{}</strong><span>{}</span></div></li>"##,
+                html_escape(label),
+                html_escape(detail),
+            )
+        })
+        .collect::<String>();
+    let next = if !identity_done {
+        r##"<div class="provider-start-command"><span class="field-label">Run on this machine</span><pre class="code-block"><code id="provider-start-command">mayhem up --provider --yes</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#provider-start-command" aria-label="Copy provider start command"><span data-copy-label>Copy</span></button></pre></div>"##.to_owned()
+    } else if !prepared_done || !route_done || !fresh_done {
+        // In a failed state the page-level "Inspect failure" action is the one
+        // primary; this panel's link stays secondary to avoid competing CTAs.
+        if state.kind == RouteStateKind::Failed {
+            r##"<a class="soft-button" href="/mayhem/dashboard/earn/machines">Continue setup</a>"##
+                .to_owned()
+        } else {
+            r##"<a class="primary-button" href="/mayhem/dashboard/earn/machines">Continue setup</a>"##
+                .to_owned()
+        }
+    } else if !first_job_done {
+        r##"<a class="primary-button" href="/mayhem/dashboard/earn/jobs">Open jobs</a>"##
+            .to_owned()
+    } else if !earnings_done {
+        r##"<a class="primary-button" href="/mayhem/dashboard/earn/earnings">Check settlement</a>"##
+            .to_owned()
+    } else {
+        r##"<a class="soft-button" href="/mayhem/dashboard/earn/jobs">Review jobs</a>"##.to_owned()
+    };
+    format!(
+        r##"<section class="panel activation-panel"><header class="panel-head"><div class="panel-title"><h2>Provider activation</h2><p>{complete} of 5 milestones confirmed from gateway evidence</p></div><span class="status-badge {}">{}</span></header><div class="panel-body activation-grid"><ol class="checklist">{step_markup}</ol><div class="activation-next"><strong>Next best action</strong><p>{}</p>{next}</div></div></section>"##,
+        state.tone,
+        html_escape(state.label),
+        html_escape(if complete == 5 {
+            "Your provider path is complete. Keep the machine healthy and review only exceptions."
+        } else if !identity_done {
+            "Start the supervised provider flow; hardware fit, model preparation, and runtime health remain visible here."
+        } else {
+            "Complete the current milestone. Later steps will unlock only from authoritative evidence."
+        }),
+    )
+}
+
+fn earn_jobs_page(
+    data: &DashboardData,
+    expires: u64,
+    requested: Option<&str>,
+    requested_page: Option<&str>,
+) -> String {
+    let provider = data.local_provider_id.as_deref();
+    let jobs = provider_job_records(data, provider);
+    let completed = jobs
+        .iter()
+        .filter(|receipt| receipt.receipt.body.final_receipt)
+        .count();
+    let incomplete = jobs.len().saturating_sub(completed);
+    let total_metered = jobs
+        .iter()
+        .filter(|receipt| receipt.receipt.body.final_receipt)
+        .fold(0_u128, |total, receipt| {
+            total.saturating_add(receipt.receipt.body.au_owed_cum)
+        });
+    let page = PageWindow::from_query(jobs.len(), MAX_ACTIVITY_ROWS, requested_page);
+    let rows = jobs
+        .iter()
+        .skip(page.start)
+        .take(page.len())
+        .map(|receipt| {
+            let body = &receipt.receipt.body;
+            let status = if body.final_receipt {
+                ("Completed", "good", "Final signed receipt")
+            } else {
+                ("Needs review", "warn", "Latest receipt is non-final")
+            };
+            let metered_note = if body.final_receipt {
+                "metered total"
+            } else {
+                "metered so far"
+            };
+            let evidence = evidence_link(
+                &evidence_href("receipt", &[("id", body.session_id.as_str())]),
+                "Verify",
+                &body.session_id,
+            );
+            format!(
+                r##"<tr data-filter-row data-filter-text="{} {} {} {}"><td data-sort-value="{}"><span class="table-primary">{} ago</span><span class="table-secondary mono">{}</span></td><td><span class="table-primary">{}</span><span class="table-secondary">{} in / {} out</span></td><td data-money><span class="table-primary money-value">{}</span><span class="table-secondary">{metered_note}</span></td><td><span class="status-badge {}">{}</span><span class="table-secondary">{}</span></td><td><span class="table-secondary">Settles on the ledger</span></td><td>{}</td></tr>"##,
+                html_escape(&body.model_id),
+                html_escape(&body.session_id),
+                status.0,
+                html_escape(&body.provider),
+                timestamp_seconds(body.ts),
+                html_escape(&format_elapsed_since(timestamp_seconds(body.ts))),
+                html_escape(short_text(&body.session_id, 18).as_ref()),
+                html_escape(short_text(&body.model_id, 32).as_ref()),
+                body.usage.prompt_tokens(),
+                body.usage.output_tokens(),
+                html_escape(&format_au_usd(body.au_owed_cum)),
+                status.1,
+                status.0,
+                status.2,
+                evidence,
+            )
+        })
+        .collect::<String>();
+    let body = if rows.is_empty() {
+        format!(
+            r##"<tr><td colspan="6">{}</td></tr>"##,
+            empty_block(
+                if provider.is_some() {
+                    "Waiting for the first job"
+                } else {
+                    "Provider setup has not started"
+                },
+                if provider.is_some() {
+                    "Keep the provider healthy. A signed receipt will appear here after this gateway observes completed work for the configured provider."
+                } else {
+                    "Start the provider flow from Earn overview before expecting job evidence."
+                },
+                None,
+            )
+        )
+    } else {
+        rows
+    };
+    let (filter, filter_empty) = shown_rows_filter(
+        "provider-jobs",
+        "provider-jobs-table",
+        "Filter observed jobs by model, session, provider, or state",
+        page.len(),
+        "jobs",
+    );
+    let pagination = pagination_nav_with_optional_provider(
+        page,
+        "/mayhem/dashboard/earn/jobs",
+        requested,
+        "observed jobs",
+    );
+    let activity_chart = provider_jobs_chart(data, &jobs);
+    let content = format!(
+        r##"{}{}<section class="metric-grid">{}{}{}</section>{}{activity_chart}<section class="panel section-gap"><header class="panel-head"><div class="panel-title"><h2>Observed jobs</h2><p>The latest signed metering record for each session this provider served.</p></div>{filter}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="provider-jobs-table"><caption class="sr-only">Gateway-observed provider jobs and signed receipt status</caption><thead><tr><th>Observed</th><th>Model and usage</th><th>Metered amount</th><th>Receipt status</th><th>Settlement</th><th>Evidence</th></tr></thead><tbody>{body}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{}</span>{pagination}<a href="/mayhem/dashboard/earn/earnings">Open earnings</a></footer></section>"##,
+        earn_subnav(DashboardProductPage::EarnJobs),
+        provider_identity_attention(data, requested),
+        metric(
+            "Observed jobs",
+            &jobs.len().to_string(),
+            "Latest record per session",
+            data.history_scope()
+        ),
+        metric(
+            "Completed",
+            &completed.to_string(),
+            "Final signed receipts",
+            "Gateway evidence"
+        ),
+        metric(
+            "Metered total",
+            &money_html(&format_au_usd(total_metered)),
+            "Across completed jobs — payouts settle on the ledger",
+            "Receipts"
+        ),
+        if incomplete > 0 {
+            attention("warn", "!", "Open jobs to review", &format!("{} still waiting on a final receipt. An open record does not mean work is still running.", count_noun(incomplete as u64, "observed session")), Some(("Review activity", "/mayhem/dashboard/activity")))
+        } else {
+            String::new()
+        },
+        page.status("observed jobs"),
+    );
+    shell_wide(
+        data,
+        expires,
+        DashboardAppPage::Earn,
+        "Provider work",
+        "Jobs",
+        "Each job this gateway observed, with its signed metering record.",
+        if provider.is_none() {
+            "Setup required"
+        } else if incomplete > 0 {
+            "Review incomplete work"
+        } else if jobs.is_empty() {
+            "Waiting for first job"
+        } else {
+            "Jobs recorded"
+        },
+        if provider.is_none() || incomplete > 0 { "warn" } else if jobs.is_empty() { "" } else { "good" },
+        if provider.is_none() {
+            r##"<a class="primary-button" href="/mayhem/dashboard/earn">Start provider setup</a>"##
+        } else {
+            ""
+        },
         &content,
     )
 }
@@ -2483,13 +3411,13 @@ fn earn_machines_page(
         earn_subnav(DashboardProductPage::EarnMachines),
         identity = provider_identity_attention(data, requested),
     );
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Earn,
         "Provider operations",
         "Machines and serving routes",
-        "Fresh heartbeat and capacity facts first; unsupported hardware telemetry is not invented.",
+        "Each configured route with its latest heartbeat, capacity, and performance.",
         state.label,
         state.tone,
         "",
@@ -2554,7 +3482,7 @@ fn earn_opportunities_page(
     );
     let provider_entries = data.provider_entries(requested);
     let state = provider_page_state(data, requested, &provider_entries);
-    shell(data, expires, DashboardAppPage::Earn, "Provider planning", "Model fit", "Match this gateway host against catalog requirements and compare current advertised supply.", state.label, state.tone, "", &content)
+    shell_wide(data, expires, DashboardAppPage::Earn, "Provider planning", "Model fit", "Which catalog models this machine can run, next to what the network currently supplies.", state.label, state.tone, "", &content)
 }
 
 fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str>) -> String {
@@ -2569,14 +3497,14 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
     } else if snapshot_fresh {
         "Ledger snapshot current"
     } else {
-        "Snapshot stale or delayed"
+        "Refresh to reconfirm"
     };
     let snapshot_tone = if snapshot_fresh && data.earnings.entries.is_empty() {
         ""
     } else if snapshot_fresh {
         "good"
     } else {
-        "warn"
+        ""
     };
     let snapshot_window = earnings_freshness_window(&data.earnings);
     let snapshot_badge = snapshot_window.map_or_else(
@@ -2587,20 +3515,16 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
                 html_escape(snapshot_state)
             )
         },
-        |window| volatile_status_badge(snapshot_state, snapshot_tone, window, "Snapshot expired"),
+        |window| {
+            volatile_status_badge(snapshot_state, snapshot_tone, window, "Refresh to reconfirm")
+        },
     );
     let refresh_label = snapshot_window.map_or_else(
         || html_escape(&earnings_refresh_label(&data.earnings)),
-        |window| {
-            volatile_relative_label(
-                "Refreshed",
-                window,
-                "Snapshot expired; refresh to reconfirm",
-            )
-        },
+        |window| volatile_relative_label("Refreshed", window, "Refresh to reconfirm amounts"),
     );
     let content = format!(
-        r##"{}{}<div class="notice"><strong>Money states stay separate.</strong> Total recorded, held, claimable, and paid are cumulative ledger fields. They are not &ldquo;this hour&rdquo; earnings.</div><section class="panel section-gap"><header class="panel-head"><div class="panel-title"><h2>Canonical earnings records</h2><p>Scoped to the configured provider identity and kept separate by rail.</p></div>{snapshot_badge}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table"><caption class="sr-only">Canonical provider earnings and payout state by rail</caption><thead><tr><th>Rail</th><th>Total recorded</th><th>Held</th><th>Claimable</th><th>Paid cumulative</th><th>Ledger epoch</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div></div><footer class="panel-footer"><span>{refresh_label}</span><span>Verify shows the exact transformed ledger record and any payout reference it contains.</span></footer></section>"##,
+        r##"{}{}<div class="notice"><strong>Cumulative totals.</strong> Recorded, held, claimable, and paid are lifetime ledger fields &mdash; not hourly earnings.</div><section class="panel section-gap"><header class="panel-head"><div class="panel-title"><h2>Earnings records</h2><p>For this provider identity, grouped by payment rail.</p></div>{snapshot_badge}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table"><caption class="sr-only">Canonical provider earnings and payout state by rail</caption><thead><tr><th>Rail</th><th>Total recorded</th><th>Held</th><th>Claimable</th><th>Paid cumulative</th><th>Ledger epoch</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div></div><footer class="panel-footer"><span>{refresh_label}</span><span>Verify opens the exact ledger record behind each row.</span></footer></section>"##,
         earn_subnav(DashboardProductPage::EarnEarnings),
         provider_identity_attention(data, requested),
     );
@@ -2610,7 +3534,7 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
         DashboardAppPage::Earn,
         "Provider finance",
         "Earnings and payouts",
-        "Canonical ledger fields stay separate from estimates and unconfirmed payout state.",
+        "What this provider has recorded, what is held, and what is claimable — straight from the ledger.",
         snapshot_state,
         snapshot_tone,
         "",
@@ -2667,7 +3591,7 @@ fn earn_reliability_page(
         }
     );
     let state = aggregate_provider_state(&entries);
-    shell(data, expires, DashboardAppPage::Earn, "Provider quality", "Reliability", "Review protocol reputation, probation requirements, and this gateway's observations as separate facts.", state.label, state.tone, "", &content)
+    shell_wide(data, expires, DashboardAppPage::Earn, "Provider quality", "Reliability", "Network reputation, probation requirements, and what this gateway has observed.", state.label, state.tone, "", &content)
 }
 
 fn provider_probation_progress(probation: Option<&ProviderProbation>) -> String {
@@ -2689,7 +3613,10 @@ fn provider_probation_progress(probation: Option<&ProviderProbation>) -> String 
     let session_state = if successful >= required {
         "Successful-session condition met".to_owned()
     } else {
-        format!("{} successful session(s) remaining", required - successful)
+        format!(
+            "{} remaining",
+            count_noun((required - successful) as u64, "successful session")
+        )
     };
     let other_conditions = if probation.required_seconds > 0 {
         "The elapsed-time condition remains separate from this bar."
@@ -2767,17 +3694,22 @@ fn network_overview_page(data: &DashboardData, expires: u64) -> String {
             "Catalog"
         ),
         metric(
-            "Canonical providers",
+            "Providers",
             &providers.to_string(),
-            "Unique provider IDs in the current catalog",
+            "Distinct providers in the current catalog",
             "Catalog"
         ),
-        metric("Fresh routes", &fresh_routes, "Within heartbeat TTL", "Now"),
+        metric(
+            "Fresh routes",
+            &fresh_routes,
+            "Routes with a live heartbeat right now",
+            "Live"
+        ),
         metric(
             "Models without capacity",
             &unavailable_models,
             "No fresh advertised capacity",
-            "Now"
+            "Live"
         ),
         if shortage_rows.is_empty() {
             if data.models.is_empty() {
@@ -2799,7 +3731,7 @@ fn network_overview_page(data: &DashboardData, expires: u64) -> String {
     } else {
         ("Supply exceptions", "warn")
     };
-    shell(data, expires, DashboardAppPage::Network, "Explore", "Network health without the noise", "Start with advertised capacity and exceptions, then inspect bounded model, provider, market, and evidence views. Request-specific eligibility is evaluated later.", status, tone, "", &content)
+    shell_wide(data, expires, DashboardAppPage::Network, "Explore", "Network health without the noise", "Current advertised capacity and anything missing it, with model, provider, market, and evidence views one tab away.", status, tone, "", &content)
 }
 
 fn network_models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
@@ -2823,7 +3755,7 @@ fn network_models_page(data: &DashboardData, expires: u64, requested_page: Optio
         r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Network models</h2><p>Catalog terms paired with fresh advertised route capacity.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="network-models-table"><caption class="sr-only">Network models, advertised capacity, capabilities, and price</caption><thead><tr><th>Model</th><th>Advertised capacity</th><th>Capabilities</th><th>Catalog price</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{model_summary}</span>{pagination}</footer></section>"##,
         network_subnav(DashboardProductPage::NetworkModels),
     );
-    shell(data, expires, DashboardAppPage::Network, "Network analysis", "Models", "Supply state reports fresh heartbeat acceptance and capacity, not request-specific routability or a static provider count.", if data.models.is_empty() { "Catalog unavailable" } else { "Catalog loaded" }, if data.models.is_empty() { "warn" } else { "good" }, "", &content)
+    shell_wide(data, expires, DashboardAppPage::Network, "Network analysis", "Models", "Every catalog model with its current advertised supply.", if data.models.is_empty() { "Catalog unavailable" } else { "Catalog loaded" }, if data.models.is_empty() { "warn" } else { "good" }, "", &content)
 }
 
 fn network_providers_page(
@@ -2856,7 +3788,7 @@ fn network_providers_page(
         r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Provider routes</h2><p>One row per catalog route on this page, enriched with current heartbeat state when present.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="provider-table"><caption class="sr-only">Canonical provider routes and current operational evidence</caption><thead><tr><th>Provider / route</th><th>Model</th><th>State</th><th>Capacity</th><th>Performance</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{route_summary}</span>{pagination}<span>Raw identifiers are secondary to operational state.</span></footer></section>"##,
         network_subnav(DashboardProductPage::NetworkProviders),
     );
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Network,
@@ -2897,7 +3829,7 @@ fn network_markets_page(
                 break;
             }
             if index >= page.start {
-                rows.push_str(&format!(r##"<tr data-filter-row data-filter-text="{} {} T{} {} {}"><td data-export-value="{} / enclave {}" data-sort-value="{} / {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td>T{} &middot; {}</td><td>{} provider(s) &middot; {} route(s)</td><td>{}</td><td>{}</td></tr>"##, html_escape(&model.id), html_escape(&market.enclave_id), market.att_tier, html_escape(&market.quant), html_escape(&market.availability), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(short_text(&market.enclave_id, 18).as_ref()), market.att_tier, html_escape(&market.quant), market.providers_online, market.route_count, html_escape(&market.availability), money_html(&dashboard_price(&market.price_ref_au))));
+                rows.push_str(&format!(r##"<tr data-filter-row data-filter-text="{} {} T{} {} {}"><td data-export-value="{} / enclave {}" data-sort-value="{} / {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td>T{} &middot; {}</td><td>{} &middot; {}</td><td>{}</td><td>{}</td></tr>"##, html_escape(&model.id), html_escape(&market.enclave_id), market.att_tier, html_escape(&market.quant), html_escape(&market.availability), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(short_text(&market.enclave_id, 18).as_ref()), market.att_tier, html_escape(&market.quant), count_noun(market.providers_online as u64, "provider"), count_noun(market.route_count as u64, "route"), html_escape(&market.availability), money_html(&dashboard_price(&market.price_ref_au))));
             }
             index += 1;
         }
@@ -2933,7 +3865,7 @@ fn network_markets_page(
         r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Catalog markets</h2><p>Market structure is contractual; current acceptance still belongs to heartbeat evidence.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="market-table"><caption class="sr-only">Catalog markets and reference prices</caption><thead><tr><th>Model / enclave</th><th>Tier / quant</th><th>Catalog supply</th><th>Availability label</th><th>Reference price</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{market_summary}</span>{pagination}</footer></section>"##,
         network_subnav(DashboardProductPage::NetworkMarkets),
     );
-    shell(data, expires, DashboardAppPage::Network, "Network analysis", "Markets", "Inspect canonical market structure without presenting catalog counts as real-time fill rate.", "Catalog view", "", "", &content)
+    shell_wide(data, expires, DashboardAppPage::Network, "Network analysis", "Markets", "How each catalog market is structured: tiers, supply, and reference prices.", "Catalog view", "", "", &content)
 }
 
 fn network_activity_page(
@@ -2981,13 +3913,13 @@ fn network_activity_page(
             rows
         }
     );
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Route snapshot",
-        "Provider-table observations are finite and ordered by heartbeat freshness.",
+        "Every observed route, ordered by heartbeat freshness.",
         "Snapshot",
         "",
         "",
@@ -3123,13 +4055,13 @@ fn network_evidence_page(
             route_rows
         },
     );
-    shell(
+    shell_wide(
         data,
         expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Evidence",
-        "Verify consequential claims without forcing raw protocol data into every primary screen.",
+        "The recorded route facts and verification probes behind every Verify button.",
         "Evidence snapshot",
         "",
         "",
@@ -3139,20 +4071,20 @@ fn network_evidence_page(
 
 fn help_page(data: &DashboardData, expires: u64) -> String {
     let provider_start = if data.local_provider_id.is_some() {
-        r##"<a class="soft-button" href="/mayhem/dashboard/earn">Open provider operations</a>"##
+        r##"<a class="soft-button" href="/mayhem/dashboard/earn">Open Earn</a>"##
     } else {
         r##"<a class="soft-button" href="/mayhem/dashboard/earn">Start provider setup</a>"##
     };
     let content = format!(
-        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Choose what you want to do</h2><p>Each path ends in evidence you can inspect.</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step active"><span class="check-mark" aria-hidden="true">1</span><div class="check-copy"><strong>Use a model in the browser</strong><span>Choose a model, send a real request, then inspect its final or incomplete record.</span><a class="soft-button" href="/mayhem/dashboard/playground">Open Playground</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">2</span><div class="check-copy"><strong>Connect an OpenAI-compatible app</strong><span>Copy the base URL, understand authentication, then test inference separately.</span><a class="soft-button" href="/mayhem/dashboard/connect">Open Connect</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">3</span><div class="check-copy"><strong>Provide compute</strong><span>Scope Earn to this gateway's provider identity, then inspect preparation, routes, and ledger records.</span>{provider_start}</div></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>What the dashboard can prove</h2><p>Labels stay tied to their source.</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Catalog</span><strong>Models, capabilities, routes, and reference prices</strong></div><div class="fact"><span>Heartbeat</span><strong>Recent advertised acceptance, slots, queue, and performance</strong></div><div class="fact"><span>Receipt</span><strong>Signed metering state recorded by this gateway</strong></div><div class="fact"><span>Ledger snapshot</span><strong>Last-known balance, earnings, holds, and payouts</strong></div></div><p class="notice section-gap"><strong>Read labels literally.</strong> Advertised capacity is not a promise that a request will route. A non-final receipt or retained pause is not proof that execution is still active. Refresh when a live-evidence label expires.</p></div></section></div><aside class="stack"><details class="panel disclosure-panel" open><summary>Essential terms</summary><div class="panel-body"><div class="checklist"><div class="check-step"><span class="check-mark" aria-hidden="true">A</span><div class="check-copy"><strong>Advertised capacity</strong><span>A fresh provider heartbeat reports acceptance and free capacity; live routing still checks price, policy, capability, reputation, and attestation.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">R</span><div class="check-copy"><strong>Final receipt</strong><span>The gateway recorded final metering evidence for a session. Settlement and provider-job state remain separate.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">E</span><div class="check-copy"><strong>Evidence</strong><span>Verify opens structured facts and the raw gateway snapshot only when requested.</span></div></div></div></div></details><details class="panel disclosure-panel"><summary>Attestation tiers</summary><div class="panel-body"><p class="notice"><strong>Tiers are different evidence classes, not privacy supersets.</strong> A higher number can satisfy the gateway's numeric minimum without inheriting every lower tier's protection. Verify the route evidence for the property you need.</p></div></details><details class="panel disclosure-panel"><summary>Money and privacy</summary><div class="panel-body"><p>Hide amounts masks dashboard text and redacts money cells from shown-page CSV exports. It does not change gateway data, transaction state, or previously saved files.</p></div></details></aside></section>"##,
+        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Choose what you want to do</h2><p>Each path ends in evidence you can inspect.</p></div></header><div class="panel-body"><div class="checklist"><div class="check-step active"><span class="check-mark" aria-hidden="true">1</span><div class="check-copy"><strong>Use a model in the browser</strong><span>Choose a model, send a real request, then inspect its final or incomplete record.</span><a class="soft-button" href="/mayhem/dashboard/playground">Open Playground</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">2</span><div class="check-copy"><strong>Connect an OpenAI-compatible app</strong><span>Copy the base URL, understand authentication, then test inference separately.</span><a class="soft-button" href="/mayhem/dashboard/connect">Open Integrations</a></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">3</span><div class="check-copy"><strong>Provide compute</strong><span>Scope Earn to this gateway's provider identity, then inspect preparation, routes, and ledger records.</span>{provider_start}</div></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>What the dashboard can prove</h2><p>Labels stay tied to their source.</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Catalog</span><strong>Models, capabilities, routes, and reference prices</strong></div><div class="fact"><span>Heartbeat</span><strong>Recent advertised acceptance, slots, queue, and performance</strong></div><div class="fact"><span>Receipt</span><strong>Signed metering state recorded by this gateway</strong></div><div class="fact"><span>Ledger snapshot</span><strong>Last-known balance, earnings, holds, and payouts</strong></div></div><p class="notice section-gap"><strong>Read labels literally.</strong> Advertised capacity is not a promise that a request will route. A non-final receipt or retained pause is not proof that execution is still active. Refresh when a live-evidence label expires.</p></div></section></div><aside class="stack"><details class="panel disclosure-panel" open><summary>Essential terms</summary><div class="panel-body"><div class="checklist"><div class="check-step"><span class="check-mark" aria-hidden="true">A</span><div class="check-copy"><strong>Advertised capacity</strong><span>A fresh provider heartbeat reports acceptance and free capacity; live routing still checks price, policy, capability, reputation, and attestation.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">R</span><div class="check-copy"><strong>Final receipt</strong><span>The gateway recorded final metering evidence for a session. Settlement and provider-job state remain separate.</span></div></div><div class="check-step"><span class="check-mark" aria-hidden="true">E</span><div class="check-copy"><strong>Evidence</strong><span>Verify opens structured facts and the raw gateway snapshot only when requested.</span></div></div></div></div></details><details class="panel disclosure-panel"><summary>Attestation tiers</summary><div class="panel-body"><p class="notice"><strong>Tiers are different evidence classes, not privacy supersets.</strong> A higher number can satisfy the gateway's numeric minimum without inheriting every lower tier's protection. Verify the route evidence for the property you need.</p></div></details><details class="panel disclosure-panel"><summary>Money and privacy</summary><div class="panel-body"><p>Hide amounts masks dashboard text and redacts money cells from shown-page CSV exports. It does not change gateway data, transaction state, or previously saved files.</p></div></details></aside></section>"##,
     );
     shell(
         data,
         expires,
         DashboardAppPage::Help,
         "Learn Mayhem",
-        "Understand the state before you act",
-        "Follow a short path, read source-backed labels literally, and open evidence only when you need the technical detail.",
+        "How Mayhem works",
+        "Three short paths, a small glossary, and what each label proves — with evidence one click away.",
         "Reference",
         "",
         r##"<a class="primary-button" href="/mayhem/dashboard/playground">Open Playground</a>"##,
@@ -3164,14 +4096,14 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
     let (version_status, version_tone) = match data.update_notice.as_ref() {
         Some(notice) if notice.level == "required" => ("Update required", "danger"),
         Some(_) => ("Update available", "warn"),
-        None => ("No catalog blocker", ""),
+        None => ("Up to date", "good"),
     };
     let update = data
         .update_notice
         .as_ref()
         .map(|notice| {
             format!(
-                "Installed {} / catalog minimum {} / {} affected model(s)",
+                "Installed {} / catalog minimum {} / {} affected",
                 notice.installed_app_version,
                 notice.required_min_app_version,
                 notice.affected_model_count
@@ -3179,7 +4111,7 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         })
         .unwrap_or_else(|| {
             format!(
-                "Mayhem {} / no catalog update blocker",
+                "Mayhem {} · compatible with the current catalog",
                 installed_app_version()
             )
         });
@@ -3189,7 +4121,7 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         ""
     };
     let content = format!(
-        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Display and attention</h2><p>Preferences are stored in this browser profile.</p></div></header><noscript><div class="panel-body"><p class="notice warn">Display preferences require JavaScript. Gateway session and version facts remain available.</p></div></noscript><div class="settings-list"><div class="settings-row"><div class="settings-copy"><strong>Hide money amounts</strong><span>Replaces monetary text semantically and visually on dashboard pages.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="amounts" aria-label="Hide money amounts" aria-pressed="false"><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Reduce motion</strong><span>Disables transitions and animated feedback while preserving state.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="motion" aria-label="Reduce motion" aria-pressed="false"><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Compact density</strong><span>Reduces spacing for professional monitoring without hiding explanations.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="density" aria-label="Compact density" aria-pressed="false"><span data-preference-label>Off</span></button></div></div><footer class="panel-footer"><button class="quiet-button js-only" type="button" data-clear-preferences>Reset preferences</button></footer></section></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Gateway session</h2><p>Access and runtime facts for this gateway</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Authentication</span><strong>{}</strong></div><div class="fact"><span>Active tokens</span><strong>{}</strong></div><div class="fact"><span>Receipt rail</span><strong>{}</strong></div><div class="fact"><span>Provider identity</span><strong>{}</strong></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Version state</h2><p>Update claims come from catalog compatibility</p></div></header><div class="panel-body"><p class="notice {}">{}</p>{update_resolution}</div></section></aside></section>"##,
+        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Display and attention</h2><p>Preferences are stored in this browser profile.</p></div></header><noscript><div class="panel-body"><p class="notice warn">Display preferences require JavaScript. Gateway session and version facts remain available.</p></div></noscript><div class="settings-list"><div class="settings-row"><div class="settings-copy"><strong>Hide money amounts</strong><span>Replaces monetary text semantically and visually on dashboard pages.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="amounts" role="switch" aria-label="Hide money amounts" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Reduce motion</strong><span>Disables transitions and animated feedback while preserving state.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="motion" role="switch" aria-label="Reduce motion" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Compact density</strong><span>Reduces spacing for professional monitoring without hiding explanations.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="density" role="switch" aria-label="Compact density" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Playground conversation history</strong><span>Prompts and responses are stored only in this browser profile. Credentials are never saved.</span></div><button class="settings-control quiet-button js-only" type="button" data-clear-playground-history>Clear history</button></div></div><footer class="panel-footer"><button class="quiet-button js-only" type="button" data-clear-preferences>Reset preferences</button></footer></section><details class="panel disclosure-panel"><summary><span>Local launch diagnostics</span><span class="status-badge"><span data-local-event-count>0</span>&nbsp;events</span></summary><div class="panel-body"><p class="notice">Optional debugging log for launch issues. Events stay in this browser and never include prompts, responses, credentials, or money amounts.</p><div class="inline-actions section-gap"><button class="soft-button js-only" type="button" data-export-local-events>Export JSON</button><button class="quiet-button js-only" type="button" data-clear-local-events>Clear diagnostics</button></div></div></details></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Gateway session</h2><p>Access and runtime facts for this gateway</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Authentication</span><strong>{}</strong></div><div class="fact"><span>Active tokens</span><strong>{}</strong></div><div class="fact"><span>Receipt rail</span><strong>{}</strong></div><div class="fact"><span>Provider identity</span><strong>{}</strong></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Version</h2><p>From the installed app and catalog requirements</p></div></header><div class="panel-body"><p class="notice {}">{}</p>{update_resolution}</div></section></aside></section>"##,
         if data.requires_auth() {
             "Required"
         } else {
@@ -3204,7 +4136,7 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         version_tone,
         html_escape(&update)
     );
-    shell(data, expires, DashboardAppPage::Settings, "Application", "Settings", "Control display density, motion, money visibility, and inspect the gateway facts this browser can actually know.", version_status, version_tone, "", &content)
+    shell(data, expires, DashboardAppPage::Settings, "Application", "Settings", "Display, motion, and money-visibility preferences, plus this gateway session's facts.", version_status, version_tone, "", &content)
 }
 
 #[derive(Clone, Debug)]
@@ -3244,27 +4176,36 @@ fn model_availability(data: &DashboardData, model: &GatewayModel) -> ModelAvaila
         ModelAvailability {
             label: "Capacity advertised",
             tone: "good",
-            explanation: format!("{accepting} route(s) advertise acceptance; {fresh} fresh"),
+            explanation: format!(
+                "{} accepting work; {fresh} fresh",
+                count_noun(accepting as u64, "route")
+            ),
         }
     } else if capacity > 0 {
         ModelAvailability {
             label: "At capacity",
             tone: "warn",
-            explanation: format!("{capacity} fresh route(s) have no advertised free slot"),
+            explanation: format!(
+                "{} with no free slot right now",
+                count_noun(capacity as u64, "fresh route")
+            ),
         }
     } else if draining > 0 {
         ModelAvailability {
             label: "Draining",
             tone: "warn",
-            explanation: format!("{draining} fresh route(s) are not accepting new work"),
+            explanation: format!(
+                "{} not accepting new work",
+                count_noun(draining as u64, "fresh route")
+            ),
         }
     } else if !model.mayhem.route_candidates.is_empty() {
         ModelAvailability {
             label: "Telemetry unavailable",
             tone: "warn",
             explanation: format!(
-                "{} canonical route(s); no fresh heartbeat",
-                model.mayhem.route_candidates.len()
+                "{}; no fresh heartbeat",
+                count_noun(model.mayhem.route_candidates.len() as u64, "canonical route")
             ),
         }
     } else {
@@ -3370,14 +4311,21 @@ fn heartbeat_age(data: &DashboardData, entry: &ProviderTableEntry) -> String {
     )
 }
 
+#[cfg(test)]
 fn provider_metric_basis(totals: &ProviderSlotTotals) -> String {
     match (totals.fresh_routes, totals.total_routes) {
         (0, 0) => "No configured route evidence".to_owned(),
-        (0, total) => format!("No fresh heartbeat across {total} configured route(s)"),
+        (0, total) => format!(
+            "No fresh heartbeat across {}",
+            count_noun(total as u64, "configured route")
+        ),
         (fresh, total) if fresh < total => {
-            format!("Fresh heartbeat totals from {fresh} of {total} configured route(s)")
+            format!("Fresh heartbeat totals from {fresh} of {total} configured routes")
         }
-        (fresh, _) => format!("Fresh heartbeat totals from all {fresh} configured route(s)"),
+        (fresh, _) => format!(
+            "Fresh heartbeat totals from {}",
+            count_noun(fresh as u64, "configured route")
+        ),
     }
 }
 
@@ -3388,17 +4336,27 @@ fn provider_coverage_notice(
     match (totals.fresh_routes, totals.total_routes, window) {
         (_, 0, _) => String::new(),
         (0, total, _) => format!(
-            r#"<div class="notice warn"><strong>Current capacity unavailable.</strong> None of the {total} configured route(s) has heartbeat evidence inside this gateway's freshness window. Refresh after the worker reconnects to reconfirm state.</div>"#,
+            r#"<div class="notice warn"><strong>No fresh heartbeat.</strong> {} without a heartbeat in the current freshness window — this usually means the worker is offline. Refresh after it reconnects.</div>"#,
+            count_noun(total as u64, "configured route"),
         ),
         (fresh, total, Some(window)) if fresh < total => format!(
-            r#"<div class="notice warn"><strong>Partial fresh coverage.</strong> Slot and queue totals include {fresh} of {total} configured route(s); {} delayed route(s) are excluded. Oldest included heartbeat: {}.</div>"#,
-            total.saturating_sub(fresh),
+            r#"<div class="notice warn"><strong>Partial coverage.</strong> Slot and queue totals cover {fresh} of {total} configured routes; {} excluded. Oldest included heartbeat: {}.</div>"#,
+            count_noun(total.saturating_sub(fresh) as u64, "delayed route"),
             relative_time(window),
         ),
-        (fresh, _, Some(window)) => format!(
-            r#"<p class="result-summary">All {fresh} configured route(s) have fresh heartbeat evidence; oldest included heartbeat: {}.</p>"#,
-            relative_time(window),
-        ),
+        (fresh, _, Some(window)) => {
+            if fresh == 1 {
+                format!(
+                    r#"<p class="result-summary">The configured route has a fresh heartbeat; latest: {}.</p>"#,
+                    relative_time(window),
+                )
+            } else {
+                format!(
+                    r#"<p class="result-summary">All {fresh} configured routes have fresh heartbeats; oldest: {}.</p>"#,
+                    relative_time(window),
+                )
+            }
+        }
         _ => String::new(),
     }
 }
@@ -3427,7 +4385,11 @@ fn aggregate_provider_state(entries: &[&ProviderTableEntry]) -> RouteState {
             kind: RouteStateKind::Accepting,
             label: "Online and accepting work",
             tone: "good",
-            explanation: format!("All {accepting} route(s) advertise fresh free capacity."),
+            explanation: if accepting == 1 {
+                "The configured route is advertising free capacity.".to_owned()
+            } else {
+                format!("All {accepting} routes advertise free capacity.")
+            },
         };
     }
     if accepting > 0 {
@@ -3436,9 +4398,9 @@ fn aggregate_provider_state(entries: &[&ProviderTableEntry]) -> RouteState {
             label: "Online with route issues",
             tone: "warn",
             explanation: format!(
-                "{accepting} of {} route(s) accept work; {} need attention.",
+                "{accepting} of {} routes accept work; attention needed on {}.",
                 states.len(),
-                states.len().saturating_sub(accepting)
+                count_noun(states.len().saturating_sub(accepting) as u64, "route")
             ),
         };
     }
@@ -3576,6 +4538,13 @@ fn provider_page_state(
             } else {
                 progress.phase.as_str()
             };
+            // Sentence-case the reported phase so the page summary reads as prose.
+            let phase = {
+                let mut chars = phase.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            };
             return RouteState {
                 kind: RouteStateKind::Waiting,
                 label: "Preparing a model",
@@ -3641,17 +4610,32 @@ fn provider_load_failure_state(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("No failure reason reported");
-    let failure = format!("{model}: {stage} failed: {reason}");
+    // Pair the verbatim error with a plain-language next step so the page
+    // never ends at a raw protocol string.
+    let advice = if reason.contains("signature") || reason.contains("checksum") {
+        "The downloaded model files don't match their signed checksum — re-run preparation to re-download, or choose another model."
+    } else if reason.contains("space") || reason.contains("disk") {
+        "The machine ran out of space — free up disk, then re-run preparation."
+    } else {
+        "Re-run preparation to retry, or choose another model."
+    };
+    let failure = format!("{model}: {stage} failed: {reason}. {advice}");
     if live_routes > 0 {
         let (label, route_summary) = if accepting_routes > 0 {
             (
                 "Online with preparation issue",
-                format!("{accepting_routes} route(s) still advertise accepting capacity"),
+                format!(
+                    "{} still advertising capacity",
+                    count_noun(accepting_routes as u64, "route")
+                ),
             )
         } else {
             (
                 "Live routes with preparation issue",
-                format!("{live_routes} route(s) still report fresh telemetry"),
+                format!(
+                    "{} still reporting fresh telemetry",
+                    count_noun(live_routes as u64, "route")
+                ),
             )
         };
         RouteState {
@@ -3925,7 +4909,7 @@ fn earnings_refresh_label(snapshot: &GatewayProviderEarningsSnapshot) -> String 
                 format!("Refreshed {} ago", format_elapsed_since(timestamp))
             } else {
                 format!(
-                    "Snapshot stale; last refreshed {} ago",
+                    "Last refreshed {} ago; refresh to reconfirm",
                     format_elapsed_since(timestamp)
                 )
             }
@@ -3946,10 +4930,10 @@ fn provider_earning_rows(data: &DashboardData, provider_id: Option<&str>) -> Str
     };
     let rows = data.earnings.entries.iter().filter(|entry| entry.get("provider").and_then(Value::as_str) == Some(provider_id)).map(|entry| {
         let money = |name: &str| entry.get(name).and_then(value_as_money_au).map(format_au_usd).unwrap_or_else(|| "Unavailable".to_owned());
-        let epoch = entry.get("updated_epoch").and_then(Value::as_u64).map(|value| format!("Epoch {value}")).unwrap_or_else(|| "Unavailable".to_owned());
+        let epoch = entry.get("updated_epoch").and_then(Value::as_u64).map(|value| value.to_string()).unwrap_or_else(|| "Unavailable".to_owned());
         let rail = entry.get("rail").and_then(Value::as_str).unwrap_or("unknown");
         let evidence = evidence_link(&evidence_href("earning", &[("rail", rail)]), "Verify", rail);
-        format!(r##"<tr><td><span class="table-primary">{}</span><span class="table-secondary">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td>{}</td><td>{}</td></tr>"##, html_escape(&rail.to_ascii_uppercase()), html_escape(entry.get("denom").and_then(Value::as_str).unwrap_or("au_usd")), html_escape(&money("total_au")), html_escape(&money("held_au")), html_escape(&money("claimable_au")), html_escape(&money("paid_cum_au")), html_escape(&epoch), evidence)
+        format!(r##"<tr><td><span class="table-primary">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td data-money><span class="money-value">{}</span></td><td>{}</td><td>{}</td></tr>"##, html_escape(&rail.to_ascii_uppercase()), html_escape(&money("total_au")), html_escape(&money("held_au")), html_escape(&money("claimable_au")), html_escape(&money("paid_cum_au")), html_escape(&epoch), evidence)
     }).collect::<String>();
     if rows.is_empty() {
         r##"<tr><td colspan="7">No canonical earnings record matches this provider identity.</td></tr>"##.to_owned()
@@ -3961,8 +4945,8 @@ fn provider_earning_rows(data: &DashboardData, provider_id: Option<&str>) -> Str
 fn provider_identity_attention(data: &DashboardData, requested: Option<&str>) -> String {
     if let Some(provider) = data.local_provider_id.as_deref() {
         return format!(
-            r##"<div class="provider-scope result-summary"><strong>Provider scope:</strong> <span class="mono">{}</span>, configured on this gateway.</div>"##,
-            html_escape(short_text(provider, 24).as_ref())
+            r##"<div class="provider-scope result-summary"><strong>Provider identity:</strong> <span class="mono">{}</span> &mdash; configured on this gateway.</div>"##,
+            html_escape(short_text(provider, 12).as_ref())
         );
     }
     if let Some(provider) = requested {
@@ -4171,27 +5155,40 @@ fn earn_subnav(active: DashboardProductPage) -> String {
             "/mayhem/dashboard/earn",
         ),
         (
+            DashboardProductPage::EarnJobs,
+            "Jobs",
+            "/mayhem/dashboard/earn/jobs",
+        ),
+        (
+            DashboardProductPage::EarnEarnings,
+            "Earnings",
+            "/mayhem/dashboard/earn/earnings",
+        ),
+        (
             DashboardProductPage::EarnMachines,
             "Machines",
             "/mayhem/dashboard/earn/machines",
         ),
-        (
-            DashboardProductPage::EarnOpportunities,
-            "Model fit",
-            "/mayhem/dashboard/earn/opportunities",
-        ),
-        (
-            DashboardProductPage::EarnEarnings,
-            "Earnings & payouts",
-            "/mayhem/dashboard/earn/earnings",
-        ),
-        (
-            DashboardProductPage::EarnReliability,
-            "Reliability",
-            "/mayhem/dashboard/earn/reliability",
-        ),
     ];
-    contextual_nav("Earn", active, &links)
+    let advanced_open = matches!(
+        active,
+        DashboardProductPage::EarnOpportunities | DashboardProductPage::EarnReliability
+    );
+    format!(
+        r##"{}<details class="subnav-advanced"{}><summary>Advanced provider analysis</summary><div><a href="/mayhem/dashboard/earn/opportunities"{}>Model fit</a><a href="/mayhem/dashboard/earn/reliability"{}>Reliability</a></div></details>"##,
+        contextual_nav("Earn", active, &links),
+        if advanced_open { " open" } else { "" },
+        if active == DashboardProductPage::EarnOpportunities {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+        if active == DashboardProductPage::EarnReliability {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+    )
 }
 
 fn network_subnav(active: DashboardProductPage) -> String {
@@ -4218,7 +5215,7 @@ fn network_subnav(active: DashboardProductPage) -> String {
         ),
         (
             DashboardProductPage::NetworkActivity,
-            "Snapshot",
+            "Routes",
             "/mayhem/dashboard/network/activity",
         ),
         (
@@ -4453,6 +5450,25 @@ fn metric(label: &str, value_html: &str, meta: &str, source: &str) -> String {
     metric_with_meta_html(label, value_html, &html_escape(meta), source)
 }
 
+// Status facts render as a badge row, never as display-type metric values;
+// the value slot is reserved for numbers and amounts.
+fn metric_status(label: &str, badge_html: &str, meta: &str, source: &str) -> String {
+    format!(
+        r##"<article class="metric"><div class="metric-top"><span class="metric-label">{}</span><span class="metric-state">{}</span></div><div class="metric-status">{badge_html}</div><p class="metric-meta">{}</p></article>"##,
+        html_escape(label),
+        html_escape(source),
+        html_escape(meta),
+    )
+}
+
+fn status_badge(label: &str, tone: &str) -> String {
+    format!(
+        r#"<span class="status-badge {}">{}</span>"#,
+        html_escape(tone),
+        html_escape(label),
+    )
+}
+
 fn metric_with_meta_html(label: &str, value_html: &str, meta_html: &str, source: &str) -> String {
     format!(
         r##"<article class="metric"><div class="metric-top"><span class="metric-label">{}</span><span class="metric-state">{}</span></div><div class="metric-value">{value_html}</div><p class="metric-meta">{meta_html}</p></article>"##,
@@ -4572,6 +5588,16 @@ fn empty_block_with_heading(
     )
 }
 
+// Every countable noun in dashboard copy is regular, so simple "s" suffixing
+// keeps "1 route" / "2 routes" out of "route(s)" territory.
+fn count_noun(count: u64, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 fn timestamp_seconds(value: u64) -> u64 {
     if value > 100_000_000_000 {
         value / 1_000
@@ -4586,9 +5612,13 @@ fn format_millis_age(value: u64) -> String {
     } else if value < 60_000 {
         format!("{}s", value / 1_000)
     } else if value < 3_600_000 {
-        format!("{}m", value / 60_000)
-    } else {
+        format!("{} min", value / 60_000)
+    } else if value < 86_400_000 {
         format!("{}h", value / 3_600_000)
+    } else if value < 14 * 86_400_000 {
+        format!("{}d", value / 86_400_000)
+    } else {
+        format!("{}w", value / (7 * 86_400_000))
     }
 }
 
@@ -4687,6 +5717,7 @@ mod tests {
             "wallet",
             "connect",
             "earn",
+            "earn/jobs",
             "earn/machines",
             "earn/opportunities",
             "earn/earnings",
@@ -4705,9 +5736,39 @@ mod tests {
         }
         assert_eq!(DashboardProductPage::from_path(""), None);
         assert_eq!(DashboardProductPage::from_path("admin"), None);
-        assert_eq!(DashboardProductPage::from_path("earn/jobs"), None);
         assert_eq!(DashboardProductPage::from_path("earn/disputes"), None);
         assert_eq!(DashboardProductPage::from_path("earn/private"), None);
+    }
+
+    #[test]
+    fn dashboard_receipt_and_recovery_history_survives_gateway_restart() {
+        let dir = tempfile::tempdir().expect("history tempdir");
+        let path = dir.path().join("dashboard-history.json");
+        let state = GatewayState::from_models(Vec::new()).with_dashboard_history_path(&path);
+        state
+            .record_receipt(activity_receipt_fixture(
+                "persistent-session",
+                true,
+                now_secs(),
+            ))
+            .expect("persist receipt");
+        state.pause_session(PausedSession {
+            session_id: "paused-session".to_owned(),
+            reason: "provider recovery pending".to_owned(),
+        });
+        drop(state);
+
+        let restored = GatewayState::from_models(Vec::new()).with_dashboard_history_path(&path);
+        assert_eq!(restored.receipts().len(), 1);
+        assert_eq!(
+            restored.receipts()[0].receipt.body.session_id,
+            "persistent-session"
+        );
+        assert_eq!(restored.paused_sessions().len(), 1);
+        assert_eq!(restored.paused_sessions()[0].session_id, "paused-session");
+        let stored = fs::read_to_string(path).expect("read persisted history");
+        assert!(!stored.contains("\"prompt\":"));
+        assert!(!stored.contains("\"response\":"));
     }
 
     #[test]
@@ -4725,8 +5786,8 @@ mod tests {
         assert_eq!(data.provider_heartbeat_ttl_millis, 4_321);
 
         let html = earn_overview_page(&data, 60, None, None);
-        assert!(html.contains("Active slots"));
-        assert!(html.contains("No configured route evidence"));
+        assert!(html.contains("Live route metrics"));
+        assert!(html.contains("No routes yet"));
         assert!(!html.contains(">0 / 0<"));
 
         let partial = ProviderSlotTotals {
@@ -4742,13 +5803,13 @@ mod tests {
             expires_at_millis: 5_321,
         };
         let notice = provider_coverage_notice(&partial, Some(window));
-        assert!(notice.contains("Partial fresh coverage"));
-        assert!(notice.contains("1 of 3 configured route(s)"));
-        assert!(notice.contains("2 delayed route(s) are excluded"));
+        assert!(notice.contains("Partial coverage"));
+        assert!(notice.contains("1 of 3 configured routes"));
+        assert!(notice.contains("2 delayed routes excluded"));
         assert!(notice.contains(r#"data-relative-time data-observed-at-ms="1000""#));
         assert_eq!(
             provider_metric_basis(&partial),
-            "Fresh heartbeat totals from 1 of 3 configured route(s)"
+            "Fresh heartbeat totals from 1 of 3 configured routes"
         );
 
         let value = volatile_text("2 / 4", window, "Unavailable");
@@ -4798,10 +5859,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(html.contains("Incomplete records need review"));
-        assert!(html.contains(r##"href="#incomplete-activity">Review incomplete records"##));
-        assert!(html.contains("do not prove that execution is still active"));
-        assert!(html.contains("Execution state unknown"));
+        assert!(html.contains("Open records to review"));
+        assert!(html.contains(r##"href="#incomplete-activity">Review open records"##));
+        assert!(html.contains("does not mean work is still running"));
+        assert!(!html.contains("Execution state unknown"));
         assert!(!html.contains("Current execution state unknown &middot; not a payout state"));
     }
 
@@ -4897,7 +5958,7 @@ mod tests {
         assert!(html.contains(
             r#"<progress max="25" value="7" aria-label="Probation successful-session requirement: 7 of 25">"#
         ));
-        assert!(html.contains("18 successful session(s) remaining"));
+        assert!(html.contains("18 successful sessions remaining"));
         assert!(html.contains("elapsed-time condition remains separate"));
 
         let mut zero_denominator = probation.clone();
@@ -4964,7 +6025,7 @@ mod tests {
         assert_eq!(state.tone, "warn");
         assert!(state
             .explanation
-            .contains("1 route(s) still advertise accepting capacity"));
+            .contains("1 route still advertising capacity"));
         assert!(state
             .explanation
             .contains("model-b: load model weights failed: out of memory"));
@@ -5017,7 +6078,7 @@ mod tests {
             DashboardProductPage::Earn,
         );
         assert!(earn.contains(
-            "Active slots</span><span class=\"metric-state\">Fresh heartbeat</span></div><div class=\"metric-value\">Unavailable"
+            "Live route metrics</span><span class=\"metric-state\">Fresh heartbeat</span></div><div class=\"metric-status\">"
         ));
         assert!(!earn.contains("<strong>Provider identity is not configured</strong>"));
         assert!(!earn.contains("<h2>Action center</h2>"));
@@ -5146,18 +6207,13 @@ mod tests {
         assert!(html.contains("data-playground-max-price"));
         assert!(html.contains(r#"data-price-mode="rate""#));
         assert!(html.contains("data-money-input"));
-        assert!(html.contains(
-            "selected model determines whether this ceiling uses a composite rate or fixed charge"
-        ));
+        assert!(html.contains("Route price ceiling"));
         assert!(html.contains("data-playground-min-att-tier"));
         assert!(html.contains(r#"<option value="4">T4 only"#));
-        assert!(html.contains("Tiers describe different evidence and are not privacy supersets"));
-        assert!(html.contains(
-            "a T4 identity route can satisfy a T3 numeric minimum without providing T3 confidential-compute properties"
-        ));
+        assert!(html.contains("Numeric identity tier does not promise confidential compute."));
         assert!(html.contains("data-playground-request-summary"));
-        assert!(html.contains("saved only in this browser tab"));
-        assert!(html.contains("access token is never saved"));
+        assert!(html.contains("drafts and history stay in this browser tab"));
+        assert!(html.contains("access tokens are never saved"));
         assert!(html.contains("data-playground-reset-draft"));
     }
 
@@ -5189,15 +6245,15 @@ mod tests {
             "active_token_count": 0,
         });
         let auth_html = playground_page(&credential_required, 60, None);
-        assert!(auth_html.contains("<h1>Credential required before sending</h1>"));
+        assert!(auth_html.contains("<h1>Playground</h1>"));
         assert!(auth_html.contains("<h2>Create an access token first</h2>"));
         assert!(!auth_html.contains("<h3>Create an access token first</h3>"));
 
         let no_models = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
         let empty_html = playground_page(&no_models, 60, None);
-        assert!(empty_html.contains("<h1>Ask, test, and verify</h1>"));
-        assert!(empty_html.contains("<h2>No models available</h2>"));
-        assert!(!empty_html.contains("<h3>No models available</h3>"));
+        assert!(empty_html.contains("<h1>Playground</h1>"));
+        assert!(empty_html.contains("<h2>No compatible models available</h2>"));
+        assert!(!empty_html.contains("<h3>No compatible models available</h3>"));
     }
 
     #[test]
@@ -5255,14 +6311,14 @@ mod tests {
 
         let user_only = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
         let user_html = home_page(&user_only, 60);
-        assert!(user_html.contains("<h2>First-value setup</h2>"));
+        assert!(user_html.contains("<h2>Getting started</h2>"));
 
         let configured = GatewayState::from_models(Vec::new()).with_local_provider_id("provider-a");
         let provider_data = DashboardData::from_state(&configured);
         assert_eq!(provider_data.completed_requests(), 0);
         let provider_html = home_page(&provider_data, 60);
-        assert!(provider_html.contains("<h2>Configured provider</h2>"));
-        assert!(!provider_html.contains("<h2>First-value setup</h2>"));
+        assert!(provider_html.contains("<h2>Your provider</h2>"));
+        assert!(!provider_html.contains("<h2>Getting started</h2>"));
     }
 
     #[test]
@@ -5284,10 +6340,10 @@ mod tests {
         );
 
         let html = home_page(&data, 60);
-        assert!(html.contains("Configured provider"));
+        assert!(html.contains("Your provider"));
         assert!(html.contains("Setup blocked by model failure"));
         assert!(html.contains("artifact signature mismatch"));
-        assert!(!html.contains("<h2>First-value setup</h2>"));
+        assert!(!html.contains("<h2>Getting started</h2>"));
     }
 
     #[test]
@@ -5300,7 +6356,7 @@ mod tests {
         assert_eq!(html.matches("demand, revenue, or earnings").count(), 1);
         assert!(html.contains("Catalog compatibility beside current advertised supply."));
         assert!(html.contains(
-            "Match this gateway host against catalog requirements and compare current advertised supply."
+            "Which catalog models this machine can run, next to what the network currently supplies."
         ));
         assert!(!html.contains("Use this as a host compatibility reference"));
         assert!(!html.contains("without inventing demand or revenue signals"));
@@ -5512,7 +6568,7 @@ mod tests {
         );
         assert!(current.contains("dashboard-new-token"));
         assert!(current.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Now</span></div><div class="metric-value">1</div>"#
+            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">1</div>"#
         ));
         assert!(current.contains("$1.00 / $10.00"));
         assert!(current.contains("lifetime total"));
@@ -5526,7 +6582,7 @@ mod tests {
             None,
         );
         assert!(revoked.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Now</span></div><div class="metric-value">0</div>"#
+            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">0</div>"#
         ));
         assert!(revoked.contains(">Inactive<"));
         let _ = fs::remove_file(path);
@@ -5628,9 +6684,9 @@ mod tests {
             &query,
             DashboardProductPage::EarnEarnings,
         );
-        assert!(html.contains("Provider scope:"));
+        assert!(html.contains("Provider identity:"));
         assert!(!html.contains("Configured gateway identity"));
-        assert!(!html.contains(r#"class="notice good"><strong>Provider scope"#));
+        assert!(!html.contains(r#"class="notice good"><strong>Provider identity"#));
         assert!(html.contains(&format_au_usd(amount)));
     }
 

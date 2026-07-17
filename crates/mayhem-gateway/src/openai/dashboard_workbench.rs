@@ -232,11 +232,17 @@ pub fn dashboard_workbench_router() -> io::Result<Router> {
         )
         .route("/mayhem/dashboard/assets/app.css", get(workbench_app_css))
         .route("/mayhem/dashboard/assets/app.js", get(workbench_app_js))
+        .route(
+            "/mayhem/dashboard/assets/brand/{asset}",
+            get(workbench_brand_asset),
+        )
         .route("/mayhem/dashboard/{*page}", get(workbench_product_page))
         .route("/__workbench/version", get(workbench_version))
         .route("/__workbench/reload.js", get(workbench_reload_script))
         .route("/__workbench/health", get(workbench_health))
         .route("/v1/chat/completions", post(workbench_chat_completions))
+        .route("/v1/images/generations", post(workbench_image_generation))
+        .route("/v1/audio/speech", post(workbench_audio_speech))
         .with_state(state))
 }
 
@@ -486,6 +492,21 @@ async fn workbench_app_js() -> Response {
     dashboard_asset_response("text/javascript; charset=utf-8", DASHBOARD_APP_JS)
 }
 
+async fn workbench_brand_asset(Path(asset): Path<String>) -> Response {
+    let Some((content_type, bytes)) = dashboard_brand_asset(&asset) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = Response::new(Body::from(bytes));
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    with_dashboard_security_headers(response)
+}
+
 async fn workbench_version(State(state): State<WorkbenchState>) -> Response {
     let mut response = Response::new(Body::from(state.version.to_string()));
     response.headers_mut().insert(
@@ -683,6 +704,145 @@ async fn workbench_chat_completions(
     with_workbench_scenario_cookie(with_dashboard_security_headers(response), scenario)
 }
 
+
+async fn workbench_image_generation(
+    State(state): State<WorkbenchState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let scenario = selected_scenario(&WorkbenchQuery::default(), &headers);
+    if let Some((status, code, message)) = workbench_scenario_blocker(scenario) {
+        return workbench_chat_error(scenario, status, code, message);
+    }
+    let requested_model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let gateway = state.gateway(scenario);
+    let Some(model) = gateway
+        .models_snapshot()
+        .iter()
+        .find(|model| model.id == requested_model && model.mayhem.model_class == "image-generation")
+        .cloned()
+    else {
+        return workbench_chat_error(
+            scenario,
+            StatusCode::BAD_REQUEST,
+            "fixture_image_model_required",
+            "Choose an image-generation fixture model.",
+        );
+    };
+    if workbench_serving_candidate(&gateway, &model).is_none() {
+        return workbench_chat_error(
+            scenario,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture_no_eligible_route",
+            "No fresh fixture route is accepting this image request.",
+        );
+    }
+    let sequence = state.request_sequence.fetch_add(1, Ordering::Relaxed);
+    let id = format!("workbench-image-{sequence:016x}");
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="768" height="768" viewBox="0 0 768 768"><defs><radialGradient id="g" cx="70%" cy="22%" r="85%"><stop stop-color="#ff8a96"/><stop offset=".42" stop-color="#7c456e"/><stop offset="1" stop-color="#11131a"/></radialGradient><filter id="n"><feTurbulence baseFrequency=".7" numOctaves="2" seed="7"/><feColorMatrix values="1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 .09 0"/></filter></defs><rect width="768" height="768" rx="44" fill="url(#g)"/><rect width="768" height="768" rx="44" filter="url(#n)" opacity=".5"/><circle cx="590" cy="170" r="92" fill="#ffd7c7" opacity=".8"/><path d="M0 575 170 385l104 92 105-145 108 130 97-78 184 191v193H0Z" fill="#11131a" opacity=".82"/><path d="m0 632 208-145 126 94 98-61 148 112 188-96v232H0Z" fill="#171b24" opacity=".9"/><text x="48" y="80" fill="#fff" font-family="system-ui,sans-serif" font-size="25" font-weight="700">OpenMayhem workbench</text><text x="48" y="113" fill="#f7c7cb" font-family="system-ui,sans-serif" font-size="17">Deterministic image-generation fixture</text></svg>"##;
+    let encoded = BASE64_STANDARD.encode(svg.as_bytes());
+    let payload = json!({
+        "id": id,
+        "object": "images.response",
+        "created": now_secs(),
+        "model": model.id,
+        "data": [{
+            "b64_json": encoded,
+            "revised_prompt": Value::Null,
+            "mayhem": {
+                "artifact_id": format!("workbench-artifact-{sequence:016x}"),
+                "content_type": "image/svg+xml",
+                "blake3": hex_fill(0xd1),
+            }
+        }],
+        "usage": {"image": 1, "step": 1},
+        "mayhem": {
+            "backend": "workbench-image-fixture",
+            "direct_session": false,
+            "billable": false,
+            "dev_session": true,
+            "receipt": Value::Null,
+        }
+    });
+    let response = Json(payload).into_response();
+    with_workbench_scenario_cookie(with_dashboard_security_headers(response), scenario)
+}
+
+fn workbench_silence_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8_000;
+    const SAMPLE_COUNT: u32 = 2_000;
+    let data_len = SAMPLE_COUNT * 2;
+    let mut wav = Vec::with_capacity((44 + data_len) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize((44 + data_len) as usize, 0);
+    wav
+}
+
+async fn workbench_audio_speech(
+    State(state): State<WorkbenchState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let scenario = selected_scenario(&WorkbenchQuery::default(), &headers);
+    if let Some((status, code, message)) = workbench_scenario_blocker(scenario) {
+        return workbench_chat_error(scenario, status, code, message);
+    }
+    let requested_model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let gateway = state.gateway(scenario);
+    let Some(model) = gateway
+        .models_snapshot()
+        .iter()
+        .find(|model| model.id == requested_model && model.mayhem.model_class == "tts")
+        .cloned()
+    else {
+        return workbench_chat_error(
+            scenario,
+            StatusCode::BAD_REQUEST,
+            "fixture_speech_model_required",
+            "Choose a speech fixture model.",
+        );
+    };
+    if workbench_serving_candidate(&gateway, &model).is_none() {
+        return workbench_chat_error(
+            scenario,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture_no_eligible_route",
+            "No fresh fixture route is accepting this speech request.",
+        );
+    }
+    let mut response = Response::new(Body::from(workbench_silence_wav()));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    response.headers_mut().insert(
+        "x-mayhem-backend",
+        HeaderValue::from_static("workbench-speech-fixture"),
+    );
+    response.headers_mut().insert(
+        "x-mayhem-direct-session",
+        HeaderValue::from_static("false"),
+    );
+    with_workbench_scenario_cookie(with_dashboard_security_headers(response), scenario)
+}
+
+
 fn workbench_include_usage(payload: &Value) -> Result<bool, (&'static str, &'static str)> {
     let Some(stream_options) = payload.get("stream_options") else {
         return Ok(false);
@@ -834,7 +994,45 @@ fn scale_state() -> GatewayState {
 }
 
 fn showcase_state_with_receipts(model_count: usize, receipt_count: usize) -> GatewayState {
-    showcase_state_from_models_with_receipts(workbench_models(model_count), receipt_count)
+    let models = if model_count == 4 {
+        workbench_playground_models(model_count)
+    } else {
+        workbench_models(model_count)
+    };
+    showcase_state_from_models_with_receipts(models, receipt_count)
+}
+
+fn workbench_playground_models(count: usize) -> Vec<GatewayModel> {
+    let mut models = workbench_models(count);
+    if let Some(model) = models.get_mut(2) {
+        model.id = "tongyi/z-image-turbo".to_owned();
+        model.owned_by = "Tongyi-MAI".to_owned();
+        model.mayhem.family = "z-image".to_owned();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.caps.ctx = 1_200;
+        model.mayhem.caps.image = true;
+        model.mayhem.caps.output_modality = Some("image".to_owned());
+        model.mayhem.caps.output_modalities = vec!["image".to_owned()];
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        for candidate in &mut model.mayhem.route_candidates {
+            candidate.served_modalities = vec!["image".to_owned()];
+        }
+    }
+    if let Some(model) = models.get_mut(3) {
+        model.id = "hexgrad/kokoro-82m".to_owned();
+        model.owned_by = "Hexgrad".to_owned();
+        model.mayhem.family = "kokoro".to_owned();
+        model.mayhem.model_class = "tts".to_owned();
+        model.mayhem.caps.ctx = 800;
+        model.mayhem.caps.audio = true;
+        model.mayhem.caps.output_modality = Some("audio".to_owned());
+        model.mayhem.caps.output_modalities = vec!["audio".to_owned()];
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "audio".to_owned()];
+        for candidate in &mut model.mayhem.route_candidates {
+            candidate.served_modalities = vec!["audio".to_owned()];
+        }
+    }
+    models
 }
 
 fn showcase_state_from_models_with_receipts(
@@ -1652,7 +1850,7 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Mayhem is ready to try"));
         assert!(html.contains(r#"class="app-shell""#));
-        assert!(html.contains("Recorded activity"));
+        assert!(html.contains("Recent activity"));
         assert!(html.contains(r#"<body class="has-workbench">"#));
         assert!(html.contains("data-workbench-chrome"));
         assert!(html.contains("Fixture: Showcase"));
@@ -1664,10 +1862,11 @@ mod tests {
         let app = dashboard_workbench_router().expect("workbench router");
         let home = rendered_workbench_page(&app, "/mayhem/dashboard?scenario=auth-required").await;
         assert!(home.contains("<h1>Create a gateway credential</h1>"));
-        assert!(home
-            .contains(r#"class="primary-button" href="/mayhem/dashboard/connect">Set up access"#));
-        assert!(home.contains("<h2>Configured provider</h2>"));
-        assert!(!home.contains("<h2>First-value setup</h2>"));
+        assert!(home.contains(
+            r#"href="/mayhem/dashboard/connect" data-product-event="use_ai_path_opened">Set up access"#
+        ));
+        assert!(home.contains("<h2>Your provider</h2>"));
+        assert!(!home.contains("<h2>Getting started</h2>"));
 
         let playground =
             rendered_workbench_page(&app, "/mayhem/dashboard/playground?scenario=auth-required")
@@ -1720,7 +1919,7 @@ mod tests {
         assert!(reliability.contains(
             r#"<progress max="25" value="7" aria-label="Probation successful-session requirement: 7 of 25">"#
         ));
-        assert!(reliability.contains("Provider scope:"));
+        assert!(reliability.contains("Provider identity:"));
         assert!(!reliability.contains("Configured gateway identity"));
 
         let failure =
@@ -1795,7 +1994,7 @@ mod tests {
 
     #[tokio::test]
     async fn workbench_scale_paginates_every_bounded_analytical_dataset() {
-        const PROVIDER_PAGE_SIZE: usize = 60;
+        const PROVIDER_PAGE_SIZE: usize = 25;
         let scale = scale_state();
         assert_eq!(scale.models_snapshot().len(), WORKBENCH_SCALE_MODEL_COUNT);
         assert_eq!(scale.receipts().len(), WORKBENCH_SCALE_RECEIPT_COUNT);
@@ -1822,10 +2021,10 @@ mod tests {
         let models = rendered_workbench_page(&app, "/mayhem/dashboard/models?scenario=scale").await;
         assert_eq!(
             table_body_row_count(&models, "Models in this gateway catalog"),
-            80
+            25
         );
-        assert!(models.contains(r#"id="models-count">80 shown rows"#));
-        assert!(models.contains("Showing rows 1&ndash;80 of 96 catalog models. Page 1 of 2."));
+        assert!(models.contains(r#"id="models-count">25 shown rows"#));
+        assert!(models.contains("Showing rows 1&ndash;25 of 96 catalog models. Page 1 of 4."));
         assert!(models.contains(r#"rel="next" href="/mayhem/dashboard/models?page=2""#));
         let models_second = rendered_workbench_page_with_cookie(
             &app,
@@ -1835,12 +2034,11 @@ mod tests {
         .await;
         assert_eq!(
             table_body_row_count(&models_second, "Models in this gateway catalog"),
-            16
+            25
         );
         assert!(
-            models_second.contains("Showing rows 81&ndash;96 of 96 catalog models. Page 2 of 2.")
+            models_second.contains("Showing rows 26&ndash;50 of 96 catalog models. Page 2 of 4.")
         );
-        assert!(models_second.contains("workbench/96-"));
         assert!(models_second.contains(r#"rel="prev" href="/mayhem/dashboard/models?page=1""#));
         let models_invalid = rendered_workbench_page_with_cookie(
             &app,
@@ -1849,7 +2047,7 @@ mod tests {
         )
         .await;
         assert!(
-            models_invalid.contains("Showing rows 1&ndash;80 of 96 catalog models. Page 1 of 2.")
+            models_invalid.contains("Showing rows 1&ndash;25 of 96 catalog models. Page 1 of 4.")
         );
         let models_clamped = rendered_workbench_page_with_cookie(
             &app,
@@ -1858,8 +2056,9 @@ mod tests {
         )
         .await;
         assert!(
-            models_clamped.contains("Showing rows 81&ndash;96 of 96 catalog models. Page 2 of 2.")
+            models_clamped.contains("Showing rows 76&ndash;96 of 96 catalog models. Page 4 of 4.")
         );
+        assert!(models_clamped.contains("workbench/96-"));
 
         let activity =
             rendered_workbench_page(&app, "/mayhem/dashboard/activity?scenario=scale").await;
@@ -1868,14 +2067,15 @@ mod tests {
                 &activity,
                 "Prioritized incomplete records, final receipts, and retained pause records from this gateway process",
             ),
-            60
+            25
         );
-        assert!(activity.contains(r#"id="activity-count">60 shown rows"#));
-        assert!(activity.contains("Showing rows 1&ndash;60 of 96 recorded sessions. Page 1 of 2."));
-        assert!(activity.contains(r#"<span class="metric-label">Checkpoints</span><span class="metric-state">This run</span></div><div class="metric-value">96</div>"#));
+        assert!(activity.contains(r#"id="activity-count">25 shown rows"#));
+        assert!(activity.contains("Showing rows 1&ndash;25 of 96 recorded sessions. Page 1 of 4."));
+        assert!(activity.contains(r#"<span class="metric-label">Final receipts</span>"#));
+        assert!(!activity.contains(r#"<span class="metric-label">Checkpoints</span>"#));
         let activity_second = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/activity?page=2",
+            "/mayhem/dashboard/activity?page=4",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -1884,10 +2084,10 @@ mod tests {
                 &activity_second,
                 "Prioritized incomplete records, final receipts, and retained pause records from this gateway process",
             ),
-            36
+            21
         );
         assert!(activity_second
-            .contains("Showing rows 61&ndash;96 of 96 recorded sessions. Page 2 of 2."));
+            .contains("Showing rows 76&ndash;96 of 96 recorded sessions. Page 4 of 4."));
         assert!(activity_second.contains("workbench-session-96"));
 
         let connect =
@@ -1897,19 +2097,19 @@ mod tests {
                 &connect,
                 "Gateway access tokens, budgets, scopes, and status",
             ),
-            50
+            25
         );
-        assert!(connect.contains("Showing rows 1&ndash;50 of 64 access tokens. Page 1 of 2."));
+        assert!(connect.contains("Showing rows 1&ndash;25 of 64 access tokens. Page 1 of 3."));
         assert!(connect.contains(r##"data-table-filter="#access-tokens-table""##));
-        assert_eq!(connect.matches("data-filter-row").count(), 50);
+        assert_eq!(connect.matches("data-filter-row").count(), 25);
         assert!(connect.contains(r#"rel="next" href="/mayhem/dashboard/connect?page=2""#));
         assert!(connect.contains("Scale active 64"));
         assert!(connect.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Now</span></div><div class="metric-value">8</div>"#
+            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">8</div>"#
         ));
         let connect_second = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/connect?page=2",
+            "/mayhem/dashboard/connect?page=3",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -1921,7 +2121,7 @@ mod tests {
             14
         );
         assert!(
-            connect_second.contains("Showing rows 51&ndash;64 of 64 access tokens. Page 2 of 2.")
+            connect_second.contains("Showing rows 51&ndash;64 of 64 access tokens. Page 3 of 3.")
         );
         assert!(connect_second.contains("Scale inactive 56"));
 
@@ -1939,13 +2139,13 @@ mod tests {
             PROVIDER_PAGE_SIZE
         );
         assert!(earn_overview
-            .contains("Showing rows 1&ndash;60 of 128 configured serving routes. Page 1 of 3."));
+            .contains("Showing rows 1&ndash;25 of 128 configured serving routes. Page 1 of 6."));
         assert!(earn_overview.contains(r##"data-table-filter="#earn-routes-table""##));
         assert!(earn_overview
             .contains(r#"href="/mayhem/dashboard/earn?provider=provider%20scope&amp;page=2""#));
         let earn_overview_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/earn?page=3",
+            "/mayhem/dashboard/earn?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -1954,14 +2154,14 @@ mod tests {
                 &earn_overview_last,
                 "Configured provider serving routes and current capacity",
             ),
-            8
+            3
         );
         assert!(earn_overview_last
-            .contains("Showing rows 121&ndash;128 of 128 configured serving routes. Page 3 of 3."));
+            .contains("Showing rows 126&ndash;128 of 128 configured serving routes. Page 6 of 6."));
 
         let machines_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/earn/machines?page=3",
+            "/mayhem/dashboard/earn/machines?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -1970,15 +2170,15 @@ mod tests {
                 &machines_last,
                 "Machine routes for the configured provider identity",
             ),
-            8
+            3
         );
         assert!(machines_last.contains(r##"data-table-filter="#machine-routes-table""##));
         assert!(machines_last
-            .contains("Showing rows 121&ndash;128 of 128 configured machine routes. Page 3 of 3."));
+            .contains("Showing rows 126&ndash;128 of 128 configured machine routes. Page 6 of 6."));
 
         let reliability_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/earn/reliability?page=3",
+            "/mayhem/dashboard/earn/reliability?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -1987,11 +2187,11 @@ mod tests {
                 &reliability_last,
                 "Provider route reputation, probation, and gateway observations",
             ),
-            8
+            3
         );
         assert!(reliability_last.contains(r##"data-table-filter="#reliability-routes-table""##));
         assert!(reliability_last.contains(
-            "Showing rows 121&ndash;128 of 128 provider reliability routes. Page 3 of 3."
+            "Showing rows 126&ndash;128 of 128 provider reliability routes. Page 6 of 6."
         ));
 
         let opportunities =
@@ -2002,14 +2202,14 @@ mod tests {
                 &opportunities,
                 "Catalog models, gateway-host compatibility, and advertised supply",
             ),
-            80
+            25
         );
         assert!(
-            opportunities.contains("Showing rows 1&ndash;80 of 96 catalog models. Page 1 of 2.")
+            opportunities.contains("Showing rows 1&ndash;25 of 96 catalog models. Page 1 of 4.")
         );
         let opportunities_second = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/earn/opportunities?page=2",
+            "/mayhem/dashboard/earn/opportunities?page=4",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -2018,10 +2218,10 @@ mod tests {
                 &opportunities_second,
                 "Catalog models, gateway-host compatibility, and advertised supply",
             ),
-            16
+            21
         );
         assert!(opportunities_second
-            .contains("Showing rows 81&ndash;96 of 96 catalog models. Page 2 of 2."));
+            .contains("Showing rows 76&ndash;96 of 96 catalog models. Page 4 of 4."));
         assert!(opportunities_second.contains("workbench/96-"));
 
         let network_models =
@@ -2031,14 +2231,14 @@ mod tests {
                 &network_models,
                 "Network models, advertised capacity, capabilities, and price",
             ),
-            80
+            25
         );
         assert!(
-            network_models.contains("Showing rows 1&ndash;80 of 96 network models. Page 1 of 2.")
+            network_models.contains("Showing rows 1&ndash;25 of 96 network models. Page 1 of 4.")
         );
         let network_models_second = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/network/models?page=2",
+            "/mayhem/dashboard/network/models?page=4",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -2047,10 +2247,10 @@ mod tests {
                 &network_models_second,
                 "Network models, advertised capacity, capabilities, and price",
             ),
-            16
+            21
         );
         assert!(network_models_second
-            .contains("Showing rows 81&ndash;96 of 96 network models. Page 2 of 2."));
+            .contains("Showing rows 76&ndash;96 of 96 network models. Page 4 of 4."));
         assert!(network_models_second.contains("workbench/96-"));
 
         let network_providers =
@@ -2061,14 +2261,14 @@ mod tests {
                 &network_providers,
                 "Canonical provider routes and current operational evidence",
             ),
-            60
+            25
         );
-        assert!(network_providers.contains(r#"id="provider-count">60 shown rows"#));
+        assert!(network_providers.contains(r#"id="provider-count">25 shown rows"#));
         assert!(network_providers
-            .contains("Showing rows 1&ndash;60 of 128 catalog provider routes. Page 1 of 3."));
+            .contains("Showing rows 1&ndash;25 of 128 catalog provider routes. Page 1 of 6."));
         let network_providers_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/network/providers?page=3",
+            "/mayhem/dashboard/network/providers?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -2077,10 +2277,10 @@ mod tests {
                 &network_providers_last,
                 "Canonical provider routes and current operational evidence",
             ),
-            8
+            3
         );
         assert!(network_providers_last
-            .contains("Showing rows 121&ndash;128 of 128 catalog provider routes. Page 3 of 3."));
+            .contains("Showing rows 126&ndash;128 of 128 catalog provider routes. Page 6 of 6."));
         assert!(network_providers_last.contains("workbench/96-"));
 
         let market_last_page = catalog_market_count.div_ceil(PROVIDER_PAGE_SIZE);
@@ -2110,13 +2310,13 @@ mod tests {
                 &network_activity,
                 "Provider route observations ordered by heartbeat freshness",
             ),
-            30
+            25
         );
         assert!(network_activity
-            .contains("Showing rows 1&ndash;30 of 128 route observations. Page 1 of 5."));
+            .contains("Showing rows 1&ndash;25 of 128 route observations. Page 1 of 6."));
         let network_activity_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/network/activity?page=5",
+            "/mayhem/dashboard/network/activity?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
@@ -2125,42 +2325,42 @@ mod tests {
                 &network_activity_last,
                 "Provider route observations ordered by heartbeat freshness",
             ),
-            8
+            3
         );
         assert!(network_activity_last
-            .contains("Showing rows 121&ndash;128 of 128 route observations. Page 5 of 5."));
+            .contains("Showing rows 126&ndash;128 of 128 route observations. Page 6 of 6."));
 
         let network_evidence =
             rendered_workbench_page(&app, "/mayhem/dashboard/network/evidence?scenario=scale")
                 .await;
         assert_eq!(
             table_body_row_count(&network_evidence, "Provider route evidence"),
-            30
+            25
         );
         assert!(
-            network_evidence.contains("Showing rows 1&ndash;30 of 128 route entries. Page 1 of 5.")
+            network_evidence.contains("Showing rows 1&ndash;25 of 128 route entries. Page 1 of 6.")
         );
         let network_evidence_last = rendered_workbench_page_with_cookie(
             &app,
-            "/mayhem/dashboard/network/evidence?page=5",
+            "/mayhem/dashboard/network/evidence?page=6",
             Some(scale_cookie.as_str()),
         )
         .await;
         assert_eq!(
             table_body_row_count(&network_evidence_last, "Provider route evidence"),
-            8
+            3
         );
         assert!(network_evidence_last
-            .contains("Showing rows 121&ndash;128 of 128 route entries. Page 5 of 5."));
+            .contains("Showing rows 126&ndash;128 of 128 route entries. Page 6 of 6."));
 
         assert_eq!(
             table_body_row_count(&network_evidence, "Verification probe evidence"),
-            30
+            25
         );
         assert!(network_evidence.contains(r##"data-table-filter="#evidence-probes-table""##));
         assert!(network_evidence.contains(r#"data-table-query-prefix="probe""#));
         assert!(
-            network_evidence.contains("Showing rows 1&ndash;30 of 64 probe events. Page 1 of 3.")
+            network_evidence.contains("Showing rows 1&ndash;25 of 64 probe events. Page 1 of 3.")
         );
         assert!(network_evidence
             .contains(r#"rel="next" href="/mayhem/dashboard/network/evidence?probe_page=2""#));
@@ -2172,10 +2372,10 @@ mod tests {
         .await;
         assert_eq!(
             table_body_row_count(&network_probe_last, "Verification probe evidence"),
-            4
+            14
         );
         assert!(network_probe_last
-            .contains("Showing rows 61&ndash;64 of 64 probe events. Page 3 of 3."));
+            .contains("Showing rows 51&ndash;64 of 64 probe events. Page 3 of 3."));
         assert!(network_probe_last.contains("workbench-scale-probe-64"));
         assert!(network_probe_last.contains(
             r#"rel="prev" href="/mayhem/dashboard/network/evidence?page=2&amp;probe_page=2""#
@@ -2200,7 +2400,7 @@ mod tests {
         let home_before =
             rendered_workbench_page_with_cookie(&app, "/mayhem/dashboard", Some(cookie.as_str()))
                 .await;
-        assert!(home_before.contains("4 receipt checkpoint(s)"));
+        assert!(home_before.contains("4 receipt records"));
 
         let (first_status, first_headers, first_body) = workbench_chat_response(
             &app,
@@ -2283,7 +2483,7 @@ mod tests {
         let home_after =
             rendered_workbench_page_with_cookie(&app, "/mayhem/dashboard", Some(cookie.as_str()))
                 .await;
-        assert!(home_after.contains("6 receipt checkpoint(s)"));
+        assert!(home_after.contains("6 receipt records"));
 
         let activity = rendered_workbench_page_with_cookie(
             &app,
@@ -2293,7 +2493,8 @@ mod tests {
         .await;
         assert!(activity.contains(&first_session));
         assert!(activity.contains(&second_session));
-        assert!(activity.contains(r#"<span class="metric-label">Checkpoints</span><span class="metric-state">This run</span></div><div class="metric-value">6</div>"#));
+        assert!(activity.contains(r#"<span class="metric-label">Final receipts</span>"#));
+        assert!(!activity.contains(r#"<span class="metric-label">Checkpoints</span>"#));
 
         let evidence_uri = format!("/mayhem/dashboard/evidence?kind=receipt&id={second_session}");
         let response = app
@@ -2458,7 +2659,7 @@ mod tests {
             Some(offline_cookie.as_str()),
         )
         .await;
-        assert!(offline_activity.contains(r#"<span class="metric-label">Checkpoints</span><span class="metric-state">This run</span></div><div class="metric-value">0</div>"#));
+        assert!(offline_activity.contains(r#"<span class="metric-label">Open records</span><span class="metric-state">Records</span></div><div class="metric-value">0</div>"#));
     }
 
     #[test]

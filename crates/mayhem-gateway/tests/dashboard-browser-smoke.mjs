@@ -11,6 +11,7 @@ const PRODUCT_ROUTES = [
   '/mayhem/dashboard/wallet',
   '/mayhem/dashboard/connect',
   '/mayhem/dashboard/earn',
+  '/mayhem/dashboard/earn/jobs',
   '/mayhem/dashboard/earn/machines',
   '/mayhem/dashboard/earn/opportunities',
   '/mayhem/dashboard/earn/earnings',
@@ -196,7 +197,12 @@ try {
   check(await menu.evaluate((button) => button === document.activeElement), 'mobile drawer', 'returns focus to the trigger');
 
   await open('/mayhem/dashboard/playground');
-  equal(await page.getByRole('button', { name: 'Open all navigation' }).getAttribute('aria-current'), 'page', 'mobile navigation', 'marks More current for secondary destinations');
+  equal(
+    await page.locator('.mobile-bottom-nav a[href="/mayhem/dashboard/playground"]').getAttribute('aria-current'),
+    'page',
+    'mobile navigation',
+    'marks Playground as the current golden-path destination',
+  );
 
   await open('/mayhem/dashboard/models?page=2&q=gemma&sort=0&direction=ascending', 'scale');
   const filter = page.locator('[data-table-filter]');
@@ -223,6 +229,10 @@ try {
     const raw = document.querySelector('[data-evidence-raw]');
     return raw && (raw.textContent || '').includes('[amount hidden]');
   });
+  const rawToggle = dialog.locator('[data-evidence-raw-toggle]');
+  if (await rawToggle.isVisible()) {
+    await rawToggle.click();
+  }
   const privateEvidence = await dialog.locator('[data-evidence-raw]').innerText();
   check(privateEvidence.includes('[amount hidden]'), 'evidence financial privacy', 'redacts monetary values in raw evidence');
   check(!/"(?:per_unit_au|per_req_au|min_session_au|active_demand_au)"\s*:\s*"\d/.test(privateEvidence), 'evidence financial privacy', 'does not leave atomic monetary values readable');
@@ -235,12 +245,38 @@ try {
   const playgroundPrice = page.locator('[data-playground-max-price]');
   const playgroundOutput = page.locator('[data-playground-max-tokens]');
   const playgroundSend = page.locator('[data-playground-send]');
+  const playgroundModelTrigger = page.locator('[data-playground-model-trigger]');
   const rateOption = playgroundModel.locator('option[data-price-mode="rate"]').first();
   const fixedOption = playgroundModel.locator('option[data-price-mode="fixed"]').first();
-  await page.locator('.playground-composer details.field > summary').click();
+  const choosePlaygroundModel = async (value) => {
+    if (await playgroundModelTrigger.getAttribute('aria-expanded') !== 'true') {
+      await playgroundModelTrigger.click();
+    }
+    const optionId = await page.locator('[data-playground-model-option]').evaluateAll(
+      (options, modelId) => options.find((option) => option.dataset.playgroundModelOption === modelId)?.id || '',
+      value,
+    );
+    check(Boolean(optionId), 'Playground model picker', 'renders the requested model in the visual listbox', value);
+    if (optionId) await page.locator(`#${optionId}`).click();
+    equal(await playgroundModel.inputValue(), value, 'Playground model picker', 'keeps the routed model control synchronized');
+  };
+  check(await playgroundModelTrigger.locator('.model-lab-mark').count() === 1, 'Playground model picker', 'shows the selected model lab mark');
+  check(
+    (await playgroundModelTrigger.locator('img').getAttribute('src'))?.endsWith('/qwen.svg'),
+    'Playground model picker',
+    'uses the local Qwen image asset for the Qwen-family fixture',
+  );
+  await playgroundModelTrigger.focus();
+  await page.keyboard.press('ArrowDown');
+  equal(await playgroundModelTrigger.getAttribute('aria-expanded'), 'true', 'Playground model picker', 'opens from the keyboard');
+  check(await page.locator('[data-playground-model-option]:focus').count() === 1, 'Playground model picker', 'moves focus to the selected listbox option');
+  await page.keyboard.press('Escape');
+  equal(await playgroundModelTrigger.getAttribute('aria-expanded'), 'false', 'Playground model picker', 'closes with Escape');
+  check(await playgroundModelTrigger.evaluate((trigger) => trigger === document.activeElement), 'Playground model picker', 'returns focus to its trigger');
+  await page.locator('.pg-advanced > summary').click();
   check(await rateOption.count() > 0, 'Playground price controls', 'offers a rate-priced fixture model');
   check(await fixedOption.count() > 0, 'Playground price controls', 'offers a fixed-only fixture model');
-  await playgroundModel.selectOption(await rateOption.getAttribute('value'));
+  await choosePlaygroundModel(await rateOption.getAttribute('value'));
   equal(await page.locator('[data-playground-price-unit]').innerText(), '$ / 1M-unit basket', 'Playground price controls', 'names the composite rate basis');
   await playgroundPrice.fill('0.50');
   await playgroundPrompt.fill('Verify the rate-price request control.');
@@ -248,10 +284,13 @@ try {
   await playgroundSend.click();
   const rateRequest = await rateRequestPromise;
   equal(rateRequest.headers()['x-mayhem-max-price-au'], '500000000000000', 'Playground price controls', 'converts $0.50 per 1M-unit basket to the gateway rate basis');
-  await page.locator('.message.assistant .message-result[data-finish-reason="stop"]').last().waitFor();
-  check(await page.locator('.message.assistant').last().getByText('Actual charge', { exact: false }).count() > 0, 'Playground completion', 'shows receipt-backed actual charge after a completed request');
+  // Wait on the result COUNT: a `.last()` wait would match the previous
+  // send's result while this one is still streaming, racing the composer
+  // clear that runs when the in-flight response completes.
+  await page.waitForFunction(() => document.querySelectorAll('.pg-message.is-assistant .message-result[data-finish-reason="stop"]').length >= 1);
+  check(await page.locator('.pg-message.is-assistant').last().getByText('Actual charge', { exact: false }).count() > 0, 'Playground completion', 'shows receipt-backed actual charge after a completed request');
 
-  await playgroundModel.selectOption(await fixedOption.getAttribute('value'));
+  await choosePlaygroundModel(await fixedOption.getAttribute('value'));
   equal(await playgroundPrice.inputValue(), '', 'Playground price controls', 'clears a ceiling when the selected model changes price basis');
   equal(await page.locator('[data-playground-price-label]').innerText(), 'Fixed route charge ceiling', 'Playground price controls', 'labels fixed-only routing separately');
   equal(await page.locator('[data-playground-price-unit]').innerText(), 'USD', 'Playground price controls', 'uses USD for a fixed route ceiling');
@@ -266,12 +305,12 @@ try {
   await playgroundSend.click();
   const fixedRequest = await fixedRequestPromise;
   equal(fixedRequest.headers()['x-mayhem-max-price-au'], '500000000000000000', 'Playground price controls', 'converts a $0.50 fixed charge to atomic units');
-  await page.locator('.message.assistant .message-result[data-finish-reason="stop"]').last().waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('.pg-message.is-assistant .message-result[data-finish-reason="stop"]').length >= 2);
 
   await playgroundOutput.fill('64');
   await playgroundPrompt.fill('Exercise the deterministic output-limit fixture.');
   await playgroundSend.click();
-  const lengthResult = page.locator('.message.assistant .message-result[data-finish-reason="length"]').last();
+  const lengthResult = page.locator('.pg-message.is-assistant .message-result[data-finish-reason="length"]').last();
   await lengthResult.waitFor();
   check((await lengthResult.innerText()).includes('Output limit reached'), 'Playground output limit', 'explains a length-limited response without calling it complete');
   const continueButton = page.locator('[data-playground-continue]').last();
@@ -302,8 +341,8 @@ try {
   await playgroundSend.click();
   const partialMarker = page.locator('[data-playground-partial-output]').last();
   await partialMarker.waitFor();
-  check((await page.locator('.message.assistant').last().innerText()).includes('Preserved partial output.'), 'Playground transport recovery', 'preserves partial streamed content');
-  check(await page.locator('.message.assistant').last().locator('[data-playground-retry]').isVisible(), 'Playground transport recovery', 'offers a retry after an incomplete stream');
+  check((await page.locator('.pg-message.is-assistant').last().innerText()).includes('Preserved partial output.'), 'Playground transport recovery', 'preserves partial streamed content');
+  check(await page.locator('.pg-message.is-assistant').last().locator('[data-playground-retry]').isVisible(), 'Playground transport recovery', 'offers a retry after an incomplete stream');
   await page.unroute('**/v1/chat/completions');
 
   await page.route('**/v1/chat/completions', async (route) => {
@@ -314,14 +353,14 @@ try {
     });
   });
   await playgroundPrompt.fill('Exercise a funding recovery path.');
-  const failedMessagesBeforeFunding = await page.locator('.message.assistant.failed').count();
+  const failedMessagesBeforeFunding = await page.locator('.pg-message.is-assistant.is-failed').count();
   expectedConsoleFailure = '402 (Payment Required)';
   await playgroundSend.click();
   await page.waitForFunction(
-    (previousCount) => document.querySelectorAll('.message.assistant.failed').length > previousCount,
+    (previousCount) => document.querySelectorAll('.pg-message.is-assistant.is-failed').length > previousCount,
     failedMessagesBeforeFunding,
   );
-  const fundingFailure = page.locator('.message.assistant.failed').last();
+  const fundingFailure = page.locator('.pg-message.is-assistant.is-failed').last();
   const fundingFailureText = await fundingFailure.innerText();
   check(fundingFailureText.includes('available balance was not sufficient'), 'Playground request recovery', 'translates a funding failure into user impact', fundingFailureText);
   check(await fundingFailure.getByRole('link', { name: 'Review wallet' }).isVisible(), 'Playground request recovery', 'offers the relevant next destination', fundingFailureText);
@@ -425,7 +464,7 @@ try {
     {
       scope: 'wallet freshness',
       path: '/mayhem/dashboard/wallet?scenario=showcase&fresh_evidence=true',
-      selector: '.metric-value [data-volatile-value][data-volatile-expired="true"]',
+      selector: '.metric-status .status-badge[data-volatile-expired="true"]',
       expected: 'Refresh to reconfirm',
       summary: 'Ledger evidence expired',
     },
@@ -433,7 +472,7 @@ try {
       scope: 'earnings freshness',
       path: '/mayhem/dashboard/earn/earnings?scenario=showcase&fresh_evidence=true',
       selector: '.status-badge[data-volatile-expired="true"]',
-      expected: 'Snapshot expired',
+      expected: 'Refresh to reconfirm',
       summary: 'Earnings ledger evidence expired',
     },
     {

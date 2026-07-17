@@ -18,11 +18,14 @@ const SCALE_ROUTE_COUNT = 128;
 const SCALE_RECEIPT_COUNT = 96;
 const SCALE_TOKEN_COUNT = 64;
 const SCALE_PROBE_COUNT = 64;
-const MODEL_ROW_CAP = 80;
-const PROVIDER_ROW_CAP = 60;
-const ACTIVITY_ROW_CAP = 60;
-const EVIDENCE_ROW_CAP = 30;
-const TOKEN_ROW_CAP = 50;
+const MODEL_ROW_CAP = 25;
+const PROVIDER_ROW_CAP = 25;
+const ACTIVITY_ROW_CAP = 25;
+const EVIDENCE_ROW_CAP = 25;
+const TOKEN_ROW_CAP = 25;
+const lastPage = (total, cap) => Math.ceil(total / cap);
+const lastPageStart = (total, cap) => (lastPage(total, cap) - 1) * cap + 1;
+const lastPageRows = (total, cap) => total - (lastPage(total, cap) - 1) * cap;
 
 const EXPECTED_SCENARIOS = [
   'showcase',
@@ -60,14 +63,14 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/playground',
     title: 'Mayhem Playground',
     pageLabel: 'Playground',
-    heading: 'Ask, test, and verify',
+    heading: 'Playground',
     markers: ['href="/mayhem/dashboard/activity"'],
   },
   {
     id: 'models',
     path: '/mayhem/dashboard/models',
     title: 'Mayhem Models',
-    pageLabel: 'Models',
+    pageLabel: 'Model catalog',
     heading: 'Choose by what the work needs',
     primaryPath: '/mayhem/dashboard/models',
     markers: ['id="models-table"', '<caption class="sr-only">Models in this gateway catalog</caption>'],
@@ -77,7 +80,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/activity',
     title: 'Mayhem Activity',
     pageLabel: 'Activity',
-    heading: 'Recorded requests and retained state',
+    heading: 'Requests and receipts',
     primaryPath: '/mayhem/dashboard/activity',
     markers: ['id="activity-table"', '<caption class="sr-only">Prioritized incomplete records, final receipts, and retained pause records from this gateway process</caption>'],
   },
@@ -85,8 +88,8 @@ const PRODUCT_ROUTES = [
     id: 'wallet',
     path: '/mayhem/dashboard/wallet',
     title: 'Mayhem Wallet',
-    pageLabel: 'Wallet',
-    heading: 'Balance, funding, and recovery',
+    pageLabel: 'Billing',
+    heading: 'Billing',
     primaryPath: '/mayhem/dashboard/wallet',
     markers: ['id="wallet-backup-command"'],
   },
@@ -94,7 +97,7 @@ const PRODUCT_ROUTES = [
     id: 'connect',
     path: '/mayhem/dashboard/connect',
     title: 'Mayhem Connect',
-    pageLabel: 'Connect',
+    pageLabel: 'Integrations',
     heading: 'Connect the tools you already use',
     primaryPath: '/mayhem/dashboard/connect',
     markers: ['id="gateway-base-url"', 'id="connection-result"', 'data-connection-test'],
@@ -107,6 +110,16 @@ const PRODUCT_ROUTES = [
     primaryPath: '/mayhem/dashboard/earn',
     context: 'Earn',
     markers: ['data-money', 'id="earn-routes-table"'],
+  },
+  {
+    id: 'earn-jobs',
+    path: '/mayhem/dashboard/earn/jobs',
+    title: 'Mayhem Jobs',
+    pageLabel: 'Earn',
+    heading: 'Jobs',
+    primaryPath: '/mayhem/dashboard/earn',
+    context: 'Earn',
+    markers: ['id="provider-jobs-table"', 'Gateway-observed provider jobs'],
   },
   {
     id: 'earn-machines',
@@ -213,7 +226,7 @@ const PRODUCT_ROUTES = [
     path: '/mayhem/dashboard/help',
     title: 'Mayhem Help',
     pageLabel: 'Help',
-    heading: 'Understand the state before you act',
+    heading: 'How Mayhem works',
     primaryPath: '/mayhem/dashboard/help',
     markers: ['Choose what you want to do', 'Essential terms', 'Attestation tiers'],
   },
@@ -321,18 +334,7 @@ const EVIDENCE_ROUTE_IDS = new Set([
   'network-evidence',
 ]);
 
-const MOBILE_MORE_ROUTE_IDS = new Set([
-  'playground',
-  'wallet',
-  'connect',
-  'network',
-  'network-models',
-  'network-providers',
-  'network-markets',
-  'network-activity',
-  'network-evidence',
-  'settings',
-]);
+const MOBILE_MORE_ROUTE_IDS = new Set([]);
 
 function usage() {
   console.log(`Usage:
@@ -752,6 +754,9 @@ function checkScenarioSemantics(report, scenario, route, html) {
     }
     if (route.id === 'playground') {
       report.includes(html, 'data-playground-form', scope, 'renders the interactive prompt form');
+      report.includes(html, 'aria-label="Playground mode"', scope, 'renders the Text, Image, and Speech mode switcher');
+      report.includes(html, 'data-playground-mode-panel="image"', scope, 'renders the image workspace');
+      report.includes(html, 'data-playground-mode-panel="speech"', scope, 'renders the speech workspace');
       report.includes(html, 'data-playground-max-tokens', scope, 'offers an enforceable output limit');
       report.includes(html, 'data-playground-max-price', scope, 'offers the selected model price ceiling');
       report.includes(html, 'data-price-mode="rate"', scope, 'exposes the fixture model price basis');
@@ -760,15 +765,15 @@ function checkScenarioSemantics(report, scenario, route, html) {
       report.includes(html, 'data-playground-min-att-tier', scope, 'offers the minimum attestation tier');
       report.includes(
         html,
-        'saved only in this browser tab',
+        'drafts and history stay in this browser tab',
         scope,
         'explains the scope of draft persistence',
       );
-      report.includes(html, 'The access token is never saved', scope, 'excludes the access token from draft persistence');
+      report.includes(html, 'access tokens are never saved', scope, 'excludes the access token from draft persistence');
       report.includes(html, 'data-playground-reset-draft', scope, 'offers an explicit low-noise draft reset');
       report.includes(
         html,
-        'a T4 identity route can satisfy a T3 numeric minimum without providing T3 confidential-compute properties',
+        'Numeric identity tier does not promise confidential compute.',
         scope,
         'does not overstate attestation as a privacy guarantee',
       );
@@ -796,7 +801,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
         scope,
         'labels the determinate probation requirement',
       );
-      report.includes(html, 'Provider scope:', scope, 'keeps configured identity as compact context');
+      report.includes(html, 'Provider identity:', scope, 'keeps configured identity as compact context');
       report.check(
         !html.includes('Configured gateway identity'),
         scope,
@@ -818,10 +823,15 @@ function checkScenarioSemantics(report, scenario, route, html) {
   if (scenario === 'auth-required') {
     if (route.id === 'home') {
       report.includes(html, '<h1>Create a gateway credential</h1>', scope, 'surfaces the missing credential as the next setup step');
-      report.includes(html, 'class="primary-button" href="/mayhem/dashboard/connect">Set up access', scope, 'makes credential setup the primary action');
       report.includes(
         html,
-        '<h2>Configured provider</h2>',
+        'href="/mayhem/dashboard/connect" data-product-event="use_ai_path_opened">Set up access',
+        scope,
+        'makes credential setup the Use AI launch action',
+      );
+      report.includes(
+        html,
+        '<h2>Your provider</h2>',
         scope,
         'keeps provider evidence visible while credential setup remains the page-level action',
       );
@@ -845,7 +855,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
 
   if (scenario === 'empty') {
     if (route.id === 'home') {
-      report.includes(html, '<h1>Catalog unavailable</h1>', scope, 'names the unavailable catalog state');
+      report.includes(html, '<h1>Set up your first model</h1>', scope, 'frames the empty catalog as a setup step');
     }
     if (route.id === 'playground') {
       report.includes(html, 'class="empty-block"', scope, 'renders a purposeful empty state');
@@ -861,7 +871,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
     if (route.id === 'wallet') {
       report.includes(
         html,
-        'Ledger balance</span><span class="metric-state">FIAT</span></div><div class="metric-value">Unavailable</div>',
+        'Ledger balance</span><span class="metric-state">FIAT</span></div><div class="metric-status"><span class="status-badge warn">Unavailable</span></div>',
         scope,
         'marks the unavailable ledger balance explicitly without fabricating a balance',
       );
@@ -889,7 +899,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
     }
     if (route.id === 'earn') {
       report.includes(html, '<h1>Preparing a model</h1>', scope, 'names the active preparation state');
-      report.includes(html, 'download is 68% complete', scope, 'exposes deterministic preparation progress');
+      report.includes(html, 'Download is 68% complete', scope, 'exposes deterministic preparation progress');
     }
   }
 
@@ -948,12 +958,13 @@ function checkScenarioSemantics(report, scenario, route, html) {
     } else if (route.id === 'home') {
       report.includes(
         html,
-        '<a class="primary-button" href="/mayhem/dashboard/settings">Review update</a>',
+        '<a class="soft-button" href="/mayhem/dashboard/settings">Review update</a>',
         scope,
-        'keeps the update action in the page header without a duplicate attention link',
+        'keeps one update action with the blocking attention state',
       );
-      report.check(
-        !html.includes('<a class="soft-button" href="/mayhem/dashboard/settings">'),
+      report.equal(
+        countOccurrences(html, '<a class="soft-button" href="/mayhem/dashboard/settings">Review update</a>'),
+        1,
         scope,
         'does not duplicate the Home update action',
       );
@@ -1034,6 +1045,11 @@ async function exerciseWorkbench(baseUrl, options) {
   report.check(font.body.length > 10_000, 'font asset', 'contains a non-trivial embedded font', `received ${font.body.length} bytes`);
   report.equal(font.body.subarray(0, 4).toString('ascii'), 'wOF2', 'font asset', 'has a WOFF2 signature');
 
+  const qwenLogo = await get(baseUrl, '/mayhem/dashboard/assets/brand/qwen.svg', requestOptions);
+  report.equal(qwenLogo.status, 200, 'Qwen logo asset', 'returns HTTP 200');
+  report.equal(headerValue(qwenLogo.headers, 'content-type'), 'image/svg+xml', 'Qwen logo asset', 'uses SVG content type');
+  report.includes(qwenLogo.text, '<svg', 'Qwen logo asset', 'serves the materialized Qwen vector file');
+
   const appCss = await get(baseUrl, '/mayhem/dashboard/assets/app.css', requestOptions);
   report.equal(appCss.status, 200, 'app stylesheet', 'returns HTTP 200');
   report.check(
@@ -1074,7 +1090,7 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     appCss.text,
-    'html.js-ready .playground-interactive.js-only{display:block!important}',
+    'html.js-ready .playground-interactive.js-only{display:flex!important;flex-direction:column}',
     'app stylesheet',
     'reveals the Playground interaction layer only after JavaScript is ready',
   );
@@ -1268,17 +1284,15 @@ async function exerciseWorkbench(baseUrl, options) {
         'renders one page-level heading',
       );
       if (route.heading !== undefined) {
-        const expectedHeading = scenario === 'auth-required' && route.id === 'playground'
-          ? 'Credential required before sending'
-          : route.heading;
-        report.includes(response.text, `<h1>${expectedHeading}</h1>`, scope, 'uses the route heading');
+        report.includes(response.text, `<h1>${route.heading}</h1>`, scope, 'uses the route heading');
       }
       report.includes(response.text, '<body class="has-workbench">', scope, 'marks workbench rendering');
       report.includes(response.text, '<div class="app-shell">', scope, 'renders the shared application shell');
       report.includes(response.text, '<a class="skip-link" href="#main-content">', scope, 'offers a keyboard skip link');
       report.includes(response.text, 'aria-label="Mayhem navigation"', scope, 'labels the application navigation');
       report.includes(response.text, '<nav class="app-nav" aria-label="Primary">', scope, 'renders labeled primary navigation');
-      report.includes(response.text, '<main class="app-main" id="main-content" tabindex="-1">', scope, 'provides a focusable main landmark');
+      report.includes(response.text, '<main class="app-main', scope, 'provides a focusable main landmark');
+      report.includes(response.text, 'id="main-content" tabindex="-1">', scope, 'keeps the main landmark focusable');
       report.includes(response.text, '<header class="app-topbar">', scope, 'renders the shared top bar');
       report.includes(response.text, 'data-page-status-text', scope, 'keeps critical page status in a compact mobile-safe text wrapper');
       const hasMoney = response.text.includes('data-money');
@@ -1338,11 +1352,16 @@ async function exerciseWorkbench(baseUrl, options) {
         report.includes(response.text, `href="${primaryPath}"`, scope, `links primary destination ${primaryPath}`);
       }
       if (route.primaryPath !== undefined) {
+        const navigationLabel = route.id === 'models'
+          ? 'Model catalog'
+          : route.id.startsWith('network')
+            ? 'Network explorer'
+            : route.pageLabel;
         report.includes(
           response.text,
-          `<a href="${route.primaryPath}" aria-label="${route.pageLabel}" aria-current="page">`,
+          `<a href="${route.primaryPath}" aria-label="${navigationLabel}" aria-current="page">`,
           scope,
-          'marks the current primary product area',
+          'marks the current navigation destination',
         );
       }
       if (route.context !== undefined) {
@@ -1432,7 +1451,7 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleModels,
-    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} catalog models. Page 1 of 2.`,
+    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} catalog models. Page 1 of ${lastPage(SCALE_MODEL_COUNT, MODEL_ROW_CAP)}.`,
     'scale/models',
     'reports the current model row range and page count',
   );
@@ -1460,30 +1479,31 @@ async function exerciseWorkbench(baseUrl, options) {
     ...requestOptions,
     headers: { Cookie: scaleScenarioCookie ?? '' },
   };
+  const modelLastPage = lastPage(SCALE_MODEL_COUNT, MODEL_ROW_CAP);
   const scaleModelsSecondResponse = await get(
     baseUrl,
-    '/mayhem/dashboard/models?page=2',
+    `/mayhem/dashboard/models?page=${modelLastPage}`,
     scalePageOptions,
   );
   const scaleModelsSecond = scaleModelsSecondResponse.text;
-  report.equal(scaleModelsSecondResponse.status, 200, 'scale/models page 2', 'returns HTTP 200');
+  report.equal(scaleModelsSecondResponse.status, 200, 'scale/models last page', 'returns HTTP 200');
   report.equal(
     tableBodyRowCount(scaleModelsSecond, 'Models in this gateway catalog'),
-    SCALE_MODEL_COUNT - MODEL_ROW_CAP,
-    'scale/models page 2',
+    lastPageRows(SCALE_MODEL_COUNT, MODEL_ROW_CAP),
+    'scale/models last page',
     'renders every remaining model row',
   );
   report.includes(
     scaleModelsSecond,
-    `Showing rows ${MODEL_ROW_CAP + 1}&ndash;${SCALE_MODEL_COUNT} of ${SCALE_MODEL_COUNT} catalog models. Page 2 of 2.`,
-    'scale/models page 2',
+    `Showing rows ${lastPageStart(SCALE_MODEL_COUNT, MODEL_ROW_CAP)}&ndash;${SCALE_MODEL_COUNT} of ${SCALE_MODEL_COUNT} catalog models. Page ${modelLastPage} of ${modelLastPage}.`,
+    'scale/models last page',
     'reports the final model row range',
   );
-  report.includes(scaleModelsSecond, 'workbench/96-', 'scale/models page 2', 'makes the final model reachable');
-  report.includes(scaleModelsSecond, 'Fixture: Scale and overflow', 'scale/models page 2', 'preserves the fixture through its cookie');
+  report.includes(scaleModelsSecond, 'workbench/96-', 'scale/models last page', 'makes the final model reachable');
+  report.includes(scaleModelsSecond, 'Fixture: Scale and overflow', 'scale/models last page', 'preserves the fixture through its cookie');
   report.check(
     !scaleModelsSecond.includes('href="/mayhem/dashboard/models?scenario=scale&amp;page=1"'),
-    'scale/models page 2',
+    'scale/models last page',
     'keeps pagination URLs product-clean and relies on the local fixture cookie',
   );
 
@@ -1499,34 +1519,35 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleActivity,
-    `<div class="metric-value">${SCALE_RECEIPT_COUNT}</div><p class="metric-meta">Raw gateway receipt records</p>`,
+    '<span class="metric-label">Final receipts</span>',
     'scale/activity',
-    'discloses the full receipt count behind the bounded table',
+    'summarizes final receipts without a raw checkpoint card',
   );
   report.includes(
     scaleActivity,
-    `Showing rows 1&ndash;${ACTIVITY_ROW_CAP} of ${SCALE_RECEIPT_COUNT} recorded sessions. Page 1 of 2.`,
+    `Showing rows 1&ndash;${ACTIVITY_ROW_CAP} of ${SCALE_RECEIPT_COUNT} recorded sessions. Page 1 of ${lastPage(SCALE_RECEIPT_COUNT, ACTIVITY_ROW_CAP)}.`,
     'scale/activity',
     'reports the current activity row range and page count',
   );
+  const activityLastPage = lastPage(SCALE_RECEIPT_COUNT, ACTIVITY_ROW_CAP);
   const scaleActivitySecond = (await get(
     baseUrl,
-    '/mayhem/dashboard/activity?page=2',
+    `/mayhem/dashboard/activity?page=${activityLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleActivitySecond, 'Prioritized incomplete records, final receipts, and retained pause records from this gateway process'),
-    SCALE_RECEIPT_COUNT - ACTIVITY_ROW_CAP,
-    'scale/activity page 2',
+    lastPageRows(SCALE_RECEIPT_COUNT, ACTIVITY_ROW_CAP),
+    'scale/activity last page',
     'renders every remaining activity row',
   );
   report.includes(
     scaleActivitySecond,
-    `Showing rows ${ACTIVITY_ROW_CAP + 1}&ndash;${SCALE_RECEIPT_COUNT} of ${SCALE_RECEIPT_COUNT} recorded sessions. Page 2 of 2.`,
-    'scale/activity page 2',
+    `Showing rows ${lastPageStart(SCALE_RECEIPT_COUNT, ACTIVITY_ROW_CAP)}&ndash;${SCALE_RECEIPT_COUNT} of ${SCALE_RECEIPT_COUNT} recorded sessions. Page ${activityLastPage} of ${activityLastPage}.`,
+    'scale/activity last page',
     'reports the final activity row range',
   );
-  report.includes(scaleActivitySecond, 'workbench-session-96', 'scale/activity page 2', 'makes the final recorded session reachable');
+  report.includes(scaleActivitySecond, 'workbench-session-96', 'scale/activity last page', 'makes the final recorded session reachable');
 
   const scaleConnect = rendered.get('scale/connect') ?? '';
   report.equal(
@@ -1540,7 +1561,7 @@ async function exerciseWorkbench(baseUrl, options) {
   report.equal(countOccurrences(scaleConnect, 'data-filter-row'), TOKEN_ROW_CAP, 'scale/connect', 'makes each shown token sortable and exportable');
   report.includes(
     scaleConnect,
-    `Showing rows 1&ndash;${TOKEN_ROW_CAP} of ${SCALE_TOKEN_COUNT} access tokens. Page 1 of 2.`,
+    `Showing rows 1&ndash;${TOKEN_ROW_CAP} of ${SCALE_TOKEN_COUNT} access tokens. Page 1 of ${lastPage(SCALE_TOKEN_COUNT, TOKEN_ROW_CAP)}.`,
     'scale/connect',
     'reports the first reachable token page',
   );
@@ -1550,24 +1571,25 @@ async function exerciseWorkbench(baseUrl, options) {
     'scale/connect',
     'keeps active tokens ahead of older inactive records',
   );
+  const tokenLastPage = lastPage(SCALE_TOKEN_COUNT, TOKEN_ROW_CAP);
   const scaleConnectSecond = (await get(
     baseUrl,
-    '/mayhem/dashboard/connect?page=2',
+    `/mayhem/dashboard/connect?page=${tokenLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleConnectSecond, 'Gateway access tokens, budgets, scopes, and status'),
-    SCALE_TOKEN_COUNT - TOKEN_ROW_CAP,
-    'scale/connect page 2',
+    lastPageRows(SCALE_TOKEN_COUNT, TOKEN_ROW_CAP),
+    'scale/connect last page',
     'renders every remaining access token',
   );
   report.includes(
     scaleConnectSecond,
-    `Showing rows ${TOKEN_ROW_CAP + 1}&ndash;${SCALE_TOKEN_COUNT} of ${SCALE_TOKEN_COUNT} access tokens. Page 2 of 2.`,
-    'scale/connect page 2',
+    `Showing rows ${lastPageStart(SCALE_TOKEN_COUNT, TOKEN_ROW_CAP)}&ndash;${SCALE_TOKEN_COUNT} of ${SCALE_TOKEN_COUNT} access tokens. Page ${tokenLastPage} of ${tokenLastPage}.`,
+    'scale/connect last page',
     'reports the final token row range',
   );
-  report.includes(scaleConnectSecond, 'Scale inactive 56', 'scale/connect page 2', 'makes the final sorted token reachable');
+  report.includes(scaleConnectSecond, 'Scale inactive 56', 'scale/connect last page', 'makes the final sorted token reachable');
 
   const scaleEarn = rendered.get('scale/earn') ?? '';
   report.equal(
@@ -1577,17 +1599,18 @@ async function exerciseWorkbench(baseUrl, options) {
     'bounds provider overview routes',
   );
   report.includes(scaleEarn, 'data-table-filter="#earn-routes-table"', 'scale/earn', 'adds shown-page tools to provider overview routes');
+  const routeLastPage = lastPage(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP);
   report.includes(
     scaleEarn,
-    `Showing rows 1&ndash;${PROVIDER_ROW_CAP} of ${SCALE_ROUTE_COUNT} configured serving routes. Page 1 of 3.`,
+    `Showing rows 1&ndash;${PROVIDER_ROW_CAP} of ${SCALE_ROUTE_COUNT} configured serving routes. Page 1 of ${routeLastPage}.`,
     'scale/earn',
     'reports the provider overview range',
   );
-  const scaleEarnLast = (await get(baseUrl, '/mayhem/dashboard/earn?page=3', scalePageOptions)).text;
+  const scaleEarnLast = (await get(baseUrl, `/mayhem/dashboard/earn?page=${routeLastPage}`, scalePageOptions)).text;
   report.equal(
     tableBodyRowCount(scaleEarnLast, 'Configured provider serving routes and current capacity'),
-    SCALE_ROUTE_COUNT - PROVIDER_ROW_CAP * 2,
-    'scale/earn page 3',
+    lastPageRows(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP),
+    'scale/earn last page',
     'makes every provider overview route reachable',
   );
 
@@ -1599,11 +1622,11 @@ async function exerciseWorkbench(baseUrl, options) {
     'bounds provider machine routes',
   );
   report.includes(scaleMachines, 'data-table-filter="#machine-routes-table"', 'scale/earn-machines', 'adds shown-page tools to machine routes');
-  const scaleMachinesLast = (await get(baseUrl, '/mayhem/dashboard/earn/machines?page=3', scalePageOptions)).text;
+  const scaleMachinesLast = (await get(baseUrl, `/mayhem/dashboard/earn/machines?page=${routeLastPage}`, scalePageOptions)).text;
   report.equal(
     tableBodyRowCount(scaleMachinesLast, 'Machine routes for the configured provider identity'),
-    SCALE_ROUTE_COUNT - PROVIDER_ROW_CAP * 2,
-    'scale/earn-machines page 3',
+    lastPageRows(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP),
+    'scale/earn-machines last page',
     'makes every provider machine route reachable',
   );
 
@@ -1615,11 +1638,11 @@ async function exerciseWorkbench(baseUrl, options) {
     'bounds provider reliability rows',
   );
   report.includes(scaleReliability, 'data-table-filter="#reliability-routes-table"', 'scale/earn-reliability', 'adds shown-page tools to reliability routes');
-  const scaleReliabilityLast = (await get(baseUrl, '/mayhem/dashboard/earn/reliability?page=3', scalePageOptions)).text;
+  const scaleReliabilityLast = (await get(baseUrl, `/mayhem/dashboard/earn/reliability?page=${routeLastPage}`, scalePageOptions)).text;
   report.equal(
     tableBodyRowCount(scaleReliabilityLast, 'Provider route reputation, probation, and gateway observations'),
-    SCALE_ROUTE_COUNT - PROVIDER_ROW_CAP * 2,
-    'scale/earn-reliability page 3',
+    lastPageRows(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP),
+    'scale/earn-reliability last page',
     'makes every provider reliability route reachable',
   );
 
@@ -1635,22 +1658,22 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleOpportunities,
-    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} catalog models. Page 1 of 2.`,
+    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} catalog models. Page 1 of ${modelLastPage}.`,
     'scale/earn-opportunities',
     'reports the current host-fit row range and page count',
   );
   const scaleOpportunitiesSecond = (await get(
     baseUrl,
-    '/mayhem/dashboard/earn/opportunities?page=2',
+    `/mayhem/dashboard/earn/opportunities?page=${modelLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleOpportunitiesSecond, 'Catalog models, gateway-host compatibility, and advertised supply'),
-    SCALE_MODEL_COUNT - MODEL_ROW_CAP,
-    'scale/earn-opportunities page 2',
+    lastPageRows(SCALE_MODEL_COUNT, MODEL_ROW_CAP),
+    'scale/earn-opportunities last page',
     'renders every remaining host-fit row',
   );
-  report.includes(scaleOpportunitiesSecond, 'workbench/96-', 'scale/earn-opportunities page 2', 'makes the final host-fit row reachable');
+  report.includes(scaleOpportunitiesSecond, 'workbench/96-', 'scale/earn-opportunities last page', 'makes the final host-fit row reachable');
 
   const scaleNetworkModels = rendered.get('scale/network-models') ?? '';
   report.equal(
@@ -1664,22 +1687,22 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleNetworkModels,
-    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} network models. Page 1 of 2.`,
+    `Showing rows 1&ndash;${MODEL_ROW_CAP} of ${SCALE_MODEL_COUNT} network models. Page 1 of ${modelLastPage}.`,
     'scale/network-models',
     'reports the current network-model row range and page count',
   );
   const scaleNetworkModelsSecond = (await get(
     baseUrl,
-    '/mayhem/dashboard/network/models?page=2',
+    `/mayhem/dashboard/network/models?page=${modelLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleNetworkModelsSecond, 'Network models, advertised capacity, capabilities, and price'),
-    SCALE_MODEL_COUNT - MODEL_ROW_CAP,
-    'scale/network-models page 2',
+    lastPageRows(SCALE_MODEL_COUNT, MODEL_ROW_CAP),
+    'scale/network-models last page',
     'renders every remaining network-model row',
   );
-  report.includes(scaleNetworkModelsSecond, 'workbench/96-', 'scale/network-models page 2', 'makes the final network model reachable');
+  report.includes(scaleNetworkModelsSecond, 'workbench/96-', 'scale/network-models last page', 'makes the final network model reachable');
 
   const scaleProviders = rendered.get('scale/network-providers') ?? '';
   report.equal(
@@ -1693,25 +1716,25 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleProviders,
-    `Showing rows 1&ndash;${PROVIDER_ROW_CAP} of ${SCALE_ROUTE_COUNT} catalog provider routes. Page 1 of 3.`,
+    `Showing rows 1&ndash;${PROVIDER_ROW_CAP} of ${SCALE_ROUTE_COUNT} catalog provider routes. Page 1 of ${routeLastPage}.`,
     'scale/network-providers',
     'reports the current provider-route row range and page count',
   );
   const scaleProvidersLast = (await get(
     baseUrl,
-    '/mayhem/dashboard/network/providers?page=3',
+    `/mayhem/dashboard/network/providers?page=${routeLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleProvidersLast, 'Canonical provider routes and current operational evidence'),
-    SCALE_ROUTE_COUNT - PROVIDER_ROW_CAP * 2,
-    'scale/network-providers page 3',
+    lastPageRows(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP),
+    'scale/network-providers last page',
     'renders every provider route on the final page',
   );
   report.includes(
     scaleProvidersLast,
-    `Showing rows ${PROVIDER_ROW_CAP * 2 + 1}&ndash;${SCALE_ROUTE_COUNT} of ${SCALE_ROUTE_COUNT} catalog provider routes. Page 3 of 3.`,
-    'scale/network-providers page 3',
+    `Showing rows ${lastPageStart(SCALE_ROUTE_COUNT, PROVIDER_ROW_CAP)}&ndash;${SCALE_ROUTE_COUNT} of ${SCALE_ROUTE_COUNT} catalog provider routes. Page ${routeLastPage} of ${routeLastPage}.`,
+    'scale/network-providers last page',
     'reports the final provider-route range',
   );
 
@@ -1726,7 +1749,7 @@ async function exerciseWorkbench(baseUrl, options) {
     'renders catalog markets beyond the first page',
   );
   report.check(
-    /Showing rows 61&ndash;\d+ of \d+ catalog markets\. Page 2 of \d+\./.test(scaleMarketsSecond),
+    new RegExp(`Showing rows ${PROVIDER_ROW_CAP + 1}&ndash;\\d+ of \\d+ catalog markets\\. Page 2 of \\d+\\.`).test(scaleMarketsSecond),
     'scale/network-markets page 2',
     'reports a truthful later market row range',
   );
@@ -1741,21 +1764,22 @@ async function exerciseWorkbench(baseUrl, options) {
     'scale/network-activity',
     'caps current route observations at the evidence limit',
   );
+  const evidenceLastPage = lastPage(SCALE_ROUTE_COUNT, EVIDENCE_ROW_CAP);
   report.includes(
     scaleNetworkActivity,
-    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_ROUTE_COUNT} route observations. Page 1 of 5.`,
+    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_ROUTE_COUNT} route observations. Page 1 of ${evidenceLastPage}.`,
     'scale/network-activity',
     'reports the current route-observation range and page count',
   );
   const scaleNetworkActivityLast = (await get(
     baseUrl,
-    '/mayhem/dashboard/network/activity?page=5',
+    `/mayhem/dashboard/network/activity?page=${evidenceLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleNetworkActivityLast, 'Provider route observations ordered by heartbeat freshness'),
-    SCALE_ROUTE_COUNT - EVIDENCE_ROW_CAP * 4,
-    'scale/network-activity page 5',
+    lastPageRows(SCALE_ROUTE_COUNT, EVIDENCE_ROW_CAP),
+    'scale/network-activity last page',
     'renders every route observation on the final page',
   );
 
@@ -1768,19 +1792,19 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(
     scaleNetworkEvidence,
-    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_ROUTE_COUNT} route entries. Page 1 of 5.`,
+    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_ROUTE_COUNT} route entries. Page 1 of ${evidenceLastPage}.`,
     'scale/network-evidence',
     'reports the current route-evidence range and page count',
   );
   const scaleNetworkEvidenceLast = (await get(
     baseUrl,
-    '/mayhem/dashboard/network/evidence?page=5',
+    `/mayhem/dashboard/network/evidence?page=${evidenceLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleNetworkEvidenceLast, 'Provider route evidence'),
-    SCALE_ROUTE_COUNT - EVIDENCE_ROW_CAP * 4,
-    'scale/network-evidence page 5',
+    lastPageRows(SCALE_ROUTE_COUNT, EVIDENCE_ROW_CAP),
+    'scale/network-evidence last page',
     'renders every route-evidence row on the final page',
   );
   report.equal(
@@ -1791,33 +1815,34 @@ async function exerciseWorkbench(baseUrl, options) {
   );
   report.includes(scaleNetworkEvidence, 'data-table-filter="#evidence-probes-table"', 'scale/network-evidence probes', 'adds shown-page tools to probes');
   report.includes(scaleNetworkEvidence, 'data-table-query-prefix="probe"', 'scale/network-evidence probes', 'isolates probe filter and sort URL state');
+  const probeLastPage = lastPage(SCALE_PROBE_COUNT, EVIDENCE_ROW_CAP);
   report.includes(
     scaleNetworkEvidence,
-    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_PROBE_COUNT} probe events. Page 1 of 3.`,
+    `Showing rows 1&ndash;${EVIDENCE_ROW_CAP} of ${SCALE_PROBE_COUNT} probe events. Page 1 of ${probeLastPage}.`,
     'scale/network-evidence probes',
     'reports the first probe range',
   );
   const scaleProbeLast = (await get(
     baseUrl,
-    '/mayhem/dashboard/network/evidence?page=2&probe_page=3',
+    `/mayhem/dashboard/network/evidence?page=2&probe_page=${probeLastPage}`,
     scalePageOptions,
   )).text;
   report.equal(
     tableBodyRowCount(scaleProbeLast, 'Verification probe evidence'),
-    SCALE_PROBE_COUNT - EVIDENCE_ROW_CAP * 2,
-    'scale/network-evidence probes page 3',
+    lastPageRows(SCALE_PROBE_COUNT, EVIDENCE_ROW_CAP),
+    'scale/network-evidence probes last page',
     'makes every probe event reachable',
   );
   report.includes(
     scaleProbeLast,
-    '/mayhem/dashboard/network/evidence?page=2&amp;probe_page=2',
-    'scale/network-evidence probes page 3',
+    `/mayhem/dashboard/network/evidence?page=2&amp;probe_page=${probeLastPage - 1}`,
+    'scale/network-evidence probes last page',
     'preserves the route page while paging probes',
   );
   report.includes(
     scaleProbeLast,
-    '/mayhem/dashboard/network/evidence?probe_page=3&amp;page=1',
-    'scale/network-evidence probes page 3',
+    `/mayhem/dashboard/network/evidence?probe_page=${probeLastPage}&amp;page=1`,
+    'scale/network-evidence probes last page',
     'preserves the probe page while paging routes',
   );
 
@@ -1868,7 +1893,7 @@ async function exerciseWorkbench(baseUrl, options) {
       headers: { Cookie: scenarioCookie },
     });
     report.includes(overridden.text, 'Fixture: Provider loading', 'scenario query', 'query overrides the remembered cookie');
-    report.includes(overridden.text, 'download is 68% complete', 'scenario query', 'query selects the requested fixture data');
+    report.includes(overridden.text, 'Download is 68% complete', 'scenario query', 'query selects the requested fixture data');
   }
 
   const invalid = await get(baseUrl, '/mayhem/dashboard?scenario=not-a-scenario', requestOptions);
@@ -1899,7 +1924,7 @@ async function exerciseWorkbench(baseUrl, options) {
     });
     report.includes(
       homeBeforeRequest.text,
-      '4 receipt checkpoint(s)',
+      '4 receipt records',
       'playground state slice',
       'starts from the deterministic Showcase receipt fixture',
     );
@@ -2015,7 +2040,7 @@ async function exerciseWorkbench(baseUrl, options) {
     });
     report.includes(
       homeAfterRequest.text,
-      '6 receipt checkpoint(s)',
+      '6 receipt records',
       'playground state slice',
       'updates the Home snapshot after both completed requests',
     );
@@ -2037,7 +2062,7 @@ async function exerciseWorkbench(baseUrl, options) {
     );
     report.includes(
       activityAfterRequest.text,
-      '<div class="metric-value">6</div><p class="metric-meta">Raw gateway receipt records</p>',
+      '<span class="metric-label">Final receipts</span><span class="metric-state">Current gateway run</span></div><div class="metric-value">4</div>',
       'playground state slice',
       'updates the Activity receipt count',
     );
@@ -2125,7 +2150,7 @@ async function exerciseWorkbench(baseUrl, options) {
     });
     report.includes(
       offlineActivity.text,
-      '<div class="metric-value">0</div><p class="metric-meta">Raw gateway receipt records</p>',
+      '<span class="metric-label">Final receipts</span><span class="metric-state">Current gateway run</span></div><div class="metric-value">0</div>',
       'playground offline',
       'does not manufacture receipt evidence for failed work',
     );
@@ -2159,18 +2184,6 @@ async function exerciseWorkbench(baseUrl, options) {
     1,
     notFoundScope,
     'renders one page-level heading',
-  );
-
-  const unsupportedJobs = await get(
-    baseUrl,
-    '/mayhem/dashboard/earn/jobs?scenario=showcase',
-    requestOptions,
-  );
-  report.equal(
-    unsupportedJobs.status,
-    404,
-    'unsupported jobs surface',
-    'does not ship an invented workflow without provider-side job ingestion',
   );
 
   const unsupportedDisputes = await get(
