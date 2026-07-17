@@ -738,7 +738,7 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
 .pg-surface{height:clamp(32rem,calc(100dvh - 19rem),42rem);min-height:32rem;overflow:hidden;border:1px solid rgba(229,231,235,.1);border-radius:1rem;background:var(--pg-surface);box-shadow:inset 0 1px 0 rgba(229,231,235,.04),0 28px 70px -42px #000}
 .pg-mode-stack,.pg-mode-panel{height:100%;min-height:0}
 .pg-mode-panel{animation:pg-mode-in .28s var(--pg-ease) backwards}
-@keyframes pg-mode-in{from{opacity:0;transform:translateY(6px) scale(.998)}to{opacity:1;transform:none}}
+@keyframes pg-mode-in{from{transform:translateY(6px) scale(.998)}to{transform:none}}
 .pg-chat{height:100%;min-height:0;display:flex;flex-direction:column}
 .pg-chat-thread{min-height:0;flex:1;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin}
 .pg-chat-thread.is-empty{display:grid;place-items:center;padding:3rem 1.5rem 2rem}
@@ -1638,7 +1638,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (mobileBottom && 'inert' in mobileBottom) mobileBottom.inert = open;
       if (open) {
         const first = drawerFocusable()[0];
-        if (first) window.requestAnimationFrame(() => first.focus());
+        if (first) first.focus();
       } else if (drawerTrigger && typeof drawerTrigger.focus === 'function') {
         const restore = drawerTrigger;
         drawerTrigger = null;
