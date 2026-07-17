@@ -983,6 +983,27 @@ test('admin writer diagnostics expose transition state without key material', ()
       pendingIndexers: [],
       indexerUpdate: false,
     },
+    view: {
+      core: {
+        writable: true,
+        opened: true,
+        length: 10,
+        signedLength: 9,
+        core: { upgrading: false },
+      },
+    },
+    views: [{
+      name: 'view',
+      mappedIndex: 0,
+      length: 9,
+      core: {
+        writable: true,
+        opened: true,
+        length: 10,
+        signedLength: 9,
+        core: { upgrading: false },
+      },
+    }],
   };
   writer.peer.base.view = {
     core: {
@@ -1003,6 +1024,8 @@ test('admin writer diagnostics expose transition state without key material', ()
   assert.equal(report.base.appending_count, 1);
   assert.equal(report.view.writable, false);
   assert.equal(report.view.upgrading, true);
+  assert.equal(report.apply_state.view.writable, true);
+  assert.equal(report.apply_state.views[0].core_length, 10);
   assert.equal(report.local_writer.active_indexer, true);
   assert.deepEqual(report.apply_state.indexer_lengths, [4]);
   assert.doesNotMatch(JSON.stringify(report), new RegExp(adminKey));

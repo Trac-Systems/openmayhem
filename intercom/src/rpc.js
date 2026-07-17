@@ -24,6 +24,7 @@ export const adminWriterDiagnostics = (peer) => {
   const system = applyState?.system;
   const applyStage = peer?.contract?.instance?._mayhemApplyStage;
   const viewCore = base?.view?.core;
+  const applyViewCore = applyState?.view?.core;
   return {
     contract: {
       apply_stage: typeof applyStage === 'string' ? applyStage : null,
@@ -81,6 +82,27 @@ export const adminWriterDiagnostics = (peer) => {
         ? system.indexers.map((entry) => Number(entry?.length ?? 0))
         : [],
       indexers_updated: system?.indexerUpdate === true,
+      view: applyViewCore ? {
+        writable: applyViewCore.writable === true,
+        opened: applyViewCore.opened === true,
+        closing: applyViewCore.closing === true,
+        length: Number(applyViewCore.length ?? 0),
+        fork: Number(applyViewCore.fork ?? 0),
+        signed_length: Number(applyViewCore.signedLength ?? 0),
+        upgrading: applyViewCore?.core?.upgrading === true,
+      } : null,
+      views: Array.isArray(applyState.views)
+        ? applyState.views.map((entry) => ({
+          name: typeof entry?.name === 'string' ? entry.name : null,
+          mapped_index: Number(entry?.mappedIndex ?? -1),
+          length: Number(entry?.length ?? 0),
+          core_writable: entry?.core?.writable === true,
+          core_opened: entry?.core?.opened === true,
+          core_length: Number(entry?.core?.length ?? 0),
+          core_signed_length: Number(entry?.core?.signedLength ?? 0),
+          core_upgrading: entry?.core?.core?.upgrading === true,
+        }))
+        : [],
     } : null,
   };
 };
