@@ -655,7 +655,8 @@ async fn workbench_chat_completions(
     let receipt_value =
         (scenario == WorkbenchScenario::Showcase).then(|| receipt_summary(&receipt));
 
-    if scenario == WorkbenchScenario::Showcase && gateway.record_receipt(receipt).is_err() {
+    if scenario == WorkbenchScenario::Showcase && gateway.record_workbench_receipt(receipt).is_err()
+    {
         return workbench_chat_error(
             scenario,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1081,7 +1082,7 @@ fn showcase_state_from_models_with_receipts(
             let final_receipt = index % 3 != 0;
             let receipt = fixture_receipt(model, candidate, index, final_receipt);
             state
-                .record_receipt(receipt)
+                .record_workbench_receipt(receipt)
                 .expect("workbench receipts are internally consistent");
         }
     }
@@ -1513,6 +1514,10 @@ fn fixture_receipt(
     let cost = 120_000_000_000_000_000_u128.saturating_add(index as u128 * 47_000_000_000_000_000);
     let voucher_body = SpendVoucherBody {
         session_id: session_id.clone(),
+        billing_id: session_id.clone(),
+        billing_attempt: 0,
+        billing_prior_usage: ReceiptUsage::default(),
+        billing_prior_au_owed_cum: 0,
         rail: "fiat".to_owned(),
         enclave_id: candidate.enclave_id.clone(),
         price_ver: candidate.price_ver,
@@ -1533,6 +1538,10 @@ fn fixture_receipt(
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: session_id.clone(),
+        billing_id: session_id.clone(),
+        billing_attempt: 0,
+        billing_prior_usage: ReceiptUsage::default(),
+        billing_prior_au_owed_cum: 0,
         seq: if final_receipt { 2 } else { 1 },
         final_receipt,
         rail: "fiat".to_owned(),

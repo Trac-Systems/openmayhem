@@ -3426,6 +3426,25 @@ impl GatewayState {
         self.receipts.lock_recover("receipt store").len()
     }
 
+    #[cfg(feature = "dashboard-workbench")]
+    fn record_workbench_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
+        {
+            let mut receipts = self.receipts.lock_recover("receipt store");
+            receipts.push(receipt);
+            if receipts.len() > self.retention_limits.receipts {
+                let remove = receipts.len() - self.retention_limits.receipts;
+                receipts.drain(..remove);
+            }
+        }
+        if let Err(err) = self.persist_dashboard_history() {
+            eprintln!(
+                "Mayhem dashboard workbench could not persist receipt history: {}",
+                err.message
+            );
+        }
+        Ok(())
+    }
+
     fn paused_session_count(&self) -> usize {
         self.paused_sessions
             .lock_recover("paused session store")
