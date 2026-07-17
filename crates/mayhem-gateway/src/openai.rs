@@ -3426,7 +3426,7 @@ impl GatewayState {
         self.receipts.lock_recover("receipt store").len()
     }
 
-    #[cfg(feature = "dashboard-workbench")]
+    #[cfg(any(test, feature = "dashboard-workbench"))]
     fn record_workbench_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
         {
             let mut receipts = self.receipts.lock_recover("receipt store");

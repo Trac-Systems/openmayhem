@@ -5986,6 +5986,10 @@ mod tests {
         let voucher = SpendVoucher {
             body: SpendVoucherBody {
                 session_id: session_id.to_owned(),
+                billing_id: format!("billing-{session_id}"),
+                billing_attempt: 0,
+                billing_prior_usage: ReceiptUsage::default(),
+                billing_prior_au_owed_cum: 0,
                 rail: "fiat".to_owned(),
                 enclave_id: "enclave-test".to_owned(),
                 price_ver: 1,
@@ -6008,6 +6012,10 @@ mod tests {
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.to_owned(),
+            billing_id: format!("billing-{session_id}"),
+            billing_attempt: 0,
+            billing_prior_usage: ReceiptUsage::default(),
+            billing_prior_au_owed_cum: 0,
             seq: if final_receipt { 2 } else { 1 },
             final_receipt,
             rail: "fiat".to_owned(),
@@ -6085,7 +6093,7 @@ mod tests {
         let path = dir.path().join("dashboard-history.json");
         let state = GatewayState::from_models(Vec::new()).with_dashboard_history_path(&path);
         state
-            .record_receipt(activity_receipt_fixture(
+            .record_workbench_receipt(activity_receipt_fixture(
                 "persistent-session",
                 true,
                 now_secs(),
@@ -6237,7 +6245,7 @@ mod tests {
 
         let receipt = activity_receipt_fixture("receipt-evidence", true, now_secs());
         state
-            .record_receipt(receipt)
+            .record_workbench_receipt(receipt)
             .expect("fixture receipt can be retained");
         let receipt_payload = dashboard_evidence_payload(
             &state,
@@ -6733,14 +6741,17 @@ mod tests {
         let data = DashboardData::from_state(&state);
         let html = models_page(&data, 60, None);
 
-        assert!(html.contains(&format!("(+{omitted_abilities} more)")));
-        assert!(html.contains("(+2 more rates)"));
+        assert!(html.contains(&format!(
+            r#"data-collapsed-label="+{omitted_abilities} more""#
+        )));
+        assert!(html.contains("+2 other rates"));
         assert!(html.contains(&format!(
             r#"data-export-value="{}" data-sort-value="{}""#,
             html_escape(&exported_abilities),
             html_escape(&exported_abilities),
         )));
-        assert!(html.contains(r#"<th scope="row">"#));
+        assert!(html.contains(r#"<th scope="row""#));
+        assert!(html.contains("data-model-detail-open"));
         assert!(html.contains(&format!(r#"aria-label="Use {model_id} in Playground""#)));
 
         let mut fixed_only = GatewayState::fixture().models_snapshot()[0]
@@ -7058,7 +7069,8 @@ mod tests {
         assert!(html.contains("data-evidence-url"));
         assert!(html.contains("/mayhem/dashboard/evidence?kind=model&amp;id="));
         assert_eq!(html.matches("id=\"dashboard-evidence-dialog\"").count(), 1);
-        assert_eq!(html.matches("<dialog").count(), 1);
+        assert_eq!(html.matches("id=\"model-detail-dialog\"").count(), 1);
+        assert_eq!(html.matches("<dialog").count(), 2);
 
         let amount = 123_000_000_000_000_000_u128;
         let earnings_query = DashboardQuery {

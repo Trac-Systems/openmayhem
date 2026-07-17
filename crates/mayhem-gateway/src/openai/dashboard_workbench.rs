@@ -1887,7 +1887,7 @@ mod tests {
         assert!(
             connect.contains(r##"class="primary-button" href="#access-tokens">Set up credential"##)
         );
-        assert!(connect.contains("Available after a gateway credential is active."));
+        assert!(connect.contains("Available after an API key is configured."));
         assert!(!connect.contains(r#"class="primary-button" href="/mayhem/dashboard/playground""#));
     }
 
@@ -1967,7 +1967,9 @@ mod tests {
             body.len()
         );
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(html.matches("<dialog").count(), 1);
+        assert_eq!(html.matches(r#"id="dashboard-evidence-dialog""#).count(), 1);
+        assert_eq!(html.matches(r#"id="model-detail-dialog""#).count(), 1);
+        assert_eq!(html.matches("<dialog").count(), 2);
         let marker = "/mayhem/dashboard/evidence?kind=model&amp;id=";
         let start = html.find(marker).expect("model evidence link");
         let end = html[start..]
@@ -2111,9 +2113,7 @@ mod tests {
         assert_eq!(connect.matches("data-filter-row").count(), 25);
         assert!(connect.contains(r#"rel="next" href="/mayhem/dashboard/connect?page=2""#));
         assert!(connect.contains("Scale active 64"));
-        assert!(connect.contains(
-            r#"<span class="metric-label">Active tokens</span><span class="metric-state">Current</span></div><div class="metric-value">8</div>"#
-        ));
+        assert!(connect.contains("8 active &middot; 64 total"));
         let connect_second = rendered_workbench_page_with_cookie(
             &app,
             "/mayhem/dashboard/connect?page=3",

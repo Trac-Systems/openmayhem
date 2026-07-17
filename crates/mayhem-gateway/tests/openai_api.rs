@@ -5218,7 +5218,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert!(body.contains("Ledger balance"));
     assert!(body.contains("$1.00"));
     assert!(body.contains("Final receipts"));
-    assert!(body.contains("Recorded activity"));
+    assert!(body.contains("Recent activity"));
     assert!(!body.contains("1,240.00 TAP"));
     assert_no_external_urls(&body);
 
@@ -5277,7 +5277,7 @@ async fn models_dashboard_shows_canonical_route_count() {
     let body = String::from_utf8(bytes).expect("models dashboard html");
     assert!(body.contains("Model catalog"));
     assert!(body.contains("mayhem/routed-test"));
-    assert!(body.contains("3 route(s) advertise acceptance; 3 fresh"));
+    assert!(body.contains("3 routes accepting work; 3 fresh"));
     assert_no_external_urls(&body);
 }
 
@@ -5300,7 +5300,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
         .strip_prefix("http://127.0.0.1:11435")
         .expect("models dashboard url is rooted at gateway")
         .to_owned();
-    let second_path = format!("{first_path}&page=2");
+    let second_path = format!("{first_path}&page=4");
     let invalid_path = format!("{first_path}&page=not-a-page");
     let out_of_range_path = format!("{first_path}&page=999");
     let app = openai_router(state);
@@ -5317,7 +5317,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     assert_eq!(first_status, StatusCode::OK, "{first}");
     assert!(first.contains("mayhem/page-000"), "{first}");
     assert!(!first.contains("mayhem/page-080"));
-    assert!(first.contains("Showing rows 1&ndash;80 of 82 catalog models. Page 1 of 2."));
+    assert!(first.contains("Showing rows 1&ndash;25 of 82 catalog models. Page 1 of 4."));
     assert!(first.contains(r#"rel="next" href="/mayhem/dashboard/models?page=2""#));
 
     let (status, _, second_bytes) = raw_request_with_headers(
@@ -5333,8 +5333,8 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     assert!(!second.contains("mayhem/page-000"));
     assert!(second.contains("mayhem/page-080"));
     assert!(second.contains("mayhem/page-081"));
-    assert!(second.contains("Showing rows 81&ndash;82 of 82 catalog models. Page 2 of 2."));
-    assert!(second.contains(r#"rel="prev" href="/mayhem/dashboard/models?page=1""#));
+    assert!(second.contains("Showing rows 76&ndash;82 of 82 catalog models. Page 4 of 4."));
+    assert!(second.contains(r#"rel="prev" href="/mayhem/dashboard/models?page=3""#));
 
     let (_, _, invalid_bytes) = raw_request_with_headers(
         app.clone(),
@@ -5346,7 +5346,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     .await;
     let invalid = String::from_utf8(invalid_bytes).expect("invalid models page html");
     assert!(invalid.contains("mayhem/page-000"));
-    assert!(invalid.contains("Page 1 of 2."));
+    assert!(invalid.contains("Page 1 of 4."));
 
     let (_, _, clamped_bytes) = raw_request_with_headers(
         app,
@@ -5358,7 +5358,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     .await;
     let clamped = String::from_utf8(clamped_bytes).expect("clamped models page html");
     assert!(clamped.contains("mayhem/page-081"));
-    assert!(clamped.contains("Page 2 of 2."));
+    assert!(clamped.contains("Page 4 of 4."));
 }
 
 #[tokio::test]
@@ -5415,7 +5415,7 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("earn dashboard html");
     assert!(body.contains("Provider operations"));
-    assert!(body.contains("Provider scope:"));
+    assert!(body.contains("Provider identity:"));
     assert!(!body.contains("Configured gateway identity:"));
     assert!(body.contains("Settlement snapshot"));
     assert!(body.contains("$1.75"));
@@ -5446,12 +5446,13 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let earnings = String::from_utf8(bytes).expect("earnings dashboard html");
-    assert!(earnings.contains("Canonical earnings records"));
+    assert!(earnings.contains("Earnings records"));
     assert!(earnings.contains("$2.50"));
     assert!(earnings.contains("$0.50"));
     assert!(earnings.contains("$1.75"));
     assert!(earnings.contains("$0.25"));
-    assert!(earnings.contains("Epoch 9"));
+    assert!(earnings.contains("Ledger epoch"));
+    assert!(earnings.contains("<td>9</td>"));
     assert!(earnings.contains("data-evidence-url"));
     assert_no_external_urls(&earnings);
 }
@@ -5725,7 +5726,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     let body = String::from_utf8(bytes).expect("network dashboard html");
     assert!(body.contains("Network health"));
     assert!(body.contains("Catalog models"));
-    assert!(body.contains("Canonical providers"));
+    assert!(body.contains("Providers"));
     assert!(body.contains("Fresh routes"));
     assert!(body.contains("Supply exceptions"));
     assert!(body.contains("mayhem/unavailable-test"));
