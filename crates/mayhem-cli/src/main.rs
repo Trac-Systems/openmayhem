@@ -290,6 +290,7 @@ const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
 const MAYHEMD_CONTROL_TOKEN_FILE: &str = "mayhemd-control-token";
+const SC_BRIDGE_TOKEN_FILE: &str = "sc-bridge-token";
 const MAYHEMD_CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
 const MAYHEMD_RESTART_STABLE_AFTER_MILLIS: u64 = 60_000;
 const MAYHEMD_CRASH_LOOP_THRESHOLD: u64 = 5;
@@ -26538,6 +26539,12 @@ fn write_up_supervisor_config(plan: &UpPlan) -> Result<()> {
     if let Some(parent) = plan.supervisor_config_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
+    let token_path = sc_bridge_token_file_path(&plan.home);
+    write_private_file(
+        &token_path,
+        format!("{}\n", plan.sc_bridge_token).as_bytes(),
+    )
+    .with_context(|| format!("writing {}", token_path.display()))?;
     write_private_file(
         &plan.supervisor_config_path,
         up_supervisor_config(plan)?.as_bytes(),
@@ -26623,6 +26630,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "127.0.0.1".to_owned(),
         "--sc-bridge-port".to_owned(),
         sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
+        "--sc-bridge-token-file".to_owned(),
+        sc_bridge_token_file_path(&plan.home).display().to_string(),
         "--sc-bridge-cli".to_owned(),
         "1".to_owned(),
         "--rpc".to_owned(),
@@ -26642,7 +26651,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         &plan.pear_runtime,
         &peer_args,
         Some(&plan.intercom_dir),
-        &[("SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
+        &[],
     )?;
 
     let mut gateway_args = vec![
@@ -26907,6 +26916,10 @@ fn mayhemd_up_config_path(home: &Path) -> PathBuf {
 
 fn mayhemd_control_token_path(home: &Path) -> PathBuf {
     home.join(MAYHEMD_CONTROL_TOKEN_FILE)
+}
+
+fn sc_bridge_token_file_path(home: &Path) -> PathBuf {
+    home.join(SC_BRIDGE_TOKEN_FILE)
 }
 
 fn load_or_create_mayhemd_control_token(home: &Path) -> Result<String> {
@@ -78783,9 +78796,20 @@ State initialization...
                     })
                 })
         }));
+        assert!(children[0].get("env").is_none());
+        let peer_args = children[0]["args"].as_array().unwrap();
+        let token_file_index = peer_args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--sc-bridge-token-file"))
+            .unwrap();
         assert_eq!(
-            children[0]["env"]["SC_BRIDGE_TOKEN"].as_str(),
-            Some("test-token")
+            peer_args[token_file_index + 1].as_str(),
+            Some(
+                sc_bridge_token_file_path(&home)
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
         );
         assert_eq!(
             children[1]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),
@@ -78837,6 +78861,13 @@ State initialization...
             .mode()
             & 0o777;
         assert_eq!(supervisor_mode, 0o600);
+        let token_path = sc_bridge_token_file_path(&home);
+        assert_eq!(
+            fs::read_to_string(&token_path).unwrap().trim(),
+            "test-token"
+        );
+        let token_mode = fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(token_mode, 0o600);
 
         let config = toml::Value::Table(toml::map::Map::new());
         write_config_toml_value(&plan.config_path, &config).unwrap();

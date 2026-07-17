@@ -24,6 +24,7 @@ import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
 import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
+import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
@@ -825,10 +826,7 @@ const scBridgePort = Number.parseInt(
   (flags['sc-bridge-port'] && String(flags['sc-bridge-port'])) || env.SC_BRIDGE_PORT || '',
   10
 );
-const scBridgeToken =
-  (flags['sc-bridge-token'] && String(flags['sc-bridge-token'])) ||
-  env.SC_BRIDGE_TOKEN ||
-  '';
+const scBridgeToken = resolveScBridgeToken(flags, env);
 const scBridgeCliEnabled = parseBool(
   (flags['sc-bridge-cli'] && String(flags['sc-bridge-cli'])) || env.SC_BRIDGE_CLI || '',
   false
@@ -922,7 +920,9 @@ const apiTxLocalApply = parseBool(
 );
 
 if (scBridgeEnabled && !scBridgeToken) {
-  throw new Error('SC-Bridge requires --sc-bridge-token (auth is mandatory).');
+  throw new Error(
+    'SC-Bridge requires --sc-bridge-token or --sc-bridge-token-file (auth is mandatory).'
+  );
 }
 if (rpcEnabled && (!Number.isSafeInteger(rpcPort) || rpcPort < 1 || rpcPort > 65535)) {
   throw new Error('Invalid --rpc-port. Expected integer 1-65535.');
