@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
+import PeerWallet from 'trac-wallet';
 import Sidechannel from '../features/sidechannel/index.js';
 import {
   decodedJsonByteLength,
@@ -21,6 +22,36 @@ const peer = {
   },
 };
 
+const makeSignedPeer = async () => {
+  const wallet = new PeerWallet();
+  await wallet.ready;
+  await wallet.generateKeyPair();
+  return { wallet };
+};
+
+const captureIncoming = (sidechannel, connection, channelName) => {
+  let incoming = null;
+  const channel = {
+    opened: true,
+    addMessage({ onmessage }) {
+      incoming = onmessage;
+      return { send: () => true };
+    },
+    open() {},
+    close() {},
+    fullyOpened: async () => true,
+  };
+  connection.userData = {
+    pair() {},
+    createChannel: () => channel,
+  };
+  sidechannel._openChannelForConnection(
+    connection,
+    sidechannel.channels.get(channelName)
+  );
+  return () => incoming;
+};
+
 test('relay PoW and size cap are isolated from entry and session channels', () => {
   const sidechannel = new Sidechannel(peer, {
     channels: [entryChannel, MAYHEM_RELAY_CHANNEL, sessionChannel],
@@ -37,6 +68,10 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
   assert.equal(sidechannel._powRequired(MAYHEM_RELAY_CHANNEL), true);
   assert.equal(sidechannel._powRequired(entryChannel), false);
   assert.equal(sidechannel._powRequired(sessionChannel), false);
+  assert.equal(sidechannel._relayPolicyAllows(MAYHEM_RELAY_CHANNEL), true);
+  assert.equal(sidechannel._relayPolicyAllows(entryChannel), false);
+  assert.equal(sidechannel._relayPolicyAllows(sessionChannel), false);
+  assert.equal(sidechannel.relayTtl, 1);
   assert.equal(sidechannel._maxMessageBytes(MAYHEM_RELAY_CHANNEL), 16_384);
   assert.equal(sidechannel._maxMessageBytes(entryChannel), 1_000_000);
   assert.equal(sidechannel._maxMessageBytes(sessionChannel), 1_000_000);
@@ -59,24 +94,14 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
 });
 
 test('a rejected remote message handler is contained and later messages still run', async () => {
-  let incoming;
+  const senderPeer = await makeSignedPeer();
+  const sender = new Sidechannel(senderPeer, {
+    channels: [entryChannel],
+    entryChannel,
+  });
   let calls = 0;
-  const channel = {
-    opened: true,
-    addMessage({ onmessage }) {
-      incoming = onmessage;
-      return { send: () => true };
-    },
-    open() {},
-    close() {},
-    fullyOpened: async () => true,
-  };
   const connection = {
-    remotePublicKey: b4a.from('cc'.repeat(32), 'hex'),
-    userData: {
-      pair() {},
-      createChannel: () => channel,
-    },
+    remotePublicKey: senderPeer.wallet.publicKey,
   };
   const sidechannel = new Sidechannel(peer, {
     channels: [entryChannel],
@@ -87,20 +112,163 @@ test('a rejected remote message handler is contained and later messages still ru
       if (calls === 1) throw new Error('injected poisoned message');
     },
   });
-  sidechannel._openChannelForConnection(connection, sidechannel.channels.get(entryChannel));
+  const incomingRef = captureIncoming(sidechannel, connection, entryChannel);
+  const incoming = incomingRef();
   assert.equal(typeof incoming, 'function');
 
   const originalError = console.error;
   console.error = () => {};
   try {
-    assert.doesNotThrow(() => incoming({ id: 'first', from: 'cc'.repeat(32), message: { n: 1 } }));
+    assert.doesNotThrow(() => incoming(sender._buildPayload(entryChannel, { n: 1 })));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.doesNotThrow(() => incoming({ id: 'second', from: 'cc'.repeat(32), message: { n: 2 } }));
+    assert.doesNotThrow(() => incoming(sender._buildPayload(entryChannel, { n: 2 })));
     await new Promise((resolve) => setTimeout(resolve, 0));
   } finally {
     console.error = originalError;
   }
   assert.equal(calls, 2);
+});
+
+test('generic dispatch rejects unsigned and spoofed senders but accepts the signed direct path', async () => {
+  const senderPeer = await makeSignedPeer();
+  const senderKey = b4a.toString(senderPeer.wallet.publicKey, 'hex');
+  const sender = new Sidechannel(senderPeer, {
+    channels: [entryChannel],
+    entryChannel,
+  });
+  const received = [];
+  const receiver = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    relayEnabled: false,
+    onMessage: (_channel, payload) => received.push(payload),
+  });
+  const connection = { remotePublicKey: senderPeer.wallet.publicKey };
+  const incoming = captureIncoming(receiver, connection, entryChannel)();
+
+  incoming({
+    type: 'sidechannel',
+    id: 'unsigned',
+    channel: entryChannel,
+    from: senderKey,
+    origin: senderKey,
+    message: { text: 'unsigned' },
+    ts: Date.now(),
+    ttl: 1,
+  });
+  const spoofed = sender._buildPayload(entryChannel, { text: 'spoofed' });
+  spoofed.from = 'ff'.repeat(32);
+  spoofed.origin = spoofed.from;
+  incoming(spoofed);
+  const valid = sender._buildPayload(entryChannel, { text: 'signed' });
+  incoming(valid);
+  const wrongChannel = sender._buildPayload(entryChannel, { text: 'cross-channel' });
+  wrongChannel.channel = 'other-channel';
+  incoming(wrongChannel);
+  const oversizedId = sender._buildPayload(entryChannel, { text: 'large-id' });
+  oversizedId.id = 'x'.repeat(257);
+  incoming(oversizedId);
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].id, valid.id);
+  assert.equal(receiver.verifyPayload(valid, senderKey), true);
+  assert.equal(receiver.relayCounters.unauthenticated_drops, 2);
+});
+
+test('relay egress is one hop, gated, and bounded per node and authenticated author', async () => {
+  const relayPeer = await makeSignedPeer();
+  const firstPeer = await makeSignedPeer();
+  const secondPeer = await makeSignedPeer();
+  const relayKey = b4a.toString(relayPeer.wallet.publicKey, 'hex');
+  const channelName = MAYHEM_RELAY_CHANNEL;
+  const senderConfig = {
+    channels: [channelName],
+    powEnabled: true,
+    powDifficulty: 1,
+    powRequiredChannels: [channelName],
+  };
+  const firstSender = new Sidechannel(firstPeer, senderConfig);
+  const secondSender = new Sidechannel(secondPeer, senderConfig);
+  const relay = new Sidechannel(relayPeer, {
+    ...senderConfig,
+    relayRateBytesPerSecond: 1,
+    relaySourceRateBytesPerSecond: 1,
+  });
+  const firstPayload = firstSender._buildPayload(channelName, { text: 'bounded relay' });
+  const relayedBytes = b4a.byteLength(JSON.stringify({
+    ...firstPayload,
+    ttl: 0,
+    relayedBy: relayKey,
+  }), 'utf8');
+  relay.relayBurstBytes = relayedBytes * 2;
+  relay.relayLimiter.tokens = relay.relayBurstBytes;
+  relay.relaySourceBurstBytes = relayedBytes;
+
+  const sent = [];
+  for (const key of ['66', '77']) {
+    const connection = { remotePublicKey: b4a.from(key.repeat(32), 'hex') };
+    relay.connections.set(connection, new Map([[
+      channelName,
+      { message: { send: (payload) => sent.push(payload) } },
+    ]]));
+  }
+  const firstConnection = { remotePublicKey: firstPeer.wallet.publicKey };
+  relay._relay(channelName, firstPayload, firstConnection);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].ttl, 0);
+  assert.equal(relay.verifyPayload(sent[0]), true);
+  assert.equal(relay.relayCounters.source_budget_drops, 1);
+
+  const secondPayload = secondSender._buildPayload(channelName, { text: 'bounded relay' });
+  const secondConnection = { remotePublicKey: secondPeer.wallet.publicKey };
+  relay._relay(channelName, secondPayload, secondConnection);
+  assert.equal(sent.length, 2);
+  assert.equal(relay.relayCounters.node_budget_drops, 1);
+  assert.equal(relay.relayCounters.messages, 2);
+  assert.equal(relay.relayCounters.bytes, relayedBytes * 2);
+
+  let relayedDispatches = 0;
+  let downstreamSends = 0;
+  const recipientPeer = await makeSignedPeer();
+  const recipient = new Sidechannel(recipientPeer, {
+    ...senderConfig,
+    welcomeRequired: false,
+    onMessage: () => { relayedDispatches += 1; },
+  });
+  const downstream = { remotePublicKey: b4a.from('88'.repeat(32), 'hex') };
+  recipient.connections.set(downstream, new Map([[
+    channelName,
+    { message: { send: () => { downstreamSends += 1; } } },
+  ]]));
+  const relayConnection = { remotePublicKey: relayPeer.wallet.publicKey };
+  const incoming = captureIncoming(recipient, relayConnection, channelName)();
+  incoming(sent[0]);
+
+  assert.equal(relayedDispatches, 1);
+  assert.equal(downstreamSends, 0);
+  assert.equal(recipient.verifyPayload(sent[0]), true);
+});
+
+test('seen purge scans bounded state instead of assuming timestamp insertion order', () => {
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    seenTtlMs: 100,
+    maxSeen: 3,
+  });
+  sidechannel.seen.set('fresh-first', 1_000);
+  sidechannel.seen.set('stale-middle', 100);
+  sidechannel.seen.set('fresh-last', 1_001);
+
+  sidechannel._purgeSeen(1_050);
+  assert.deepEqual(Array.from(sidechannel.seen.keys()), ['fresh-first', 'fresh-last']);
+
+  sidechannel.seen.set('oldest-by-time', 900);
+  sidechannel._rememberSeen('newest', 1_050);
+  assert.equal(sidechannel.seen.has('oldest-by-time'), false);
+  assert.equal(sidechannel.seen.has('fresh-first'), true);
+  assert.equal(sidechannel.seen.has('fresh-last'), true);
+  assert.equal(sidechannel.seen.has('newest'), true);
 });
 
 test('required DHT bootstrap failure rejects sidechannel startup for supervisor recovery', async () => {
@@ -161,6 +329,44 @@ test('sidechannel decoder drops oversized JSON before parsing it', () => {
   assert.equal(state.start, 66);
 });
 
+test('sidechannel decoder rejects an individually oversized UTF-8 string within the byte budget', () => {
+  const text = JSON.stringify({ value: 'é'.repeat(17) });
+  const encoded = b4a.from(text);
+  const encoding = {
+    buffer: b4a.concat([b4a.from([encoded.length]), encoded]),
+    start: 0,
+    end: encoded.length + 1,
+  };
+  const sidechannel = new Sidechannel(peer, {
+    channels: [entryChannel],
+    entryChannel,
+    maxMessageBytes: 1_000,
+    maxStringBytes: 32,
+  });
+  let boundedEncoding = null;
+  const connection = {
+    remotePublicKey: b4a.from('dd'.repeat(32), 'hex'),
+    userData: {
+      pair() {},
+      createChannel: () => ({
+        opened: true,
+        addMessage(options) {
+          boundedEncoding = options.encoding;
+          return { send: () => true };
+        },
+        open() {},
+        close() {},
+        fullyOpened: async () => true,
+      }),
+    },
+  };
+  sidechannel._openChannelForConnection(connection, sidechannel.channels.get(entryChannel));
+
+  const decoded = boundedEncoding.decode(encoding);
+  assert.equal(decodedJsonWasRejected(decoded), true);
+  assert.equal(decodedJsonByteLength(decoded), encoded.length);
+});
+
 test('sidechannel bounds channel names/count and reclaims limiter state under connection churn', () => {
   const sidechannel = new Sidechannel(peer, {
     channels: [entryChannel],
@@ -179,6 +385,13 @@ test('sidechannel bounds channel names/count and reclaims limiter state under co
   }
   assert.equal(sidechannel.rateLimits.size, 0);
   assert.equal(sidechannel.connections.size, 0);
+
+  sidechannel.maxRelaySources = 2;
+  sidechannel._relaySourceLimiter('aa'.repeat(32), 1);
+  sidechannel._relaySourceLimiter('bb'.repeat(32), 2);
+  sidechannel._relaySourceLimiter('cc'.repeat(32), 3);
+  assert.equal(sidechannel.relaySourceLimits.size, 2);
+  assert.equal(sidechannel.relaySourceLimits.has('aa'.repeat(32)), false);
 });
 
 test('sidechannel does not send from a stale fully-opened callback after channel removal', async () => {

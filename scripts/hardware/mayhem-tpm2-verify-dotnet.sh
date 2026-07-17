@@ -707,6 +707,7 @@ static string MetadataDeviceKey(JsonElement quote)
     return string.Empty;
 }
 
+var verdictBinding = Clean(Environment.GetEnvironmentVariable("MAYHEM_HW_VERIFY_BINDING")).ToLowerInvariant();
 try
 {
     var input = Clean(Console.In.ReadToEnd());
@@ -718,6 +719,7 @@ try
         throw new InvalidOperationException($"unsupported quote kind {kind}");
     }
     var expectedBinding = Required(root, "expected_binding").ToLowerInvariant();
+    verdictBinding = expectedBinding;
     var quote = root.GetProperty("quote");
     var quoteBinding = Required(quote, "binding").ToLowerInvariant();
     if (quoteBinding != expectedBinding)
@@ -783,6 +785,7 @@ catch (Exception ex)
     {
         ok = false,
         kind = "tpm2_quote_ek",
+        binding = verdictBinding,
         att_tier = 2,
         reason = ex.Message
     };

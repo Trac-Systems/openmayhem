@@ -351,8 +351,12 @@ if (flags['msb-transfer-helper']) {
 
 if (flags['wallet-helper']) {
   try {
-    const { runWalletHelper } = await import('./wallet-helper.js');
-    const output = await runWalletHelper(flags);
+    const {
+      readWalletHelperSecretsFromStdin,
+      runWalletHelper,
+    } = await import('./wallet-helper.js');
+    const secrets = await readWalletHelperSecretsFromStdin();
+    const output = await runWalletHelper(flags, secrets);
     console.log(JSON.stringify(output));
     Bare.exit(0);
   } catch (error) {

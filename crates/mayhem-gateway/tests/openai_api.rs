@@ -863,7 +863,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a mayhem_gateway::openai::GatewayHedgeProbeInvocation,
     ) -> mayhem_gateway::openai::GatewayHedgeProbeFuture<'a> {
         Box::pin(async move {
             let provider = invocation
@@ -2897,7 +2897,7 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
     assert_eq!(body["mayhem"]["backend"], "test-hedge-inspect");
     assert_eq!(body["mayhem"]["hedge"]["requested"], true);
     assert_eq!(body["mayhem"]["hedge"]["planned_probe_count"], 2);

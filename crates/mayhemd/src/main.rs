@@ -26,6 +26,8 @@ const DEFAULT_PID_FILE: &str = "mayhemd.pid";
 const DEFAULT_STATE_FILE: &str = "mayhemd-state.json";
 const DEFAULT_RESTART_STABLE_AFTER_MS: u64 = 60_000;
 const DEFAULT_CRASH_LOOP_THRESHOLD: u64 = 5;
+const CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
+const MIN_CONTROL_TOKEN_BYTES: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhemd")]
@@ -257,6 +259,8 @@ async fn main() -> Result<()> {
         Some(bind) => bind,
         None => parse_bind(&file_config.supervisor.bind)?,
     };
+    let control_token = read_control_token()?;
+    validate_control_bind(bind, control_token.as_deref())?;
     let pid_file = args
         .pid_file
         .clone()
@@ -315,6 +319,7 @@ async fn main() -> Result<()> {
         file_config.supervisor.children,
         status_listener,
         runtime,
+        control_token,
         args.exit_after_ms,
     )
     .await;
@@ -326,6 +331,7 @@ async fn run_supervisor(
     children: Vec<ChildConfig>,
     status_listener: TcpListener,
     runtime: SupervisorRuntime,
+    control_token: Option<String>,
     exit_after_ms: Option<u64>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -338,6 +344,7 @@ async fn run_supervisor(
         runtime.clone(),
         shutdown_rx.clone(),
         control_tx,
+        control_token.map(Arc::<str>::from),
     ));
     for child in children {
         spawn_supervised_child(child, &runtime, &mut tasks, &mut child_shutdowns)?;
@@ -554,6 +561,7 @@ async fn supervise_child(
 
         let mut command = Command::new(&child.command);
         command.args(&child.args);
+        command.env_remove(CONTROL_TOKEN_ENV);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -681,6 +689,7 @@ async fn supervise_status_server(
     runtime: SupervisorRuntime,
     mut shutdown: watch::Receiver<bool>,
     control_tx: mpsc::Sender<SupervisorCommand>,
+    control_token: Option<Arc<str>>,
 ) -> Result<()> {
     loop {
         let task = tokio::spawn(status_server(
@@ -688,6 +697,7 @@ async fn supervise_status_server(
             runtime.clone(),
             shutdown.clone(),
             control_tx.clone(),
+            control_token.clone(),
         ));
         let failure = match task.await {
             Ok(Ok(())) if *shutdown.borrow() => return Ok(()),
@@ -712,6 +722,7 @@ async fn status_server(
     runtime: SupervisorRuntime,
     mut shutdown: watch::Receiver<bool>,
     control_tx: mpsc::Sender<SupervisorCommand>,
+    control_token: Option<Arc<str>>,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -719,8 +730,11 @@ async fn status_server(
                 let (stream, _) = accepted.context("accepting status connection")?;
                 let runtime = runtime.clone();
                 let control_tx = control_tx.clone();
+                let control_token = control_token.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_status_connection(stream, runtime, control_tx).await {
+                    if let Err(err) =
+                        handle_status_connection(stream, runtime, control_tx, control_token).await
+                    {
                         eprintln!("mayhemd status request failed: {err}");
                     }
                 });
@@ -739,6 +753,7 @@ async fn handle_status_connection(
     mut stream: TcpStream,
     runtime: SupervisorRuntime,
     control_tx: mpsc::Sender<SupervisorCommand>,
+    control_token: Option<Arc<str>>,
 ) -> Result<()> {
     let mut buffer = [0_u8; 65_536];
     let read = stream.read(&mut buffer).await.context("reading request")?;
@@ -762,6 +777,14 @@ async fn handle_status_connection(
             write_http_json(&mut stream, 200, &snapshot).await
         }
         ("POST", "/children/add") => {
+            if !control_request_authorized(&request, control_token.as_deref()) {
+                return write_http_json(
+                    &mut stream,
+                    401,
+                    &json!({ "ok": false, "error": "unauthorized" }),
+                )
+                .await;
+            }
             let child = serde_json::from_str::<ChildConfig>(body.trim())
                 .context("parsing child add request")?;
             let (reply, response) = oneshot::channel();
@@ -777,6 +800,14 @@ async fn handle_status_connection(
             }
         }
         ("POST", "/children/remove") => {
+            if !control_request_authorized(&request, control_token.as_deref()) {
+                return write_http_json(
+                    &mut stream,
+                    401,
+                    &json!({ "ok": false, "error": "unauthorized" }),
+                )
+                .await;
+            }
             let body = serde_json::from_str::<serde_json::Value>(body.trim())
                 .context("parsing child remove request")?;
             let name = body
@@ -819,6 +850,7 @@ async fn write_http_json<T: Serialize>(
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         503 => "Service Unavailable",
         _ => "Error",
@@ -1126,6 +1158,66 @@ fn parse_bind(value: &str) -> Result<SocketAddr> {
         .with_context(|| format!("parsing supervisor bind address {value:?}"))
 }
 
+fn read_control_token() -> Result<Option<String>> {
+    let Some(token) = env::var(CONTROL_TOKEN_ENV).ok() else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.len() < MIN_CONTROL_TOKEN_BYTES {
+        bail!("{CONTROL_TOKEN_ENV} must contain at least {MIN_CONTROL_TOKEN_BYTES} bytes");
+    }
+    if token.len() > 1_024 || token.chars().any(char::is_control) {
+        bail!("{CONTROL_TOKEN_ENV} is invalid");
+    }
+    Ok(Some(token.to_owned()))
+}
+
+fn validate_control_bind(bind: SocketAddr, control_token: Option<&str>) -> Result<()> {
+    if bind.ip().is_loopback() || control_token.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "refusing non-loopback supervisor bind {bind} without {CONTROL_TOKEN_ENV}; status may be exposed remotely only with authenticated control"
+    )
+}
+
+fn control_request_authorized(request: &str, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        return false;
+    };
+    let Some(header) = request
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or(request)
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.trim())
+    else {
+        return false;
+    };
+    let Some((scheme, supplied_token)) = header.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_token_eq(supplied_token.trim().as_bytes(), expected_token.as_bytes())
+}
+
+fn constant_time_token_eq(supplied: &[u8], expected: &[u8]) -> bool {
+    let mut difference = supplied.len() ^ expected.len();
+    let max_len = supplied.len().max(expected.len());
+    for index in 0..max_len {
+        let supplied_byte = supplied.get(index).copied().unwrap_or(0);
+        let expected_byte = expected.get(index).copied().unwrap_or(0);
+        difference |= usize::from(supplied_byte ^ expected_byte);
+    }
+    difference == 0
+}
+
 fn default_home() -> Result<PathBuf> {
     if let Ok(home) = env::var("MAYHEM_HOME") {
         let home = home.trim();
@@ -1289,6 +1381,114 @@ mod tests {
     #[test]
     fn rejects_invalid_bind_address() {
         assert!(parse_bind("not-a-socket").is_err());
+    }
+
+    #[test]
+    fn remote_control_bind_requires_an_explicit_auth_secret() {
+        let loopback = "127.0.0.1:11437".parse().unwrap();
+        let remote = "0.0.0.0:11437".parse().unwrap();
+        assert!(validate_control_bind(loopback, None).is_ok());
+        assert!(validate_control_bind(remote, None).is_err());
+        assert!(validate_control_bind(remote, Some("configured-token")).is_ok());
+    }
+
+    #[test]
+    fn control_auth_requires_the_exact_bearer_token() {
+        let expected = "test-control-token-0123456789abcdef";
+        assert!(control_request_authorized(
+            "POST /children/add HTTP/1.1\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\n\r\n",
+            Some(expected),
+        ));
+        assert!(!control_request_authorized(
+            "POST /children/add HTTP/1.1\r\n\r\n",
+            Some(expected),
+        ));
+        assert!(!control_request_authorized(
+            "POST /children/add HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\n\r\n",
+            Some(expected),
+        ));
+        assert!(!control_request_authorized(
+            "POST /children/add HTTP/1.1\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\n\r\n",
+            None,
+        ));
+    }
+
+    async fn send_control_request(
+        runtime: SupervisorRuntime,
+        control_tx: mpsc::Sender<SupervisorCommand>,
+        control_token: Option<&str>,
+        request: &str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let token = control_token.map(|value| Arc::<str>::from(value.to_owned()));
+        let task = tokio::spawn(handle_status_connection(server, runtime, control_tx, token));
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_child_add_is_rejected_before_dispatch() {
+        let temp = env::temp_dir().join(format!("mayhemd-auth-reject-test-{}", std::process::id()));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let body = r#"{"name":"attacker","command":"sh","args":["-c","exit 0"]}"#;
+        let request = format!(
+            "POST /children/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = send_control_request(
+            runtime,
+            control_tx,
+            Some("test-control-token-0123456789abcdef"),
+            &request,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), control_rx.recv())
+                .await
+                .expect("control channel should close without dispatch")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_child_add_reaches_the_supervisor() {
+        let temp = env::temp_dir().join(format!("mayhemd-auth-accept-test-{}", std::process::id()));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let body = r#"{"name":"worker","command":"true","restart":false}"#;
+        let request = format!(
+            "POST /children/add HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response_task = tokio::spawn(async move {
+            send_control_request(
+                runtime,
+                control_tx,
+                Some("test-control-token-0123456789abcdef"),
+                &request,
+            )
+            .await
+        });
+        let command = control_rx.recv().await.expect("authenticated command");
+        let SupervisorCommand::Add { child, reply } = command else {
+            panic!("expected child add command");
+        };
+        assert_eq!(child.name, "worker");
+        reply
+            .send(Ok(json!({ "ok": true, "name": child.name })))
+            .unwrap();
+        let response = response_task.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#""name": "worker""#));
     }
 
     #[test]

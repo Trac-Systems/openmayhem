@@ -18,7 +18,7 @@ pub use endpoint_contract::{
 
 pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 12;
-pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 9;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
@@ -250,7 +250,8 @@ pub fn ctx_bracket_for_tokens_in_schedule(
     let table = ctx_bracket_table_at(schedule, at);
     ctx_bracket_for_tokens_in_table(tokens, table).map(|bracket| (bracket, table.ver))
 }
-pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
+pub const CATALOG_ENCLAVE_ID_DOMAIN: &str = "mayhem-catalog-enclave-id-v2";
+pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v2";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 pub const DEFAULT_MODEL_CLASS: &str = "text-generation";
 pub const USAGE_INPUT_TOKEN: &str = "input_token";
@@ -844,16 +845,22 @@ impl AttestationReport {
 }
 
 pub fn catalog_enclave_id(identity: &CatalogEnclaveIdentity) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(identity.admin_pubkey.as_bytes());
-    hasher.update(identity.model_id.as_bytes());
-    hasher.update(identity.artifact_root.as_bytes());
+    let mut hasher = blake3::Hasher::new_derive_key(CATALOG_ENCLAVE_ID_DOMAIN);
+    update_len_prefixed(&mut hasher, identity.admin_pubkey.as_bytes());
+    update_len_prefixed(&mut hasher, identity.model_id.as_bytes());
+    update_len_prefixed(&mut hasher, identity.artifact_root.as_bytes());
+    hasher.update(&(identity.artifact_sidecar_roots.len() as u64).to_be_bytes());
     for (name, root) in &identity.artifact_sidecar_roots {
-        hasher.update(name.as_bytes());
-        hasher.update(root.as_bytes());
+        update_len_prefixed(&mut hasher, name.as_bytes());
+        update_len_prefixed(&mut hasher, root.as_bytes());
     }
-    hasher.update(identity.manifest_hash.as_bytes());
+    update_len_prefixed(&mut hasher, identity.manifest_hash.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+fn update_len_prefixed(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 pub fn attestation_signing_bytes(
@@ -880,8 +887,6 @@ pub fn attestation_report_head(report: &AttestationReport) -> Result<String, ser
 pub fn hardware_quote_binding(body: &AttestationBody) -> Result<String, serde_json::Error> {
     let mut bound_body = body.clone();
     bound_body.hw_quote = None;
-    bound_body.report_ts = 0;
-    bound_body.nonce_u.clear();
     Ok(
         blake3::hash(&serde_json::to_vec(&AttestationHardwareQuoteBinding {
             domain: HARDWARE_QUOTE_BINDING_DOMAIN,
@@ -1733,7 +1738,26 @@ mod tests {
     }
 
     #[test]
-    fn hardware_quote_binding_excludes_quote_session_fields_but_includes_identity() {
+    fn catalog_enclave_id_separates_shifted_field_boundaries() {
+        let first = CatalogEnclaveIdentity {
+            admin_pubkey: "ab".to_owned(),
+            model_id: "c".to_owned(),
+            artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: BTreeMap::from([("adapter".to_owned(), "root".to_owned())]),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash: "binary".to_owned(),
+        };
+        let second = CatalogEnclaveIdentity {
+            admin_pubkey: "a".to_owned(),
+            model_id: "bc".to_owned(),
+            ..first.clone()
+        };
+
+        assert_ne!(catalog_enclave_id(&first), catalog_enclave_id(&second));
+    }
+
+    #[test]
+    fn hardware_quote_binding_includes_freshness_and_identity() {
         let mut body = AttestationBody {
             schema_version: ATTESTATION_SCHEMA_VERSION,
             alg: ATTESTATION_ALG.to_owned(),
@@ -1759,8 +1783,11 @@ mod tests {
         });
         assert_eq!(hardware_quote_binding(&body).unwrap(), base);
         body.nonce_u = "bb".repeat(32);
+        assert_ne!(hardware_quote_binding(&body).unwrap(), base);
+        body.nonce_u = "aa".repeat(32);
         body.report_ts = 99;
-        assert_eq!(hardware_quote_binding(&body).unwrap(), base);
+        assert_ne!(hardware_quote_binding(&body).unwrap(), base);
+        body.report_ts = 2;
         body.manifest_hash = "other-manifest".to_owned();
         assert_ne!(hardware_quote_binding(&body).unwrap(), base);
     }

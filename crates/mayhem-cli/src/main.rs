@@ -17,7 +17,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -34,7 +34,7 @@ use anyhow::anyhow;
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use flate2::read::GzDecoder;
 use hf_hub::progress::{
     DownloadEvent as HfDownloadEvent, ProgressEvent as HfProgressEvent,
@@ -111,7 +111,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use xet::xet_session::{XetFileInfo, XetSessionBuilder};
@@ -157,6 +157,19 @@ const MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
 static HF_XET_LOGGING_INIT: Once = Once::new();
 const MAX_PROVIDER_MODALITY_ITEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PROVIDER_MODALITY_ITEM_UNITS: u64 = 1_000_000_000_000;
+
+fn read_secret_file_arg(value: &str) -> std::result::Result<String, String> {
+    let path = Path::new(value);
+    let mut secret =
+        fs::read_to_string(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
+    if secret.ends_with('\n') {
+        secret.pop();
+        if secret.ends_with('\r') {
+            secret.pop();
+        }
+    }
+    Ok(secret)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct MainnetManifest {
@@ -276,6 +289,8 @@ const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
+const MAYHEMD_CONTROL_TOKEN_FILE: &str = "mayhemd-control-token";
+const MAYHEMD_CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
 const MAYHEMD_RESTART_STABLE_AFTER_MILLIS: u64 = 60_000;
 const MAYHEMD_CRASH_LOOP_THRESHOLD: u64 = 5;
 const DEFAULT_RELEASE_FEED_URL: &str =
@@ -777,8 +792,12 @@ struct WalletLocatorArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password. MAYHEM_WALLET_PASSWORD is also accepted.
+    #[arg(
+        long = "wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     wallet_password: Option<String>,
 }
 
@@ -811,16 +830,30 @@ struct WalletImportArgs {
     #[command(flatten)]
     wallet: WalletLocatorArgs,
 
-    /// BIP-39 mnemonic to import.
-    #[arg(long)]
-    mnemonic: String,
+    /// File containing the BIP-39 mnemonic to import. MAYHEM_WALLET_MNEMONIC is also accepted.
+    #[arg(
+        long = "mnemonic-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
+    mnemonic: Option<String>,
 
-    /// Existing Ethereum private key to store with the local wallet.
-    #[arg(long, conflicts_with = "ethereum_mnemonic")]
+    /// File containing an Ethereum private key to store with the local wallet.
+    #[arg(
+        long = "ethereum-private-key-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg,
+        conflicts_with = "ethereum_mnemonic"
+    )]
     ethereum_private_key: Option<String>,
 
-    /// Existing Ethereum mnemonic to derive and store with the local wallet.
-    #[arg(long, conflicts_with = "ethereum_private_key")]
+    /// File containing an Ethereum mnemonic to derive and store with the local wallet.
+    #[arg(
+        long = "ethereum-mnemonic-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg,
+        conflicts_with = "ethereum_private_key"
+    )]
     ethereum_mnemonic: Option<String>,
 
     /// Overwrite an existing keypair.json.
@@ -837,8 +870,12 @@ struct WalletPasswdArgs {
     #[command(flatten)]
     wallet: WalletLocatorArgs,
 
-    /// New password for the encrypted keypair.json. Empty string removes the password.
-    #[arg(long)]
+    /// File containing the new wallet password. An empty file removes the password.
+    #[arg(
+        long = "new-wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     new_wallet_password: Option<String>,
 
     /// Print a machine-readable password-rotation report.
@@ -959,8 +996,8 @@ struct BalanceArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Public key to inspect. Defaults to the local wallet public key.
@@ -1013,8 +1050,8 @@ struct StatusArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Maximum seconds for gateway HTTP checks.
@@ -1090,8 +1127,8 @@ struct ReputationArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Provider public key. Defaults to the local wallet public key.
@@ -1336,8 +1373,8 @@ struct UpArgs {
     #[arg(long, default_value = "mayhem-up-main")]
     peer_store_name: String,
 
-    /// Mayhem wallet password for gateway/provider signing.
-    #[arg(long)]
+    /// File containing the Mayhem wallet password for gateway/provider signing.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Accept first-run setup defaults in non-interactive terminals.
@@ -1407,8 +1444,8 @@ struct UseArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// SC-Bridge websocket URL for direct provider sessions.
@@ -1705,8 +1742,8 @@ struct AuditorCanaryArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted auditor keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted auditor keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Model id to probe. Defaults to the first gateway model.
@@ -1953,8 +1990,8 @@ struct PayRailArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Idempotency key forwarded when the selected rail supports it.
@@ -2016,8 +2053,8 @@ struct PayTnkArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the free TNK deposit intent feature through peer RPC.
@@ -2027,6 +2064,10 @@ struct PayTnkArgs {
     /// Broadcast the matching MSB transfer from this local wallet. Requires --submit-intent.
     #[arg(long)]
     submit_transfer: bool,
+
+    /// Confirm the pinned TNK destination without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
 
     /// Maximum seconds to wait for MSB account sync and validator connection when --submit-transfer is used.
     #[arg(long, default_value_t = 180)]
@@ -2101,8 +2142,8 @@ struct DepositStatusArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Account to inspect. Defaults to the local Mayhem wallet public key.
@@ -2206,8 +2247,8 @@ struct ParticipantTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted participant keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted participant keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -2574,12 +2615,12 @@ struct SetupArgs {
     #[arg(long, value_enum, default_value_t = WalletMode::Auto)]
     wallet: WalletMode,
 
-    /// BIP-39 mnemonic to import, or to use for deterministic test creation.
-    #[arg(long)]
+    /// File containing a BIP-39 mnemonic to import or use for deterministic test creation.
+    #[arg(long = "mnemonic-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     mnemonic: Option<String>,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Intercom peer store name under <home>/stores.
@@ -2648,8 +2689,8 @@ struct RulesReviewArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
@@ -3433,8 +3474,8 @@ struct AdminTxArgs {
     #[arg(long, value_name = "PATH")]
     keypair: Option<PathBuf>,
 
-    /// Password for the encrypted admin keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted admin keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -4481,8 +4522,12 @@ struct AdminTnkSettlementArgs {
     #[arg(long, value_name = "PATH")]
     treasury_keypair: Option<PathBuf>,
 
-    /// Password for the funded treasury keypair. Defaults to MAYHEM_TNK_WALLET_PASSWORD or empty.
-    #[arg(long)]
+    /// File containing the funded treasury keypair password.
+    #[arg(
+        long = "treasury-wallet-password-file",
+        value_name = "PATH",
+        value_parser = read_secret_file_arg
+    )]
     treasury_wallet_password: Option<String>,
 
     /// Operator/admin TNK address receiving the aggregate TNK operator fee.
@@ -4978,8 +5023,8 @@ struct ProviderTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Build and sign provider lifecycle feature records without appending them.
@@ -5005,8 +5050,8 @@ struct ProviderContractTxArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
@@ -5040,8 +5085,8 @@ struct ProviderReadArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Provider public key to inspect. Defaults to the local provider wallet public key.
@@ -5099,8 +5144,8 @@ struct ProviderStripeArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Print a machine-readable report.
@@ -5251,8 +5296,8 @@ struct ProviderDrainArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Restrict drain to one served enclave id. Omit to drain all local provider markets.
@@ -5286,8 +5331,8 @@ struct ProviderEarningsArgs {
     #[arg(long, default_value = "main")]
     peer_store_name: String,
 
-    /// Password for the encrypted provider keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Print machine-readable earnings.
@@ -5540,8 +5585,8 @@ struct ProviderStartArgs {
     #[arg(long)]
     sc_bridge_token: Option<String>,
 
-    /// Password for the encrypted keypair.json. Empty by default.
-    #[arg(long)]
+    /// File containing the encrypted keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
     wallet_password: Option<String>,
 
     /// Path to catalog/models.json. Defaults to the repo catalog.
@@ -5722,7 +5767,7 @@ enum WalletMode {
     Auto,
     /// Create a fresh wallet. Fails if keypair.json exists unless --force is used.
     Create,
-    /// Import from --mnemonic. Fails if keypair.json exists unless --force is used.
+    /// Import from a mnemonic file or environment. Fails if keypair.json exists unless --force is used.
     Import,
     /// Reuse an existing keypair.json.
     Reuse,
@@ -5804,6 +5849,40 @@ struct EthereumKeyOutput {
 struct EthereumSignOutput {
     address: String,
     signature: String,
+}
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+struct WalletHelperSecrets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mnemonic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ethereum_private_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ethereum_mnemonic: Option<String>,
+}
+
+impl WalletHelperSecrets {
+    fn apply_environment_fallbacks(&mut self) {
+        if self.password.is_none() {
+            self.password = env::var("MAYHEM_WALLET_PASSWORD").ok();
+        }
+        if self.new_password.is_none() {
+            self.new_password = env::var("MAYHEM_NEW_WALLET_PASSWORD").ok();
+        }
+        if self.mnemonic.is_none() {
+            self.mnemonic = env::var("MAYHEM_WALLET_MNEMONIC").ok();
+        }
+        if self.ethereum_private_key.is_none() {
+            self.ethereum_private_key = env::var("MAYHEM_ETHEREUM_PRIVATE_KEY").ok();
+        }
+        if self.ethereum_mnemonic.is_none() {
+            self.ethereum_mnemonic = env::var("MAYHEM_ETHEREUM_MNEMONIC").ok();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -5894,6 +5973,7 @@ struct ConfigNetwork {
     gateway_bind: Option<String>,
     gateway_url: Option<String>,
     tnk_treasury_address: Option<String>,
+    admin_peer_pubkey: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6388,13 +6468,26 @@ async fn wallet_import(args: WalletImportArgs) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let mnemonic = args
+        .mnemonic
+        .or_else(|| env::var("MAYHEM_WALLET_MNEMONIC").ok())
+        .context("wallet import requires --mnemonic-file or MAYHEM_WALLET_MNEMONIC")?;
+    let ethereum_private_key = args
+        .ethereum_private_key
+        .or_else(|| env::var("MAYHEM_ETHEREUM_PRIVATE_KEY").ok());
+    let ethereum_mnemonic = args
+        .ethereum_mnemonic
+        .or_else(|| env::var("MAYHEM_ETHEREUM_MNEMONIC").ok());
+    if ethereum_private_key.is_some() && ethereum_mnemonic.is_some() {
+        bail!("set only one of the Ethereum private-key or mnemonic secret inputs");
+    }
     let wallet = create_wallet(
         &keypair_path,
         &password,
-        Some(&args.mnemonic),
+        Some(&mnemonic),
         true,
-        args.ethereum_private_key.as_deref(),
-        args.ethereum_mnemonic.as_deref(),
+        ethereum_private_key.as_deref(),
+        ethereum_mnemonic.as_deref(),
     )
     .await
     .with_context(|| format!("importing wallet {}", keypair_path.display()))?;
@@ -6416,7 +6509,7 @@ async fn wallet_passwd(args: WalletPasswdArgs) -> Result<()> {
         .clone()
         .or_else(|| env::var("MAYHEM_NEW_WALLET_PASSWORD").ok())
         .context(
-            "missing --new-wallet-password (or MAYHEM_NEW_WALLET_PASSWORD); pass an empty string to remove the password",
+            "missing --new-wallet-password-file (or MAYHEM_NEW_WALLET_PASSWORD); use an empty file or empty environment value to remove the password",
         )?;
     let wallet = rotate_wallet_password(&keypair_path, &old_password, &new_password)
         .await
@@ -6501,14 +6594,14 @@ fn print_wallet_backup(wallet: &WalletInfo) {
     if let Some(mnemonic) = wallet.mnemonic.as_deref() {
         println!("Mnemonic: {mnemonic}");
         println!(
-            "Restore command: mayhem wallet import --keypair {} --mnemonic '<mnemonic>'",
+            "Restore command: mayhem wallet import --keypair {} --mnemonic-file <private-mnemonic-file>",
             wallet.keypair_path
         );
     }
     if let Some(private_key) = wallet.ethereum_private_key.as_deref() {
         println!("Ethereum private key: {private_key}");
         println!(
-            "Restore Ethereum key with: mayhem wallet import --keypair {} --mnemonic '<mnemonic>' --ethereum-private-key '<0x-private-key>'",
+            "Restore Ethereum key with: mayhem wallet import --keypair {} --mnemonic-file <private-mnemonic-file> --ethereum-private-key-file <private-key-file>",
             wallet.keypair_path
         );
     }
@@ -9150,7 +9243,7 @@ fn verify_release_manifest_signature(
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("release public key is invalid")?;
     verifying_key
-        .verify(
+        .verify_strict(
             &release_manifest_signing_bytes(manifest_bytes),
             &Signature::from_bytes(&sig_bytes),
         )
@@ -21135,6 +21228,9 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    if args.tx.submit || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let treasury_address =
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
@@ -21496,6 +21592,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    if args.tx.submit || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let mut plan =
         build_fiat_settlement_plan(&rpc, epoch, at, &operator_to, &operator_currency).await?;
@@ -22817,6 +22916,13 @@ struct CanonicalPaymentState {
     observed_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TnkFundTrustAnchor {
+    source: &'static str,
+    admin_peer_pubkey: String,
+    treasury_address: String,
+}
+
 async fn deposit_command(command: DepositCommands) -> Result<()> {
     match command {
         DepositCommands::Tnk(args) => pay_tnk(args).await,
@@ -23049,6 +23155,12 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         .unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    if args.confirm {
+        require_secure_fund_rpc_url(&peer_rpc_url)?;
+        if let Some(eth_rpc) = args.eth_rpc.as_deref() {
+            require_secure_fund_rpc_url(eth_rpc)?;
+        }
+    }
     let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
     let payment_state = read_canonical_payment_state(&peer_rpc).await?;
     let tap = payment_state.payments.tap.clone();
@@ -23404,6 +23516,12 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         .unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let peer_rpc_url = resolve_cli_rpc_url(Some(&home), args.peer_rpc_url.as_deref())?;
+    if args.confirm {
+        require_secure_fund_rpc_url(&peer_rpc_url)?;
+        if let Some(eth_rpc) = args.eth_rpc.as_deref() {
+            require_secure_fund_rpc_url(eth_rpc)?;
+        }
+    }
     let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
     let payment_state = read_canonical_payment_state(&peer_rpc).await?;
     let tap = payment_state.payments.tap.clone();
@@ -24660,18 +24778,25 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("");
     let wallet = resolve_cli_wallet_with_keypair(
         &home,
         config.as_ref(),
         args.keypair.as_deref(),
         &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
+        wallet_password,
     )
     .await?;
     let amount_au = parse_usd_amount_to_au(&args.amount)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    if args.submit_intent || args.submit_transfer {
+        require_secure_fund_rpc_url(&rpc_url)?;
+    }
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let payment_state = read_canonical_payment_state(&rpc).await?;
+    let trust_anchor = (args.submit_intent || args.submit_transfer)
+        .then(|| validate_tnk_fund_trust_anchor(config.as_ref(), &payment_state))
+        .transpose()?;
     let treasury_address = payment_state.payments.tnk.treasury_address.clone();
     let msb_network = payment_state.payments.tnk.network.clone();
     let rate_age = require_fresh_payment_rate(
@@ -24713,7 +24838,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let keypair_path = PathBuf::from(wallet.keypair_path.clone());
     let intent_sig = sign_message(
         &keypair_path,
-        args.wallet_password.as_deref().unwrap_or(""),
+        wallet_password,
         &deposit_tnk_intent_message(&intent_payload),
     )
     .await?;
@@ -24752,6 +24877,22 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         &memo_hash,
         &deposit_intent_command,
     )?;
+    let depositor_address = if args.submit_transfer {
+        let depositor = wallet
+            .address
+            .as_deref()
+            .context("local wallet did not expose a TNK/MSB source address")?;
+        confirm_tnk_transfer_destination(
+            args.yes,
+            depositor,
+            &treasury_address,
+            &tnk_decimal,
+            &msb_network,
+        )?;
+        Some(depositor.to_owned())
+    } else {
+        None
+    };
 
     let before_au = if args.wait {
         Some(read_user_balance_au(&rpc, &wallet.public_key, "tnk").await?)
@@ -24779,19 +24920,27 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let msb_transfer = if args.submit_transfer {
         let keypair_path = PathBuf::from(wallet.keypair_path.clone());
         let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
-        Some(
-            submit_msb_transfer(
-                &msb_network,
-                &stores_directory,
-                &store_name,
-                &treasury_address,
-                &tnk_decimal,
-                args.msb_transfer_timeout_seconds,
-                3,
-                None,
-            )
-            .await?,
+        let transfer = submit_msb_transfer(
+            &msb_network,
+            &stores_directory,
+            &store_name,
+            &treasury_address,
+            &tnk_decimal,
+            args.msb_transfer_timeout_seconds,
+            3,
+            None,
         )
+        .await?;
+        verify_tnk_transfer_result(
+            &transfer,
+            &msb_network,
+            depositor_address
+                .as_deref()
+                .context("TNK depositor address missing after confirmation")?,
+            &treasury_address,
+            &tnk_decimal,
+        )?;
+        Some(transfer)
     } else {
         None
     };
@@ -24831,6 +24980,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "msb_network": msb_network,
             "treasury_address": treasury_address,
         },
+        "local_trust_anchor": trust_anchor,
         "rate": {
             "source_key": "rate/latest",
             "denom": "tnk_usd_au",
@@ -24954,6 +25104,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     )
     .await?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    require_secure_fund_rpc_url(&rpc_url)?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let payment_state = read_canonical_payment_state(&rpc).await?;
     let currency = args.currency.trim().to_ascii_lowercase();
@@ -25081,7 +25232,7 @@ struct UpProviderWorker {
     enclave: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct UpPlan {
     home: PathBuf,
     config_path: PathBuf,
@@ -25108,6 +25259,8 @@ struct UpPlan {
     dashboard_url: String,
     supervisor_bind: String,
     supervisor_url: String,
+    mayhemd_control_token: String,
+    wallet_password: Option<String>,
     gateway_bind: SocketAddr,
     rail: GatewayLedgerRail,
     gateway_require_auth: bool,
@@ -25652,10 +25805,11 @@ async fn up_add_selected_provider_workers(
             hardware_quote_config,
             worker_name,
         )?;
-        let response = post_gateway_json(
+        let response = post_mayhemd_json(
             client,
             &format!("{}/children/add", plan.supervisor_url),
             &child,
+            &plan.mayhemd_control_token,
         )
         .await
         .with_context(|| {
@@ -25839,6 +25993,11 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let sc_bridge_url = format!("ws://127.0.0.1:{}", args.sc_bridge_port);
     let supervisor_bind = format!("127.0.0.1:{}", args.supervisor_port);
     let supervisor_url = format!("http://{supervisor_bind}");
+    let mayhemd_control_token = load_or_create_mayhemd_control_token(&home)?;
+    let wallet_password = args
+        .wallet_password
+        .clone()
+        .or_else(|| env::var("MAYHEM_WALLET_PASSWORD").ok());
     let config_path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&config_path)?;
     let gateway_bind =
@@ -26024,6 +26183,8 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         dashboard_url,
         supervisor_bind,
         supervisor_url,
+        mayhemd_control_token,
+        wallet_password,
         gateway_bind,
         rail,
         gateway_require_auth,
@@ -26462,8 +26623,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "127.0.0.1".to_owned(),
         "--sc-bridge-port".to_owned(),
         sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
-        "--sc-bridge-token".to_owned(),
-        plan.sc_bridge_token.clone(),
         "--sc-bridge-cli".to_owned(),
         "1".to_owned(),
         "--rpc".to_owned(),
@@ -26483,6 +26642,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         &plan.pear_runtime,
         &peer_args,
         Some(&plan.intercom_dir),
+        &[("SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
     )?;
 
     let mut gateway_args = vec![
@@ -26493,8 +26653,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         plan.rpc_url.clone(),
         "--sc-bridge-url".to_owned(),
         plan.sc_bridge_url.clone(),
-        "--sc-bridge-token".to_owned(),
-        plan.sc_bridge_token.clone(),
         "--bind".to_owned(),
         plan.gateway_bind.to_string(),
         "--rail".to_owned(),
@@ -26514,7 +26672,14 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     if plan.dev_embedded_catalog {
         gateway_args.push("--dev-embedded-catalog".to_owned());
     }
-    write_supervisor_child(&mut out, "gateway", &plan.mayhem_path, &gateway_args, None)?;
+    write_supervisor_child(
+        &mut out,
+        "gateway",
+        &plan.mayhem_path,
+        &gateway_args,
+        None,
+        &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
+    )?;
 
     if plan.fraud_challenger {
         let challenger_args = vec![
@@ -26538,6 +26703,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             &plan.mayhem_path,
             &challenger_args,
             None,
+            &[],
         )?;
     }
 
@@ -26552,8 +26718,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 plan.rpc_url.clone(),
                 "--sc-bridge-url".to_owned(),
                 plan.sc_bridge_url.clone(),
-                "--sc-bridge-token".to_owned(),
-                plan.sc_bridge_token.clone(),
                 "--serve-sessions".to_owned(),
             ];
             if let Some(enclave) = &worker.enclave {
@@ -26587,6 +26751,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 &plan.mayhem_path,
                 &provider_args,
                 None,
+                &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
             )?;
         }
     }
@@ -26599,6 +26764,7 @@ fn write_supervisor_child(
     command: &Path,
     args: &[String],
     cwd: Option<&Path>,
+    env: &[(&str, &str)],
 ) -> Result<()> {
     writeln!(out, "[[supervisor.children]]")?;
     writeln!(out, "name = {}", toml_string(name))?;
@@ -26610,6 +26776,14 @@ fn write_supervisor_child(
     writeln!(out, "args = [{}]", toml_string_array(args))?;
     if let Some(cwd) = cwd {
         writeln!(out, "cwd = {}", toml_string(&cwd.display().to_string()))?;
+    }
+    if !env.is_empty() {
+        let entries = env
+            .iter()
+            .map(|(key, value)| format!("{} = {}", toml_string(key), toml_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "env = {{ {entries} }}")?;
     }
     writeln!(out, "restart = true")?;
     writeln!(out, "restart_backoff_ms = 1000")?;
@@ -26647,9 +26821,16 @@ fn start_mayhemd_for_up(plan: &UpPlan) -> Result<()> {
         .arg("--config")
         .arg(&plan.supervisor_config_path)
         .arg("--json")
+        .env(
+            MAYHEMD_CONTROL_TOKEN_ENV,
+            plan.mayhemd_control_token.as_str(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if let Some(password) = plan.wallet_password.as_deref() {
+        command.env("MAYHEM_WALLET_PASSWORD", password);
+    }
     command.spawn().with_context(|| {
         format!(
             "starting mayhemd {}; logs at {}",
@@ -26722,6 +26903,29 @@ fn mayhemd_state_path(home: &Path) -> PathBuf {
 
 fn mayhemd_up_config_path(home: &Path) -> PathBuf {
     home.join(MAYHEMD_UP_CONFIG_FILE)
+}
+
+fn mayhemd_control_token_path(home: &Path) -> PathBuf {
+    home.join(MAYHEMD_CONTROL_TOKEN_FILE)
+}
+
+fn load_or_create_mayhemd_control_token(home: &Path) -> Result<String> {
+    let path = mayhemd_control_token_path(home);
+    if path.exists() {
+        let token =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let token = token.trim();
+        if !is_hex_len(token, 64) {
+            bail!("{} contains an invalid control token", path.display());
+        }
+        return Ok(token.to_owned());
+    }
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("generating mayhemd control token entropy")?;
+    let token = hex_encode(&random);
+    write_private_file(&path, format!("{token}\n").as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
 }
 
 fn read_pid_file(path: &Path) -> Result<Option<u32>> {
@@ -32270,6 +32474,27 @@ async fn post_gateway_json(client: &reqwest::Client, url: &str, body: &Value) ->
     serde_json::from_str(&response_body).with_context(|| format!("parsing JSON from {url}"))
 }
 
+async fn post_mayhemd_json(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    control_token: &str,
+) -> Result<Value> {
+    let response = client
+        .post(url)
+        .bearer_auth(control_token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("posting {url}"))?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("mayhemd returned {status} for {url}: {response_body}");
+    }
+    serde_json::from_str(&response_body).with_context(|| format!("parsing JSON from {url}"))
+}
+
 async fn post_gateway_json_for_provider(
     client: &reqwest::Client,
     url: &str,
@@ -34028,6 +34253,113 @@ fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<
         .and_then(|config| config.network)
         .and_then(|network| network.rpc_url)
         .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()))
+}
+
+fn require_secure_fund_rpc_url(rpc_url: &str) -> Result<()> {
+    let parsed =
+        reqwest::Url::parse(rpc_url).with_context(|| format!("parsing fund RPC URL {rpc_url}"))?;
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "fund RPC URL must not contain credentials"
+    );
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed
+                .host_str()
+                .context("fund RPC URL must include a host")?;
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            ensure!(
+                loopback,
+                "refusing plaintext HTTP RPC for fund operation on non-loopback host {host}; use HTTPS or a loopback RPC"
+            );
+            Ok(())
+        }
+        scheme => bail!("fund RPC URL must use HTTPS or loopback HTTP, not {scheme}"),
+    }
+}
+
+fn validate_tnk_fund_trust_anchor(
+    config: Option<&MayhemConfig>,
+    payment_state: &CanonicalPaymentState,
+) -> Result<TnkFundTrustAnchor> {
+    let payments = &payment_state.payments;
+    if payments.tnk.network == "mainnet" {
+        let manifest = canonical_mainnet_manifest()?;
+        ensure!(
+            payments
+                .set_by
+                .eq_ignore_ascii_case(&manifest.contract.admin_peer_pubkey),
+            "RPC admin {} does not match the locally pinned mainnet admin",
+            payments.set_by
+        );
+        ensure!(
+            payments.tnk.treasury_address == manifest.payments.tnk.treasury_address,
+            "RPC TNK treasury {} does not match the locally pinned mainnet treasury",
+            payments.tnk.treasury_address
+        );
+        return Ok(TnkFundTrustAnchor {
+            source: "compiled-mainnet-manifest",
+            admin_peer_pubkey: manifest.contract.admin_peer_pubkey,
+            treasury_address: manifest.payments.tnk.treasury_address,
+        });
+    }
+
+    let local_network = config.and_then(|config| config.network.as_ref());
+    let admin_peer_pubkey = local_network
+        .and_then(|network| network.admin_peer_pubkey.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_ADMIN_PEER_PUBKEY")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .context(
+            "non-mainnet TNK fund operations require local network.admin_peer_pubkey or MAYHEM_ADMIN_PEER_PUBKEY",
+        )?;
+    ensure!(
+        is_hex_len(&admin_peer_pubkey, 64),
+        "local TNK admin trust anchor must be a 32-byte hex public key"
+    );
+    let treasury_address = local_network
+        .and_then(|network| network.tnk_treasury_address.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_TNK_TREASURY_ADDRESS")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .context("non-mainnet TNK fund operations require a local treasury trust anchor")?;
+    ensure!(
+        is_safe_key_part(&treasury_address),
+        "local TNK treasury trust anchor is invalid"
+    );
+    ensure!(
+        payments.set_by.eq_ignore_ascii_case(&admin_peer_pubkey),
+        "RPC admin {} does not match the local admin trust anchor",
+        payments.set_by
+    );
+    ensure!(
+        payments.tnk.treasury_address == treasury_address,
+        "RPC TNK treasury {} does not match the local treasury trust anchor",
+        payments.tnk.treasury_address
+    );
+    Ok(TnkFundTrustAnchor {
+        source: "local-config",
+        admin_peer_pubkey,
+        treasury_address,
+    })
 }
 
 fn resolve_cli_tnk_treasury_address(
@@ -36176,6 +36508,78 @@ fn emit_tnk_handoff(
     Ok(())
 }
 
+fn confirm_tnk_transfer_destination(
+    yes: bool,
+    from: &str,
+    treasury: &str,
+    amount: &str,
+    network: &str,
+) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "refusing TNK transfer without interactive destination confirmation; pass --yes for unattended operation"
+        );
+    }
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "TNK transfer destination confirmation")?;
+    writeln!(stderr, "Network: {network}")?;
+    writeln!(stderr, "From: {from}")?;
+    writeln!(stderr, "To treasury: {treasury}")?;
+    writeln!(stderr, "Amount: {amount} TNK")?;
+    write!(stderr, "Type the full treasury address to continue: ")?;
+    stderr.flush()?;
+    drop(stderr);
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    ensure!(
+        answer.trim() == treasury,
+        "TNK transfer cancelled: treasury confirmation did not match"
+    );
+    Ok(())
+}
+
+fn verify_tnk_transfer_result(
+    transfer: &MsbTransferOutput,
+    expected_network: &str,
+    expected_from: &str,
+    expected_to: &str,
+    expected_amount: &str,
+) -> Result<()> {
+    ensure!(transfer.ok, "MSB transfer helper did not report success");
+    ensure!(
+        transfer.network == expected_network,
+        "MSB transfer network {} does not match expected {expected_network}",
+        transfer.network
+    );
+    ensure!(
+        transfer.from == expected_from,
+        "MSB transfer source {} does not match local depositor {expected_from}",
+        transfer.from
+    );
+    ensure!(
+        transfer.to == expected_to,
+        "MSB transfer destination {} does not match pinned treasury {expected_to}",
+        transfer.to
+    );
+    ensure!(
+        transfer.amount == expected_amount,
+        "MSB transfer amount {} does not match confirmed amount {expected_amount}",
+        transfer.amount
+    );
+    ensure!(
+        is_hex_len(&transfer.tx_hash, 64),
+        "MSB transfer helper returned an invalid transaction hash"
+    );
+    ensure!(
+        transfer.validator_connections > 0,
+        "MSB transfer helper returned no validator connection"
+    );
+    Ok(())
+}
+
 async fn submit_journaled_msb_settlement_transfer(
     network: &str,
     stores_directory: &Path,
@@ -36261,6 +36665,7 @@ where
     let (command, helper_args) = args
         .split_first()
         .context("MSB transfer helper command is required")?;
+    validate_external_helper_option_pairs(helper_args)?;
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
     let output = Command::new(&pear_runtime)
@@ -36291,6 +36696,36 @@ where
         );
     }
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+}
+
+fn validate_external_helper_option_pairs(args: &[String]) -> Result<()> {
+    let mut pairs = args.chunks_exact(2);
+    for pair in &mut pairs {
+        ensure!(
+            pair[0].starts_with("--") && pair[0].len() > 2,
+            "external helper argument {} is not an option",
+            pair[0]
+        );
+        ensure_external_helper_value(&pair[0], &pair[1])?;
+    }
+    ensure!(
+        pairs.remainder().is_empty(),
+        "external helper options must have explicit values"
+    );
+    Ok(())
+}
+
+fn ensure_external_helper_value(option: &str, value: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "{option} helper value must not be empty");
+    ensure!(
+        !value.starts_with('-'),
+        "{option} helper value must not start with '-'"
+    );
+    ensure!(
+        !value.chars().any(char::is_control),
+        "{option} helper value must not contain control characters"
+    );
+    Ok(())
 }
 
 fn parse_msb_transfer_helper_json<T>(stdout: &[u8], stderr: &[u8]) -> Result<T>
@@ -39483,6 +39918,7 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         .build()
         .context("building mayhemd control HTTP client")?;
     let supervisor_url = mayhemd_control_url(&home)?;
+    let control_token = load_or_create_mayhemd_control_token(&home)?;
     let serve_plan_args = ProviderServePlanArgs {
         home: Some(home.clone()),
         rpc_url: None,
@@ -39535,9 +39971,14 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         computed.hardware_quote_config.as_ref(),
         None,
     )?;
-    let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
-        .await
-        .context("adding provider worker to mayhemd")?;
+    let response = post_mayhemd_json(
+        &client,
+        &format!("{supervisor_url}/children/add"),
+        &child,
+        &control_token,
+    )
+    .await
+    .context("adding provider worker to mayhemd")?;
     let report = json!({
         "ok": true,
         "home": home,
@@ -39573,12 +40014,14 @@ async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
         .build()
         .context("building mayhemd control HTTP client")?;
     let supervisor_url = mayhemd_control_url(&home)?;
+    let control_token = load_or_create_mayhemd_control_token(&home)?;
     let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
     let child_name = provider_serve_child_name_for_target(&status, &args.target)?;
-    let response = post_gateway_json(
+    let response = post_mayhemd_json(
         &client,
         &format!("{supervisor_url}/children/remove"),
         &json!({ "name": child_name }),
+        &control_token,
     )
     .await
     .context("removing provider worker from mayhemd")?;
@@ -39656,8 +40099,6 @@ fn provider_serve_child_config(
         rpc_url,
         "--sc-bridge-url".to_owned(),
         sc_bridge_url,
-        "--sc-bridge-token".to_owned(),
-        sc_bridge_token,
         "--serve-sessions".to_owned(),
         "--enclave".to_owned(),
         enclave.to_owned(),
@@ -39689,7 +40130,8 @@ fn provider_serve_child_config(
         ]);
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
-    let runtime_env = provider_backend_runtime_child_env(backend, runtime);
+    let mut runtime_env = provider_backend_runtime_child_env(backend, runtime);
+    runtime_env.insert("MAYHEM_SC_BRIDGE_TOKEN".to_owned(), sc_bridge_token);
     Ok(json!({
         "name": name.unwrap_or_else(|| format!("provider-live-{}", up_provider_worker_slug(enclave))),
         "command": mayhem_path.display().to_string(),
@@ -53159,7 +53601,7 @@ fn verify_provider_session_receipt_ack(
     let signature = Signature::from_bytes(&sig_bytes);
     let payload = receipt_signing_bytes(body)?;
     verifying_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .context("receipt ack user signature failed")
 }
 
@@ -55225,7 +55667,7 @@ fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &s
     let signature = Signature::from_bytes(&sig_bytes);
     let payload = spend_voucher_signing_bytes(&voucher.body)?;
     verifying_key
-        .verify(&payload, &signature)
+        .verify_strict(&payload, &signature)
         .context("spend voucher user signature failed")
 }
 
@@ -58031,6 +58473,7 @@ fn is_hex_len(value: &str, len: usize) -> bool {
 
 fn is_safe_key_part(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('-')
         && value.len() <= 128
         && value
             .as_bytes()
@@ -58423,6 +58866,9 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "tnk_treasury_address" | "network.tnk_treasury_address" => {
             Ok("network.tnk_treasury_address")
         }
+        "admin_peer_pubkey" | "network.admin_peer_pubkey" => {
+            Ok("network.admin_peer_pubkey")
+        }
         "subnet_channel" | "network.subnet_channel" => Ok("network.subnet_channel"),
         "subnet_bootstrap" | "network.subnet_bootstrap" => Ok("network.subnet_bootstrap"),
         "msb_channel" | "network.msb_channel" => Ok("network.msb_channel"),
@@ -58448,7 +58894,7 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "rail" | "user.rail" => Ok("user.rail"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.rail, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, admin_peer_pubkey, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.rail, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -58758,6 +59204,10 @@ async fn materialize_wallet(
     password: &str,
 ) -> Result<WalletInfo> {
     let exists = keypair_path.exists();
+    let mnemonic = args
+        .mnemonic
+        .clone()
+        .or_else(|| env::var("MAYHEM_WALLET_MNEMONIC").ok());
     match args.wallet {
         WalletMode::Auto => {
             if exists {
@@ -58766,7 +59216,7 @@ async fn materialize_wallet(
                 create_wallet(
                     keypair_path,
                     password,
-                    args.mnemonic.as_deref(),
+                    mnemonic.as_deref(),
                     false,
                     None,
                     None,
@@ -58784,7 +59234,7 @@ async fn materialize_wallet(
             create_wallet(
                 keypair_path,
                 password,
-                args.mnemonic.as_deref(),
+                mnemonic.as_deref(),
                 args.force,
                 None,
                 None,
@@ -58798,10 +59248,9 @@ async fn materialize_wallet(
                     keypair_path.display()
                 );
             }
-            let mnemonic = args
-                .mnemonic
+            let mnemonic = mnemonic
                 .as_deref()
-                .context("--wallet import requires --mnemonic")?;
+                .context("--wallet import requires --mnemonic-file or MAYHEM_WALLET_MNEMONIC")?;
             create_wallet(keypair_path, password, Some(mnemonic), true, None, None).await
         }
         WalletMode::Reuse => {
@@ -58824,39 +59273,35 @@ async fn create_wallet(
     ethereum_private_key: Option<&str>,
     ethereum_mnemonic: Option<&str>,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "create".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    if let Some(mnemonic) = mnemonic {
-        args.extend(["--mnemonic".to_owned(), mnemonic.to_owned()]);
-    }
-    if let Some(private_key) = ethereum_private_key {
-        args.extend(["--ethereum-private-key".to_owned(), private_key.to_owned()]);
-    }
-    if let Some(mnemonic) = ethereum_mnemonic {
-        args.extend(["--ethereum-mnemonic".to_owned(), mnemonic.to_owned()]);
-    }
+    let mut args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
     if force {
         args.push("--force".to_owned());
     }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "create",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            mnemonic: mnemonic.map(str::to_owned),
+            ethereum_private_key: ethereum_private_key.map(str::to_owned),
+            ethereum_mnemonic: ethereum_mnemonic.map(str::to_owned),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn inspect_wallet(keypair_path: &Path, password: &str) -> Result<WalletInfo> {
-    let mut args = vec![
-        "inspect".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "inspect",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn inspect_wallet_for_network_prefix(
@@ -58864,29 +59309,34 @@ async fn inspect_wallet_for_network_prefix(
     password: &str,
     network_prefix: &str,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "inspect".to_owned(),
+    let args = vec![
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
         "--network-prefix".to_owned(),
         network_prefix.to_owned(),
     ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "inspect",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn backup_wallet(keypair_path: &Path, password: &str) -> Result<WalletInfo> {
-    let mut args = vec![
-        "backup".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "backup",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn rotate_wallet_password(
@@ -58894,29 +59344,30 @@ async fn rotate_wallet_password(
     old_password: &str,
     new_password: &str,
 ) -> Result<WalletInfo> {
-    let mut args = vec![
-        "passwd".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-        "--new-password".to_owned(),
-        new_password.to_owned(),
-    ];
-    if !old_password.is_empty() {
-        args.extend(["--password".to_owned(), old_password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "passwd",
+        args,
+        WalletHelperSecrets {
+            password: (!old_password.is_empty()).then(|| old_password.to_owned()),
+            new_password: Some(new_password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn ethereum_wallet_key(keypair_path: &Path, password: &str) -> Result<EthereumKeyOutput> {
-    let mut args = vec![
-        "eth-key".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    run_wallet_helper(
+        "eth-key",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 async fn sign_ethereum_message(
@@ -58924,17 +59375,21 @@ async fn sign_ethereum_message(
     password: &str,
     message: &str,
 ) -> Result<EthereumSignOutput> {
-    let mut args = vec![
-        "eth-sign".to_owned(),
+    let args = vec![
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
         "--message".to_owned(),
         message.to_owned(),
     ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    run_wallet_helper(args).await
+    run_wallet_helper(
+        "eth-sign",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await
 }
 
 // One Pear wallet-helper spawn per signature froze busy providers: at a 2s
@@ -58955,15 +59410,16 @@ async fn cached_wallet_signing_key(keypair_path: &Path, password: &str) -> Resul
     if let Some(key) = cache.get(&cache_key) {
         return Ok(key.clone());
     }
-    let mut args = vec![
-        "seed".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    let output: WalletSeedOutput = run_wallet_helper(
+        "seed",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await?;
     let seed = hex_decode_array::<32>(&output.signing_seed_hex, "wallet signing seed")?;
     let key = SigningKey::from_bytes(&seed);
     let derived_public_key = hex_encode(&key.verifying_key().to_bytes());
@@ -58994,15 +59450,16 @@ async fn wallet_signing_seed(
     password: &str,
     expected_public_key: &str,
 ) -> Result<[u8; 32]> {
-    let mut args = vec![
-        "seed".to_owned(),
-        "--keypair".to_owned(),
-        keypair_path.display().to_string(),
-    ];
-    if !password.is_empty() {
-        args.extend(["--password".to_owned(), password.to_owned()]);
-    }
-    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    let args = vec!["--keypair".to_owned(), keypair_path.display().to_string()];
+    let output: WalletSeedOutput = run_wallet_helper(
+        "seed",
+        args,
+        WalletHelperSecrets {
+            password: (!password.is_empty()).then(|| password.to_owned()),
+            ..WalletHelperSecrets::default()
+        },
+    )
+    .await?;
     if !output.public_key.eq_ignore_ascii_case(expected_public_key) {
         bail!(
             "wallet helper returned public key {}, expected {}",
@@ -59022,28 +59479,52 @@ async fn wallet_signing_seed(
     Ok(seed)
 }
 
-async fn run_wallet_helper<T>(args: Vec<String>) -> Result<T>
+async fn run_wallet_helper<T>(
+    command: &str,
+    helper_args: Vec<String>,
+    mut secrets: WalletHelperSecrets,
+) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let (command, helper_args) = args
-        .split_first()
-        .context("wallet helper command is required")?;
+    validate_wallet_helper_public_args(&helper_args)?;
+    secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
-    let output = Command::new(&pear_runtime)
+    let mut process = Command::new(&pear_runtime);
+    process
         .arg("run")
         .arg(&intercom_app)
         .arg(format!("--wallet-helper={command}"))
-        .args(helper_args)
-        .output()
+        .args(&helper_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().with_context(|| {
+        format!(
+            "running wallet helper via pear-runtime app {}",
+            intercom_app.display()
+        )
+    })?;
+    let encoded_secrets =
+        serde_json::to_vec(&secrets).context("serializing wallet helper secrets")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("wallet helper stdin pipe was not created")?;
+    stdin
+        .write_all(&encoded_secrets)
         .await
-        .with_context(|| {
-            format!(
-                "running wallet helper via pear-runtime app {}",
-                intercom_app.display()
-            )
-        })?;
+        .context("writing wallet helper secrets to stdin")?;
+    stdin
+        .shutdown()
+        .await
+        .context("closing wallet helper secret stdin")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("waiting for wallet helper")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -59058,6 +59539,44 @@ where
 
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
         .context("parsing Pear wallet helper JSON output")
+}
+
+fn validate_wallet_helper_public_args(args: &[String]) -> Result<()> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if [
+            "--password",
+            "--password=",
+            "--new-password",
+            "--new-password=",
+            "--mnemonic",
+            "--mnemonic=",
+            "--ethereum-private-key",
+            "--ethereum-private-key=",
+            "--ethereum-mnemonic",
+            "--ethereum-mnemonic=",
+        ]
+        .iter()
+        .any(|secret_arg| arg == secret_arg || arg.starts_with(secret_arg))
+        {
+            bail!("wallet helper secrets must use the typed stdin channel");
+        }
+        match arg.as_str() {
+            "--keypair" | "--network-prefix" | "--message" | "--message-hex" => {
+                let value = args
+                    .get(index + 1)
+                    .with_context(|| format!("{arg} requires a value"))?;
+                ensure_external_helper_value(arg, value)?;
+                index += 2;
+            }
+            "--force" => {
+                index += 1;
+            }
+            _ => bail!("unsupported wallet helper argument {arg}"),
+        }
+    }
+    Ok(())
 }
 
 fn write_config(
@@ -59321,6 +59840,14 @@ mod tests {
     use std::thread;
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn weak_identity_key_and_signature() -> (String, String) {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        (hex_encode(&weak_key), hex_encode(&weak_signature))
+    }
 
     #[test]
     fn gateway_heartbeat_watcher_reconciles_catalog_room_changes() {
@@ -59742,18 +60269,31 @@ mod tests {
 
     #[test]
     fn wallet_cli_parses_ethereum_import_key() {
-        let cli = Cli::try_parse_from([
-            "mayhem",
-            "wallet",
-            "import",
-            "--keypair",
-            "/tmp/mayhem-wallet/db/keypair.json",
-            "--mnemonic",
-            "bar same olive hurry place manage truck sleep banana wrist harvest bus clap prefer clarify copy leader jeans acoustic stairs cover echo reopen grow",
-            "--ethereum-private-key",
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "--force",
-            "--json",
+        let temp = test_temp_dir("wallet-cli-secret-files");
+        let mnemonic_path = temp.join("mnemonic");
+        let private_key_path = temp.join("ethereum-key");
+        fs::write(
+            &mnemonic_path,
+            "bar same olive hurry place manage truck sleep banana wrist harvest bus clap prefer clarify copy leader jeans acoustic stairs cover echo reopen grow\n",
+        )
+        .unwrap();
+        fs::write(
+            &private_key_path,
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "mayhem".to_owned(),
+            "wallet".to_owned(),
+            "import".to_owned(),
+            "--keypair".to_owned(),
+            temp.join("keypair.json").display().to_string(),
+            "--mnemonic-file".to_owned(),
+            mnemonic_path.display().to_string(),
+            "--ethereum-private-key-file".to_owned(),
+            private_key_path.display().to_string(),
+            "--force".to_owned(),
+            "--json".to_owned(),
         ])
         .unwrap();
 
@@ -59769,6 +60309,74 @@ mod tests {
             Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
         assert!(args.ethereum_mnemonic.is_none());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn wallet_cli_rejects_secret_valued_legacy_flags() {
+        assert!(Cli::try_parse_from([
+            "mayhem",
+            "wallet",
+            "show",
+            "--wallet-password",
+            "argv-secret",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(
+            ["mayhem", "wallet", "import", "--mnemonic", "argv mnemonic",]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wallet_helper_keeps_every_secret_out_of_child_argv() {
+        let public_args = vec![
+            "--keypair".to_owned(),
+            "wallet.json".to_owned(),
+            "--force".to_owned(),
+        ];
+        let secrets = WalletHelperSecrets {
+            password: Some("old-password".to_owned()),
+            new_password: Some("new-password".to_owned()),
+            mnemonic: Some("mnemonic words".to_owned()),
+            ethereum_private_key: Some("0xprivate".to_owned()),
+            ethereum_mnemonic: Some("ethereum mnemonic".to_owned()),
+        };
+        validate_wallet_helper_public_args(&public_args).unwrap();
+        assert_eq!(
+            public_args,
+            ["--keypair", "wallet.json", "--force"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        let child_argv = public_args.join("\0");
+        for secret in [
+            "old-password",
+            "new-password",
+            "mnemonic words",
+            "0xprivate",
+            "ethereum mnemonic",
+        ] {
+            assert!(!child_argv.contains(secret));
+        }
+        assert_eq!(secrets.password.as_deref(), Some("old-password"));
+        assert_eq!(secrets.new_password.as_deref(), Some("new-password"));
+        assert_eq!(secrets.mnemonic.as_deref(), Some("mnemonic words"));
+        assert_eq!(secrets.ethereum_private_key.as_deref(), Some("0xprivate"));
+        assert_eq!(
+            secrets.ethereum_mnemonic.as_deref(),
+            Some("ethereum mnemonic")
+        );
+        let serialized = serde_json::to_string(&secrets).unwrap();
+        assert!(serialized.contains("old-password"));
+        assert!(serialized.contains("ethereum mnemonic"));
+    }
+
+    #[test]
+    fn wallet_helper_public_args_reject_secret_pseudo_flags() {
+        let args = vec!["--password".to_owned(), "argv-secret".to_owned()];
+        assert!(validate_wallet_helper_public_args(&args).is_err());
     }
 
     #[test]
@@ -64272,11 +64880,10 @@ mod tests {
             "command": "mayhem",
             "args": [
                 "provider",
-                "start",
-                "--sc-bridge-token",
-                "local-secret-value"
+                "start"
             ],
             "env": {
+                "MAYHEM_SC_BRIDGE_TOKEN": "local-secret-value",
                 "MAYHEM_VLLM_PYTHON": "provider-python"
             },
             "restart": true,
@@ -64294,6 +64901,44 @@ mod tests {
         assert!(report.get("env").is_none());
         assert!(!encoded.contains("local-secret-value"));
         assert!(!encoded.contains("provider-python"));
+    }
+
+    #[test]
+    fn provider_serve_child_inherits_sc_bridge_token_without_argv_exposure() {
+        let home = test_temp_dir("provider-child-secret-channel");
+        let config = toml::from_str::<toml::Value>(
+            r#"
+            [network]
+            rpc_url = "http://127.0.0.1:49223/v1"
+            sc_bridge_url = "ws://127.0.0.1:8001"
+            sc_bridge_token = "provider-secret-token"
+            "#,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+
+        let child = provider_serve_child_config(
+            &home,
+            &"11".repeat(32),
+            "llama.cpp",
+            &ProviderBackendRuntime::default(),
+            None,
+            None,
+            &["text".to_owned()],
+            &BTreeMap::new(),
+            None,
+            Some("provider-live-test".to_owned()),
+        )
+        .unwrap();
+        let args = child["args"].as_array().unwrap();
+        assert!(!args.iter().any(|arg| arg == "--sc-bridge-token"));
+        assert!(!args.iter().any(|arg| arg == "provider-secret-token"));
+        assert_eq!(
+            child["env"]["MAYHEM_SC_BRIDGE_TOKEN"],
+            "provider-secret-token"
+        );
+
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -67560,7 +68205,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
     }
 
@@ -67620,7 +68265,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
     }
 
@@ -67792,7 +68437,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key
-            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
     }
 
@@ -67973,6 +68618,45 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut wrong_sig = frame;
         wrong_sig["user_sig"] = json!("11".repeat(64));
         assert!(provider_session_receipt_ack_from_frame(&wrong_sig, &active, &receipt).is_err());
+    }
+
+    #[test]
+    fn provider_session_user_signatures_reject_low_order_forgeries() {
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        active.user_pubkey = weak_key.clone();
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &json!({"messages": [{"role": "user", "content": "strict ack"}]}),
+            ReceiptUsage::text(1, 1),
+            1,
+            true,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap();
+        let ack_frame = json!({
+            "t": "s.receipt_ack",
+            "v": 1,
+            "session_id": active.session_id,
+            "seq": receipt.body.seq,
+            "user_sig": weak_signature,
+        });
+        provider_session_receipt_ack_from_frame(&ack_frame, &active, &receipt)
+            .expect_err("low-order receipt ack forgery must fail strict verification");
+
+        let mut open_frame = test_session_open_frame(&terms);
+        open_frame["user"] = json!(weak_key);
+        open_frame["voucher"]["user_sig"] = json!(weak_signature);
+        open_frame["sig"] = json!(weak_signature);
+        assert!(matches!(
+            provider_session_open_decision(&open_frame, &terms),
+            ProviderSessionDecision::Reject {
+                code: "SIGNATURE",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -72625,6 +73309,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 gateway_bind: None,
                 gateway_url: None,
                 tnk_treasury_address: Some("testtrac1treasury".to_owned()),
+                admin_peer_pubkey: Some("11".repeat(32)),
             }),
             provider: None,
             user: None,
@@ -72636,6 +73321,215 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "testtrac1treasury"
         );
         assert!(resolve_cli_tnk_treasury_address(Some(&config), Some("bad address")).is_err());
+    }
+
+    fn tnk_payment_state(network: &str, treasury: &str, admin: &str) -> CanonicalPaymentState {
+        CanonicalPaymentState {
+            payments: CanonicalPayments {
+                denom: "au_usd".to_owned(),
+                rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+                fiat: CanonicalFiatRail {
+                    processor: "stripe".to_owned(),
+                    currencies: vec!["usd".to_owned(), "eur".to_owned()],
+                    locale: "en".to_owned(),
+                },
+                tap: CanonicalTapRail {
+                    chain_id: MAINNET_TAP_CHAIN_ID,
+                    token_address: MAINNET_TAP_TOKEN_ADDRESS.to_owned(),
+                    pool_address: MAINNET_TAP_POOL_ADDRESS.to_owned(),
+                },
+                tnk: CanonicalTnkRail {
+                    network: network.to_owned(),
+                    treasury_address: treasury.to_owned(),
+                },
+                ver: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                set_by: admin.to_owned(),
+                set_by_role: "admin".to_owned(),
+            },
+            tap_rate: CanonicalTapRate {
+                denom: "tap_usd_au".to_owned(),
+                tap_usd_au: 1,
+                source: "config".to_owned(),
+                ts: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                posted_by: admin.to_owned(),
+                posted_by_role: "admin".to_owned(),
+            },
+            tnk_rate: CanonicalTnkRate {
+                denom: "tnk_usd_au".to_owned(),
+                tnk_usd_au: 1,
+                source: "gate-spot".to_owned(),
+                ts: 1,
+                updated_at: "2026-07-17T00:00:00Z".to_owned(),
+                posted_by: admin.to_owned(),
+                posted_by_role: "admin".to_owned(),
+            },
+            rate_staleness_seconds: 1,
+            observed_at: 1,
+        }
+    }
+
+    #[test]
+    fn fund_rpc_rejects_remote_plaintext_and_accepts_loopback_or_tls() {
+        assert!(require_secure_fund_rpc_url("http://127.0.0.1:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://[::1]:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://localhost:49223/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("https://rpc.example.test/v1").is_ok());
+        assert!(require_secure_fund_rpc_url("http://192.0.2.10:49223/v1").is_err());
+        assert!(require_secure_fund_rpc_url("ws://127.0.0.1:49223/v1").is_err());
+        assert!(require_secure_fund_rpc_url("https://user:password@rpc.example.test/v1").is_err());
+    }
+
+    #[test]
+    fn tnk_mainnet_fund_anchor_rejects_a_self_consistent_hostile_rpc() {
+        let manifest = canonical_mainnet_manifest().unwrap();
+        let honest = tnk_payment_state(
+            "mainnet",
+            MAINNET_TNK_TREASURY_ADDRESS,
+            &manifest.contract.admin_peer_pubkey,
+        );
+        let anchor = validate_tnk_fund_trust_anchor(None, &honest).unwrap();
+        assert_eq!(anchor.source, "compiled-mainnet-manifest");
+        assert_eq!(anchor.treasury_address, MAINNET_TNK_TREASURY_ADDRESS);
+
+        let hostile = tnk_payment_state(
+            "mainnet",
+            "trac1attacker000000000000000000000000000000000000000000000000",
+            &"aa".repeat(32),
+        );
+        assert!(validate_tnk_fund_trust_anchor(None, &hostile).is_err());
+    }
+
+    #[test]
+    fn tnk_testnet_fund_anchor_requires_matching_local_admin_and_treasury() {
+        let admin = "22".repeat(32);
+        let treasury = "testtrac1trustedtreasury";
+        let config = MayhemConfig {
+            identity: None,
+            network: Some(ConfigNetwork {
+                rpc_url: None,
+                sc_bridge_url: None,
+                sc_bridge_token: None,
+                gateway_bind: None,
+                gateway_url: None,
+                tnk_treasury_address: Some(treasury.to_owned()),
+                admin_peer_pubkey: Some(admin.clone()),
+            }),
+            provider: None,
+            user: None,
+            role: None,
+        };
+        let honest = tnk_payment_state("testnet1", treasury, &admin);
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &honest).is_ok());
+        let redirected = tnk_payment_state("testnet1", "testtrac1attacker", &admin);
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &redirected).is_err());
+        let hostile_admin = tnk_payment_state("testnet1", treasury, &"33".repeat(32));
+        assert!(validate_tnk_fund_trust_anchor(Some(&config), &hostile_admin).is_err());
+    }
+
+    fn valid_msb_transfer() -> MsbTransferOutput {
+        MsbTransferOutput {
+            ok: true,
+            network: "mainnet".to_owned(),
+            from: "trac1depositor".to_owned(),
+            to: "trac1treasury".to_owned(),
+            amount: "1.25".to_owned(),
+            tx_hash: "ab".repeat(32),
+            before_balance: "10".to_owned(),
+            validator_connections: 1,
+            confirmed_length: Some(10),
+            observed_signed_length: Some(12),
+        }
+    }
+
+    #[test]
+    fn tnk_transfer_result_must_match_confirmed_identity() {
+        let transfer = valid_msb_transfer();
+        assert!(verify_tnk_transfer_result(
+            &transfer,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_ok());
+
+        let mut wrong_from = valid_msb_transfer();
+        wrong_from.from = "trac1attacker".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_from,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+        let mut wrong_to = valid_msb_transfer();
+        wrong_to.to = "trac1attacker".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_to,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+        let mut wrong_amount = valid_msb_transfer();
+        wrong_amount.amount = "125".to_owned();
+        assert!(verify_tnk_transfer_result(
+            &wrong_amount,
+            "mainnet",
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tnk_destination_confirmation_preserves_headless_operation() {
+        assert!(confirm_tnk_transfer_destination(
+            true,
+            "trac1depositor",
+            "trac1treasury",
+            "1.25",
+            "mainnet",
+        )
+        .is_ok());
+        if !io::stdin().is_terminal() {
+            assert!(confirm_tnk_transfer_destination(
+                false,
+                "trac1depositor",
+                "trac1treasury",
+                "1.25",
+                "mainnet",
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn helper_values_and_contract_key_parts_reject_leading_dash() {
+        assert!(is_safe_key_part("trac1destination"));
+        assert!(!is_safe_key_part("-destination"));
+        assert!(validate_external_helper_option_pairs(&[
+            "--to".to_owned(),
+            "trac1destination".to_owned(),
+            "--amount".to_owned(),
+            "1.25".to_owned(),
+        ])
+        .is_ok());
+        assert!(validate_external_helper_option_pairs(&[
+            "--to".to_owned(),
+            "--attacker-option".to_owned(),
+        ])
+        .is_err());
+        assert!(validate_wallet_helper_public_args(&[
+            "--keypair".to_owned(),
+            "--attacker-option".to_owned(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -72958,6 +73852,7 @@ State initialization...
                 gateway_bind: None,
                 gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
                 tnk_treasury_address: None,
+                admin_peer_pubkey: None,
             }),
             provider: None,
             user: None,
@@ -73065,29 +73960,32 @@ State initialization...
 
     #[test]
     fn use_gateway_accepts_wallet_and_rail_flags() {
-        let cli = Cli::try_parse_from([
-            "mayhem",
-            "use",
-            "--keypair",
-            "/tmp/mayhem/stores/main/db/keypair.json",
-            "--peer-store-name",
-            "terminal",
-            "--wallet-password",
-            "secret",
-            "--rail",
-            "tnk",
-            "--min-ctx",
-            "128000",
-            "--canary-probe-min-interval-sessions",
-            "1",
-            "--canary-probe-max-interval-sessions",
-            "1",
-            "--canary-probe-epoch",
-            "7",
-            "--receipt-checkpoint-tokens",
-            "32",
-            "--receipt-checkpoint-ms",
-            "2500",
+        let temp = test_temp_dir("use-wallet-password-file");
+        let password_path = temp.join("wallet-password");
+        fs::write(&password_path, "secret\n").unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "mayhem".to_owned(),
+            "use".to_owned(),
+            "--keypair".to_owned(),
+            "/tmp/mayhem/stores/main/db/keypair.json".to_owned(),
+            "--peer-store-name".to_owned(),
+            "terminal".to_owned(),
+            "--wallet-password-file".to_owned(),
+            password_path.display().to_string(),
+            "--rail".to_owned(),
+            "tnk".to_owned(),
+            "--min-ctx".to_owned(),
+            "128000".to_owned(),
+            "--canary-probe-min-interval-sessions".to_owned(),
+            "1".to_owned(),
+            "--canary-probe-max-interval-sessions".to_owned(),
+            "1".to_owned(),
+            "--canary-probe-epoch".to_owned(),
+            "7".to_owned(),
+            "--receipt-checkpoint-tokens".to_owned(),
+            "32".to_owned(),
+            "--receipt-checkpoint-ms".to_owned(),
+            "2500".to_owned(),
         ])
         .unwrap();
         match cli.command {
@@ -73108,6 +74006,7 @@ State initialization...
             }
             other => panic!("expected use command, got {other:?}"),
         }
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -76285,6 +77184,30 @@ State initialization...
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn release_manifest_signature_rejects_low_order_forgery() {
+        let (weak_key, weak_signature) = weak_identity_key_and_signature();
+        let manifest_bytes = br#"{"schema":1,"name":"mayhem"}"#;
+        let signature = ReleaseDetachedSignature {
+            schema_version: 1,
+            alg: "ed25519".to_owned(),
+            signed_path: "manifest.json".to_owned(),
+            key_id: "test-release-key".to_owned(),
+            public_key: weak_key.clone(),
+            sha256: sha256_bytes_hex(manifest_bytes),
+            sig: weak_signature,
+        };
+
+        verify_release_manifest_signature(
+            manifest_bytes,
+            &signature,
+            None,
+            Some(&weak_key),
+            Some("test-release-key"),
+        )
+        .expect_err("low-order release manifest forgery must fail strict verification");
+    }
+
     #[tokio::test]
     async fn update_report_rejects_tampered_release_archive() {
         let temp = test_temp_dir("mayhem-release-update-tamper");
@@ -77585,6 +78508,8 @@ State initialization...
             dashboard_url: "http://127.0.0.1:11435/mayhem/dashboard".to_owned(),
             supervisor_bind: "127.0.0.1:11437".to_owned(),
             supervisor_url: "http://127.0.0.1:11437".to_owned(),
+            mayhemd_control_token: "11".repeat(32),
+            wallet_password: None,
             gateway_bind: "0.0.0.0:11435".parse().unwrap(),
             rail: GatewayLedgerRail::Tap,
             gateway_require_auth: true,
@@ -77634,7 +78559,25 @@ State initialization...
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["peer", "gateway"]);
         assert!(up_provider_workers_deferred(&plan));
-        assert!(text.contains("--sc-bridge-token"));
+        assert!(children.iter().all(|child| {
+            child
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|args| {
+                    args.iter().all(|arg| {
+                        arg.as_str() != Some("--sc-bridge-token")
+                            && arg.as_str() != Some("test-token")
+                    })
+                })
+        }));
+        assert_eq!(
+            children[0]["env"]["SC_BRIDGE_TOKEN"].as_str(),
+            Some("test-token")
+        );
+        assert_eq!(
+            children[1]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),
+            Some("test-token")
+        );
         assert!(text.contains("test-token"));
         assert!(text.contains("--subnet-channel"));
         assert!(text.contains("mayhem-mainnet-v1"));
@@ -77690,6 +78633,26 @@ State initialization...
             .mode()
             & 0o777;
         assert_eq!(config_mode, 0o600);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mayhemd_control_token_is_private_stable_and_validated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_temp_dir("mayhemd-control-token");
+        fs::create_dir_all(&home).unwrap();
+        let first = load_or_create_mayhemd_control_token(&home).unwrap();
+        let second = load_or_create_mayhemd_control_token(&home).unwrap();
+        assert_eq!(first, second);
+        assert!(is_hex_len(&first, 64));
+        let path = mayhemd_control_token_path(&home);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        fs::write(&path, "weak-token\n").unwrap();
+        assert!(load_or_create_mayhemd_control_token(&home).is_err());
         fs::remove_dir_all(home).unwrap();
     }
 

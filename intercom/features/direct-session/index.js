@@ -1,10 +1,13 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
+import crypto from 'crypto';
 import Protomux from 'protomux';
 import {
+  DEFAULT_MAX_JSON_STRING_BYTES,
   boundedJsonEncoding,
   decodedJsonByteLength,
   decodedJsonWasRejected,
+  jsonShapeWithinBounds,
 } from '../bounded-json.js';
 
 const SESSION_PROTOCOL = 'mx/s';
@@ -24,6 +27,7 @@ const DEFAULT_MAX_SESSIONS = 1024;
 const DEFAULT_MAX_SESSIONS_PER_CONNECTION = 128;
 const MAX_FRAME_TYPE_BYTES = 64;
 const MAX_HEALTH_FRAME_BYTES = 256;
+const MAX_PENDING_HEALTH_PROBES = 32;
 
 const normalizeKeyHex = (value) => {
   if (!value) return null;
@@ -57,6 +61,11 @@ class DirectSession extends Feature {
     this.started = false;
     this.debug = config.debug === true;
     this.maxFrameBytes = safeIntegerOr(config.maxFrameBytes, DEFAULT_MAX_FRAME_BYTES, { min: 1 });
+    this.maxStringBytes = safeIntegerOr(
+      config.maxStringBytes,
+      Math.min(this.maxFrameBytes, DEFAULT_MAX_JSON_STRING_BYTES),
+      { min: 1 }
+    );
     this.rateBytesPerSecond = safeIntegerOr(
       config.rateBytesPerSecond,
       DEFAULT_RATE_BYTES_PER_SECOND
@@ -108,8 +117,6 @@ class DirectSession extends Feature {
     this.connectionHealth = new Map();
     this.explicitPeers = new Set();
     this.reconnectSuspended = new Set();
-    this.verifiedPeers = new Set();
-    this.healthNonce = 0;
     this.lastConnectAttempt = null;
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
     this.onClose = typeof config.onClose === 'function' ? config.onClose : null;
@@ -137,6 +144,7 @@ class DirectSession extends Feature {
       started: this.started === true,
       protocol: SESSION_PROTOCOL,
       maxFrameBytes: this.maxFrameBytes,
+      maxStringBytes: this.maxStringBytes,
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
       receiveRateBurstBytes: this._receiveRateBurstBytes(),
@@ -162,7 +170,7 @@ class DirectSession extends Feature {
       connections: Array.from(this.connectionHealth.values()).map((health) => ({
         remote: this._remoteKey(health.connection),
         explicit: this.explicitPeers.has(this._remoteKey(health.connection)),
-        health_capable: this.verifiedPeers.has(this._remoteKey(health.connection)),
+        health_capable: health.proven === true,
         healthy: this._healthIsFresh(health),
         last_ack_age_ms: health.lastAckAt > 0 ? Date.now() - health.lastAckAt : null,
         unhealthy_age_ms: health.unhealthySince > 0
@@ -234,7 +242,6 @@ class DirectSession extends Feature {
         if (probed.has(connection)) {
           const health = this.connectionHealth.get(connection);
           if (this._healthIsFresh(health)) {
-            this.verifiedPeers.add(normalizedRemote);
             attempt.state = 'connected';
             attempt.verified = true;
             attempt.completed_at = Date.now();
@@ -253,7 +260,6 @@ class DirectSession extends Feature {
         );
         try {
           await this._ensureConnectionHealthy(connection, probeMs);
-          this.verifiedPeers.add(normalizedRemote);
           attempt.state = 'connected';
           attempt.verified = true;
           attempt.completed_at = Date.now();
@@ -261,8 +267,8 @@ class DirectSession extends Feature {
         } catch (error) {
           attempt.error = error?.message ?? String(error);
           probed.add(connection);
-          if (this.healthTimeoutMs > 0 && this.verifiedPeers.has(normalizedRemote)) {
-            const health = this.connectionHealth.get(connection);
+          const health = this.connectionHealth.get(connection);
+          if (this.healthTimeoutMs > 0 && health?.proven === true) {
             if (health && health.unhealthySince === 0) health.unhealthySince = Date.now();
             continue;
           }
@@ -456,7 +462,9 @@ class DirectSession extends Feature {
       opened: false,
       lastAckAt: 0,
       unhealthySince: 0,
+      proven: false,
       timer: null,
+      probes: new Map(),
       waiters: new Map(),
     };
     this.connectionHealth.set(connection, health);
@@ -512,7 +520,7 @@ class DirectSession extends Feature {
       health.unhealthySince = 0;
     } else if (
       explicitlyPinned
-      && this.verifiedPeers.has(remote)
+      && health.proven === true
       && this.healthTimeoutMs > 0
     ) {
       const now = Date.now();
@@ -538,22 +546,49 @@ class DirectSession extends Feature {
   }
 
   _nextHealthNonce() {
-    this.healthNonce = (this.healthNonce + 1) % Number.MAX_SAFE_INTEGER;
-    return `${Date.now().toString(36)}-${this.healthNonce.toString(36)}`;
+    return b4a.toString(crypto.randomBytes(16), 'hex');
   }
 
   _sendHealthPing(health, waiter = null) {
     if (!health?.opened || !health.message) return false;
     const nonce = this._nextHealthNonce();
+    const now = Date.now();
+    this._purgeHealthProbes(health, now);
+    health.probes ??= new Map();
+    if (health.probes.size >= MAX_PENDING_HEALTH_PROBES) {
+      let oldestNonce = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [candidate, sentAt] of health.probes) {
+        if (sentAt < oldestAt) {
+          oldestNonce = candidate;
+          oldestAt = sentAt;
+        }
+      }
+      if (oldestNonce !== null) health.probes.delete(oldestNonce);
+    }
+    health.probes.set(nonce, now);
     if (waiter) health.waiters.set(nonce, waiter);
     try {
       health.message.send({ t: 'ping', n: nonce });
       return nonce;
     } catch (error) {
+      health.probes.delete(nonce);
       if (waiter) health.waiters.delete(nonce);
       if (waiter?.timer) clearTimeout(waiter.timer);
       waiter?.reject(error);
       return false;
+    }
+  }
+
+  _purgeHealthProbes(health, now = Date.now()) {
+    const ttlMs = Math.max(
+      this.healthIntervalMs,
+      this.healthFreshMs,
+      this.healthTimeoutMs
+    );
+    const cutoff = now - ttlMs;
+    for (const [nonce, sentAt] of health?.probes ?? []) {
+      if (!Number.isFinite(sentAt) || sentAt < cutoff) health.probes.delete(nonce);
     }
   }
 
@@ -576,10 +611,13 @@ class DirectSession extends Feature {
       return;
     }
     if (frame.t !== 'pong') return;
-    health.lastAckAt = Date.now();
+    const now = Date.now();
+    this._purgeHealthProbes(health, now);
+    if (!health.probes?.has(frame.n)) return;
+    health.probes.delete(frame.n);
+    health.lastAckAt = now;
     health.unhealthySince = 0;
-    const remote = this._remoteKey(health.connection);
-    if (remote) this.verifiedPeers.add(remote);
+    health.proven = true;
     const waiter = health.waiters.get(frame.n);
     if (!waiter) return;
     health.waiters.delete(frame.n);
@@ -642,6 +680,7 @@ class DirectSession extends Feature {
       waiter.reject(error);
     }
     health?.waiters?.clear?.();
+    health?.probes?.clear?.();
   }
 
   _dropHealthConnection(connection) {
@@ -739,7 +778,11 @@ class DirectSession extends Feature {
       closed: false,
     };
     const message = channel.addMessage({
-      encoding: boundedJsonEncoding(this.maxFrameBytes, 'Direct session frame'),
+      encoding: boundedJsonEncoding(
+        this.maxFrameBytes,
+        'Direct session frame',
+        { maxStringBytes: this.maxStringBytes }
+      ),
       onmessage: (frame) => this._handleFrame(record, frame),
     });
     record.message = message;
@@ -817,6 +860,9 @@ class DirectSession extends Feature {
     }
     if (b4a.byteLength(frame.t, 'utf8') > MAX_FRAME_TYPE_BYTES) {
       return fail(`Session frame t exceeds ${MAX_FRAME_TYPE_BYTES} bytes.`);
+    }
+    if (!jsonShapeWithinBounds(frame, undefined, undefined, this.maxStringBytes)) {
+      return fail('Session frame exceeds JSON shape or string bounds.');
     }
     let size = decodedJsonByteLength(frame);
     if (size === null) {

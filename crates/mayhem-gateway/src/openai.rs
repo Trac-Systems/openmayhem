@@ -70,7 +70,7 @@ use base64::{
     },
     Engine as _,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{stream, Stream};
 use image::ImageReader;
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -2091,7 +2091,7 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a GatewayHedgeProbeInvocation,
     ) -> GatewayHedgeProbeFuture<'a> {
         Box::pin(async move {
             Ok(GatewayHedgeProbeResult {
@@ -2528,6 +2528,31 @@ pub struct GatewaySessionInvocation {
     receipt_recorder: GatewayReceiptRecorder,
     receipt_cosign_enabled: bool,
     receipt_user_seed: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayHedgeProbeInvocation {
+    pub session_id: String,
+    pub provider_pubkey: Option<String>,
+    pub transport_peer: Option<String>,
+    pub failover: GatewayFailoverInvocation,
+}
+
+impl GatewayHedgeProbeInvocation {
+    fn provider_pubkey_required(&self) -> Result<&str, GatewaySessionError> {
+        self.provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))
+    }
+
+    fn direct_peer(&self) -> Result<&str, GatewaySessionError> {
+        self.transport_peer.as_deref().ok_or_else(|| {
+            GatewaySessionError::retryable(format!(
+                "provider {} has no fresh signed transport peer heartbeat",
+                self.provider_pubkey.as_deref().unwrap_or("unknown")
+            ))
+        })
+    }
 }
 
 impl GatewaySessionInvocation {
@@ -11411,7 +11436,7 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         &'a self,
         _model: &'a GatewayModel,
         _request: &'a ChatCompletionRequest,
-        invocation: &'a GatewaySessionInvocation,
+        invocation: &'a GatewayHedgeProbeInvocation,
     ) -> GatewayHedgeProbeFuture<'a> {
         Box::pin(async move { self.hedge_probe_over_bridge(invocation).await })
     }
@@ -11489,7 +11514,7 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 impl ScBridgeGatewaySessionBackend {
     async fn hedge_probe_over_bridge(
         &self,
-        invocation: &GatewaySessionInvocation,
+        invocation: &GatewayHedgeProbeInvocation,
     ) -> Result<GatewayHedgeProbeResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
@@ -12736,7 +12761,7 @@ fn verify_direct_session_accept_signature(
         .map_err(|err| GatewaySessionError::new(format!("invalid provider pubkey: {err}")))?;
     let signature = Signature::from_bytes(&signature);
     verifying_key
-        .verify(
+        .verify_strict(
             &session_accept_signing_bytes(frame).map_err(|err| {
                 GatewaySessionError::new(format!("provider accept signing payload failed: {err}"))
             })?,
@@ -12788,7 +12813,7 @@ fn verify_provider_receipt_signature(
     let payload = receipt_signing_bytes(&receipt.body).map_err(|err| {
         GatewaySessionError::new(format!("provider receipt signing payload failed: {err}"))
     })?;
-    if verifying_key.verify(&payload, &signature).is_ok() {
+    if verifying_key.verify_strict(&payload, &signature).is_ok() {
         return Ok(());
     }
     Err(GatewaySessionError::new(
@@ -19976,9 +20001,9 @@ async fn run_hedge_probes_if_requested(
         return Ok(GatewayHedgeProbeOutcome::default());
     };
     let first_invocation =
-        state.prepare_chat_invocation_for_route(model, request, Some(routes[0]), options)?;
+        state.prepare_chat_hedge_probe_invocation(model, request, routes[0], options);
     let second_invocation =
-        state.prepare_chat_invocation_for_route(model, request, Some(routes[1]), options)?;
+        state.prepare_chat_hedge_probe_invocation(model, request, routes[1], options);
     let (first, second) = tokio::join!(
         state
             .session_backend
@@ -24560,6 +24585,31 @@ impl GatewayState {
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
+    }
+
+    fn prepare_chat_hedge_probe_invocation(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+        route: &GatewayRouteCandidate,
+        options: &GatewayRequestOptions,
+    ) -> GatewayHedgeProbeInvocation {
+        let prompt_text = chat_prompt_text(request);
+        let input_tokens = rough_tokens(&prompt_text);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let paid_session_id = session_id_for(&model.id, &prompt_text);
+        let session_id = stable_value_hash(&json!({
+            "domain": "mayhem-hedge-probe-session-v1",
+            "paid_session_id": paid_session_id,
+            "provider": route.provider,
+            "transport_peer": self.transport_peer_for_route(Some(route)),
+        }));
+        GatewayHedgeProbeInvocation {
+            session_id,
+            provider_pubkey: Some(route.provider.clone()),
+            transport_peer: self.transport_peer_for_route(Some(route)),
+            failover,
+        }
     }
 
     fn prepare_embedding_invocation_for_route(
@@ -29963,6 +30013,33 @@ mod tests {
         let mut wrong_sig = frame;
         wrong_sig["sig"] = json!("ee".repeat(64));
         assert_accept_err(&wrong_sig, &invocation, "signature");
+    }
+
+    #[test]
+    fn direct_session_signatures_reject_low_order_forgeries() {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        let weak_key = hex::encode(weak_key);
+        let weak_signature = hex::encode(weak_signature);
+
+        let invocation = test_invocation();
+        let accept = test_accept_frame(&invocation);
+        let accept_err =
+            verify_direct_session_accept_signature(&accept, &weak_key, &weak_signature)
+                .expect_err("low-order accept forgery must fail strict verification");
+        assert!(accept_err.message.contains("signature"));
+
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let mut receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        receipt.enclave_pubkey = weak_key;
+        receipt.enclave_sig = weak_signature;
+        let receipt_err = verify_provider_receipt_signature(&receipt)
+            .expect_err("low-order receipt forgery must fail strict verification");
+        assert!(receipt_err.message.contains("signature"));
     }
 
     #[test]

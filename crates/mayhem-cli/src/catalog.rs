@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use mayhem_gateway::MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS;
 use mayhem_proto::{
     default_model_class, EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType,
@@ -642,7 +642,7 @@ fn verify_signature_bytes(catalog_bytes: &[u8], signature: &CatalogSignature) ->
     let sig_bytes = hex_to_vec(&signature.sig)?;
     let key = VerifyingKey::from_bytes(&public_key_bytes).context("invalid catalog public key")?;
     let sig = Signature::from_slice(&sig_bytes).context("invalid catalog signature bytes")?;
-    key.verify(catalog_bytes, &sig)
+    key.verify_strict(catalog_bytes, &sig)
         .context("catalog signature verification failed")
 }
 
@@ -3657,6 +3657,27 @@ mod tests {
 
         verify_signature_bytes(bytes, &signature).unwrap();
         assert!(verify_signature_bytes(br#"{"schema_version":2}"#, &signature).is_err());
+    }
+
+    #[test]
+    fn signature_verification_rejects_low_order_forgery() {
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0_u8; 64];
+        weak_signature[0] = 1;
+        let bytes = br#"{"schema_version":1}"#;
+        let signature = CatalogSignature {
+            schema_version: 1,
+            alg: "ed25519".to_owned(),
+            signed_path: "catalog/models.json".to_owned(),
+            key_id: "test".to_owned(),
+            public_key: hex_string(&weak_key),
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            sig: hex_string(&weak_signature),
+        };
+
+        verify_signature_bytes(bytes, &signature)
+            .expect_err("low-order catalog signature forgery must fail strict verification");
     }
 
     #[test]

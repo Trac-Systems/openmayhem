@@ -50,6 +50,7 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
 
   assert.equal(stats.protocol, 'mx/s');
   assert.equal(stats.maxFrameBytes, 256 * 1024);
+  assert.equal(stats.maxStringBytes, 256 * 1024);
   assert.equal(stats.rateBytesPerSecond, 1_000_000);
   assert.equal(stats.rateBurstBytes, 1_000_000);
   assert.equal(stats.receiveRateBurstBytes, 1_000_000 + (256 * 1024));
@@ -95,6 +96,7 @@ test('DirectSession reports a relay route without changing frame semantics', () 
 test('DirectSession accepts explicit mx/s limiter config and ignores unsafe values', () => {
   const configured = new DirectSession({}, {
     maxFrameBytes: 4096,
+    maxStringBytes: 2048,
     rateBytesPerSecond: 2_000_000,
     rateBurstBytes: 3_000_000,
     sendDrainTimeoutMs: 12_000,
@@ -104,6 +106,7 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
 
   assert.equal(configured.maxFrameBytes, 4096);
   assert.equal(configured.stats().maxFrameBytes, 4096);
+  assert.equal(configured.stats().maxStringBytes, 2048);
   assert.equal(configured.stats().rateBytesPerSecond, 2_000_000);
   assert.equal(configured.stats().rateBurstBytes, 3_000_000);
   assert.equal(configured.stats().receiveRateBurstBytes, 3_004_096);
@@ -345,6 +348,63 @@ test('bounded JSON rejects excessive nesting without a recursive second size pas
   assert.equal(decodedJsonByteLength(decoded), b4a.byteLength(text, 'utf8'));
 });
 
+test('bounded JSON rejects an individually oversized string before dispatch', () => {
+  const text = JSON.stringify({ t: 's.delta', d: 'é'.repeat(17) });
+  const buffer = c.encode(c.utf8, text);
+  const state = { buffer, start: 0, end: buffer.length };
+  const decoded = boundedJsonEncoding(
+    buffer.length,
+    'string-bounded frame',
+    { maxStringBytes: 32 }
+  ).decode(state);
+
+  assert.equal(decodedJsonWasRejected(decoded), true);
+  assert.equal(decodedJsonByteLength(decoded), b4a.byteLength(text, 'utf8'));
+
+  const directSession = new DirectSession({}, {
+    maxFrameBytes: 1024,
+    maxStringBytes: 32,
+  });
+  assert.throws(
+    () => directSession._validateFrame({ t: 's.delta', d: 'é'.repeat(17) }),
+    /string bounds/
+  );
+});
+
+test('DirectSession dispatches identical authenticated transport frames on direct and relayed routes', () => {
+  const directConnection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const relayConnection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const frames = [];
+  const directSession = new DirectSession({}, {
+    transportInfo: (connection) => ({
+      relayed: connection === relayConnection,
+      relay: connection === relayConnection ? localPeer : null,
+    }),
+    onFrame: (event) => frames.push(event),
+  });
+  const makeSession = (connection, id) => ({
+    sessionId: id,
+    remote,
+    connection,
+    receiveLimiter: directSession._newReceiveLimiter(),
+    channel: { closed: false, destroyed: false },
+    closed: false,
+  });
+  const frame = { t: 's.delta', i: 0, d: 'same frame', fin: 'stop' };
+
+  directSession._handleFrame(makeSession(directConnection, sessionId), frame);
+  directSession._handleFrame(makeSession(relayConnection, 'ef'.repeat(32)), frame);
+
+  assert.equal(frames.length, 2);
+  assert.deepEqual(frames[0].frame, frame);
+  assert.deepEqual(frames[1].frame, frame);
+  assert.equal(frames[0].direct, true);
+  assert.equal(frames[0].relayed, false);
+  assert.equal(frames[1].direct, false);
+  assert.equal(frames[1].relayed, true);
+  assert.equal(frames[1].relay, localPeer);
+});
+
 test('DirectSession bounds inbound sessions per connection and globally', () => {
   const connection = { remotePublicKey: b4a.from(remote, 'hex') };
   const directSession = new DirectSession({}, {
@@ -570,26 +630,52 @@ test('DirectSession health frames prove both transport directions', async () => 
   const sent = [];
   const directSession = new DirectSession({}, {});
   const health = {
+    connection: { remotePublicKey: b4a.from(remote, 'hex') },
+    opened: true,
     message: { send: (frame) => sent.push(frame) },
+    probes: new Map(),
     waiters: new Map(),
     lastAckAt: 0,
+    proven: false,
   };
 
   directSession._handleHealthFrame(health, { t: 'ping', n: 'probe-one' });
   assert.deepEqual(sent, [{ t: 'pong', n: 'probe-one' }]);
 
   let resolved = false;
-  health.waiters.set('probe-two', {
+  const nonce = directSession._sendHealthPing(health, {
     resolve: () => { resolved = true; },
     reject: () => {},
     timer: null,
   });
-  directSession._handleHealthFrame(health, { t: 'pong', n: 'probe-two' });
+  directSession._handleHealthFrame(health, { t: 'pong', n: nonce });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   assert.equal(resolved, true);
   assert.equal(health.waiters.size, 0);
+  assert.equal(health.proven, true);
   assert.equal(directSession._healthIsFresh(health), true);
+});
+
+test('DirectSession ignores an unsolicited pong before health promotion', () => {
+  const directSession = new DirectSession({}, {});
+  const health = {
+    connection: { remotePublicKey: b4a.from(remote, 'hex') },
+    opened: true,
+    message: { send: () => true },
+    probes: new Map(),
+    waiters: new Map(),
+    lastAckAt: 0,
+    unhealthySince: 42,
+    proven: false,
+  };
+
+  directSession._handleHealthFrame(health, { t: 'pong', n: 'forged-by-peer' });
+
+  assert.equal(health.lastAckAt, 0);
+  assert.equal(health.unhealthySince, 42);
+  assert.equal(health.proven, false);
+  assert.equal(directSession.stats().connections.length, 0);
 });
 
 test('DirectSession completes a real bidirectional Protomux health probe', async () => {
@@ -685,9 +771,9 @@ test('DirectSession accepts a late health acknowledgement from a previously veri
     opened: true,
     lastAckAt: 0,
     unhealthySince: 0,
+    proven: true,
   };
   directSession.connectionHealth.set(connection, health);
-  directSession.verifiedPeers.add(remote);
   directSession._prepareConnection = () => {};
   directSession._ensureConnectionHealthy = async () => {
     setTimeout(() => {
@@ -701,7 +787,7 @@ test('DirectSession accepts a late health acknowledgement from a previously veri
   assert.equal(connected.connected, true);
   assert.equal(directSession.lastConnectAttempt.state, 'connected');
   assert.equal(directSession.lastConnectAttempt.verified, true);
-  assert.equal(directSession.verifiedPeers.has(remote), true);
+  assert.equal(health.proven, true);
 });
 
 test('DirectSession retires a verified dead connection despite stale active session state', () => {
@@ -718,11 +804,12 @@ test('DirectSession retires a verified dead connection despite stale active sess
     opened: false,
     lastAckAt: 0,
     unhealthySince: Date.now() - 11,
+    proven: true,
     timer: null,
+    probes: new Map(),
     waiters: new Map(),
   };
   directSession.explicitPeers.add(remote);
-  directSession.verifiedPeers.add(remote);
   directSession.connectionHealth.set(connection, health);
 
   directSession.sessions.set(`${remote}:${sessionId}`, {
@@ -752,7 +839,9 @@ test('DirectSession does not retire an explicit legacy connection without proven
     opened: false,
     lastAckAt: 0,
     unhealthySince: Date.now() - 100,
+    proven: false,
     timer: null,
+    probes: new Map(),
     waiters: new Map(),
   };
   directSession.explicitPeers.add(remote);
