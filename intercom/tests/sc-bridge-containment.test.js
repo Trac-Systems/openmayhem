@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { dispatchContainedClientRequest } from '../features/sc-bridge/containment.js';
 import {
@@ -15,6 +18,32 @@ import {
   sessionFrameRecipients,
   sessionSubscriptionMatches,
 } from '../features/sc-bridge/session-ownership.js';
+import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
+
+test('SC-Bridge reads a private token file when Pear does not expose child environment', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-sc-bridge-token-'));
+  const tokenFile = path.join(root, 'token');
+  fs.writeFileSync(tokenFile, 'file-secret\n', { mode: 0o600 });
+  try {
+    assert.equal(
+      resolveScBridgeToken(
+        { 'sc-bridge-token-file': tokenFile },
+        { SC_BRIDGE_TOKEN: 'environment-secret' }
+      ),
+      'file-secret'
+    );
+    assert.throws(
+      () =>
+        resolveScBridgeToken({
+          'sc-bridge-token': 'argument-secret',
+          'sc-bridge-token-file': tokenFile,
+        }),
+      /either --sc-bridge-token or --sc-bridge-token-file/
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('failed async client request is contained and the bridge serves the next request', async () => {
   const events = [];
