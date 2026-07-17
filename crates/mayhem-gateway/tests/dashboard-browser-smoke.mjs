@@ -399,6 +399,7 @@ try {
   const selectedRatio = await page.locator('[data-playground-aspect-ratio][aria-pressed="true"]').getAttribute('data-playground-aspect-ratio');
   const expectedImageSize = imageSizes[selectedRatio];
   check(Boolean(expectedImageSize), 'Playground image dimensions', 'selects dimensions published by the signed model contract');
+  equal(expectedImageSize, '1024x1024', 'Playground image dimensions', 'uses the landing Playground proven square preset');
   check(expectedImageSize !== '512x512', 'Playground image dimensions', 'does not reuse the rejected 512 by 512 hardcoded size');
   equal(
     await page.locator('[data-playground-image-size]').innerText(),

@@ -2026,10 +2026,13 @@ fn playground_mode_icon(mode: &str) -> &'static str {
 }
 
 const PLAYGROUND_IMAGE_RATIOS: [(&str, u32, u32, u32); 4] = [
-    ("1:1", 1, 1, 512),
-    ("4:3", 4, 3, 160),
-    ("3:4", 3, 4, 160),
-    ("16:9", 16, 9, 48),
+    ("1:1", 1, 1, 1_024),
+    ("4:3", 4, 3, 288),
+    ("3:4", 3, 4, 288),
+    // Z-Image's proven wide preset is 1344x768, exposed as 16:9 in the
+    // product UI. Preserve that provider-tested shape rather than inventing
+    // an uncalibrated exact-ratio replacement.
+    ("16:9", 7, 4, 192),
 ];
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2071,11 +2074,17 @@ fn playground_image_request_config(model: &GatewayModel) -> Option<PlaygroundIma
     let mut sizes = BTreeMap::new();
 
     for (label, ratio_width, ratio_height, preferred_scale) in PLAYGROUND_IMAGE_RATIOS {
-        let minimum_scale = preferred_scale
-            .max(minimum_width.div_ceil(ratio_width))
+        let minimum_scale = minimum_width
+            .div_ceil(ratio_width)
             .max(minimum_height.div_ceil(ratio_height));
         let maximum_scale = (maximum_width / ratio_width).min(maximum_height / ratio_height);
-        for scale in minimum_scale..=maximum_scale {
+        if minimum_scale > maximum_scale {
+            continue;
+        }
+        let preferred_scale = preferred_scale.clamp(minimum_scale, maximum_scale);
+        let mut candidate_scales = (minimum_scale..=maximum_scale).collect::<Vec<_>>();
+        candidate_scales.sort_by_key(|scale| scale.abs_diff(preferred_scale));
+        for scale in candidate_scales {
             let width = ratio_width.saturating_mul(scale);
             let height = ratio_height.saturating_mul(scale);
             if !signed_dimension_allows(width_spec, width)
@@ -6726,16 +6735,16 @@ mod tests {
 
         let config = playground_image_request_config(&model).expect("image request config");
         assert_eq!(config.dimension_mode, "size");
-        assert_eq!(config.sizes["1:1"], "576x576");
-        assert_eq!(config.sizes["4:3"], "768x576");
-        assert_eq!(config.sizes["3:4"], "576x768");
-        assert_eq!(config.sizes["16:9"], "1024x576");
+        assert_eq!(config.sizes["1:1"], "1024x1024");
+        assert_eq!(config.sizes["4:3"], "1152x864");
+        assert_eq!(config.sizes["3:4"], "864x1152");
+        assert_eq!(config.sizes["16:9"], "1344x768");
         assert!(!config.sizes.values().any(|size| size == "512x512"));
 
         let data = DashboardData::from_state(&GatewayState::from_models(vec![model.clone()]));
         let html = playground_page(&data, 60, Some(&model.id));
         assert!(html.contains(r#"data-image-dimension-mode="size""#));
-        assert!(html.contains(r#"&quot;1:1&quot;:&quot;576x576&quot;"#));
+        assert!(html.contains(r#"&quot;1:1&quot;:&quot;1024x1024&quot;"#));
         assert!(html.contains("data-playground-image-size"));
 
         contract.request_attributes.retain(|path| path != "size");
@@ -6744,7 +6753,7 @@ mod tests {
         let dimensions =
             playground_image_request_config(&model).expect("width-height image request config");
         assert_eq!(dimensions.dimension_mode, "width-height");
-        assert_eq!(dimensions.sizes["1:1"], "576x576");
+        assert_eq!(dimensions.sizes["1:1"], "1024x1024");
     }
 
     #[test]
