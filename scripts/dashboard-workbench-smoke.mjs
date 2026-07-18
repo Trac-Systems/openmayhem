@@ -92,7 +92,12 @@ const PRODUCT_ROUTES = [
     pageLabel: 'Billing',
     heading: 'Billing',
     primaryPath: '/mayhem/dashboard/wallet',
-    markers: ['id="wallet-backup-command"'],
+    markers: [
+      'id="wallet-funding-command-fiat"',
+      'id="wallet-funding-command-tap"',
+      'id="wallet-funding-command-tnk"',
+      'Stripe is recommended',
+    ],
   },
   {
     id: 'connect',
@@ -243,6 +248,7 @@ const PRODUCT_ROUTES = [
       'data-preference="motion"',
       'data-preference="density"',
       'data-clear-preferences',
+      'id="wallet-backup-command"',
     ],
   },
 ];
@@ -737,7 +743,11 @@ function checkHtmlResponse(report, response, scope) {
   report.includes(response.text, 'name="viewport"', scope, 'declares a responsive viewport');
   report.includes(response.text, '</html>', scope, 'closes the HTML document');
   report.check(!response.text.includes('\uFFFD'), scope, 'contains no UTF-8 replacement characters');
-  report.check(!response.text.includes('https://'), scope, 'loads no HTTPS/external resources');
+  report.check(
+    !/\b(?:src|srcset|action|poster)=["']https:\/\//i.test(response.text),
+    scope,
+    'loads no HTTPS/external resources',
+  );
   report.check(
     containsOnlyLoopbackHttpUrls(response.text),
     scope,
@@ -874,7 +884,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
     if (route.id === 'wallet') {
       report.includes(
         html,
-        'Ledger balance</span><span class="metric-state">FIAT</span></div><div class="metric-status"><span class="status-badge warn">Unavailable</span></div>',
+        'id="wallet-balance-title">Unavailable</strong>',
         scope,
         'marks the unavailable ledger balance explicitly without fabricating a balance',
       );
@@ -1056,6 +1066,16 @@ async function exerciseWorkbench(baseUrl, options) {
   report.equal(qwenLogo.status, 200, 'Qwen logo asset', 'returns HTTP 200');
   report.equal(headerValue(qwenLogo.headers, 'content-type'), 'image/svg+xml', 'Qwen logo asset', 'uses SVG content type');
   report.includes(qwenLogo.text, '<svg', 'Qwen logo asset', 'serves the materialized Qwen vector file');
+
+  for (const [name, contentType] of [
+    ['ethereum.svg', 'image/svg+xml'],
+    ['tnk-white.avif', 'image/avif'],
+  ]) {
+    const paymentLogo = await get(baseUrl, `/mayhem/dashboard/assets/brand/${name}`, requestOptions);
+    report.equal(paymentLogo.status, 200, `${name} asset`, 'returns HTTP 200');
+    report.equal(headerValue(paymentLogo.headers, 'content-type'), contentType, `${name} asset`, 'uses the expected content type');
+    report.check(paymentLogo.body.length > 100, `${name} asset`, 'contains the payment method mark', `received ${paymentLogo.body.length} bytes`);
+  }
 
   const appCss = await get(baseUrl, '/mayhem/dashboard/assets/app.css', requestOptions);
   report.equal(appCss.status, 200, 'app stylesheet', 'returns HTTP 200');

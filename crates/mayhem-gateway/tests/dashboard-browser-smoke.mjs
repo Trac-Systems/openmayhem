@@ -511,11 +511,47 @@ try {
   await page.unroute('**/v1/chat/completions');
 
   await open('/mayhem/dashboard/wallet');
+  equal(await page.locator('#add-funds').getAttribute('open'), null, 'billing funding', 'keeps optional funding compact when credit is already available');
+  check((await page.locator('#add-funds > summary').innerText()).includes('Card, TAP, or TNK'), 'billing funding', 'makes every supported payment method discoverable while collapsed');
+  await page.locator('#add-funds > summary').click();
+  equal(await page.locator('[data-wallet-funding-method]').count(), 3, 'billing funding', 'offers Stripe, TAP, and TNK without hiding non-active rails');
+  const fundingLogos = await page.locator('.wallet-method-icon').evaluateAll((icons) => ({
+    count: icons.filter((icon) => icon.querySelector('img, svg')).length,
+    unloaded: icons.flatMap((icon) => [...icon.querySelectorAll('img')]).filter((logo) => !logo.complete || logo.naturalWidth === 0).map((logo) => logo.getAttribute('src')),
+  }));
+  equal(fundingLogos.count, 3, 'billing funding', 'uses a clear icon for every funding method');
+  equal(fundingLogos.unloaded.length, 0, 'billing funding', 'loads every branded funding method logo');
+  check(await page.locator('[data-wallet-funding-method][value="fiat"]').isChecked(), 'billing funding', 'selects the gateway spending rail by default');
+  check((await page.locator('[data-wallet-method="fiat"]').innerText()).includes('Recommended'), 'billing funding', 'recommends card and Stripe for most users');
+  await page.locator('[data-wallet-funding-method][value="tap"]').check();
+  const tapOnboarding = page.locator('[data-wallet-funding-panel="tap"] .wallet-onboarding-hint a');
+  check(await tapOnboarding.isVisible(), 'billing funding onboarding', 'shows TAP acquisition help only in the selected workflow');
+  equal(await tapOnboarding.getAttribute('href'), 'https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454', 'billing funding onboarding', 'links directly to the specified TAP token on Uniswap');
+  equal(await tapOnboarding.getAttribute('target'), '_blank', 'billing funding onboarding', 'keeps the Billing workflow open while visiting Uniswap');
+  await page.locator('[data-wallet-funding-method][value="tnk"]').check();
+  const tnkOnboarding = page.locator('[data-wallet-funding-panel="tnk"] .wallet-onboarding-hint a');
+  check(await tnkOnboarding.isVisible(), 'billing funding onboarding', 'shows TNK wallet help only in the selected workflow');
+  equal(await tnkOnboarding.getAttribute('href'), 'https://www.tracsystems.io/tap-wallet', 'billing funding onboarding', 'links TNK users to Trac Systems TAP Wallet');
+  await page.locator('[data-wallet-funding-method][value="tap"]').check();
+  await page.locator('#wallet-tap-amount').fill('12.5');
+  equal(await page.locator('#wallet-funding-command-tap').innerText(), 'mayhem pay tap --amount-tap 12.5', 'billing funding', 'builds the selected method command from the chosen amount');
+  equal(await page.locator('#wallet-deposit-status-command').innerText(), 'mayhem deposit status --rail tap', 'billing funding', 'keeps confirmation on the selected deposit rail');
+  check((await page.locator('[data-wallet-funding-panel="tap"] .wallet-rail-warning').innerText()).includes('currently spends'), 'billing funding', 'warns before funding a balance the gateway does not currently spend');
+  equal(await page.locator('[data-wallet-funding-panel="tap"] .wallet-switch-disclosure').getAttribute('open'), null, 'billing funding', 'keeps optional rail-switch commands collapsed');
+  equal(await page.locator('[data-wallet-funding-panel].is-active').count(), 1, 'billing funding', 'shows one focused funding workflow at a time');
+  await page.locator('[data-wallet-funding-panel="tap"] [data-wallet-copy-command]').click();
+  equal(await page.evaluate(() => navigator.clipboard.readText()), 'mayhem pay tap --amount-tap 12.5', 'billing funding', 'copies the complete method-specific command');
+  await page.locator('#wallet-tap-amount').fill('0');
+  check(await page.locator('[data-wallet-funding-panel="tap"] [data-wallet-copy-command]').isDisabled(), 'billing funding', 'blocks an invalid zero-value command');
+  await page.locator('#wallet-tap-amount').fill('12.5');
+  equal(await page.locator('[data-wallet-funding-panel="tap"] [data-wallet-copy-command]').isEnabled(), true, 'billing funding', 'reenables the command after correction');
+  equal(await page.locator('.wallet-confirmation-row').count(), 1, 'billing funding', 'keeps deposit confirmation in one compact final step');
   await page.getByRole('button', { name: 'Hide amounts' }).click();
   check(await page.locator('html').evaluate((html) => html.classList.contains('amounts-hidden')), 'financial privacy', 'enables amount hiding');
   check(await page.locator('.money-value').evaluateAll((values) => values.every((value) => value.textContent === '\u2022\u2022\u2022\u2022')), 'financial privacy', 'masks every visible monetary value');
 
   await open('/mayhem/dashboard/settings');
+  check(await page.locator('#wallet-security').isVisible(), 'wallet security', 'keeps host-only recovery guidance available from Settings');
   await page.locator('[data-preference="motion"]').click();
   check(await page.locator('html').evaluate((html) => html.classList.contains('motion-reduced')), 'reduced motion', 'enables the saved reduced-motion mode');
   equal(await page.locator('.app-sidebar').evaluate((element) => getComputedStyle(element).transitionDuration), '0s', 'reduced motion', 'removes navigation transitions');
