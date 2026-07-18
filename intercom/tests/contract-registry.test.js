@@ -1362,6 +1362,39 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.equal(diffusionImage.ok, true, diffusionImage.message);
   assert.deepEqual((await storage.get(`enclave/${'d'.repeat(64)}`)).value.caps, diffusionImageCaps);
 
+  const transformersAsrCaps = {
+    chat: false,
+    tools: false,
+    json: false,
+    vision: false,
+    image: false,
+    video: false,
+    audio: true,
+    ctx: 1,
+    ctx_max: 1,
+    output_modality: 'text',
+    output_modalities: ['text'],
+    modality_set: ['audio', 'text'],
+    speciality_levels: {},
+  };
+  const transformersAsr = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '6'.repeat(64),
+      model_id: 'admin/parakeet',
+      model_class: 'stt',
+      backend: 'transformers-asr',
+      caps: transformersAsrCaps,
+    },
+    admin.publicKey,
+    57
+  );
+  assert.equal(transformersAsr.ok, true, transformersAsr.message);
+  assert.deepEqual((await storage.get(`enclave/${'6'.repeat(64)}`)).value.caps, transformersAsrCaps);
+
   const invalidOutputModality = await execute(
     contract,
     storage,
