@@ -3036,7 +3036,7 @@ fn wallet_switch_warning(guide: &WalletFundingGuide, active_rail: &str) -> Strin
 fn wallet_onboarding_hint(rail: &str) -> &'static str {
     match rail {
         "tap" => {
-            r#"<p class="wallet-onboarding-hint"><span>Need TAP?</span><a href="https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454" target="_blank" rel="noopener noreferrer" data-product-event="billing_tap_uniswap_opened" aria-label="Buy TAP on Uniswap in a new tab">Buy TAP on Uniswap <span aria-hidden="true">↗</span></a><small>Verify the token and Ethereum network before swapping.</small></p>"#
+            r#"<p class="wallet-onboarding-hint"><span>Need TAP?</span><a href="https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454" target="_blank" rel="noopener noreferrer" data-product-event="billing_tap_uniswap_opened" aria-label="Buy TAP on Uniswap in a new tab">Buy TAP on Uniswap <span aria-hidden="true">↗</span></a><small>Verify the token and Ethereum network. Send a small amount of ETH to the same wallet first for TAP approval and network gas.</small></p>"#
         }
         "tnk" => {
             r#"<p class="wallet-onboarding-hint"><span>Need a TNK wallet?</span><a href="https://www.tracsystems.io/tap-wallet" target="_blank" rel="noopener noreferrer" data-product-event="billing_tnk_wallet_opened" aria-label="Get TAP Wallet from Trac Systems in a new tab">Get TAP Wallet <span aria-hidden="true">↗</span></a><small>Trac Systems' wallet supports TNK on Trac Network.</small></p>"#
@@ -6776,6 +6776,9 @@ mod tests {
         assert!(wallet.contains("/assets/brand/ethereum.svg"));
         assert!(wallet.contains("/assets/brand/tnk-white.avif"));
         assert!(wallet.contains("https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454"));
+        assert!(wallet.contains(
+            "Send a small amount of ETH to the same wallet first for TAP approval and network gas."
+        ));
         assert!(wallet.contains("https://www.tracsystems.io/tap-wallet"));
         assert!(wallet.contains(r#"target="_blank" rel="noopener noreferrer""#));
         assert!(wallet.contains(r#"id="wallet-funding-command-fiat""#));

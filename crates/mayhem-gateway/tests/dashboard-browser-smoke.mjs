@@ -528,6 +528,7 @@ try {
   check(await tapOnboarding.isVisible(), 'billing funding onboarding', 'shows TAP acquisition help only in the selected workflow');
   equal(await tapOnboarding.getAttribute('href'), 'https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454', 'billing funding onboarding', 'links directly to the specified TAP token on Uniswap');
   equal(await tapOnboarding.getAttribute('target'), '_blank', 'billing funding onboarding', 'keeps the Billing workflow open while visiting Uniswap');
+  check((await page.locator('[data-wallet-funding-panel="tap"] .wallet-onboarding-hint small').innerText()).includes('small amount of ETH'), 'billing funding onboarding', 'explains that TAP approval and Ethereum gas require ETH in the same wallet');
   await page.locator('[data-wallet-funding-method][value="tnk"]').check();
   const tnkOnboarding = page.locator('[data-wallet-funding-panel="tnk"] .wallet-onboarding-hint a');
   check(await tnkOnboarding.isVisible(), 'billing funding onboarding', 'shows TNK wallet help only in the selected workflow');
