@@ -55152,7 +55152,7 @@ fn provider_canary_self_test_body(
                 .context("STT modality canary audio_b64 is invalid")?;
             let audio_seconds = audio_duration_seconds_ceil(&audio)
                 .context("STT modality canary is not a valid bounded WAV or FLAC")?;
-            Ok(json!({
+            let mut body = json!({
                 "kind": "audio_transcription",
                 "audio": {
                     "encoding": "base64",
@@ -55164,15 +55164,23 @@ fn provider_canary_self_test_body(
                     }),
                 },
                 "audio_seconds": audio_seconds,
-                "language": prompt.language,
-            }))
+            });
+            if let Some(language) = &prompt.language {
+                body["language"] = json!(language);
+            }
+            Ok(body)
         }
-        "tts" => Ok(json!({
-            "kind": "audio_speech",
-            "input": canary_prompt_text(prompt)?,
-            "voice": prompt.voice,
-            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
-        })),
+        "tts" => {
+            let mut body = json!({
+                "kind": "audio_speech",
+                "input": canary_prompt_text(prompt)?,
+                "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
+            });
+            if let Some(voice) = &prompt.voice {
+                body["voice"] = json!(voice);
+            }
+            Ok(body)
+        }
         "audio-generation" => Ok(json!({
             "kind": "audio_generation",
             "prompt": canary_prompt_text(prompt)?,
@@ -70681,6 +70689,38 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(explicit["steps"], 9);
         assert_eq!(explicit["cfg_scale"], 0.0);
         assert_eq!(explicit["seed"], 11);
+    }
+
+    #[test]
+    fn parakeet_provider_canaries_omit_absent_language_and_match_signed_endpoints() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "nvidia/parakeet-tdt-0.6b-v3")
+            .expect("live Parakeet model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        for prompt in prompts {
+            assert!(
+                prompt.language.is_none(),
+                "{} unexpectedly pins a language",
+                prompt.id
+            );
+            let body = provider_canary_self_test_body(model, &prompt)
+                .unwrap_or_else(|error| panic!("{} body: {error:#}", prompt.id));
+            assert!(
+                body.get("language").is_none(),
+                "{} serialized an absent optional language",
+                prompt.id
+            );
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                .unwrap_or_else(|error| panic!("{} seal: {error:#}", prompt.id));
+        }
     }
 
     #[test]
