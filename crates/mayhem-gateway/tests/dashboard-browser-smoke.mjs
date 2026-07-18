@@ -392,6 +392,30 @@ try {
   await page.keyboard.press('Escape');
   equal(await playgroundModelTrigger.getAttribute('aria-expanded'), 'false', 'Playground model picker', 'closes with Escape');
   check(await playgroundModelTrigger.evaluate((trigger) => trigger === document.activeElement), 'Playground model picker', 'returns focus to its trigger');
+
+  await page.getByRole('tab', { name: 'Image', exact: true }).click();
+  const imageOption = playgroundModel.locator('option:checked');
+  const imageSizes = JSON.parse((await imageOption.getAttribute('data-image-sizes')) || '{}');
+  const selectedRatio = await page.locator('[data-playground-aspect-ratio][aria-pressed="true"]').getAttribute('data-playground-aspect-ratio');
+  const expectedImageSize = imageSizes[selectedRatio];
+  check(Boolean(expectedImageSize), 'Playground image dimensions', 'selects dimensions published by the signed model contract');
+  equal(expectedImageSize, '1024x1024', 'Playground image dimensions', 'uses the landing Playground proven square preset');
+  check(expectedImageSize !== '512x512', 'Playground image dimensions', 'does not reuse the rejected 512 by 512 hardcoded size');
+  equal(
+    await page.locator('[data-playground-image-size]').innerText(),
+    expectedImageSize.replace('x', '\u00d7'),
+    'Playground image dimensions',
+    'shows the exact dimensions that will be requested',
+  );
+  await page.locator('[data-playground-image-prompt]').fill('A signed-dimension compatibility check.');
+  const imageRequestPromise = page.waitForRequest((request) => request.url().endsWith('/v1/images/generations') && request.method() === 'POST');
+  await page.locator('[data-playground-generate-image]').click();
+  const imageRequest = await imageRequestPromise;
+  const imageRequestBody = imageRequest.postDataJSON();
+  equal(imageRequestBody.size, expectedImageSize, 'Playground image dimensions', 'submits the selected model-compatible size');
+  await page.locator('.pg-generated-image').waitFor();
+  await page.getByRole('tab', { name: 'Text', exact: true }).click();
+
   await page.locator('.pg-advanced > summary').click();
   check(await rateOption.count() > 0, 'Playground price controls', 'offers a rate-priced fixture model');
   check(await fixedOption.count() > 0, 'Playground price controls', 'offers a fixed-only fixture model');

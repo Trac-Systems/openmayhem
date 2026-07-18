@@ -2025,6 +2025,143 @@ fn playground_mode_icon(mode: &str) -> &'static str {
     }
 }
 
+const PLAYGROUND_IMAGE_RATIOS: [(&str, u32, u32, u32); 4] = [
+    ("1:1", 1, 1, 1_024),
+    ("4:3", 4, 3, 288),
+    ("3:4", 3, 4, 288),
+    // Z-Image's proven wide preset is 1344x768, exposed as 16:9 in the
+    // product UI. Preserve that provider-tested shape rather than inventing
+    // an uncalibrated exact-ratio replacement.
+    ("16:9", 7, 4, 192),
+];
+
+#[derive(Debug, Eq, PartialEq)]
+struct PlaygroundImageRequestConfig {
+    dimension_mode: &'static str,
+    sizes: BTreeMap<&'static str, String>,
+}
+
+fn playground_image_request_config(model: &GatewayModel) -> Option<PlaygroundImageRequestConfig> {
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)?;
+    let supports_size = contract
+        .request_attributes
+        .iter()
+        .any(|path| path == "size");
+    let supports_dimensions = ["width", "height"].iter().all(|required| {
+        contract
+            .request_attributes
+            .iter()
+            .any(|path| path == required)
+    });
+    let dimension_mode = if supports_size {
+        "size"
+    } else if supports_dimensions {
+        "width-height"
+    } else {
+        return None;
+    };
+    let width_spec = contract.request_attribute_specs.get("width");
+    let height_spec = contract.request_attribute_specs.get("height");
+    let minimum_width = signed_dimension_minimum(width_spec);
+    let minimum_height = signed_dimension_minimum(height_spec);
+    let maximum_width = signed_dimension_maximum(width_spec, model.mayhem.caps.max_image_width);
+    let maximum_height = signed_dimension_maximum(height_spec, model.mayhem.caps.max_image_height);
+    let mut sizes = BTreeMap::new();
+
+    for (label, ratio_width, ratio_height, preferred_scale) in PLAYGROUND_IMAGE_RATIOS {
+        let minimum_scale = minimum_width
+            .div_ceil(ratio_width)
+            .max(minimum_height.div_ceil(ratio_height));
+        let maximum_scale = (maximum_width / ratio_width).min(maximum_height / ratio_height);
+        if minimum_scale > maximum_scale {
+            continue;
+        }
+        let preferred_scale = preferred_scale.clamp(minimum_scale, maximum_scale);
+        let mut candidate_scales = (minimum_scale..=maximum_scale).collect::<Vec<_>>();
+        candidate_scales.sort_by_key(|scale| scale.abs_diff(preferred_scale));
+        for scale in candidate_scales {
+            let width = ratio_width.saturating_mul(scale);
+            let height = ratio_height.saturating_mul(scale);
+            if !signed_dimension_allows(width_spec, width)
+                || !signed_dimension_allows(height_spec, height)
+            {
+                continue;
+            }
+            let request = if dimension_mode == "size" {
+                json!({
+                    "model": model.id,
+                    "prompt": "Playground image dimension compatibility check",
+                    "size": format!("{width}x{height}"),
+                })
+            } else {
+                json!({
+                    "model": model.id,
+                    "prompt": "Playground image dimension compatibility check",
+                    "width": width,
+                    "height": height,
+                })
+            };
+            if mayhem_proto::validate_endpoint_request(contract, &request).is_ok() {
+                sizes.insert(label, format!("{width}x{height}"));
+                break;
+            }
+        }
+    }
+
+    Some(PlaygroundImageRequestConfig {
+        dimension_mode,
+        sizes,
+    })
+}
+
+fn signed_dimension_minimum(spec: Option<&mayhem_proto::EndpointAttributeSpec>) -> u32 {
+    spec.and_then(|spec| spec.minimum)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.ceil().min(f64::from(u32::MAX)) as u32)
+        .unwrap_or(1)
+}
+
+fn signed_dimension_maximum(
+    spec: Option<&mayhem_proto::EndpointAttributeSpec>,
+    caps_maximum: Option<u32>,
+) -> u32 {
+    let signed_maximum = spec
+        .and_then(|spec| spec.maximum)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.floor().min(f64::from(u32::MAX)) as u32)
+        .unwrap_or(4_096);
+    caps_maximum.map_or(signed_maximum, |value| value.min(signed_maximum))
+}
+
+fn signed_dimension_allows(spec: Option<&mayhem_proto::EndpointAttributeSpec>, value: u32) -> bool {
+    let Some(spec) = spec else {
+        return true;
+    };
+    let value = f64::from(value);
+    if spec.minimum.is_some_and(|minimum| value < minimum)
+        || spec.maximum.is_some_and(|maximum| value > maximum)
+    {
+        return false;
+    }
+    if spec.multiple_of.is_some_and(|multiple| {
+        !multiple.is_finite()
+            || multiple <= 0.0
+            || (value / multiple - (value / multiple).round()).abs() > f64::EPSILON * 16.0
+    }) {
+        return false;
+    }
+    spec.enum_values.is_empty()
+        || spec
+            .enum_values
+            .iter()
+            .any(|candidate| candidate.as_u64() == Some(value as u64))
+}
+
 fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&str>) -> String {
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
     let mut choices = data
@@ -2095,8 +2232,18 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
             "speech" => "Natural text to speech",
             _ => "Chat and text generation",
         };
+        let image_attributes =
+            playground_image_request_config(model).map_or_else(String::new, |config| {
+                let sizes =
+                    serde_json::to_string(&config.sizes).unwrap_or_else(|_| "{}".to_owned());
+                format!(
+                    r#" data-image-dimension-mode="{}" data-image-sizes="{}""#,
+                    config.dimension_mode,
+                    html_escape(&sizes),
+                )
+            });
         options.push_str(&format!(
-            r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}"{selected}>{} &mdash; {}</option>"##,
+            r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}"{image_attributes}{selected}>{} &mdash; {}</option>"##,
             html_escape(&model.id),
             html_escape(availability.label),
             html_escape(&dashboard_model_price(model)),
@@ -2238,7 +2385,7 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
 
         <section id="playground-image-panel" role="tabpanel" aria-label="Image playground" class="pg-mode-panel" data-playground-mode-panel="image"{image_hidden}>
           <section class="pg-media" aria-label="Image generation playground">
-            <div class="pg-settings"><div class="pg-section-heading"><h2>Generate an image</h2><p>Describe what you want to create.</p></div><label class="pg-field" for="playground-image-prompt"><span>Prompt <em class="pg-count" data-playground-image-count>0/1200</em></span><textarea id="playground-image-prompt" data-playground-image-prompt data-playground-draft maxlength="1200" rows="7" placeholder="A quiet observatory above a sea of clouds…"></textarea></label><fieldset class="pg-ratio-field"><legend>Aspect ratio</legend><div><button type="button" class="is-active" aria-pressed="true" data-playground-aspect-ratio="1:1"><span class="pg-ratio-glyph ratio-1-1" aria-hidden="true"></span>1:1</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="4:3"><span class="pg-ratio-glyph ratio-4-3" aria-hidden="true"></span>4:3</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="3:4"><span class="pg-ratio-glyph ratio-3-4" aria-hidden="true"></span>3:4</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="16:9"><span class="pg-ratio-glyph ratio-16-9" aria-hidden="true"></span>16:9</button></div></fieldset><button type="button" class="pg-primary-action" data-playground-generate-image disabled>{image_icon}<span>Generate image</span></button></div>
+            <div class="pg-settings"><div class="pg-section-heading"><h2>Generate an image</h2><p>Describe what you want to create.</p></div><label class="pg-field" for="playground-image-prompt"><span>Prompt <em class="pg-count" data-playground-image-count>0/1200</em></span><textarea id="playground-image-prompt" data-playground-image-prompt data-playground-draft maxlength="1200" rows="7" placeholder="A quiet observatory above a sea of clouds…"></textarea></label><fieldset class="pg-ratio-field"><legend><span>Aspect ratio</span><em class="pg-count" data-playground-image-size>Model dimensions</em></legend><div><button type="button" class="is-active" aria-pressed="true" data-playground-aspect-ratio="1:1"><span class="pg-ratio-glyph ratio-1-1" aria-hidden="true"></span>1:1</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="4:3"><span class="pg-ratio-glyph ratio-4-3" aria-hidden="true"></span>4:3</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="3:4"><span class="pg-ratio-glyph ratio-3-4" aria-hidden="true"></span>3:4</button><button type="button" aria-pressed="false" data-playground-aspect-ratio="16:9"><span class="pg-ratio-glyph ratio-16-9" aria-hidden="true"></span>16:9</button></div></fieldset><button type="button" class="pg-primary-action" data-playground-generate-image disabled>{image_icon}<span>Generate image</span></button></div>
             <div class="pg-output" data-playground-image-output aria-live="polite"><div class="pg-output-empty">{image_icon}<strong>Image output</strong><span>Your generated image will appear here.</span></div></div>
           </section>
         </section>
@@ -6562,6 +6709,51 @@ mod tests {
         assert!(html.contains("drafts and history stay in this browser tab"));
         assert!(html.contains("access tokens are never saved"));
         assert!(html.contains("data-playground-reset-draft"));
+    }
+
+    #[test]
+    fn playground_image_sizes_follow_the_selected_models_signed_constraints() {
+        let mut model = GatewayState::fixture().models_snapshot()[0].clone();
+        model.id = "test/signed-image".to_owned();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.caps.image = true;
+        model.mayhem.caps.max_image_width = Some(2_048);
+        model.mayhem.caps.max_image_height = Some(2_048);
+        model.mayhem.caps.output_modality = Some("image".to_owned());
+        model.mayhem.caps.output_modalities = vec!["image".to_owned()];
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("OpenAI image endpoint contract");
+        for path in ["width", "height"] {
+            let spec = contract.request_attribute_specs.get_mut(path).unwrap();
+            spec.minimum = Some(576.0);
+            spec.maximum = Some(2_048.0);
+            spec.multiple_of = Some(16.0);
+        }
+        model.mayhem.adapter.endpoint_families = vec![contract.clone()];
+
+        let config = playground_image_request_config(&model).expect("image request config");
+        assert_eq!(config.dimension_mode, "size");
+        assert_eq!(config.sizes["1:1"], "1024x1024");
+        assert_eq!(config.sizes["4:3"], "1152x864");
+        assert_eq!(config.sizes["3:4"], "864x1152");
+        assert_eq!(config.sizes["16:9"], "1344x768");
+        assert!(!config.sizes.values().any(|size| size == "512x512"));
+
+        let data = DashboardData::from_state(&GatewayState::from_models(vec![model.clone()]));
+        let html = playground_page(&data, 60, Some(&model.id));
+        assert!(html.contains(r#"data-image-dimension-mode="size""#));
+        assert!(html.contains(r#"&quot;1:1&quot;:&quot;1024x1024&quot;"#));
+        assert!(html.contains("data-playground-image-size"));
+
+        contract.request_attributes.retain(|path| path != "size");
+        contract.request_attribute_specs.remove("size");
+        model.mayhem.adapter.endpoint_families = vec![contract];
+        let dimensions =
+            playground_image_request_config(&model).expect("width-height image request config");
+        assert_eq!(dimensions.dimension_mode, "width-height");
+        assert_eq!(dimensions.sizes["1:1"], "1024x1024");
     }
 
     #[test]
