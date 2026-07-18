@@ -514,6 +514,9 @@ try {
   equal(await page.locator('#add-funds').getAttribute('open'), null, 'billing funding', 'keeps optional funding compact when credit is already available');
   check((await page.locator('#add-funds > summary').innerText()).includes('Card, TAP, or TNK'), 'billing funding', 'makes every supported payment method discoverable while collapsed');
   await page.locator('#add-funds > summary').click();
+  const fundingGuidance = await page.locator('.wallet-methods > p').innerText();
+  check(fundingGuidance.includes('Agent-guided setup is recommended'), 'billing funding guidance', 'recommends an agent-guided flow over manual setup');
+  check(fundingGuidance.includes('Review and confirm every payment yourself'), 'billing funding guidance', 'keeps financial approval with the user');
   equal(await page.locator('[data-wallet-funding-method]').count(), 3, 'billing funding', 'offers Stripe, TAP, and TNK without hiding non-active rails');
   const fundingLogos = await page.locator('.wallet-method-icon').evaluateAll((icons) => ({
     count: icons.filter((icon) => icon.querySelector('img, svg')).length,

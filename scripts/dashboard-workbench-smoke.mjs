@@ -97,6 +97,7 @@ const PRODUCT_ROUTES = [
       'id="wallet-funding-command-tap"',
       'id="wallet-funding-command-tnk"',
       'Stripe is recommended',
+      'Agent-guided setup is recommended',
       'small amount of ETH',
     ],
   },

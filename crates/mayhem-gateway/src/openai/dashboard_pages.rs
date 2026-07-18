@@ -3186,7 +3186,7 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
         .collect::<String>();
     let funding_open = if balance_ready { "" } else { " open" };
     let content = format!(
-        r##"{balance_summary}<details class="panel wallet-funding-shell" id="add-funds"{funding_open}><summary><span><strong>Add funds</strong><small>Card, TAP, or TNK · Stripe is recommended</small></span></summary><div class="wallet-funding-body"><fieldset class="wallet-methods"><legend>Choose a method</legend><p>Requests currently spend the <strong>{}</strong> balance.</p><div class="wallet-method-grid">{method_cards}</div></fieldset><div class="wallet-funding-details">{funding_details}</div><section class="wallet-confirmation-row" aria-labelledby="wallet-confirmation-title"><div><span class="wallet-step-label">3 · Confirm</span><h3 id="wallet-confirmation-title">Check the deposit</h3><p>Run this after payment, then refresh your balance.</p></div><pre class="code-block compact"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" data-product-event="billing_deposit_check_copied" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre></section></div></details>"##,
+        r##"{balance_summary}<details class="panel wallet-funding-shell" id="add-funds"{funding_open}><summary><span><strong>Add funds</strong><small>Card, TAP, or TNK · Stripe is recommended</small></span></summary><div class="wallet-funding-body"><fieldset class="wallet-methods"><legend>Choose a method</legend><p><strong>Agent-guided setup is recommended.</strong> Review and confirm every payment yourself, or continue with the manual steps below. Requests currently spend the <strong>{}</strong> balance.</p><div class="wallet-method-grid">{method_cards}</div></fieldset><div class="wallet-funding-details">{funding_details}</div><section class="wallet-confirmation-row" aria-labelledby="wallet-confirmation-title"><div><span class="wallet-step-label">3 · Confirm</span><h3 id="wallet-confirmation-title">Check the deposit</h3><p>Run this after payment, then refresh your balance.</p></div><pre class="code-block compact"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" data-product-event="billing_deposit_check_copied" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre></section></div></details>"##,
         html_escape(wallet_rail_label(&data.rail)),
         html_escape(&deposit_status_command),
     );
@@ -6770,6 +6770,8 @@ mod tests {
         let wallet = wallet_page(&data, 60);
         assert!(wallet.contains("data-hide-amounts"));
         assert!(wallet.contains("Stripe is recommended"));
+        assert!(wallet.contains("Agent-guided setup is recommended."));
+        assert!(wallet.contains("Review and confirm every payment yourself"));
         assert!(wallet.contains(r#"data-wallet-method="fiat""#));
         assert!(wallet.contains(r#"data-wallet-method="tap""#));
         assert!(wallet.contains(r#"data-wallet-method="tnk""#));
