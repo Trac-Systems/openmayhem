@@ -55152,16 +55152,25 @@ fn provider_canary_self_test_body(
                 .context("STT modality canary audio_b64 is invalid")?;
             let audio_seconds = audio_duration_seconds_ceil(&audio)
                 .context("STT modality canary is not a valid bounded WAV or FLAC")?;
+            let content_type = prompt.content_type.clone().unwrap_or_else(|| {
+                detected_audio_content_type(&audio)
+                    .unwrap_or("audio/wav")
+                    .to_owned()
+            });
+            let filename = prompt.filename.clone().unwrap_or_else(|| {
+                if content_type == "audio/flac" {
+                    "test.flac".to_owned()
+                } else {
+                    "test.wav".to_owned()
+                }
+            });
             let mut body = json!({
                 "kind": "audio_transcription",
                 "audio": {
                     "encoding": "base64",
                     "data": base64::engine::general_purpose::STANDARD.encode(&audio),
-                    "content_type": prompt.content_type.clone().unwrap_or_else(|| {
-                        detected_audio_content_type(&audio)
-                            .unwrap_or("audio/wav")
-                            .to_owned()
-                    }),
+                    "content_type": content_type,
+                    "filename": filename,
                 },
                 "audio_seconds": audio_seconds,
             });
@@ -70718,8 +70727,24 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "{} serialized an absent optional language",
                 prompt.id
             );
-            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
-                .unwrap_or_else(|error| panic!("{} seal: {error:#}", prompt.id));
+            assert_eq!(
+                body["audio"]["filename"].as_str(),
+                prompt.filename.as_deref(),
+                "{} did not preserve its signed canary filename",
+                prompt.id
+            );
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap_or_else(|error| panic!("{} seal: {error:#}", prompt.id));
+            let contract_request = sealed
+                .get("contract_request")
+                .unwrap_or_else(|| panic!("{} sealed contract request", prompt.id));
+            provider_audio_transcription_request_from_body(
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+                contract_request,
+                &sealed,
+            )
+            .unwrap_or_else(|error| panic!("{} transported audio: {error:#}", prompt.id));
         }
     }
 
