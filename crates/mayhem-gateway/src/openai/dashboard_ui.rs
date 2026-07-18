@@ -100,6 +100,8 @@ pub(super) struct DashboardShell<'a> {
     pub status: &'a str,
     pub status_tone: &'a str,
     pub actions: &'a str,
+    pub topbar_update: &'a str,
+    pub settings_update_badge: &'a str,
     pub content: &'a str,
     pub footer: &'a str,
     pub expires_in_seconds: u64,
@@ -170,11 +172,11 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
 <div class="app-shell">
   <aside class="app-sidebar" id="app-navigation" aria-label="Mayhem navigation">
     <a class="app-brand" href="/mayhem/dashboard" aria-label="Mayhem Home"><span class="app-brand-mark" aria-hidden="true">M</span><span class="app-brand-text">MAY<span class="hem">HEM</span></span></a>
-    <nav class="app-nav" aria-label="Primary"><span class="app-nav-label">Workspace</span>{navigation}<details class="advanced-nav"{advanced_open}><summary><span class="nav-icon" aria-hidden="true">&#8943;</span><span class="nav-text">Advanced</span></summary><div class="advanced-nav-items">{advanced_navigation}</div></details><span class="app-nav-label">System</span><a href="/mayhem/dashboard/help" aria-label="Help"{help_current}><span class="nav-icon">{help_icon}</span><span class="nav-text">Help</span></a><a href="/mayhem/dashboard/settings" aria-label="Settings"{settings_current}><span class="nav-icon">{settings_icon}</span><span class="nav-text">Settings</span></a></nav>
+    <nav class="app-nav" aria-label="Primary"><span class="app-nav-label">Workspace</span>{navigation}<details class="advanced-nav"{advanced_open}><summary><span class="nav-icon" aria-hidden="true">&#8943;</span><span class="nav-text">Advanced</span></summary><div class="advanced-nav-items">{advanced_navigation}</div></details><span class="app-nav-label">System</span><a href="/mayhem/dashboard/help" aria-label="Help"{help_current}><span class="nav-icon">{help_icon}</span><span class="nav-text">Help</span></a><a href="/mayhem/dashboard/settings" aria-label="Settings"{settings_current}><span class="nav-icon">{settings_icon}</span><span class="nav-text">Settings</span>{settings_update_badge}</a></nav>
   </aside>
   <button class="nav-scrim js-only" type="button" data-nav-close aria-label="Close navigation"></button>
   <div class="app-frame">
-    <header class="app-topbar"><div class="topbar-context"><button class="icon-button mobile-menu-button js-only" type="button" data-nav-toggle aria-label="Open navigation" aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">&#9776;</span></button><button class="icon-button sidebar-collapse-button js-only" type="button" data-sidebar-toggle aria-label="Collapse navigation" aria-controls="app-navigation" aria-expanded="true"><span aria-hidden="true">&#8592;</span></button><strong>{page_label}</strong><span class="topbar-status"><span class="state-indicator {status_tone}" aria-hidden="true"></span><span data-page-status-text>{status}</span></span></div><div class="topbar-actions">{amount_control}</div></header>
+    <header class="app-topbar"><div class="topbar-context"><button class="icon-button mobile-menu-button js-only" type="button" data-nav-toggle aria-label="Open navigation" aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">&#9776;</span></button><button class="icon-button sidebar-collapse-button js-only" type="button" data-sidebar-toggle aria-label="Collapse navigation" aria-controls="app-navigation" aria-expanded="true"><span aria-hidden="true">&#8592;</span></button><strong>{page_label}</strong><span class="topbar-status"><span class="state-indicator {status_tone}" aria-hidden="true"></span><span data-page-status-text>{status}</span></span></div><div class="topbar-actions">{topbar_update}{amount_control}</div></header>
     <main class="app-main{wide_class}{page_class}" id="main-content" tabindex="-1"><header class="page-head"><div><p class="page-eyebrow">{eyebrow}</p><h1>{heading}</h1><p class="page-summary">{summary}</p></div><div class="page-head-actions">{actions}</div></header>{content}</main>
     <footer class="app-footer"><div class="app-footer-inner{wide_class_footer}"><span>{footer}</span><span class="mono" data-session-seconds="{expires}" data-session-status>Browser session active</span></div></footer>
   </div>
@@ -186,9 +188,11 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         advanced_open = if advanced_open { " open" } else { "" },
         help_current = help_current,
         settings_current = settings_current,
+        settings_update_badge = shell.settings_update_badge,
         status_tone = status_tone,
         status = html_escape(shell.status),
         amount_control = amount_control,
+        topbar_update = shell.topbar_update,
         page_label = shell.page.label(),
         help_icon = DashboardAppPage::Help.icon(),
         settings_icon = DashboardAppPage::Settings.icon(),
@@ -288,7 +292,7 @@ a,button{-webkit-tap-highlight-color:transparent}
 .app-brand-mark{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(145deg,var(--app-accent),#b83c61);box-shadow:0 8px 24px rgba(255,107,122,.24);font-size:13px}
 .app-nav{display:grid;gap:4px}
 .app-nav-label{margin:11px 10px 5px;color:var(--app-text-muted);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
-.app-nav a{min-height:44px;display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid transparent;border-radius:12px;color:var(--app-text-soft);text-decoration:none;font-weight:600}
+.app-nav a{position:relative;min-height:44px;display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid transparent;border-radius:12px;color:var(--app-text-soft);text-decoration:none;font-weight:600}
 .app-nav a:hover{background:var(--app-panel);color:var(--app-text)}
 .app-nav a[aria-current="page"]{background:linear-gradient(110deg,rgba(255,107,122,.15),rgba(255,107,122,.04));border-color:rgba(255,107,122,.25);color:var(--app-text)}
 .advanced-nav{margin-top:3px}
@@ -300,6 +304,9 @@ a,button{-webkit-tap-highlight-color:transparent}
 .nav-icon{width:20px;height:20px;display:grid;place-items:center;color:var(--app-text-muted)}
 .nav-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .app-nav a[aria-current="page"] .nav-icon{color:var(--app-accent-strong)}
+.nav-update-badge{margin-left:auto;min-height:20px;padding:2px 7px;border:1px solid rgba(110,168,255,.28);border-radius:999px;background:rgba(110,168,255,.09);color:var(--app-info);display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:800;line-height:1}
+.nav-update-badge>span:first-child{width:6px;height:6px;border-radius:999px;background:currentColor;box-shadow:0 0 0 3px rgba(110,168,255,.08)}
+.nav-update-badge.danger{border-color:rgba(255,84,73,.3);background:rgba(255,84,73,.09);color:var(--app-danger)}
 .state-indicator{width:9px;height:9px;border-radius:999px;background:var(--app-text-muted);box-shadow:0 0 0 4px rgba(126,135,148,.1)}
 .state-indicator.good{background:var(--app-good);box-shadow:0 0 0 4px rgba(88,214,168,.1)}
 .state-indicator.warn{background:var(--app-warn);box-shadow:0 0 0 4px rgba(245,184,92,.1)}
@@ -311,6 +318,17 @@ a,button{-webkit-tap-highlight-color:transparent}
 .topbar-context strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .topbar-status{display:inline-flex;align-items:center;gap:8px;color:var(--app-text-soft);font-size:13px}
 .topbar-actions{display:flex;align-items:center;gap:8px}
+html.js-ready .topbar-update-notice.js-only:not([hidden]){display:flex!important}
+.topbar-update-notice{min-height:34px;border:1px solid rgba(110,168,255,.28);border-radius:10px;background:rgba(110,168,255,.07);align-items:stretch;color:var(--app-info);overflow:hidden}
+.topbar-update-notice.danger{border-color:rgba(255,84,73,.3);background:rgba(255,84,73,.08);color:var(--app-danger)}
+.topbar-update-notice>a{min-height:32px;padding:5px 9px;display:inline-flex;align-items:center;gap:6px;color:inherit;text-decoration:none;font-size:11px;font-weight:800;white-space:nowrap}
+.topbar-update-notice>a:hover{background:rgba(110,168,255,.08)}
+.topbar-update-notice.danger>a:hover{background:rgba(255,84,73,.08)}
+.topbar-update-icon{width:18px;height:18px;border-radius:6px;background:rgba(110,168,255,.12);display:grid;place-items:center;font-size:12px}
+.topbar-update-notice.danger .topbar-update-icon{background:rgba(255,84,73,.12)}
+.topbar-update-notice>button{width:29px;min-height:32px;padding:0;border:0;border-left:1px solid currentColor;background:transparent;color:inherit;opacity:.66;display:grid;place-items:center;font-size:15px}
+.topbar-update-notice>button:hover{opacity:1;background:rgba(110,168,255,.08)}
+.topbar-update-label-mobile{display:none}
 .icon-button,.soft-button,.primary-button,.quiet-button{min-height:44px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 13px;text-decoration:none;font-weight:700;transition:transform var(--app-fast) ease,background var(--app-fast) ease,border-color var(--app-fast) ease}
 .button-icon{width:18px;height:18px;display:grid;place-items:center}
 .button-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
@@ -539,6 +557,10 @@ th[aria-sort="descending"] .table-sort-button::after{content:"↓";opacity:1;col
 .notice.good{border-color:rgba(88,214,168,.28);background:rgba(88,214,168,.06)}
 .notice.warn{border-color:rgba(245,184,92,.3);background:rgba(245,184,92,.07)}
 .notice.danger{border-color:rgba(255,84,73,.3);background:rgba(255,84,73,.07)}
+.version-guidance{margin:14px 0;padding:13px 14px;border:1px solid rgba(110,168,255,.22);border-radius:12px;background:rgba(110,168,255,.045);display:grid;gap:10px}
+.version-guidance.source{border-style:dashed}
+.version-guidance p{margin:0;color:var(--app-text-muted);font-size:12px;line-height:1.55}.version-guidance p strong{color:var(--app-text)}
+.version-guidance>a{justify-self:start}
 .code-block{position:relative;min-height:62px;margin:0;padding:20px 72px 20px 15px;border:1px solid var(--app-border);border-radius:13px;background:#0b0d10;color:#cdd3db;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}
 .code-block .copy-corner{position:absolute;right:8px;top:8px}
 .connect-ready{margin-bottom:24px;padding:17px 18px;border:1px solid var(--app-border);border-radius:16px;background:linear-gradient(120deg,rgba(88,214,168,.07),rgba(255,255,255,.015) 58%);display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:14px}
@@ -1001,6 +1023,9 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   html.sidebar-collapsed .app-brand{justify-content:center;padding-inline:0}
   html.sidebar-collapsed .app-brand-text,html.sidebar-collapsed .app-nav-label,html.sidebar-collapsed .app-nav .nav-text,html.sidebar-collapsed .advanced-nav-items{display:none}
   html.sidebar-collapsed .app-nav a,html.sidebar-collapsed .advanced-nav>summary{justify-content:center;padding-inline:10px}
+  html.sidebar-collapsed .nav-update-badge{position:absolute;right:5px;top:5px;width:7px;min-width:7px;height:7px;min-height:7px;padding:0;border:0;background:var(--app-info)}
+  html.sidebar-collapsed .nav-update-badge.danger{background:var(--app-danger)}
+  html.sidebar-collapsed .nav-update-badge>span{display:none}
   html.sidebar-collapsed .sidebar-collapse-button span{transform:rotate(180deg)}
 }
 
@@ -1054,6 +1079,7 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
 }
 
 @media(max-width:520px){
+  .topbar-update-label{display:none}.topbar-update-label-mobile{display:inline}
   .topbar-actions .soft-button .button-label{display:none}
   .metric-grid{grid-template-columns:1fr}
   .metric-grid--three{grid-template-columns:1fr}
@@ -1191,6 +1217,21 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (!selector) return null;
       try { return scope.querySelector(selector); } catch (_) { return null; }
     };
+
+    document.querySelectorAll('[data-update-notice]').forEach((notice) => {
+      const id = String(notice.dataset.updateId || '').trim();
+      if (!id) return;
+      const key = `mayhem.dashboard.dismissedUpdate.${id}`;
+      if (storage.get(key) === '1') {
+        notice.hidden = true;
+        return;
+      }
+      safeQuery('[data-update-dismiss]', notice)?.addEventListener('click', () => {
+        storage.set(key, '1');
+        notice.hidden = true;
+        announce('Update notice dismissed. The update indicator remains in Settings.', false, false);
+      });
+    });
 
     const readLocalProductEvents = () => {
       const stored = storage.get(localProductEventsKey);

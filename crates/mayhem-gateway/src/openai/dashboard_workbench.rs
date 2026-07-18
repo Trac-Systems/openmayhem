@@ -45,18 +45,22 @@ enum WorkbenchScenario {
     Loading,
     Failure,
     Offline,
+    SourceUpdate,
+    SignedUpdate,
     UpdateRequired,
     Scale,
 }
 
 impl WorkbenchScenario {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 10] = [
         Self::Showcase,
         Self::AuthRequired,
         Self::Empty,
         Self::Loading,
         Self::Failure,
         Self::Offline,
+        Self::SourceUpdate,
+        Self::SignedUpdate,
         Self::UpdateRequired,
         Self::Scale,
     ];
@@ -69,6 +73,8 @@ impl WorkbenchScenario {
             Self::Loading => "loading",
             Self::Failure => "failure",
             Self::Offline => "offline",
+            Self::SourceUpdate => "source-update",
+            Self::SignedUpdate => "signed-update",
             Self::UpdateRequired => "update-required",
             Self::Scale => "scale",
         }
@@ -82,6 +88,8 @@ impl WorkbenchScenario {
             Self::Loading => "Provider loading",
             Self::Failure => "Provider failure",
             Self::Offline => "Routes offline",
+            Self::SourceUpdate => "Source update",
+            Self::SignedUpdate => "Signed update",
             Self::UpdateRequired => "Update required",
             Self::Scale => "Scale and overflow",
         }
@@ -95,6 +103,8 @@ impl WorkbenchScenario {
             Self::Loading => "A provider downloading and verifying a model before its route exists.",
             Self::Failure => "A provider load that failed during artifact verification.",
             Self::Offline => "Canonical routes exist, but no provider heartbeat is currently live.",
+            Self::SourceUpdate => "Newer GitHub source is available without a signed executable for this system.",
+            Self::SignedUpdate => "A newer GitHub release includes the complete signed executable asset set.",
             Self::UpdateRequired => "A catalog compatibility gate hides a model until the app is updated.",
             Self::Scale => "Ninety-six models, more than one hundred provider-scoped routes, ninety-six receipts, sixty-four access tokens, and sixty-four probes for testing reachability, renderer bounds, density, and mobile overflow.",
         }
@@ -135,6 +145,8 @@ impl WorkbenchState {
             WorkbenchScenario::Offline,
             base_state(workbench_models(4), false),
         );
+        scenarios.insert(WorkbenchScenario::SourceUpdate, github_update_state(false));
+        scenarios.insert(WorkbenchScenario::SignedUpdate, github_update_state(true));
         scenarios.insert(
             WorkbenchScenario::UpdateRequired,
             showcase_state(3).with_hidden_update_models(vec![GatewayUpdateModelNotice {
@@ -164,6 +176,48 @@ impl WorkbenchState {
             .cloned()
             .unwrap_or_else(GatewayState::fixture)
     }
+}
+
+fn github_update_state(installable: bool) -> GatewayState {
+    let update = if installable {
+        GatewayGithubUpdate {
+            kind: "release".to_owned(),
+            installed_version: installed_app_version().to_owned(),
+            available_version: Some("0.3.0".to_owned()),
+            installed_revision: Some("1".repeat(40)),
+            available_revision: None,
+            release_url: Some(
+                "https://github.com/Trac-Systems/openmayhem/releases/tag/0.3.0".to_owned(),
+            ),
+            compare_url: None,
+            published_at: Some("2026-07-18T12:00:00Z".to_owned()),
+            installable: true,
+            message: "Mayhem 0.3.0 is available as a signed update for this system.".to_owned(),
+        }
+    } else {
+        GatewayGithubUpdate {
+            kind: "source".to_owned(),
+            installed_version: installed_app_version().to_owned(),
+            available_version: None,
+            installed_revision: Some("1".repeat(40)),
+            available_revision: Some("2".repeat(40)),
+            release_url: None,
+            compare_url: Some(
+                "https://github.com/Trac-Systems/openmayhem/compare/source...main".to_owned(),
+            ),
+            published_at: None,
+            installable: false,
+            message: "3 newer source changes are available on GitHub.".to_owned(),
+        }
+    };
+    showcase_state(4).with_github_update_status(GatewayGithubUpdateStatus {
+        state: "available".to_owned(),
+        installed_version: installed_app_version().to_owned(),
+        installed_revision: Some("1".repeat(40)),
+        checked_at_seconds: Some(now_secs()),
+        message: update.message.clone(),
+        update: Some(update),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -903,6 +957,8 @@ fn workbench_scenario_blocker(
             "The fixture catalog has routes, but none has a fresh provider heartbeat.",
         )),
         WorkbenchScenario::Showcase
+        | WorkbenchScenario::SourceUpdate
+        | WorkbenchScenario::SignedUpdate
         | WorkbenchScenario::UpdateRequired
         | WorkbenchScenario::Scale => None,
     }

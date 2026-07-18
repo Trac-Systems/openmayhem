@@ -100,6 +100,12 @@ use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
 
+mod github_update;
+use github_update::{
+    automatic_update_check_enabled, check_github_update, GithubUpdateCache, GithubUpdateCheckConfig,
+};
+pub use github_update::{GatewayGithubUpdate, GatewayGithubUpdateStatus};
+
 mod dashboard_ui;
 use dashboard_ui::{DASHBOARD_APP_CSS, DASHBOARD_APP_JS};
 
@@ -236,6 +242,8 @@ pub struct GatewayState {
     preferred_providers: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     access_control: Arc<GatewayAccessControl>,
     hidden_update_models: Arc<Vec<GatewayUpdateModelNotice>>,
+    github_update_status: Arc<Mutex<GatewayGithubUpdateStatus>>,
+    github_update_check_enabled: bool,
     epoch_seconds: u64,
     provider_heartbeat_ttl_millis: u64,
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
@@ -3034,6 +3042,8 @@ impl GatewayState {
             preferred_providers: Arc::new(Mutex::new(BTreeMap::new())),
             access_control: Arc::new(GatewayAccessControl::disabled()),
             hidden_update_models: Arc::new(Vec::new()),
+            github_update_status: Arc::new(Mutex::new(GatewayGithubUpdateStatus::disabled())),
+            github_update_check_enabled: false,
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
             provider_heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
@@ -3338,6 +3348,32 @@ impl GatewayState {
 
     pub fn update_notice(&self) -> Option<GatewayUpdateNotice> {
         gateway_update_notice(&self.models_snapshot(), &self.hidden_update_models)
+    }
+
+    pub fn with_github_update_check_enabled(mut self) -> Self {
+        self.github_update_check_enabled = true;
+        *self
+            .github_update_status
+            .lock_recover("GitHub update status") = GatewayGithubUpdateStatus::checking();
+        self
+    }
+
+    pub fn with_github_update_status(mut self, status: GatewayGithubUpdateStatus) -> Self {
+        self.github_update_check_enabled = false;
+        self.github_update_status = Arc::new(Mutex::new(status));
+        self
+    }
+
+    pub fn github_update_status(&self) -> GatewayGithubUpdateStatus {
+        self.github_update_status
+            .lock_recover("GitHub update status")
+            .clone()
+    }
+
+    fn replace_github_update_status(&self, status: GatewayGithubUpdateStatus) {
+        *self
+            .github_update_status
+            .lock_recover("GitHub update status") = status;
     }
 
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
@@ -3784,8 +3820,25 @@ pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result
         GatewayMediaLimits::from_env()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
     );
+    if state.github_update_check_enabled && automatic_update_check_enabled() {
+        spawn_github_update_watcher(state.clone());
+    } else if state.github_update_check_enabled {
+        state.replace_github_update_status(GatewayGithubUpdateStatus::disabled());
+    }
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, openai_router(state)).await
+}
+
+fn spawn_github_update_watcher(state: GatewayState) {
+    tokio::spawn(async move {
+        let config = GithubUpdateCheckConfig::from_env();
+        let mut cache = GithubUpdateCache::default();
+        loop {
+            let status = check_github_update(&config, &mut cache, now_secs()).await;
+            state.replace_github_update_status(status);
+            tokio::time::sleep(config.interval).await;
+        }
+    });
 }
 
 pub fn gateway_bind_is_loopback(bind: SocketAddr) -> bool {
@@ -6747,6 +6800,7 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "receipts": state.receipt_count(),
         "probes": state.probes.lock_recover("probe store").len(),
         "update_notice": update_notice,
+        "github_update": state.github_update_status(),
         "access": state.access_summary(),
     }))
     .into_response()

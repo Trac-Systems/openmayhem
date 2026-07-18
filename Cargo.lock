@@ -2080,6 +2080,7 @@ dependencies = [
  "mayhem-bridge",
  "mayhem-enclave",
  "mayhem-proto",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",

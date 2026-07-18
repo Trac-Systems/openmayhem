@@ -100,6 +100,7 @@ struct DashboardData {
     payment_directory: Option<Value>,
     access: Value,
     update_notice: Option<GatewayUpdateNotice>,
+    github_update: GatewayGithubUpdateStatus,
     earnings: GatewayProviderEarningsSnapshot,
     local_provider_id: Option<String>,
     rail: String,
@@ -128,6 +129,7 @@ impl DashboardData {
             payment_directory: state.payment_directory(),
             access: state.access_summary(),
             update_notice: state.update_notice(),
+            github_update: state.github_update_status(),
             earnings: state.provider_earnings_snapshot(),
             local_provider_id: state.local_provider_id().map(str::to_owned),
             rail: state.receipt_config.rail.clone(),
@@ -1229,6 +1231,15 @@ fn shell_impl(
         format!("{status_freshness}{content}")
     };
     let content = keyboard_accessible_table_regions(&content);
+    let update_presentation = dashboard_update_presentation(data);
+    let topbar_update = update_presentation
+        .as_ref()
+        .map(dashboard_topbar_update)
+        .unwrap_or_default();
+    let settings_update_badge = update_presentation
+        .as_ref()
+        .map(dashboard_settings_update_badge)
+        .unwrap_or_default();
     dashboard_app_shell(DashboardShell {
         page,
         eyebrow,
@@ -1237,11 +1248,92 @@ fn shell_impl(
         status,
         status_tone: tone,
         actions,
+        topbar_update: &topbar_update,
+        settings_update_badge: &settings_update_badge,
         content: &content,
         footer: "Controls and evidence belong to this gateway process.",
         expires_in_seconds: expires,
         wide,
     })
+}
+
+struct DashboardUpdatePresentation {
+    id: String,
+    label: String,
+    tone: &'static str,
+    required: bool,
+}
+
+fn dashboard_update_presentation(data: &DashboardData) -> Option<DashboardUpdatePresentation> {
+    if let Some(notice) = data
+        .update_notice
+        .as_ref()
+        .filter(|notice| notice.level == "required")
+    {
+        return Some(DashboardUpdatePresentation {
+            id: format!("catalog-required:{}", notice.required_min_app_version),
+            label: "Update required".to_owned(),
+            tone: "danger",
+            required: true,
+        });
+    }
+    if let Some(update) = data.github_update.update.as_ref() {
+        let label = match (update.installable, update.available_version.as_deref()) {
+            (true, Some(version)) => format!("{} available", version.trim_start_matches('v')),
+            (false, Some(_)) => "New version on GitHub".to_owned(),
+            _ => "Source update available".to_owned(),
+        };
+        let identifier = update
+            .available_version
+            .as_deref()
+            .or(update.available_revision.as_deref())
+            .unwrap_or("source");
+        return Some(DashboardUpdatePresentation {
+            id: format!("github:{}:{identifier}", update.kind),
+            label,
+            tone: "info",
+            required: false,
+        });
+    }
+    data.update_notice
+        .as_ref()
+        .map(|notice| DashboardUpdatePresentation {
+            id: format!("catalog-available:{}", notice.required_min_app_version),
+            label: "Update available".to_owned(),
+            tone: "info",
+            required: false,
+        })
+}
+
+fn dashboard_topbar_update(update: &DashboardUpdatePresentation) -> String {
+    let dismiss = if update.required {
+        String::new()
+    } else {
+        format!(
+            r#"<button type="button" data-update-dismiss aria-label="Dismiss {} notice"><span aria-hidden="true">×</span></button>"#,
+            html_escape(&update.label)
+        )
+    };
+    format!(
+        r#"<div class="topbar-update-notice {} js-only" data-update-notice data-update-id="{}"><a href="/mayhem/dashboard/settings" aria-label="{}; review in Settings"><span class="topbar-update-icon" aria-hidden="true">↑</span><span class="topbar-update-label">{}</span><span class="topbar-update-label-mobile">Update</span></a>{dismiss}</div>"#,
+        update.tone,
+        html_escape(&update.id),
+        html_escape(&update.label),
+        html_escape(&update.label),
+    )
+}
+
+fn dashboard_settings_update_badge(update: &DashboardUpdatePresentation) -> String {
+    format!(
+        r#"<span class="nav-update-badge {}"><span aria-hidden="true"></span><span class="nav-update-text">{}</span><span class="sr-only">: {}</span></span>"#,
+        update.tone,
+        if update.required {
+            "Required"
+        } else {
+            "Update"
+        },
+        html_escape(&update.label),
+    )
 }
 
 fn keyboard_accessible_table_regions(content: &str) -> String {
@@ -1281,22 +1373,17 @@ fn keyboard_accessible_table_regions(content: &str) -> String {
 }
 
 fn global_update_attention(data: &DashboardData) -> String {
-    let Some(notice) = data.update_notice.as_ref() else {
+    let Some(notice) = data
+        .update_notice
+        .as_ref()
+        .filter(|notice| notice.level == "required")
+    else {
         return String::new();
     };
-    let tone = if notice.level == "required" {
-        "danger"
-    } else {
-        "warn"
-    };
     attention(
-        tone,
+        "danger",
         "!",
-        if notice.level == "required" {
-            "Update required"
-        } else {
-            "Update available"
-        },
+        "Update required",
         &format!(
             "Installed {}. A newer app version (minimum {}) is required for {}.",
             notice.installed_app_version,
@@ -4565,32 +4652,34 @@ fn help_page(data: &DashboardData, expires: u64) -> String {
 }
 
 fn settings_page(data: &DashboardData, expires: u64) -> String {
-    let (version_status, version_tone) = match data.update_notice.as_ref() {
-        Some(notice) if notice.level == "required" => ("Update required", "danger"),
-        Some(_) => ("Update available", "warn"),
-        None => ("Up to date", "good"),
+    let github_update = data.github_update.update.as_ref();
+    let (version_status, version_tone) = match (data.update_notice.as_ref(), github_update) {
+        (Some(notice), _) if notice.level == "required" => ("Update required", "danger"),
+        (_, Some(_)) | (Some(_), _) => ("Update available", ""),
+        _ if data.github_update.state == "current" => ("Up to date", "good"),
+        _ if data.github_update.state == "checking" => ("Checking GitHub", ""),
+        _ => ("Installed", ""),
     };
-    let update = data
-        .update_notice
-        .as_ref()
-        .map(|notice| {
+    let update = match (data.update_notice.as_ref(), github_update) {
+        (Some(notice), _) if notice.level == "required" => {
             format!(
                 "Installed {} / catalog minimum {} / {} affected",
                 notice.installed_app_version,
                 notice.required_min_app_version,
                 notice.affected_model_count
             )
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "Mayhem {} · compatible with the current catalog",
-                installed_app_version()
-            )
-        });
-    let update_resolution = if data.update_notice.is_some() {
-        r##"<div class="field"><span class="field-label">1. Verify and stage on the gateway host</span><pre class="code-block"><code id="mayhem-update-stage-command">mayhem update</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#mayhem-update-stage-command" aria-label="Copy Mayhem update staging command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Downloads and verifies the release, then stages it. This does not replace the installed binary.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Apply the staged update</span><pre class="code-block"><code id="mayhem-update-apply-command">mayhem update --apply-staged</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#mayhem-update-apply-command" aria-label="Copy Mayhem staged-update apply command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Run after the required staging delay. Applying replaces the host binary and runs its health check, but it does not restart an already-running gateway service; restart that service, then reload this page.</p></div>"##
-    } else {
-        ""
+        }
+        (_, Some(update)) => update.message.clone(),
+        _ => format!(
+            "Mayhem {} · {}",
+            data.github_update.installed_version, data.github_update.message
+        ),
+    };
+    let update_resolution = match github_update {
+        Some(update) if update.installable => signed_release_update_resolution(update),
+        Some(update) => source_update_resolution(update),
+        None if data.update_notice.is_some() => signed_update_commands(None),
+        None => String::new(),
     };
     let content = format!(
         r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Display and attention</h2><p>Preferences are stored in this browser profile.</p></div></header><noscript><div class="panel-body"><p class="notice warn">Display preferences require JavaScript. Gateway session and version facts remain available.</p></div></noscript><div class="settings-list"><div class="settings-row"><div class="settings-copy"><strong>Hide money amounts</strong><span>Replaces monetary text semantically and visually on dashboard pages.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="amounts" role="switch" aria-label="Hide money amounts" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Reduce motion</strong><span>Disables transitions and animated feedback while preserving state.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="motion" role="switch" aria-label="Reduce motion" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Compact density</strong><span>Reduces spacing for professional monitoring without hiding explanations.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="density" role="switch" aria-label="Compact density" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Playground conversation history</strong><span>Prompts and responses are stored only in this browser profile. Credentials are never saved.</span></div><button class="settings-control quiet-button js-only" type="button" data-clear-playground-history>Clear history</button></div></div><footer class="panel-footer"><button class="quiet-button js-only" type="button" data-clear-preferences>Reset preferences</button></footer></section><details class="panel disclosure-panel"><summary><span>Local launch diagnostics</span><span class="status-badge"><span data-local-event-count>0</span>&nbsp;events</span></summary><div class="panel-body"><p class="notice">Optional debugging log for launch issues. Events stay in this browser and never include prompts, responses, credentials, or money amounts.</p><div class="inline-actions section-gap"><button class="soft-button js-only" type="button" data-export-local-events>Export JSON</button><button class="quiet-button js-only" type="button" data-clear-local-events>Clear diagnostics</button></div></div></details></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Gateway session</h2><p>Access and runtime facts for this gateway</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Authentication</span><strong>{}</strong></div><div class="fact"><span>Active tokens</span><strong>{}</strong></div><div class="fact"><span>Receipt rail</span><strong>{}</strong></div><div class="fact"><span>Provider identity</span><strong>{}</strong></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Version</h2><p>From the installed app and catalog requirements</p></div></header><div class="panel-body"><p class="notice {}">{}</p>{update_resolution}</div></section></aside></section>"##,
@@ -4620,6 +4709,46 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         "",
         &content,
     )
+}
+
+fn signed_release_update_resolution(update: &GatewayGithubUpdate) -> String {
+    signed_update_commands(update.release_url.as_deref())
+}
+
+fn signed_update_commands(release_url: Option<&str>) -> String {
+    let release_link = safe_github_link(release_url)
+        .map(|url| {
+            format!(
+                r#"<a class="quiet-button" href="{}" target="_blank" rel="noopener noreferrer">View release notes <span aria-hidden="true">↗</span></a>"#,
+                html_escape(url)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r##"<div class="version-guidance"><p><strong>Agent-guided update recommended.</strong> Ask your agent to guide these steps and review every command before running it.</p>{release_link}</div><div class="field"><span class="field-label">1. Verify and stage on the gateway host</span><pre class="code-block"><code id="mayhem-update-stage-command">mayhem update</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#mayhem-update-stage-command" aria-label="Copy Mayhem update staging command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Downloads and verifies the signed release, then stages it. This does not replace the installed binary.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Apply the staged update</span><pre class="code-block"><code id="mayhem-update-apply-command">mayhem update --apply-staged</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#mayhem-update-apply-command" aria-label="Copy Mayhem staged-update apply command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Run after the required staging delay. Applying replaces the host binary and runs its health check, but it does not restart an already-running gateway service; restart that service, then reload this page.</p></div>"##
+    )
+}
+
+fn source_update_resolution(update: &GatewayGithubUpdate) -> String {
+    let url = update
+        .release_url
+        .as_deref()
+        .or(update.compare_url.as_deref());
+    let link = safe_github_link(url)
+        .map(|url| {
+            format!(
+                r#"<a class="soft-button" href="{}" target="_blank" rel="noopener noreferrer">View changes on GitHub <span aria-hidden="true">↗</span></a>"#,
+                html_escape(url)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<div class="version-guidance source"><p><strong>Source update only.</strong> No signed executable update is available for this system yet. Update from your source checkout using its existing build process.</p><p>Agent-guided updating is recommended; review every command before running it. When signed executables are published, this panel will switch automatically to the verified updater.</p>{link}</div>"#
+    )
+}
+
+fn safe_github_link(value: Option<&str>) -> Option<&str> {
+    value.filter(|url| url.starts_with("https://github.com/"))
 }
 
 #[derive(Clone, Debug)]
@@ -6612,6 +6741,78 @@ mod tests {
         assert!(html.contains("data-copy-target=\"#mayhem-update-apply-command\""));
         assert!(html.contains("does not replace the installed binary"));
         assert!(html.contains("does not restart an already-running gateway service"));
+    }
+
+    #[test]
+    fn source_update_is_lightweight_and_never_claims_a_binary_is_available() {
+        let state = GatewayState::from_models(Vec::new());
+        let mut data = DashboardData::from_state(&state);
+        let update = GatewayGithubUpdate {
+            kind: "source".to_owned(),
+            installed_version: "0.2.0".to_owned(),
+            available_version: None,
+            installed_revision: Some("1".repeat(40)),
+            available_revision: Some("2".repeat(40)),
+            release_url: None,
+            compare_url: Some(
+                "https://github.com/Trac-Systems/openmayhem/compare/source...main".to_owned(),
+            ),
+            published_at: None,
+            installable: false,
+            message: "3 newer source changes are available on GitHub.".to_owned(),
+        };
+        data.github_update = GatewayGithubUpdateStatus {
+            state: "available".to_owned(),
+            installed_version: "0.2.0".to_owned(),
+            installed_revision: update.installed_revision.clone(),
+            checked_at_seconds: Some(42),
+            message: update.message.clone(),
+            update: Some(update),
+        };
+
+        let html = settings_page(&data, 60);
+        assert!(html.contains("Source update only."));
+        assert!(html.contains("View changes on GitHub"));
+        assert!(html.contains("data-update-notice"));
+        assert!(html.contains("nav-update-badge info"));
+        assert!(!html.contains("mayhem-update-stage-command"));
+        assert!(!html.contains("attention-card danger"));
+    }
+
+    #[test]
+    fn signed_release_switches_to_the_verified_updater_guidance() {
+        let state = GatewayState::from_models(Vec::new());
+        let mut data = DashboardData::from_state(&state);
+        let update = GatewayGithubUpdate {
+            kind: "release".to_owned(),
+            installed_version: "0.2.0".to_owned(),
+            available_version: Some("0.3.0".to_owned()),
+            installed_revision: Some("1".repeat(40)),
+            available_revision: None,
+            release_url: Some(
+                "https://github.com/Trac-Systems/openmayhem/releases/tag/0.3.0".to_owned(),
+            ),
+            compare_url: None,
+            published_at: Some("2026-07-18T12:00:00Z".to_owned()),
+            installable: true,
+            message: "Mayhem 0.3.0 is available as a signed update for this system.".to_owned(),
+        };
+        data.github_update = GatewayGithubUpdateStatus {
+            state: "available".to_owned(),
+            installed_version: "0.2.0".to_owned(),
+            installed_revision: update.installed_revision.clone(),
+            checked_at_seconds: Some(42),
+            message: update.message.clone(),
+            update: Some(update),
+        };
+
+        let html = settings_page(&data, 60);
+        assert!(html.contains("0.3.0 available"));
+        assert!(html.contains("Agent-guided update recommended."));
+        assert!(html.contains("View release notes"));
+        assert!(html.contains("mayhem-update-stage-command"));
+        assert!(html.contains("mayhem-update-apply-command"));
+        assert!(!html.contains("Source update only."));
     }
 
     #[test]
