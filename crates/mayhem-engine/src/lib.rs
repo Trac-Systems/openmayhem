@@ -1289,6 +1289,24 @@ struct WorkerContainment {
     _job: Option<win32job::Job>,
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_MINIMUM_WORKING_SET_BYTES: usize = 1024 * 1024;
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_worker_working_set_bounds(bytes: u64) -> Result<(usize, usize)> {
+    let maximum = usize::try_from(bytes).map_err(|_| {
+        EngineError::InvalidConfig(format!(
+            "Windows worker memory limit {bytes} exceeds this process address size"
+        ))
+    })?;
+    if maximum < WINDOWS_MINIMUM_WORKING_SET_BYTES {
+        return Err(EngineError::InvalidConfig(format!(
+            "Windows worker memory limit {bytes} is below the minimum supported working set of {WINDOWS_MINIMUM_WORKING_SET_BYTES} bytes"
+        )));
+    }
+    Ok((WINDOWS_MINIMUM_WORKING_SET_BYTES, maximum))
+}
+
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -1305,17 +1323,24 @@ fn attach_worker_containment(
     let Some(bytes) = memory_limit_bytes.filter(|bytes| *bytes > 0) else {
         return Ok(WorkerContainment::default());
     };
-    let max = usize::try_from(bytes).map_err(|_| {
-        EngineError::InvalidConfig(format!(
-            "Windows worker memory limit {bytes} exceeds this process address size"
-        ))
-    })?;
+    let (minimum, maximum) = windows_worker_working_set_bounds(bytes)?;
     let mut limit = win32job::ExtendedLimitInfo::new();
-    limit.limit_working_memory(1, max).limit_kill_on_job_close();
-    let job = win32job::Job::create_with_limit_info(&limit)
-        .map_err(|err| EngineError::Io(std::io::Error::from(err)))?;
+    limit
+        .limit_working_memory(minimum, maximum)
+        .limit_kill_on_job_close();
+    let job = win32job::Job::create_with_limit_info(&limit).map_err(|error| {
+        EngineError::Io(std::io::Error::other(format!(
+            "creating Windows worker job with working set {minimum}..={maximum} bytes failed: {}",
+            std::io::Error::from(error)
+        )))
+    })?;
     job.assign_process(child.as_raw_handle() as isize)
-        .map_err(|err| EngineError::Io(std::io::Error::from(err)))?;
+        .map_err(|error| {
+            EngineError::Io(std::io::Error::other(format!(
+                "assigning worker process to Windows containment job failed: {}",
+                std::io::Error::from(error)
+            )))
+        })?;
     Ok(WorkerContainment { _job: Some(job) })
 }
 
@@ -8225,6 +8250,19 @@ mod trt_llm_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_worker_containment_uses_a_valid_minimum_working_set() {
+        let maximum = 8 * 1024 * 1024;
+        assert_eq!(
+            windows_worker_working_set_bounds(maximum).unwrap(),
+            (WINDOWS_MINIMUM_WORKING_SET_BYTES, maximum as usize)
+        );
+        assert!(
+            windows_worker_working_set_bounds((WINDOWS_MINIMUM_WORKING_SET_BYTES - 1) as u64)
+                .is_err()
+        );
+    }
 
     #[test]
     fn speciality_reasoning_detection_ignores_history_preservation_controls() {
