@@ -447,15 +447,15 @@ pub fn evaluate_catalog_canary_embedding_cosine_probe(
 pub fn normalize_canary_transcript(value: &str) -> String {
     let mut normalized = String::new();
     let mut pending_space = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else {
             if pending_space && !normalized.is_empty() {
                 normalized.push(' ');
             }
             normalized.push(ch);
             pending_space = false;
-        } else if ch.is_whitespace() || ch.is_ascii_punctuation() {
-            pending_space = true;
         }
     }
     normalized
@@ -930,6 +930,29 @@ mod tests {
             evaluate_catalog_canary_perceptual_hash_probe(&spec(), &expected, &missing, 9_000);
         assert_eq!(fail.total_positions, 32);
         assert!(!fail.pass);
+    }
+
+    #[test]
+    fn transcript_match_preserves_case_and_punctuation_but_collapses_whitespace() {
+        let expected = BTreeMap::from([(
+            "fixed".to_owned(),
+            "Hello, world!  Mayhem works.".to_owned(),
+        )]);
+        let whitespace_only = BTreeMap::from([(
+            "fixed".to_owned(),
+            "  Hello, world!\nMayhem works.  ".to_owned(),
+        )]);
+        assert!(
+            evaluate_catalog_canary_transcript_match_probe(&spec(), &expected, &whitespace_only)
+                .pass
+        );
+
+        for observed in ["hello, world! Mayhem works.", "Hello world Mayhem works"] {
+            let mismatch = BTreeMap::from([("fixed".to_owned(), observed.to_owned())]);
+            assert!(
+                !evaluate_catalog_canary_transcript_match_probe(&spec(), &expected, &mismatch).pass
+            );
+        }
     }
 
     #[test]

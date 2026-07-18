@@ -7734,6 +7734,484 @@
         ]
       },
       "tier": "launch"
+    },
+    {
+      "adapter": {
+        "chat_template_id": "generic_chatml",
+        "endpoint_families": [
+          {
+            "family": "openai_audio_transcriptions",
+            "interaction_groups": [
+              [
+                "response_format",
+                "timestamp_granularities"
+              ]
+            ],
+            "request_attribute_specs": {
+              "file": {
+                "calibration_values": [
+                  {
+                    "blake3": "$AUDIO_BLAKE3",
+                    "bytes": "$AUDIO_BYTES",
+                    "content_type": "$AUDIO_CONTENT_TYPE",
+                    "filename": "$AUDIO_FILENAME"
+                  }
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "nvidia/parakeet-tdt-0.6b-v3"
+                ],
+                "enum_values": [
+                  "nvidia/parakeet-tdt-0.6b-v3"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "response_format": {
+                "calibration_values": [
+                  "json",
+                  "text",
+                  "srt",
+                  "verbose_json",
+                  "vtt"
+                ],
+                "default": "json",
+                "enum_values": [
+                  "json",
+                  "text",
+                  "srt",
+                  "verbose_json",
+                  "vtt"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "timestamp_granularities": {
+                "calibration_values": [
+                  [
+                    "word"
+                  ],
+                  [
+                    "segment"
+                  ]
+                ],
+                "default": [
+                  "segment"
+                ],
+                "enum_values": [
+                  "word",
+                  "segment"
+                ],
+                "max_items": 2,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              }
+            },
+            "request_attributes": [
+              "file",
+              "model",
+              "response_format",
+              "timestamp_granularities"
+            ],
+            "required_request_attributes": [
+              "file",
+              "model"
+            ],
+            "required_response_attributes": [
+              "text",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "duration": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 86400,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "segments": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "task": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "text": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "words": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              }
+            },
+            "response_attributes": [
+              "text",
+              "task",
+              "duration",
+              "words",
+              "segments",
+              "usage",
+              "mayhem"
+            ]
+          },
+          {
+            "family": "hf_automatic_speech_recognition",
+            "interaction_groups": [],
+            "request_attribute_specs": {
+              "inputs": {
+                "calibration_values": [
+                  "$AUDIO_BASE64",
+                  {
+                    "content_type": "$AUDIO_CONTENT_TYPE",
+                    "data": "$AUDIO_BASE64",
+                    "filename": "$AUDIO_FILENAME"
+                  }
+                ],
+                "value_types": [
+                  "string",
+                  "object"
+                ]
+              },
+              "parameters.return_timestamps": {
+                "calibration_values": [
+                  false,
+                  true,
+                  "word",
+                  "segment"
+                ],
+                "enum_values": [
+                  false,
+                  true,
+                  "word",
+                  "segment"
+                ],
+                "value_types": [
+                  "string",
+                  "boolean"
+                ]
+              }
+            },
+            "request_attributes": [
+              "inputs",
+              "parameters.return_timestamps"
+            ],
+            "required_request_attributes": [
+              "inputs"
+            ],
+            "required_response_attributes": [
+              "text",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "chunks": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "text": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "text",
+              "chunks",
+              "usage",
+              "mayhem"
+            ]
+          }
+        ],
+        "modality_set": [
+          "audio",
+          "text"
+        ],
+        "reasoning_passthrough": "strip",
+        "specialities": [],
+        "tool_call_strategy": "none"
+      },
+      "artifacts": {
+        "safetensors": {
+          "artifact_root": "ed83bbb836ba9f0c9d5b40eb51b8d0732ace55b143369f117409119e756aedb2",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "download_check": true,
+          "engine": "transformers-asr",
+          "notes": "Pinned byte-identical Transformers safetensors release with all processor/tokenizer sidecars. Transformers is the portable serving backend; NeMo remains the NVIDIA reference format.",
+          "path": "model.safetensors",
+          "sidecars": {
+            "transformers_config": {
+              "artifact_root": "6575333cfdbabe85987605b248fcc2b7b54b383a204835f8b6f34ba56266e2de",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "path": "config.json",
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+                "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+              },
+              "source_sha256": "e747b85e1bdfd300c8b8ac63bac8dd5221f8fe9bc275b48d06c735fcd6971b6e",
+              "weights_bytes": 1153
+            },
+            "transformers_generation_config": {
+              "artifact_root": "b243b2ac31345977a188b99c82b5492ae926ea863abbc469fcc8c60ed814ecab",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "path": "generation_config.json",
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+                "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+              },
+              "source_sha256": "b141de6ec6d7f982ece13f98f604e3fe1807ea9c0e839185d0ab7064604209d0",
+              "weights_bytes": 289
+            },
+            "transformers_processor_config": {
+              "artifact_root": "e17006d3560ed049e182a1e099569642222316c2e4a15ba543e73d8b138de98c",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "path": "processor_config.json",
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+                "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+              },
+              "source_sha256": "8346a93a3b987fa1dec57a78f045cd0817d21786589a5a096b41a57a446fd1d7",
+              "weights_bytes": 392
+            },
+            "transformers_tokenizer_config": {
+              "artifact_root": "2834949e044704ba4a98840dea23319287e42ea1a9ed81f93287c6698c7016e7",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "path": "tokenizer_config.json",
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+                "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+              },
+              "source_sha256": "0b2fe0037599ee335f0b972fa682bf0ece74e4ccfec755cb7daa3405d3d3e874",
+              "weights_bytes": 290
+            },
+            "transformers_tokenizer_json": {
+              "artifact_root": "452b136f2f4977897650cabfab99594b7e6cc64ea2c7534cefecc2bac6b46797",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "path": "tokenizer.json",
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+                "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+              },
+              "source_sha256": "bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91",
+              "weights_bytes": 1159960
+            }
+          },
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers",
+            "revision": "a83f71f1a8a1cf099b5dbe23262c5028ad931086"
+          },
+          "source_sha256": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+          "upstream_source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "nvidia/parakeet-tdt-0.6b-v3",
+            "revision": "7c35754d166cca382ad1e53e68b01e7c575f3a1d"
+          },
+          "weights_bytes": 2508311120
+        }
+      },
+      "canary": {
+        "match_min": 1,
+        "set_id": "canary-stt-launch-v2",
+        "transcripts": {
+          "safetensors": {
+            "stt-de-auto-language": "Guten Morgen, OpenMyem funktioniert.",
+            "stt-en-punctuation-auto-language": "Hello, world, open mayhem works.",
+            "stt-long-overlap-chunking": "Hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world, hello world"
+          }
+        },
+        "verification_method": "transcript_match"
+      },
+      "caps": {
+        "audio": true,
+        "ctx_max": 1,
+        "image": false,
+        "json": false,
+        "output_modalities": [
+          "text"
+        ],
+        "output_modality": "text",
+        "tools": false,
+        "video": false,
+        "vision": false
+      },
+      "family": "parakeet-tdt",
+      "modality_assessment": {
+        "calibrated_fingerprints": {
+          "safetensors": {
+            "audio": "1ac9beb87da1f107d5c4ee4512443a4110c1c9fd6680ac70f18d40c8bc6c3811",
+            "text": "1ac9beb87da1f107d5c4ee4512443a4110c1c9fd6680ac70f18d40c8bc6c3811"
+          }
+        },
+        "detected": [
+          "audio",
+          "text"
+        ],
+        "evidence": [
+          "Pinned NVIDIA card/config and Transformers AutoModelForTDT/AutoProcessor pipeline expose 16 kHz mono WAV/FLAC speech input, automatic recognition across 25 languages, model-native punctuation and capitalization, canonical predicted-duration word/segment timestamps, and bounded overlapping long-audio chunking. The model does not expose forced-language, prompt, sampling, or streaming controls."
+        ],
+        "resource_profiles": {
+          "safetensors": {
+            "audio": {
+              "unit": "second",
+              "measurement_source": "process_rss; pool=system_memory; host available memory; --memory-reserve override 20% = 12.62GiB",
+              "max_item_bytes": 4151852,
+              "max_item_units": 130,
+              "measured_item_bytes": 4151852,
+              "measured_item_units": 130,
+              "measured_working_set_bytes": 24960000,
+              "calibration_baseline_memory_bytes": 22597632,
+              "calibration_peak_memory_bytes": 28196864,
+              "calibration_f13_budget_bytes": 42173741465,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "model_class": "stt",
+      "model_id": "nvidia/parakeet-tdt-0.6b-v3",
+      "params_b": 0.627,
+      "price_ref_au": {
+        "denom": "au_usd",
+        "rate_map": [
+          {
+            "granularity": 60,
+            "per_unit_au": "1000000000000000",
+            "unit": "audio_second"
+          }
+        ]
+      },
+      "provenance": {
+        "conversion": [
+          {
+            "input_sha256": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+            "method": "immutable-byte-mirror:nvidia/parakeet-tdt-0.6b-v3@7c35754d166cca382ad1e53e68b01e7c575f3a1d",
+            "output_sha256": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+            "tool": "huggingface_hub"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "license_sha256": "9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411",
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "nvidia/parakeet-tdt-0.6b-v3",
+          "revision": "7c35754d166cca382ad1e53e68b01e7c575f3a1d"
+        }
+      },
+      "requirements": {
+        "backends": [
+          "transformers-asr"
+        ],
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "min_ram_gb": 8,
+        "min_vram_gb_full_offload": 4
+      },
+      "sampling": {},
+      "speciality_assessment": {
+        "calibrated": {},
+        "detected": [],
+        "evidence": [
+          "Pinned card, config, generation config, processor, tokenizer, Transformers implementation, and NeMo reference expose no reasoning-effort or other model speciality levels."
+        ],
+        "unsupported": {}
+      },
+      "tier": "launch"
     }
   ],
   "schema_version": 1

@@ -2938,6 +2938,26 @@ fn validate_artifact(
             }
         }
     }
+    if artifact.engine == "transformers-asr" {
+        for (required, expected_path) in [
+            ("transformers_config", "config.json"),
+            ("transformers_generation_config", "generation_config.json"),
+            ("transformers_processor_config", "processor_config.json"),
+            ("transformers_tokenizer_json", "tokenizer.json"),
+            ("transformers_tokenizer_config", "tokenizer_config.json"),
+        ] {
+            match artifact.sidecars.get(required) {
+                Some(sidecar) if sidecar.path == expected_path => {}
+                Some(sidecar) => errors.push(format!(
+                    "{model_id}/{name} transformers-asr sidecar {required} must use path {expected_path}, got {}",
+                    sidecar.path
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} transformers-asr artifact needs sidecar {required}"
+                )),
+            }
+        }
+    }
     match (&artifact.stable_diffusion_cpp, artifact.engine.as_str()) {
         (Some(config), "stable-diffusion.cpp") => {
             if let Err(error) = config.validate() {

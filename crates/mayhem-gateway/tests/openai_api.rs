@@ -2601,6 +2601,140 @@ async fn hf_audio_transcription_returns_requested_timestamp_chunks() {
 }
 
 #[tokio::test]
+async fn hf_audio_transcription_accepts_raw_wav_and_rejects_mismatched_mime() {
+    let state = test_gateway_state_from_models(vec![routed_hf_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let wav = tiny_wav_bytes(32_000);
+
+    let (status, _, bytes) = raw_bytes_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        wav.clone(),
+        &[("content-type", "audio/wav")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&bytes).expect("raw HF ASR response JSON");
+    assert_eq!(body["text"], "hello mayhem");
+    assert_eq!(
+        state.receipts()[0]
+            .receipt
+            .body
+            .usage
+            .get(USAGE_AUDIO_SECOND),
+        2
+    );
+
+    let (status, body) = json_request(
+        app.clone(),
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        json!({
+            "inputs": {
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav),
+                "content_type": "audio/wav",
+                "filename": "arbitrary-user-audio.wav",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["text"], "hello mayhem");
+
+    let (status, _, bytes) = raw_bytes_request_with_headers(
+        app,
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        wav,
+        &[("content-type", "audio/flac")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&bytes).expect("MIME mismatch error JSON");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not match audio/wav bytes"));
+    assert_eq!(state.receipts().len(), 2);
+}
+
+#[tokio::test]
+async fn hf_audio_transcription_meters_flac_streaminfo_duration() {
+    let state = test_gateway_state_from_models(vec![routed_hf_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let flac = tiny_flac_bytes();
+    let request = json!({
+        "inputs": base64::engine::general_purpose::STANDARD.encode(flac)
+    });
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["text"], "hello mayhem");
+    assert_eq!(
+        state.receipts()[0]
+            .receipt
+            .body
+            .usage
+            .get(USAGE_AUDIO_SECOND),
+        3
+    );
+    assert_eq!(state.receipts()[0].receipt.body.au_owed_cum, 750);
+}
+
+#[tokio::test]
+async fn audio_duration_rejects_forged_wav_geometry_and_decodes_flac_frames() {
+    let state = test_gateway_state_from_models(vec![routed_hf_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
+    let app = openai_router(state.clone());
+
+    let mut wav = tiny_wav_bytes(32_000);
+    wav[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+    let (status, _) = json_request(
+        app.clone(),
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        json!({
+            "inputs": base64::engine::general_purpose::STANDARD.encode(wav),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(state.receipts().is_empty());
+
+    let mut flac = tiny_flac_bytes();
+    let packed = u64::from_be_bytes(flac[18..26].try_into().expect("STREAMINFO packed field"));
+    let forged = (packed & !0x0000_000f_ffff_ffff) | 1;
+    flac[18..26].copy_from_slice(&forged.to_be_bytes());
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/hf-inference/models/admin/stt-fixture",
+        json!({
+            "inputs": base64::engine::general_purpose::STANDARD.encode(flac),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state.receipts()[0]
+            .receipt
+            .body
+            .usage
+            .get(USAGE_AUDIO_SECOND),
+        3
+    );
+}
+
+#[tokio::test]
 async fn automatic_transcript_match_probe_records_pass() {
     let state = test_gateway_state_from_models(vec![routed_audio_transcription_test_model()])
         .with_canary_registry(test_transcript_canary_registry(tiny_wav_bytes(16_000)))
@@ -2648,6 +2782,18 @@ async fn automatic_transcript_match_probe_records_pass() {
     assert!(probe.pass);
     assert_eq!(probe.match_bps, 10_000);
     assert_eq!(probe.evidence["receipts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        probe.evidence["evidence"]["prompts"][0]["word_timestamp_count"],
+        2
+    );
+    assert_eq!(
+        probe.evidence["evidence"]["prompts"][0]["segment_timestamp_count"],
+        2
+    );
+    assert_eq!(
+        probe.evidence["evidence"]["prompts"][0]["request"]["timestamp_granularities"],
+        json!(["word", "segment"])
+    );
 }
 
 #[tokio::test]
@@ -4129,10 +4275,7 @@ fn audio_speech_usage_for_test(request: &AudioSpeechRequest, audio: &[u8]) -> Re
 }
 
 fn audio_transcription_usage_for_test(request: &AudioTranscriptionRequest) -> ReceiptUsage {
-    ReceiptUsage::from_units([(
-        USAGE_AUDIO_SECOND,
-        wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
-    )])
+    ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, request.audio_seconds)])
 }
 
 fn image_steps_for_test(request: &ImageGenerationRequest) -> u64 {
@@ -4302,6 +4445,10 @@ fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
     bytes
 }
 
+fn tiny_flac_bytes() -> Vec<u8> {
+    include_bytes!("fixtures/stt-32001-samples.flac").to_vec()
+}
+
 fn wav_duration_seconds_ceil_for_test(bytes: &[u8]) -> Option<u64> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
@@ -4326,6 +4473,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 verification_tolerance_bps: None,
                 prompts: vec![GatewayCanaryPrompt {
                     id: "fixed-probe".to_owned(),
+                    calibration_only: false,
                     messages: vec![ChatMessage {
                         role: "user".to_owned(),
                         content: json!("fixed canary prompt"),
@@ -4350,6 +4498,8 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     language: None,
                     voice: None,
                     response_format: None,
+                    require_word_timestamps: false,
+                    require_segment_timestamps: false,
                     size: None,
                     steps: None,
                     cfg_scale: None,
@@ -4392,6 +4542,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 verification_tolerance_bps: Some(500),
                 prompts: vec![GatewayCanaryPrompt {
                     id: "fixed-image".to_owned(),
+                    calibration_only: false,
                     messages: Vec::new(),
                     tools: None,
                     specialities: BTreeMap::new(),
@@ -4411,6 +4562,8 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     language: None,
                     voice: None,
                     response_format: None,
+                    require_word_timestamps: false,
+                    require_segment_timestamps: false,
                     size: Some("64x64".to_owned()),
                     steps: Some(1),
                     cfg_scale: Some(1.0),
@@ -4450,6 +4603,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 verification_tolerance_bps: Some(100),
                 prompts: vec![GatewayCanaryPrompt {
                     id: "fixed-embedding".to_owned(),
+                    calibration_only: false,
                     messages: Vec::new(),
                     tools: None,
                     specialities: BTreeMap::new(),
@@ -4469,6 +4623,8 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     language: None,
                     voice: None,
                     response_format: None,
+                    require_word_timestamps: false,
+                    require_segment_timestamps: false,
                     size: None,
                     steps: None,
                     cfg_scale: None,
@@ -4497,6 +4653,39 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
 }
 
 fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
+    let runtime_prompt = GatewayCanaryPrompt {
+        id: "fixed-stt".to_owned(),
+        calibration_only: false,
+        messages: Vec::new(),
+        tools: None,
+        specialities: BTreeMap::new(),
+        max_tokens: 1,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        min_p: None,
+        repeat_penalty: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        prompt: None,
+        input: None,
+        audio_b64: Some(base64::engine::general_purpose::STANDARD.encode(audio)),
+        content_type: Some("audio/wav".to_owned()),
+        filename: Some("fixed-stt.wav".to_owned()),
+        language: Some("en".to_owned()),
+        voice: None,
+        response_format: Some("json".to_owned()),
+        require_word_timestamps: true,
+        require_segment_timestamps: true,
+        size: None,
+        steps: None,
+        cfg_scale: None,
+        shift: None,
+        seed: None,
+    };
+    let mut calibration_prompt = runtime_prompt.clone();
+    calibration_prompt.id = "long-calibration-only".to_owned();
+    calibration_prompt.calibration_only = true;
     GatewayCanaryRegistry {
         models: BTreeMap::from([(
             "admin/stt-fixture".to_owned(),
@@ -4506,40 +4695,20 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 match_min_bps: 10_000,
                 verification_method: "transcript_match".to_owned(),
                 verification_tolerance_bps: None,
-                prompts: vec![GatewayCanaryPrompt {
-                    id: "fixed-stt".to_owned(),
-                    messages: Vec::new(),
-                    tools: None,
-                    specialities: BTreeMap::new(),
-                    max_tokens: 1,
-                    temperature: None,
-                    top_p: None,
-                    top_k: None,
-                    min_p: None,
-                    repeat_penalty: None,
-                    frequency_penalty: None,
-                    presence_penalty: None,
-                    prompt: None,
-                    input: None,
-                    audio_b64: Some(base64::engine::general_purpose::STANDARD.encode(audio)),
-                    content_type: Some("audio/wav".to_owned()),
-                    filename: Some("fixed-stt.wav".to_owned()),
-                    language: Some("en".to_owned()),
-                    voice: None,
-                    response_format: Some("json".to_owned()),
-                    size: None,
-                    steps: None,
-                    cfg_scale: None,
-                    shift: None,
-                    seed: None,
-                }],
+                prompts: vec![runtime_prompt, calibration_prompt],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
-                    BTreeMap::from([("fixed-stt".to_owned(), "Hello, mayhem!".to_owned())]),
+                    BTreeMap::from([
+                        ("fixed-stt".to_owned(), "hello mayhem".to_owned()),
+                        (
+                            "long-calibration-only".to_owned(),
+                            "must never run live".to_owned(),
+                        ),
+                    ]),
                 )]),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
@@ -4566,6 +4735,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 verification_tolerance_bps: None,
                 prompts: vec![GatewayCanaryPrompt {
                     id: "fixed-tts".to_owned(),
+                    calibration_only: false,
                     messages: Vec::new(),
                     tools: None,
                     specialities: BTreeMap::new(),
@@ -4585,6 +4755,8 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     language: None,
                     voice: Some("launch".to_owned()),
                     response_format: Some("wav".to_owned()),
+                    require_word_timestamps: false,
+                    require_segment_timestamps: false,
                     size: None,
                     steps: None,
                     cfg_scale: None,

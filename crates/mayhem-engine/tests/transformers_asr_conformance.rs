@@ -3,6 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -99,6 +100,32 @@ fn request(content_type: &str) -> AudioTranscriptionRequest {
         language: None,
         prompt: None,
     }
+}
+
+#[test]
+fn transformers_asr_worker_uses_canonical_timestamps_and_stitches_overlap() {
+    let test = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("transformers_asr_worker_test.py");
+    let python = std::env::var_os("MAYHEM_TRANSFORMERS_ASR_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    let output = Command::new(&python)
+        .arg(&test)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "running worker logic tests with {} failed: {error}",
+                python.display()
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "worker logic tests failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

@@ -54,7 +54,7 @@ use crate::{
     ReputationEventKind,
 };
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
@@ -80,17 +80,18 @@ use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
     metered_output_units, payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, validate_transcription_result, AttestationReport, CheckpointPolicy,
-    CtxBracketSchedule, EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    stable_json_bytes, validate_transcription_result, validated_audio_metadata,
+    validated_wav_audio_metadata, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SessionReceipt, SpendVoucher, SpendVoucherBody, TranscriptionResult, TranscriptionResultLimits,
-    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
-    USAGE_VIDEO_SECOND,
+    ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -146,6 +147,8 @@ const EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-embedding-launch-v1.json");
 const EMBEDDED_CANARY_TTS_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-tts-launch-v1.json");
+const EMBEDDED_CANARY_STT_LAUNCH_V2: &str =
+    include_str!("../../../catalog/canaries/canary-stt-launch-v2.json");
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
@@ -1643,6 +1646,7 @@ pub struct GatewayCanaryModelConfig {
 #[derive(Clone, Debug)]
 pub struct GatewayCanaryPrompt {
     pub id: String,
+    pub calibration_only: bool,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Value>>,
     pub specialities: BTreeMap<String, String>,
@@ -1662,6 +1666,8 @@ pub struct GatewayCanaryPrompt {
     pub language: Option<String>,
     pub voice: Option<String>,
     pub response_format: Option<String>,
+    pub require_word_timestamps: bool,
+    pub require_segment_timestamps: bool,
     pub size: Option<String>,
     pub steps: Option<u64>,
     pub cfg_scale: Option<f32>,
@@ -1986,6 +1992,7 @@ struct VideoContentQuery {
 pub struct AudioTranscriptionRequest {
     pub model: String,
     pub audio: Vec<u8>,
+    pub audio_seconds: u64,
     pub content_type: Option<String>,
     pub filename: Option<String>,
     pub response_format: Option<String>,
@@ -1996,6 +2003,65 @@ pub struct AudioTranscriptionRequest {
     pub stream: bool,
     pub endpoint_family: String,
     pub contract_request: Value,
+}
+
+#[derive(Clone, Debug)]
+struct HfRawAudio {
+    bytes: Vec<u8>,
+    content_type: String,
+    filename: String,
+}
+
+#[derive(Clone, Debug)]
+struct HfInferencePayload {
+    contract_request: Value,
+    raw_audio: Option<HfRawAudio>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalHfAsrObjectInput {
+    pub contract_request: Value,
+    pub audio: Vec<u8>,
+    pub content_type: String,
+    pub filename: String,
+}
+
+pub fn canonicalize_hf_asr_object_input(
+    mut contract_request: Value,
+) -> Result<Option<CanonicalHfAsrObjectInput>, String> {
+    let Some(input) = contract_request.get("inputs").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let encoded = input
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "HF ASR inputs object requires base64 data".to_owned())?;
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("inputs.data is not valid base64 audio: {err}"))?;
+    let declared_content_type = input.get("content_type").and_then(Value::as_str);
+    let audio =
+        bounded_audio_metadata(&bytes, declared_content_type).map_err(|error| error.message)?;
+    let filename = input
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(audio.filename)
+        .to_owned();
+    let content_type = audio.content_type.to_owned();
+    contract_request["inputs"] = json!({
+        "encoding": "raw",
+        "bytes": bytes.len(),
+        "blake3": blake3_hex(&bytes),
+        "content_type": content_type,
+    });
+    Ok(Some(CanonicalHfAsrObjectInput {
+        contract_request,
+        audio: bytes,
+        content_type,
+        filename,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5599,7 +5665,7 @@ async fn create_hf_inference(
     State(state): State<SharedState>,
     Path(model_path): Path<String>,
     headers: HeaderMap,
-    Json(raw_request): Json<Value>,
+    body: Bytes,
 ) -> Response {
     let (model_id, endpoint_family) = match hf_inference_target(&state, &model_path) {
         Ok(target) => target,
@@ -5609,12 +5675,23 @@ async fn create_hf_inference(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    let raw_request =
-        match normalize_catalog_endpoint_request(&state, &model_id, &endpoint_family, &raw_request)
-        {
-            Ok(normalized) => normalized,
-            Err(err) => return err.into_response(),
-        };
+    let payload = match parse_hf_inference_payload(&headers, &endpoint_family, body) {
+        Ok(payload) => payload,
+        Err(err) => return err.into_response(),
+    };
+    let contract_request = match normalize_catalog_endpoint_request(
+        &state,
+        &model_id,
+        &endpoint_family,
+        &payload.contract_request,
+    ) {
+        Ok(normalized) => normalized,
+        Err(err) => return err.into_response(),
+    };
+    let payload = HfInferencePayload {
+        contract_request,
+        raw_audio: payload.raw_audio,
+    };
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -5625,7 +5702,7 @@ async fn create_hf_inference(
         &headers,
         &endpoint_family,
         &model_id,
-        &raw_request,
+        &payload.contract_request,
         &options.access_token,
     )
     .await
@@ -5640,7 +5717,7 @@ async fn create_hf_inference(
         let job_id = job.id.clone();
         spawn_gateway_job_request(
             job,
-            execute_hf_inference_job(state, model_id, endpoint_family, raw_request, options),
+            execute_hf_inference_job(state, model_id, endpoint_family, payload, options),
         );
         return gateway_job_pending_response(&job_id);
     }
@@ -5649,7 +5726,7 @@ async fn create_hf_inference(
     let result = run_detached_gateway_job_request(
         cancellation,
         job.clone(),
-        execute_hf_inference_job(state, model_id, endpoint_family, raw_request, options),
+        execute_hf_inference_job(state, model_id, endpoint_family, payload, options),
     )
     .await;
     match result {
@@ -5661,13 +5738,92 @@ async fn create_hf_inference(
     }
 }
 
+fn parse_hf_inference_payload(
+    headers: &HeaderMap,
+    endpoint_family: &str,
+    body: Bytes,
+) -> Result<HfInferencePayload, ApiError> {
+    let declared_content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let json_body = declared_content_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/json")
+            || value.to_ascii_lowercase().starts_with("application/json;")
+    }) || declared_content_type.is_none()
+        && body
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(b'{');
+    if json_body {
+        let contract_request = serde_json::from_slice::<Value>(&body).map_err(|err| {
+            ApiError::bad_request(format!("invalid HF JSON request: {err}"), Some("body"))
+        })?;
+        let (contract_request, raw_audio) = if endpoint_family
+            == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
+            && contract_request.get("inputs").is_some_and(Value::is_object)
+        {
+            let canonical = canonicalize_hf_asr_object_input(contract_request)
+                .map_err(|error| ApiError::bad_request(error, Some("inputs")))?
+                .expect("object input was checked above");
+            (
+                canonical.contract_request,
+                Some(HfRawAudio {
+                    bytes: canonical.audio,
+                    content_type: canonical.content_type,
+                    filename: canonical.filename,
+                }),
+            )
+        } else {
+            (contract_request, None)
+        };
+        return Ok(HfInferencePayload {
+            contract_request,
+            raw_audio,
+        });
+    }
+    if endpoint_family != mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+        return Err(ApiError::bad_request(
+            "this HF task endpoint requires an application/json request",
+            Some("body"),
+        ));
+    }
+    if body.is_empty() {
+        return Err(ApiError::bad_request(
+            "raw HF ASR request body must not be empty",
+            Some("body"),
+        ));
+    }
+    let bytes = body.to_vec();
+    let audio = bounded_audio_metadata(&bytes, declared_content_type)?;
+    let contract_request = json!({
+        "inputs": {
+            "encoding": "raw",
+            "bytes": bytes.len(),
+            "blake3": blake3_hex(&bytes),
+            "content_type": audio.content_type,
+        },
+    });
+    Ok(HfInferencePayload {
+        contract_request,
+        raw_audio: Some(HfRawAudio {
+            bytes,
+            content_type: audio.content_type.to_owned(),
+            filename: audio.filename.to_owned(),
+        }),
+    })
+}
+
 async fn execute_hf_inference_job(
     state: SharedState,
     model_id: String,
     endpoint_family: String,
-    raw_request: Value,
+    payload: HfInferencePayload,
     options: GatewayRequestOptions,
 ) -> Result<Response, ApiError> {
+    let raw_request = payload.contract_request;
     match endpoint_family.as_str() {
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
             let request = hf_embedding_request(&model_id, raw_request)?;
@@ -5684,7 +5840,8 @@ async fn execute_hf_inference_job(
             build_audio_speech(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
-            let request = hf_audio_transcription_request(&model_id, raw_request)?;
+            let request =
+                hf_audio_transcription_request(&model_id, raw_request, payload.raw_audio)?;
             build_audio_transcription(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
@@ -5943,15 +6100,54 @@ fn hf_audio_speech_request(
 fn hf_audio_transcription_request(
     model_id: &str,
     raw_request: Value,
+    raw_audio: Option<HfRawAudio>,
 ) -> Result<AudioTranscriptionRequest, ApiError> {
-    let encoded = raw_request
-        .get("inputs")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?;
-    let audio = BASE64_STANDARD.decode(encoded).map_err(|err| {
+    let (audio, content_type, filename) = if let Some(raw_audio) = raw_audio {
+        let descriptor = raw_request
+            .get("inputs")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "raw HF ASR request is missing its signed input descriptor",
+                    Some("inputs"),
+                )
+            })?;
+        let raw_blake3 = blake3_hex(&raw_audio.bytes);
+        if descriptor.get("encoding").and_then(Value::as_str) != Some("raw")
+            || descriptor.get("bytes").and_then(Value::as_u64)
+                != Some(u64::try_from(raw_audio.bytes.len()).unwrap_or(u64::MAX))
+            || descriptor.get("blake3").and_then(Value::as_str) != Some(raw_blake3.as_str())
+            || descriptor.get("content_type").and_then(Value::as_str)
+                != Some(raw_audio.content_type.as_str())
+        {
+            return Err(ApiError::bad_request(
+                "raw HF ASR input descriptor does not match the request body",
+                Some("inputs"),
+            ));
+        }
+        (raw_audio.bytes, raw_audio.content_type, raw_audio.filename)
+    } else {
+        let encoded = raw_request
+            .get("inputs")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?;
+        let audio = BASE64_STANDARD.decode(encoded).map_err(|err| {
+            ApiError::bad_request(
+                format!("inputs is not valid base64 audio: {err}"),
+                Some("inputs"),
+            )
+        })?;
+        let metadata = bounded_audio_metadata(&audio, None)?;
+        (
+            audio,
+            metadata.content_type.to_owned(),
+            metadata.filename.to_owned(),
+        )
+    };
+    let audio_seconds = audio_duration_seconds_ceil(&audio).ok_or_else(|| {
         ApiError::bad_request(
-            format!("inputs is not valid base64 audio: {err}"),
+            "HF ASR input must be a valid bounded WAV or FLAC file",
             Some("inputs"),
         )
     })?;
@@ -5974,8 +6170,9 @@ fn hf_audio_transcription_request(
     Ok(AudioTranscriptionRequest {
         model: model_id.to_owned(),
         audio,
-        content_type: Some("audio/wav".to_owned()),
-        filename: Some("audio.wav".to_owned()),
+        audio_seconds,
+        content_type: Some(content_type),
+        filename: Some(filename),
         response_format: Some("json".to_owned()),
         language: None,
         prompt: None,
@@ -7522,6 +7719,8 @@ struct CanarySetDocument {
 struct CanaryPromptDocument {
     id: String,
     #[serde(default)]
+    calibration_only: bool,
+    #[serde(default)]
     messages: Vec<ChatMessage>,
     #[serde(default)]
     tools: Option<Vec<Value>>,
@@ -7559,6 +7758,10 @@ struct CanaryPromptDocument {
     voice: Option<String>,
     #[serde(default)]
     response_format: Option<String>,
+    #[serde(default)]
+    require_word_timestamps: bool,
+    #[serde(default)]
+    require_segment_timestamps: bool,
     #[serde(default)]
     size: Option<String>,
     #[serde(default)]
@@ -7602,6 +7805,13 @@ fn canary_registry_from_catalog_root(
         let Some(prompts) = canary_sets.get(canary_set).cloned() else {
             continue;
         };
+        let prompts = prompts
+            .into_iter()
+            .filter(|prompt| !prompt.calibration_only)
+            .collect::<Vec<_>>();
+        if prompts.is_empty() {
+            continue;
+        }
         let match_min_bps = canary
             .get("match_min")
             .and_then(Value::as_f64)
@@ -7899,6 +8109,7 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
         EMBEDDED_CANARY_IMAGE_LAUNCH_V1,
         EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1,
         EMBEDDED_CANARY_TTS_LAUNCH_V1,
+        EMBEDDED_CANARY_STT_LAUNCH_V2,
     ]
     .into_iter()
     .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
@@ -7911,6 +8122,7 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
         .into_iter()
         .map(|prompt| GatewayCanaryPrompt {
             id: prompt.id,
+            calibration_only: prompt.calibration_only,
             messages: prompt.messages,
             tools: prompt.tools,
             specialities: prompt.specialities,
@@ -7930,6 +8142,8 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             language: prompt.language,
             voice: prompt.voice,
             response_format: prompt.response_format,
+            require_word_timestamps: prompt.require_word_timestamps,
+            require_segment_timestamps: prompt.require_segment_timestamps,
             size: prompt.size,
             steps: prompt.steps,
             cfg_scale: prompt.cfg_scale,
@@ -10627,12 +10841,12 @@ fn direct_session_audio_transcription_request_body(request: &AudioTranscriptionR
         "kind": "audio_transcription",
         "model": &request.model,
         "audio": {
-            "encoding": "hex",
+            "encoding": "base64",
             "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
             "filename": request.filename.as_deref().unwrap_or("audio.wav"),
-            "data": hex_encode(&request.audio),
+            "data": BASE64_STANDARD.encode(&request.audio),
         },
-        "audio_seconds": audio_transcription_seconds(request),
+        "audio_seconds": request.audio_seconds,
         "response_format": request.response_format.as_deref().unwrap_or("json"),
         "endpoint_family": &request.endpoint_family,
     });
@@ -18569,7 +18783,7 @@ fn request_requirements_for_audio_transcription(
     max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
-    let seconds = audio_transcription_seconds(request).max(1);
+    let seconds = request.audio_seconds.max(1);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
@@ -18588,7 +18802,7 @@ fn request_requirements_for_audio_transcription(
             },
         )]),
         min_ctx: 1,
-        input_tokens: audio_transcription_seconds(request),
+        input_tokens: request.audio_seconds,
         output_tokens: 0,
         usage: audio_transcription_usage_for_request(request),
         min_throughput,
@@ -19928,6 +20142,9 @@ async fn parse_audio_transcription_multipart(
         .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?;
     let audio =
         audio.ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?;
+    let audio_metadata = bounded_audio_metadata(&audio, content_type.as_deref())?;
+    let content_type = Some(audio_metadata.content_type.to_owned());
+    let filename = filename.or_else(|| Some(audio_metadata.filename.to_owned()));
     let mut contract_request = json!({
         "model": &model,
         "file": {
@@ -19966,6 +20183,7 @@ async fn parse_audio_transcription_multipart(
     Ok(AudioTranscriptionRequest {
         model,
         audio,
+        audio_seconds: audio_metadata.seconds,
         content_type,
         filename,
         response_format,
@@ -22095,6 +22313,22 @@ impl GatewayState {
                 .run_audio_transcription(model, &request, &invocation)
                 .await
                 .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            if prompt.require_word_timestamps && result.output.transcription.words.is_empty() {
+                return Err(ApiError::bad_gateway(
+                    format!("STT canary prompt {} requires word timestamps", prompt.id),
+                    Some("model"),
+                ));
+            }
+            if prompt.require_segment_timestamps && result.output.transcription.segments.is_empty()
+            {
+                return Err(ApiError::bad_gateway(
+                    format!(
+                        "STT canary prompt {} requires segment timestamps",
+                        prompt.id
+                    ),
+                    Some("model"),
+                ));
+            }
             observed_transcripts
                 .insert(prompt.id.clone(), result.output.transcription.text.clone());
             let receipt = self.meter_audio_transcription_session(
@@ -22111,6 +22345,8 @@ impl GatewayState {
                 "prompt_id": prompt.id,
                 "request": direct_session_audio_transcription_request_body(&request),
                 "transcript": result.output.transcription.text,
+                "word_timestamp_count": result.output.transcription.words.len(),
+                "segment_timestamp_count": result.output.transcription.segments.len(),
                 "session_id": invocation.session_id,
                 "receipt_hash": receipt_hash,
             }));
@@ -23922,7 +24158,7 @@ fn canary_expected_transcripts(
     config: &GatewayCanaryModelConfig,
     invocation: &GatewaySessionInvocation,
 ) -> Option<BTreeMap<String, String>> {
-    invocation
+    let mut expected = invocation
         .attestation
         .as_ref()
         .and_then(|attestation| {
@@ -23931,7 +24167,15 @@ fn canary_expected_transcripts(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_transcripts.clone())
+        .or_else(|| config.default_transcripts.clone())?;
+    let runtime_prompts = config
+        .prompts
+        .iter()
+        .filter(|prompt| !prompt.calibration_only)
+        .map(|prompt| prompt.id.as_str())
+        .collect::<BTreeSet<_>>();
+    expected.retain(|prompt_id, _| runtime_prompts.contains(prompt_id.as_str()));
+    (!expected.is_empty()).then_some(expected)
 }
 
 fn canary_expected_audio_fingerprints(
@@ -24254,6 +24498,8 @@ fn canary_audio_transcription_request(
             Some("model"),
         ));
     }
+    let audio_metadata =
+        bounded_audio_metadata(&audio, prompt.content_type.as_deref().or(Some("audio/wav")))?;
     let filename = prompt
         .filename
         .clone()
@@ -24262,6 +24508,13 @@ fn canary_audio_transcription_request(
         .response_format
         .clone()
         .unwrap_or_else(|| "json".to_owned());
+    let mut timestamp_granularities = Vec::new();
+    if prompt.require_word_timestamps {
+        timestamp_granularities.push("word".to_owned());
+    }
+    if prompt.require_segment_timestamps {
+        timestamp_granularities.push("segment".to_owned());
+    }
     let mut contract_request = json!({
         "model": model_id,
         "file": {
@@ -24272,6 +24525,9 @@ fn canary_audio_transcription_request(
         },
         "response_format": &response_format,
     });
+    if !timestamp_granularities.is_empty() {
+        contract_request["timestamp_granularities"] = json!(&timestamp_granularities);
+    }
     set_optional_json(
         &mut contract_request,
         "language",
@@ -24290,18 +24546,18 @@ fn canary_audio_transcription_request(
     Ok(AudioTranscriptionRequest {
         model: model_id.to_owned(),
         audio,
-        content_type: Some(
-            prompt
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "audio/wav".to_owned()),
-        ),
-        filename: Some(filename),
+        audio_seconds: audio_metadata.seconds,
+        content_type: Some(audio_metadata.content_type.to_owned()),
+        filename: Some(if filename.trim().is_empty() {
+            audio_metadata.filename.to_owned()
+        } else {
+            filename
+        }),
         response_format: Some(response_format),
         language: prompt.language.clone(),
         prompt: prompt.prompt.clone(),
         temperature: prompt.temperature,
-        timestamp_granularities: Vec::new(),
+        timestamp_granularities,
         stream: false,
         endpoint_family: mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS.to_owned(),
         contract_request,
@@ -25391,90 +25647,77 @@ fn stable_value_hash(value: &Value) -> String {
         .to_string()
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BoundedAudioMetadata {
+    content_type: &'static str,
+    filename: &'static str,
+    seconds: u64,
+}
+
+fn bounded_audio_metadata(
+    bytes: &[u8],
+    declared_content_type: Option<&str>,
+) -> Result<BoundedAudioMetadata, ApiError> {
+    let audio = validated_audio_metadata(bytes).ok_or_else(|| {
+        ApiError::bad_request(
+            "audio input must be a valid bounded WAV or FLAC file",
+            Some("file"),
+        )
+    })?;
+    let metadata = match audio.format {
+        ValidatedAudioFormat::Wav => BoundedAudioMetadata {
+            content_type: "audio/wav",
+            filename: "audio.wav",
+            seconds: audio.duration_seconds_ceil,
+        },
+        ValidatedAudioFormat::Flac => BoundedAudioMetadata {
+            content_type: "audio/flac",
+            filename: "audio.flac",
+            seconds: audio.duration_seconds_ceil,
+        },
+    };
+    if let Some(declared) = declared_content_type {
+        let declared = declared
+            .split(';')
+            .next()
+            .unwrap_or(declared)
+            .trim()
+            .to_ascii_lowercase();
+        let generic = matches!(
+            declared.as_str(),
+            "" | "application/octet-stream" | "binary/octet-stream"
+        );
+        let matches_format = match metadata.content_type {
+            "audio/wav" => matches!(
+                declared.as_str(),
+                "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave"
+            ),
+            "audio/flac" => matches!(declared.as_str(), "audio/flac" | "audio/x-flac"),
+            _ => false,
+        };
+        if !generic && !matches_format {
+            return Err(ApiError::bad_request(
+                format!(
+                    "declared content type {declared} does not match {} bytes",
+                    metadata.content_type
+                ),
+                Some("file"),
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+fn audio_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
+    Some(validated_audio_metadata(bytes)?.duration_seconds_ceil)
+}
+
 fn wav_sample_rate(bytes: &[u8]) -> Option<u32> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut offset = 12usize;
-    while offset.saturating_add(8) <= bytes.len() {
-        let chunk_id = &bytes[offset..offset + 4];
-        let chunk_len = u32::from_le_bytes([
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
-        let chunk_start = offset + 8;
-        let chunk_end = chunk_start.checked_add(chunk_len)?;
-        if chunk_end > bytes.len() {
-            return None;
-        }
-        if chunk_id == b"fmt " && chunk_len >= 16 {
-            let sample_rate = u32::from_le_bytes([
-                bytes[chunk_start + 4],
-                bytes[chunk_start + 5],
-                bytes[chunk_start + 6],
-                bytes[chunk_start + 7],
-            ]);
-            return (sample_rate > 0).then_some(sample_rate);
-        }
-        offset = chunk_end.checked_add(chunk_len % 2)?;
-    }
-    None
+    Some(validated_wav_audio_metadata(bytes)?.sample_rate)
 }
 
 fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut offset = 12usize;
-    let mut sample_rate = None;
-    let mut channels = None;
-    let mut bits_per_sample = None;
-    let mut data_len = None;
-    while offset.saturating_add(8) <= bytes.len() {
-        let chunk_id = &bytes[offset..offset + 4];
-        let chunk_len = u32::from_le_bytes([
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
-        let chunk_start = offset + 8;
-        let chunk_end = chunk_start.saturating_add(chunk_len).min(bytes.len());
-        if chunk_id == b"fmt " && chunk_len >= 16 && chunk_end <= bytes.len() {
-            channels = Some(u16::from_le_bytes([
-                bytes[chunk_start + 2],
-                bytes[chunk_start + 3],
-            ]));
-            sample_rate = Some(u32::from_le_bytes([
-                bytes[chunk_start + 4],
-                bytes[chunk_start + 5],
-                bytes[chunk_start + 6],
-                bytes[chunk_start + 7],
-            ]));
-            bits_per_sample = Some(u16::from_le_bytes([
-                bytes[chunk_start + 14],
-                bytes[chunk_start + 15],
-            ]));
-        } else if chunk_id == b"data" {
-            data_len = Some(chunk_len);
-        }
-        let padded = chunk_len + (chunk_len % 2);
-        offset = chunk_start.saturating_add(padded);
-    }
-    let sample_rate = u64::from(sample_rate?);
-    let channels = u64::from(channels?);
-    let bits_per_sample = u64::from(bits_per_sample?);
-    let data_len = u64::try_from(data_len?).ok()?;
-    let bytes_per_second = sample_rate
-        .saturating_mul(channels)
-        .saturating_mul(bits_per_sample)
-        .checked_div(8)?;
-    if bytes_per_second == 0 {
-        return None;
-    }
-    Some(data_len.div_ceil(bytes_per_second).max(1))
+    Some(validated_wav_audio_metadata(bytes)?.duration_seconds_ceil)
 }
 
 fn stable_json_value(value: &Value) -> Value {
@@ -25964,15 +26207,11 @@ fn audio_speech_usage_for_observed(
 }
 
 fn audio_transcription_usage_for_request(request: &AudioTranscriptionRequest) -> ReceiptUsage {
-    ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, audio_transcription_seconds(request))])
-}
-
-fn audio_transcription_seconds(request: &AudioTranscriptionRequest) -> u64 {
-    wav_duration_seconds_ceil(&request.audio).unwrap_or(1)
+    ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, request.audio_seconds)])
 }
 
 fn audio_transcription_failover_work_units(request: &AudioTranscriptionRequest) -> u64 {
-    audio_transcription_seconds(request).saturating_mul(1_000)
+    request.audio_seconds.saturating_mul(1_000)
 }
 
 fn artifact_generation_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
@@ -28783,6 +29022,7 @@ mod tests {
         };
         let prompt = GatewayCanaryPrompt {
             id: "sampling-high".to_owned(),
+            calibration_only: false,
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: json!("sample"),
@@ -28807,6 +29047,8 @@ mod tests {
             language: None,
             voice: None,
             response_format: None,
+            require_word_timestamps: false,
+            require_segment_timestamps: false,
             size: None,
             steps: None,
             cfg_scale: None,
@@ -29036,6 +29278,7 @@ mod tests {
             "canary-dev-v1".to_owned(),
             vec![GatewayCanaryPrompt {
                 id: "fixed-image".to_owned(),
+                calibration_only: false,
                 messages: Vec::new(),
                 tools: None,
                 specialities: BTreeMap::new(),
@@ -29055,6 +29298,8 @@ mod tests {
                 language: None,
                 voice: None,
                 response_format: None,
+                require_word_timestamps: false,
+                require_segment_timestamps: false,
                 size: Some("64x64".to_owned()),
                 steps: Some(1),
                 cfg_scale: Some(1.0),
@@ -29143,6 +29388,32 @@ mod tests {
         wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
         wav.extend_from_slice(&data);
         BASE64_STANDARD.encode(wav)
+    }
+
+    #[test]
+    fn hf_asr_object_input_canonicalization_preserves_public_parameters() {
+        let encoded = test_wav_b64();
+        let canonical = canonicalize_hf_asr_object_input(json!({
+            "inputs": {
+                "data": encoded,
+                "content_type": "audio/wav",
+                "filename": "speech.wav"
+            },
+            "parameters": {"return_timestamps": "word"}
+        }))
+        .unwrap()
+        .expect("object input");
+
+        assert_eq!(canonical.audio.len(), 8_044);
+        assert_eq!(canonical.content_type, "audio/wav");
+        assert_eq!(canonical.filename, "speech.wav");
+        assert_eq!(
+            canonical.contract_request["parameters"]["return_timestamps"],
+            "word"
+        );
+        assert_eq!(canonical.contract_request["inputs"]["encoding"], "raw");
+        assert_eq!(canonical.contract_request["inputs"]["bytes"], 8_044);
+        assert!(canonical.contract_request["inputs"].get("data").is_none());
     }
 
     #[test]

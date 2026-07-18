@@ -6,8 +6,8 @@ mod gemma4;
 mod python_runtime;
 
 use endpoint_calibration::{
-    run_endpoint_calibration_matrix, validate_endpoint_calibration_report,
-    EndpointCalibrationExecution, EndpointCalibrationReport,
+    normalize_endpoint_calibration_request, run_endpoint_calibration_matrix,
+    validate_endpoint_calibration_report, EndpointCalibrationExecution, EndpointCalibrationReport,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -96,11 +96,12 @@ use mayhem_proto::{
     ctx_bracket_table_at, default_ctx_bracket_schedule, metered_output_units, payload_chunk_at,
     payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
-    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SpendVoucher, TranscriptionResult, TranscriptionResultLimits,
-    TranscriptionTimestamp, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    stable_json_bytes, validate_ctx_bracket_schedule, validated_audio_metadata,
+    validated_wav_audio_metadata, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SpendVoucher, TranscriptionResult, TranscriptionResultLimits, TranscriptionTimestamp,
+    ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
@@ -12561,7 +12562,8 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             )?;
             ensure_launch_stable_token_count(model, "base canary", &reports)?;
         }
-        let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
+        let catalog_fingerprint =
+            aggregate_canary_fingerprint_for_method(&model.canary.verification_method, &reports);
         let modality_fingerprints =
             aggregate_calibrated_modality_fingerprints(model, &prompts, &reports)?;
         let modality_resource_profiles =
@@ -12768,9 +12770,16 @@ fn validate_resumed_canary_core(
                 max_tokens.max(1)
             );
         }
+        if report.verification_method == CANARY_VERIFICATION_TRANSCRIPT_MATCH {
+            validate_transcript_calibration_prompt_evidence(prompt, calibrated)?;
+        }
     }
     ensure!(
-        report.catalog_fingerprint == aggregate_canary_fingerprint(&report.prompts),
+        report.catalog_fingerprint
+            == aggregate_canary_fingerprint_for_method(
+                &report.verification_method,
+                &report.prompts,
+            ),
         "resume core report aggregate fingerprint does not bind its prompt reports"
     );
     let mut core_errors = Vec::new();
@@ -13267,8 +13276,7 @@ fn catalog_endpoint_calibration_preflight(
                 mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
                     .map_err(anyhow::Error::msg)?;
             let contract_result = mayhem_proto::validate_endpoint_request(contract, &request);
-            let gateway_result =
-                mayhem_gateway::openai::normalize_endpoint_request_for_provider(contract, &request);
+            let gateway_result = normalize_endpoint_calibration_request(contract, &request);
             if !case.expect_accept {
                 if contract_result.is_ok() || gateway_result.is_ok() {
                     failures.push(format!(
@@ -13382,6 +13390,20 @@ fn catalog_endpoint_calibration_fixtures(
                         "$AUDIO_BLAKE3".to_owned(),
                         json!(blake3::hash(&bytes).to_hex().to_string()),
                     );
+                    if let Ok(byte_count) = u64::try_from(bytes.len()) {
+                        substitutions.insert("$AUDIO_BYTES".to_owned(), json!(byte_count));
+                    }
+                    let content_type =
+                        detected_audio_content_type(&bytes).unwrap_or("application/octet-stream");
+                    substitutions.insert("$AUDIO_CONTENT_TYPE".to_owned(), json!(content_type));
+                    substitutions.insert(
+                        "$AUDIO_FILENAME".to_owned(),
+                        json!(if content_type == "audio/flac" {
+                            "calibration.flac"
+                        } else {
+                            "calibration.wav"
+                        }),
+                    );
                     fixtures.audio = Some(bytes);
                 }
             }
@@ -13485,32 +13507,55 @@ fn catalog_endpoint_calibration_transport(
             | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
     ) {
         let bytes = if contract.family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
-            let encoded = request
-                .get("inputs")
-                .and_then(Value::as_str)
-                .context("HF ASR request is missing base64 inputs")?;
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .context("HF ASR inputs are not valid base64")?
+            match request.get("inputs") {
+                Some(Value::String(encoded)) => base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .context("HF ASR inputs are not valid base64")?,
+                Some(Value::Object(descriptor))
+                    if descriptor.get("encoding").and_then(Value::as_str) == Some("raw") =>
+                {
+                    fixtures
+                        .audio
+                        .clone()
+                        .context("HF ASR raw calibration has no audio fixture")?
+                }
+                _ => bail!("HF ASR request is missing a supported audio input"),
+            }
         } else {
             fixtures
                 .audio
                 .clone()
                 .context("OpenAI transcription calibration has no audio fixture")?
         };
+        let audio_seconds = audio_duration_seconds_ceil(&bytes)
+            .context("ASR calibration audio is not a valid bounded WAV or FLAC")?;
         let file = request.get("file").and_then(Value::as_object);
         transport["audio"] = json!({
-            "encoding": "hex",
-            "data": hex_encode(&bytes),
+            "encoding": "base64",
+            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
             "content_type": file
                 .and_then(|file| file.get("content_type"))
                 .and_then(Value::as_str)
-                .unwrap_or("audio/wav"),
+                .or_else(|| {
+                    request
+                        .get("inputs")
+                        .and_then(Value::as_object)
+                        .and_then(|input| input.get("content_type"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_else(|| detected_audio_content_type(&bytes).unwrap_or("audio/wav")),
             "filename": file
                 .and_then(|file| file.get("filename"))
                 .and_then(Value::as_str)
-                .unwrap_or("calibration.wav"),
+                .unwrap_or_else(|| {
+                    if detected_audio_content_type(&bytes) == Some("audio/flac") {
+                        "calibration.flac"
+                    } else {
+                        "calibration.wav"
+                    }
+                }),
         });
+        transport["audio_seconds"] = json!(audio_seconds);
     }
     Ok(transport)
 }
@@ -15381,6 +15426,15 @@ fn catalog_canary_evidence_report(
         }
         entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
         entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
+        let bound_report_fingerprint = aggregate_canary_fingerprint_for_method(
+            &calibration.verification_method,
+            &calibration.prompts,
+        );
+        if calibration.catalog_fingerprint != bound_report_fingerprint {
+            entry.errors.push(format!(
+                "report catalog_fingerprint does not bind its prompt reports; expected {bound_report_fingerprint}"
+            ));
+        }
         let matches_catalog = entry
             .expected_fingerprint
             .as_ref()
@@ -15575,6 +15629,26 @@ fn catalog_canary_evidence_report(
                     .to_owned(),
             );
         }
+        let transcript_source_prompts = if entry.verification_method
+            == CANARY_VERIFICATION_TRANSCRIPT_MATCH
+        {
+            match load_canary_prompts_checked(Some(&canaries_dir), &entry.canary_set, None, false) {
+                Ok(prompts) => Some(
+                    prompts
+                        .into_iter()
+                        .map(|prompt| (prompt.id.clone(), prompt))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
+                Err(error) => {
+                    entry.errors.push(format!(
+                        "loading STT canary requirements for report validation: {error:#}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut prompt_ids = BTreeSet::new();
         for prompt in &calibration.prompts {
             if !prompt_ids.insert(prompt.prompt_id.clone()) {
@@ -15596,6 +15670,24 @@ fn catalog_canary_evidence_report(
                 prompt,
                 &mut entry.errors,
             );
+            if let Some(source_prompts) = transcript_source_prompts.as_ref() {
+                match source_prompts.get(&prompt.prompt_id) {
+                    Some(source) => {
+                        if let Err(error) =
+                            validate_transcript_calibration_prompt_evidence(source, prompt)
+                        {
+                            entry.errors.push(format!(
+                                "prompt {} STT evidence: {error:#}",
+                                prompt.prompt_id
+                            ));
+                        }
+                    }
+                    None => entry.errors.push(format!(
+                        "prompt {} is absent from the current STT canary set",
+                        prompt.prompt_id
+                    )),
+                }
+            }
         }
         if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
             && token_prefixes_match_catalog != Some(true)
@@ -17071,6 +17163,7 @@ fn canary_set_matrix_check(
         return Err(format!("canary set {set_id} has no prompts"));
     }
     let mut prompt_ids = Vec::with_capacity(doc.prompts.len());
+    let mut runtime_prompt_count = 0usize;
     for prompt in &doc.prompts {
         if prompt.id.trim().is_empty() {
             return Err(format!("canary set {set_id} has an empty prompt id"));
@@ -17139,7 +17232,53 @@ fn canary_set_matrix_check(
                 ));
             }
         }
+        if model.canary.verification_method == CANARY_VERIFICATION_TRANSCRIPT_MATCH {
+            let request = canary_audio_transcription_request(prompt)
+                .map_err(|error| format!("STT canary prompt {}: {error:#}", prompt.id))?;
+            let seconds = audio_duration_seconds_ceil(&request.audio).ok_or_else(|| {
+                format!(
+                    "STT canary prompt {} is not a valid bounded WAV or FLAC",
+                    prompt.id
+                )
+            })?;
+            if let Some(expected) = prompt.expected_transcript.as_deref() {
+                if expected.trim().is_empty() {
+                    return Err(format!(
+                        "STT canary prompt {} expected_transcript must not be empty",
+                        prompt.id
+                    ));
+                }
+            }
+            if let Some(minimum) = prompt.minimum_audio_seconds {
+                if minimum == 0 || seconds < minimum {
+                    return Err(format!(
+                        "STT canary prompt {} audio is {seconds}s, below minimum_audio_seconds {minimum}",
+                        prompt.id
+                    ));
+                }
+            }
+            if !prompt.calibration_only {
+                runtime_prompt_count = runtime_prompt_count.saturating_add(1);
+            }
+        } else if prompt.calibration_only
+            || prompt.expected_transcript.is_some()
+            || prompt.minimum_audio_seconds.is_some()
+            || prompt.require_word_timestamps
+            || prompt.require_segment_timestamps
+        {
+            return Err(format!(
+                "canary prompt {} uses STT-only calibration requirements",
+                prompt.id
+            ));
+        }
         prompt_ids.push(prompt.id.clone());
+    }
+    if model.canary.verification_method == CANARY_VERIFICATION_TRANSCRIPT_MATCH
+        && runtime_prompt_count == 0
+    {
+        return Err(format!(
+            "STT canary set {set_id} must contain at least one runtime probe"
+        ));
     }
     if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
         validate_canary_sampling_range(model, &doc.prompts)?;
@@ -17740,7 +17879,7 @@ fn calibrate_transcript_match_prompt(
 ) -> Result<CanaryCalibrationPromptReport> {
     let request = canary_audio_transcription_request(prompt)?;
     let audio_bytes = u64::try_from(request.audio.len()).unwrap_or(u64::MAX);
-    let measured_audio_seconds = wav_duration_seconds_ceil(&request.audio).unwrap_or(1);
+    let measured_audio_seconds = audio_duration_seconds_ceil(&request.audio).unwrap_or(1);
     let output = backend
         .transcribe(request, &CancellationToken::new())
         .with_context(|| format!("transcribing canary prompt {}", prompt.id))?;
@@ -17761,7 +17900,7 @@ fn calibrate_transcript_match_prompt(
             item_units: output.audio_seconds.max(measured_audio_seconds).max(1),
         },
     )]);
-    Ok(CanaryCalibrationPromptReport {
+    let report = CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
         prompt_tokens: 0,
@@ -17784,7 +17923,115 @@ fn calibrate_transcript_match_prompt(
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: include_output.then_some(output.text),
-    })
+    };
+    validate_transcript_calibration_prompt_evidence(prompt, &report)?;
+    Ok(report)
+}
+
+fn validate_transcript_calibration_prompt_evidence(
+    prompt: &CanaryPrompt,
+    report: &CanaryCalibrationPromptReport,
+) -> Result<()> {
+    let transcript = report
+        .transcript
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("STT canary prompt {} transcript is empty", prompt.id))?;
+    if let Some(expected) = prompt.expected_transcript.as_deref() {
+        ensure!(
+            normalize_canary_transcript(transcript) == normalize_canary_transcript(expected),
+            "STT canary prompt {} transcript {:?} does not exactly match expected {:?}",
+            prompt.id,
+            transcript,
+            expected
+        );
+    }
+
+    let metered_seconds = report
+        .resource_items
+        .get("audio")
+        .filter(|resource| resource.unit == "second")
+        .map(|resource| resource.item_units)
+        .with_context(|| {
+            format!(
+                "STT canary prompt {} is missing measured audio seconds",
+                prompt.id
+            )
+        })?;
+    if let Some(minimum) = prompt.minimum_audio_seconds {
+        ensure!(
+            metered_seconds >= minimum,
+            "STT canary prompt {} measured {metered_seconds}s, below required {minimum}s",
+            prompt.id
+        );
+    }
+    if prompt.require_word_timestamps {
+        ensure!(
+            !report.word_timestamps.is_empty(),
+            "STT canary prompt {} produced no word timestamps",
+            prompt.id
+        );
+    }
+    if prompt.require_segment_timestamps {
+        ensure!(
+            !report.segment_timestamps.is_empty(),
+            "STT canary prompt {} produced no segment timestamps",
+            prompt.id
+        );
+    }
+
+    let transcription = TranscriptionResult {
+        schema_version: mayhem_proto::TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+        text: transcript.to_owned(),
+        detected_language: report.detected_language.clone(),
+        duration_seconds: report.transcription_duration_seconds,
+        words: report
+            .word_timestamps
+            .iter()
+            .map(|word| TranscriptionTimestamp {
+                text: word.text.clone(),
+                start: word.start,
+                end: word.end,
+            })
+            .collect(),
+        segments: report
+            .segment_timestamps
+            .iter()
+            .map(|segment| TranscriptionTimestamp {
+                text: segment.text.clone(),
+                start: segment.start,
+                end: segment.end,
+            })
+            .collect(),
+    };
+    mayhem_proto::validate_transcription_result(
+        &transcription,
+        TranscriptionResultLimits::default(),
+    )
+    .with_context(|| {
+        format!(
+            "STT canary prompt {} produced invalid timestamp evidence",
+            prompt.id
+        )
+    })?;
+    if prompt.require_word_timestamps
+        || prompt.require_segment_timestamps
+        || prompt.minimum_audio_seconds.is_some()
+    {
+        let duration = report.transcription_duration_seconds.with_context(|| {
+            format!(
+                "STT canary prompt {} produced no source duration",
+                prompt.id
+            )
+        })?;
+        let lower_bound = metered_seconds.saturating_sub(1) as f64;
+        ensure!(
+            duration > lower_bound && duration <= metered_seconds as f64,
+            "STT canary prompt {} duration {duration}s is inconsistent with metered {metered_seconds}s",
+            prompt.id
+        );
+    }
+    Ok(())
 }
 
 fn calibrate_audio_fingerprint_prompt(
@@ -18128,6 +18375,18 @@ fn canary_token_fingerprint(tokens: impl IntoIterator<Item = i32>) -> String {
 
 fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> String {
     aggregate_canary_fingerprint_refs(prompts.iter())
+}
+
+fn aggregate_canary_fingerprint_for_method(
+    method: &str,
+    prompts: &[CanaryCalibrationPromptReport],
+) -> String {
+    if method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+        return aggregate_canary_fingerprint(prompts);
+    }
+    let mut canonical = prompts.iter().collect::<Vec<_>>();
+    canonical.sort_by(|left, right| left.prompt_id.cmp(&right.prompt_id));
+    aggregate_canary_fingerprint_refs(canonical)
 }
 
 fn aggregate_canary_fingerprint_refs<'a>(
@@ -30794,6 +31053,16 @@ struct CanaryPrompt {
     audio_b64: Option<String>,
     #[serde(default)]
     audio_repeat_count: Option<u32>,
+    #[serde(default)]
+    calibration_only: bool,
+    #[serde(default)]
+    expected_transcript: Option<String>,
+    #[serde(default)]
+    minimum_audio_seconds: Option<u64>,
+    #[serde(default)]
+    require_word_timestamps: bool,
+    #[serde(default)]
+    require_segment_timestamps: bool,
     #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
@@ -54881,14 +55150,20 @@ fn provider_canary_self_test_body(
                         .context("STT modality canary is missing audio_b64")?,
                 )
                 .context("STT modality canary audio_b64 is invalid")?;
+            let audio_seconds = audio_duration_seconds_ceil(&audio)
+                .context("STT modality canary is not a valid bounded WAV or FLAC")?;
             Ok(json!({
                 "kind": "audio_transcription",
                 "audio": {
-                    "encoding": "hex",
-                    "data": hex_encode(&audio),
-                    "content_type": prompt.content_type.clone().unwrap_or_else(|| "audio/wav".to_owned()),
+                    "encoding": "base64",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&audio),
+                    "content_type": prompt.content_type.clone().unwrap_or_else(|| {
+                        detected_audio_content_type(&audio)
+                            .unwrap_or("audio/wav")
+                            .to_owned()
+                    }),
                 },
-                "audio_seconds": wav_duration_seconds_ceil(&audio).unwrap_or(1),
+                "audio_seconds": audio_seconds,
                 "language": prompt.language,
             }))
         }
@@ -56684,7 +56959,11 @@ fn provider_seal_local_contract_request(
             .get("audio")
             .and_then(|value| value.get("data"))
             .and_then(Value::as_str)
-            .map(|value| hex_decode_vec(value, "test audio"))
+            .map(|value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .context("test audio is not valid base64")
+            })
             .transpose()?
             .unwrap_or_default();
         let mut public = json!({
@@ -57385,28 +57664,59 @@ fn provider_audio_transcription_request_from_body(
     let encoding = audio
         .get("encoding")
         .and_then(Value::as_str)
-        .unwrap_or("hex");
-    if encoding != "hex" {
-        bail!("audio_transcription audio.encoding must be hex");
+        .context("audio_transcription audio.encoding missing")?;
+    if encoding != "base64" {
+        bail!("audio_transcription audio.encoding must be base64");
     }
-    let bytes_hex = audio
+    let encoded = audio
         .get("data")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .context("audio_transcription audio.data missing")?;
-    let bytes = hex_decode_vec(bytes_hex, "audio_transcription audio.data")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("audio_transcription audio.data is not valid base64")?;
     if endpoint_family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
-        let encoded = body
-            .get("inputs")
-            .and_then(Value::as_str)
-            .context("HF ASR contract request missing base64 inputs")?;
-        let contract_bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .context("HF ASR inputs are not valid base64")?;
-        ensure!(
-            contract_bytes == bytes,
-            "HF ASR transported audio differs from the signed contract input"
-        );
+        match body.get("inputs") {
+            Some(Value::String(contract_input)) => {
+                let contract_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(contract_input)
+                    .context("HF ASR inputs are not valid base64")?;
+                ensure!(
+                    contract_bytes == bytes,
+                    "HF ASR transported audio differs from the signed contract input"
+                );
+            }
+            Some(Value::Object(descriptor)) => {
+                ensure!(
+                    descriptor.get("encoding").and_then(Value::as_str) == Some("raw"),
+                    "HF ASR raw input descriptor has an unsupported encoding"
+                );
+                ensure!(
+                    descriptor.get("bytes").and_then(Value::as_u64)
+                        == Some(
+                            u64::try_from(bytes.len())
+                                .context("HF ASR audio byte count overflowed u64")?
+                        ),
+                    "HF ASR raw input byte count does not match transported audio"
+                );
+                let digest = blake3::hash(&bytes).to_hex().to_string();
+                ensure!(
+                    descriptor.get("blake3").and_then(Value::as_str) == Some(digest.as_str()),
+                    "HF ASR raw input digest does not match transported audio"
+                );
+                if let Some(expected_content_type) =
+                    descriptor.get("content_type").and_then(Value::as_str)
+                {
+                    ensure!(
+                        audio.get("content_type").and_then(Value::as_str)
+                            == Some(expected_content_type),
+                        "HF ASR raw input content type does not match transported audio"
+                    );
+                }
+            }
+            _ => bail!("HF ASR contract request is missing a supported audio input"),
+        }
     } else {
         let file = body
             .get("file")
@@ -57435,13 +57745,13 @@ fn provider_audio_transcription_request_from_body(
             );
         }
     }
-    let audio_seconds = wav_duration_seconds_ceil(&bytes)
-        .context("audio_transcription audio is not a valid bounded WAV")?
+    let audio_seconds = audio_duration_seconds_ceil(&bytes)
+        .context("audio_transcription audio is not a valid bounded WAV or FLAC")?
         .max(1);
     if let Some(declared) = transport_body.get("audio_seconds").and_then(Value::as_u64) {
         ensure!(
             declared == audio_seconds,
-            "audio_transcription declared {declared} seconds but bounded WAV is {audio_seconds} seconds"
+            "audio_transcription declared {declared} seconds but bounded audio is {audio_seconds} seconds"
         );
     }
     Ok(ProviderAudioTranscriptionRequest {
@@ -59233,96 +59543,26 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 fn wav_sample_rate(bytes: &[u8]) -> Option<u32> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut offset = 12usize;
-    while offset.saturating_add(8) <= bytes.len() {
-        let chunk_id = &bytes[offset..offset + 4];
-        let chunk_len = u32::from_le_bytes([
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
-        let chunk_start = offset + 8;
-        let chunk_end = chunk_start.checked_add(chunk_len)?;
-        if chunk_end > bytes.len() {
-            return None;
-        }
-        if chunk_id == b"fmt " && chunk_len >= 16 {
-            let sample_rate = u32::from_le_bytes([
-                bytes[chunk_start + 4],
-                bytes[chunk_start + 5],
-                bytes[chunk_start + 6],
-                bytes[chunk_start + 7],
-            ]);
-            return (sample_rate > 0).then_some(sample_rate);
-        }
-        offset = chunk_end.checked_add(chunk_len % 2)?;
-    }
-    None
+    Some(validated_wav_audio_metadata(bytes)?.sample_rate)
 }
 
 fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
+    Some(validated_wav_audio_metadata(bytes)?.duration_seconds_ceil)
+}
+
+fn audio_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
+    Some(validated_audio_metadata(bytes)?.duration_seconds_ceil)
+}
+
+fn detected_audio_content_type(bytes: &[u8]) -> Option<&'static str> {
+    match validated_audio_metadata(bytes)?.format {
+        ValidatedAudioFormat::Wav => Some("audio/wav"),
+        ValidatedAudioFormat::Flac => Some("audio/flac"),
     }
-    let mut offset = 12usize;
-    let mut sample_rate = None;
-    let mut channels = None;
-    let mut bits_per_sample = None;
-    let mut data_len = None;
-    while offset.saturating_add(8) <= bytes.len() {
-        let chunk_id = &bytes[offset..offset + 4];
-        let chunk_len = u32::from_le_bytes([
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
-        let chunk_start = offset + 8;
-        let chunk_end = chunk_start.saturating_add(chunk_len).min(bytes.len());
-        if chunk_id == b"fmt " && chunk_len >= 16 && chunk_end <= bytes.len() {
-            channels = Some(u16::from_le_bytes([
-                bytes[chunk_start + 2],
-                bytes[chunk_start + 3],
-            ]));
-            sample_rate = Some(u32::from_le_bytes([
-                bytes[chunk_start + 4],
-                bytes[chunk_start + 5],
-                bytes[chunk_start + 6],
-                bytes[chunk_start + 7],
-            ]));
-            bits_per_sample = Some(u16::from_le_bytes([
-                bytes[chunk_start + 14],
-                bytes[chunk_start + 15],
-            ]));
-        } else if chunk_id == b"data" {
-            data_len = Some(chunk_len);
-        }
-        let padded = chunk_len + (chunk_len % 2);
-        offset = chunk_start.saturating_add(padded);
-    }
-    let sample_rate = u64::from(sample_rate?);
-    let channels = u64::from(channels?);
-    let bits_per_sample = u64::from(bits_per_sample?);
-    let data_len = u64::try_from(data_len?).ok()?;
-    let bytes_per_second = sample_rate
-        .saturating_mul(channels)
-        .saturating_mul(bits_per_sample)
-        .checked_div(8)?;
-    if bytes_per_second == 0 {
-        return None;
-    }
-    Some(data_len.div_ceil(bytes_per_second).max(1))
 }
 
 fn repeat_wav_audio(bytes: &[u8], repeat_count: u32) -> Result<Vec<u8>> {
-    ensure!(
-        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-        "audio fixture is not a RIFF/WAVE file"
-    );
+    validated_wav_audio_metadata(bytes).context("audio fixture is not a valid bounded WAV file")?;
     ensure!(repeat_count > 0, "WAV repeat count must be positive");
     if repeat_count == 1 {
         return Ok(bytes.to_vec());
@@ -61425,6 +61665,18 @@ mod tests {
                 "mayhem-tap-account-bind-v1{{\"chain_id\":1,\"ethereum_address\":\"0x2222222222222222222222222222222222222222\",\"pool_address\":\"0x3333333333333333333333333333333333333333\",\"user\":\"{user}\"}}"
             )
         );
+    }
+
+    #[test]
+    fn bounded_audio_duration_supports_wav_and_flac_exactly() {
+        let wav = tiny_wav_bytes(32_001);
+        let flac =
+            include_bytes!("../../mayhem-gateway/tests/fixtures/stt-32001-samples.flac").as_slice();
+
+        assert_eq!(audio_duration_seconds_ceil(&wav), Some(3));
+        assert_eq!(detected_audio_content_type(&wav), Some("audio/wav"));
+        assert_eq!(audio_duration_seconds_ceil(flac), Some(3));
+        assert_eq!(detected_audio_content_type(flac), Some("audio/flac"));
     }
 
     #[test]
@@ -71020,10 +71272,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let body = json!({
             "kind": "audio_transcription",
             "audio": {
-                "encoding": "hex",
+                "encoding": "base64",
                 "content_type": "audio/wav",
                 "filename": "hello.wav",
-                "data": hex_encode(&wav)
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav)
             },
             "audio_seconds": 1,
             "language": "en"
@@ -71056,6 +71308,63 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.audio, wav);
         assert_eq!(request.content_type.as_deref(), Some("audio/wav"));
         assert_eq!(request.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn provider_hf_asr_accepts_signed_raw_descriptor_over_base64_transport() {
+        let wav = tiny_wav_bytes(32_000);
+        let digest = blake3::hash(&wav).to_hex().to_string();
+        let contract = json!({
+            "inputs": {
+                "encoding": "raw",
+                "bytes": wav.len(),
+                "blake3": digest,
+                "content_type": "audio/wav"
+            },
+            "parameters": {"return_timestamps": "word"}
+        });
+        let transport = json!({
+            "audio": {
+                "encoding": "base64",
+                "content_type": "audio/wav",
+                "filename": "audio.wav",
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav)
+            },
+            "audio_seconds": 2
+        });
+
+        let request = provider_audio_transcription_request_from_body(
+            mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+            &contract,
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(request.engine.audio, wav);
+        assert_eq!(request.audio_seconds, 2);
+
+        let mut invalid = contract.clone();
+        invalid["inputs"]["blake3"] = json!("00".repeat(32));
+        assert!(provider_audio_transcription_request_from_body(
+            mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+            &invalid,
+            &transport,
+        )
+        .err()
+        .expect("mismatched raw descriptor must fail")
+        .to_string()
+        .contains("digest does not match"));
+
+        let mut legacy_transport = transport;
+        legacy_transport["audio"]["encoding"] = json!("hex");
+        assert!(provider_audio_transcription_request_from_body(
+            mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+            &contract,
+            &legacy_transport,
+        )
+        .err()
+        .expect("legacy hex transport must fail")
+        .to_string()
+        .contains("must be base64"));
     }
 
     #[test]
@@ -75431,6 +75740,11 @@ State initialization...
             input: None,
             audio_b64: None,
             audio_repeat_count: None,
+            calibration_only: false,
+            expected_transcript: None,
+            minimum_audio_seconds: None,
+            require_word_timestamps: false,
+            require_segment_timestamps: false,
             content_type: None,
             filename: None,
             language: None,
@@ -75510,6 +75824,33 @@ State initialization...
         assert_ne!(
             aggregate_canary_fingerprint(&[first]),
             aggregate_canary_fingerprint(&[same_digest_different_id])
+        );
+    }
+
+    #[test]
+    fn non_token_canary_aggregate_matches_catalog_map_order() {
+        let first = test_calibration_prompt("stt-z", "aa".repeat(32));
+        let second = test_calibration_prompt("stt-a", "bb".repeat(32));
+
+        assert_ne!(
+            aggregate_canary_fingerprint_for_method(
+                CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+                &[first.clone(), second.clone()],
+            ),
+            aggregate_canary_fingerprint_for_method(
+                CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+                &[second.clone(), first.clone()],
+            )
+        );
+        assert_eq!(
+            aggregate_canary_fingerprint_for_method(
+                CANARY_VERIFICATION_TRANSCRIPT_MATCH,
+                &[first, second],
+            ),
+            aggregate_prompt_fingerprint_map([
+                ("stt-a", "bb".repeat(32)),
+                ("stt-z", "aa".repeat(32)),
+            ])
         );
     }
 
@@ -75866,6 +76207,58 @@ State initialization...
     }
 
     #[test]
+    fn stt_canary_matrix_requires_a_runtime_probe_and_checks_long_audio() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.model_class = "stt".to_owned();
+        model.canary.set_id = "test-stt-calibration-only".to_owned();
+        model.canary.verification_method = CANARY_VERIFICATION_TRANSCRIPT_MATCH.to_owned();
+        model.canary.verification_tolerance_bps = None;
+        let wav = base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000));
+        let canaries_dir = test_canary_dir_with_prompts(
+            &model.canary.set_id,
+            json!([
+                {
+                    "id": "runtime",
+                    "audio_b64": wav,
+                    "content_type": "audio/wav",
+                    "expected_transcript": "hello mayhem"
+                },
+                {
+                    "id": "long-calibration",
+                    "audio_b64": base64::engine::general_purpose::STANDARD
+                        .encode(tiny_wav_bytes(48_000)),
+                    "content_type": "audio/wav",
+                    "expected_transcript": "hello mayhem",
+                    "calibration_only": true,
+                    "minimum_audio_seconds": 3,
+                    "require_word_timestamps": true,
+                    "require_segment_timestamps": true
+                }
+            ]),
+        );
+
+        let result = canary_set_matrix_check(&canaries_dir, model).unwrap();
+        assert_eq!(result.prompt_count, 2);
+
+        let calibration_only_dir = test_canary_dir_with_prompts(
+            "test-stt-only-offline",
+            json!([{
+                "id": "offline-only",
+                "audio_b64": base64::engine::general_purpose::STANDARD
+                    .encode(tiny_wav_bytes(48_000)),
+                "content_type": "audio/wav",
+                "expected_transcript": "hello mayhem",
+                "calibration_only": true,
+                "minimum_audio_seconds": 3
+            }]),
+        );
+        model.canary.set_id = "test-stt-only-offline".to_owned();
+        let error = canary_set_matrix_check(&calibration_only_dir, model).unwrap_err();
+        assert!(error.contains("at least one runtime probe"), "{error}");
+    }
+
+    #[test]
     fn canary_matrix_rejects_out_of_range_client_penalties() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         let model = &mut catalog.models[0];
@@ -76026,7 +76419,11 @@ State initialization...
             "id": "stt-p1",
             "audio_b64": base64::engine::general_purpose::STANDARD.encode(&wav),
             "content_type": "audio/wav",
-            "language": "en"
+            "language": "en",
+            "expected_transcript": "hello mayhem",
+            "minimum_audio_seconds": 1,
+            "require_word_timestamps": true,
+            "require_segment_timestamps": true
         }))
         .unwrap();
         let mut stt_backend = FakeEngineBackend::new("unused");
@@ -76037,6 +76434,15 @@ State initialization...
         assert_eq!(
             transcript.fingerprint,
             blake3_bytes_hex(normalize_canary_transcript("hello mayhem").as_bytes())
+        );
+
+        let mut punctuation_mismatch = stt_prompt;
+        punctuation_mismatch.expected_transcript = Some("Hello, mayhem!".to_owned());
+        assert!(
+            calibrate_transcript_match_prompt(&mut stt_backend, &punctuation_mismatch, false)
+                .unwrap_err()
+                .to_string()
+                .contains("does not exactly match")
         );
 
         let tts_wav = tiny_wav_bytes(24_000);
@@ -76684,6 +77090,33 @@ State initialization...
             .iter()
             .any(|error| error
                 .contains("existing_catalog_fingerprint does not match current catalog")));
+    }
+
+    #[test]
+    fn canary_apply_rejects_report_fingerprint_not_bound_to_prompts() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), None);
+        calibration.model_id = "test/model@4bit".to_owned();
+        calibration.catalog_fingerprint = "bb".repeat(32);
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("does not bind its prompt reports")));
     }
 
     #[test]
@@ -79197,7 +79630,8 @@ State initialization...
     fn test_endpoint_calibration_report_for_adapter(
         adapter: &catalog::CatalogAdapter,
     ) -> EndpointCalibrationReport {
-        let fixture_bytes = b"mayhem-endpoint-calibration-fixture";
+        let fixture_bytes = tiny_wav_bytes(8_000);
+        let fixture_b64 = base64::engine::general_purpose::STANDARD.encode(&fixture_bytes);
         let report = run_endpoint_calibration_matrix(
             &adapter.endpoint_families,
             &BTreeMap::from([
@@ -79209,11 +79643,14 @@ State initialization...
                     json!("data:image/png;base64,aGVsbG8="),
                 ),
                 ("$IMAGE_FILE".to_owned(), json!("fixture.png")),
-                ("$AUDIO_BASE64".to_owned(), json!("aGVsbG8=")),
+                ("$AUDIO_BASE64".to_owned(), json!(fixture_b64)),
+                ("$AUDIO_BYTES".to_owned(), json!(fixture_bytes.len())),
                 (
                     "$AUDIO_BLAKE3".to_owned(),
-                    json!(blake3::hash(fixture_bytes).to_hex().to_string()),
+                    json!(blake3::hash(&fixture_bytes).to_hex().to_string()),
                 ),
+                ("$AUDIO_CONTENT_TYPE".to_owned(), json!("audio/wav")),
+                ("$AUDIO_FILENAME".to_owned(), json!("calibration.wav")),
                 ("$VIDEO_BASE64".to_owned(), json!("aGVsbG8=")),
                 ("$VOICE".to_owned(), json!("launch")),
             ]),

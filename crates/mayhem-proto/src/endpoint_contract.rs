@@ -593,14 +593,22 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
                 json!(["Mayhem calibration A", "Mayhem calibration B"]),
             ],
         ),
-        "inputs" if family == ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
-            string_spec(1, 256 * 1024 * 1024, json!("$AUDIO_BASE64"))
-        }
+        "inputs" if family == ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => union_spec(
+            &[EndpointValueType::String, EndpointValueType::Object],
+            &[
+                json!("$AUDIO_BASE64"),
+                json!({
+                    "data": "$AUDIO_BASE64",
+                    "content_type": "$AUDIO_CONTENT_TYPE",
+                    "filename": "$AUDIO_FILENAME"
+                }),
+            ],
+        ),
         "inputs" => string_spec(1, 32_000, json!("Mayhem calibration")),
         "file" => object_spec(json!({
-            "filename": "calibration.wav",
-            "content_type": "audio/wav",
-            "bytes": 44,
+            "filename": "$AUDIO_FILENAME",
+            "content_type": "$AUDIO_CONTENT_TYPE",
+            "bytes": "$AUDIO_BYTES",
             "blake3": "$AUDIO_BLAKE3"
         })),
         "user" => string_spec(1, 512, json!("mayhem-calibration-user")),
@@ -1262,7 +1270,11 @@ pub fn generate_endpoint_calibration_cases(
         if let Some(default) = &spec.default {
             accepted_values.push(default.clone());
         }
-        accepted_values.extend(spec.enum_values.iter().cloned());
+        if spec.value_types == [EndpointValueType::Array] {
+            accepted_values.extend(spec.enum_values.iter().cloned().map(|value| json!([value])));
+        } else {
+            accepted_values.extend(spec.enum_values.iter().cloned());
+        }
         deduplicate_values(&mut accepted_values);
         for (index, value) in accepted_values.into_iter().enumerate() {
             push_calibration_case(
@@ -1321,7 +1333,7 @@ pub fn generate_endpoint_calibration_cases(
             &contract_fingerprint,
             &base_request,
             "response_attribute",
-            Vec::new(),
+            response_attribute_calibration_mutations(contract, path),
             true,
             vec![path.clone()],
         );
@@ -1401,6 +1413,50 @@ pub fn generate_endpoint_calibration_cases(
         }
     }
     Ok(cases)
+}
+
+fn response_attribute_calibration_mutations(
+    contract: &EndpointFamilyContract,
+    response_path: &str,
+) -> Vec<EndpointCalibrationMutation> {
+    let request_path_is_signed = |path: &str| {
+        contract
+            .request_attributes
+            .iter()
+            .any(|value| value == path)
+    };
+    let mut mutations = Vec::new();
+
+    match (contract.family.as_str(), response_path) {
+        (ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, "chunks")
+            if request_path_is_signed("parameters.return_timestamps") =>
+        {
+            mutations.push(literal_mutation(
+                "parameters.return_timestamps",
+                json!("word"),
+            ));
+        }
+        (
+            ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+            "task" | "language" | "duration" | "words" | "segments",
+        ) if request_path_is_signed("response_format") => {
+            mutations.push(literal_mutation("response_format", json!("verbose_json")));
+            match response_path {
+                "words" if request_path_is_signed("timestamp_granularities") => {
+                    mutations.push(literal_mutation("timestamp_granularities", json!(["word"])));
+                }
+                "segments" if request_path_is_signed("timestamp_granularities") => {
+                    mutations.push(literal_mutation(
+                        "timestamp_granularities",
+                        json!(["segment"]),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    mutations
 }
 
 pub fn materialize_endpoint_calibration_request(
@@ -2626,6 +2682,116 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(wrong_type[0].path, "parameters.width");
+    }
+
+    #[test]
+    fn audio_file_calibration_descriptor_uses_fixture_metadata() {
+        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS)
+            .expect("audio transcription contract");
+        let descriptor = contract.request_attribute_specs["file"].calibration_values[0].clone();
+        let substitutions = BTreeMap::from([
+            ("$AUDIO_BYTES".to_owned(), json!(12_345)),
+            ("$AUDIO_BLAKE3".to_owned(), json!("11".repeat(32))),
+            ("$AUDIO_CONTENT_TYPE".to_owned(), json!("audio/flac")),
+            ("$AUDIO_FILENAME".to_owned(), json!("calibration.flac")),
+        ]);
+        let descriptor = substitute_calibration_markers(descriptor, &substitutions);
+
+        assert_eq!(descriptor["bytes"], json!(12_345));
+        assert_eq!(descriptor["blake3"], json!("11".repeat(32)));
+        assert_eq!(descriptor["content_type"], "audio/flac");
+        assert_eq!(descriptor["filename"], "calibration.flac");
+    }
+
+    #[test]
+    fn array_enum_calibration_cases_remain_arrays() {
+        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS)
+            .expect("audio transcription contract");
+        let substitutions = BTreeMap::from([
+            ("$MODEL".to_owned(), json!("test/model")),
+            ("$AUDIO_BYTES".to_owned(), json!(44)),
+            ("$AUDIO_BLAKE3".to_owned(), json!("11".repeat(32))),
+            ("$AUDIO_CONTENT_TYPE".to_owned(), json!("audio/wav")),
+            ("$AUDIO_FILENAME".to_owned(), json!("calibration.wav")),
+        ]);
+        let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
+        let accepted = cases
+            .iter()
+            .filter(|case| {
+                case.expect_accept
+                    && case
+                        .attributes
+                        .contains(&"timestamp_granularities".to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert!(!accepted.is_empty());
+        for case in accepted {
+            let request = materialize_endpoint_calibration_request(case, &substitutions)
+                .expect("materialized request");
+            assert!(
+                validate_endpoint_request(&contract, &request).is_ok(),
+                "{} produced {}",
+                case.case_id,
+                request["timestamp_granularities"]
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_stt_response_cases_enable_their_request_controls() {
+        let substitutions = BTreeMap::from([
+            ("$MODEL".to_owned(), json!("test/model")),
+            ("$AUDIO_BYTES".to_owned(), json!(44)),
+            ("$AUDIO_BLAKE3".to_owned(), json!("11".repeat(32))),
+            ("$AUDIO_CONTENT_TYPE".to_owned(), json!("audio/wav")),
+            ("$AUDIO_FILENAME".to_owned(), json!("calibration.wav")),
+            ("$AUDIO_BASE64".to_owned(), json!("UklGRg==")),
+        ]);
+
+        let openai = endpoint_family_contract_template(ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS)
+            .expect("audio transcription contract");
+        let openai_cases = generate_endpoint_calibration_cases(&openai).expect("OpenAI STT matrix");
+        for (response_attribute, expected_granularity) in [
+            ("task", None),
+            ("language", None),
+            ("duration", None),
+            ("words", Some("word")),
+            ("segments", Some("segment")),
+        ] {
+            let case = openai_cases
+                .iter()
+                .find(|case| {
+                    case.case_kind == "response_attribute"
+                        && case
+                            .expected_response_attributes
+                            .contains(&response_attribute.to_owned())
+                })
+                .expect("conditional OpenAI response row");
+            let request = materialize_endpoint_calibration_request(case, &substitutions)
+                .expect("materialized OpenAI response row");
+            assert_eq!(request["response_format"], "verbose_json");
+            if let Some(granularity) = expected_granularity {
+                assert_eq!(request["timestamp_granularities"], json!([granularity]));
+            }
+            assert!(validate_endpoint_request(&openai, &request).is_ok());
+        }
+
+        let hf = endpoint_family_contract_template(ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION)
+            .expect("HF ASR contract");
+        let hf_case = generate_endpoint_calibration_cases(&hf)
+            .expect("HF ASR matrix")
+            .into_iter()
+            .find(|case| {
+                case.case_kind == "response_attribute"
+                    && case
+                        .expected_response_attributes
+                        .contains(&"chunks".to_owned())
+            })
+            .expect("HF chunks response row");
+        let request = materialize_endpoint_calibration_request(&hf_case, &substitutions)
+            .expect("materialized HF chunks row");
+        assert_eq!(request["parameters"]["return_timestamps"], json!("word"));
+        assert!(validate_endpoint_request(&hf, &request).is_ok());
     }
 
     #[test]

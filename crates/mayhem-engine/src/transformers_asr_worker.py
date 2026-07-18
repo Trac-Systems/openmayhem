@@ -132,51 +132,35 @@ def decode_audio(encoded):
     return samples, duration
 
 
-def timestamped_words(sequences, durations):
-    token_ids = sequences[0].detach().cpu().tolist()
-    token_durations = durations[0].detach().cpu().tolist()
-    tokenizer = processor.tokenizer
-    skip_ids = {
-        value
-        for value in (
-            tokenizer.pad_token_id,
-            getattr(processor, "blank_token_id", None),
-        )
-        if value is not None
-    }
-    frame_rate = (
-        float(processor.feature_extractor.hop_length)
-        / float(sample_rate)
-        * float(subsampling_factor)
-    )
-
+def words_from_timestamps(timestamps):
     words = []
-    frame = 0
-    for token_id, token_duration in zip(token_ids, token_durations):
-        duration_frames = int(token_duration)
-        start = float(frame) * frame_rate
-        frame += duration_frames
-        if int(token_id) in skip_ids:
+    for timestamp in timestamps:
+        if not isinstance(timestamp, dict):
+            raise RuntimeError("Parakeet processor returned an invalid timestamp entry")
+        token = timestamp.get("token")
+        if not isinstance(token, str):
+            raise RuntimeError("Parakeet processor timestamp is missing its token text")
+        pieces = token.split()
+        if not pieces:
             continue
 
-        raw_token = tokenizer.convert_ids_to_tokens(int(token_id))
-        if raw_token is None or raw_token.startswith("<") and raw_token.endswith(">"):
-            continue
-        begins_word = raw_token.startswith("▁")
-        piece = tokenizer.convert_tokens_to_string([raw_token]).strip()
-        if not piece:
-            continue
-        end = float(frame) * frame_rate
+        try:
+            start = float(timestamp["start"])
+            end = float(timestamp["end"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Parakeet processor returned an invalid timestamp range"
+            ) from error
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start:
+            raise RuntimeError("Parakeet processor returned an invalid timestamp range")
 
-        punctuation_only = all(not char.isalnum() for char in piece)
-        if punctuation_only and words:
-            words[-1]["text"] += piece
-            words[-1]["end"] = max(words[-1]["end"], end)
-        elif begins_word or not words:
-            words.append({"text": piece, "start": start, "end": end})
-        else:
-            words[-1]["text"] += piece
-            words[-1]["end"] = max(words[-1]["end"], end)
+        begins_word = token[0].isspace()
+        for index, piece in enumerate(pieces):
+            if begins_word or index > 0 or not words:
+                words.append({"text": piece, "start": start, "end": end})
+            else:
+                words[-1]["text"] += piece
+                words[-1]["end"] = max(words[-1]["end"], end)
 
     return words
 
@@ -201,8 +185,12 @@ def transcribe_window(samples):
         durations=output.durations,
         skip_special_tokens=True,
     )
-    text = decoded[0][0] if isinstance(decoded, tuple) else decoded[0]
-    return text.strip(), timestamped_words(output.sequences, output.durations)
+    if not isinstance(decoded, tuple) or len(decoded) != 2:
+        raise RuntimeError("Parakeet processor did not return canonical timestamps")
+    decoded_texts, timestamp_batches = decoded
+    if len(decoded_texts) != 1 or len(timestamp_batches) != 1:
+        raise RuntimeError("Parakeet processor returned an unexpected decode batch size")
+    return decoded_texts[0].strip(), words_from_timestamps(timestamp_batches[0])
 
 
 def render_text(words):
@@ -244,6 +232,29 @@ def build_segments(words):
             }
         )
     return segments
+
+
+def reconcile_word_timestamps(words, duration):
+    reconciled = []
+    for raw_word in words:
+        word = dict(raw_word)
+        word["start"] = max(0.0, min(float(word["start"]), duration))
+        word["end"] = max(0.0, min(float(word["end"]), duration))
+        if word["end"] <= word["start"]:
+            raise RuntimeError("Parakeet returned a word outside the decoded audio duration")
+        if reconciled and word["start"] < reconciled[-1]["end"]:
+            previous = reconciled[-1]
+            previous_center = (previous["start"] + previous["end"]) / 2.0
+            current_center = (word["start"] + word["end"]) / 2.0
+            if current_center <= previous_center:
+                raise RuntimeError("Parakeet returned out-of-order word timestamps")
+            boundary = (previous_center + current_center) / 2.0
+            previous["end"] = min(previous["end"], boundary)
+            word["start"] = max(word["start"], boundary)
+            if previous["end"] <= previous["start"] or word["end"] <= word["start"]:
+                raise RuntimeError("Parakeet returned irreconcilable overlapping word timestamps")
+        reconciled.append(word)
+    return reconciled
 
 
 def transcribe(payload):
@@ -291,6 +302,8 @@ def transcribe(payload):
     if not words:
         raise RuntimeError("Transformers ASR produced no timestamped words")
 
+    words = reconcile_word_timestamps(words, duration)
+    text = render_text(words)
     for item in words:
         item["start"] = round(max(0.0, float(item["start"])), 6)
         item["end"] = round(max(item["start"], float(item["end"])), 6)

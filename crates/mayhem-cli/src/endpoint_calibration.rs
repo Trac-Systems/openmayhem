@@ -73,6 +73,20 @@ pub(crate) struct EndpointCalibrationExecution {
     pub(crate) response: Value,
 }
 
+pub(crate) fn normalize_endpoint_calibration_request(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+) -> Result<mayhem_gateway::openai::EndpointRequestNormalization, String> {
+    let request = if contract.family == mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
+        mayhem_gateway::openai::canonicalize_hf_asr_object_input(request.clone())?
+            .map(|canonical| canonical.contract_request)
+            .unwrap_or_else(|| request.clone())
+    } else {
+        request.clone()
+    };
+    mayhem_gateway::openai::normalize_endpoint_request_for_provider(contract, &request)
+}
+
 pub(crate) fn run_endpoint_calibration_matrix<F>(
     contracts: &[EndpointFamilyContract],
     substitutions: &BTreeMap<String, Value>,
@@ -171,8 +185,7 @@ where
     }
     let request_fingerprint = stable_value_fingerprint(&request);
     let contract_result = validate_endpoint_request(contract, &request);
-    let gateway_result =
-        mayhem_gateway::openai::normalize_endpoint_request_for_provider(contract, &request);
+    let gateway_result = normalize_endpoint_calibration_request(contract, &request);
 
     if !case.expect_accept {
         let contract_validation = match contract_result {

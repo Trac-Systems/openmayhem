@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod endpoint_contract;
+mod validated_audio;
 
 pub use endpoint_contract::{
     endpoint_attribute_value_matches, endpoint_contract_fingerprint,
@@ -14,6 +15,10 @@ pub use endpoint_contract::{
     materialize_endpoint_request_defaults, validate_endpoint_attribute_value,
     validate_endpoint_request, validate_endpoint_response, EndpointCalibrationCase,
     EndpointCalibrationMutation, EndpointCalibrationValue, EndpointContractViolation,
+};
+pub use validated_audio::{
+    validated_audio_metadata, validated_flac_audio_metadata, validated_wav_audio_metadata,
+    ValidatedAudioFormat, ValidatedAudioMetadata, MAX_TRANSCRIPTION_AUDIO_SECONDS,
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
@@ -1098,12 +1103,12 @@ pub fn validate_transcription_result(
     }
     if result
         .duration_seconds
-        .is_some_and(|duration| !duration.is_finite() || duration < 0.0)
+        .is_some_and(|duration| !duration.is_finite() || duration <= 0.0)
     {
         return Err(TranscriptionResultError::InvalidTimestamp {
             kind: "duration",
             index: 0,
-            reason: "duration must be finite and non-negative",
+            reason: "duration must be finite and positive",
         });
     }
     let timestamp_entries = result
@@ -1119,20 +1124,9 @@ pub fn validate_transcription_result(
                 .map_err(|_| TranscriptionResultError::LengthOverflow)?,
         });
     }
-    validate_transcription_timestamps(
-        "word",
-        result
-            .words
-            .iter()
-            .map(|word| (word.text.as_str(), word.start, word.end)),
-    )?;
-    validate_transcription_timestamps(
-        "segment",
-        result
-            .segments
-            .iter()
-            .map(|segment| (segment.text.as_str(), segment.start, segment.end)),
-    )?;
+    validate_transcription_timestamps("word", &result.words, result.duration_seconds)?;
+    validate_transcription_timestamps("segment", &result.segments, result.duration_seconds)?;
+    validate_transcription_timestamp_structure(&result.words, &result.segments)?;
     let bytes = serde_json::to_vec(result)
         .map_err(|error| TranscriptionResultError::Json(error.to_string()))?;
     if bytes.len() > limits.max_bytes {
@@ -1146,23 +1140,26 @@ pub fn validate_transcription_result(
     Ok(())
 }
 
-fn validate_transcription_timestamps<'a>(
+fn validate_transcription_timestamps(
     kind: &'static str,
-    entries: impl IntoIterator<Item = (&'a str, f64, f64)>,
+    entries: &[TranscriptionTimestamp],
+    duration_seconds: Option<f64>,
 ) -> Result<(), TranscriptionResultError> {
-    let mut previous_start = 0.0;
-    for (index, (text, start, end)) in entries.into_iter().enumerate() {
+    let mut previous_end = None;
+    for (index, entry) in entries.iter().enumerate() {
         let index = u64::try_from(index).map_err(|_| TranscriptionResultError::LengthOverflow)?;
-        let reason = if text.trim().is_empty() {
+        let reason = if entry.text.trim().is_empty() {
             Some("text must not be empty")
-        } else if !start.is_finite() || !end.is_finite() {
+        } else if !entry.start.is_finite() || !entry.end.is_finite() {
             Some("start and end must be finite")
-        } else if start < 0.0 || end < 0.0 {
+        } else if entry.start < 0.0 || entry.end < 0.0 {
             Some("start and end must be non-negative")
-        } else if end < start {
-            Some("end must not precede start")
-        } else if start < previous_start {
-            Some("entries must be ordered by start time")
+        } else if entry.end <= entry.start {
+            Some("end must be greater than start")
+        } else if previous_end.is_some_and(|previous_end| entry.start < previous_end) {
+            Some("entries must be ordered and non-overlapping")
+        } else if duration_seconds.is_some_and(|duration| entry.end > duration) {
+            Some("end must not exceed duration")
         } else {
             None
         };
@@ -1173,8 +1170,72 @@ fn validate_transcription_timestamps<'a>(
                 reason,
             });
         }
-        previous_start = start;
+        previous_end = Some(entry.end);
     }
+    Ok(())
+}
+
+fn validate_transcription_timestamp_structure(
+    words: &[TranscriptionTimestamp],
+    segments: &[TranscriptionTimestamp],
+) -> Result<(), TranscriptionResultError> {
+    if words.is_empty() || segments.is_empty() {
+        return Ok(());
+    }
+
+    let mut segment_index = 0;
+    let mut segment_has_word = false;
+    for (word_index, word) in words.iter().enumerate() {
+        while segment_index < segments.len() && word.start >= segments[segment_index].end {
+            if !segment_has_word {
+                return Err(TranscriptionResultError::InvalidTimestamp {
+                    kind: "segment",
+                    index: u64::try_from(segment_index)
+                        .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+                    reason: "segment must contain at least one word",
+                });
+            }
+            segment_index += 1;
+            segment_has_word = false;
+        }
+
+        let Some(segment) = segments.get(segment_index) else {
+            return Err(TranscriptionResultError::InvalidTimestamp {
+                kind: "word",
+                index: u64::try_from(word_index)
+                    .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+                reason: "word must be contained within a segment",
+            });
+        };
+        if word.start < segment.start || word.end > segment.end {
+            return Err(TranscriptionResultError::InvalidTimestamp {
+                kind: "word",
+                index: u64::try_from(word_index)
+                    .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+                reason: "word must be contained within a segment",
+            });
+        }
+        segment_has_word = true;
+    }
+
+    if !segment_has_word {
+        return Err(TranscriptionResultError::InvalidTimestamp {
+            kind: "segment",
+            index: u64::try_from(segment_index)
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+            reason: "segment must contain at least one word",
+        });
+    }
+    segment_index += 1;
+    if segment_index < segments.len() {
+        return Err(TranscriptionResultError::InvalidTimestamp {
+            kind: "segment",
+            index: u64::try_from(segment_index)
+                .map_err(|_| TranscriptionResultError::LengthOverflow)?,
+            reason: "segment must contain at least one word",
+        });
+    }
+
     Ok(())
 }
 
@@ -2013,6 +2074,29 @@ mod tests {
     }
 
     #[test]
+    fn catalog_enclave_id_matches_canonical_five_sidecar_vector() {
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "admin".to_owned(),
+            model_id: "nvidia/parakeet-tdt-0.6b-v3".to_owned(),
+            artifact_root: "aa".repeat(32),
+            artifact_sidecar_roots: BTreeMap::from([
+                ("transformers_config".to_owned(), "11".repeat(32)),
+                ("transformers_generation_config".to_owned(), "22".repeat(32)),
+                ("transformers_processor_config".to_owned(), "33".repeat(32)),
+                ("transformers_tokenizer_config".to_owned(), "44".repeat(32)),
+                ("transformers_tokenizer_json".to_owned(), "55".repeat(32)),
+            ]),
+            manifest_hash: "66".repeat(32),
+            binary_hash: String::new(),
+        };
+
+        assert_eq!(
+            catalog_enclave_id(&identity),
+            "92f874cc308be95ad33bc745139891d73c4f0e7fc873d5a49c4f5b4e86745db5"
+        );
+    }
+
+    #[test]
     fn hardware_quote_binding_includes_freshness_and_identity() {
         let mut body = AttestationBody {
             schema_version: ATTESTATION_SCHEMA_VERSION,
@@ -2439,6 +2523,61 @@ mod tests {
         assert_eq!(restored, stable_json_value(&value));
     }
 
+    fn transcription_timestamp(text: &str, start: f64, end: f64) -> TranscriptionTimestamp {
+        TranscriptionTimestamp {
+            text: text.to_owned(),
+            start,
+            end,
+        }
+    }
+
+    fn assert_invalid_transcription_timestamp(
+        result: &TranscriptionResult,
+        kind: &'static str,
+        index: u64,
+        reason: &'static str,
+    ) {
+        assert_eq!(
+            validate_transcription_result(result, TranscriptionResultLimits::default()),
+            Err(TranscriptionResultError::InvalidTimestamp {
+                kind,
+                index,
+                reason,
+            })
+        );
+    }
+
+    #[test]
+    fn transcription_result_allows_optional_timestamp_metadata() {
+        let text_only = TranscriptionResult::text("hello mayhem");
+        validate_transcription_result(&text_only, TranscriptionResultLimits::default()).unwrap();
+        let encoded = serde_json::to_value(&text_only).unwrap();
+        assert!(encoded.get("words").is_none());
+        assert!(encoded.get("segments").is_none());
+        assert_eq!(
+            serde_json::from_value::<TranscriptionResult>(json!({
+                "v": TRANSCRIPTION_RESULT_SCHEMA_VERSION,
+                "text": "hello mayhem",
+            }))
+            .unwrap(),
+            text_only
+        );
+
+        let mut words_only = TranscriptionResult::text("hello mayhem");
+        words_only.duration_seconds = Some(1.0);
+        words_only.words = vec![
+            transcription_timestamp("hello", 0.0, 0.5),
+            transcription_timestamp("mayhem", 0.5, 1.0),
+        ];
+        validate_transcription_result(&words_only, TranscriptionResultLimits::default()).unwrap();
+
+        let mut segments_only = TranscriptionResult::text("hello mayhem");
+        segments_only.duration_seconds = Some(1.0);
+        segments_only.segments = vec![transcription_timestamp("hello mayhem", 0.0, 1.0)];
+        validate_transcription_result(&segments_only, TranscriptionResultLimits::default())
+            .unwrap();
+    }
+
     #[test]
     fn transcription_result_roundtrips_through_bounded_chunks() {
         let result = TranscriptionResult {
@@ -2479,7 +2618,110 @@ mod tests {
     }
 
     #[test]
-    fn transcription_result_rejects_unbounded_or_invalid_timestamps() {
+    fn transcription_result_rejects_non_finite_empty_or_non_positive_timestamps() {
+        let invalid_entries = [
+            (
+                transcription_timestamp("  ", 0.0, 0.5),
+                "text must not be empty",
+            ),
+            (
+                transcription_timestamp("hello", f64::NAN, 0.5),
+                "start and end must be finite",
+            ),
+            (
+                transcription_timestamp("hello", 0.0, f64::INFINITY),
+                "start and end must be finite",
+            ),
+            (
+                transcription_timestamp("hello", -0.1, 0.5),
+                "start and end must be non-negative",
+            ),
+            (
+                transcription_timestamp("hello", 0.5, 0.5),
+                "end must be greater than start",
+            ),
+            (
+                transcription_timestamp("hello", 0.6, 0.5),
+                "end must be greater than start",
+            ),
+        ];
+        for (entry, reason) in invalid_entries {
+            let mut result = TranscriptionResult::text("hello");
+            result.words = vec![entry];
+            assert_invalid_transcription_timestamp(&result, "word", 0, reason);
+        }
+
+        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut result = TranscriptionResult::text("hello");
+            result.duration_seconds = Some(duration);
+            assert_invalid_transcription_timestamp(
+                &result,
+                "duration",
+                0,
+                "duration must be finite and positive",
+            );
+        }
+    }
+
+    #[test]
+    fn transcription_result_rejects_overlapping_or_duration_exceeding_timestamps() {
+        let mut result = TranscriptionResult::text("hello mayhem");
+        result.duration_seconds = Some(1.0);
+        result.words = vec![
+            transcription_timestamp("hello", 0.0, 0.6),
+            transcription_timestamp("mayhem", 0.5, 0.9),
+        ];
+        assert_invalid_transcription_timestamp(
+            &result,
+            "word",
+            1,
+            "entries must be ordered and non-overlapping",
+        );
+
+        result.words[1] = transcription_timestamp("mayhem", 0.6, 1.1);
+        assert_invalid_transcription_timestamp(&result, "word", 1, "end must not exceed duration");
+
+        result.words.clear();
+        result.segments = vec![transcription_timestamp("hello mayhem", 0.0, 1.1)];
+        assert_invalid_transcription_timestamp(
+            &result,
+            "segment",
+            0,
+            "end must not exceed duration",
+        );
+    }
+
+    #[test]
+    fn transcription_result_rejects_inconsistent_word_and_segment_ranges() {
+        let mut result = TranscriptionResult::text("hello");
+        result.duration_seconds = Some(1.0);
+        result.words = vec![transcription_timestamp("hello", 0.4, 0.6)];
+        result.segments = vec![
+            transcription_timestamp("hel", 0.0, 0.5),
+            transcription_timestamp("lo", 0.5, 1.0),
+        ];
+        assert_invalid_transcription_timestamp(
+            &result,
+            "word",
+            0,
+            "word must be contained within a segment",
+        );
+
+        result.words = vec![transcription_timestamp("hello", 0.5, 0.8)];
+        result.segments = vec![
+            transcription_timestamp("unused", 0.0, 0.4),
+            transcription_timestamp("hello", 0.4, 1.0),
+        ];
+        assert_invalid_transcription_timestamp(
+            &result,
+            "segment",
+            0,
+            "segment must contain at least one word",
+        );
+    }
+
+    #[test]
+    fn transcription_result_rejects_unordered_or_unbounded_timestamp_counts() {
         let mut result = TranscriptionResult::text("hello mayhem");
         result.words = vec![
             TranscriptionTimestamp {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -127,7 +128,8 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         }
 
         let requirements_path = venv.join("mayhem-requirements.txt");
-        fs::write(&requirements_path, spec.requirements).with_context(|| {
+        let requirements = canonical_requirements(spec.requirements, spec.backend)?;
+        fs::write(&requirements_path, requirements.as_ref()).with_context(|| {
             format!(
                 "writing checked {} requirements {}",
                 spec.backend,
@@ -161,13 +163,19 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
                 )
             })?;
         if !install.status.success() {
+            let detail = command_output_detail(&install);
             let _ = fs::remove_dir_all(&venv);
             bail!(
-                "installing pinned {}=={} for {} failed with {}; check network access and the backend OS prerequisites, then retry",
+                "installing pinned {}=={} for {} failed with {}{}; check network access and the backend OS prerequisites, then retry",
                 spec.distribution,
                 spec.version,
                 spec.backend,
-                install.status
+                install.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
             );
         }
         validate_python(&managed_python, &spec, &cache_root).with_context(|| {
@@ -247,10 +255,11 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
                 "numpy",
                 "soundfile",
                 "soxr",
+                "librosa",
             ],
             version: "5.14.1",
             requirements: TRANSFORMERS_ASR_REQUIREMENTS,
-            requirements_sha256: "40aea5afdff6383d8cd1dc53faea4fb1413f0833628bb3a61afd18cd27e36684",
+            requirements_sha256: "293ff8c2998e0fe7962e561e53b7f379b295460f294a407eabc2cacd5464827c",
             extra_index_urls: &[],
             min_free_bytes: 8 * GIB,
         }),
@@ -259,7 +268,8 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
 }
 
 fn verify_requirements(spec: &PythonRuntimeSpec) -> Result<()> {
-    let actual = format!("{:x}", Sha256::digest(spec.requirements));
+    let requirements = canonical_requirements(spec.requirements, spec.backend)?;
+    let actual = format!("{:x}", Sha256::digest(requirements.as_ref()));
     if actual != spec.requirements_sha256 {
         bail!(
             "embedded {} requirements checksum mismatch: expected {}, got {}",
@@ -268,7 +278,7 @@ fn verify_requirements(spec: &PythonRuntimeSpec) -> Result<()> {
             actual
         );
     }
-    let text = std::str::from_utf8(spec.requirements)
+    let text = std::str::from_utf8(requirements.as_ref())
         .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
     let expected = format!("{}=={}", spec.distribution, spec.version);
     let pairs = exact_requirement_pairs(text).with_context(|| {
@@ -288,6 +298,19 @@ fn verify_requirements(spec: &PythonRuntimeSpec) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn canonical_requirements<'a>(requirements: &'a [u8], backend: &str) -> Result<Cow<'a, [u8]>> {
+    let text = std::str::from_utf8(requirements)
+        .with_context(|| format!("{backend} requirements are not UTF-8"))?;
+    if !text.contains('\r') {
+        return Ok(Cow::Borrowed(requirements));
+    }
+    let normalized = text.replace("\r\n", "\n");
+    if normalized.contains('\r') {
+        bail!("{backend} requirements contain an unsupported bare carriage return");
+    }
+    Ok(Cow::Owned(normalized.into_bytes()))
 }
 
 fn exact_requirement_pairs(text: &str) -> Result<Vec<(String, String)>> {
@@ -456,6 +479,7 @@ mod tests {
             .contains(&"transformers.models.parakeet.modeling_parakeet"));
         assert!(transformers_asr.required_imports.contains(&"soundfile"));
         assert!(transformers_asr.required_imports.contains(&"soxr"));
+        assert!(transformers_asr.required_imports.contains(&"librosa"));
         assert_eq!(
             exact_requirement_pairs(std::str::from_utf8(transformers_asr.requirements).unwrap())
                 .unwrap(),
@@ -464,9 +488,10 @@ mod tests {
                 ("torch".to_owned(), "2.13.0".to_owned()),
                 ("tokenizers".to_owned(), "0.22.2".to_owned()),
                 ("safetensors".to_owned(), "0.8.0".to_owned()),
-                ("numpy".to_owned(), "2.2.6".to_owned()),
+                ("numpy".to_owned(), "2.4.6".to_owned()),
                 ("soundfile".to_owned(), "0.14.0".to_owned()),
                 ("soxr".to_owned(), "1.1.0".to_owned()),
+                ("librosa".to_owned(), "0.11.0".to_owned()),
             ]
         );
     }
@@ -476,6 +501,19 @@ mod tests {
         assert!(exact_requirement_pairs("mlx-lm>=0.31.3\n").is_err());
         assert!(exact_requirement_pairs("--extra-index-url https://example.invalid\n").is_err());
         assert!(exact_requirement_pairs("mlx-lm==0.31.3\nmlx_lm==0.31.3\n").is_err());
+    }
+
+    #[test]
+    fn requirements_hash_is_stable_across_windows_line_endings() {
+        let mut spec = python_runtime_spec("transformers-asr").expect("Transformers ASR runtime");
+        let crlf = std::str::from_utf8(spec.requirements)
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes()
+            .into_boxed_slice();
+        spec.requirements = Box::leak(crlf);
+        verify_requirements(&spec).expect("CRLF requirements verify canonically");
+        assert!(canonical_requirements(b"a==1\rb==2\n", "test").is_err());
     }
 
     #[test]

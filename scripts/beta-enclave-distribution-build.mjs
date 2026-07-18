@@ -6,8 +6,10 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
+import { catalogEnclaveId, orderedSidecarRootEntries } from './catalog-enclave-id.mjs';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const scriptPath = fileURLToPath(import.meta.url);
+const repoRoot = path.resolve(path.dirname(scriptPath), '..');
 const defaultOutDir = '.mayhem-local/enclave-distributions';
 const defaultCatalogPath = 'catalog/models.json';
 const defaultChunkSize = 8 * 1024 * 1024;
@@ -43,6 +45,8 @@ Options:
   --binary PATH                           Release mayhem-enclave binary to measure
   --binary-hash HEX                       Precomputed binary BLAKE3 hash
   --caps-json JSON                        Canonical caps to copy into patch output
+  --sidecar NAME=PATH                     Override a catalog sidecar's local path
+                                           (repeatable; defaults to its HF snapshot path)
   --out-dir PATH                          Output dir (default: ${defaultOutDir})
   --chunk-size BYTES                      Artifact Merkle chunk size (default: ${defaultChunkSize})
   --format tar.zst|tar.gz                 Bundle archive format (default: tar.zst)
@@ -73,6 +77,7 @@ function parseArgs(argv) {
     binary: null,
     binaryHash: null,
     capsJson: null,
+    sidecars: [],
     outDir: defaultOutDir,
     chunkSize: defaultChunkSize,
     format: 'tar.zst',
@@ -105,6 +110,7 @@ function parseArgs(argv) {
     else if (arg === '--binary') args.binary = next();
     else if (arg === '--binary-hash') args.binaryHash = next();
     else if (arg === '--caps-json') args.capsJson = next();
+    else if (arg === '--sidecar') args.sidecars.push(next());
     else if (arg === '--out-dir') args.outDir = next();
     else if (arg === '--chunk-size') args.chunkSize = Number.parseInt(next(), 10);
     else if (arg === '--format') args.format = next();
@@ -296,7 +302,7 @@ function assertFile(filePath, name) {
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+    return `{${Object.keys(value).sort(compareUtf8).map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
 }
@@ -304,10 +310,6 @@ function stableJson(value) {
 async function blake3HexBytes(bytes) {
   const digest = await blake3(bytes);
   return Buffer.from(digest).toString('hex');
-}
-
-async function blake3HexText(text) {
-  return blake3HexBytes(Buffer.from(text));
 }
 
 async function blake3File(filePath) {
@@ -360,7 +362,7 @@ async function merkleRootFromLeaves(leaves) {
   return level[0];
 }
 
-async function buildMerkleManifest(filePath, chunkSize) {
+export async function buildMerkleManifest(filePath, chunkSize) {
   if (!Number.isInteger(chunkSize) || chunkSize <= 0) throw new Error('--chunk-size must be a positive integer');
   const handle = fs.openSync(filePath, 'r');
   const buffer = Buffer.alloc(chunkSize);
@@ -469,10 +471,153 @@ function urlJoin(baseUrl, fileName) {
   return base.toString();
 }
 
-function safeArtifactName(filePath) {
-  const name = path.basename(filePath).replace(/[^A-Za-z0-9._-]/g, '_');
-  if (!name || name === '.' || name === '..') throw new Error('artifact filename is not usable');
-  return name;
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+function parseSidecarOverrides(specs) {
+  const overrides = new Map();
+  for (const spec of specs || []) {
+    const separator = spec.indexOf('=');
+    if (separator <= 0 || separator === spec.length - 1) {
+      throw new Error('--sidecar must use NAME=PATH');
+    }
+    const name = spec.slice(0, separator);
+    if (overrides.has(name)) throw new Error(`--sidecar repeats catalog sidecar ${name}`);
+    overrides.set(name, resolveRepo(spec.slice(separator + 1)));
+  }
+  return overrides;
+}
+
+const TRANSFORMERS_ASR_REQUIRED_SIDECARS = Object.freeze({
+  transformers_config: 'config.json',
+  transformers_generation_config: 'generation_config.json',
+  transformers_processor_config: 'processor_config.json',
+  transformers_tokenizer_json: 'tokenizer.json',
+  transformers_tokenizer_config: 'tokenizer_config.json',
+});
+
+function huggingFaceSnapshotRoot(artifactPath, artifactPathInRepo) {
+  let root = artifactPath;
+  for (const _part of artifactPathInRepo.split('/')) root = path.dirname(root);
+  return root;
+}
+
+async function prepareArtifactSidecars(args, catalogBinding, artifactPath) {
+  const catalogArtifact = catalogBinding.binding?.artifact;
+  const rawSidecars = catalogArtifact && Object.hasOwn(catalogArtifact, 'sidecars')
+    ? requireObject(catalogArtifact.sidecars, `${args.modelId}.${catalogBinding.binding.artifactName}.sidecars`)
+    : {};
+  if (catalogArtifact?.engine === 'transformers-asr') {
+    for (const [name, expectedPath] of Object.entries(TRANSFORMERS_ASR_REQUIRED_SIDECARS)) {
+      const sidecar = requireObject(
+        rawSidecars[name],
+        `${args.modelId}.${catalogBinding.binding.artifactName}.sidecars.${name}`,
+      );
+      if (sidecar.path !== expectedPath) {
+        throw new Error(
+          `${args.modelId}.${catalogBinding.binding.artifactName} transformers-asr sidecar `
+          + `${name} must use path ${expectedPath}`,
+        );
+      }
+    }
+  }
+  const entries = Object.entries(rawSidecars).sort(([left], [right]) => compareUtf8(left, right));
+  const overrides = parseSidecarOverrides(args.sidecars);
+  for (const name of overrides.keys()) {
+    if (!Object.hasOwn(rawSidecars, name)) {
+      throw new Error(`--sidecar ${name} is not declared by the exact catalog artifact`);
+    }
+  }
+
+  const snapshotRoot = huggingFaceSnapshotRoot(artifactPath, args.artifactPathInRepo);
+  const artifactSidecarEntries = [];
+  const bundledArtifactSidecarEntries = [];
+  const artifactSidecarRootEntries = [];
+  const files = [];
+  const bundlePaths = new Set();
+
+  for (const [name, value] of entries) {
+    const sidecar = requireObject(value, `catalog sidecar ${name}`);
+    const source = requireObject(sidecar.source, `catalog sidecar ${name}.source`);
+    if (!isSafeHuggingFacePath(sidecar.path)) {
+      throw new Error(`catalog sidecar ${name}.path must be a safe relative Hugging Face artifact path`);
+    }
+    if (
+      source.kind !== 'huggingface' ||
+      !isSafeHuggingFaceRepo(source.repo) ||
+      typeof source.revision !== 'string' ||
+      !hex40.test(source.revision || '')
+    ) {
+      throw new Error(`catalog sidecar ${name}.source must be an immutable Hugging Face source`);
+    }
+    assertHex64(sidecar.artifact_root, `catalog sidecar ${name}.artifact_root`);
+    if (sidecar.artifact_root_kind !== 'blake3_merkle_v1') {
+      throw new Error(`catalog sidecar ${name}.artifact_root_kind must be blake3_merkle_v1`);
+    }
+    assertHex64(sidecar.source_sha256, `catalog sidecar ${name}.source_sha256`);
+    if (!Number.isSafeInteger(sidecar.weights_bytes) || sidecar.weights_bytes < 0) {
+      throw new Error(`catalog sidecar ${name}.weights_bytes must be a non-negative safe integer`);
+    }
+
+    const localPath = overrides.get(name) || path.resolve(snapshotRoot, sidecar.path);
+    const stat = assertFile(localPath, `--sidecar ${name}`);
+    if (stat.size !== sidecar.weights_bytes) {
+      throw new Error(
+        `sidecar ${name} byte size mismatch: signed catalog has ${sidecar.weights_bytes}, local file is ${stat.size}`
+      );
+    }
+    const sourceSha256 = await sha256File(localPath);
+    if (sourceSha256 !== sidecar.source_sha256.toLowerCase()) {
+      throw new Error(
+        `sidecar ${name} SHA-256 mismatch: signed catalog has ${sidecar.source_sha256.toLowerCase()}, local file is ${sourceSha256}`
+      );
+    }
+    const merkle = await buildMerkleManifest(localPath, args.chunkSize);
+    const artifactRoot = sidecar.artifact_root.toLowerCase();
+    if (merkle.root !== artifactRoot) {
+      throw new Error(
+        `sidecar ${name} Merkle root mismatch: signed catalog has ${artifactRoot}, local file is ${merkle.root}`
+      );
+    }
+
+    const bundlePath = `artifacts/${sidecar.path}`;
+    if (bundlePaths.has(bundlePath)) {
+      throw new Error(`catalog sidecars share bundle path ${bundlePath}`);
+    }
+    bundlePaths.add(bundlePath);
+    const record = {
+      source: {
+        kind: 'huggingface',
+        repo: source.repo,
+        revision: source.revision.toLowerCase(),
+        path: sidecar.path,
+      },
+      path: sidecar.path,
+      artifact_root: artifactRoot,
+      artifact_root_kind: 'blake3_merkle_v1',
+      weights_bytes: sidecar.weights_bytes,
+      source_sha256: sourceSha256,
+    };
+    artifactSidecarEntries.push([name, record]);
+    artifactSidecarRootEntries.push([name, artifactRoot]);
+    bundledArtifactSidecarEntries.push([name, {
+      ...record,
+      bundle_path: bundlePath,
+      bytes: stat.size,
+      sha256: sourceSha256,
+      merkle,
+    }]);
+    files.push({ name, localPath, bundlePath });
+  }
+
+  const artifactSidecarRoots = Object.fromEntries(artifactSidecarRootEntries);
+  return {
+    artifactSidecars: Object.fromEntries(artifactSidecarEntries),
+    bundledArtifactSidecars: Object.fromEntries(bundledArtifactSidecarEntries),
+    artifactSidecarRoots: Object.fromEntries(orderedSidecarRootEntries(artifactSidecarRoots)),
+    files,
+  };
 }
 
 function run(command, args) {
@@ -491,7 +636,7 @@ function assertTool(command, hint) {
   if (child.status !== 0) throw new Error(`${command} is required${hint ? ` (${hint})` : ''}`);
 }
 
-function distributionSigningPayload(adminPubkey, enclave) {
+export function distributionSigningPayload(adminPubkey, enclave) {
   return Buffer.from(stableJson({
     schema_version: 1,
     kind: 'mayhem-enclave-distribution-v1',
@@ -503,6 +648,7 @@ function distributionSigningPayload(adminPubkey, enclave) {
     artifact_root_kind: enclave.artifact_root_kind,
     artifact_source: enclave.artifact_source,
     source_sha256: enclave.source_sha256,
+    artifact_sidecars: enclave.artifact_sidecars,
     manifest_hash: enclave.manifest_hash,
     binary_hash: enclave.binary_hash,
     distribution: {
@@ -529,7 +675,7 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function build(args) {
+export async function build(args) {
   assertRequired(args.artifact, '--artifact');
   assertRequired(args.modelId, '--model-id');
   assertRequired(args.backend, '--backend');
@@ -573,9 +719,10 @@ async function build(args) {
   const merkle = await buildMerkleManifest(artifactPath, args.chunkSize);
   let artifactRoot = merkle.root;
   let artifactRootVerified = true;
-  if (args.artifactRoot) {
-    assertHex64(args.artifactRoot, '--artifact-root');
-    artifactRoot = args.artifactRoot.toLowerCase();
+  const expectedArtifactRoot = args.artifactRoot || catalogBinding.binding?.artifact?.artifact_root;
+  if (expectedArtifactRoot) {
+    assertHex64(expectedArtifactRoot, args.artifactRoot ? '--artifact-root' : 'catalog artifact_root');
+    artifactRoot = expectedArtifactRoot.toLowerCase();
     artifactRootVerified = merkle.root.toLowerCase() === artifactRoot;
     if (!artifactRootVerified && !args.allowArtifactRootMismatchForSmoke) {
       throw new Error(`artifact Merkle root mismatch: expected ${artifactRoot}, got ${merkle.root}`);
@@ -585,11 +732,20 @@ async function build(args) {
     }
   }
 
+  const {
+    artifactSidecars,
+    bundledArtifactSidecars,
+    artifactSidecarRoots,
+    files: sidecarFiles,
+  } = await prepareArtifactSidecars(args, catalogBinding, artifactPath);
   const binaryHash = args.binaryHash ? args.binaryHash.toLowerCase() : await blake3File(binaryPath);
   assertHex64(binaryHash, '--binary-hash');
   const caps = args.capsJson ? JSON.parse(args.capsJson) : undefined;
 
-  const artifactName = safeArtifactName(artifactPath);
+  const artifactBundlePath = `artifacts/${artifactSource.path}`;
+  if (sidecarFiles.some((sidecar) => sidecar.bundlePath === artifactBundlePath)) {
+    throw new Error(`artifact and sidecar share bundle path ${artifactBundlePath}`);
+  }
   const enclaveManifest = {
     schema_version: 1,
     kind: 'mayhem-enclave-manifest-v1',
@@ -602,8 +758,9 @@ async function build(args) {
     source_sha256: artifactSha256,
     catalog_binding: catalogBindingEvidence,
     artifact_root_verified: artifactRootVerified,
+    artifact_sidecars: bundledArtifactSidecars,
     artifact: {
-      path: `artifacts/${artifactName}`,
+      path: artifactBundlePath,
       bytes: artifactStat.size,
       sha256: artifactSha256,
       merkle,
@@ -611,7 +768,13 @@ async function build(args) {
   };
   const enclaveManifestBytes = Buffer.from(`${stableJson(enclaveManifest)}\n`);
   const manifestHash = await blake3HexBytes(enclaveManifestBytes);
-  const enclaveId = await blake3HexText(`${adminKey.publicKeyHex}${args.modelId}${artifactRoot}${manifestHash}`);
+  const enclaveId = catalogEnclaveId({
+    adminPubkey: adminKey.publicKeyHex,
+    modelId: args.modelId,
+    artifactRoot,
+    artifactSidecarRoots,
+    manifestHash,
+  });
 
   const outDir = resolveRepo(args.outDir);
   const enclaveOutDir = path.join(outDir, enclaveId);
@@ -620,9 +783,14 @@ async function build(args) {
 
   const tempDir = fs.mkdtempSync(path.join(enclaveOutDir, '.stage-'));
   const stageDir = path.join(tempDir, enclaveId);
-  fs.mkdirSync(path.join(stageDir, 'artifacts'), { recursive: true });
+  fs.mkdirSync(path.dirname(path.join(stageDir, artifactBundlePath)), { recursive: true });
   fs.writeFileSync(path.join(stageDir, 'enclave-manifest.json'), enclaveManifestBytes);
-  fs.copyFileSync(artifactPath, path.join(stageDir, 'artifacts', artifactName));
+  fs.copyFileSync(artifactPath, path.join(stageDir, artifactBundlePath));
+  for (const sidecar of sidecarFiles) {
+    const destination = path.join(stageDir, sidecar.bundlePath);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(sidecar.localPath, destination);
+  }
 
   const ext = args.format === 'tar.zst' ? 'tar.zst' : 'tar.gz';
   const archivePath = path.join(enclaveOutDir, `${enclaveId}.${ext}`);
@@ -658,6 +826,7 @@ async function build(args) {
     artifact_root_kind: 'blake3_merkle_v1',
     artifact_source: artifactSource,
     source_sha256: artifactSha256,
+    artifact_sidecars: artifactSidecars,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     distribution: {
@@ -687,6 +856,7 @@ async function build(args) {
     source_sha256: artifactSha256,
     catalog_binding: catalogBindingEvidence,
     artifact_root_verified: artifactRootVerified,
+    artifact_sidecars: bundledArtifactSidecars,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     enclave_manifest_file: 'enclave-manifest.json',
@@ -726,6 +896,7 @@ async function build(args) {
       artifact_root_kind: 'blake3_merkle_v1',
       artifact_source: artifactSource,
       source_sha256: artifactSha256,
+      artifact_sidecars: artifactSidecars,
       manifest_hash: manifestHash,
       binary_hash: binaryHash,
       ...(caps === undefined ? {} : { caps }),
@@ -751,6 +922,8 @@ async function build(args) {
     artifact_root_kind: 'blake3_merkle_v1',
     artifact_source: artifactSource,
     source_sha256: artifactSha256,
+    artifact_sidecars: artifactSidecars,
+    artifact_sidecar_roots: artifactSidecarRoots,
     catalog_binding: catalogBindingEvidence,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
@@ -790,4 +963,6 @@ async function main() {
   }
 }
 
-await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+  await main();
+}
