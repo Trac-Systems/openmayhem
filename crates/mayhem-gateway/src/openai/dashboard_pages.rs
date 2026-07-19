@@ -2906,44 +2906,198 @@ fn paused_activity_table_row(paused: &PausedSession, _index: usize) -> String {
 }
 
 struct WalletFundingGuide {
-    label: &'static str,
+    rail: &'static str,
+    method: &'static str,
+    balance: &'static str,
+    summary: &'static str,
+    amount_label: &'static str,
+    amount_prefix: &'static str,
+    amount_suffix: &'static str,
     command: &'static str,
     help: &'static str,
-    label_amount: Option<&'static str>,
-    command_amount: Option<&'static str>,
 }
 
 fn wallet_funding_guide(rail: &str) -> WalletFundingGuide {
     match rail {
         "fiat" => WalletFundingGuide {
-            label: "Start a $10 Stripe checkout",
+            rail: "fiat",
+            method: "Card / Stripe",
+            balance: "FIAT",
+            summary: "No crypto required",
+            amount_label: "Credit amount (USD)",
+            amount_prefix: "$",
+            amount_suffix: "",
             command: "mayhem pay stripe --amount 10",
-            help: "Edit the amount if needed. The hosted checkout still requires your review before payment.",
-            label_amount: Some("$10"),
-            command_amount: Some("10"),
+            help: "Opens Stripe Checkout for your review; this page never charges you.",
         },
         "tap" => WalletFundingGuide {
-            label: "Prepare a 10 TAP deposit",
+            rail: "tap",
+            method: "TAP",
+            balance: "TAP",
+            summary: "Ethereum wallet + gas",
+            amount_label: "Deposit amount (TAP)",
+            amount_prefix: "",
+            amount_suffix: "TAP",
             command: "mayhem pay tap --amount-tap 10",
-            help: "This is a dry run. Review the transaction plan, then add --confirm only when you are ready to broadcast.",
-            label_amount: Some("10"),
-            command_amount: Some("10"),
+            help: "Creates a dry run. Add --confirm only after reviewing it.",
         },
         "tnk" => WalletFundingGuide {
-            label: "Prepare a $10 TNK deposit intent",
+            rail: "tnk",
+            method: "TNK",
+            balance: "TNK",
+            summary: "Trac wallet required",
+            amount_label: "Credit target (USD)",
+            amount_prefix: "$",
+            amount_suffix: "",
             command: "mayhem pay tnk --amount 10",
-            help: "This prepares an intent without submitting it. Review the output before adding submission flags.",
-            label_amount: Some("$10"),
-            command_amount: Some("10"),
+            help: "Prepares an intent without submitting it.",
         },
         _ => WalletFundingGuide {
-            label: "Inspect available payment rails",
+            rail: "unknown",
+            method: "Other rail",
+            balance: "Unknown",
+            summary: "Inspect the canonical payment directory",
+            amount_label: "Amount",
+            amount_prefix: "",
+            amount_suffix: "",
             command: "mayhem payments",
             help: "This gateway reports a rail without a dashboard funding recipe. Inspect the CLI output before choosing an action.",
-            label_amount: None,
-            command_amount: None,
         },
     }
+}
+
+fn wallet_rail_label(rail: &str) -> &'static str {
+    match rail {
+        "fiat" => "Card / Stripe",
+        "tap" => "TAP",
+        "tnk" => "TNK",
+        _ => "Unknown rail",
+    }
+}
+
+fn wallet_method_icon(rail: &str) -> &'static str {
+    match rail {
+        "fiat" => {
+            r#"<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M2.5 9.5h19M6.5 15h5"/></svg>"#
+        }
+        "tap" => {
+            r#"<img class="wallet-method-logo wallet-method-logo--ethereum" src="/mayhem/dashboard/assets/brand/ethereum.svg" alt="" width="20" height="28">"#
+        }
+        "tnk" => {
+            r#"<img class="wallet-method-logo wallet-method-logo--tnk" src="/mayhem/dashboard/assets/brand/tnk-white.avif" alt="" width="24" height="21">"#
+        }
+        _ => {
+            r#"<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M8 9h8M8 12h8M8 15h5"/></svg>"#
+        }
+    }
+}
+
+fn wallet_method_card(guide: &WalletFundingGuide, active_rail: &str) -> String {
+    let active = guide.rail == active_rail;
+    let recommended = guide.rail == "fiat";
+    let badges = if recommended {
+        r#"<span class="wallet-method-badge recommended">Recommended</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<label class="wallet-method-card{}" data-wallet-method-card data-wallet-method="{}"><input type="radio" name="wallet-funding-method" value="{}" data-wallet-funding-method{}><span class="wallet-method-icon">{}</span><span class="wallet-method-copy"><strong>{}</strong><small>{}</small></span><span class="wallet-method-badges">{}</span></label>"#,
+        if active { " is-selected" } else { "" },
+        html_escape(guide.rail),
+        html_escape(guide.rail),
+        if active { " checked" } else { "" },
+        wallet_method_icon(guide.rail),
+        html_escape(guide.method),
+        html_escape(guide.summary),
+        badges,
+    )
+}
+
+fn wallet_switch_warning(guide: &WalletFundingGuide, active_rail: &str) -> String {
+    if guide.rail == active_rail {
+        return String::new();
+    }
+    let up_command_id = format!("wallet-switch-{}-command", guide.rail);
+    format!(
+        r##"<section class="wallet-rail-warning" aria-labelledby="wallet-{}-switch-title"><span class="wallet-warning-icon" aria-hidden="true">!</span><div><h4 id="wallet-{}-switch-title">Different spending balance</h4><p>{} adds to {}. This gateway currently spends {}.</p><details class="wallet-switch-disclosure"><summary>Use this balance for requests</summary><p>After the deposit, restart Mayhem on {}.</p><div class="wallet-switch-commands"><pre class="code-block compact"><code>mayhem down</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-value="mayhem down" aria-label="Copy Mayhem stop command"><span data-copy-label>Copy</span></button></pre><pre class="code-block compact"><code id="{}">mayhem up --rail {} --yes</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#{}" aria-label="Copy command to start Mayhem with {} payments"><span data-copy-label>Copy</span></button></pre></div></details></div></section>"##,
+        html_escape(guide.rail),
+        html_escape(guide.rail),
+        html_escape(guide.method),
+        html_escape(guide.balance),
+        html_escape(wallet_rail_label(active_rail)),
+        html_escape(guide.method),
+        html_escape(&up_command_id),
+        html_escape(guide.rail),
+        html_escape(&up_command_id),
+        html_escape(guide.method),
+    )
+}
+
+fn wallet_onboarding_hint(rail: &str) -> &'static str {
+    match rail {
+        "tap" => {
+            r#"<p class="wallet-onboarding-hint"><span>Need TAP?</span><a href="https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454" target="_blank" rel="noopener noreferrer" data-product-event="billing_tap_uniswap_opened" aria-label="Buy TAP on Uniswap in a new tab">Buy TAP on Uniswap <span aria-hidden="true">↗</span></a><small>Verify the token and Ethereum network. Send a small amount of ETH to the same wallet first for TAP approval and network gas.</small></p>"#
+        }
+        "tnk" => {
+            r#"<p class="wallet-onboarding-hint"><span>Need a TNK wallet?</span><a href="https://www.tracsystems.io/tap-wallet" target="_blank" rel="noopener noreferrer" data-product-event="billing_tnk_wallet_opened" aria-label="Get TAP Wallet from Trac Systems in a new tab">Get TAP Wallet <span aria-hidden="true">↗</span></a><small>Trac Systems' wallet supports TNK on Trac Network.</small></p>"#
+        }
+        _ => "",
+    }
+}
+
+fn wallet_funding_detail(guide: &WalletFundingGuide, active_rail: &str) -> String {
+    let active = guide.rail == active_rail;
+    let amount_id = format!("wallet-{}-amount", guide.rail);
+    let amount_help_id = format!("wallet-{}-amount-help", guide.rail);
+    let command_id = format!("wallet-funding-command-{}", guide.rail);
+    let copy_label = match guide.rail {
+        "fiat" => "Copy Stripe checkout command",
+        "tap" => "Copy TAP preflight command",
+        _ => "Copy TNK deposit command",
+    };
+    let presets = ["10", "25", "50"]
+        .iter()
+        .map(|amount| {
+            let visible = format!(
+                "{}{amount}{}",
+                guide.amount_prefix,
+                if guide.amount_suffix.is_empty() {
+                    "".to_owned()
+                } else {
+                    format!(" {}", guide.amount_suffix)
+                }
+            );
+            format!(
+                r##"<button class="wallet-amount-preset" type="button" data-wallet-amount-preset="{}" data-wallet-amount-target="#{}"><span data-money><span class="money-value">{}</span></span></button>"##,
+                amount,
+                html_escape(&amount_id),
+                html_escape(&visible)
+            )
+        })
+        .collect::<String>();
+    let command_prefix = guide.command.strip_suffix("10").unwrap_or(guide.command);
+    format!(
+        r##"<section class="wallet-funding-detail{}" data-wallet-funding-panel="{}" aria-label="{} funding"><div class="wallet-funding-workflow"><div class="wallet-amount-step"><span class="wallet-step-label">1 · Amount</span><label for="{}">{}</label><div class="wallet-amount-control"><span aria-hidden="true">{}</span><input id="{}" value="10" inputmode="decimal" autocomplete="off" data-wallet-funding-amount data-wallet-funding-rail="{}" data-money-input data-money-hidden-aria="Funding amount hidden" aria-describedby="{}"><span aria-hidden="true">{}</span></div><div class="wallet-amount-presets" aria-label="Common funding amounts">{}</div><p id="{}" class="wallet-amount-error" data-wallet-amount-help hidden></p>{}</div><div class="wallet-command-step"><span class="wallet-step-label">2 · Copy command</span><h3>Run in the Mayhem CLI</h3><pre class="code-block wallet-command"><code id="{}">{}<span data-wallet-command-amount data-money><span class="money-value">10</span></span></code><button class="primary-button copy-corner js-only" type="button" data-copy data-copy-target="#{}" data-wallet-copy-command data-product-event="billing_funding_command_copied" aria-label="{}"><span data-copy-label>Copy command</span></button></pre><p class="result-summary">{}</p></div></div>{}</section>"##,
+        if active { " is-active" } else { "" },
+        html_escape(guide.rail),
+        html_escape(guide.method),
+        html_escape(&amount_id),
+        html_escape(guide.amount_label),
+        html_escape(guide.amount_prefix),
+        html_escape(&amount_id),
+        html_escape(guide.rail),
+        html_escape(&amount_help_id),
+        html_escape(guide.amount_suffix),
+        presets,
+        html_escape(&amount_help_id),
+        wallet_onboarding_hint(guide.rail),
+        html_escape(&command_id),
+        html_escape(command_prefix),
+        html_escape(&command_id),
+        html_escape(copy_label),
+        html_escape(guide.help),
+        wallet_switch_warning(guide, active_rail),
+    )
 }
 
 fn wallet_deposit_status_command(rail: &str) -> String {
@@ -2955,9 +3109,6 @@ fn wallet_deposit_status_command(rail: &str) -> String {
 
 fn wallet_page(data: &DashboardData, expires: u64) -> String {
     let rail = data.rail.to_ascii_uppercase();
-    let funding = wallet_funding_guide(&data.rail);
-    let funding_label = privacy_amount_text(funding.label, funding.label_amount);
-    let funding_command = privacy_amount_text(funding.command, funding.command_amount);
     let deposit_status_command = wallet_deposit_status_command(&data.rail);
     let observed = payment_freshness_markup(data);
     let payment_ok = data
@@ -3002,57 +3153,41 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
         }
         _ => "The balance above cannot be confirmed right now.",
     };
-    let next_step = if funding_needed {
-        attention(
-            "warn",
-            "1",
-            "Fund, confirm, then send",
-            "Copy the funding command below, complete it in the CLI, then refresh this page until the ledger balance updates. The dashboard never starts a transaction without your review.",
-            Some(("View funding command", "#wallet-funding-command")),
-        )
-    } else if balance_ready {
-        attention(
-            "good",
-            "✓",
-            "Balance observed",
-            "The last ledger snapshot shows funds. Refresh this page if its freshness state expires before you send; the final signed receipt records the metered charge.",
-            Some(("Open Playground", "/mayhem/dashboard/playground")),
-        )
+    let balance_value = if data.payment_directory.is_some() {
+        money_html(&format_au_usd(data.balance_au))
     } else {
-        attention(
-            "warn",
-            "!",
-            "Confirm the payment directory first",
-            "Funding guidance is shown, but this gateway cannot currently confirm the canonical balance or payment freshness.",
-            None,
-        )
+        "Unavailable".to_owned()
     };
+    let balance_action = if funding_needed {
+        r##"<a class="primary-button" href="#add-funds">Add funds</a>"##
+    } else if balance_ready {
+        r##"<a class="primary-button" href="/mayhem/dashboard/playground" data-product-event="billing_to_playground">Open Playground</a>"##
+    } else {
+        r##"<a class="soft-button" href="/mayhem/dashboard/wallet">Refresh balance</a>"##
+    };
+    let balance_summary = format!(
+        r##"<section class="wallet-balance-summary" aria-labelledby="wallet-balance-title"><div class="wallet-balance-primary"><span>Available credit</span><strong id="wallet-balance-title">{balance_value}</strong><p>{observed}</p></div><div class="wallet-balance-facts"><div><span>Requests currently pay with</span><strong>{}</strong><small>{} balance</small></div><div><span>Ledger status</span><div class="metric-status wallet-balance-status">{ledger_status_badge}</div><small>{}</small></div></div><div class="wallet-balance-actions"><a class="quiet-button" href="/mayhem/dashboard/wallet">Refresh</a>{balance_action}</div></section>"##,
+        html_escape(wallet_rail_label(&data.rail)),
+        html_escape(&rail),
+        html_escape(ledger_status_meta),
+    );
+    let guides = [
+        wallet_funding_guide("fiat"),
+        wallet_funding_guide("tap"),
+        wallet_funding_guide("tnk"),
+    ];
+    let method_cards = guides
+        .iter()
+        .map(|guide| wallet_method_card(guide, &data.rail))
+        .collect::<String>();
+    let funding_details = guides
+        .iter()
+        .map(|guide| wallet_funding_detail(guide, &data.rail))
+        .collect::<String>();
+    let funding_open = if balance_ready { "" } else { " open" };
     let content = format!(
-        r##"{next_step}<section class="metric-grid">{}{}</section><section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Fund your requests</h2><p>Three steps: fund in the CLI, confirm the ledger, then return to Playground.</p></div></header><div class="panel-body"><div class="field"><span class="field-label">1. {}</span><pre class="code-block"><code id="wallet-funding-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-funding-command" data-product-event="billing_funding_command_copied" aria-label="Copy funding command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">{} This page does not start a transaction.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">2. Check a pending deposit</span><pre class="code-block"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" data-product-event="billing_deposit_check_copied" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">Reads the configured rail's canonical ledger state without changing it. Refresh this page after confirmation.</p></div><div class="field-gap" aria-hidden="true"></div><div class="field"><span class="field-label">3. Send a request</span><p class="result-summary">Once the balance appears above, open Playground. The receipt—not an estimate—shows the metered result.</p><a class="soft-button" href="/mayhem/dashboard/playground" data-product-event="billing_to_playground">Open Playground</a></div></div></section></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Recovery readiness</h2><p>Secret material is never rendered in this dashboard.</p></div></header><div class="panel-body"><p class="notice warn"><strong>Backup status is not exposed to the gateway.</strong> Check it on the gateway host before relying on this wallet for provider payouts.</p><pre class="code-block"><code id="wallet-backup-command">mayhem wallet backup</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-backup-command" aria-label="Copy wallet backup command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">The CLI requires explicit confirmation before revealing a mnemonic. Anyone who sees it can restore the wallet.</p></div></section></aside></section>"##,
-        if data.payment_directory.is_some() {
-            metric_with_meta_html(
-                "Ledger balance",
-                &money_html(&format_au_usd(data.balance_au)),
-                &observed,
-                &rail,
-            )
-        } else {
-            metric_status(
-                "Ledger balance",
-                &status_badge("Unavailable", "warn"),
-                "The payment directory has not answered yet.",
-                &rail,
-            )
-        },
-        metric_status(
-            "Ledger status",
-            &ledger_status_badge,
-            ledger_status_meta,
-            "Ledger",
-        ),
-        funding_label,
-        funding_command,
-        funding.help,
+        r##"{balance_summary}<details class="panel wallet-funding-shell" id="add-funds"{funding_open}><summary><span><strong>Add funds</strong><small>Card, TAP, or TNK · Stripe is recommended</small></span></summary><div class="wallet-funding-body"><fieldset class="wallet-methods"><legend>Choose a method</legend><p><strong>Agent-guided setup is recommended.</strong> Review and confirm every payment yourself, or continue with the manual steps below. Requests currently spend the <strong>{}</strong> balance.</p><div class="wallet-method-grid">{method_cards}</div></fieldset><div class="wallet-funding-details">{funding_details}</div><section class="wallet-confirmation-row" aria-labelledby="wallet-confirmation-title"><div><span class="wallet-step-label">3 · Confirm</span><h3 id="wallet-confirmation-title">Check the deposit</h3><p>Run this after payment, then refresh your balance.</p></div><pre class="code-block compact"><code id="wallet-deposit-status-command">{}</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-deposit-status-command" data-product-event="billing_deposit_check_copied" aria-label="Copy deposit status command"><span data-copy-label>Copy</span></button></pre></section></div></details>"##,
+        html_escape(wallet_rail_label(&data.rail)),
         html_escape(&deposit_status_command),
     );
     shell(
@@ -3061,7 +3196,7 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
         DashboardAppPage::Wallet,
         "Billing",
         "Billing",
-        "Fund requests, verify the ledger, and keep secret material outside the browser.",
+        "Check your available credit and add funds with card, TAP, or TNK.",
         status,
         tone,
         "",
@@ -4593,7 +4728,7 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
         ""
     };
     let content = format!(
-        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Display and attention</h2><p>Preferences are stored in this browser profile.</p></div></header><noscript><div class="panel-body"><p class="notice warn">Display preferences require JavaScript. Gateway session and version facts remain available.</p></div></noscript><div class="settings-list"><div class="settings-row"><div class="settings-copy"><strong>Hide money amounts</strong><span>Replaces monetary text semantically and visually on dashboard pages.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="amounts" role="switch" aria-label="Hide money amounts" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Reduce motion</strong><span>Disables transitions and animated feedback while preserving state.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="motion" role="switch" aria-label="Reduce motion" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Compact density</strong><span>Reduces spacing for professional monitoring without hiding explanations.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="density" role="switch" aria-label="Compact density" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Playground conversation history</strong><span>Prompts and responses are stored only in this browser profile. Credentials are never saved.</span></div><button class="settings-control quiet-button js-only" type="button" data-clear-playground-history>Clear history</button></div></div><footer class="panel-footer"><button class="quiet-button js-only" type="button" data-clear-preferences>Reset preferences</button></footer></section><details class="panel disclosure-panel"><summary><span>Local launch diagnostics</span><span class="status-badge"><span data-local-event-count>0</span>&nbsp;events</span></summary><div class="panel-body"><p class="notice">Optional debugging log for launch issues. Events stay in this browser and never include prompts, responses, credentials, or money amounts.</p><div class="inline-actions section-gap"><button class="soft-button js-only" type="button" data-export-local-events>Export JSON</button><button class="quiet-button js-only" type="button" data-clear-local-events>Clear diagnostics</button></div></div></details></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Gateway session</h2><p>Access and runtime facts for this gateway</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Authentication</span><strong>{}</strong></div><div class="fact"><span>Active tokens</span><strong>{}</strong></div><div class="fact"><span>Receipt rail</span><strong>{}</strong></div><div class="fact"><span>Provider identity</span><strong>{}</strong></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Version</h2><p>From the installed app and catalog requirements</p></div></header><div class="panel-body"><p class="notice {}">{}</p>{update_resolution}</div></section></aside></section>"##,
+        r##"<section class="dashboard-layout"><div class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Display and attention</h2><p>Preferences are stored in this browser profile.</p></div></header><noscript><div class="panel-body"><p class="notice warn">Display preferences require JavaScript. Gateway session and version facts remain available.</p></div></noscript><div class="settings-list"><div class="settings-row"><div class="settings-copy"><strong>Hide money amounts</strong><span>Replaces monetary text semantically and visually on dashboard pages.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="amounts" role="switch" aria-label="Hide money amounts" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Reduce motion</strong><span>Disables transitions and animated feedback while preserving state.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="motion" role="switch" aria-label="Reduce motion" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Compact density</strong><span>Reduces spacing for professional monitoring without hiding explanations.</span></div><button class="settings-control soft-button js-only" type="button" data-preference="density" role="switch" aria-label="Compact density" aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span data-preference-label>Off</span></button></div><div class="settings-row"><div class="settings-copy"><strong>Playground conversation history</strong><span>Prompts and responses are stored only in this browser profile. Credentials are never saved.</span></div><button class="settings-control quiet-button js-only" type="button" data-clear-playground-history>Clear history</button></div></div><footer class="panel-footer"><button class="quiet-button js-only" type="button" data-clear-preferences>Reset preferences</button></footer></section><details class="panel disclosure-panel" id="wallet-security"><summary><span>Wallet security</span><span class="status-badge">Host-only</span></summary><div class="panel-body"><p class="notice warn"><strong>Backup status is not exposed to the gateway.</strong> Check it on the gateway host before relying on this wallet for on-chain deposits or provider payouts.</p><div class="field section-gap"><span class="field-label">Back up the local wallet</span><pre class="code-block"><code id="wallet-backup-command">mayhem wallet backup</code><button class="quiet-button copy-corner js-only" type="button" data-copy data-copy-target="#wallet-backup-command" aria-label="Copy wallet backup command"><span data-copy-label>Copy</span></button></pre><p class="result-summary">The CLI requires explicit confirmation before revealing a mnemonic. Anyone who sees it can restore the wallet; Mayhem cannot recover it for you.</p></div></div></details><details class="panel disclosure-panel"><summary><span>Local launch diagnostics</span><span class="status-badge"><span data-local-event-count>0</span>&nbsp;events</span></summary><div class="panel-body"><p class="notice">Optional debugging log for launch issues. Events stay in this browser and never include prompts, responses, credentials, or money amounts.</p><div class="inline-actions section-gap"><button class="soft-button js-only" type="button" data-export-local-events>Export JSON</button><button class="quiet-button js-only" type="button" data-clear-local-events>Clear diagnostics</button></div></div></details></div><aside class="stack"><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Gateway session</h2><p>Access and runtime facts for this gateway</p></div></header><div class="panel-body"><div class="fact-grid"><div class="fact"><span>Authentication</span><strong>{}</strong></div><div class="fact"><span>Active tokens</span><strong>{}</strong></div><div class="fact"><span>Receipt rail</span><strong>{}</strong></div><div class="fact"><span>Provider identity</span><strong>{}</strong></div></div></div></section><section class="panel"><header class="panel-head"><div class="panel-title"><h2>Version</h2><p>From the installed app and catalog requirements</p></div></header><div class="panel-body"><p class="notice {}">{}</p>{update_resolution}</div></section></aside></section>"##,
         if data.requires_auth() {
             "Required"
         } else {
@@ -5970,22 +6105,6 @@ fn money_html(value: &str) -> String {
     )
 }
 
-fn privacy_amount_text(value: &str, amount: Option<&str>) -> String {
-    let Some(amount) = amount else {
-        return html_escape(value);
-    };
-    let Some(offset) = value.find(amount) else {
-        return html_escape(value);
-    };
-    let suffix_offset = offset + amount.len();
-    format!(
-        r##"{}<span data-money><span class="money-value">{}</span></span>{}"##,
-        html_escape(&value[..offset]),
-        html_escape(amount),
-        html_escape(&value[suffix_offset..]),
-    )
-}
-
 fn attention(
     tone: &str,
     icon: &str,
@@ -6650,12 +6769,39 @@ mod tests {
         let data = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
         let wallet = wallet_page(&data, 60);
         assert!(wallet.contains("data-hide-amounts"));
+        assert!(wallet.contains("Stripe is recommended"));
+        assert!(wallet.contains("Agent-guided setup is recommended."));
+        assert!(wallet.contains("Review and confirm every payment yourself"));
+        assert!(wallet.contains(r#"data-wallet-method="fiat""#));
+        assert!(wallet.contains(r#"data-wallet-method="tap""#));
+        assert!(wallet.contains(r#"data-wallet-method="tnk""#));
+        assert!(wallet.contains("/assets/brand/ethereum.svg"));
+        assert!(wallet.contains("/assets/brand/tnk-white.avif"));
+        assert!(wallet.contains("https://app.uniswap.org/explore/tokens/ethereum/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454"));
         assert!(wallet.contains(
-            r#"Start a <span data-money><span class="money-value">$10</span></span> Stripe checkout"#
+            "Send a small amount of ETH to the same wallet first for TAP approval and network gas."
         ));
-        assert!(wallet.contains(
-            r#"<code id="wallet-funding-command">mayhem pay stripe --amount <span data-money><span class="money-value">10</span></span></code>"#
+        assert!(wallet.contains("https://www.tracsystems.io/tap-wallet"));
+        assert!(wallet.contains(r#"target="_blank" rel="noopener noreferrer""#));
+        assert!(wallet.contains(r#"id="wallet-funding-command-fiat""#));
+        assert!(wallet.contains("mayhem pay stripe --amount"));
+        assert!(wallet.contains("mayhem pay tap --amount-tap"));
+        assert!(wallet.contains("mayhem pay tnk --amount"));
+        assert!(!wallet.contains("Recovery readiness"));
+
+        let tap_state = GatewayState::from_models(Vec::new()).with_receipt_rail("tap");
+        let tap_data = DashboardData::from_state(&tap_state);
+        let tap_wallet = wallet_page(&tap_data, 60);
+        assert!(tap_wallet.contains(
+            r#"data-wallet-method="tap"><input type="radio" name="wallet-funding-method" value="tap" data-wallet-funding-method checked"#
         ));
+        assert!(tap_wallet.contains("This gateway currently spends TAP"));
+        assert!(tap_wallet.contains("Use this balance for requests"));
+        assert!(tap_wallet.contains("mayhem up --rail fiat --yes"));
+
+        let settings = settings_page(&tap_data, 60);
+        assert!(settings.contains(r#"id="wallet-security""#));
+        assert!(settings.contains(r#"id="wallet-backup-command""#));
     }
 
     #[test]

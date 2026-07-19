@@ -1043,8 +1043,17 @@ fn showcase_state_from_models_with_receipts(
         .with_payment_directory(json!({
             "ok": true,
             "observed_at": now_secs(),
-            "payments": { "fiat": { "currencies": ["usd", "eur"] } },
-            "rates": { "fiat": { "usd": "1.00", "source": "workbench" } }
+            "payments": {
+                "rails": ["fiat", "tap", "tnk"],
+                "fiat": { "processor": "stripe", "currencies": ["usd", "eur"] },
+                "tap": { "network": "ethereum" },
+                "tnk": { "network": "trac" }
+            },
+            "rates": {
+                "fiat": { "usd": "1.00", "source": "workbench" },
+                "tap": { "usd": "0.42", "source": "workbench", "fresh": true },
+                "tnk": { "usd": "0.18", "source": "workbench", "fresh": true }
+            }
         }))
         .with_access_control(workbench_access_control());
 
