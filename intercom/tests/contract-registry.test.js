@@ -406,7 +406,7 @@ test('MayhemContract requires model_class and allows admin model classes', async
     enclave_id: '1'.repeat(64),
     model_id: 'admin/music-small@fp16',
     model_class: 'music-generation',
-    backend: 'comfyui',
+    backend: 'ace-step',
     artifact_root: '2'.repeat(64),
     manifest_hash: '3'.repeat(64),
     binary_hash: '4'.repeat(64),

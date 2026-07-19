@@ -235,6 +235,7 @@ const ENCLAVE_BACKENDS = new Set([
   'diffusers',
   'stable-diffusion.cpp',
   'comfyui',
+  'ace-step',
   'transformers-asr',
   'whisper.cpp',
   'piper',
