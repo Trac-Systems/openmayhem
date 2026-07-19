@@ -224,6 +224,7 @@ const ENCLAVE_UPDATE_FIELDS = [
   'launch_measurements',
   'caps',
 ];
+const ENCLAVE_ARTIFACT_SIDECARS_MAX = 64;
 const ENCLAVE_APPROVED_BINARY_HASHES_MAX = 64;
 const TIER3_MEASUREMENT_MAX_NAMES = 32;
 const TIER3_MEASUREMENT_MAX_VALUES = 128;
@@ -8851,7 +8852,9 @@ class MayhemContract extends Contract {
       return new Error('Enclave artifact_sidecars must be an object.');
     }
     const names = Object.keys(sidecars).sort();
-    if (names.length > 16) return new Error('Enclave artifact_sidecars has too many entries.');
+    if (names.length > ENCLAVE_ARTIFACT_SIDECARS_MAX) {
+      return new Error('Enclave artifact_sidecars has too many entries.');
+    }
     for (const name of names) {
       if (!this.isSafeHuggingFacePathSegment(name)) {
         return new Error('Enclave artifact_sidecars keys must be safe names.');

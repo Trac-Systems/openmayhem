@@ -46,6 +46,26 @@ const artifactSidecars = {
   },
 };
 
+function makeArtifactSidecars(count) {
+  return Object.fromEntries(Array.from({ length: count }, (_, index) => {
+    const name = `component_${index.toString().padStart(2, '0')}`;
+    const path = `components/${name}.safetensors`;
+    return [name, {
+      source: {
+        kind: 'huggingface',
+        repo: 'mayhem-catalog/compound-model',
+        revision: '7'.repeat(40),
+        path,
+      },
+      path,
+      artifact_root: index.toString(16).padStart(2, '0').repeat(32),
+      artifact_root_kind: 'blake3_merkle_v1',
+      weights_bytes: index + 1,
+      source_sha256: (index + 1).toString(16).padStart(2, '0').repeat(32),
+    }];
+  }));
+}
+
 const launchMeasurements = {
   schema_version: 1,
   effective_epoch: 0,
@@ -573,6 +593,39 @@ test('MayhemContract stores admin-bound enclave artifact sidecars only when cano
   );
   assert.match(mismatchedPath.message, /source\.path must match path/i);
   assert.equal(await storage.get(`enclave/${'c'.repeat(64)}`), null);
+
+  const compoundRegistration = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'd'.repeat(64),
+      artifact_sidecars: makeArtifactSidecars(25),
+    },
+    admin.publicKey,
+    3
+  );
+  assert.equal(compoundRegistration.ok, true, compoundRegistration.message);
+  assert.equal(
+    Object.keys((await storage.get(`enclave/${'d'.repeat(64)}`)).value.artifact_sidecars).length,
+    25
+  );
+
+  const excessiveSidecars = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'e'.repeat(64),
+      artifact_sidecars: makeArtifactSidecars(65),
+    },
+    admin.publicKey,
+    4
+  );
+  assert.match(excessiveSidecars.message, /too many entries/i);
+  assert.equal(await storage.get(`enclave/${'e'.repeat(64)}`), null);
 });
 
 test('MayhemContract requires Hugging Face catalog anchors to use pinned revisions', async () => {
