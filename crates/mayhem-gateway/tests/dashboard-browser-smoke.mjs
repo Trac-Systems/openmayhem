@@ -216,7 +216,7 @@ try {
     await open(path);
     equal(await page.locator('h1').innerText(), heading, 'page naming', `uses the descriptive heading for ${path}`);
   }
-  for (const scenario of ['auth-required', 'empty', 'loading', 'failure', 'offline', 'update-required']) {
+  for (const scenario of ['auth-required', 'empty', 'loading', 'failure', 'offline', 'source-update', 'signed-update', 'update-required']) {
     await open('/mayhem/dashboard', scenario);
     equal(await page.locator('h1').innerText(), 'Overview', 'page naming', `keeps the Home heading stable in ${scenario}`);
     await open('/mayhem/dashboard/earn', scenario);
@@ -233,6 +233,43 @@ try {
     'uses a complete gear outline for Settings',
   );
 
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open('/mayhem/dashboard', 'source-update');
+  const sourceUpdateNotice = page.locator('[data-update-notice]');
+  check(await sourceUpdateNotice.isVisible(), 'update notice', 'shows a compact notice for newer GitHub source');
+  check((await sourceUpdateNotice.innerText()).includes('Source update available'), 'update notice', 'labels a source-only update without implying an executable exists');
+  check(await page.locator('.app-nav a[href="/mayhem/dashboard/settings"] .nav-update-badge').isVisible(), 'update notice', 'keeps a persistent update marker beside Settings');
+  await sourceUpdateNotice.getByRole('button', { name: /Dismiss/ }).click();
+  check(!await sourceUpdateNotice.isVisible(), 'update notice', 'allows the lightweight notice to be dismissed');
+  await open('/mayhem/dashboard', 'source-update');
+  check(!await page.locator('[data-update-notice]').isVisible(), 'update notice', 'remembers dismissal for the same source revision');
+  check(await page.locator('.app-nav a[href="/mayhem/dashboard/settings"] .nav-update-badge').isVisible(), 'update notice', 'preserves the Settings marker after dismissal');
+  await open('/mayhem/dashboard/settings', 'source-update');
+  check(await page.getByText('Source update only.', { exact: true }).isVisible(), 'source update', 'explains the source-only installation path');
+  check(await page.getByRole('link', { name: /View changes on GitHub/ }).isVisible(), 'source update', 'links to the source comparison');
+  equal(await page.locator('#mayhem-update-stage-command').count(), 0, 'source update', 'does not offer the binary updater without signed assets');
+
+  await open('/mayhem/dashboard', 'signed-update');
+  check((await page.locator('[data-update-notice]').innerText()).includes('0.3.0 available'), 'signed update', 'names the installable release in the compact notice');
+  await open('/mayhem/dashboard/settings', 'signed-update');
+  check(await page.getByText('Agent-guided update recommended.', { exact: true }).isVisible(), 'signed update', 'recommends guided updating while preserving user review');
+  check(await page.getByRole('link', { name: /View release notes/ }).isVisible(), 'signed update', 'links to release notes');
+  equal(await page.locator('#mayhem-update-stage-command').innerText(), 'mayhem update', 'signed update', 'offers verified staging when signed assets exist');
+  equal(await page.locator('#mayhem-update-apply-command').innerText(), 'mayhem update --apply-staged', 'signed update', 'keeps update application explicit and separate');
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await open('/mayhem/dashboard', 'signed-update');
+  const mobileUpdateBounds = await page.locator('[data-update-notice]').evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return {
+      visible: rect.width > 0 && rect.height > 0,
+      insideViewport: rect.left >= 0 && rect.right <= window.innerWidth,
+    };
+  });
+  check(mobileUpdateBounds.visible, 'signed update', 'keeps the update notice visible on mobile');
+  check(mobileUpdateBounds.insideViewport, 'signed update', 'fits the compact update notice inside a mobile viewport');
+
+  await page.setViewportSize({ width: 1440, height: 900 });
   await open('/mayhem/dashboard/help');
   equal(await page.locator('h1').innerText(), 'Help', 'Help experience', 'uses a stable page title');
   equal(await page.locator('.page-head-actions').locator('a,button').count(), 0, 'Help experience', 'does not duplicate a task action in the page header');
@@ -253,6 +290,7 @@ try {
   check(await page.locator('#app-navigation').evaluate((drawer) => drawer.contains(document.activeElement)), 'mobile drawer', 'moves focus into the drawer');
   await page.keyboard.press('Escape');
   check(!await page.locator('body').evaluate((body) => body.classList.contains('nav-open')), 'mobile drawer', 'closes with Escape');
+  await page.waitForFunction(() => document.querySelector('.mobile-menu-button') === document.activeElement);
   check(await menu.evaluate((button) => button === document.activeElement), 'mobile drawer', 'returns focus to the trigger');
 
   await open('/mayhem/dashboard/playground');

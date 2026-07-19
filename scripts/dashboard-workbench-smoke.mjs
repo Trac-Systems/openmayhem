@@ -34,6 +34,8 @@ const EXPECTED_SCENARIOS = [
   'loading',
   'failure',
   'offline',
+  'source-update',
+  'signed-update',
   'update-required',
   'scale',
 ];
@@ -45,6 +47,8 @@ const SCENARIO_TITLES = new Map([
   ['loading', 'Provider loading'],
   ['failure', 'Provider failure'],
   ['offline', 'Routes offline'],
+  ['source-update', 'Source update'],
+  ['signed-update', 'Signed update'],
   ['update-required', 'Update required'],
   ['scale', 'Scale and overflow'],
 ]);
@@ -272,6 +276,8 @@ const SCENARIO_ROUTE_IDS = {
     'earn-opportunities', 'earn-reliability', 'network', 'network-models',
     'network-providers', 'network-markets', 'network-activity', 'network-evidence',
   ]),
+  'source-update': new Set(PRODUCT_ROUTES.map((route) => route.id)),
+  'signed-update': new Set(PRODUCT_ROUTES.map((route) => route.id)),
   'update-required': new Set(PRODUCT_ROUTES.map((route) => route.id)),
   scale: new Set([
     'home', 'models', 'activity', 'connect', 'earn', 'earn-machines',
@@ -721,6 +727,19 @@ function containsOnlyLoopbackHttpUrls(html) {
   }
 }
 
+function containsOnlySafeHttpsLinks(html) {
+  const safeExternalLinks = [
+    /href="https:\/\/github\.com\/[^"\s]+" target="_blank" rel="noopener noreferrer"/g,
+    /href="https:\/\/app\.uniswap\.org\/explore\/tokens\/ethereum\/0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454" target="_blank" rel="noopener noreferrer"/g,
+    /href="https:\/\/www\.tracsystems\.io\/tap-wallet" target="_blank" rel="noopener noreferrer"/g,
+  ];
+  const withoutSafeExternalLinks = safeExternalLinks.reduce(
+    (remaining, pattern) => remaining.replaceAll(pattern, ''),
+    html,
+  );
+  return !withoutSafeExternalLinks.includes('https://');
+}
+
 function checkHtmlResponse(report, response, scope) {
   report.equal(response.status, 200, scope, 'returns HTTP 200');
   report.check(
@@ -746,9 +765,9 @@ function checkHtmlResponse(report, response, scope) {
   report.includes(response.text, '</html>', scope, 'closes the HTML document');
   report.check(!response.text.includes('\uFFFD'), scope, 'contains no UTF-8 replacement characters');
   report.check(
-    !/\b(?:src|srcset|action|poster)=["']https:\/\//i.test(response.text),
+    containsOnlySafeHttpsLinks(response.text),
     scope,
-    'loads no HTTPS/external resources',
+    'loads no external HTTPS resources and allows only hardened approved links',
   );
   report.check(
     containsOnlyLoopbackHttpUrls(response.text),
@@ -991,6 +1010,27 @@ function checkScenarioSemantics(report, scenario, route, html) {
       report.includes(html, 'id="mayhem-update-stage-command"', scope, 'shows the verified staging step directly');
       report.includes(html, 'id="mayhem-update-apply-command"', scope, 'shows the separate apply step directly');
       report.includes(html, 'mayhem update --apply-staged', scope, 'does not present staging alone as a completed update');
+    }
+  }
+
+  if (scenario === 'source-update' || scenario === 'signed-update') {
+    report.includes(html, 'data-update-notice', scope, 'renders the compact topbar update notice');
+    report.includes(html, 'nav-update-badge info', scope, 'keeps a persistent update marker beside Settings');
+    report.check(
+      !html.includes('<section class="attention-card warn" role="status"><span class="attention-icon" aria-hidden="true">!</span><div class="attention-copy"><strong>Update available</strong>'),
+      scope,
+      'does not render a large optional update banner',
+    );
+    if (route.id === 'settings' && scenario === 'source-update') {
+      report.includes(html, 'Source update only.', scope, 'explains that source changes are not an executable update');
+      report.includes(html, 'View changes on GitHub', scope, 'links to the GitHub source comparison');
+      report.check(!html.includes('id="mayhem-update-stage-command"'), scope, 'does not offer an updater command without signed assets');
+    }
+    if (route.id === 'settings' && scenario === 'signed-update') {
+      report.includes(html, 'Agent-guided update recommended.', scope, 'recommends guided updating while preserving user review');
+      report.includes(html, 'View release notes', scope, 'links to the signed release notes');
+      report.includes(html, 'id="mayhem-update-stage-command"', scope, 'offers the updater only when the complete signed asset set exists');
+      report.includes(html, 'id="mayhem-update-apply-command"', scope, 'keeps staging and application separate');
     }
   }
 }

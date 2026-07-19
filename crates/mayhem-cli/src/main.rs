@@ -29990,7 +29990,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let state = match payment_directory {
         Some(directory) => state.with_payment_directory(directory),
         None => state,
-    };
+    }
+    .with_github_update_check_enabled();
     if let Some(config) = heartbeat_watcher {
         spawn_gateway_provider_heartbeat_watcher(state.clone(), config);
     }

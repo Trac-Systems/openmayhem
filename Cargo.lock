@@ -1985,7 +1985,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mayhem-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-enclave"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "blake3",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2089,6 +2089,7 @@ dependencies = [
  "mayhem-bridge",
  "mayhem-enclave",
  "mayhem-proto",
+ "reqwest",
  "rustfft",
  "semver",
  "serde",
@@ -2102,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-hwprobe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2111,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-pay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2121,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-paygate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "blake3",
@@ -2144,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "blake3",
@@ -2156,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-windows-sandbox"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
@@ -2164,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "mayhemd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",

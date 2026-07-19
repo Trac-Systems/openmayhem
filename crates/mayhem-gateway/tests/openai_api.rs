@@ -6619,6 +6619,8 @@ async fn mayhem_local_endpoints_report_status_receipts_and_balance() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["backend"], "local-openai-shape");
     assert_eq!(body["dev_session_shim"], true);
+    assert_eq!(body["github_update"]["state"], "disabled");
+    assert!(body["github_update"]["update"].is_null());
 
     let (status, body) =
         json_request(test_app(), Method::GET, "/mayhem/receipts", Value::Null).await;

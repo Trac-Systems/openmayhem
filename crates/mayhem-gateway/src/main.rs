@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(2);
     }
-    let state = GatewayState::from_embedded_catalog();
+    let state = GatewayState::from_embedded_catalog().with_github_update_check_enabled();
     eprintln!(
         "mayhem-gateway listening on http://{} with development embedded catalog",
         args.bind
