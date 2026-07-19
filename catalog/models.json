@@ -1,6 +1,6 @@
 {
   "catalog_id": "openmayhem-mainnet",
-  "generated_at": "2026-07-15T13:11:53Z",
+  "generated_at": "2026-07-19T05:59:36Z",
   "models": [
     {
       "adapter": {
@@ -8212,6 +8212,2999 @@
         "unsupported": {}
       },
       "tier": "launch"
+    },
+{
+      "model_id": "acestep/ace-step-1.5",
+      "model_class": "music-generation",
+      "family": "ace-step-1.5",
+      "params_b": 5.0,
+      "tier": "launch",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "ACE-Step/acestep-v15-sft",
+          "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-composite-mirror:ACE-Step/acestep-v15-sft@c410d249e71ea9385a7b586865e65b1473e1098d+ACE-Step/Ace-Step1.5@19671f406d603126926c1b7e2adc169acbcade22",
+            "input_sha256": "d4dd3a93870f06720027965b90771f529ab02094b3d29e2518f1d5e097e1af7e",
+            "output_sha256": "d4dd3a93870f06720027965b90771f529ab02094b3d29e2518f1d5e097e1af7e"
+          }
+        ],
+        "license": "mit",
+        "license_sha256": "05a6bce42a62636d2cfb24139cc008b6b899754e244175814bb5dd2f4a485357"
+      },
+      "artifacts": {
+        "safetensors": {
+          "engine": "ace-step",
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+            "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+            "publisher_key": "huggingface-repo"
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "repo": "ACE-Step/acestep-v15-sft",
+            "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "c3dce9f5ec6143b0411cd1a51b8be1b85e359f8a5adc3b10cee44705ca4cd05a",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 4787825604,
+          "source_sha256": "d4dd3a93870f06720027965b90771f529ab02094b3d29e2518f1d5e097e1af7e",
+          "download_check": true,
+          "notes": "Pinned byte-identical SFT DiT plus pinned encoder, 5Hz language model, and VAE components mirrored into one admin-owned release. The measured ACE-Step v0.1.8 source archive is embedded in the Mayhem engine.",
+          "sidecars": {
+            "ace_dit_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/acestep-v15-sft",
+                "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "config.json",
+              "artifact_root": "7d0578d0ac345ee9ac652db91d7847d5bfb558a6846095a7bb58189256cefad6",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1940,
+              "source_sha256": "9bb4f832f2e5e6c8bf7bddab3c6a6da1b13c01d072efbf0ed3c830536c473359"
+            },
+            "ace_dit_configuration": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/acestep-v15-sft",
+                "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "configuration_acestep_v15.py",
+              "artifact_root": "2da7f68510c70bf35f646079a34638c588c0b64e500046e8a959be253472d2c4",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 13130,
+              "source_sha256": "b89870c5c7a7ce060eb0bcdbb5ffc86b0b1a324ca325a26be552ea1b42496dc5"
+            },
+            "ace_dit_modeling": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/acestep-v15-sft",
+                "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "modeling_acestep_v15_base.py",
+              "artifact_root": "70c1b0ee775dddf7db77b26258eafc5c83fc226a9f4377ab55cede93075f7dee",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 95910,
+              "source_sha256": "5e3b475d46965dcd5b0d037e53a9af359305a7dbd78e2ee08b39e94c4b02ca48"
+            },
+            "ace_dit_apg_guidance": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/acestep-v15-sft",
+                "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "apg_guidance.py",
+              "artifact_root": "b2bbb1f17eb0f8ea20f7fbaeb46d4f7d0e372f9053bcf3f84a0aba1bdd5c56a7",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 7956,
+              "source_sha256": "0c0ce9755952c99307ecad2fac67863d43258e34541cd37ce2f2221f59e76b15"
+            },
+            "ace_dit_silence_latent": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/acestep-v15-sft",
+                "revision": "c410d249e71ea9385a7b586865e65b1473e1098d",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "silence_latent.pt",
+              "artifact_root": "836165305815cdb6d0fd233419c80390888c78623909fba83675f3d503574e2e",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 3841215,
+              "source_sha256": "a778e9dd942f5e8b2c09c55370782d318834432b03dabbcdf70e6ed49ad6358b"
+            },
+            "ace_embedding_added_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/added_tokens.json",
+              "artifact_root": "c7ee05fabf229f49a04da9f58f52cfb9d4497cb9f4b38b6423576d1b877e31df",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 707,
+              "source_sha256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+            },
+            "ace_embedding_chat_template": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/chat_template.jinja",
+              "artifact_root": "e6ac53a30235391f89b034acd572244d33cb0f235e8fb8506a0c636ef0b52a0c",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4116,
+              "source_sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+            },
+            "ace_embedding_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/config.json",
+              "artifact_root": "cb0b6cfe38261323dfdc792fc808bb086124712096635c8151d2a3192c3e2df8",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1359,
+              "source_sha256": "bb23c1607cfe059a58d8f0196cf1cebb52082b1056b8e358a579da80a5759420"
+            },
+            "ace_embedding_merges": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/merges.txt",
+              "artifact_root": "4c9e5374d798802ae6491739da886f1c61f2ebe640cf68be8cd9fe856b51ed11",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1671853,
+              "source_sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+            },
+            "ace_embedding_model": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/model.safetensors",
+              "artifact_root": "b00adf9840066241a4ae06abc6412f65ddd143ef67d488c531e7787e1c048950",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1191586416,
+              "source_sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"
+            },
+            "ace_embedding_special_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/special_tokens_map.json",
+              "artifact_root": "8249ab269dfa201eea8d78a58d7415b7b350049c558659f92910455568fd9b82",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 613,
+              "source_sha256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+            },
+            "ace_embedding_tokenizer": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/tokenizer.json",
+              "artifact_root": "5b237e72a66c9d47fcb9d6fff50079f1d9a36c834a631b2a6054429486edf02d",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 11423705,
+              "source_sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+            },
+            "ace_embedding_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/tokenizer_config.json",
+              "artifact_root": "e9951806b143e98f4e001f80819bc19ea2abe8ed875176670404b128b54fa12f",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 5404,
+              "source_sha256": "443bfa629eb16387a12edbf92a76f6a6f10b2af3b53d87ba1550adfcf45f7fa0"
+            },
+            "ace_embedding_vocab": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "Qwen3-Embedding-0.6B/vocab.json",
+              "artifact_root": "07e084d5bb703cb11e2e1d14570b12572f794244e2f6b850bfeb278db0053cdf",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2776833,
+              "source_sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+            },
+            "ace_lm_added_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/added_tokens.json",
+              "artifact_root": "2402cef4c0f4c3f233f8e788de04ce1cc29c7e968db931488eb61eb9c4a55ec2",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2217787,
+              "source_sha256": "db08b66a515fb5d6acca0b3492d25bb44e0deda6241fc1113ac0679d40558c48"
+            },
+            "ace_lm_chat_template": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/chat_template.jinja",
+              "artifact_root": "fed3c84d352a64220aeb92f6534eca906d6fcf8c1b353ee1fbde9d486f5a9dcf",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4168,
+              "source_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+            },
+            "ace_lm_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/config.json",
+              "artifact_root": "3f34fc35c5e35752c29249e3784a63bc22066a5379f93ffeff7c934cf45ff569",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1385,
+              "source_sha256": "73515ca4bfd86a5b56f28bf680311d1911e159c85d7f7ceb2188e310007c9010"
+            },
+            "ace_lm_merges": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/merges.txt",
+              "artifact_root": "4c9e5374d798802ae6491739da886f1c61f2ebe640cf68be8cd9fe856b51ed11",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1671853,
+              "source_sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+            },
+            "ace_lm_model": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/model.safetensors",
+              "artifact_root": "74bb434112eca32593dcf91815610881cdf6bb7471e0ae363b98dffe73b02121",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 3708521528,
+              "source_sha256": "f161689da73e5ecefa28ff780d51c2d92a00f056d021d7933c779ed5c6cd7db8"
+            },
+            "ace_lm_special_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/special_tokens_map.json",
+              "artifact_root": "4cd4439b016e79ec1b1c2ab8342bed75454b1a2002efdc080d3d39c04ec490b9",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1824199,
+              "source_sha256": "76e233bfc357b0b03d7b6e6ba8e799244f358552575a7cdadb78d3d19106b298"
+            },
+            "ace_lm_tokenizer": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/tokenizer.json",
+              "artifact_root": "9a9e323a37ac96b5559b54e4c0bc5b7dfa816ab5f74f6392177850b23cf93aee",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 24321939,
+              "source_sha256": "35af56c3f5cb3ea2cc578aa28a8937770981d504f183ac5c8c38baf4bbd4af4d"
+            },
+            "ace_lm_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/tokenizer_config.json",
+              "artifact_root": "d5bb39efc45126578566365b5551b3468284a1488b1c419f08d2ac8bdfe981e4",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 14072925,
+              "source_sha256": "6cd70cdd89425971794f5235562edcc608b0629a6c4686ae51a8b8c8b8ba5e95"
+            },
+            "ace_lm_vocab": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "acestep-5Hz-lm-1.7B/vocab.json",
+              "artifact_root": "07e084d5bb703cb11e2e1d14570b12572f794244e2f6b850bfeb278db0053cdf",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2776833,
+              "source_sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+            },
+            "ace_vae_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "vae/config.json",
+              "artifact_root": "aa015809b80ba0738c566a10c79f838dc94946813503391257084679e455be01",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 425,
+              "source_sha256": "14e019904df567f26df750317a70e2bd08f9f8f3c40ff4a24c97d1cd3f20ccd2"
+            },
+            "ace_vae_model": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT",
+                "revision": "f41443d7171a03181ada08912780b0449e8ff7fe",
+                "publisher_key": "huggingface-repo"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "ACE-Step/Ace-Step1.5",
+                "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "vae/diffusion_pytorch_model.safetensors",
+              "artifact_root": "8fb66ea82d49215718547970928a37a75eb3a7ddfc4181b7f5d88265826a5f2a",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 337431388,
+              "source_sha256": "da17edb604c40deaf09e9b24974e590d1ca83a374070e5d0884cfa4bed9a99b0"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": false,
+        "video": false,
+        "audio": true,
+        "output_modality": "audio",
+        "output_modalities": [
+          "audio"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 16,
+        "min_vram_gb_full_offload": 20,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "ace-step"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_music_generations",
+            "request_attributes": [
+              "model",
+              "prompt",
+              "caption",
+              "lyrics",
+              "instrumental",
+              "style",
+              "genre",
+              "tags",
+              "sample_mode",
+              "sample_query",
+              "description",
+              "desc",
+              "use_format",
+              "format",
+              "audio_codes",
+              "audio_code_string",
+              "language",
+              "vocal_language",
+              "bpm",
+              "key",
+              "keyscale",
+              "key_scale",
+              "time_signature",
+              "timesignature",
+              "duration",
+              "audio_duration",
+              "melody",
+              "duration_seconds",
+              "steps",
+              "inference_steps",
+              "n",
+              "batch",
+              "batch_size",
+              "response_format",
+              "audio_format",
+              "mp3_bitrate",
+              "mp3_sample_rate",
+              "temperature",
+              "top_k",
+              "top_p",
+              "guidance_scale",
+              "seed",
+              "task_type",
+              "thinking",
+              "instruction",
+              "lm_temperature",
+              "lm_cfg_scale",
+              "lm_cfg",
+              "lm_top_k",
+              "lm_top_p",
+              "lm_negative_prompt",
+              "use_cot_metas",
+              "use_cot_caption",
+              "use_cot_language",
+              "constrained_decoding",
+              "use_constrained_decoding",
+              "infer_method",
+              "inference_method",
+              "sampler",
+              "sampler_mode",
+              "velocity_norm_threshold",
+              "velocity_ema_factor",
+              "dcw_enabled",
+              "dcw_mode",
+              "dcw_scaler",
+              "dcw_high_scaler",
+              "dcw_wavelet",
+              "shift",
+              "custom_timesteps",
+              "timesteps",
+              "adg",
+              "use_adg",
+              "cfg_interval_start",
+              "cfg_interval_end",
+              "repaint_start",
+              "repainting_start",
+              "repaint_end",
+              "repainting_end",
+              "repaint_mode",
+              "repaint_strength",
+              "chunk_mask_mode",
+              "cover_strength",
+              "audio_cover_strength",
+              "cover_noise_strength",
+              "enable_normalization",
+              "normalization_db",
+              "fade_in_duration",
+              "fade_out_duration",
+              "latent_shift",
+              "latent_rescale",
+              "retake_seed",
+              "retake_variance",
+              "flow_edit_morph",
+              "flow_edit",
+              "flow_edit_source_caption",
+              "flow_edit_source_lyrics",
+              "flow_edit_n_min",
+              "flow_edit_n_max",
+              "flow_edit_n_avg",
+              "seeds",
+              "source_audio",
+              "source_audio.data",
+              "source_audio.encoding",
+              "source_audio.content_type",
+              "src_audio",
+              "src_audio.data",
+              "src_audio.encoding",
+              "src_audio.content_type",
+              "ctx_audio",
+              "ctx_audio.data",
+              "ctx_audio.encoding",
+              "ctx_audio.content_type",
+              "reference_audio",
+              "reference_audio.data",
+              "reference_audio.encoding",
+              "reference_audio.content_type",
+              "melody.data",
+              "melody.encoding",
+              "melody.content_type",
+              "ref_audio",
+              "ref_audio.data",
+              "ref_audio.encoding",
+              "ref_audio.content_type",
+              "no_fsq",
+              "negative_prompt"
+            ],
+            "required_request_attributes": [
+              "model"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "music",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "music",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "adg": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "audio_code_string": {
+                "value_types": [
+                  "string",
+                  "array"
+                ],
+                "min_length": 0,
+                "max_length": 60000,
+                "min_items": 1,
+                "max_items": 8,
+                "calibration_values": [
+                  "<|audio_code_1|><|audio_code_2|>",
+                  [
+                    "<|audio_code_1|><|audio_code_2|>",
+                    "<|audio_code_3|><|audio_code_4|>"
+                  ]
+                ]
+              },
+              "audio_codes": {
+                "value_types": [
+                  "string",
+                  "array"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 60000,
+                "min_items": 1,
+                "max_items": 8,
+                "calibration_values": [
+                  "<|audio_code_1|><|audio_code_2|>",
+                  [
+                    "<|audio_code_1|><|audio_code_2|>",
+                    "<|audio_code_3|><|audio_code_4|>"
+                  ]
+                ]
+              },
+              "audio_cover_strength": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  1.0
+                ]
+              },
+              "audio_duration": {
+                "value_types": [
+                  "number",
+                  "string",
+                  "null"
+                ],
+                "minimum": -1.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  null,
+                  "auto",
+                  -1.0,
+                  10.0,
+                  600.0
+                ]
+              },
+              "audio_format": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "flac",
+                  "mp3",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "wav32"
+                ],
+                "calibration_values": [
+                  "flac",
+                  "mp3",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "wav32"
+                ]
+              },
+              "batch": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 1.0,
+                "maximum": 8.0,
+                "calibration_values": [
+                  2
+                ]
+              },
+              "batch_size": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 1.0,
+                "maximum": 8.0,
+                "calibration_values": [
+                  2
+                ]
+              },
+              "bpm": {
+                "value_types": [
+                  "integer",
+                  "null"
+                ],
+                "default": null,
+                "minimum": 30.0,
+                "maximum": 300.0,
+                "calibration_values": [
+                  null,
+                  30,
+                  120,
+                  300
+                ]
+              },
+              "caption": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "Mayhem calibration"
+                ]
+              },
+              "cfg_interval_end": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  1.0
+                ]
+              },
+              "cfg_interval_start": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "chunk_mask_mode": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "auto",
+                "enum_values": [
+                  "explicit",
+                  "auto"
+                ],
+                "calibration_values": [
+                  "explicit",
+                  "auto"
+                ]
+              },
+              "constrained_decoding": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "cover_noise_strength": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "cover_strength": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  1.0
+                ]
+              },
+              "ctx_audio": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "ctx_audio.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "ctx_audio.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "ctx_audio.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "custom_timesteps": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 2,
+                "max_items": 200,
+                "calibration_values": [
+                  [
+                    1.0,
+                    0.5,
+                    0.0
+                  ]
+                ]
+              },
+              "dcw_enabled": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "dcw_high_scaler": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.02,
+                "minimum": 0.0,
+                "maximum": 0.1,
+                "calibration_values": [
+                  0.02
+                ]
+              },
+              "dcw_mode": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "double",
+                "enum_values": [
+                  "low",
+                  "high",
+                  "double",
+                  "pix"
+                ],
+                "calibration_values": [
+                  "low",
+                  "high",
+                  "pix",
+                  "double"
+                ]
+              },
+              "dcw_scaler": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.05,
+                "minimum": 0.0,
+                "maximum": 0.1,
+                "calibration_values": [
+                  0.05
+                ]
+              },
+              "dcw_wavelet": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "haar",
+                "enum_values": [
+                  "haar",
+                  "db2",
+                  "db4",
+                  "sym4",
+                  "sym8",
+                  "coif2"
+                ],
+                "calibration_values": [
+                  "haar",
+                  "db2",
+                  "db4",
+                  "sym4",
+                  "sym8",
+                  "coif2"
+                ]
+              },
+              "desc": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "A restrained piano ballad"
+                ]
+              },
+              "description": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "A restrained piano ballad"
+                ]
+              },
+              "duration": {
+                "value_types": [
+                  "number",
+                  "string",
+                  "null"
+                ],
+                "minimum": -1.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  null,
+                  "auto",
+                  -1.0,
+                  10.0,
+                  600.0
+                ]
+              },
+              "duration_seconds": {
+                "value_types": [
+                  "number",
+                  "string",
+                  "null"
+                ],
+                "default": null,
+                "minimum": -1.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  null,
+                  "auto",
+                  -1.0,
+                  10.0,
+                  600.0
+                ]
+              },
+              "enable_normalization": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "fade_in_duration": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 10.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "fade_out_duration": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 10.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "flow_edit": {
+                "value_types": [
+                  "boolean"
+                ],
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "flow_edit_morph": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "flow_edit_n_avg": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 1,
+                "minimum": 1.0,
+                "maximum": 8.0,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "flow_edit_n_max": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  1.0
+                ]
+              },
+              "flow_edit_n_min": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "flow_edit_source_caption": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "Original source arrangement"
+                ]
+              },
+              "flow_edit_source_lyrics": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 4096,
+                "calibration_values": [
+                  "Original source lyrics"
+                ]
+              },
+              "format": {
+                "value_types": [
+                  "boolean"
+                ],
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "genre": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 505,
+                "calibration_values": [
+                  "indie folk"
+                ]
+              },
+              "guidance_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 7.0,
+                "minimum": 1.0,
+                "maximum": 15.0,
+                "calibration_values": [
+                  7.0
+                ]
+              },
+              "infer_method": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "ode",
+                "enum_values": [
+                  "ode",
+                  "sde"
+                ],
+                "calibration_values": [
+                  "ode",
+                  "sde"
+                ]
+              },
+              "inference_method": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "ode",
+                  "sde"
+                ],
+                "calibration_values": [
+                  "ode",
+                  "sde"
+                ]
+              },
+              "inference_steps": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 1.0,
+                "maximum": 200.0,
+                "calibration_values": [
+                  50
+                ]
+              },
+              "instruction": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "Fill the audio semantic mask based on the given conditions:",
+                "min_length": 1,
+                "max_length": 1024,
+                "calibration_values": [
+                  "Fill the audio semantic mask based on the given conditions:"
+                ]
+              },
+              "instrumental": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "key": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 8,
+                "calibration_values": [
+                  "C major"
+                ]
+              },
+              "key_scale": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 8,
+                "calibration_values": [
+                  "C major"
+                ]
+              },
+              "keyscale": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 8,
+                "calibration_values": [
+                  "C major"
+                ]
+              },
+              "language": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "unknown",
+                "enum_values": [
+                  "ar",
+                  "az",
+                  "bg",
+                  "bn",
+                  "ca",
+                  "cs",
+                  "da",
+                  "de",
+                  "el",
+                  "en",
+                  "es",
+                  "fa",
+                  "fi",
+                  "fr",
+                  "he",
+                  "hi",
+                  "hr",
+                  "ht",
+                  "hu",
+                  "id",
+                  "is",
+                  "it",
+                  "ja",
+                  "ko",
+                  "la",
+                  "lt",
+                  "ms",
+                  "ne",
+                  "nl",
+                  "no",
+                  "pa",
+                  "pl",
+                  "pt",
+                  "ro",
+                  "ru",
+                  "sa",
+                  "sk",
+                  "sr",
+                  "sv",
+                  "sw",
+                  "ta",
+                  "te",
+                  "th",
+                  "tl",
+                  "tr",
+                  "uk",
+                  "ur",
+                  "vi",
+                  "yue",
+                  "zh",
+                  "unknown"
+                ],
+                "calibration_values": [
+                  "ar",
+                  "az",
+                  "bg",
+                  "bn",
+                  "ca",
+                  "cs",
+                  "da",
+                  "de",
+                  "el",
+                  "en",
+                  "es",
+                  "fa",
+                  "fi",
+                  "fr",
+                  "he",
+                  "hi",
+                  "hr",
+                  "ht",
+                  "hu",
+                  "id",
+                  "is",
+                  "it",
+                  "ja",
+                  "ko",
+                  "la",
+                  "lt",
+                  "ms",
+                  "ne",
+                  "nl",
+                  "no",
+                  "pa",
+                  "pl",
+                  "pt",
+                  "ro",
+                  "ru",
+                  "sa",
+                  "sk",
+                  "sr",
+                  "sv",
+                  "sw",
+                  "ta",
+                  "te",
+                  "th",
+                  "tl",
+                  "tr",
+                  "uk",
+                  "ur",
+                  "vi",
+                  "yue",
+                  "zh",
+                  "unknown"
+                ]
+              },
+              "latent_rescale": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1.0,
+                "minimum": 0.5,
+                "maximum": 1.5,
+                "calibration_values": [
+                  1.0
+                ]
+              },
+              "latent_shift": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": -0.2,
+                "maximum": 0.2,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "lm_cfg": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 1.0,
+                "maximum": 3.0,
+                "calibration_values": [
+                  2.0
+                ]
+              },
+              "lm_cfg_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 2.0,
+                "minimum": 1.0,
+                "maximum": 3.0,
+                "calibration_values": [
+                  2.0
+                ]
+              },
+              "lm_negative_prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "NO USER INPUT",
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "NO USER INPUT"
+                ]
+              },
+              "lm_temperature": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.85,
+                "minimum": 0.0,
+                "maximum": 2.0,
+                "calibration_values": [
+                  0.85
+                ]
+              },
+              "lm_top_k": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 0,
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "lm_top_p": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.9,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.9
+                ]
+              },
+              "lyrics": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 4096,
+                "calibration_values": [
+                  "Calibration lyrics"
+                ]
+              },
+              "melody": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "melody.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "melody.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "melody.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "acestep/ace-step-1.5"
+                ],
+                "enum_values": [
+                  "acestep/ace-step-1.5"
+                ]
+              },
+              "mp3_bitrate": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "128k",
+                "enum_values": [
+                  "128k",
+                  "192k",
+                  "256k",
+                  "320k"
+                ],
+                "calibration_values": [
+                  "128k",
+                  "192k",
+                  "256k",
+                  "320k"
+                ]
+              },
+              "mp3_sample_rate": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 48000,
+                "enum_values": [
+                  44100,
+                  48000
+                ],
+                "calibration_values": [
+                  44100,
+                  48000
+                ]
+              },
+              "n": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 2,
+                "minimum": 1.0,
+                "maximum": 8.0,
+                "calibration_values": [
+                  2
+                ]
+              },
+              "negative_prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "NO USER INPUT"
+                ]
+              },
+              "no_fsq": {
+                "value_types": [
+                  "boolean"
+                ],
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "normalization_db": {
+                "value_types": [
+                  "number"
+                ],
+                "default": -1.0,
+                "minimum": -10.0,
+                "maximum": 0.0,
+                "calibration_values": [
+                  -1.0
+                ]
+              },
+              "prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "Mayhem calibration"
+                ]
+              },
+              "ref_audio": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "ref_audio.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "ref_audio.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "ref_audio.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "reference_audio": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "reference_audio.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "reference_audio.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "reference_audio.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "repaint_end": {
+                "value_types": [
+                  "number"
+                ],
+                "default": -1.0,
+                "minimum": -1.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  30.0
+                ]
+              },
+              "repaint_mode": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "balanced",
+                "enum_values": [
+                  "conservative",
+                  "balanced",
+                  "aggressive"
+                ],
+                "calibration_values": [
+                  "conservative",
+                  "balanced",
+                  "aggressive"
+                ]
+              },
+              "repaint_start": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 599.999,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "repaint_strength": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.5,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.5
+                ]
+              },
+              "repainting_end": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": -1.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  30.0
+                ]
+              },
+              "repainting_start": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 0.0,
+                "maximum": 599.999,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "flac",
+                "enum_values": [
+                  "flac",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "wav32",
+                  "mp3"
+                ],
+                "calibration_values": [
+                  "flac",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "wav32",
+                  "mp3"
+                ]
+              },
+              "retake_seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": -1.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  7
+                ]
+              },
+              "retake_variance": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.5
+                ]
+              },
+              "sample_mode": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "sample_query": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 512,
+                "calibration_values": [
+                  "A restrained piano ballad"
+                ]
+              },
+              "sampler": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "euler",
+                "enum_values": [
+                  "euler",
+                  "heun"
+                ],
+                "calibration_values": [
+                  "euler",
+                  "heun"
+                ]
+              },
+              "sampler_mode": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "euler",
+                  "heun"
+                ],
+                "calibration_values": [
+                  "euler",
+                  "heun"
+                ]
+              },
+              "seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": -1,
+                "minimum": -1.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  7
+                ]
+              },
+              "seeds": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 8,
+                "calibration_values": [
+                  [
+                    7,
+                    11
+                  ]
+                ]
+              },
+              "shift": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 3.0,
+                "minimum": 1.0,
+                "maximum": 5.0,
+                "calibration_values": [
+                  3.0
+                ]
+              },
+              "source_audio": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "source_audio.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "source_audio.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "source_audio.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "src_audio": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "content_type": "audio/wav",
+                    "data": "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw",
+                    "encoding": "base64"
+                  }
+                ]
+              },
+              "src_audio.content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ],
+                "calibration_values": [
+                  "audio/aac",
+                  "audio/flac",
+                  "audio/m4a",
+                  "audio/mp4",
+                  "audio/mpeg",
+                  "audio/mp3",
+                  "audio/ogg",
+                  "audio/opus",
+                  "audio/wav",
+                  "audio/x-wav"
+                ]
+              },
+              "src_audio.data": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 2192,
+                "max_length": 89478488,
+                "calibration_values": [
+                  "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADwABAA8AAQAPAAEADw"
+                ]
+              },
+              "src_audio.encoding": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "base64"
+                ],
+                "calibration_values": [
+                  "base64"
+                ]
+              },
+              "steps": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 50,
+                "minimum": 1.0,
+                "maximum": 200.0,
+                "calibration_values": [
+                  50
+                ]
+              },
+              "style": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 505,
+                "calibration_values": [
+                  "acoustic"
+                ]
+              },
+              "tags": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "min_length": 0,
+                "max_length": 506,
+                "calibration_values": [
+                  "intimate, live"
+                ]
+              },
+              "task_type": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "text2music",
+                "enum_values": [
+                  "text2music",
+                  "repaint",
+                  "cover",
+                  "cover-nofsq"
+                ],
+                "calibration_values": [
+                  "text2music",
+                  "repaint",
+                  "cover",
+                  "cover-nofsq"
+                ]
+              },
+              "temperature": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 0.0,
+                "maximum": 2.0,
+                "calibration_values": [
+                  0.85
+                ]
+              },
+              "thinking": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "time_signature": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "",
+                "enum_values": [
+                  "",
+                  "2",
+                  "2/4",
+                  "3",
+                  "3/4",
+                  "4",
+                  "4/4",
+                  "6",
+                  "6/8"
+                ],
+                "calibration_values": [
+                  "",
+                  "2",
+                  "2/4",
+                  "3",
+                  "3/4",
+                  "4",
+                  "4/4",
+                  "6",
+                  "6/8"
+                ]
+              },
+              "timesignature": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "",
+                  "2",
+                  "2/4",
+                  "3",
+                  "3/4",
+                  "4",
+                  "4/4",
+                  "6",
+                  "6/8"
+                ],
+                "calibration_values": [
+                  "",
+                  "2",
+                  "2/4",
+                  "3",
+                  "3/4",
+                  "4",
+                  "4/4",
+                  "6",
+                  "6/8"
+                ]
+              },
+              "timesteps": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 2,
+                "max_items": 200,
+                "calibration_values": [
+                  [
+                    1.0,
+                    0.5,
+                    0.0
+                  ]
+                ]
+              },
+              "top_k": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "top_p": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "calibration_values": [
+                  0.9
+                ]
+              },
+              "use_adg": {
+                "value_types": [
+                  "boolean"
+                ],
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "use_constrained_decoding": {
+                "value_types": [
+                  "boolean"
+                ],
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "use_cot_caption": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "use_cot_language": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "use_cot_metas": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "use_format": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "velocity_ema_factor": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 0.5,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "velocity_norm_threshold": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.0,
+                "minimum": 0.0,
+                "maximum": 5.0,
+                "calibration_values": [
+                  0.0
+                ]
+              },
+              "vocal_language": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "ar",
+                  "az",
+                  "bg",
+                  "bn",
+                  "ca",
+                  "cs",
+                  "da",
+                  "de",
+                  "el",
+                  "en",
+                  "es",
+                  "fa",
+                  "fi",
+                  "fr",
+                  "he",
+                  "hi",
+                  "hr",
+                  "ht",
+                  "hu",
+                  "id",
+                  "is",
+                  "it",
+                  "ja",
+                  "ko",
+                  "la",
+                  "lt",
+                  "ms",
+                  "ne",
+                  "nl",
+                  "no",
+                  "pa",
+                  "pl",
+                  "pt",
+                  "ro",
+                  "ru",
+                  "sa",
+                  "sk",
+                  "sr",
+                  "sv",
+                  "sw",
+                  "ta",
+                  "te",
+                  "th",
+                  "tl",
+                  "tr",
+                  "uk",
+                  "ur",
+                  "vi",
+                  "yue",
+                  "zh",
+                  "unknown"
+                ],
+                "calibration_values": [
+                  "ar",
+                  "az",
+                  "bg",
+                  "bn",
+                  "ca",
+                  "cs",
+                  "da",
+                  "de",
+                  "el",
+                  "en",
+                  "es",
+                  "fa",
+                  "fi",
+                  "fr",
+                  "he",
+                  "hi",
+                  "hr",
+                  "ht",
+                  "hu",
+                  "id",
+                  "is",
+                  "it",
+                  "ja",
+                  "ko",
+                  "la",
+                  "lt",
+                  "ms",
+                  "ne",
+                  "nl",
+                  "no",
+                  "pa",
+                  "pl",
+                  "pt",
+                  "ro",
+                  "ru",
+                  "sa",
+                  "sk",
+                  "sr",
+                  "sv",
+                  "sw",
+                  "ta",
+                  "te",
+                  "th",
+                  "tl",
+                  "tr",
+                  "uk",
+                  "ur",
+                  "vi",
+                  "yue",
+                  "zh",
+                  "unknown"
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "music": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": [
+              [
+                "steps",
+                "guidance_scale",
+                "seed",
+                "shift",
+                "infer_method",
+                "adg",
+                "cfg_interval_start",
+                "cfg_interval_end"
+              ],
+              [
+                "thinking",
+                "lm_temperature",
+                "lm_cfg_scale",
+                "lm_top_k",
+                "lm_top_p",
+                "lm_negative_prompt",
+                "use_cot_metas",
+                "use_cot_caption",
+                "use_cot_language",
+                "constrained_decoding"
+              ],
+              [
+                "task_type",
+                "source_audio",
+                "reference_audio"
+              ],
+              [
+                "repaint_start",
+                "repaint_end",
+                "repaint_mode",
+                "chunk_mask_mode",
+                "source_audio"
+              ],
+              [
+                "repaint_strength",
+                "source_audio"
+              ],
+              [
+                "cover_strength",
+                "cover_noise_strength",
+                "source_audio"
+              ],
+              [
+                "sampler",
+                "velocity_norm_threshold",
+                "velocity_ema_factor",
+                "dcw_enabled",
+                "dcw_mode",
+                "dcw_scaler",
+                "dcw_high_scaler",
+                "dcw_wavelet"
+              ],
+              [
+                "response_format",
+                "mp3_bitrate",
+                "mp3_sample_rate",
+                "enable_normalization",
+                "normalization_db",
+                "fade_in_duration",
+                "fade_out_duration",
+                "latent_shift",
+                "latent_rescale"
+              ],
+              [
+                "retake_seed",
+                "retake_variance",
+                "flow_edit_morph",
+                "flow_edit_source_caption",
+                "flow_edit_source_lyrics",
+                "flow_edit_n_min",
+                "flow_edit_n_max",
+                "flow_edit_n_avg"
+              ]
+            ]
+          },
+          {
+            "family": "mayhem_audio_generations",
+            "request_attributes": [
+              "model",
+              "prompt",
+              "duration_seconds",
+              "response_format",
+              "guidance_scale",
+              "seed"
+            ],
+            "required_request_attributes": [
+              "model",
+              "prompt"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "audio",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "audio",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "acestep/ace-step-1.5"
+                ],
+                "enum_values": [
+                  "acestep/ace-step-1.5"
+                ]
+              },
+              "prompt": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "Mayhem calibration"
+                ]
+              },
+              "duration_seconds": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 10.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  10.0,
+                  30.0
+                ],
+                "default": 10.0
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "flac",
+                "enum_values": [
+                  "flac",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "mp3"
+                ],
+                "calibration_values": [
+                  "flac",
+                  "opus",
+                  "aac",
+                  "wav",
+                  "mp3"
+                ]
+              },
+              "guidance_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 1.0,
+                "maximum": 15.0,
+                "calibration_values": [
+                  1.0,
+                  7.0,
+                  15.0
+                ],
+                "default": 7.0
+              },
+              "seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  7
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "audio": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          },
+          {
+            "family": "hf_text_to_audio",
+            "request_attributes": [
+              "inputs",
+              "parameters.duration_seconds",
+              "parameters.guidance_scale",
+              "parameters.seed"
+            ],
+            "required_request_attributes": [
+              "inputs"
+            ],
+            "response_attributes": [
+              "audio",
+              "sampling_rate",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "audio",
+              "sampling_rate",
+              "content_type",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "inputs": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "Mayhem calibration"
+                ]
+              },
+              "parameters.duration_seconds": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 10.0,
+                "maximum": 600.0,
+                "calibration_values": [
+                  10.0,
+                  30.0
+                ],
+                "default": 10.0
+              },
+              "parameters.guidance_scale": {
+                "value_types": [
+                  "number"
+                ],
+                "minimum": 1.0,
+                "maximum": 15.0,
+                "calibration_values": [
+                  1.0,
+                  7.0,
+                  15.0
+                ],
+                "default": 7.0
+              },
+              "parameters.seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0.0,
+                "maximum": 4294967295.0,
+                "calibration_values": [
+                  7
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "audio": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "content_type": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "sampling_rate": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 1.0,
+                "maximum": 1000000.0,
+                "calibration_values": [
+                  16000
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "audio"
+        ],
+        "specialities": []
+      },
+      "modality_assessment": {
+        "detected": [
+          "audio"
+        ],
+        "evidence": [
+          "Pinned ACE-Step v0.1.8 source, SFT checkpoint, and shared component revisions expose bounded text-to-music, cover, cover-nofsq, and repaint generation with arbitrary validated inline source/reference audio and FLAC/Opus/AAC/WAV/WAV32/MP3 output."
+        ],
+        "calibrated_fingerprints": {
+          "safetensors": {
+            "audio": "7e0a4ffe3c1c4bbaeaf134b3f8f0dcde03c0573b2f0c89527ed8f6d3eeb7b83c"
+          }
+        },
+        "resource_profiles": {
+          "safetensors": {
+            "audio": {
+              "unit": "second",
+              "measurement_source": "process_rss; pool=system_memory; host available memory; default unified memory reserve 1500bps floor 4.00GiB = 17.95GiB",
+              "max_item_bytes": 1920044,
+              "max_item_units": 10,
+              "measured_item_bytes": 1920044,
+              "measured_item_units": 10,
+              "measured_working_set_bytes": 1193320448,
+              "calibration_baseline_memory_bytes": 3540377600,
+              "calibration_peak_memory_bytes": 4733698048,
+              "calibration_f13_budget_bytes": 104160077620,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "Pinned source research found no reasoning-effort speciality; thinking is an ordinary signed music-generation control and is unsupported for cover/repaint tasks."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {},
+      "canary": {
+        "set_id": "canary-music-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "audio_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "audio_fingerprints": {
+          "safetensors": {
+            "ace-step-text2music-seed7": "audiospec-v1:10000:f6fc1627251d19160d070f00f4e2d6d5fe0a271f23291e22180e1606f6e3d7d5fefe181b2027201f1a0d1800f1e5d7d5f8fc1515252a2b221b091601f3e5d7d5f8ff181f2a2a282216071201f5e8d7d5fd102b2126291f1f1c0b1500f6e6d7d5011f1f1e262d2028180d1a07f5e9d8d5ff160b182e201c201d0a1902f4e8d8d5ff1f131b302e1e20130a1805f5e7d8d500291b222d2127291d101d02f3e9d9d5fd201422282c241f180a1b05f0e8d8d5fe2013222e2a1f271b111b06f7e9d9d5fe281a1a2f22201d1b111601f3e8d8d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "rate_map": [
+          {
+            "unit": "input_character",
+            "per_unit_au": "1",
+            "granularity": 1
+          },
+          {
+            "unit": "audio_second",
+            "per_unit_au": "100000000000000",
+            "granularity": 1
+          }
+        ]
+      }
     }
   ],
   "schema_version": 1

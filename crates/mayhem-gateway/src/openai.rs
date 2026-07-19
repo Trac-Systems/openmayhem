@@ -74,25 +74,26 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{stream, Stream};
 use image::ImageReader;
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
+use mayhem_proto::{
+    artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
+    default_ctx_bracket_schedule, default_model_class, metered_output_units, payload_chunk_at,
+    payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
+    validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
+    AttestationReport, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
+    EndpointValueType, ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    SpendVoucherBody, TranscriptionResult, TranscriptionResultLimits, ValidatedAudioFormat,
+    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
+    USAGE_VIDEO_SECOND,
+};
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
-use mayhem_proto::{
-    ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule, default_model_class,
-    metered_output_units, payload_chunk_at, payload_chunk_manifest, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, validate_transcription_result, validated_audio_metadata,
-    validated_wav_audio_metadata, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
-    EndpointFamilyContract, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, TranscriptionResult, TranscriptionResultLimits,
-    ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
-    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
-};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
@@ -149,6 +150,8 @@ const EMBEDDED_CANARY_TTS_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-tts-launch-v1.json");
 const EMBEDDED_CANARY_STT_LAUNCH_V2: &str =
     include_str!("../../../catalog/canaries/canary-stt-launch-v2.json");
+const EMBEDDED_CANARY_MUSIC_LAUNCH_V1: &str =
+    include_str!("../../../catalog/canaries/canary-music-launch-v1.json");
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
@@ -1673,6 +1676,7 @@ pub struct GatewayCanaryPrompt {
     pub cfg_scale: Option<f32>,
     pub shift: Option<f32>,
     pub seed: Option<i64>,
+    pub endpoint_attributes: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1962,6 +1966,10 @@ pub struct ArtifactGenerationRequest {
     pub duration_seconds: u64,
     pub frame_count: u64,
     pub step_count: u64,
+    pub artifact_count: u64,
+    pub input_audio_count: u32,
+    pub input_audio_max_bytes: u64,
+    pub input_audio_max_seconds: u64,
     pub response_format: String,
 }
 
@@ -2140,8 +2148,12 @@ pub fn normalize_endpoint_request_for_provider(
         }
     }
     let mut normalized_request = defaulted_request;
-    restore_explicit_null_attributes(raw_request, &mut normalized_request);
-    if let Some(path) = changed_supplied_endpoint_path(raw_request, &normalized_request, "") {
+    let canonical_raw_request =
+        mayhem_proto::canonicalize_endpoint_request_aliases(contract, raw_request)?;
+    restore_explicit_null_attributes(&canonical_raw_request, &mut normalized_request);
+    if let Some(path) =
+        changed_supplied_endpoint_path(&canonical_raw_request, &normalized_request, "")
+    {
         return Err(format!(
             "gateway normalization changed or dropped supplied attribute {path}"
         ));
@@ -2666,6 +2678,7 @@ fn artifact_generation_job_result(
         "seconds": request.duration_seconds,
         "frames": request.frame_count,
         "steps": request.step_count,
+        "artifacts_requested": request.artifact_count,
         "usage": output.usage,
         "artifacts": artifact_summaries(&output.artifacts),
     })
@@ -4008,6 +4021,190 @@ fn parse_catalog_endpoint_request<T: DeserializeOwned>(
     Ok((request, normalized))
 }
 
+const ARTIFACT_GENERATION_PROMPT_ALIASES: &[&str] = &["prompt", "caption"];
+const ARTIFACT_GENERATION_TAG_ALIASES: &[&str] = &["tags"];
+const ARTIFACT_GENERATION_DURATION_ALIASES: &[&str] = &[
+    "duration_seconds",
+    "duration",
+    "audio_duration",
+    "target_duration",
+    "audioDuration",
+    "targetDuration",
+];
+const ARTIFACT_GENERATION_STEP_ALIASES: &[&str] = &[
+    "steps",
+    "inference_steps",
+    "num_inference_steps",
+    "inferenceSteps",
+];
+const ARTIFACT_GENERATION_FORMAT_ALIASES: &[&str] =
+    &["response_format", "audio_format", "audioFormat"];
+const ARTIFACT_GENERATION_COUNT_ALIASES: &[&str] = &["n", "batch", "batch_size", "batchSize"];
+
+const ARTIFACT_GENERATION_ALIAS_GROUPS: &[&[&str]] = &[
+    ARTIFACT_GENERATION_PROMPT_ALIASES,
+    &["style"],
+    &["genre"],
+    ARTIFACT_GENERATION_TAG_ALIASES,
+    &["global_caption"],
+    &["lyrics"],
+    &["instrumental"],
+    &["language", "vocal_language", "vocalLanguage"],
+    &["bpm"],
+    &["key", "key_scale", "keyscale", "keyScale"],
+    &["time_signature", "timesignature", "timeSignature"],
+    ARTIFACT_GENERATION_DURATION_ALIASES,
+    ARTIFACT_GENERATION_STEP_ALIASES,
+    &["guidance_scale", "guidanceScale"],
+    &["seed"],
+    &["seeds"],
+    &["use_random_seed", "useRandomSeed"],
+    &["sample_mode", "sampleMode"],
+    &["sample_query", "sampleQuery", "description", "desc"],
+    &["use_format", "useFormat", "format"],
+    &["task_type", "taskType"],
+    &["thinking"],
+    &[
+        "lm_temperature",
+        "temperature",
+        "generation_parameters.temperature",
+    ],
+    &[
+        "lm_top_k",
+        "lm_topk",
+        "top_k",
+        "generation_parameters.top_k",
+    ],
+    &[
+        "lm_top_p",
+        "lm_topp",
+        "top_p",
+        "generation_parameters.top_p",
+    ],
+    &["typical_p", "generation_parameters.typical_p"],
+    &["do_sample", "generation_parameters.do_sample"],
+    &["max_new_tokens", "generation_parameters.max_new_tokens"],
+    &["lm_cfg_scale", "lm_cfg"],
+    &[
+        "lm_repetition_penalty",
+        "lm_repeat_penalty",
+        "repetition_penalty",
+    ],
+    &["use_cot_metas", "cot_metas"],
+    &["use_cot_caption", "cot_caption", "cot-caption"],
+    &["use_cot_lyrics", "cot_lyrics"],
+    &["use_cot_language", "cot_language", "cot-language"],
+    &[
+        "constrained_decoding",
+        "use_constrained_decoding",
+        "constrained",
+        "constrainedDecoding",
+    ],
+    &["inference_method", "infer_method", "inferMethod"],
+    &["shift"],
+    &["custom_timesteps", "timesteps"],
+    &["adg", "use_adg"],
+    &["cfg_interval_start"],
+    &["cfg_interval_end"],
+    &["repaint_start", "repainting_start"],
+    &["repaint_end", "repainting_end"],
+    &["repaint_strength"],
+    &["chunk_mask_mode"],
+    &["repaint_latent_crossfade_frames"],
+    &["repaint_wav_crossfade_sec"],
+    &["repaint_mode"],
+    &[
+        "cover_strength",
+        "audio_cover_strength",
+        "coverStrength",
+        "audioCoverStrength",
+    ],
+    &["cover_noise_strength", "coverNoiseStrength"],
+    &["sampler", "sampler_mode"],
+    &["velocity_norm_threshold"],
+    &["velocity_ema_factor"],
+    &["dcw_enabled"],
+    &["dcw_mode"],
+    &["dcw_scaler"],
+    &["dcw_high_scaler"],
+    &["dcw_wavelet"],
+    &["enable_normalization"],
+    &["normalization_db"],
+    &["fade_in_duration"],
+    &["fade_out_duration"],
+    &["latent_shift"],
+    &["latent_rescale"],
+    &["retake_seed"],
+    &["retake_variance"],
+    &["flow_edit_morph", "flow_edit"],
+    &["flow_edit_source_caption"],
+    &["flow_edit_source_lyrics"],
+    &["flow_edit_n_min"],
+    &["flow_edit_n_max"],
+    &["flow_edit_n_avg"],
+    ARTIFACT_GENERATION_FORMAT_ALIASES,
+    &["mp3_bitrate"],
+    &["mp3_sample_rate"],
+    ARTIFACT_GENERATION_COUNT_ALIASES,
+    &["instruction"],
+    &["audio_codes", "audio_code_string", "audioCodeString"],
+    &["allow_lm_batch", "allowLmBatch", "parallel_thinking"],
+    &["lm_batch_chunk_size"],
+    &["constrained_decoding_debug", "constrainedDecodingDebug"],
+    &["track_name", "trackName"],
+    &[
+        "track_classes",
+        "complete_track_classes",
+        "trackClasses",
+        "instruments",
+    ],
+    &[
+        "source_audio",
+        "src_audio",
+        "input_audio",
+        "audio",
+        "source_audio_base64",
+        "src_audio_base64",
+        "source_audio_data",
+        "src_audio_data",
+        "ctx_audio",
+    ],
+    &[
+        "reference_audio",
+        "ref_audio",
+        "melody",
+        "reference_audio_base64",
+        "reference_audio_data",
+    ],
+];
+
+const ARTIFACT_GENERATION_SOURCE_AUDIO_ALIASES: &[&str] = &[
+    "source_audio",
+    "src_audio",
+    "input_audio",
+    "audio",
+    "source_audio_base64",
+    "src_audio_base64",
+    "source_audio_data",
+    "src_audio_data",
+    "ctx_audio",
+];
+const ARTIFACT_GENERATION_REFERENCE_AUDIO_ALIASES: &[&str] = &[
+    "reference_audio",
+    "ref_audio",
+    "melody",
+    "reference_audio_base64",
+    "reference_audio_data",
+];
+const ARTIFACT_GENERATION_SERVER_AUDIO_PATH_FIELDS: &[&str] = &[
+    "audio_path",
+    "input_audio_path",
+    "melody_path",
+    "reference_audio_path",
+    "source_audio_path",
+    "src_audio_path",
+];
+
 fn normalize_catalog_endpoint_request(
     state: &GatewayState,
     model_id: &str,
@@ -4015,14 +4212,502 @@ fn normalize_catalog_endpoint_request(
     raw_request: &Value,
 ) -> Result<Value, ApiError> {
     let contract = catalog_endpoint_contract(state, model_id, endpoint_family)?;
-    normalize_endpoint_request_for_provider(&contract, raw_request)
-        .map(|normalized| normalized.normalized_request)
-        .map_err(|err| {
-            ApiError::bad_request(
-                format!("request normalization failed: {err}"),
-                Some("request"),
+    let prepared_request = uses_audio_generation_aliases(endpoint_family)
+        .then(|| {
+            canonicalize_artifact_generation_request(
+                &contract,
+                endpoint_family,
+                raw_request,
+                state.media_limits.max_audio_bytes,
             )
         })
+        .transpose()
+        .map_err(|err| ApiError::bad_request(err, Some("request")))?;
+    normalize_endpoint_request_for_provider(
+        &contract,
+        prepared_request.as_ref().unwrap_or(raw_request),
+    )
+    .map(|normalized| normalized.normalized_request)
+    .map_err(|err| {
+        ApiError::bad_request(
+            format!("request normalization failed: {err}"),
+            Some("request"),
+        )
+    })
+}
+
+fn uses_audio_generation_aliases(endpoint_family: &str) -> bool {
+    matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    )
+}
+
+fn canonicalize_artifact_generation_request(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    raw_request: &Value,
+    max_audio_bytes: u64,
+) -> Result<Value, String> {
+    if let Some(path) = artifact_generation_server_audio_path(raw_request, "") {
+        return Err(format!(
+            "{path} is forbidden; source and reference audio must be inline base64 or a base64 data URL"
+        ));
+    }
+
+    let mut request = raw_request.clone();
+    for aliases in ARTIFACT_GENERATION_ALIAS_GROUPS {
+        canonicalize_artifact_generation_alias_group(
+            contract,
+            endpoint_family,
+            &mut request,
+            aliases,
+        )?;
+    }
+    canonicalize_music_no_fsq_alias(endpoint_family, &mut request)?;
+    canonicalize_optional_music_prompt(contract, endpoint_family, &mut request)?;
+    canonicalize_artifact_generation_negative_prompt(contract, endpoint_family, &mut request)?;
+    canonicalize_artifact_generation_tags(contract, endpoint_family, &mut request)?;
+    canonicalize_artifact_generation_inline_audio(
+        contract,
+        endpoint_family,
+        &mut request,
+        max_audio_bytes,
+    )?;
+    Ok(request)
+}
+
+fn canonicalize_music_no_fsq_alias(
+    endpoint_family: &str,
+    request: &mut Value,
+) -> Result<(), String> {
+    if endpoint_family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        return Ok(());
+    }
+    let Some(no_fsq) = request.get("no_fsq").cloned() else {
+        return Ok(());
+    };
+    let no_fsq = no_fsq
+        .as_bool()
+        .ok_or_else(|| "no_fsq must be a boolean".to_owned())?;
+    request
+        .as_object_mut()
+        .ok_or_else(|| "music generation request must be a JSON object".to_owned())?
+        .remove("no_fsq");
+    let task = request.get("task_type").and_then(Value::as_str);
+    if no_fsq {
+        if task.is_some_and(|task| !matches!(task, "cover" | "cover-nofsq")) {
+            return Err("no_fsq=true is compatible only with cover tasks".to_owned());
+        }
+        request
+            .as_object_mut()
+            .expect("validated music request object")
+            .insert("task_type".to_owned(), json!("cover-nofsq"));
+    } else if task == Some("cover-nofsq") {
+        return Err("no_fsq=false conflicts with task_type=cover-nofsq".to_owned());
+    }
+    Ok(())
+}
+
+fn canonicalize_optional_music_prompt(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+) -> Result<(), String> {
+    if endpoint_family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        return Ok(());
+    }
+    let candidates =
+        artifact_generation_alias_candidates(endpoint_family, ARTIFACT_GENERATION_PROMPT_ALIASES);
+    let Some(target) = artifact_generation_alias_target(contract, &candidates) else {
+        return Ok(());
+    };
+    if json_path_value(request, &target).is_none() {
+        set_json_path(request, &target, json!(""))?;
+    }
+    Ok(())
+}
+
+fn canonicalize_artifact_generation_alias_group(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+    aliases: &[&str],
+) -> Result<(), String> {
+    let candidates = artifact_generation_alias_candidates(endpoint_family, aliases);
+    let Some(target) = artifact_generation_alias_target(contract, &candidates) else {
+        return Ok(());
+    };
+    let supplied = candidates
+        .iter()
+        .filter_map(|path| json_path_value(request, path).map(|value| (path, value)))
+        .collect::<Vec<_>>();
+    let Some((_, value)) = supplied.first() else {
+        return Ok(());
+    };
+    if supplied.len() > 1 {
+        return Err(format!(
+            "conflicting aliases supplied for {}",
+            aliases.join("/")
+        ));
+    }
+    let value = (*value).clone();
+    for path in &candidates {
+        remove_json_path(request, path);
+    }
+    set_json_path(request, &target, value)?;
+    Ok(())
+}
+
+fn canonicalize_artifact_generation_negative_prompt(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+) -> Result<(), String> {
+    let lm_candidates =
+        artifact_generation_alias_candidates(endpoint_family, &["lm_negative_prompt"]);
+    if artifact_generation_alias_target(contract, &lm_candidates).is_some() {
+        return canonicalize_artifact_generation_alias_group(
+            contract,
+            endpoint_family,
+            request,
+            &["lm_negative_prompt", "negative_prompt"],
+        );
+    }
+    canonicalize_artifact_generation_alias_group(
+        contract,
+        endpoint_family,
+        request,
+        &["negative_prompt"],
+    )?;
+    canonicalize_artifact_generation_alias_group(
+        contract,
+        endpoint_family,
+        request,
+        &["lm_negative_prompt"],
+    )
+}
+
+fn canonicalize_artifact_generation_tags(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+) -> Result<(), String> {
+    let candidates =
+        artifact_generation_alias_candidates(endpoint_family, ARTIFACT_GENERATION_TAG_ALIASES);
+    let Some(target) = artifact_generation_alias_target(contract, &candidates) else {
+        return Ok(());
+    };
+    let Some(value) = json_path_value(request, &target).cloned() else {
+        return Ok(());
+    };
+    let Value::Array(values) = value else {
+        if value.is_string() || value.is_null() {
+            return Ok(());
+        }
+        return Err(format!("{target} must be a string or an array of strings"));
+    };
+    let max_chars = contract
+        .request_attribute_specs
+        .get(&target)
+        .and_then(|spec| spec.max_length)
+        .ok_or_else(|| format!("signed {target} string contract must declare max_length"))?;
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut combined_chars = 0_u64;
+    for (index, value) in values.into_iter().enumerate() {
+        let tag = value
+            .as_str()
+            .ok_or_else(|| format!("{target}[{index}] must be a string"))?
+            .trim();
+        if tag.is_empty() {
+            return Err(format!("{target}[{index}] must not be empty"));
+        }
+        let tag_chars = u64::try_from(tag.chars().count()).unwrap_or(u64::MAX);
+        if tag_chars > max_chars {
+            return Err(format!(
+                "{target}[{index}] exceeds the signed {max_chars}-character limit"
+            ));
+        }
+        if !normalized.is_empty() {
+            combined_chars = combined_chars.saturating_add(2);
+        }
+        combined_chars = combined_chars.saturating_add(tag_chars);
+        if combined_chars > max_chars {
+            return Err(format!(
+                "{target} array canonicalizes beyond the signed {max_chars}-character limit"
+            ));
+        }
+        normalized.push(tag.to_owned());
+    }
+    set_json_path(request, &target, Value::String(normalized.join(", ")))
+}
+
+fn artifact_generation_alias_target(
+    contract: &EndpointFamilyContract,
+    candidates: &[String],
+) -> Option<String> {
+    candidates
+        .iter()
+        .find(|path| endpoint_contract_supports_request_path(contract, path))
+        .cloned()
+}
+
+fn artifact_generation_alias_candidates(endpoint_family: &str, aliases: &[&str]) -> Vec<String> {
+    let hf = matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+    );
+    let mut candidates = Vec::new();
+    if hf && aliases.contains(&"prompt") {
+        candidates.push("inputs".to_owned());
+    }
+    if hf {
+        candidates.extend(aliases.iter().map(|alias| format!("parameters.{alias}")));
+        candidates.extend(aliases.iter().map(|alias| (*alias).to_owned()));
+    } else {
+        candidates.extend(aliases.iter().map(|alias| (*alias).to_owned()));
+        candidates.extend(aliases.iter().map(|alias| format!("parameters.{alias}")));
+    }
+    candidates.dedup();
+    candidates
+}
+
+fn endpoint_contract_supports_request_path(contract: &EndpointFamilyContract, path: &str) -> bool {
+    contract.request_attribute_specs.contains_key(path)
+        || contract
+            .request_attributes
+            .iter()
+            .any(|candidate| candidate == path)
+}
+
+fn json_path_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(value, |current, component| current.get(component))
+}
+
+fn remove_json_path(value: &mut Value, path: &str) -> Option<Value> {
+    let (head, tail) = path.split_once('.').unwrap_or((path, ""));
+    let object = value.as_object_mut()?;
+    if tail.is_empty() {
+        return object.remove(head);
+    }
+    let child = object.get_mut(head)?;
+    let removed = remove_json_path(child, tail);
+    if child.as_object().is_some_and(serde_json::Map::is_empty) {
+        object.remove(head);
+    }
+    removed
+}
+
+fn set_json_path(value: &mut Value, path: &str, inserted: Value) -> Result<(), String> {
+    let (head, tail) = path.split_once('.').unwrap_or((path, ""));
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "artifact generation request must be a JSON object".to_owned())?;
+    if tail.is_empty() {
+        object.insert(head.to_owned(), inserted);
+        return Ok(());
+    }
+    let child = object.entry(head.to_owned()).or_insert_with(|| json!({}));
+    if !child.is_object() {
+        return Err(format!("{head} must be an object"));
+    }
+    set_json_path(child, tail, inserted)
+}
+
+fn artifact_generation_server_audio_path(value: &Value, parent: &str) -> Option<String> {
+    let object = value.as_object()?;
+    for (key, child) in object {
+        let path = if parent.is_empty() {
+            key.clone()
+        } else {
+            format!("{parent}.{key}")
+        };
+        if ARTIFACT_GENERATION_SERVER_AUDIO_PATH_FIELDS.contains(&key.as_str()) && !child.is_null()
+        {
+            return Some(path);
+        }
+        if let Some(path) = artifact_generation_server_audio_path(child, &path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn canonicalize_artifact_generation_inline_audio(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+    max_audio_bytes: u64,
+) -> Result<(), String> {
+    let mut total_bytes = 0_u64;
+    for aliases in [
+        ARTIFACT_GENERATION_SOURCE_AUDIO_ALIASES,
+        ARTIFACT_GENERATION_REFERENCE_AUDIO_ALIASES,
+    ] {
+        for path in artifact_generation_alias_candidates(endpoint_family, aliases) {
+            let Some(value) = json_path_value(request, &path).cloned() else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            let object_target = contract
+                .request_attribute_specs
+                .get(&path)
+                .is_some_and(|spec| spec.value_types.contains(&EndpointValueType::Object));
+            let (canonical, decoded_len) =
+                canonical_inline_audio_value(&value, &path, max_audio_bytes, object_target)?;
+            total_bytes = total_bytes.checked_add(decoded_len).ok_or_else(|| {
+                "combined inline source/reference audio length overflowed".to_owned()
+            })?;
+            if total_bytes > max_audio_bytes {
+                return Err(format!(
+                    "combined inline source/reference audio exceeds the {max_audio_bytes}-byte gateway limit"
+                ));
+            }
+            set_json_path(request, &path, canonical)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_inline_audio_value(
+    value: &Value,
+    path: &str,
+    max_audio_bytes: u64,
+    object_target: bool,
+) -> Result<(Value, u64), String> {
+    let (original, declared_content_type) = match value {
+        Value::String(encoded) => (encoded.as_str(), None),
+        Value::Object(audio) => {
+            if let Some(unsupported) = audio
+                .keys()
+                .find(|key| !matches!(key.as_str(), "data" | "encoding" | "content_type"))
+            {
+                return Err(format!(
+                    "{path}.{unsupported} is not a supported inline audio field"
+                ));
+            }
+            if audio
+                .get("encoding")
+                .is_some_and(|encoding| encoding.as_str() != Some("base64"))
+            {
+                return Err(format!("{path}.encoding must be the string base64"));
+            }
+            let encoded = audio
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{path}.data must contain base64 audio"))?;
+            let content_type = audio
+                .get("content_type")
+                .map(|content_type| {
+                    content_type
+                        .as_str()
+                        .ok_or_else(|| format!("{path}.content_type must be a string"))
+                })
+                .transpose()?;
+            (encoded, content_type)
+        }
+        _ => {
+            return Err(format!(
+                "{path} must be inline base64, a base64 data URL, or an inline audio object"
+            ))
+        }
+    };
+    let (encoded, data_url_content_type) = inline_audio_payload(original, path)?;
+    if declared_content_type.is_some()
+        && data_url_content_type.is_some()
+        && declared_content_type != data_url_content_type
+    {
+        return Err(format!(
+            "{path}.content_type conflicts with the inline data URL media type"
+        ));
+    }
+    let content_type = declared_content_type
+        .or(data_url_content_type)
+        .unwrap_or("audio/octet-stream");
+    if !valid_inline_audio_content_type(content_type) {
+        return Err(format!(
+            "{path}.content_type must be a valid audio/* media type"
+        ));
+    }
+    let decoded_len = decoded_inline_audio_len(encoded, path, max_audio_bytes)?;
+    let canonical = if object_target {
+        json!({
+            "data": encoded,
+            "encoding": "base64",
+            "content_type": content_type,
+        })
+    } else {
+        value.clone()
+    };
+    Ok((canonical, decoded_len))
+}
+
+fn inline_audio_payload<'a>(
+    value: &'a str,
+    path: &str,
+) -> Result<(&'a str, Option<&'a str>), String> {
+    let Some(data_url) = value.strip_prefix("data:") else {
+        return Ok((value, None));
+    };
+    let (metadata, encoded) = data_url
+        .split_once(',')
+        .ok_or_else(|| format!("{path} is not a valid data URL"))?;
+    if !metadata
+        .split(';')
+        .any(|component| component.eq_ignore_ascii_case("base64"))
+    {
+        return Err(format!("{path} data URL must use base64 encoding"));
+    }
+    let content_type = metadata
+        .split(';')
+        .next()
+        .filter(|content_type| !content_type.is_empty());
+    Ok((encoded, content_type))
+}
+
+fn valid_inline_audio_content_type(content_type: &str) -> bool {
+    let Some(subtype) = content_type.strip_prefix("audio/") else {
+        return false;
+    };
+    !subtype.is_empty()
+        && subtype.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                )
+        })
+}
+
+fn decoded_inline_audio_len(value: &str, path: &str, max_audio_bytes: u64) -> Result<u64, String> {
+    if value.is_empty() {
+        return Err(format!("{path} audio data must not be empty"));
+    }
+    let encoded_limit = usize::try_from(max_audio_bytes)
+        .unwrap_or(usize::MAX / 4)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(4);
+    if value.len() > encoded_limit {
+        return Err(format!(
+            "{path} exceeds the {max_audio_bytes}-byte gateway audio limit"
+        ));
+    }
+    let bytes = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| format!("{path} contains invalid base64 audio"))?;
+    let decoded_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if decoded_len == 0 || decoded_len > max_audio_bytes {
+        return Err(format!(
+            "{path} audio must contain 1..={max_audio_bytes} decoded bytes"
+        ));
+    }
+    Ok(decoded_len)
 }
 
 fn catalog_endpoint_contract(
@@ -6189,34 +6874,32 @@ fn artifact_generation_request(
     endpoint_family: &str,
     raw_request: Value,
 ) -> Result<ArtifactGenerationRequest, ApiError> {
+    let inline_audio = artifact_generation_inline_audio_load(&raw_request).map_err(|error| {
+        ApiError::bad_request(
+            format!("invalid inline artifact-generation audio: {error}"),
+            Some("request"),
+        )
+    })?;
     let parameters = raw_request.get("parameters").and_then(Value::as_object);
-    let prompt_key = if matches!(
+    let prompt = artifact_generation_request_value(
+        &raw_request,
         endpoint_family,
-        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
-    ) {
-        "inputs"
-    } else {
-        "prompt"
-    };
-    let prompt = raw_request
-        .get(prompt_key)
-        .and_then(Value::as_str)
-        .filter(|prompt| !prompt.trim().is_empty())
-        .ok_or_else(|| ApiError::bad_request("request missing prompt", Some(prompt_key)))?
-        .to_owned();
-    let duration_seconds = raw_request
-        .get("duration_seconds")
-        .and_then(generation_duration_seconds_ceil)
-        .or_else(|| {
-            parameters
-                .and_then(|parameters| parameters.get("duration_seconds"))
-                .and_then(generation_duration_seconds_ceil)
-        })
-        .or_else(|| {
-            raw_request
-                .get("seconds")
-                .and_then(generation_duration_seconds_ceil)
-        });
+        ARTIFACT_GENERATION_PROMPT_ALIASES,
+    )
+    .and_then(Value::as_str)
+    .unwrap_or_default()
+    .to_owned();
+    let duration_seconds = artifact_generation_request_value(
+        &raw_request,
+        endpoint_family,
+        ARTIFACT_GENERATION_DURATION_ALIASES,
+    )
+    .and_then(generation_duration_seconds_ceil)
+    .or_else(|| {
+        raw_request
+            .get("seconds")
+            .and_then(generation_duration_seconds_ceil)
+    });
     let requested_frames = parameters
         .and_then(|parameters| parameters.get("num_frames"))
         .and_then(Value::as_u64);
@@ -6247,27 +6930,39 @@ fn artifact_generation_request(
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
                 "audio",
                 "music_generation",
-                duration_seconds.unwrap_or(1).max(1),
+                duration_seconds
+                    .unwrap_or(inline_audio.max_item_seconds.max(1))
+                    .max(1),
                 0,
-                raw_request
-                    .get("response_format")
-                    .and_then(Value::as_str)
-                    .unwrap_or("wav"),
+                artifact_generation_request_value(
+                    &raw_request,
+                    endpoint_family,
+                    ARTIFACT_GENERATION_FORMAT_ALIASES,
+                )
+                .and_then(Value::as_str)
+                .unwrap_or("wav"),
             ),
             mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
                 "audio",
                 "audio_generation",
-                duration_seconds.unwrap_or(1).max(1),
+                duration_seconds
+                    .unwrap_or(inline_audio.max_item_seconds.max(1))
+                    .max(1),
                 0,
-                raw_request
-                    .get("response_format")
-                    .and_then(Value::as_str)
-                    .unwrap_or("wav"),
+                artifact_generation_request_value(
+                    &raw_request,
+                    endpoint_family,
+                    ARTIFACT_GENERATION_FORMAT_ALIASES,
+                )
+                .and_then(Value::as_str)
+                .unwrap_or("wav"),
             ),
             mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => (
                 "audio",
                 "audio_generation",
-                duration_seconds.unwrap_or(1).max(1),
+                duration_seconds
+                    .unwrap_or(inline_audio.max_item_seconds.max(1))
+                    .max(1),
                 0,
                 "wav",
             ),
@@ -6278,12 +6973,37 @@ fn artifact_generation_request(
                 ))
             }
         };
-    let step_count = parameters
-        .and_then(|parameters| parameters.get("num_inference_steps"))
+    let step_count = artifact_generation_request_value(
+        &raw_request,
+        endpoint_family,
+        ARTIFACT_GENERATION_STEP_ALIASES,
+    )
+    .and_then(Value::as_u64)
+    .or_else(|| {
+        artifact_generation_request_value(
+            &raw_request,
+            endpoint_family,
+            &["max_new_tokens", "generation_parameters.max_new_tokens"],
+        )
         .and_then(Value::as_u64)
-        .or_else(|| raw_request.get("max_new_tokens").and_then(Value::as_u64))
-        .unwrap_or(1)
-        .max(1);
+    })
+    .unwrap_or(1)
+    .max(1);
+    let artifact_count = artifact_generation_request_value(
+        &raw_request,
+        endpoint_family,
+        ARTIFACT_GENERATION_COUNT_ALIASES,
+    )
+    .map(|value| {
+        value.as_u64().filter(|count| *count > 0).ok_or_else(|| {
+            ApiError::bad_request(
+                "signed endpoint contract resolved a non-positive artifact count",
+                Some("request"),
+            )
+        })
+    })
+    .transpose()?
+    .unwrap_or(1);
     let response_format = response_format.to_owned();
     Ok(ArtifactGenerationRequest {
         model: model_id.to_owned(),
@@ -6295,8 +7015,22 @@ fn artifact_generation_request(
         duration_seconds,
         frame_count,
         step_count,
+        artifact_count,
+        input_audio_count: inline_audio.item_count,
+        input_audio_max_bytes: inline_audio.max_item_bytes,
+        input_audio_max_seconds: inline_audio.max_item_seconds,
         response_format,
     })
+}
+
+fn artifact_generation_request_value<'a>(
+    request: &'a Value,
+    endpoint_family: &str,
+    aliases: &[&str],
+) -> Option<&'a Value> {
+    artifact_generation_alias_candidates(endpoint_family, aliases)
+        .into_iter()
+        .find_map(|path| json_path_value(request, &path))
 }
 
 fn generation_duration_seconds_ceil(value: &Value) -> Option<u64> {
@@ -6317,28 +7051,45 @@ fn artifact_generation_response_value(
     run: &CompletedArtifactGeneration,
 ) -> Value {
     let output = &run.output;
-    let artifact = output.artifacts.first();
-    let id = artifact
+    let artifact_field =
+        if request.endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+            "music"
+        } else {
+            "audio"
+        };
+    let data = output
+        .artifacts
+        .iter()
         .map(|artifact| {
-            format!(
-                "{}-{}",
-                request.output_modality,
-                artifact.blake3.get(..16).unwrap_or(&artifact.blake3)
-            )
+            let mut item = json!({
+                "id": artifact.id,
+                "content_type": artifact.content_type,
+                "blake3": artifact.blake3,
+            });
+            item[artifact_field] = json!(BASE64_STANDARD.encode(&artifact.bytes));
+            item
         })
-        .unwrap_or_else(|| make_id("artifact"));
-    let encoded = artifact
-        .map(|artifact| BASE64_STANDARD.encode(&artifact.bytes))
-        .unwrap_or_default();
-    let content_type = artifact
-        .map(|artifact| artifact.content_type.as_str())
-        .unwrap_or("application/octet-stream");
+        .collect::<Vec<_>>();
+    let first = data.first();
+    let id = first
+        .and_then(|artifact| artifact.get("id"))
+        .cloned()
+        .unwrap_or_else(|| json!(make_id("artifact")));
+    let encoded = first
+        .and_then(|artifact| artifact.get(artifact_field))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let content_type = first
+        .and_then(|artifact| artifact.get("content_type"))
+        .cloned()
+        .unwrap_or_else(|| json!("application/octet-stream"));
     let mayhem = json!({
         "backend": run.backend,
         "direct_session": run.direct_session,
         "billable": run.billable,
         "session_id": run.session_id,
-        "artifact_blake3": artifact.map(|artifact| artifact.blake3.as_str()),
+        "artifact_blake3": output.artifacts.first().map(|artifact| artifact.blake3.as_str()),
+        "artifacts": artifact_summaries(&output.artifacts),
         "quality": run.quality.map(|quality| json!({
             "ttft_ms": quality.ttft_ms,
             "tok_s": quality.tok_s,
@@ -6356,16 +7107,22 @@ fn artifact_generation_response_value(
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => json!({
             "id": id,
             "object": "music.generation",
+            "created": now_secs(),
+            "model": request.model,
             "music": encoded,
             "content_type": content_type,
+            "data": data,
             "usage": output.usage,
             "mayhem": mayhem,
         }),
         _ => json!({
             "id": id,
             "object": "audio.generation",
+            "created": now_secs(),
+            "model": request.model,
             "audio": encoded,
             "content_type": content_type,
+            "data": data,
             "usage": output.usage,
             "mayhem": mayhem,
         }),
@@ -6418,6 +7175,9 @@ fn artifact_generation_raw_response(
     request: &ArtifactGenerationRequest,
     run: &CompletedArtifactGeneration,
 ) -> Result<Response, ApiError> {
+    if run.output.artifacts.len() > 1 {
+        return Ok(Json(artifact_generation_response_value(request, run)).into_response());
+    }
     let artifact = run.output.artifacts.first().ok_or_else(|| {
         ApiError::bad_gateway("artifact generation response is empty", Some("model"))
     })?;
@@ -7772,6 +8532,8 @@ struct CanaryPromptDocument {
     shift: Option<f32>,
     #[serde(default)]
     seed: Option<i64>,
+    #[serde(flatten)]
+    endpoint_attributes: BTreeMap<String, Value>,
 }
 
 struct ExpectedProviderReceipt<'a> {
@@ -8068,7 +8830,7 @@ fn canary_audio_fingerprints_by_artifact(
                 .filter_map(|(prompt_id, fingerprint)| {
                     fingerprint
                         .as_str()
-                        .filter(|fingerprint| is_hex_len(fingerprint, 64))
+                        .filter(|fingerprint| crate::valid_audio_fingerprint(fingerprint))
                         .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -8110,6 +8872,7 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
         EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1,
         EMBEDDED_CANARY_TTS_LAUNCH_V1,
         EMBEDDED_CANARY_STT_LAUNCH_V2,
+        EMBEDDED_CANARY_MUSIC_LAUNCH_V1,
     ]
     .into_iter()
     .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
@@ -8149,6 +8912,7 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
             cfg_scale: prompt.cfg_scale,
             shift: prompt.shift,
             seed: prompt.seed,
+            endpoint_attributes: prompt.endpoint_attributes,
         })
         .collect()
 }
@@ -18822,11 +19586,16 @@ fn request_requirements_for_artifact_generation(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
-    let max_item_units = if request.output_modality == "video" {
+    let output_item_units = if request.output_modality == "video" {
         request.frame_count.max(1)
     } else {
         request.duration_seconds.max(1)
     };
+    let item_count = u32::try_from(request.artifact_count)
+        .unwrap_or(u32::MAX)
+        .max(request.input_audio_count);
+    let max_item_bytes = request.input_audio_max_bytes.max(1);
+    let max_item_units = output_item_units.max(request.input_audio_max_seconds);
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
@@ -18837,8 +19606,8 @@ fn request_requirements_for_artifact_generation(
         modality_load: BTreeMap::from([(
             request.output_modality.clone(),
             ModalityRequestLoad {
-                item_count: 1,
-                max_item_bytes: 1,
+                item_count,
+                max_item_bytes,
                 max_item_units,
             },
         )]),
@@ -19832,21 +20601,19 @@ async fn build_artifact_generation(
     options: GatewayRequestOptions,
 ) -> Result<CompletedArtifactGeneration, ApiError> {
     let model = require_model(state, &request.model)?;
+    let signed_endpoint_capability = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == request.endpoint_family);
     let class_allowed = match request.endpoint_family.as_str() {
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
             model.mayhem.model_class == "video-generation"
         }
-        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => {
-            model.mayhem.model_class == "music-generation"
-        }
-        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => matches!(
-            model.mayhem.model_class.as_str(),
-            "audio-generation" | "music-generation"
-        ),
-        mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => matches!(
-            model.mayhem.model_class.as_str(),
-            "audio-generation" | "music-generation"
-        ),
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => signed_endpoint_capability,
         _ => false,
     };
     if !class_allowed {
@@ -19871,30 +20638,44 @@ async fn build_artifact_generation(
         metering_request,
         metering_output,
     } = run_artifact_generation_with_route_retry(state, &model, &request, options).await?;
-    if output.artifacts.len() != 1 {
+    let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
+        ApiError::bad_request(
+            "signed artifact count exceeds this gateway platform",
+            Some("request"),
+        )
+    })?;
+    if output.artifacts.len() != expected_artifacts {
         return Err(ApiError::bad_gateway(
             format!(
-                "provider returned {} {} artifact(s), expected 1",
+                "provider returned {} {} artifact(s), expected {expected_artifacts}",
                 output.artifacts.len(),
                 request.output_modality
             ),
             Some("model"),
         ));
     }
-    let content_type = output.artifacts[0].content_type.as_str();
     let expected_prefix = if request.output_modality == "video" {
         "video/"
     } else {
         "audio/"
     };
-    if !content_type.starts_with(expected_prefix) {
+    if let Some(artifact) = output
+        .artifacts
+        .iter()
+        .find(|artifact| !artifact.content_type.starts_with(expected_prefix))
+    {
         return Err(ApiError::bad_gateway(
-            format!("provider returned content type {content_type}, expected {expected_prefix}*"),
+            format!(
+                "provider returned content type {}, expected {expected_prefix}*",
+                artifact.content_type
+            ),
             Some("model"),
         ));
     }
     if request.endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
-        && (content_type != "audio/wav" || wav_sample_rate(&output.artifacts[0].bytes).is_none())
+        && output.artifacts.iter().any(|artifact| {
+            artifact.content_type != "audio/wav" || wav_sample_rate(&artifact.bytes).is_none()
+        })
     {
         return Err(ApiError::bad_gateway(
             "HF text-to-audio provider must return a valid WAV artifact with a sample rate",
@@ -20624,6 +21405,13 @@ fn model_supports_tts(model: &GatewayModel) -> bool {
             .any(|modality| modality == "audio")
 }
 
+fn model_supports_audio_fingerprint_canary(model: &GatewayModel) -> bool {
+    matches!(
+        model.mayhem.model_class.as_str(),
+        "tts" | "audio-generation" | "music-generation"
+    )
+}
+
 fn model_supports_stt(model: &GatewayModel) -> bool {
     model.mayhem.model_class == "stt"
 }
@@ -21178,7 +21966,7 @@ impl GatewayState {
                 }
             }
             CANARY_VERIFICATION_AUDIO_FINGERPRINT => {
-                if !model_supports_tts(model) {
+                if !model_supports_audio_fingerprint_canary(model) {
                     return;
                 }
             }
@@ -22422,25 +23210,92 @@ impl GatewayState {
             if !expected_fingerprints.contains_key(&prompt.id) {
                 continue;
             }
-            let request = canary_audio_speech_request(&model.id, prompt);
-            validate_audio_speech_request(&request)?;
-            let invocation = self.prepare_audio_speech_invocation_for_route(
-                model,
-                &request,
-                route.as_ref(),
-                &GatewayRequestOptions::default(),
-            )?;
-            let result = self
-                .session_backend
-                .run_audio_speech(model, &request, &invocation)
-                .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
-            let artifact = result
-                .output
-                .artifacts
+            let (artifacts, receipt, request_body, session_id) = if model.mayhem.model_class
+                == "tts"
+            {
+                let request = canary_audio_speech_request(&model.id, prompt);
+                validate_audio_speech_request(&request)?;
+                let invocation = self.prepare_audio_speech_invocation_for_route(
+                    model,
+                    &request,
+                    route.as_ref(),
+                    &GatewayRequestOptions::default(),
+                )?;
+                let result = self
+                    .session_backend
+                    .run_audio_speech(model, &request, &invocation)
+                    .await
+                    .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                let receipt = self.meter_audio_speech_session(
+                    model,
+                    &request,
+                    &result.output,
+                    &invocation,
+                    result.provider_receipt.as_ref(),
+                )?;
+                (
+                    result.output.artifacts,
+                    receipt,
+                    direct_session_audio_speech_request_body(&request),
+                    invocation.session_id,
+                )
+            } else {
+                let request = canary_artifact_generation_request(self, model, prompt)?;
+                let invocation = self.prepare_artifact_generation_invocation_for_route(
+                    model,
+                    &request,
+                    route.as_ref(),
+                    &GatewayRequestOptions::default(),
+                )?;
+                let result = self
+                    .session_backend
+                    .run_artifact_generation(model, &request, &invocation)
+                    .await
+                    .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
+                    ApiError::bad_gateway(
+                        "signed canary artifact count exceeds this gateway platform",
+                        Some("model"),
+                    )
+                })?;
+                if result.output.artifacts.len() != expected_artifacts {
+                    return Err(ApiError::bad_gateway(
+                            format!(
+                                "provider returned {} audio canary artifact(s), expected {expected_artifacts}",
+                                result.output.artifacts.len()
+                            ),
+                            Some("model"),
+                        ));
+                }
+                if result
+                    .output
+                    .artifacts
+                    .iter()
+                    .any(|artifact| !artifact.content_type.starts_with("audio/"))
+                {
+                    return Err(ApiError::bad_gateway(
+                        "provider returned a non-audio artifact for an audio canary",
+                        Some("model"),
+                    ));
+                }
+                let receipt = self.meter_artifact_generation_session(
+                    model,
+                    &request,
+                    &result.output,
+                    &invocation,
+                    result.provider_receipt.as_ref(),
+                )?;
+                (
+                    result.output.artifacts,
+                    receipt,
+                    request.contract_request,
+                    invocation.session_id,
+                )
+            };
+            let artifact = artifacts
                 .iter()
                 .find(|artifact| artifact.content_type == "audio/wav")
-                .or_else(|| result.output.artifacts.first())
+                .or_else(|| artifacts.first())
                 .ok_or_else(|| {
                     ApiError::bad_gateway(
                         "provider returned no audio canary artifact",
@@ -22449,29 +23304,22 @@ impl GatewayState {
                 })?;
             let observed = audio_fingerprint(&artifact.bytes);
             observed_fingerprints.insert(prompt.id.clone(), observed.clone());
-            let receipt = self.meter_audio_speech_session(
-                model,
-                &request,
-                &result.output,
-                &invocation,
-                result.provider_receipt.as_ref(),
-            )?;
             let receipt_hash = stable_value_hash(&json!(receipt));
             receipt_hashes.push(receipt_hash.clone());
             stored_receipts.push(receipt);
             prompt_reports.push(json!({
                 "prompt_id": prompt.id,
-                "request": direct_session_audio_speech_request_body(&request),
+                "request": request_body,
                 "artifact": artifact_summaries(std::slice::from_ref(artifact)),
                 "observed_audio_fingerprint": observed,
-                "session_id": invocation.session_id,
+                "session_id": session_id,
                 "receipt_hash": receipt_hash,
             }));
         }
 
         if observed_fingerprints.is_empty() {
             return Err(ApiError::bad_gateway(
-                "no canary TTS prompts matched expected audio fingerprints",
+                "no canary audio prompts matched expected audio fingerprints",
                 Some("model"),
             ));
         }
@@ -22495,10 +23343,15 @@ impl GatewayState {
             &spec,
             &expected_fingerprints,
             &observed_fingerprints,
+            config
+                .verification_tolerance_bps
+                .map(|tolerance| 10_000u32.saturating_sub(tolerance))
+                .unwrap_or(config.match_min_bps),
         );
         let evidence = json!({
             "schema_version": 1,
-            "kind": "mayhem-automatic-tts-canary-probe-evidence",
+            "kind": "mayhem-automatic-audio-canary-probe-evidence",
+            "verification_tolerance_bps": config.verification_tolerance_bps,
             "catalog_expected_audio_fingerprints": expected_fingerprints,
             "observed_audio_fingerprints": observed_fingerprints,
             "evaluation": evaluation,
@@ -23188,6 +24041,7 @@ impl GatewayState {
         } else {
             request.duration_seconds
         }
+        .saturating_mul(request.artifact_count)
         .saturating_mul(1_000)
         .max(1);
         let failover = self.failover_thresholds_for_model(model, options, work_units);
@@ -24479,6 +25333,50 @@ fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> 
     }
 }
 
+fn canary_artifact_generation_request(
+    state: &GatewayState,
+    model: &GatewayModel,
+    prompt: &GatewayCanaryPrompt,
+) -> Result<ArtifactGenerationRequest, ApiError> {
+    let endpoint_family = match model.mayhem.model_class.as_str() {
+        "music-generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        "audio-generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+        other => {
+            return Err(ApiError::bad_gateway(
+                format!("audio fingerprint canary is not wired for model class {other}"),
+                Some("model"),
+            ))
+        }
+    };
+    let mut request = Map::from_iter(prompt.endpoint_attributes.clone());
+    request.insert("model".to_owned(), json!(model.id));
+    if let Some(value) = prompt.prompt.as_ref().or(prompt.input.as_ref()) {
+        request.insert("prompt".to_owned(), json!(value));
+    }
+    if let Some(value) = prompt.response_format.as_ref() {
+        request.insert("response_format".to_owned(), json!(value));
+    }
+    if let Some(value) = prompt.steps {
+        request.insert("steps".to_owned(), json!(value));
+    }
+    if let Some(value) = prompt.cfg_scale {
+        request.insert("cfg_scale".to_owned(), json!(value));
+    }
+    if let Some(value) = prompt.shift {
+        request.insert("shift".to_owned(), json!(value));
+    }
+    if let Some(value) = prompt.seed {
+        request.insert("seed".to_owned(), json!(value));
+    }
+    let normalized = normalize_catalog_endpoint_request(
+        state,
+        &model.id,
+        endpoint_family,
+        &Value::Object(request),
+    )?;
+    artifact_generation_request(&model.id, endpoint_family, normalized)
+}
+
 fn canary_audio_transcription_request(
     model_id: &str,
     prompt: &GatewayCanaryPrompt,
@@ -25675,6 +26573,12 @@ fn bounded_audio_metadata(
             filename: "audio.flac",
             seconds: audio.duration_seconds_ceil,
         },
+        ValidatedAudioFormat::Mp3 | ValidatedAudioFormat::Opus | ValidatedAudioFormat::Aac => {
+            return Err(ApiError::bad_request(
+                "audio input must be a valid bounded WAV or FLAC file",
+                Some("file"),
+            ));
+        }
     };
     if let Some(declared) = declared_content_type {
         let declared = declared
@@ -26217,16 +27121,32 @@ fn audio_transcription_failover_work_units(request: &AudioTranscriptionRequest) 
 fn artifact_generation_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
     if request.output_modality == "video" {
         ReceiptUsage::from_units([
-            (USAGE_VIDEO_SECOND, request.duration_seconds),
-            (USAGE_FRAME, request.frame_count),
+            (
+                USAGE_VIDEO_SECOND,
+                request
+                    .duration_seconds
+                    .saturating_mul(request.artifact_count),
+            ),
+            (
+                USAGE_FRAME,
+                request.frame_count.saturating_mul(request.artifact_count),
+            ),
         ])
     } else {
         ReceiptUsage::from_units([
             (
                 USAGE_INPUT_CHARACTER,
-                u64::try_from(request.prompt.chars().count()).unwrap_or(u64::MAX),
+                mayhem_proto::artifact_generation_input_characters(
+                    &request.endpoint_family,
+                    &request.contract_request,
+                ),
             ),
-            (USAGE_AUDIO_SECOND, request.duration_seconds),
+            (
+                USAGE_AUDIO_SECOND,
+                request
+                    .duration_seconds
+                    .saturating_mul(request.artifact_count),
+            ),
         ])
     }
 }
@@ -26864,6 +27784,39 @@ mod tests {
 
         assert_eq!(normalized.normalized_request["parameters"]["width"], 768);
         assert_eq!(normalized.normalized_request["parameters"]["height"], 1024);
+    }
+
+    #[test]
+    fn music_endpoint_aliases_are_preserved_semantically_during_normalization() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        )
+        .expect("music contract");
+        let normalized = normalize_endpoint_request_for_provider(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "caption": "arbitrary source audio calibration",
+                "vocal_language": "en",
+                "batch_size": 1,
+                "audio_format": "flac"
+            }),
+        )
+        .expect("music aliases");
+
+        assert_eq!(
+            normalized.normalized_request["prompt"],
+            "arbitrary source audio calibration"
+        );
+        assert_eq!(normalized.normalized_request["language"], "en");
+        assert_eq!(normalized.normalized_request["n"], 1);
+        assert_eq!(normalized.normalized_request["response_format"], "flac");
+        for alias in ["caption", "vocal_language", "batch_size", "audio_format"] {
+            assert!(
+                normalized.normalized_request.get(alias).is_none(),
+                "{alias}"
+            );
+        }
     }
 
     #[test]
@@ -29054,6 +30007,7 @@ mod tests {
             cfg_scale: None,
             shift: None,
             seed: Some(77),
+            endpoint_attributes: BTreeMap::new(),
         };
 
         let request = canary_chat_request(&model, &prompt, 9).unwrap();
@@ -29066,6 +30020,42 @@ mod tests {
         assert_eq!(request.frequency_penalty, Some(-0.25));
         assert_eq!(request.presence_penalty, Some(2.0));
         assert_eq!(request.seed, Some(77));
+    }
+
+    #[test]
+    fn embedded_music_canary_preserves_endpoint_attributes() {
+        let sets = embedded_canary_sets();
+        let prompt = sets["canary-music-launch-v1"]
+            .iter()
+            .find(|prompt| prompt.id == "ace-step-text2music-seed7")
+            .expect("embedded ACE-Step canary");
+
+        assert_eq!(
+            prompt.prompt.as_deref(),
+            Some(
+                "Warm analog synthwave with a steady pulse, bright arpeggios, and a hopeful cinematic chorus."
+            )
+        );
+        assert_eq!(prompt.steps, Some(50));
+        assert_eq!(prompt.seed, Some(7));
+        assert_eq!(prompt.response_format.as_deref(), Some("wav"));
+        assert!(prompt
+            .audio_b64
+            .as_ref()
+            .is_some_and(|audio| !audio.is_empty()));
+        assert_eq!(
+            prompt.endpoint_attributes["lyrics"],
+            "[Verse]\nSignals rise across the night\n[Chorus]\nOpen roads and morning light"
+        );
+        assert_eq!(prompt.endpoint_attributes["instrumental"], false);
+        assert_eq!(prompt.endpoint_attributes["duration_seconds"], 10);
+        assert_eq!(prompt.endpoint_attributes["bpm"], 120);
+        assert_eq!(prompt.endpoint_attributes["keyscale"], "C major");
+        assert_eq!(prompt.endpoint_attributes["timesignature"], "4/4");
+        assert_eq!(prompt.endpoint_attributes["task_type"], "text2music");
+        assert_eq!(prompt.endpoint_attributes["thinking"], false);
+        assert_eq!(prompt.endpoint_attributes["guidance_scale"], 7);
+        assert_eq!(prompt.endpoint_attributes["n"], 1);
     }
 
     #[test]
@@ -29305,6 +30295,7 @@ mod tests {
                 cfg_scale: Some(1.0),
                 shift: None,
                 seed: Some(7),
+                endpoint_attributes: BTreeMap::new(),
             }],
         )]);
         let registry = canary_registry_from_catalog_root(&root, &canary_sets);
@@ -29372,7 +30363,11 @@ mod tests {
     }
 
     fn test_wav_b64() -> String {
-        let data = vec![128_u8; 8_000];
+        test_wav_b64_with_samples(8_000)
+    }
+
+    fn test_wav_b64_with_samples(sample_count: usize) -> String {
+        let data = vec![128_u8; sample_count];
         let mut wav = Vec::with_capacity(44 + data.len());
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36_u32 + data.len() as u32).to_le_bytes());
@@ -32086,7 +33081,76 @@ mod tests {
             };
             let response = artifact_generation_response_value(&request, &run);
             assert_eq!(response["object"], json!(expected_object));
+            assert_eq!(response["data"].as_array().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn music_inline_audio_drives_gateway_route_load_and_auto_duration() {
+        let source = test_wav_b64_with_samples(16_000);
+        let reference = test_wav_b64_with_samples(8_000);
+        let source_bytes = BASE64_STANDARD.decode(&source).unwrap();
+        let request = artifact_generation_request(
+            "mayhem/music-test",
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            json!({
+                "model": "mayhem/music-test",
+                "task_type": "cover",
+                "n": 1,
+                "source_audio": {
+                    "data": source,
+                    "encoding": "base64",
+                    "content_type": "audio/wav"
+                },
+                "reference_audio": {
+                    "data": reference,
+                    "encoding": "base64",
+                    "content_type": "audio/wav"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(request.duration_seconds, 2);
+        assert_eq!(request.input_audio_count, 2);
+        assert_eq!(
+            request.input_audio_max_bytes,
+            u64::try_from(source_bytes.len()).unwrap()
+        );
+        assert_eq!(request.input_audio_max_seconds, 2);
+
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(requirements.modality_load["audio"].item_count, 2);
+        assert_eq!(
+            requirements.modality_load["audio"].max_item_bytes,
+            u64::try_from(source_bytes.len()).unwrap()
+        );
+        assert_eq!(requirements.modality_load["audio"].max_item_units, 2);
+    }
+
+    #[test]
+    fn music_inline_audio_enforces_gateway_decoded_byte_limit() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        )
+        .unwrap();
+        let request = json!({
+            "model": "mayhem/music-test",
+            "prompt": "bounded source",
+            "source_audio": BASE64_STANDARD.encode([1_u8, 2, 3, 4, 5]),
+        });
+
+        let error = canonicalize_artifact_generation_request(
+            &contract,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            &request,
+            4,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("1..=4 decoded bytes"), "{error}");
     }
 
     #[tokio::test]

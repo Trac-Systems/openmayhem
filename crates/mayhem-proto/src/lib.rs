@@ -9,12 +9,14 @@ mod endpoint_contract;
 mod validated_audio;
 
 pub use endpoint_contract::{
-    endpoint_attribute_value_matches, endpoint_contract_fingerprint,
-    endpoint_family_contract_template, endpoint_request_fingerprint,
+    artifact_generation_inline_audio_load, artifact_generation_input_characters,
+    canonicalize_endpoint_request_aliases, endpoint_attribute_value_matches,
+    endpoint_contract_fingerprint, endpoint_family_contract_template, endpoint_request_fingerprint,
     generate_endpoint_calibration_cases, materialize_endpoint_calibration_request,
     materialize_endpoint_request_defaults, validate_endpoint_attribute_value,
-    validate_endpoint_request, validate_endpoint_response, EndpointCalibrationCase,
-    EndpointCalibrationMutation, EndpointCalibrationValue, EndpointContractViolation,
+    validate_endpoint_request, validate_endpoint_response, ArtifactGenerationInlineAudioLoad,
+    EndpointCalibrationCase, EndpointCalibrationMutation, EndpointCalibrationValue,
+    EndpointContractViolation,
 };
 pub use validated_audio::{
     validated_audio_metadata, validated_flac_audio_metadata, validated_wav_audio_metadata,

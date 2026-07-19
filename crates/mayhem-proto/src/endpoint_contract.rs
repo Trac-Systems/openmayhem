@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::{
-    EndpointAttributeSpec, EndpointFamilyContract, EndpointValueType,
-    ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, ENDPOINT_HF_FEATURE_EXTRACTION,
+    validated_audio_metadata, EndpointAttributeSpec, EndpointFamilyContract, EndpointValueType,
+    ValidatedAudioFormat, ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, ENDPOINT_HF_FEATURE_EXTRACTION,
     ENDPOINT_HF_MULTIMODAL_CHAT, ENDPOINT_HF_TEXT_TO_AUDIO, ENDPOINT_HF_TEXT_TO_IMAGE,
     ENDPOINT_HF_TEXT_TO_SPEECH, ENDPOINT_HF_TEXT_TO_VIDEO, ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
     ENDPOINT_MAYHEM_MUSIC_GENERATIONS, ENDPOINT_OPENAI_AUDIO_SPEECH,
@@ -12,6 +13,105 @@ use crate::{
     ENDPOINT_OPENAI_COMPLETIONS, ENDPOINT_OPENAI_EMBEDDINGS, ENDPOINT_OPENAI_IMAGE_GENERATIONS,
     ENDPOINT_OPENAI_RESPONSES, ENDPOINT_OPENAI_VIDEOS,
 };
+
+const MAX_MUSIC_CAPTION_CHARS: u64 = 512;
+const MAX_MUSIC_LYRICS_CHARS: u64 = 4_096;
+const MAX_MUSIC_AUDIO_CODE_VALUE: u64 = 63_999;
+const MAX_MUSIC_AUDIO_CODE_COUNT: u64 = 600 * 5;
+const MAX_MUSIC_INLINE_AUDIO_SECONDS: u64 = 600;
+const MAX_MUSIC_AUDIO_CODES_CHARS: u64 =
+    MAX_MUSIC_AUDIO_CODE_COUNT * "<|audio_code_63999|>".len() as u64;
+const MAX_MUSIC_INLINE_AUDIO_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS: u64 =
+    (MAX_MUSIC_INLINE_AUDIO_BYTES.div_ceil(3) * 4) as u64;
+const MIN_MUSIC_INLINE_AUDIO_BYTES: usize = 44 + (8_000 / 10 * 2);
+const MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS: u64 =
+    (MIN_MUSIC_INLINE_AUDIO_BYTES.div_ceil(3) * 4) as u64;
+const MAX_MUSIC_CUSTOM_TIMESTEPS: u64 = 200;
+const MAX_MUSIC_SEED: f64 = u32::MAX as f64;
+const MUSIC_VALID_LANGUAGES: &[&str] = &[
+    "ar", "az", "bg", "bn", "ca", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fr", "he", "hi",
+    "hr", "ht", "hu", "id", "is", "it", "ja", "ko", "la", "lt", "ms", "ne", "nl", "no", "pa", "pl",
+    "pt", "ro", "ru", "sa", "sk", "sr", "sv", "sw", "ta", "te", "th", "tl", "tr", "uk", "ur", "vi",
+    "yue", "zh", "unknown",
+];
+
+const MUSIC_REQUEST_ALIAS_GROUPS: &[(&str, &[&str])] = &[
+    ("prompt", &["caption"]),
+    ("language", &["vocal_language"]),
+    ("key", &["keyscale", "key_scale"]),
+    ("time_signature", &["timesignature"]),
+    ("duration_seconds", &["duration", "audio_duration"]),
+    ("steps", &["inference_steps"]),
+    ("n", &["batch", "batch_size"]),
+    ("custom_timesteps", &["timesteps"]),
+    ("adg", &["use_adg"]),
+    ("sample_query", &["description", "desc"]),
+    ("use_format", &["format"]),
+    ("repaint_start", &["repainting_start"]),
+    ("repaint_end", &["repainting_end"]),
+    ("cover_strength", &["audio_cover_strength"]),
+    ("response_format", &["audio_format"]),
+    ("source_audio", &["src_audio", "ctx_audio"]),
+    ("reference_audio", &["melody", "ref_audio"]),
+    ("audio_codes", &["audio_code_string"]),
+    ("infer_method", &["inference_method"]),
+    ("sampler", &["sampler_mode"]),
+    ("flow_edit_morph", &["flow_edit"]),
+    ("lm_temperature", &["temperature"]),
+    ("lm_cfg_scale", &["lm_cfg"]),
+    ("lm_top_k", &["top_k"]),
+    ("lm_top_p", &["top_p"]),
+    ("lm_negative_prompt", &["negative_prompt"]),
+    ("constrained_decoding", &["use_constrained_decoding"]),
+];
+
+const MUSIC_INLINE_AUDIO_ROOTS: &[&str] = &[
+    "source_audio",
+    "src_audio",
+    "ctx_audio",
+    "reference_audio",
+    "melody",
+    "ref_audio",
+];
+const MUSIC_INLINE_AUDIO_CONTENT_TYPES: &[&str] = &[
+    "audio/aac",
+    "audio/flac",
+    "audio/m4a",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/opus",
+    "audio/wav",
+    "audio/x-wav",
+];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArtifactGenerationInlineAudioLoad {
+    pub item_count: u32,
+    pub max_item_bytes: u64,
+    pub max_item_seconds: u64,
+}
+
+pub fn artifact_generation_inline_audio_load(
+    request: &Value,
+) -> Result<ArtifactGenerationInlineAudioLoad, String> {
+    let mut load = ArtifactGenerationInlineAudioLoad::default();
+    for root in ["source_audio", "reference_audio"] {
+        let Some(audio) = request.get(root) else {
+            continue;
+        };
+        let (bytes, seconds) = validated_music_inline_audio_item(root, audio)?;
+        load.item_count = load
+            .item_count
+            .checked_add(1)
+            .ok_or_else(|| "inline audio item count overflowed u32".to_owned())?;
+        load.max_item_bytes = load.max_item_bytes.max(bytes);
+        load.max_item_seconds = load.max_item_seconds.max(seconds);
+    }
+    Ok(load)
+}
 
 pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyContract> {
     let (request, required, response): (&[&str], &[&str], &[&str]) = match family {
@@ -338,19 +438,131 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
             &[
                 "model",
                 "prompt",
+                "caption",
+                "lyrics",
+                "instrumental",
+                "style",
+                "genre",
+                "tags",
+                "sample_mode",
+                "sample_query",
+                "description",
+                "desc",
+                "use_format",
+                "format",
+                "audio_codes",
+                "audio_code_string",
+                "language",
+                "vocal_language",
+                "bpm",
+                "key",
+                "keyscale",
+                "key_scale",
+                "time_signature",
+                "timesignature",
+                "duration",
+                "audio_duration",
                 "melody",
                 "duration_seconds",
+                "steps",
+                "inference_steps",
+                "n",
+                "batch",
+                "batch_size",
                 "response_format",
+                "audio_format",
+                "mp3_bitrate",
+                "mp3_sample_rate",
                 "temperature",
                 "top_k",
                 "top_p",
-                "typical_p",
                 "guidance_scale",
                 "seed",
-                "do_sample",
-                "max_new_tokens",
+                "task_type",
+                "thinking",
+                "instruction",
+                "lm_temperature",
+                "lm_cfg_scale",
+                "lm_cfg",
+                "lm_top_k",
+                "lm_top_p",
+                "lm_negative_prompt",
+                "use_cot_metas",
+                "use_cot_caption",
+                "use_cot_language",
+                "constrained_decoding",
+                "use_constrained_decoding",
+                "infer_method",
+                "inference_method",
+                "sampler",
+                "sampler_mode",
+                "velocity_norm_threshold",
+                "velocity_ema_factor",
+                "dcw_enabled",
+                "dcw_mode",
+                "dcw_scaler",
+                "dcw_high_scaler",
+                "dcw_wavelet",
+                "shift",
+                "custom_timesteps",
+                "timesteps",
+                "adg",
+                "use_adg",
+                "cfg_interval_start",
+                "cfg_interval_end",
+                "repaint_start",
+                "repainting_start",
+                "repaint_end",
+                "repainting_end",
+                "repaint_mode",
+                "repaint_strength",
+                "chunk_mask_mode",
+                "cover_strength",
+                "audio_cover_strength",
+                "cover_noise_strength",
+                "enable_normalization",
+                "normalization_db",
+                "fade_in_duration",
+                "fade_out_duration",
+                "latent_shift",
+                "latent_rescale",
+                "retake_seed",
+                "retake_variance",
+                "flow_edit_morph",
+                "flow_edit",
+                "flow_edit_source_caption",
+                "flow_edit_source_lyrics",
+                "flow_edit_n_min",
+                "flow_edit_n_max",
+                "flow_edit_n_avg",
+                "seeds",
+                "source_audio",
+                "source_audio.data",
+                "source_audio.encoding",
+                "source_audio.content_type",
+                "src_audio",
+                "src_audio.data",
+                "src_audio.encoding",
+                "src_audio.content_type",
+                "ctx_audio",
+                "ctx_audio.data",
+                "ctx_audio.encoding",
+                "ctx_audio.content_type",
+                "reference_audio",
+                "reference_audio.data",
+                "reference_audio.encoding",
+                "reference_audio.content_type",
+                "melody.data",
+                "melody.encoding",
+                "melody.content_type",
+                "ref_audio",
+                "ref_audio.data",
+                "ref_audio.encoding",
+                "ref_audio.content_type",
+                "no_fsq",
+                "negative_prompt",
             ],
-            &["model", "prompt"],
+            &["model"],
             &["id", "object", "music", "content_type", "usage", "mayhem"],
         ),
         ENDPOINT_HF_TEXT_TO_AUDIO => (
@@ -505,7 +717,7 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
                 "parameters.seed",
             ],
         ],
-        ENDPOINT_MAYHEM_AUDIO_GENERATIONS | ENDPOINT_MAYHEM_MUSIC_GENERATIONS => &[&[
+        ENDPOINT_MAYHEM_AUDIO_GENERATIONS => &[&[
             "temperature",
             "top_k",
             "top_p",
@@ -513,6 +725,71 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
             "do_sample",
             "max_new_tokens",
         ]],
+        ENDPOINT_MAYHEM_MUSIC_GENERATIONS => &[
+            &[
+                "steps",
+                "guidance_scale",
+                "seed",
+                "shift",
+                "infer_method",
+                "adg",
+                "cfg_interval_start",
+                "cfg_interval_end",
+            ],
+            &[
+                "thinking",
+                "lm_temperature",
+                "lm_cfg_scale",
+                "lm_top_k",
+                "lm_top_p",
+                "lm_negative_prompt",
+                "use_cot_metas",
+                "use_cot_caption",
+                "use_cot_language",
+                "constrained_decoding",
+            ],
+            &["task_type", "source_audio", "reference_audio"],
+            &[
+                "repaint_start",
+                "repaint_end",
+                "repaint_mode",
+                "chunk_mask_mode",
+                "source_audio",
+            ],
+            &["repaint_strength", "source_audio"],
+            &["cover_strength", "cover_noise_strength", "source_audio"],
+            &[
+                "sampler",
+                "velocity_norm_threshold",
+                "velocity_ema_factor",
+                "dcw_enabled",
+                "dcw_mode",
+                "dcw_scaler",
+                "dcw_high_scaler",
+                "dcw_wavelet",
+            ],
+            &[
+                "response_format",
+                "mp3_bitrate",
+                "mp3_sample_rate",
+                "enable_normalization",
+                "normalization_db",
+                "fade_in_duration",
+                "fade_out_duration",
+                "latent_shift",
+                "latent_rescale",
+            ],
+            &[
+                "retake_seed",
+                "retake_variance",
+                "flow_edit_morph",
+                "flow_edit_source_caption",
+                "flow_edit_source_lyrics",
+                "flow_edit_n_min",
+                "flow_edit_n_max",
+                "flow_edit_n_avg",
+            ],
+        ],
         ENDPOINT_HF_TEXT_TO_AUDIO
         | ENDPOINT_HF_TEXT_TO_SPEECH
         | ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => &[&[
@@ -532,6 +809,11 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
 }
 
 fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeSpec> {
+    if family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        if let Some(spec) = music_request_attribute_spec(path) {
+            return Some(spec);
+        }
+    }
     let leaf = path.rsplit('.').next().unwrap_or(path);
     let spec = match path {
         "model" => marker_string_spec(json!("$MODEL")),
@@ -811,6 +1093,322 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
     Some(spec)
 }
 
+fn music_request_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
+    let spec = match path {
+        "prompt" | "caption" => {
+            string_spec(0, MAX_MUSIC_CAPTION_CHARS, json!("Mayhem calibration"))
+        }
+        "lyrics" => with_default(
+            string_spec(0, MAX_MUSIC_LYRICS_CHARS, json!("Calibration lyrics")),
+            json!(""),
+        ),
+        "style" => with_default(string_spec(0, 505, json!("acoustic")), json!("")),
+        "genre" => with_default(string_spec(0, 505, json!("indie folk")), json!("")),
+        "tags" => with_default(string_spec(0, 506, json!("intimate, live")), json!("")),
+        "sample_query" => with_default(
+            string_spec(
+                0,
+                MAX_MUSIC_CAPTION_CHARS,
+                json!("A restrained piano ballad"),
+            ),
+            json!(""),
+        ),
+        "description" | "desc" => string_spec(
+            0,
+            MAX_MUSIC_CAPTION_CHARS,
+            json!("A restrained piano ballad"),
+        ),
+        "audio_codes" => music_audio_codes_spec(Some(json!(""))),
+        "audio_code_string" => music_audio_codes_spec(None),
+        "language" => music_language_spec(Some(json!("unknown"))),
+        "vocal_language" => music_language_spec(None),
+        "key" => with_default(string_spec(0, 8, json!("C major")), json!("")),
+        "keyscale" | "key_scale" => string_spec(0, 8, json!("C major")),
+        "time_signature" => enum_spec(
+            Some(json!("")),
+            &[
+                json!(""),
+                json!("2"),
+                json!("2/4"),
+                json!("3"),
+                json!("3/4"),
+                json!("4"),
+                json!("4/4"),
+                json!("6"),
+                json!("6/8"),
+            ],
+        ),
+        "timesignature" => enum_spec(
+            None,
+            &[
+                json!(""),
+                json!("2"),
+                json!("2/4"),
+                json!("3"),
+                json!("3/4"),
+                json!("4"),
+                json!("4/4"),
+                json!("6"),
+                json!("6/8"),
+            ],
+        ),
+        "instruction" => with_default(
+            string_spec(
+                1,
+                1_024,
+                json!("Fill the audio semantic mask based on the given conditions:"),
+            ),
+            json!("Fill the audio semantic mask based on the given conditions:"),
+        ),
+        "flow_edit_source_caption" => with_default(
+            string_spec(
+                0,
+                MAX_MUSIC_CAPTION_CHARS,
+                json!("Original source arrangement"),
+            ),
+            json!(""),
+        ),
+        "flow_edit_source_lyrics" => with_default(
+            string_spec(0, MAX_MUSIC_LYRICS_CHARS, json!("Original source lyrics")),
+            json!(""),
+        ),
+        "lm_negative_prompt" => with_default(
+            string_spec(0, MAX_MUSIC_CAPTION_CHARS, json!("NO USER INPUT")),
+            json!("NO USER INPUT"),
+        ),
+        "negative_prompt" => string_spec(0, MAX_MUSIC_CAPTION_CHARS, json!("NO USER INPUT")),
+        "task_type" => enum_spec(
+            Some(json!("text2music")),
+            &[
+                json!("text2music"),
+                json!("repaint"),
+                json!("cover"),
+                json!("cover-nofsq"),
+            ],
+        ),
+        "infer_method" => enum_spec(Some(json!("ode")), &[json!("ode"), json!("sde")]),
+        "inference_method" => enum_spec(None, &[json!("ode"), json!("sde")]),
+        "sampler" => enum_spec(Some(json!("euler")), &[json!("euler"), json!("heun")]),
+        "sampler_mode" => enum_spec(None, &[json!("euler"), json!("heun")]),
+        "dcw_mode" => music_dcw_mode_spec(),
+        "dcw_wavelet" => enum_spec(
+            Some(json!("haar")),
+            &[
+                json!("haar"),
+                json!("db2"),
+                json!("db4"),
+                json!("sym4"),
+                json!("sym8"),
+                json!("coif2"),
+            ],
+        ),
+        "chunk_mask_mode" => enum_spec(Some(json!("auto")), &[json!("explicit"), json!("auto")]),
+        "repaint_mode" => enum_spec(
+            Some(json!("balanced")),
+            &[
+                json!("conservative"),
+                json!("balanced"),
+                json!("aggressive"),
+            ],
+        ),
+        "response_format" => enum_spec(
+            Some(json!("flac")),
+            &[
+                json!("flac"),
+                json!("opus"),
+                json!("aac"),
+                json!("wav"),
+                json!("wav32"),
+                json!("mp3"),
+            ],
+        ),
+        "audio_format" => enum_spec(
+            None,
+            &[
+                json!("flac"),
+                json!("mp3"),
+                json!("opus"),
+                json!("aac"),
+                json!("wav"),
+                json!("wav32"),
+            ],
+        ),
+        "mp3_bitrate" => enum_spec(
+            Some(json!("128k")),
+            &[json!("128k"), json!("192k"), json!("256k"), json!("320k")],
+        ),
+        "mp3_sample_rate" => enum_spec(Some(json!(48_000)), &[json!(44_100), json!(48_000)]),
+        "source_audio" | "src_audio" | "ctx_audio" | "reference_audio" | "melody" | "ref_audio" => {
+            music_inline_audio_object_spec()
+        }
+        path if music_inline_audio_child(path, "data") => string_spec(
+            MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS,
+            MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS,
+            json!(endpoint_calibration_wav_base64_fixture(
+                MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+            )
+            .expect("minimum music audio fixture is constructible")),
+        ),
+        path if music_inline_audio_child(path, "encoding") => enum_spec(None, &[json!("base64")]),
+        path if music_inline_audio_child(path, "content_type") => {
+            music_inline_audio_content_type_spec()
+        }
+        "instrumental" | "sample_mode" | "use_format" => boolean_spec(Some(false)),
+        "format" | "no_fsq" => boolean_spec(None),
+        "thinking" => boolean_spec(Some(false)),
+        "adg" => boolean_spec(Some(false)),
+        "use_adg" => boolean_spec(None),
+        "dcw_enabled" => boolean_spec(Some(false)),
+        "enable_normalization" => boolean_spec(Some(true)),
+        "flow_edit_morph" => boolean_spec(Some(false)),
+        "flow_edit" => boolean_spec(None),
+        "use_cot_metas" | "use_cot_caption" | "use_cot_language" => boolean_spec(Some(true)),
+        "constrained_decoding" => boolean_spec(Some(true)),
+        "use_constrained_decoding" => boolean_spec(None),
+        "bpm" => music_bpm_spec(),
+        "steps" => with_default(integer_spec(1.0, 200.0, 50), json!(50)),
+        "inference_steps" => integer_spec(1.0, 200.0, 50),
+        "n" => with_default(integer_spec(1.0, 8.0, 2), json!(2)),
+        "batch" | "batch_size" => integer_spec(1.0, 8.0, 2),
+        "top_k" => integer_spec(0.0, 100.0, 0),
+        "lm_top_k" => with_default(integer_spec(0.0, 100.0, 0), json!(0)),
+        "seed" => with_default(integer_spec(-1.0, MAX_MUSIC_SEED, 7), json!(-1)),
+        "flow_edit_n_avg" => with_default(integer_spec(1.0, 8.0, 1), json!(1)),
+        "duration_seconds" => music_duration_spec(Some(Value::Null)),
+        "duration" | "audio_duration" => music_duration_spec(None),
+        "temperature" => number_spec(0.0, 2.0, 0.85),
+        "lm_temperature" => with_default(number_spec(0.0, 2.0, 0.85), json!(0.85)),
+        "top_p" => number_spec(0.0, 1.0, 0.9),
+        "lm_top_p" => with_default(number_spec(0.0, 1.0, 0.9), json!(0.9)),
+        "guidance_scale" => with_default(number_spec(1.0, 15.0, 7.0), json!(7.0)),
+        "lm_cfg_scale" => with_default(number_spec(1.0, 3.0, 2.0), json!(2.0)),
+        "lm_cfg" => number_spec(1.0, 3.0, 2.0),
+        "shift" => with_default(number_spec(1.0, 5.0, 3.0), json!(3.0)),
+        "cfg_interval_start" => with_default(number_spec(0.0, 1.0, 0.0), json!(0.0)),
+        "cfg_interval_end" => with_default(number_spec(0.0, 1.0, 1.0), json!(1.0)),
+        "repaint_start" => with_default(number_spec(0.0, 599.999, 0.0), json!(0.0)),
+        "repainting_start" => number_spec(0.0, 599.999, 0.0),
+        "repaint_end" => with_default(number_spec(-1.0, 600.0, 30.0), json!(-1.0)),
+        "repainting_end" => number_spec(-1.0, 600.0, 30.0),
+        "repaint_strength" => with_default(number_spec(0.0, 1.0, 0.5), json!(0.5)),
+        "cover_strength" => with_default(number_spec(0.0, 1.0, 1.0), json!(1.0)),
+        "audio_cover_strength" => number_spec(0.0, 1.0, 1.0),
+        "cover_noise_strength" => with_default(number_spec(0.0, 1.0, 0.0), json!(0.0)),
+        "velocity_norm_threshold" => with_default(number_spec(0.0, 5.0, 0.0), json!(0.0)),
+        "velocity_ema_factor" => with_default(number_spec(0.0, 0.5, 0.0), json!(0.0)),
+        "dcw_scaler" => with_default(number_spec(0.0, 0.1, 0.05), json!(0.05)),
+        "dcw_high_scaler" => with_default(number_spec(0.0, 0.1, 0.02), json!(0.02)),
+        "normalization_db" => with_default(number_spec(-10.0, 0.0, -1.0), json!(-1.0)),
+        "fade_in_duration" | "fade_out_duration" => {
+            with_default(number_spec(0.0, 10.0, 0.0), json!(0.0))
+        }
+        "latent_shift" => with_default(number_spec(-0.2, 0.2, 0.0), json!(0.0)),
+        "latent_rescale" => with_default(number_spec(0.5, 1.5, 1.0), json!(1.0)),
+        "retake_variance" => with_default(number_spec(0.0, 1.0, 0.5), json!(0.0)),
+        "flow_edit_n_min" => with_default(number_spec(0.0, 1.0, 0.0), json!(0.0)),
+        "flow_edit_n_max" => with_default(number_spec(0.0, 1.0, 1.0), json!(1.0)),
+        "retake_seed" => integer_spec(-1.0, MAX_MUSIC_SEED, 7),
+        "custom_timesteps" | "timesteps" => {
+            array_spec(2, MAX_MUSIC_CUSTOM_TIMESTEPS, json!([1.0, 0.5, 0.0]))
+        }
+        "seeds" => array_spec(1, 8, json!([7, 11])),
+        _ => return None,
+    };
+    Some(spec)
+}
+
+fn music_inline_audio_object_spec() -> EndpointAttributeSpec {
+    object_spec(json!({
+        "data": endpoint_calibration_wav_base64_fixture(
+            MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+        ).expect("minimum music audio fixture is constructible"),
+        "encoding": "base64",
+        "content_type": "audio/wav"
+    }))
+}
+
+fn music_inline_audio_content_type_spec() -> EndpointAttributeSpec {
+    let values = MUSIC_INLINE_AUDIO_CONTENT_TYPES
+        .iter()
+        .map(|content_type| json!(content_type))
+        .collect::<Vec<_>>();
+    enum_spec(None, &values)
+}
+
+fn music_language_spec(default: Option<Value>) -> EndpointAttributeSpec {
+    let values = MUSIC_VALID_LANGUAGES
+        .iter()
+        .map(|language| json!(language))
+        .collect::<Vec<_>>();
+    enum_spec(default, &values)
+}
+
+fn music_duration_spec(default: Option<Value>) -> EndpointAttributeSpec {
+    let mut spec = union_spec(
+        &[
+            EndpointValueType::Number,
+            EndpointValueType::String,
+            EndpointValueType::Null,
+        ],
+        &[
+            Value::Null,
+            json!("auto"),
+            json!(-1.0),
+            json!(10.0),
+            json!(600.0),
+        ],
+    );
+    spec.default = default;
+    spec.minimum = Some(-1.0);
+    spec.maximum = Some(600.0);
+    spec
+}
+
+fn music_bpm_spec() -> EndpointAttributeSpec {
+    let mut spec = union_spec(
+        &[EndpointValueType::Integer, EndpointValueType::Null],
+        &[Value::Null, json!(30), json!(120), json!(300)],
+    );
+    spec.default = Some(Value::Null);
+    spec.minimum = Some(30.0);
+    spec.maximum = Some(300.0);
+    spec
+}
+
+fn music_audio_codes_spec(default: Option<Value>) -> EndpointAttributeSpec {
+    let mut spec = union_spec(
+        &[EndpointValueType::String, EndpointValueType::Array],
+        &[
+            json!("<|audio_code_1|><|audio_code_2|>"),
+            json!([
+                "<|audio_code_1|><|audio_code_2|>",
+                "<|audio_code_3|><|audio_code_4|>"
+            ]),
+        ],
+    );
+    spec.default = default;
+    spec.min_length = Some(0);
+    spec.max_length = Some(MAX_MUSIC_AUDIO_CODES_CHARS);
+    spec.min_items = Some(1);
+    spec.max_items = Some(8);
+    spec
+}
+
+fn music_dcw_mode_spec() -> EndpointAttributeSpec {
+    let mut spec = enum_spec(
+        Some(json!("double")),
+        &[json!("low"), json!("high"), json!("double"), json!("pix")],
+    );
+    spec.calibration_values = vec![json!("low"), json!("high"), json!("pix"), json!("double")];
+    spec
+}
+
+fn music_inline_audio_child(path: &str, child: &str) -> bool {
+    MUSIC_INLINE_AUDIO_ROOTS
+        .iter()
+        .any(|root| path == format!("{root}.{child}"))
+}
+
 fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
     let leaf = path.rsplit('.').next().unwrap_or(path);
     let spec = match leaf {
@@ -993,6 +1591,11 @@ fn number_spec(minimum: f64, maximum: f64, calibration: f64) -> EndpointAttribut
     spec.minimum = Some(minimum);
     spec.maximum = Some(maximum);
     spec.calibration_values = vec![json!(calibration)];
+    spec
+}
+
+fn with_default(mut spec: EndpointAttributeSpec, default: Value) -> EndpointAttributeSpec {
+    spec.default = Some(default);
     spec
 }
 
@@ -1198,6 +1801,17 @@ pub fn generate_endpoint_calibration_cases(
             .ok_or_else(|| format!("required attribute {path} has no calibration baseline"))?;
         set_endpoint_path(&mut base_request, path, value)?;
     }
+    if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        for path in ["prompt", "lyrics"] {
+            let Some(spec) = contract.request_attribute_specs.get(path) else {
+                continue;
+            };
+            let value = endpoint_calibration_nonempty_string(spec)
+                .or_else(|| endpoint_calibration_baseline(spec))
+                .ok_or_else(|| format!("music attribute {path} has no calibration baseline"))?;
+            set_endpoint_path(&mut base_request, path, value)?;
+        }
+    }
     validate_endpoint_request(contract, &base_request).map_err(|violations| {
         format!(
             "generated baseline request is invalid: {}",
@@ -1257,10 +1871,7 @@ pub fn generate_endpoint_calibration_cases(
                 } else {
                     "omitted_optional"
                 },
-                vec![EndpointCalibrationMutation {
-                    path: path.clone(),
-                    value: EndpointCalibrationValue::Omitted,
-                }],
+                calibration_mutations_for_omission(contract, path),
                 true,
                 Vec::new(),
             );
@@ -1478,18 +2089,27 @@ pub fn materialize_endpoint_calibration_request(
                 let length = usize::try_from(*length).map_err(|_| {
                     format!("string fixture for {} exceeds this platform", mutation.path)
                 })?;
-                set_endpoint_path(&mut request, &mutation.path, json!("x".repeat(length)))?;
+                let fixture = endpoint_calibration_string_fixture(case, &mutation.path, length);
+                set_endpoint_path(&mut request, &mutation.path, json!(fixture))?;
             }
             EndpointCalibrationValue::ArrayLength { length, item } => {
                 let length = usize::try_from(*length).map_err(|_| {
                     format!("array fixture for {} exceeds this platform", mutation.path)
                 })?;
                 let item = substitute_calibration_markers(item.clone(), substitutions);
-                set_endpoint_path(
-                    &mut request,
-                    &mutation.path,
-                    Value::Array(vec![item; length]),
-                )?;
+                let values = if case.endpoint_family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+                    && matches!(mutation.path.as_str(), "custom_timesteps" | "timesteps")
+                    && case.expect_accept
+                    && length >= 2
+                {
+                    let denominator = (length - 1) as f64;
+                    (0..length)
+                        .map(|index| json!(1.0 - index as f64 / denominator))
+                        .collect()
+                } else {
+                    vec![item; length]
+                };
+                set_endpoint_path(&mut request, &mutation.path, Value::Array(values))?;
             }
         }
     }
@@ -1500,8 +2120,14 @@ pub fn materialize_endpoint_request_defaults(
     contract: &EndpointFamilyContract,
     request: &Value,
 ) -> Result<Value, String> {
+    let mut normalized = if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        normalize_music_request_aliases(contract, request)
+            .map_err(|violation| format!("{}: {}", violation.path, violation.reason))?
+    } else {
+        request.clone()
+    };
     let image_aliases = if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
-        let object = request
+        let object = normalized
             .as_object()
             .ok_or_else(|| "endpoint request must be an object".to_owned())?;
         let has_size = object.contains_key("size");
@@ -1517,7 +2143,6 @@ pub fn materialize_endpoint_request_defaults(
     } else {
         None
     };
-    let mut normalized = request.clone();
     for path in &contract.request_attributes {
         if image_aliases.is_some_and(|(has_size, has_dimensions)| {
             (has_size && matches!(path.as_str(), "width" | "height"))
@@ -1525,16 +2150,38 @@ pub fn materialize_endpoint_request_defaults(
         }) {
             continue;
         }
+        if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            && music_alias_canonical(contract, path).is_some()
+        {
+            continue;
+        }
+        if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            && !music_request_default_applies(path, &normalized)
+        {
+            continue;
+        }
         if !endpoint_values_at_path(&normalized, path).is_empty() {
             continue;
         }
-        let Some(default) = contract
+        let Some(mut default) = contract
             .request_attribute_specs
             .get(path)
             .and_then(|spec| spec.default.clone())
         else {
             continue;
         };
+        if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            && normalized
+                .get("thinking")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            if path == "dcw_scaler" {
+                default = json!(0.02);
+            } else if path == "dcw_high_scaler" {
+                default = json!(0.06);
+            }
+        }
         set_endpoint_path(&mut normalized, path, default)?;
     }
     if image_aliases.is_some() {
@@ -1554,11 +2201,298 @@ pub fn materialize_endpoint_request_defaults(
     Ok(normalized)
 }
 
+pub fn artifact_generation_input_characters(family: &str, request: &Value) -> u64 {
+    let paths: &[&str] = match family {
+        ENDPOINT_MAYHEM_MUSIC_GENERATIONS => &[
+            "prompt",
+            "global_caption",
+            "lyrics",
+            "style",
+            "genre",
+            "tags",
+            "sample_query",
+            "audio_codes",
+            "negative_prompt",
+            "lm_negative_prompt",
+            "instruction",
+            "flow_edit_source_caption",
+            "flow_edit_source_lyrics",
+        ],
+        ENDPOINT_MAYHEM_AUDIO_GENERATIONS => &["prompt", "negative_prompt"],
+        ENDPOINT_HF_TEXT_TO_AUDIO => &["inputs", "parameters.negative_prompt"],
+        _ => &["prompt", "inputs", "negative_prompt"],
+    };
+    paths
+        .iter()
+        .flat_map(|path| endpoint_values_at_path(request, path))
+        .fold(0_u64, |total, value| {
+            total.saturating_add(json_text_characters(value))
+        })
+}
+
+fn json_text_characters(value: &Value) -> u64 {
+    match value {
+        Value::String(value) => u64::try_from(value.chars().count()).unwrap_or(u64::MAX),
+        Value::Array(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(json_text_characters(value))
+        }),
+        _ => 0,
+    }
+}
+
+fn normalize_music_request_aliases(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+) -> Result<Value, EndpointContractViolation> {
+    let Some(request_object) = request.as_object() else {
+        return Ok(request.clone());
+    };
+    let mut normalized = request_object.clone();
+    for (canonical, aliases) in MUSIC_REQUEST_ALIAS_GROUPS {
+        let canonical_is_signed = contract
+            .request_attributes
+            .iter()
+            .any(|path| path == canonical);
+        if !canonical_is_signed {
+            continue;
+        }
+        let signed_aliases = aliases
+            .iter()
+            .filter(|alias| {
+                contract
+                    .request_attributes
+                    .iter()
+                    .any(|path| path == **alias)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let supplied = std::iter::once(*canonical)
+            .chain(signed_aliases.iter().copied())
+            .filter(|path| request_object.contains_key(*path))
+            .collect::<Vec<_>>();
+        if supplied.len() > 1 {
+            return Err(EndpointContractViolation {
+                path: (*canonical).to_owned(),
+                reason: format!(
+                    "ambiguous aliases cannot be combined: {}",
+                    supplied.join(", ")
+                ),
+            });
+        }
+        let Some(alias) = signed_aliases
+            .iter()
+            .find(|alias| request_object.contains_key(**alias))
+        else {
+            continue;
+        };
+        let value = normalized
+            .remove(*alias)
+            .expect("supplied music alias exists in normalized request");
+        normalized.insert((*canonical).to_owned(), value);
+    }
+    if contract
+        .request_attributes
+        .iter()
+        .any(|path| path == "no_fsq")
+        && request_object.contains_key("no_fsq")
+    {
+        let no_fsq = normalized
+            .remove("no_fsq")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| EndpointContractViolation {
+                path: "no_fsq".to_owned(),
+                reason: "no_fsq must be a boolean".to_owned(),
+            })?;
+        if no_fsq {
+            match normalized.get("task_type").and_then(Value::as_str) {
+                None | Some("cover") => {
+                    normalized.insert("task_type".to_owned(), json!("cover-nofsq"));
+                }
+                Some("cover-nofsq") => {}
+                Some(task) => {
+                    return Err(EndpointContractViolation {
+                        path: "no_fsq".to_owned(),
+                        reason: format!(
+                            "no_fsq=true conflicts with task_type={task}; use cover or cover-nofsq"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(Value::Object(normalized))
+}
+
+pub fn canonicalize_endpoint_request_aliases(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+) -> Result<Value, String> {
+    if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        normalize_music_request_aliases(contract, request)
+            .map_err(|violation| format!("{}: {}", violation.path, violation.reason))
+    } else {
+        Ok(request.clone())
+    }
+}
+
+fn music_alias_canonical(contract: &EndpointFamilyContract, path: &str) -> Option<&'static str> {
+    MUSIC_REQUEST_ALIAS_GROUPS
+        .iter()
+        .find(|(canonical, aliases)| {
+            contract
+                .request_attributes
+                .iter()
+                .any(|signed| signed == canonical)
+                && aliases.contains(&path)
+                && contract
+                    .request_attributes
+                    .iter()
+                    .any(|signed| signed == path)
+        })
+        .map(|(canonical, _)| *canonical)
+}
+
+fn music_request_default_applies(path: &str, request: &Value) -> bool {
+    let task = request
+        .get("task_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text2music");
+    if path == "seed" && request.get("seeds").is_some() {
+        return false;
+    }
+    if path == "instruction" {
+        return task == "text2music";
+    }
+    if music_lm_control(path) {
+        if matches!(task, "cover" | "cover-nofsq" | "repaint")
+            || request
+                .get("flow_edit_morph")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        if path == "use_cot_language"
+            && request
+                .get("language")
+                .and_then(Value::as_str)
+                .is_some_and(|language| language != "unknown")
+        {
+            return false;
+        }
+    }
+    if matches!(path, "steps" | "shift") && request.get("custom_timesteps").is_some() {
+        return false;
+    }
+    if matches!(path, "mp3_bitrate" | "mp3_sample_rate") {
+        return request
+            .get("response_format")
+            .and_then(Value::as_str)
+            .unwrap_or("flac")
+            == "mp3";
+    }
+    if music_dcw_control(path) {
+        if !request
+            .get("dcw_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if path == "dcw_high_scaler" {
+            return request
+                .get("dcw_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("double")
+                == "double";
+        }
+    }
+    if path == "normalization_db" {
+        return request
+            .get("enable_normalization")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+    }
+    if music_repaint_control(path) {
+        if path == "repaint_strength" {
+            return task == "repaint"
+                && request
+                    .get("repaint_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("balanced")
+                    == "balanced";
+        }
+        return task == "repaint";
+    }
+    if music_cover_control(path) {
+        return matches!(task, "cover" | "cover-nofsq" | "repaint");
+    }
+    if music_flow_control(path) {
+        return request
+            .get("flow_edit_morph")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    true
+}
+
+fn music_repaint_control(path: &str) -> bool {
+    matches!(
+        path,
+        "repaint_start" | "repaint_end" | "repaint_mode" | "repaint_strength" | "chunk_mask_mode"
+    )
+}
+
+fn music_cover_control(path: &str) -> bool {
+    matches!(path, "cover_strength" | "cover_noise_strength")
+}
+
+fn music_dcw_control(path: &str) -> bool {
+    matches!(
+        path,
+        "dcw_mode" | "dcw_scaler" | "dcw_high_scaler" | "dcw_wavelet"
+    )
+}
+
+fn music_lm_control(path: &str) -> bool {
+    matches!(
+        path,
+        "lm_temperature"
+            | "lm_cfg_scale"
+            | "lm_top_k"
+            | "lm_top_p"
+            | "lm_negative_prompt"
+            | "use_cot_metas"
+            | "use_cot_caption"
+            | "use_cot_language"
+            | "constrained_decoding"
+    )
+}
+
+fn music_flow_control(path: &str) -> bool {
+    matches!(
+        path,
+        "flow_edit_source_caption"
+            | "flow_edit_source_lyrics"
+            | "flow_edit_n_min"
+            | "flow_edit_n_max"
+            | "flow_edit_n_avg"
+    )
+}
+
 fn endpoint_calibration_baseline(spec: &EndpointAttributeSpec) -> Option<Value> {
     spec.default
         .clone()
         .or_else(|| spec.calibration_values.first().cloned())
         .or_else(|| spec.enum_values.first().cloned())
+}
+
+fn endpoint_calibration_nonempty_string(spec: &EndpointAttributeSpec) -> Option<Value> {
+    spec.calibration_values
+        .iter()
+        .chain(spec.enum_values.iter())
+        .find(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+        .cloned()
 }
 
 fn endpoint_calibration_interaction_value(spec: &EndpointAttributeSpec) -> Option<Value> {
@@ -1586,6 +2520,39 @@ fn calibration_mutations_for_literal(
     mutations
 }
 
+fn calibration_mutations_for_omission(
+    contract: &EndpointFamilyContract,
+    path: &str,
+) -> Vec<EndpointCalibrationMutation> {
+    let mut mutations = vec![EndpointCalibrationMutation {
+        path: path.to_owned(),
+        value: EndpointCalibrationValue::Omitted,
+    }];
+    if contract.family != ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        return mutations;
+    }
+    let semantic_path = music_alias_canonical(contract, path).unwrap_or(path);
+    if let Some(canonical) = music_alias_canonical(contract, path) {
+        mutations.push(EndpointCalibrationMutation {
+            path: canonical.to_owned(),
+            value: EndpointCalibrationValue::Omitted,
+        });
+    }
+    let companion = match semantic_path {
+        "prompt" => "lyrics",
+        "lyrics" => "prompt",
+        _ => return mutations,
+    };
+    if let Some(value) = contract
+        .request_attribute_specs
+        .get(companion)
+        .and_then(endpoint_calibration_nonempty_string)
+    {
+        mutations.push(literal_mutation(companion, value));
+    }
+    mutations
+}
+
 fn endpoint_calibration_companion_baseline(
     contract: &EndpointFamilyContract,
     path: &str,
@@ -1604,6 +2571,23 @@ fn add_calibration_companion_mutations(
     value: Option<&Value>,
     mutations: &mut Vec<EndpointCalibrationMutation>,
 ) {
+    if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        if let Some(canonical) = music_alias_canonical(contract, path) {
+            mutations.push(EndpointCalibrationMutation {
+                path: canonical.to_owned(),
+                value: EndpointCalibrationValue::Omitted,
+            });
+        }
+        let semantic_path = music_alias_canonical(contract, path).unwrap_or(path);
+        if matches!(semantic_path, "style" | "genre" | "tags")
+            && !mutations.iter().any(|mutation| mutation.path == "prompt")
+        {
+            mutations.push(EndpointCalibrationMutation {
+                path: "prompt".to_owned(),
+                value: EndpointCalibrationValue::Omitted,
+            });
+        }
+    }
     let mut add = |companion_path: &str, companion_value: Value| {
         if contract
             .request_attributes
@@ -1619,6 +2603,119 @@ fn add_calibration_companion_mutations(
 
     if path.starts_with("messages.content.") {
         add("messages.role", json!("user"));
+    }
+    if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        if let Some(root) = music_inline_audio_root(path) {
+            add(&format!("{root}.data"), json!("$AUDIO_BASE64"));
+            add(&format!("{root}.encoding"), json!("base64"));
+            add(
+                &format!("{root}.content_type"),
+                json!("$AUDIO_CONTENT_TYPE"),
+            );
+        }
+        let semantic_path = music_alias_canonical(contract, path).unwrap_or(path);
+        let empty_semantic_text = value
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty());
+        if semantic_path == "prompt" && empty_semantic_text {
+            if let Some(lyrics) = contract
+                .request_attribute_specs
+                .get("lyrics")
+                .and_then(endpoint_calibration_nonempty_string)
+            {
+                add("lyrics", lyrics);
+            }
+        } else if semantic_path == "lyrics" && empty_semantic_text {
+            if let Some(prompt) = contract
+                .request_attribute_specs
+                .get("prompt")
+                .and_then(endpoint_calibration_nonempty_string)
+            {
+                add("prompt", prompt);
+            }
+        }
+        if matches!(semantic_path, "style" | "genre" | "tags") {
+            if let Some(lyrics) = contract
+                .request_attribute_specs
+                .get("lyrics")
+                .and_then(endpoint_calibration_nonempty_string)
+            {
+                add("lyrics", lyrics);
+            }
+        }
+        if semantic_path == "instrumental" && value.and_then(Value::as_bool) == Some(true) {
+            add("lyrics", json!("[Instrumental]"));
+        }
+        let task_needs_source = semantic_path == "task_type"
+            && matches!(
+                value.and_then(Value::as_str),
+                Some("cover" | "cover-nofsq" | "repaint")
+            );
+        let flow_enabled =
+            semantic_path == "flow_edit_morph" && value.and_then(Value::as_bool) == Some(true);
+        if music_repaint_control(semantic_path) {
+            add("task_type", json!("repaint"));
+            if semantic_path == "repaint_strength" {
+                add("repaint_mode", json!("balanced"));
+            }
+        } else if music_cover_control(semantic_path) {
+            add("task_type", json!("cover"));
+        } else if music_flow_control(semantic_path) {
+            add("flow_edit_morph", json!(true));
+        }
+        if music_inline_audio_root(semantic_path)
+            .is_some_and(|root| matches!(root, "source_audio" | "src_audio" | "ctx_audio"))
+        {
+            add("task_type", json!("cover"));
+        }
+        if semantic_path == "audio_codes" && music_audio_codes_nonempty(value) {
+            add("task_type", json!("cover"));
+            if let Some(length) = value
+                .and_then(Value::as_array)
+                .and_then(|items| u64::try_from(items.len()).ok())
+            {
+                add("n", json!(length));
+            }
+        }
+        if music_dcw_control(semantic_path) {
+            add("dcw_enabled", json!(true));
+            if semantic_path == "dcw_high_scaler" {
+                add("dcw_mode", json!("double"));
+            }
+        }
+        if semantic_path == "normalization_db" {
+            add("enable_normalization", json!(true));
+        }
+        if semantic_path == "no_fsq" && value.and_then(Value::as_bool) == Some(true) {
+            add("task_type", json!("cover"));
+            add("source_audio.data", json!("$AUDIO_BASE64"));
+            add("source_audio.encoding", json!("base64"));
+            add("source_audio.content_type", json!("$AUDIO_CONTENT_TYPE"));
+        }
+        if semantic_path == "retake_seed" {
+            add("retake_variance", json!(0.5));
+        }
+        if matches!(semantic_path, "mp3_bitrate" | "mp3_sample_rate") {
+            add("response_format", json!("mp3"));
+        }
+        if semantic_path == "seeds" {
+            if let Some(length) = value
+                .and_then(Value::as_array)
+                .and_then(|items| u64::try_from(items.len()).ok())
+            {
+                add("n", json!(length));
+            }
+        }
+        if task_needs_source
+            || flow_enabled
+            || music_repaint_control(semantic_path)
+            || music_cover_control(semantic_path)
+            || music_flow_control(semantic_path)
+        {
+            add("source_audio.data", json!("$AUDIO_BASE64"));
+            add("source_audio.encoding", json!("base64"));
+            add("source_audio.content_type", json!("$AUDIO_CONTENT_TYPE"));
+        }
     }
 
     match path {
@@ -1738,6 +2835,97 @@ fn add_calibration_companion_mutations(
     }
 }
 
+fn endpoint_calibration_string_fixture(
+    case: &EndpointCalibrationCase,
+    path: &str,
+    length: usize,
+) -> String {
+    if case.endpoint_family != ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        return "x".repeat(length);
+    }
+    if music_inline_audio_child(path, "content_type") && length >= "audio/x".len() {
+        return format!("audio/{}", "x".repeat(length - "audio/".len()));
+    }
+    if matches!(path, "audio_codes" | "audio_code_string") {
+        const TOKEN: &str = "<|audio_code_63999|>";
+        if length == 0 {
+            return String::new();
+        }
+        if case.expect_accept && length % TOKEN.len() == 0 {
+            return TOKEN.repeat(length / TOKEN.len());
+        }
+    }
+    if matches!(path, "key" | "keyscale" | "key_scale") && case.expect_accept {
+        return match length {
+            0 => String::new(),
+            8 => "C# minor".to_owned(),
+            _ => "C major".chars().take(length).collect(),
+        };
+    }
+    if music_inline_audio_child(path, "data")
+        && case.expect_accept
+        && length >= MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+        && length % 4 == 0
+    {
+        if let Some(audio) = endpoint_calibration_wav_base64_fixture(length) {
+            return audio;
+        }
+    }
+    "x".repeat(length)
+}
+
+fn endpoint_calibration_wav_base64_fixture(encoded_length: usize) -> Option<String> {
+    let decoded_length = if encoded_length == MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize {
+        MAX_MUSIC_INLINE_AUDIO_BYTES
+    } else {
+        encoded_length.checked_div(4)?.checked_mul(3)?
+    };
+    if decoded_length < MIN_MUSIC_INLINE_AUDIO_BYTES
+        || decoded_length > MAX_MUSIC_INLINE_AUDIO_BYTES
+    {
+        return None;
+    }
+    let data_length = decoded_length.checked_sub(44)?;
+    if data_length % 4 != 0 {
+        return None;
+    }
+    let (channels, sample_rate, block_align) =
+        if data_length <= 600_usize.checked_mul(8_000)?.checked_mul(2)? {
+            (1_u16, 8_000_u32, 2_u16)
+        } else {
+            (2_u16, 96_000_u32, 4_u16)
+        };
+    let riff_length = u32::try_from(decoded_length.checked_sub(8)?).ok()?;
+    let data_length_u32 = u32::try_from(data_length).ok()?;
+    let mut wav = Vec::with_capacity(decoded_length);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_length.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_length_u32.to_le_bytes());
+    while wav.len() < decoded_length {
+        wav.extend_from_slice(&[0x00, 0x10, 0x00, 0xf0]);
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(wav);
+    (encoded.len() == encoded_length).then_some(encoded)
+}
+
+fn music_inline_audio_root(path: &str) -> Option<&str> {
+    MUSIC_INLINE_AUDIO_ROOTS.iter().copied().find(|root| {
+        path == *root
+            || path
+                .strip_prefix(*root)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_calibration_case(
     cases: &mut Vec<EndpointCalibrationCase>,
@@ -1809,6 +2997,15 @@ fn add_boundary_calibration_cases(
             value: EndpointCalibrationValue::StringLength { length },
         }];
         add_calibration_companion_mutations(contract, path, None, &mut mutations);
+        if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            && music_alias_canonical(contract, path).unwrap_or(path) == "audio_codes"
+            && length > 0
+            && !mutations
+                .iter()
+                .any(|mutation| mutation.path == "task_type")
+        {
+            mutations.push(literal_mutation("task_type", json!("cover")));
+        }
         push_calibration_case(
             cases,
             contract,
@@ -2195,6 +3392,19 @@ pub fn validate_endpoint_request(
     contract: &EndpointFamilyContract,
     request: &Value,
 ) -> Result<(), Vec<EndpointContractViolation>> {
+    let raw_request = request;
+    let normalized;
+    let request = if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        match normalize_music_request_aliases(contract, request) {
+            Ok(value) => {
+                normalized = value;
+                &normalized
+            }
+            Err(violation) => return Err(vec![violation]),
+        }
+    } else {
+        request
+    };
     let mut violations = validate_endpoint_value(
         &contract.request_attributes,
         &contract.required_request_attributes,
@@ -2207,10 +3417,912 @@ pub fn validate_endpoint_request(
     if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
         validate_openai_image_dimension_aliases(contract, request, &mut violations);
     }
+    if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        validate_music_alias_attribute_specs(contract, raw_request, &mut violations);
+        validate_music_request(contract, request, &mut violations);
+    }
     if violations.is_empty() {
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+fn validate_music_alias_attribute_specs(
+    contract: &EndpointFamilyContract,
+    raw_request: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    for (_, aliases) in MUSIC_REQUEST_ALIAS_GROUPS {
+        for alias in *aliases {
+            if raw_request.get(*alias).is_none() {
+                continue;
+            }
+            for (path, spec) in contract.request_attribute_specs.iter().filter(|(path, _)| {
+                path.as_str() == *alias || path.starts_with(&format!("{alias}."))
+            }) {
+                for candidate in endpoint_values_at_path(raw_request, path) {
+                    if let Err(reason) = validate_endpoint_attribute_value(spec, candidate) {
+                        violations.push(EndpointContractViolation {
+                            path: path.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_music_request(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    let task = request
+        .get("task_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text2music");
+    let has_prompt = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    let has_lyrics = request
+        .get("lyrics")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    let has_source_audio = request.get("source_audio").is_some();
+    let instrumental = request
+        .get("instrumental")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if instrumental
+        && request
+            .get("lyrics")
+            .and_then(Value::as_str)
+            .is_some_and(|lyrics| {
+                let lyrics = lyrics.trim();
+                !lyrics.is_empty() && lyrics != "[Instrumental]"
+            })
+    {
+        violations.push(EndpointContractViolation {
+            path: "lyrics".to_owned(),
+            reason: "instrumental=true cannot be combined with vocal lyrics".to_owned(),
+        });
+    }
+    if task == "text2music" && !has_prompt && !has_lyrics {
+        violations.push(EndpointContractViolation {
+            path: "prompt".to_owned(),
+            reason: "text2music requires a nonempty prompt/caption or nonempty lyrics".to_owned(),
+        });
+    }
+
+    let sample_mode = request
+        .get("sample_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_sample_query = request
+        .get("sample_query")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    let use_format = request
+        .get("use_format")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sample_controls_enabled = sample_mode || has_sample_query || use_format;
+    if sample_controls_enabled && task != "text2music" {
+        violations.push(EndpointContractViolation {
+            path: "sample_mode".to_owned(),
+            reason: "sample_mode, sample_query, and use_format are supported only for text2music"
+                .to_owned(),
+        });
+    }
+    if use_format && !has_prompt && !has_lyrics {
+        violations.push(EndpointContractViolation {
+            path: "use_format".to_owned(),
+            reason: "use_format requires a nonempty prompt/caption or nonempty lyrics".to_owned(),
+        });
+    }
+    let flow_enabled = request
+        .get("flow_edit_morph")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_audio_codes = music_audio_codes_nonempty(request.get("audio_codes"));
+    if sample_controls_enabled && has_audio_codes {
+        violations.push(EndpointContractViolation {
+            path: "audio_codes".to_owned(),
+            reason: "audio_codes cannot be combined with sample_mode, sample_query, or use_format"
+                .to_owned(),
+        });
+    }
+    if has_audio_codes && !matches!(task, "cover" | "cover-nofsq") {
+        violations.push(EndpointContractViolation {
+            path: "task_type".to_owned(),
+            reason: "audio_codes require an explicit cover or cover-nofsq task".to_owned(),
+        });
+    }
+    if has_audio_codes && has_source_audio {
+        violations.push(EndpointContractViolation {
+            path: "audio_codes".to_owned(),
+            reason: "audio_codes and source_audio cannot be combined because the runtime would ignore source_audio"
+                .to_owned(),
+        });
+    }
+    if has_audio_codes && flow_enabled {
+        violations.push(EndpointContractViolation {
+            path: "audio_codes".to_owned(),
+            reason: "audio_codes cannot be combined with flow editing".to_owned(),
+        });
+    }
+    let source_driven_task = matches!(task, "cover" | "cover-nofsq" | "repaint");
+    if source_driven_task
+        && !has_source_audio
+        && !(matches!(task, "cover" | "cover-nofsq") && has_audio_codes)
+    {
+        violations.push(EndpointContractViolation {
+            path: "source_audio".to_owned(),
+            reason: format!("{task} requires inline source_audio or validated audio_codes"),
+        });
+    }
+    if flow_enabled && !has_source_audio {
+        violations.push(EndpointContractViolation {
+            path: "source_audio".to_owned(),
+            reason: "flow editing requires inline source_audio".to_owned(),
+        });
+    }
+    if task == "text2music" && has_source_audio && !flow_enabled {
+        violations.push(EndpointContractViolation {
+            path: "source_audio".to_owned(),
+            reason: "plain text2music does not consume source_audio; enable flow editing or choose a source-driven task"
+                .to_owned(),
+        });
+    }
+    if flow_enabled && !matches!(task, "text2music" | "cover" | "cover-nofsq") {
+        violations.push(EndpointContractViolation {
+            path: "flow_edit_morph".to_owned(),
+            reason: format!("flow editing is not supported for task_type {task}"),
+        });
+    }
+    if !flow_enabled {
+        for path in [
+            "flow_edit_source_caption",
+            "flow_edit_source_lyrics",
+            "flow_edit_n_min",
+            "flow_edit_n_max",
+            "flow_edit_n_avg",
+        ] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: "flow-edit controls require flow_edit_morph=true".to_owned(),
+                });
+            }
+        }
+    } else {
+        let n_min = request
+            .get("flow_edit_n_min")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let n_max = request
+            .get("flow_edit_n_max")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        if n_min > n_max {
+            violations.push(EndpointContractViolation {
+                path: "flow_edit_n_max".to_owned(),
+                reason: "flow_edit_n_max must be greater than or equal to flow_edit_n_min"
+                    .to_owned(),
+            });
+        }
+        if request.get("sampler").and_then(Value::as_str) == Some("heun") {
+            violations.push(EndpointContractViolation {
+                path: "sampler".to_owned(),
+                reason: "flow editing v1 bypasses heun; sampler must be euler".to_owned(),
+            });
+        }
+        if request.get("adg").and_then(Value::as_bool).unwrap_or(false) {
+            violations.push(EndpointContractViolation {
+                path: "adg".to_owned(),
+                reason: "flow editing v1 bypasses ADG".to_owned(),
+            });
+        }
+        if request
+            .get("dcw_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            violations.push(EndpointContractViolation {
+                path: "dcw_enabled".to_owned(),
+                reason: "flow editing v1 bypasses DCW".to_owned(),
+            });
+        }
+        if request.get("infer_method").and_then(Value::as_str) == Some("sde") {
+            violations.push(EndpointContractViolation {
+                path: "infer_method".to_owned(),
+                reason: "flow editing v1 does not honor infer_method=sde".to_owned(),
+            });
+        }
+    }
+
+    if request
+        .get("thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && source_driven_task
+    {
+        violations.push(EndpointContractViolation {
+            path: "thinking".to_owned(),
+            reason: "thinking is not consumed by cover or repaint tasks".to_owned(),
+        });
+    }
+    let lm_path_allowed = !source_driven_task && !flow_enabled;
+    if !lm_path_allowed {
+        for path in [
+            "lm_temperature",
+            "lm_cfg_scale",
+            "lm_top_k",
+            "lm_top_p",
+            "lm_negative_prompt",
+        ] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: "LM controls are not consumed by source or flow-edit tasks".to_owned(),
+                });
+            }
+        }
+        for path in [
+            "use_cot_metas",
+            "use_cot_caption",
+            "use_cot_language",
+            "constrained_decoding",
+        ] {
+            if request.get(path).and_then(Value::as_bool) == Some(true) {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: "LM and CoT controls are not consumed by source or flow-edit tasks"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    if request
+        .get("language")
+        .and_then(Value::as_str)
+        .is_some_and(|language| language != "unknown")
+        && request.get("use_cot_language").and_then(Value::as_bool) == Some(true)
+    {
+        violations.push(EndpointContractViolation {
+            path: "use_cot_language".to_owned(),
+            reason: "use_cot_language=true would replace the explicit language".to_owned(),
+        });
+    }
+
+    if task != "repaint" {
+        for path in [
+            "repaint_start",
+            "repaint_end",
+            "repaint_mode",
+            "repaint_strength",
+            "chunk_mask_mode",
+        ] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: format!("repaint control is not supported for task_type {task}"),
+                });
+            }
+        }
+    } else {
+        let start = request
+            .get("repaint_start")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let end = request
+            .get("repaint_end")
+            .and_then(Value::as_f64)
+            .unwrap_or(-1.0);
+        if end >= 0.0 && end <= start {
+            violations.push(EndpointContractViolation {
+                path: "repaint_end".to_owned(),
+                reason: "repaint_end must be -1 or greater than repaint_start".to_owned(),
+            });
+        }
+        if request.get("repaint_strength").is_some()
+            && request
+                .get("repaint_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("balanced")
+                != "balanced"
+        {
+            violations.push(EndpointContractViolation {
+                path: "repaint_strength".to_owned(),
+                reason: "repaint_strength is active only when repaint_mode=balanced".to_owned(),
+            });
+        }
+    }
+
+    if !matches!(task, "cover" | "cover-nofsq" | "repaint") {
+        for path in ["cover_strength", "cover_noise_strength"] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: format!("cover control is not supported for task_type {task}"),
+                });
+            }
+        }
+    }
+
+    let cfg_interval_start = request
+        .get("cfg_interval_start")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let cfg_interval_end = request
+        .get("cfg_interval_end")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if cfg_interval_start > cfg_interval_end {
+        violations.push(EndpointContractViolation {
+            path: "cfg_interval_end".to_owned(),
+            reason: "cfg_interval_end must be greater than or equal to cfg_interval_start"
+                .to_owned(),
+        });
+    }
+    if request.get("infer_method").and_then(Value::as_str) == Some("sde")
+        && request.get("sampler").and_then(Value::as_str) == Some("heun")
+    {
+        violations.push(EndpointContractViolation {
+            path: "sampler".to_owned(),
+            reason: "sampler=heun is not honored with infer_method=sde".to_owned(),
+        });
+    }
+
+    let dcw_enabled = request
+        .get("dcw_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !dcw_enabled {
+        for path in ["dcw_mode", "dcw_scaler", "dcw_high_scaler", "dcw_wavelet"] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: "DCW controls require dcw_enabled=true".to_owned(),
+                });
+            }
+        }
+    } else if request.get("dcw_high_scaler").is_some()
+        && request
+            .get("dcw_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("double")
+            != "double"
+    {
+        violations.push(EndpointContractViolation {
+            path: "dcw_high_scaler".to_owned(),
+            reason: "dcw_high_scaler is active only when dcw_mode=double".to_owned(),
+        });
+    }
+
+    if !request
+        .get("enable_normalization")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        && request.get("normalization_db").is_some()
+    {
+        violations.push(EndpointContractViolation {
+            path: "normalization_db".to_owned(),
+            reason: "normalization_db requires enable_normalization=true".to_owned(),
+        });
+    }
+
+    let fade_in = request
+        .get("fade_in_duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let fade_out = request
+        .get("fade_out_duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let duration_value = request.get("duration_seconds");
+    if let Some(value) = duration_value {
+        let valid = value.is_null()
+            || value.as_str() == Some("auto")
+            || value
+                .as_f64()
+                .is_some_and(|duration| duration == -1.0 || (10.0..=600.0).contains(&duration));
+        if !valid {
+            violations.push(EndpointContractViolation {
+                path: "duration_seconds".to_owned(),
+                reason: "duration must be null, auto, -1, or between 10 and 600 seconds".to_owned(),
+            });
+        }
+    }
+    let duration = duration_value
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            contract
+                .request_attribute_specs
+                .get("duration_seconds")
+                .and_then(|spec| spec.default.as_ref())
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(-1.0);
+    if duration > 0.0 && fade_in + fade_out > duration {
+        violations.push(EndpointContractViolation {
+            path: "fade_out_duration".to_owned(),
+            reason: "fade-in and fade-out durations must not exceed duration_seconds".to_owned(),
+        });
+    }
+
+    if request.get("retake_seed").is_some()
+        && request
+            .get("retake_variance")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            == 0.0
+    {
+        violations.push(EndpointContractViolation {
+            path: "retake_variance".to_owned(),
+            reason: "retake_seed requires retake_variance greater than zero".to_owned(),
+        });
+    }
+
+    let response_format = request
+        .get("response_format")
+        .and_then(Value::as_str)
+        .unwrap_or("flac");
+    if response_format != "mp3" {
+        for path in ["mp3_bitrate", "mp3_sample_rate"] {
+            if request.get(path).is_some() {
+                violations.push(EndpointContractViolation {
+                    path: path.to_owned(),
+                    reason: "MP3 controls require response_format=mp3".to_owned(),
+                });
+            }
+        }
+    }
+
+    let composed_caption_chars = music_composed_caption_chars(contract, request);
+    if composed_caption_chars > MAX_MUSIC_CAPTION_CHARS {
+        violations.push(EndpointContractViolation {
+            path: "prompt".to_owned(),
+            reason: format!(
+                "composed prompt, style, genre, and tags length {composed_caption_chars} exceeds the signed {MAX_MUSIC_CAPTION_CHARS}-character budget"
+            ),
+        });
+    }
+    if let Some(key) = request.get("key").and_then(Value::as_str) {
+        if !valid_music_keyscale(key) {
+            violations.push(EndpointContractViolation {
+                path: "key".to_owned(),
+                reason: "key must be empty or a supported note followed by major or minor"
+                    .to_owned(),
+            });
+        }
+    }
+
+    if contract
+        .request_attributes
+        .iter()
+        .any(|signed| signed == "audio_codes")
+    {
+        if let Some(audio_codes) = request.get("audio_codes") {
+            if let Err(reason) = validate_music_audio_codes_value(contract, request, audio_codes) {
+                violations.push(EndpointContractViolation {
+                    path: "audio_codes".to_owned(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    for path in ["custom_timesteps"] {
+        if !contract
+            .request_attributes
+            .iter()
+            .any(|signed| signed == path)
+        {
+            continue;
+        }
+        let Some(items) = request.get(path).and_then(Value::as_array) else {
+            continue;
+        };
+        if request.get("steps").is_some() || request.get("shift").is_some() {
+            violations.push(EndpointContractViolation {
+                path: path.to_owned(),
+                reason: "custom_timesteps overrides steps and shift; do not supply them together"
+                    .to_owned(),
+            });
+        }
+        let mut previous = None;
+        for (index, item) in items.iter().enumerate() {
+            let Some(value) = item.as_f64() else {
+                violations.push(EndpointContractViolation {
+                    path: format!("{path}[{index}]"),
+                    reason: "custom timestep must be a number".to_owned(),
+                });
+                continue;
+            };
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                violations.push(EndpointContractViolation {
+                    path: format!("{path}[{index}]"),
+                    reason: "custom timestep must be in the closed range 0..=1".to_owned(),
+                });
+            }
+            if previous.is_some_and(|previous| previous <= value) {
+                violations.push(EndpointContractViolation {
+                    path: format!("{path}[{index}]"),
+                    reason: "custom timesteps must be in strict descending order".to_owned(),
+                });
+            }
+            previous = Some(value);
+        }
+    }
+
+    if contract
+        .request_attributes
+        .iter()
+        .any(|signed| signed == "seeds")
+    {
+        if let Some(seeds) = request.get("seeds").and_then(Value::as_array) {
+            if request.get("seed").is_some() {
+                violations.push(EndpointContractViolation {
+                    path: "seeds".to_owned(),
+                    reason: "seed and seeds cannot both be supplied".to_owned(),
+                });
+            }
+            if let Some(batch_size) = request.get("n").and_then(Value::as_u64).or_else(|| {
+                contract
+                    .request_attribute_specs
+                    .get("n")
+                    .and_then(|spec| spec.default.as_ref())
+                    .and_then(Value::as_u64)
+            }) {
+                let seed_count = u64::try_from(seeds.len()).unwrap_or(u64::MAX);
+                if seed_count != batch_size {
+                    violations.push(EndpointContractViolation {
+                        path: "seeds".to_owned(),
+                        reason: format!(
+                            "seeds must contain exactly one value per batch item ({batch_size})"
+                        ),
+                    });
+                }
+            }
+            for (index, seed) in seeds.iter().enumerate() {
+                if value_type(seed) != Some(EndpointValueType::Integer)
+                    || seed
+                        .as_i64()
+                        .is_none_or(|value| !(-1..=i64::from(u32::MAX)).contains(&value))
+                {
+                    violations.push(EndpointContractViolation {
+                        path: format!("seeds[{index}]"),
+                        reason: "seed must be -1 or an unsigned 32-bit integer".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    for root in ["source_audio", "reference_audio"] {
+        if !contract
+            .request_attributes
+            .iter()
+            .any(|signed| signed == root)
+        {
+            continue;
+        }
+        let Some(audio) = request.get(root) else {
+            continue;
+        };
+        validate_music_inline_audio(contract, root, audio, violations);
+    }
+}
+
+fn music_composed_caption_chars(contract: &EndpointFamilyContract, request: &Value) -> u64 {
+    let signed = |path: &str| {
+        contract
+            .request_attributes
+            .iter()
+            .any(|candidate| candidate == path)
+    };
+    let mut length = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|_| signed("prompt"))
+        .map(str::trim)
+        .map(|text| u64::try_from(text.chars().count()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    for (path, label) in [
+        ("style", "Style: "),
+        ("genre", "Genre: "),
+        ("tags", "Tags: "),
+    ] {
+        let Some(text) = request
+            .get(path)
+            .and_then(Value::as_str)
+            .filter(|_| signed(path))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        if length > 0 {
+            length = length.saturating_add(1);
+        }
+        length = length
+            .saturating_add(u64::try_from(label.chars().count()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(text.chars().count()).unwrap_or(u64::MAX));
+    }
+    length
+}
+
+fn valid_music_keyscale(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let Some((note, mode)) = value.split_once(' ') else {
+        return false;
+    };
+    let mut chars = note.chars();
+    matches!(chars.next(), Some('A'..='G'))
+        && matches!(chars.as_str(), "" | "#" | "b" | "♯" | "♭")
+        && matches!(mode, "major" | "minor")
+}
+
+fn validate_music_inline_audio(
+    contract: &EndpointFamilyContract,
+    root: &str,
+    audio: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    let Some(audio) = audio.as_object() else {
+        return;
+    };
+    for child in ["data", "encoding", "content_type"] {
+        if !audio.contains_key(child) {
+            violations.push(EndpointContractViolation {
+                path: format!("{root}.{child}"),
+                reason: "inline audio attribute is required when the audio object is supplied"
+                    .to_owned(),
+            });
+        }
+    }
+    if audio.get("encoding").and_then(Value::as_str) != Some("base64") {
+        return;
+    }
+    if let Some(content_type) = audio.get("content_type").and_then(Value::as_str) {
+        if !valid_audio_content_type(content_type) {
+            violations.push(EndpointContractViolation {
+                path: format!("{root}.content_type"),
+                reason: "content type is not in the signed inline-audio MIME allowlist".to_owned(),
+            });
+        }
+    }
+    let Some(data) = audio.get("data").and_then(Value::as_str) else {
+        return;
+    };
+    let signed_encoded_limit = contract
+        .request_attribute_specs
+        .get(&format!("{root}.data"))
+        .and_then(|spec| spec.max_length)
+        .unwrap_or(MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS);
+    let decoded_limit =
+        maximum_base64_decoded_size(signed_encoded_limit).min(MAX_MUSIC_INLINE_AUDIO_BYTES as u64);
+    if let Err(reason) = validate_base64_decoded_size(data, decoded_limit) {
+        violations.push(EndpointContractViolation {
+            path: format!("{root}.data"),
+            reason,
+        });
+    }
+}
+
+fn valid_audio_content_type(content_type: &str) -> bool {
+    MUSIC_INLINE_AUDIO_CONTENT_TYPES.contains(&content_type)
+}
+
+fn validated_music_inline_audio_item(root: &str, audio: &Value) -> Result<(u64, u64), String> {
+    let audio = audio
+        .as_object()
+        .ok_or_else(|| format!("{root} must be an inline audio object"))?;
+    if audio.get("encoding").and_then(Value::as_str) != Some("base64") {
+        return Err(format!("{root}.encoding must be base64"));
+    }
+    let content_type = audio
+        .get("content_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{root}.content_type must be an audio MIME type"))?;
+    let encoded = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{root}.data must contain base64 audio"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| format!("{root}.data contains invalid base64 audio"))?;
+    let metadata = validated_audio_metadata(&bytes)
+        .ok_or_else(|| format!("{root} must contain valid bounded audio"))?;
+    if !music_audio_content_type_matches_format(content_type, metadata.format) {
+        return Err(format!(
+            "{root}.content_type {content_type} does not match the encoded audio"
+        ));
+    }
+    if metadata.duration_seconds_ceil > MAX_MUSIC_INLINE_AUDIO_SECONDS {
+        return Err(format!(
+            "{root} exceeds the {MAX_MUSIC_INLINE_AUDIO_SECONDS}-second signed limit"
+        ));
+    }
+    Ok((
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        metadata.duration_seconds_ceil,
+    ))
+}
+
+fn music_audio_content_type_matches_format(
+    content_type: &str,
+    format: ValidatedAudioFormat,
+) -> bool {
+    match format {
+        ValidatedAudioFormat::Wav => matches!(content_type, "audio/wav" | "audio/x-wav"),
+        ValidatedAudioFormat::Flac => content_type == "audio/flac",
+        ValidatedAudioFormat::Mp3 => matches!(content_type, "audio/mpeg" | "audio/mp3"),
+        ValidatedAudioFormat::Opus => matches!(content_type, "audio/ogg" | "audio/opus"),
+        ValidatedAudioFormat::Aac => {
+            matches!(
+                content_type,
+                "audio/aac" | "audio/m4a" | "audio/mp4" | "audio/x-m4a"
+            )
+        }
+    }
+}
+
+fn validate_music_audio_codes(audio_codes: &str) -> Result<u64, String> {
+    if audio_codes.len() > MAX_MUSIC_AUDIO_CODES_CHARS as usize {
+        return Err(format!(
+            "audio codes exceed the {MAX_MUSIC_AUDIO_CODES_CHARS}-byte encoded maximum"
+        ));
+    }
+    if audio_codes.is_empty() {
+        return Ok(0);
+    }
+    let mut remainder = audio_codes;
+    let mut count = 0_u64;
+    while !remainder.is_empty() {
+        let Some(after_prefix) = remainder.strip_prefix("<|audio_code_") else {
+            return Err("audio codes must be concatenated <|audio_code_N|> tokens".to_owned());
+        };
+        let Some(end) = after_prefix.find("|>") else {
+            return Err("audio code token is missing its |>-terminator".to_owned());
+        };
+        let digits = &after_prefix[..end];
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("audio code token must contain a decimal code value".to_owned());
+        }
+        let value = digits
+            .parse::<u64>()
+            .map_err(|_| "audio code value exceeds the parser integer range".to_owned())?;
+        if value > MAX_MUSIC_AUDIO_CODE_VALUE {
+            return Err(format!(
+                "audio code value {value} exceeds the pinned parser maximum {MAX_MUSIC_AUDIO_CODE_VALUE}"
+            ));
+        }
+        count = count.saturating_add(1);
+        if count > MAX_MUSIC_AUDIO_CODE_COUNT {
+            return Err(format!(
+                "audio code count exceeds the 5 Hz, 600-second maximum of {MAX_MUSIC_AUDIO_CODE_COUNT}"
+            ));
+        }
+        remainder = &after_prefix[end + 2..];
+    }
+    Ok(count)
+}
+
+fn music_audio_codes_nonempty(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(codes)) => !codes.is_empty(),
+        Some(Value::Array(codes)) => !codes.is_empty(),
+        _ => false,
+    }
+}
+
+fn validate_music_audio_codes_value(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+    audio_codes: &Value,
+) -> Result<(), String> {
+    match audio_codes {
+        Value::String(codes) => {
+            validate_music_audio_codes(codes)?;
+        }
+        Value::Array(codes) => {
+            if codes.is_empty() || codes.len() > 8 {
+                return Err("audio codes arrays must contain between 1 and 8 strings".to_owned());
+            }
+            let mut token_count = None;
+            for (index, codes) in codes.iter().enumerate() {
+                let Some(codes) = codes.as_str() else {
+                    return Err(format!("audio codes item {index} must be a string"));
+                };
+                if codes.is_empty() {
+                    return Err(format!("audio codes item {index} cannot be empty"));
+                }
+                let count = validate_music_audio_codes(codes)?;
+                if token_count
+                    .replace(count)
+                    .is_some_and(|previous| previous != count)
+                {
+                    return Err(
+                        "audio codes arrays must use equal-duration code strings".to_owned()
+                    );
+                }
+            }
+            let batch_size = request.get("n").and_then(Value::as_u64).or_else(|| {
+                contract
+                    .request_attribute_specs
+                    .get("n")
+                    .and_then(|spec| spec.default.as_ref())
+                    .and_then(Value::as_u64)
+            });
+            if batch_size.is_some_and(|batch_size| batch_size != codes.len() as u64) {
+                return Err(
+                    "audio codes arrays must contain exactly one code string per batch item"
+                        .to_owned(),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn maximum_base64_decoded_size(encoded_char_limit: u64) -> u64 {
+    encoded_char_limit.saturating_div(4).saturating_mul(3)
+}
+
+fn validate_base64_decoded_size(encoded: &str, maximum_decoded_bytes: u64) -> Result<u64, String> {
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err("inline audio data must be non-empty canonical base64".to_owned());
+    }
+    let padding = if bytes.ends_with(b"==") {
+        2
+    } else if bytes.ends_with(b"=") {
+        1
+    } else {
+        0
+    };
+    let payload_len = bytes.len() - padding;
+    if bytes[..payload_len]
+        .iter()
+        .any(|byte| base64_sextet(*byte).is_none())
+        || bytes[payload_len..].iter().any(|byte| *byte != b'=')
+    {
+        return Err("inline audio data must be canonical base64".to_owned());
+    }
+    if padding == 2 && base64_sextet(bytes[payload_len - 1]).is_none_or(|value| value & 0x0f != 0) {
+        return Err("inline audio data must be canonical base64".to_owned());
+    }
+    if padding == 1 && base64_sextet(bytes[payload_len - 1]).is_none_or(|value| value & 0x03 != 0) {
+        return Err("inline audio data must be canonical base64".to_owned());
+    }
+    let decoded_bytes = u64::try_from(bytes.len() / 4)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3)
+        .saturating_sub(padding as u64);
+    if decoded_bytes > maximum_decoded_bytes {
+        return Err(format!(
+            "decoded inline audio size {decoded_bytes} exceeds the signed limit {maximum_decoded_bytes}"
+        ));
+    }
+    Ok(decoded_bytes)
+}
+
+fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -2624,6 +4736,1146 @@ mod tests {
     }
 
     #[test]
+    fn music_template_signs_source_controls_with_finite_closed_specs() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        for path in [
+            "prompt",
+            "caption",
+            "lyrics",
+            "instrumental",
+            "style",
+            "genre",
+            "tags",
+            "sample_mode",
+            "sample_query",
+            "use_format",
+            "audio_codes",
+            "language",
+            "vocal_language",
+            "bpm",
+            "key",
+            "keyscale",
+            "time_signature",
+            "timesignature",
+            "duration_seconds",
+            "duration",
+            "steps",
+            "inference_steps",
+            "guidance_scale",
+            "seed",
+            "n",
+            "batch",
+            "batch_size",
+            "task_type",
+            "thinking",
+            "instruction",
+            "lm_temperature",
+            "lm_cfg_scale",
+            "lm_top_k",
+            "lm_top_p",
+            "lm_negative_prompt",
+            "use_cot_metas",
+            "use_cot_caption",
+            "use_cot_language",
+            "constrained_decoding",
+            "infer_method",
+            "sampler",
+            "sampler_mode",
+            "velocity_norm_threshold",
+            "velocity_ema_factor",
+            "dcw_enabled",
+            "dcw_mode",
+            "dcw_scaler",
+            "dcw_high_scaler",
+            "dcw_wavelet",
+            "shift",
+            "custom_timesteps",
+            "adg",
+            "cfg_interval_start",
+            "cfg_interval_end",
+            "repaint_start",
+            "repaint_end",
+            "repaint_mode",
+            "repaint_strength",
+            "chunk_mask_mode",
+            "cover_strength",
+            "cover_noise_strength",
+            "enable_normalization",
+            "normalization_db",
+            "fade_in_duration",
+            "fade_out_duration",
+            "latent_shift",
+            "latent_rescale",
+            "retake_seed",
+            "retake_variance",
+            "flow_edit_morph",
+            "flow_edit_source_caption",
+            "flow_edit_source_lyrics",
+            "flow_edit_n_min",
+            "flow_edit_n_max",
+            "flow_edit_n_avg",
+            "seeds",
+            "response_format",
+            "mp3_bitrate",
+            "mp3_sample_rate",
+            "source_audio",
+            "reference_audio",
+        ] {
+            assert!(
+                contract.request_attribute_specs.contains_key(path),
+                "missing signed music attribute {path}"
+            );
+        }
+        assert_eq!(
+            contract.request_attribute_specs["lyrics"].max_length,
+            Some(4_096)
+        );
+        for path in ["prompt", "caption"] {
+            assert_eq!(
+                contract.request_attribute_specs[path].max_length,
+                Some(MAX_MUSIC_CAPTION_CHARS),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            contract.request_attribute_specs["style"].max_length,
+            Some(505)
+        );
+        assert_eq!(
+            contract.request_attribute_specs["genre"].max_length,
+            Some(505)
+        );
+        assert_eq!(
+            contract.request_attribute_specs["tags"].max_length,
+            Some(506)
+        );
+        assert_eq!(
+            contract.request_attribute_specs["audio_codes"].max_length,
+            Some(MAX_MUSIC_AUDIO_CODES_CHARS)
+        );
+        assert_eq!(
+            contract.request_attribute_specs["audio_codes"].value_types,
+            vec![EndpointValueType::String, EndpointValueType::Array]
+        );
+        assert_eq!(
+            contract.request_attribute_specs["audio_codes"].max_items,
+            Some(8)
+        );
+        assert_eq!(
+            contract.request_attribute_specs["custom_timesteps"].max_items,
+            Some(200)
+        );
+        assert_eq!(contract.request_attribute_specs["seeds"].max_items, Some(8));
+        for (path, minimum, maximum) in [
+            ("bpm", 30.0, 300.0),
+            ("duration_seconds", -1.0, 600.0),
+            ("steps", 1.0, 200.0),
+            ("guidance_scale", 1.0, 15.0),
+            ("seed", -1.0, MAX_MUSIC_SEED),
+            ("lm_temperature", 0.0, 2.0),
+            ("lm_cfg_scale", 1.0, 3.0),
+            ("velocity_norm_threshold", 0.0, 5.0),
+            ("velocity_ema_factor", 0.0, 0.5),
+            ("normalization_db", -10.0, 0.0),
+            ("latent_shift", -0.2, 0.2),
+            ("latent_rescale", 0.5, 1.5),
+        ] {
+            let spec = &contract.request_attribute_specs[path];
+            assert_eq!(spec.minimum, Some(minimum), "{path}");
+            assert_eq!(spec.maximum, Some(maximum), "{path}");
+        }
+        for unsupported in [
+            "global_caption",
+            "use_cot_lyrics",
+            "lm_repetition_penalty",
+            "lm_repeat_penalty",
+            "repaint_latent_crossfade_frames",
+            "repaint_wav_crossfade_sec",
+            "typical_p",
+            "do_sample",
+            "max_new_tokens",
+            "cot_lyrics",
+        ] {
+            assert!(
+                !contract
+                    .request_attributes
+                    .iter()
+                    .any(|path| path == unsupported),
+                "{unsupported}"
+            );
+            let mut request = json!({"model": "test/music", "prompt": "closed contract"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .insert(unsupported.to_owned(), json!(true));
+            let violations = validate_endpoint_request(&contract, &request).unwrap_err();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.path == unsupported),
+                "{unsupported}: {violations:?}"
+            );
+        }
+        for forbidden in [
+            "source_audio_path",
+            "src_audio_path",
+            "reference_audio_path",
+            "melody_path",
+            "audio_path",
+            "lm_model_path",
+        ] {
+            assert!(!contract
+                .request_attributes
+                .iter()
+                .any(|path| path == forbidden));
+        }
+    }
+
+    #[test]
+    fn music_defaults_materialize_from_canonical_source_calibration() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let normalized = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({"model": "test/music", "prompt": "minimal source request"}),
+        )
+        .unwrap();
+        for (path, expected) in [
+            ("thinking", json!(false)),
+            ("use_cot_caption", json!(true)),
+            ("duration_seconds", Value::Null),
+            ("steps", json!(50)),
+            ("guidance_scale", json!(7.0)),
+            ("n", json!(2)),
+            ("response_format", json!("flac")),
+            ("lm_temperature", json!(0.85)),
+            ("lm_cfg_scale", json!(2.0)),
+            ("lm_top_k", json!(0)),
+            ("lm_top_p", json!(0.9)),
+            ("infer_method", json!("ode")),
+            ("sampler", json!("euler")),
+            ("shift", json!(3.0)),
+            ("dcw_enabled", json!(false)),
+            ("enable_normalization", json!(true)),
+            ("normalization_db", json!(-1.0)),
+            ("latent_shift", json!(0.0)),
+            ("latent_rescale", json!(1.0)),
+        ] {
+            assert_eq!(normalized[path], expected, "{path}");
+        }
+        assert_eq!(normalized["bpm"], Value::Null);
+        assert!(normalized.get("seeds").is_none());
+        assert!(normalized.get("retake_seed").is_none());
+        assert!(normalized.get("repaint_mode").is_none());
+        assert!(normalized.get("cover_strength").is_none());
+        assert!(normalized.get("flow_edit_n_min").is_none());
+        assert!(normalized.get("mp3_bitrate").is_none());
+        assert!(normalized.get("mp3_sample_rate").is_none());
+        assert!(validate_endpoint_request(&contract, &normalized).is_ok());
+
+        let explicit = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "caption": "explicit aliases",
+                "batch_size": 4,
+                "audio_format": "mp3",
+                "thinking": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(explicit["prompt"], json!("explicit aliases"));
+        assert_eq!(explicit["n"], json!(4));
+        assert_eq!(explicit["response_format"], json!("mp3"));
+        assert_eq!(explicit["mp3_bitrate"], json!("128k"));
+        assert_eq!(explicit["mp3_sample_rate"], json!(48_000));
+        assert_eq!(explicit["thinking"], json!(true));
+        for alias in ["caption", "batch_size", "audio_format"] {
+            assert!(explicit.get(alias).is_none(), "{alias}");
+        }
+    }
+
+    #[test]
+    fn artifact_generation_character_usage_counts_all_consumed_text_deterministically() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let music = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({"model": "test/music", "prompt": "duet"}),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_generation_input_characters(ENDPOINT_MAYHEM_MUSIC_GENERATIONS, &music),
+            76
+        );
+        assert_eq!(
+            artifact_generation_input_characters(
+                ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+                &json!({"prompt": "rain", "negative_prompt": "speech"})
+            ),
+            10
+        );
+        assert_eq!(
+            artifact_generation_input_characters(
+                ENDPOINT_HF_TEXT_TO_AUDIO,
+                &json!({
+                    "inputs": "ocean",
+                    "parameters": {"negative_prompt": "voices"}
+                })
+            ),
+            11
+        );
+    }
+
+    #[test]
+    fn music_task_requirements_allow_lyrics_only_and_source_driven_requests() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        assert_eq!(contract.required_request_attributes, vec!["model"]);
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "lyrics": "[Verse]\nSignal in the rain"})
+        )
+        .is_ok());
+
+        let source_audio =
+            endpoint_calibration_wav_base64_fixture(MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize)
+                .unwrap();
+        let source_driven = json!({
+            "model": "test/music",
+            "task_type": "cover",
+            "source_audio": {
+                "data": source_audio,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+        assert!(validate_endpoint_request(&contract, &source_driven).is_ok());
+        let normalized = materialize_endpoint_request_defaults(&contract, &source_driven).unwrap();
+        assert_eq!(normalized["cover_strength"], json!(1.0));
+        assert!(normalized.get("repaint_mode").is_none());
+        assert!(normalized.get("instruction").is_none());
+        assert!(validate_endpoint_request(&contract, &normalized).is_ok());
+
+        let missing_text =
+            validate_endpoint_request(&contract, &json!({"model": "test/music"})).unwrap_err();
+        assert!(missing_text.iter().any(|violation| {
+            violation.path == "prompt" && violation.reason.contains("prompt/caption")
+        }));
+        let missing_source = validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "task_type": "repaint"}),
+        )
+        .unwrap_err();
+        assert!(missing_source
+            .iter()
+            .any(|violation| violation.path == "source_audio"));
+    }
+
+    #[test]
+    fn music_flow_and_repaint_controls_are_task_consistent() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let source_audio = json!({
+            "data": "AA==",
+            "encoding": "base64",
+            "content_type": "audio/flac"
+        });
+        let invalid_repaint_range = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "task_type": "repaint",
+                "source_audio": source_audio,
+                "repaint_start": 4.0,
+                "repaint_end": 2.0
+            }),
+        )
+        .unwrap_err();
+        assert!(invalid_repaint_range
+            .iter()
+            .any(|violation| violation.path == "repaint_end"));
+
+        let text_repaint_control = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "not repainting",
+                "repaint_strength": 0.5
+            }),
+        )
+        .unwrap_err();
+        assert!(text_repaint_control
+            .iter()
+            .any(|violation| violation.path == "repaint_strength"));
+
+        let invalid_flow_range = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "target arrangement",
+                "source_audio": {
+                    "data": "AA==",
+                    "encoding": "base64",
+                    "content_type": "audio/flac"
+                },
+                "flow_edit_morph": true,
+                "flow_edit_n_min": 0.8,
+                "flow_edit_n_max": 0.2
+            }),
+        )
+        .unwrap_err();
+        assert!(invalid_flow_range
+            .iter()
+            .any(|violation| violation.path == "flow_edit_n_max"));
+
+        let missing_flow_source = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "target arrangement",
+                "flow_edit_morph": true
+            }),
+        )
+        .unwrap_err();
+        assert!(missing_flow_source
+            .iter()
+            .any(|violation| violation.path == "source_audio"));
+    }
+
+    #[test]
+    fn music_consumed_cross_field_controls_are_source_consistent() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "controlled render",
+                "duration_seconds": 10,
+                "cfg_interval_start": 0.2,
+                "cfg_interval_end": 0.8,
+                "fade_in_duration": 4,
+                "fade_out_duration": 6,
+                "retake_seed": 7,
+                "retake_variance": 0.2,
+                "response_format": "mp3",
+                "mp3_bitrate": "256k",
+                "mp3_sample_rate": 44_100
+            })
+        )
+        .is_ok());
+
+        let source_audio = json!({
+            "data": "AA==",
+            "encoding": "base64",
+            "content_type": "audio/flac"
+        });
+        for (request, path) in [
+            (
+                json!({
+                    "model": "test/music",
+                    "task_type": "cover",
+                    "source_audio": source_audio,
+                    "sample_mode": true
+                }),
+                "sample_mode",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "conflicting preprocess",
+                    "sample_query": "a generated sample",
+                    "audio_codes": "<|audio_code_1|>"
+                }),
+                "audio_codes",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "reversed interval",
+                    "cfg_interval_start": 0.8,
+                    "cfg_interval_end": 0.2
+                }),
+                "cfg_interval_end",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "overlong fades",
+                    "duration_seconds": 10,
+                    "fade_in_duration": 6,
+                    "fade_out_duration": 5
+                }),
+                "fade_out_duration",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "missing retake variance",
+                    "retake_seed": 7
+                }),
+                "retake_variance",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "wrong output controls",
+                    "response_format": "flac",
+                    "mp3_bitrate": "256k"
+                }),
+                "mp3_bitrate",
+            ),
+        ] {
+            let violations = validate_endpoint_request(&contract, &request).unwrap_err();
+            assert!(
+                violations.iter().any(|violation| violation.path == path),
+                "{path}: {violations:?}"
+            );
+        }
+        assert!(validate_endpoint_attribute_value(
+            &contract.request_attribute_specs["retake_seed"],
+            &json!("7")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn music_aliases_normalize_without_merging_independent_modifiers() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let reference_audio =
+            endpoint_calibration_wav_base64_fixture(MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize)
+                .unwrap();
+        let request = json!({
+            "model": "test/music",
+            "caption": "a close-miked prepared piano",
+            "style": "acoustic",
+            "genre": "minimalism",
+            "tags": "close-miked, prepared piano",
+            "vocal_language": "en",
+            "key_scale": "D minor",
+            "timesignature": "6",
+            "duration": 12.5,
+            "inference_steps": 12,
+            "batch_size": 2,
+            "use_adg": true,
+            "audio_format": "flac",
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8,
+            "sampler_mode": "heun",
+            "lm_cfg": 2.0,
+            "use_cot_metas": true,
+            "use_cot_caption": false,
+            "use_cot_language": false,
+            "use_constrained_decoding": true,
+            "melody": {
+                "data": reference_audio,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+        assert!(validate_endpoint_request(&contract, &request).is_ok());
+
+        let normalized = materialize_endpoint_request_defaults(&contract, &request).unwrap();
+        for (canonical, expected) in [
+            ("prompt", json!("a close-miked prepared piano")),
+            ("style", json!("acoustic")),
+            ("genre", json!("minimalism")),
+            ("tags", json!("close-miked, prepared piano")),
+            ("language", json!("en")),
+            ("key", json!("D minor")),
+            ("time_signature", json!("6")),
+            ("duration_seconds", json!(12.5)),
+            ("steps", json!(12)),
+            ("n", json!(2)),
+            ("adg", json!(true)),
+            ("response_format", json!("flac")),
+            ("lm_temperature", json!(0.7)),
+            ("lm_top_k", json!(20)),
+            ("lm_top_p", json!(0.8)),
+            ("sampler", json!("heun")),
+            ("lm_cfg_scale", json!(2.0)),
+            ("constrained_decoding", json!(true)),
+        ] {
+            assert_eq!(normalized[canonical], expected, "{canonical}");
+        }
+        assert_eq!(normalized["reference_audio"]["data"], reference_audio);
+        for alias in [
+            "caption",
+            "vocal_language",
+            "key_scale",
+            "timesignature",
+            "duration",
+            "inference_steps",
+            "batch_size",
+            "use_adg",
+            "audio_format",
+            "temperature",
+            "top_k",
+            "top_p",
+            "sampler_mode",
+            "melody",
+        ] {
+            assert!(normalized.get(alias).is_none(), "{alias} was not removed");
+        }
+
+        let source_audio =
+            endpoint_calibration_wav_base64_fixture(MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize)
+                .unwrap();
+        let source_alias = json!({
+            "model": "test/music",
+            "prompt": "cover alias",
+            "task_type": "cover",
+            "src_audio": {
+                "data": source_audio,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+        assert!(validate_endpoint_request(&contract, &source_alias).is_ok());
+        let normalized_source =
+            materialize_endpoint_request_defaults(&contract, &source_alias).unwrap();
+        assert_eq!(normalized_source["source_audio"]["data"], source_audio);
+        assert!(normalized_source.get("src_audio").is_none());
+
+        let ambiguous = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "canonical",
+                "caption": "alias"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous[0].path, "prompt");
+        assert!(ambiguous[0].reason.contains("ambiguous aliases"));
+
+        for (canonical, request) in [
+            (
+                "sampler",
+                json!({
+                    "model": "test/music",
+                    "prompt": "ambiguous sampler",
+                    "sampler": "euler",
+                    "sampler_mode": "heun"
+                }),
+            ),
+            (
+                "lm_temperature",
+                json!({
+                    "model": "test/music",
+                    "prompt": "ambiguous temperature",
+                    "lm_temperature": 0.85,
+                    "temperature": 0.7
+                }),
+            ),
+            (
+                "lm_top_k",
+                json!({
+                    "model": "test/music",
+                    "prompt": "ambiguous top k",
+                    "lm_top_k": 0,
+                    "top_k": 20
+                }),
+            ),
+            (
+                "lm_top_p",
+                json!({
+                    "model": "test/music",
+                    "prompt": "ambiguous top p",
+                    "lm_top_p": 0.9,
+                    "top_p": 0.8
+                }),
+            ),
+        ] {
+            let violations = validate_endpoint_request(&contract, &request).unwrap_err();
+            assert_eq!(violations[0].path, canonical);
+            assert!(violations[0].reason.contains("ambiguous aliases"));
+        }
+
+        let independent = json!({
+            "model": "test/music",
+            "prompt": "pulse",
+            "style": "dry",
+            "genre": "minimal",
+            "tags": "analog"
+        });
+        assert!(validate_endpoint_request(&contract, &independent).is_ok());
+    }
+
+    #[test]
+    fn music_catalog_narrowing_applies_after_alias_normalization() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        contract
+            .request_attribute_specs
+            .get_mut("prompt")
+            .unwrap()
+            .max_length = Some(8);
+        contract
+            .request_attribute_specs
+            .get_mut("caption")
+            .unwrap()
+            .max_length = Some(6);
+        contract
+            .request_attribute_specs
+            .get_mut("bpm")
+            .unwrap()
+            .maximum = Some(300.0);
+        contract.request_attributes.retain(|path| path != "tags");
+        contract.request_attribute_specs.remove("tags");
+
+        let narrowed_alias = validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "caption": "longer than eight"}),
+        )
+        .unwrap_err();
+        assert!(narrowed_alias
+            .iter()
+            .any(|violation| violation.path == "prompt"));
+        let alias_signed_bound = validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "caption": "1234567"}),
+        )
+        .unwrap_err();
+        assert!(alias_signed_bound
+            .iter()
+            .any(|violation| violation.path == "caption"));
+        let narrowed_bpm = validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "prompt": "valid", "bpm": 301}),
+        )
+        .unwrap_err();
+        assert!(narrowed_bpm.iter().any(|violation| violation.path == "bpm"));
+        let unsupported_alias = validate_endpoint_request(
+            &contract,
+            &json!({"model": "test/music", "prompt": "valid", "tags": "ambient"}),
+        )
+        .unwrap_err();
+        assert!(unsupported_alias
+            .iter()
+            .any(|violation| violation.path == "tags"));
+    }
+
+    #[test]
+    fn music_inline_audio_is_closed_typed_and_bounded_after_decoding() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let arbitrary_audio = base64::engine::general_purpose::STANDARD
+            .encode(vec![0x5a_u8; MIN_MUSIC_INLINE_AUDIO_BYTES]);
+        let valid = json!({
+            "model": "test/music",
+            "prompt": "transform arbitrary bytes",
+            "task_type": "cover",
+            "source_audio": {
+                "data": arbitrary_audio,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+        assert!(validate_endpoint_request(&contract, &valid).is_ok());
+        assert_eq!(
+            validate_base64_decoded_size(
+                valid["source_audio"]["data"].as_str().unwrap(),
+                MIN_MUSIC_INLINE_AUDIO_BYTES as u64
+            ),
+            Ok(MIN_MUSIC_INLINE_AUDIO_BYTES as u64),
+            "audio validation must not require a codec magic header"
+        );
+        assert!(valid_audio_content_type("audio/mp3"));
+        assert!(valid_audio_content_type("audio/m4a"));
+        assert!(!valid_audio_content_type("audio/x-flac"));
+        assert!(!valid_audio_content_type("audio/x-m4a"));
+        assert!(validate_base64_decoded_size("AAECAw==", 3)
+            .unwrap_err()
+            .contains("decoded inline audio size 4"));
+
+        for (request, path) in [
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "missing metadata",
+                    "source_audio": {"data": "AA==", "encoding": "base64"}
+                }),
+                "source_audio.content_type",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "malformed",
+                    "source_audio": {
+                        "data": "A===",
+                        "encoding": "base64",
+                        "content_type": "audio/wav"
+                    }
+                }),
+                "source_audio.data",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "unsupported audio subtype",
+                    "source_audio": {
+                        "data": "AA==",
+                        "encoding": "base64",
+                        "content_type": "audio/x-arbitrary"
+                    }
+                }),
+                "source_audio.content_type",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "closed object",
+                    "source_audio": {
+                        "data": "AA==",
+                        "encoding": "base64",
+                        "content_type": "audio/wav",
+                        "path": "/tmp/input.wav"
+                    }
+                }),
+                "source_audio.path",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "no string paths",
+                    "source_audio": "/tmp/input.wav"
+                }),
+                "source_audio",
+            ),
+            (
+                json!({
+                    "model": "test/music",
+                    "prompt": "no path fields",
+                    "source_audio_path": "/tmp/input.wav"
+                }),
+                "source_audio_path",
+            ),
+        ] {
+            let violations = validate_endpoint_request(&contract, &request).unwrap_err();
+            assert!(
+                violations.iter().any(|violation| violation.path == path),
+                "{path}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn music_inline_audio_load_measures_every_validated_input() {
+        let encoded =
+            endpoint_calibration_wav_base64_fixture(MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize)
+                .unwrap();
+        let request = json!({
+            "source_audio": {
+                "data": encoded,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            },
+            "reference_audio": {
+                "data": encoded,
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+        let load = artifact_generation_inline_audio_load(&request).unwrap();
+        assert_eq!(load.item_count, 2);
+        assert_eq!(
+            load.max_item_bytes,
+            u64::try_from(MIN_MUSIC_INLINE_AUDIO_BYTES).unwrap()
+        );
+        assert_eq!(load.max_item_seconds, 1);
+
+        let mut wrong_mime = request.clone();
+        wrong_mime["source_audio"]["content_type"] = json!("audio/flac");
+        assert!(artifact_generation_inline_audio_load(&wrong_mime)
+            .unwrap_err()
+            .contains("does not match"));
+
+        let mut garbage = request;
+        garbage["source_audio"]["data"] = json!(base64::engine::general_purpose::STANDARD
+            .encode(vec![0x5a_u8; MIN_MUSIC_INLINE_AUDIO_BYTES]));
+        assert!(artifact_generation_inline_audio_load(&garbage)
+            .unwrap_err()
+            .contains("valid bounded audio"));
+    }
+
+    #[test]
+    fn music_custom_timesteps_require_bounded_numeric_items() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "valid schedule",
+                "custom_timesteps": [1, 0.5, 0]
+            })
+        )
+        .is_ok());
+        let wrong_item = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "invalid schedule",
+                "timesteps": [1.0, "0.5", 0.0]
+            }),
+        )
+        .unwrap_err();
+        assert!(wrong_item
+            .iter()
+            .any(|violation| violation.path == "custom_timesteps[1]"));
+        let unsafe_item = validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "invalid schedule",
+                "custom_timesteps": [1.01]
+            }),
+        )
+        .unwrap_err();
+        assert!(unsafe_item
+            .iter()
+            .any(|violation| violation.path == "custom_timesteps[0]"));
+    }
+
+    #[test]
+    fn music_enums_ranges_and_composed_caption_budget_are_enforced() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        for (path, accepted, rejected) in [
+            ("task_type", json!("cover"), json!("flow-edit")),
+            ("time_signature", json!("4/4"), json!("7/8")),
+            ("infer_method", json!("sde"), json!("deterministic")),
+            ("sampler", json!("heun"), json!("rk4")),
+            ("dcw_mode", json!("double"), json!("triple")),
+            ("dcw_wavelet", json!("coif2"), json!("coif3")),
+            ("repaint_mode", json!("aggressive"), json!("maximum")),
+            ("chunk_mask_mode", json!("explicit"), json!("masked")),
+            ("response_format", json!("wav32"), json!("pcm")),
+            ("mp3_bitrate", json!("320k"), json!("96k")),
+            ("mp3_sample_rate", json!(44_100), json!(96_000)),
+        ] {
+            let spec = &contract.request_attribute_specs[path];
+            assert!(
+                validate_endpoint_attribute_value(spec, &accepted).is_ok(),
+                "{path}"
+            );
+            assert!(
+                validate_endpoint_attribute_value(spec, &rejected).is_err(),
+                "{path}"
+            );
+        }
+        for (path, minimum, maximum) in [
+            ("bpm", json!(30), json!(300)),
+            ("duration_seconds", json!(10), json!(600)),
+            ("steps", json!(1), json!(200)),
+            ("guidance_scale", json!(1), json!(15)),
+            ("lm_temperature", json!(0), json!(2)),
+            ("lm_cfg_scale", json!(1), json!(3)),
+            ("velocity_norm_threshold", json!(0), json!(5)),
+            ("velocity_ema_factor", json!(0), json!(0.5)),
+            ("dcw_scaler", json!(0), json!(0.1)),
+            ("normalization_db", json!(-10), json!(0)),
+            ("fade_in_duration", json!(0), json!(10)),
+            ("latent_shift", json!(-0.2), json!(0.2)),
+            ("latent_rescale", json!(0.5), json!(1.5)),
+            ("retake_variance", json!(0), json!(1)),
+            ("flow_edit_n_avg", json!(1), json!(8)),
+        ] {
+            let spec = &contract.request_attribute_specs[path];
+            assert!(
+                validate_endpoint_attribute_value(spec, &minimum).is_ok(),
+                "{path} minimum"
+            );
+            assert!(
+                validate_endpoint_attribute_value(spec, &maximum).is_ok(),
+                "{path} maximum"
+            );
+        }
+
+        let within_budget = json!({
+            "model": "test/music",
+            "prompt": "p".repeat(480),
+            "style": "s".repeat(4),
+            "genre": "g".repeat(4),
+            "tags": "t"
+        });
+        assert!(validate_endpoint_request(&contract, &within_budget).is_ok());
+        let over_budget = json!({
+            "model": "test/music",
+            "prompt": "p".repeat(480),
+            "style": "s".repeat(4),
+            "genre": "g".repeat(4),
+            "tags": "tt"
+        });
+        let violations = validate_endpoint_request(&contract, &over_budget).unwrap_err();
+        assert!(violations.iter().any(|violation| {
+            violation.path == "prompt" && violation.reason.contains("composed")
+        }));
+    }
+
+    #[test]
+    fn music_audio_codes_and_seed_arrays_follow_pinned_source_limits() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        assert_eq!(
+            validate_music_audio_codes("<|audio_code_0|><|audio_code_63999|>"),
+            Ok(2)
+        );
+        assert!(validate_music_audio_codes("<|audio_code_64000|>")
+            .unwrap_err()
+            .contains("pinned parser maximum"));
+        assert!(validate_music_audio_codes("prefix<|audio_code_1|>").is_err());
+        let maximum_codes = "<|audio_code_63999|>".repeat(MAX_MUSIC_AUDIO_CODE_COUNT as usize);
+        assert!(u64::try_from(maximum_codes.len()).unwrap() <= MAX_MUSIC_AUDIO_CODES_CHARS);
+        assert_eq!(
+            validate_music_audio_codes(&maximum_codes),
+            Ok(MAX_MUSIC_AUDIO_CODE_COUNT)
+        );
+        assert!(
+            validate_music_audio_codes(&format!("{maximum_codes}<|audio_code_0|>"))
+                .unwrap_err()
+                .contains("encoded maximum")
+        );
+
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "seeded",
+                "task_type": "cover",
+                "audio_codes": "<|audio_code_1|>",
+                "n": 3,
+                "seeds": [-1, 0, 7]
+            })
+        )
+        .is_ok());
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "per-item code hints",
+                "task_type": "cover",
+                "audio_codes": [
+                    "<|audio_code_1|><|audio_code_2|>",
+                    "<|audio_code_3|><|audio_code_4|>"
+                ],
+                "n": 2
+            })
+        )
+        .is_ok());
+        for invalid in [
+            json!({
+                "model": "test/music",
+                "prompt": "wrong code batch",
+                "task_type": "cover",
+                "audio_codes": ["<|audio_code_1|>"],
+                "n": 2
+            }),
+            json!({
+                "model": "test/music",
+                "prompt": "unequal code durations",
+                "task_type": "cover",
+                "audio_codes": [
+                    "<|audio_code_1|>",
+                    "<|audio_code_2|><|audio_code_3|>"
+                ],
+                "n": 2
+            }),
+            json!({
+                "model": "test/music",
+                "prompt": "wrong code type",
+                "task_type": "cover",
+                "audio_codes": [7, 8],
+                "n": 2
+            }),
+        ] {
+            let violations = validate_endpoint_request(&contract, &invalid).unwrap_err();
+            assert!(violations
+                .iter()
+                .any(|violation| violation.path == "audio_codes"));
+        }
+        for invalid in [
+            json!([1.5]),
+            json!(["7"]),
+            json!([-2]),
+            json!([4_294_967_296_u64]),
+        ] {
+            let violations = validate_endpoint_request(
+                &contract,
+                &json!({"model": "test/music", "prompt": "seeded", "n": 1, "seeds": invalid}),
+            )
+            .unwrap_err();
+            assert!(violations
+                .iter()
+                .any(|violation| violation.path == "seeds[0]"));
+        }
+
+        for request in [
+            json!({
+                "model": "test/music",
+                "prompt": "ambiguous seed",
+                "n": 1,
+                "seed": 7,
+                "seeds": [7]
+            }),
+            json!({
+                "model": "test/music",
+                "prompt": "wrong seed count",
+                "n": 2,
+                "seeds": [7]
+            }),
+        ] {
+            let violations = validate_endpoint_request(&contract, &request).unwrap_err();
+            assert!(violations.iter().any(|violation| violation.path == "seeds"));
+        }
+
+        let normalized = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({
+                "model": "test/music",
+                "prompt": "per-item seeds",
+                "n": 2,
+                "seeds": [7, 11]
+            }),
+        )
+        .unwrap();
+        assert!(normalized.get("seed").is_none());
+        assert!(validate_endpoint_request(&contract, &normalized).is_ok());
+    }
+
+    #[test]
+    fn music_extensions_do_not_change_other_endpoint_families() {
+        let audio = endpoint_family_contract_template(ENDPOINT_MAYHEM_AUDIO_GENERATIONS)
+            .expect("audio endpoint contract");
+        assert!(!audio.request_attributes.iter().any(|path| path == "lyrics"));
+        assert!(validate_endpoint_request(
+            &audio,
+            &json!({
+                "model": "test/audio",
+                "prompt": "rain",
+                "input_audio": {"data": "not-decoded-here", "format": "wav"}
+            })
+        )
+        .is_ok());
+
+        let chat = endpoint_family_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat endpoint contract");
+        assert!(validate_endpoint_request(
+            &chat,
+            &json!({
+                "model": "test/chat",
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn selected_model_contract_rejects_unknown_and_unsupported_attributes() {
         let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
             .expect("chat contract");
@@ -2989,6 +6241,46 @@ mod tests {
             assert_eq!(video["num_frames"], json!(frame_count));
             assert_eq!(video["fps"], json!(1.0));
             assert!(validate_endpoint_request(&contract, &request).is_ok());
+        }
+    }
+
+    #[test]
+    fn music_matrix_materializes_requests_matching_each_expected_verdict() {
+        let contract = endpoint_family_contract_template(ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("music endpoint contract");
+        let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
+        let substitutions = BTreeMap::from([
+            ("$MODEL".to_owned(), json!("test/music")),
+            (
+                "$AUDIO_BASE64".to_owned(),
+                json!(endpoint_calibration_wav_base64_fixture(
+                    MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+                )
+                .unwrap()),
+            ),
+            ("$AUDIO_CONTENT_TYPE".to_owned(), json!("audio/wav")),
+        ]);
+
+        for case in cases {
+            let request = materialize_endpoint_calibration_request(&case, &substitutions)
+                .unwrap_or_else(|error| panic!("{} materialization failed: {error}", case.case_id));
+            let verdict = validate_endpoint_request(&contract, &request);
+            let accepted = verdict.is_ok();
+            let detail = verdict
+                .err()
+                .map(|violations| {
+                    violations
+                        .into_iter()
+                        .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                accepted, case.expect_accept,
+                "{} ({}) produced the wrong verdict: {detail}",
+                case.case_id, case.case_kind,
+            );
         }
     }
 }

@@ -5,9 +5,12 @@ mod endpoint_calibration;
 mod gemma4;
 mod python_runtime;
 
+#[cfg(test)]
+use endpoint_calibration::run_endpoint_calibration_matrix;
 use endpoint_calibration::{
-    normalize_endpoint_calibration_request, run_endpoint_calibration_matrix,
-    validate_endpoint_calibration_report, EndpointCalibrationExecution, EndpointCalibrationReport,
+    normalize_endpoint_calibration_request, run_endpoint_calibration_matrix_with_materializer,
+    validate_endpoint_calibration_report, EndpointCalibrationBackendProof,
+    EndpointCalibrationBackendProofKind, EndpointCalibrationExecution, EndpointCalibrationReport,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -91,23 +94,25 @@ use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
     GpuVendor, HardwareReport, ProbeOptions, VerdictStatus,
 };
+#[cfg(test)]
+use mayhem_proto::MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN;
 use mayhem_proto::{
-    catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
-    ctx_bracket_table_at, default_ctx_bracket_schedule, metered_output_units, payload_chunk_at,
-    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, validate_ctx_bracket_schedule, validated_audio_metadata,
-    validated_wav_audio_metadata, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, TranscriptionResult, TranscriptionResultLimits, TranscriptionTimestamp,
-    ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    artifact_generation_inline_audio_load, catalog_enclave_id, chunk_json_payload,
+    ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
+    metered_output_units, payload_chunk_at, payload_chunk_manifest, reassemble_json_payload,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, validate_ctx_bracket_schedule,
+    validated_audio_metadata, validated_wav_audio_metadata, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SpendVoucher, TranscriptionResult, TranscriptionResultLimits,
+    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
-    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
+    USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -2723,7 +2728,7 @@ struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, transformers-asr, whisper.cpp, or piper.
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
@@ -3133,6 +3138,10 @@ struct CatalogCalibrateCanaryArgs {
     /// Include raw generated text in the report.
     #[arg(long)]
     include_output: bool,
+
+    /// Write validated generated canary artifacts to this directory for admin review.
+    #[arg(long, value_name = "PATH")]
+    artifact_output_dir: Option<PathBuf>,
 
     /// Reuse fully validated core evidence from this report and rerun the endpoint matrix.
     #[arg(long, value_name = "PATH")]
@@ -5443,7 +5452,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -5620,7 +5629,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -6851,6 +6860,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "vllm"
                 | "trt-llm"
                 | "stable-diffusion.cpp"
+                | "ace-step"
                 | "transformers-asr"
                 | "whisper.cpp"
                 | "piper"
@@ -7785,6 +7795,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
         "stable-diffusion.cpp" => {
             "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
+        }
+        "ace-step" => {
+            "ACE-Step requires its pinned local Python runtime and enough RAM or accelerator memory for the signed artifact"
         }
         "transformers-asr" => {
             "Transformers ASR requires at least 8 GiB RAM and supports CUDA, Metal/MPS, or CPU execution"
@@ -11297,33 +11310,34 @@ fn catalog_artifact_stage_plan_report(
                 continue;
             }
             let mut entry_errors = Vec::new();
-            let upstream_source = artifact
-                .upstream_source
-                .as_ref()
-                .unwrap_or(&model.provenance.source);
+            let upstream_source = catalog_artifact_primary_upstream_source(model, artifact);
             let source_dir = catalog_artifact_stage_source_dir(&source_cache_dir, upstream_source);
-            let source_key = (
-                upstream_source.kind.clone(),
-                upstream_source.repo.clone(),
-                upstream_source.revision.clone(),
-            );
-            if planned_sources.insert(source_key) {
+            for source in catalog_artifact_stage_sources(model, artifact) {
+                let source_key = (
+                    source.kind.clone(),
+                    source.repo.clone(),
+                    source.revision.clone(),
+                );
+                if !planned_sources.insert(source_key) {
+                    continue;
+                }
+                let source_dir = catalog_artifact_stage_source_dir(&source_cache_dir, source);
                 let mut source_errors = Vec::new();
-                if upstream_source.kind != "huggingface" {
+                if source.kind != "huggingface" {
                     source_errors.push(format!(
                         "upstream source kind {} is not supported by artifact staging",
-                        upstream_source.kind
+                        source.kind
                     ));
                 }
                 let allow_patterns = catalog_artifact_stage_source_patterns(
                     catalog_doc,
-                    upstream_source,
+                    source,
                     launch_only,
                     model_filter.as_deref(),
                     artifact_filter.as_deref(),
                 );
                 let command = catalog_artifact_stage_source_download_command(
-                    upstream_source,
+                    source,
                     &source_dir,
                     hf_token_file.as_deref(),
                     allow_patterns.as_deref(),
@@ -11332,10 +11346,10 @@ fn catalog_artifact_stage_plan_report(
                 let entry = CatalogArtifactStageSourceEntry {
                     model_id: model.model_id.clone(),
                     tier: model.tier.clone(),
-                    source_kind: upstream_source.kind.clone(),
-                    source_repo: upstream_source.repo.clone(),
-                    source_revision: upstream_source.revision.clone(),
-                    source_dir: source_dir.clone(),
+                    source_kind: source.kind.clone(),
+                    source_repo: source.repo.clone(),
+                    source_revision: source.revision.clone(),
+                    source_dir,
                     command,
                     ok,
                     errors: source_errors,
@@ -11397,6 +11411,8 @@ fn catalog_artifact_stage_plan_report(
                 artifact_name,
                 artifact,
                 &source_dir,
+                &source_cache_dir,
+                upstream_source,
                 &artifact_base,
                 &artifact_path,
             ) {
@@ -11811,6 +11827,32 @@ fn catalog_artifact_metadata_plan_command(
     catalog_canary_plan_command(argv)
 }
 
+fn catalog_artifact_primary_upstream_source<'a>(
+    model: &'a catalog::CatalogModel,
+    artifact: &'a catalog::CatalogArtifact,
+) -> &'a catalog::SourceRef {
+    artifact
+        .upstream_source
+        .as_ref()
+        .unwrap_or(&model.provenance.source)
+}
+
+fn catalog_artifact_stage_sources<'a>(
+    model: &'a catalog::CatalogModel,
+    artifact: &'a catalog::CatalogArtifact,
+) -> Vec<&'a catalog::SourceRef> {
+    let primary = catalog_artifact_primary_upstream_source(model, artifact);
+    let mut sources = vec![primary];
+    for sidecar in artifact.sidecars.values() {
+        if let Some(source) = &sidecar.upstream_source {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+    }
+    sources
+}
+
 fn catalog_artifact_stage_source_dir(
     source_cache_dir: &Path,
     source: &catalog::SourceRef,
@@ -11895,24 +11937,21 @@ fn catalog_artifact_stage_source_patterns(
             if artifact_filter.is_some_and(|selected| selected != artifact_name) {
                 continue;
             }
-            let selected_source = artifact
-                .upstream_source
-                .as_ref()
-                .unwrap_or(&model.provenance.source);
-            if selected_source != source {
-                continue;
+            let primary_source = catalog_artifact_primary_upstream_source(model, artifact);
+            if primary_source == source {
+                if artifact.upstream_source.is_none() {
+                    return None;
+                }
+                selected = true;
+                patterns.insert(artifact.path.clone());
             }
-            if artifact.upstream_source.is_none() {
-                return None;
+            for sidecar in artifact.sidecars.values() {
+                let sidecar_source = sidecar.upstream_source.as_ref().unwrap_or(primary_source);
+                if sidecar_source == source {
+                    selected = true;
+                    patterns.insert(sidecar.path.clone());
+                }
             }
-            selected = true;
-            patterns.insert(artifact.path.clone());
-            patterns.extend(
-                artifact
-                    .sidecars
-                    .values()
-                    .map(|sidecar| sidecar.path.clone()),
-            );
         }
     }
     if !selected {
@@ -11937,11 +11976,18 @@ fn catalog_artifact_stage_command(
     artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
     source_dir: &Path,
+    source_cache_dir: &Path,
+    upstream_source: &catalog::SourceRef,
     artifact_base: &Path,
     artifact_path: &Path,
 ) -> Result<CatalogCanaryPlanCommand> {
     if artifact.upstream_source.is_some() {
-        return catalog_artifact_stage_mirror_command(source_dir, artifact, artifact_path);
+        return catalog_artifact_stage_mirror_command(
+            source_cache_dir,
+            upstream_source,
+            artifact,
+            artifact_path,
+        );
     }
     match artifact.engine.as_str() {
         "llama.cpp" => Ok(catalog_artifact_stage_gguf_command(
@@ -11963,7 +12009,8 @@ fn catalog_artifact_stage_command(
             artifact_path,
         )?),
         "vllm" => Ok(catalog_artifact_stage_mirror_command(
-            source_dir,
+            source_cache_dir,
+            upstream_source,
             artifact,
             artifact_path,
         )?),
@@ -12062,22 +12109,30 @@ fn catalog_artifact_stage_trt_command(
 }
 
 fn catalog_artifact_stage_mirror_command(
-    source_dir: &Path,
+    source_cache_dir: &Path,
+    primary_source: &catalog::SourceRef,
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
 ) -> Result<CatalogCanaryPlanCommand> {
     let target_root = catalog_artifact_local_root(artifact_path, &artifact.path)?;
-    let mut files = vec![("weights", artifact.path.as_str())];
-    files.extend(
-        artifact
-            .sidecars
-            .iter()
-            .map(|(name, sidecar)| (name.as_str(), sidecar.path.as_str())),
-    );
+    let primary_source_dir = catalog_artifact_stage_source_dir(source_cache_dir, primary_source);
+    let mut files = vec![(
+        "weights".to_owned(),
+        artifact.path.clone(),
+        primary_source_dir.clone(),
+    )];
+    files.extend(artifact.sidecars.iter().map(|(name, sidecar)| {
+        let source = sidecar.upstream_source.as_ref().unwrap_or(primary_source);
+        (
+            name.clone(),
+            sidecar.path.clone(),
+            catalog_artifact_stage_source_dir(source_cache_dir, source),
+        )
+    }));
     let mut seen_paths = BTreeSet::new();
     let mut steps = Vec::new();
-    for (label, relative) in files {
-        let relative = validate_catalog_artifact_relative_path(relative)?;
+    for (label, relative, source_dir) in files {
+        let relative = validate_catalog_artifact_relative_path(&relative)?;
         if !seen_paths.insert(relative.clone()) {
             bail!("artifact has duplicate staged path {}", relative.display());
         }
@@ -12096,8 +12151,8 @@ fn catalog_artifact_stage_mirror_command(
     }
     steps.push(format!(
         "for MAYHEM_METADATA in .gitattributes README.md LICENSE LICENSE.md LICENSE.txt; do if [ -f {}/\"$MAYHEM_METADATA\" ]; then cp -f {}/\"$MAYHEM_METADATA\" {}/\"$MAYHEM_METADATA\"; fi; done",
-        shell_single_quote(&source_dir.display().to_string()),
-        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&primary_source_dir.display().to_string()),
+        shell_single_quote(&primary_source_dir.display().to_string()),
         shell_single_quote(&target_root.display().to_string()),
     ));
     let script = steps.join(" && ");
@@ -12446,6 +12501,15 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .as_ref()
         .map(|path| absolutize(path.clone()))
         .transpose()?;
+    let artifact_output_dir = args
+        .artifact_output_dir
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
+    ensure!(
+        artifact_output_dir.is_none() || report_output.is_some(),
+        "--artifact-output-dir requires --report-output so retained artifacts are cryptographically bound to their calibration report"
+    );
     let resume_core_report_path = args
         .resume_core_report
         .as_ref()
@@ -12522,8 +12586,19 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     let mut backend =
         catalog_calibration_backend(artifact, &artifact_path, &artifact_sidecar_paths, &args)?;
     let report = if let Some(mut report) = resume_core_report {
-        report.endpoint_calibration =
-            catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
+        let behavioral_witness = resumed_endpoint_behavioral_witness(
+            resume_core_report_path
+                .as_deref()
+                .context("resume core report path was not retained")?,
+            artifact_output_dir.as_deref(),
+            &report,
+        )?;
+        report.endpoint_calibration = catalog_endpoint_calibration_report(
+            backend.as_mut(),
+            model,
+            &prompts,
+            behavioral_witness,
+        );
         report.artifact_path = artifact_path.clone();
         report.existing_catalog_fingerprint = existing.clone();
         report.matches_existing_catalog = existing
@@ -12545,6 +12620,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
                         prompt,
                         args.seed,
                         args.include_output,
+                        artifact_output_dir.as_deref(),
                     )
                 })?;
             report.calibration_baseline_memory_bytes = baseline;
@@ -12576,8 +12652,18 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             args.include_output,
             &calibration_memory,
         )?;
-        let endpoint_calibration =
-            catalog_endpoint_calibration_report(backend.as_mut(), model, &prompts);
+        let behavioral_witness = reports.iter().find_map(|prompt| {
+            Some(EndpointCalibrationBehavioralWitness {
+                output: prompt.behavioral_witness.clone()?,
+                fingerprint: prompt.behavioral_output_fingerprint.clone()?,
+            })
+        });
+        let endpoint_calibration = catalog_endpoint_calibration_report(
+            backend.as_mut(),
+            model,
+            &prompts,
+            behavioral_witness,
+        );
         let matches_existing = existing
             .as_ref()
             .map(|expected| expected == &catalog_fingerprint);
@@ -12666,6 +12752,12 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         endpoint_errors.is_empty(),
         "endpoint-family calibration matrix failed: {}",
         endpoint_errors.join("; ")
+    );
+    let witness_errors = validate_endpoint_behavioral_witness_links(&report);
+    ensure!(
+        witness_errors.is_empty(),
+        "endpoint-family behavioral witness linkage failed: {}",
+        witness_errors.join("; ")
     );
     Ok(())
 }
@@ -13237,29 +13329,193 @@ fn calibration_token_prefixes(
 #[derive(Default)]
 struct CatalogEndpointCalibrationFixtures {
     audio: Option<Vec<u8>>,
+    audio_by_content_type: BTreeMap<&'static str, &'static [u8]>,
+}
+
+#[derive(Clone, Debug)]
+struct EndpointCalibrationBehavioralWitness {
+    output: ProviderSessionOutput,
+    fingerprint: String,
+}
+
+const CALIBRATION_AUDIO_AAC: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.aac");
+const CALIBRATION_AUDIO_FLAC: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.flac");
+const CALIBRATION_AUDIO_M4A: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.m4a");
+const CALIBRATION_AUDIO_MP3: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.mp3");
+const CALIBRATION_AUDIO_OPUS: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.opus");
+const CALIBRATION_AUDIO_WAV: &[u8] =
+    include_bytes!("../resources/calibration/audio/tone-1.25s.wav");
+
+fn resumed_endpoint_behavioral_witness(
+    report_path: &Path,
+    artifact_output_dir: Option<&Path>,
+    report: &CatalogCanaryCalibrationReport,
+) -> Result<Option<EndpointCalibrationBehavioralWitness>> {
+    for prompt in &report.prompts {
+        let Some(fingerprint) = prompt.behavioral_output_fingerprint.as_ref() else {
+            continue;
+        };
+        if prompt.retained_artifacts.is_empty() {
+            continue;
+        }
+        let artifact_dir = artifact_output_dir
+            .or_else(|| report_path.parent())
+            .context("resume report retained artifacts need --artifact-output-dir")?;
+        let mut artifacts = Vec::with_capacity(prompt.retained_artifacts.len());
+        for (index, retained) in prompt.retained_artifacts.iter().enumerate() {
+            let relative = Path::new(&retained.file_name);
+            let mut components = relative.components();
+            ensure!(
+                matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none(),
+                "retained calibration artifact file name is unsafe: {:?}",
+                retained.file_name
+            );
+            let path = artifact_dir.join(relative);
+            let bytes = fs::read(&path).with_context(|| {
+                format!(
+                    "reading retained calibration artifact {}; pass its directory with --artifact-output-dir",
+                    path.display()
+                )
+            })?;
+            ensure!(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX) == retained.bytes,
+                "retained calibration artifact {} has {} bytes, expected {}",
+                path.display(),
+                bytes.len(),
+                retained.bytes
+            );
+            ensure!(
+                sha256_bytes_hex(&bytes) == retained.sha256,
+                "retained calibration artifact {} SHA-256 does not match the resume report",
+                path.display()
+            );
+            if retained.content_type.starts_with("audio/") {
+                let metadata = validated_audio_metadata(&bytes).with_context(|| {
+                    format!(
+                        "retained calibration artifact {} is not valid bounded audio",
+                        path.display()
+                    )
+                })?;
+                ensure!(
+                    provider_audio_content_type_matches_format(
+                        &retained.content_type,
+                        metadata.format
+                    ),
+                    "retained calibration artifact {} bytes do not match {}",
+                    path.display(),
+                    retained.content_type
+                );
+            }
+            artifacts.push(ProviderSessionArtifact {
+                id: format!(
+                    "retained-{}-{index}",
+                    safe_path_component(&prompt.prompt_id)
+                ),
+                content_type: retained.content_type.clone(),
+                bytes,
+            });
+        }
+        return Ok(Some(EndpointCalibrationBehavioralWitness {
+            output: ProviderSessionOutput {
+                content: String::new(),
+                reasoning_evidence: String::new(),
+                tools: Vec::new(),
+                embeddings: None,
+                transcription: None,
+                artifacts,
+                finish_reason: "stop".to_owned(),
+                prompt_tokens: u64::from(prompt.prompt_tokens),
+                completion_tokens: u64::from(prompt.completion_tokens),
+                token_ids: prompt.token_ids.clone(),
+                usage: ReceiptUsage::default(),
+                usage_attribution: BTreeMap::new(),
+            },
+            fingerprint: fingerprint.clone(),
+        }));
+    }
+    Ok(None)
 }
 
 fn catalog_endpoint_calibration_report(
     backend: &mut dyn EngineBackend,
     model: &catalog::CatalogModel,
     prompts: &[CanaryPrompt],
+    mut behavioral_witness: Option<EndpointCalibrationBehavioralWitness>,
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
     let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
-    run_endpoint_calibration_matrix(
+    run_endpoint_calibration_matrix_with_materializer(
         &model.adapter.endpoint_families,
         &substitutions,
+        |contract, case, request| {
+            catalog_endpoint_calibration_materialize_request(contract, case, request, &fixtures)
+                .map_err(|error| format!("{error:#}"))
+        },
         |contract, _case, request| {
             let cache_key = (contract.family.clone(), stable_value_hash(request));
             if let Some(execution) = execution_cache.get(&cache_key) {
                 return Ok(execution.clone());
             }
-            let execution =
-                catalog_endpoint_calibration_execute(backend, model, contract, request, &fixtures)?;
+            let execution = catalog_endpoint_calibration_execute(
+                backend,
+                model,
+                contract,
+                request,
+                &fixtures,
+                &mut behavioral_witness,
+            )?;
             execution_cache.insert(cache_key, execution.clone());
             Ok(execution)
         },
     )
+}
+
+fn validate_endpoint_behavioral_witness_links(
+    report: &CatalogCanaryCalibrationReport,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let witnesses = report
+        .prompts
+        .iter()
+        .filter_map(|prompt| prompt.behavioral_output_fingerprint.as_deref())
+        .collect::<BTreeSet<_>>();
+    for witness in &witnesses {
+        if !is_hex_len(witness, 64) {
+            errors.push(format!(
+                "canary report contains invalid behavioral output fingerprint {witness}"
+            ));
+        }
+    }
+    for case in report
+        .endpoint_calibration
+        .families
+        .iter()
+        .flat_map(|family| &family.cases)
+        .filter(|case| case.expect_accept)
+    {
+        let Some(proof) = case.backend_proof.as_ref() else {
+            continue;
+        };
+        if proof.kind != EndpointCalibrationBackendProofKind::WorkerSemanticValidation {
+            continue;
+        }
+        let Some(witness) = proof.behavioral_witness_fingerprint.as_deref() else {
+            continue;
+        };
+        if !witnesses.contains(witness) {
+            errors.push(format!(
+                "endpoint calibration case {} references behavioral witness {witness} absent from canonical canary evidence",
+                case.case_id
+            ));
+        }
+    }
+    errors
 }
 
 fn catalog_endpoint_calibration_preflight(
@@ -13275,6 +13531,9 @@ fn catalog_endpoint_calibration_preflight(
             let request =
                 mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
                     .map_err(anyhow::Error::msg)?;
+            let request = catalog_endpoint_calibration_materialize_request(
+                contract, &case, request, &fixtures,
+            )?;
             let contract_result = mayhem_proto::validate_endpoint_request(contract, &request);
             let gateway_result = normalize_endpoint_calibration_request(contract, &request);
             if !case.expect_accept {
@@ -13375,7 +13634,21 @@ fn catalog_endpoint_calibration_fixtures(
     prompts: &[CanaryPrompt],
 ) -> (BTreeMap<String, Value>, CatalogEndpointCalibrationFixtures) {
     let mut substitutions = BTreeMap::from([("$MODEL".to_owned(), json!(model.model_id))]);
-    let mut fixtures = CatalogEndpointCalibrationFixtures::default();
+    let mut fixtures = CatalogEndpointCalibrationFixtures {
+        audio: None,
+        audio_by_content_type: BTreeMap::from([
+            ("audio/aac", CALIBRATION_AUDIO_AAC),
+            ("audio/flac", CALIBRATION_AUDIO_FLAC),
+            ("audio/m4a", CALIBRATION_AUDIO_M4A),
+            ("audio/mp4", CALIBRATION_AUDIO_M4A),
+            ("audio/mpeg", CALIBRATION_AUDIO_MP3),
+            ("audio/mp3", CALIBRATION_AUDIO_MP3),
+            ("audio/ogg", CALIBRATION_AUDIO_OPUS),
+            ("audio/opus", CALIBRATION_AUDIO_OPUS),
+            ("audio/wav", CALIBRATION_AUDIO_WAV),
+            ("audio/x-wav", CALIBRATION_AUDIO_WAV),
+        ]),
+    };
     for prompt in prompts {
         if let Some(voice) = prompt.voice.as_deref().filter(|value| !value.is_empty()) {
             substitutions
@@ -13413,6 +13686,159 @@ fn catalog_endpoint_calibration_fixtures(
         }
     }
     (substitutions, fixtures)
+}
+
+fn catalog_endpoint_calibration_materialize_request(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    mut request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    if contract.family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+        return Ok(request);
+    }
+    let repaint_start = ["repaint_start", "repainting_start"]
+        .into_iter()
+        .filter_map(|path| request.get(path).and_then(Value::as_f64))
+        .fold(0.0_f64, f64::max);
+    let repaint_end = ["repaint_end", "repainting_end"]
+        .into_iter()
+        .filter_map(|path| request.get(path).and_then(Value::as_f64))
+        .filter(|value| *value >= 0.0)
+        .fold(0.0_f64, f64::max);
+    let required_source_duration = repaint_end
+        .max((repaint_start + 0.001).min(600.0))
+        .max(1.25)
+        .min(600.0);
+    let duration_fixture = (required_source_duration > 1.25)
+        .then(|| calibration_music_source_wav(required_source_duration))
+        .transpose()?;
+
+    for root in [
+        "source_audio",
+        "src_audio",
+        "ctx_audio",
+        "reference_audio",
+        "melody",
+        "ref_audio",
+    ] {
+        let Some(descriptor) = request.get_mut(root).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let data_path = format!("{root}.data");
+        let target_count = if case.case_kind == "pairwise_interaction" {
+            2
+        } else {
+            1
+        };
+        let data_mutation = case
+            .mutations
+            .iter()
+            .take(target_count)
+            .find(|mutation| mutation.path == data_path);
+        let source_duration_case = matches!(root, "source_audio" | "src_audio" | "ctx_audio")
+            && duration_fixture.is_some();
+        if let Some(data_mutation) = data_mutation {
+            if matches!(
+                &data_mutation.value,
+                mayhem_proto::EndpointCalibrationValue::StringLength { .. }
+            ) {
+                descriptor.insert("content_type".to_owned(), json!("audio/wav"));
+            } else if let Some(content_type) = descriptor
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .as_deref()
+                .and_then(detected_audio_content_type)
+            {
+                descriptor.insert("content_type".to_owned(), json!(content_type));
+            }
+            descriptor.insert("encoding".to_owned(), json!("base64"));
+            continue;
+        }
+        let (content_type, bytes) = if source_duration_case {
+            (
+                "audio/wav",
+                duration_fixture
+                    .as_deref()
+                    .context("duration-matched source fixture is missing")?,
+            )
+        } else {
+            let Some(content_type) = descriptor.get("content_type").and_then(Value::as_str) else {
+                if case.expect_accept {
+                    bail!(
+                        "music calibration accepted case {} audio descriptor {root} has no content_type",
+                        case.case_id
+                    );
+                }
+                continue;
+            };
+            let Some(bytes) = fixtures.audio_by_content_type.get(content_type).copied() else {
+                if case.expect_accept {
+                    bail!(
+                        "music calibration accepted case {} has no real codec fixture for declared {content_type}",
+                        case.case_id
+                    );
+                }
+                continue;
+            };
+            (content_type, bytes)
+        };
+        descriptor.insert("content_type".to_owned(), json!(content_type));
+        descriptor.insert("encoding".to_owned(), json!("base64"));
+        descriptor.insert(
+            "data".to_owned(),
+            json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        );
+    }
+    Ok(request)
+}
+
+fn calibration_music_source_wav(duration_seconds: f64) -> Result<Vec<u8>> {
+    ensure!(
+        duration_seconds.is_finite() && duration_seconds > 0.0 && duration_seconds <= 600.0,
+        "music calibration source duration must be in (0, 600]"
+    );
+    const SAMPLE_RATE: u32 = 8_000;
+    const CHANNELS: u16 = 1;
+    const BYTES_PER_SAMPLE: u16 = 2;
+    let sample_count = (duration_seconds * f64::from(SAMPLE_RATE)).ceil() as usize;
+    let data_length = sample_count
+        .checked_mul(usize::from(BYTES_PER_SAMPLE))
+        .context("music calibration WAV data length overflowed")?;
+    let total_length = 44_usize
+        .checked_add(data_length)
+        .context("music calibration WAV length overflowed")?;
+    let riff_length =
+        u32::try_from(total_length - 8).context("music calibration WAV RIFF length overflowed")?;
+    let data_length_u32 =
+        u32::try_from(data_length).context("music calibration WAV data exceeded u32")?;
+    let mut wav = Vec::with_capacity(total_length);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_length.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&CHANNELS.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * u32::from(BYTES_PER_SAMPLE)).to_le_bytes());
+    wav.extend_from_slice(&BYTES_PER_SAMPLE.to_le_bytes());
+    wav.extend_from_slice(&(BYTES_PER_SAMPLE * 8).to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_length_u32.to_le_bytes());
+    for index in 0..sample_count {
+        let sample = if index % 2 == 0 {
+            4_096_i16
+        } else {
+            -4_096_i16
+        };
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    Ok(wav)
 }
 
 fn collect_endpoint_media_fixture_substitutions(
@@ -13463,36 +13889,135 @@ fn catalog_endpoint_calibration_execute(
     contract: &mayhem_proto::EndpointFamilyContract,
     request: &Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
+    behavioral_witness: &mut Option<EndpointCalibrationBehavioralWitness>,
 ) -> Result<EndpointCalibrationExecution, String> {
     let transport = catalog_endpoint_calibration_transport(contract, request, fixtures)
         .map_err(|error| format!("building provider transport: {error:#}"))?;
-    let (translation, handled_request_attributes) =
+    let (translation, mut handled_request_attributes) =
         catalog_endpoint_calibration_translation(model, contract, request, &transport)
             .map_err(|error| format!("translating endpoint request: {error:#}"))?;
     let sealed = catalog_endpoint_calibration_seal(contract, request, transport)
         .map_err(|error| format!("sealing provider request: {error:#}"))?;
-    let output = provider_engine_session_response_with_sampling_bounded(
+    let semantic_validation = provider_engine_session_media_validation(
         backend,
         Some(&model.model_id),
         &model.adapter,
-        &model.sampling,
         &sealed,
-        None,
-        Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
         &CancellationToken::new(),
     )
-    .map_err(|error| format!("executing provider request: {error:#}"))?;
+    .map_err(|error| format!("validating provider request with the loaded backend: {error:#}"))?;
+    let (output, backend_execution_fingerprint, backend_proof) =
+        if let Some(validation) = semantic_validation {
+            handled_request_attributes = validation
+                .handled_request_attributes
+                .into_iter()
+                .filter(|path| {
+                    contract.request_attributes.contains(path)
+                        || !contract
+                            .request_attributes
+                            .iter()
+                            .any(|attribute| attribute.starts_with(&format!("{path}.")))
+                })
+                .collect();
+            let semantic_fingerprint = stable_value_hash(&json!({
+                "worker_evidence": validation.evidence,
+                "handled_request_attributes": handled_request_attributes,
+            }));
+            if let Some(witness) = behavioral_witness.as_ref() {
+                (
+                    witness.output.clone(),
+                    semantic_fingerprint,
+                    EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::WorkerSemanticValidation,
+                        behavioral_witness_fingerprint: Some(witness.fingerprint.clone()),
+                    },
+                )
+            } else {
+                let output = provider_engine_session_response_with_sampling_bounded(
+                    backend,
+                    Some(&model.model_id),
+                    &model.adapter,
+                    &model.sampling,
+                    &sealed,
+                    None,
+                    Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                    &CancellationToken::new(),
+                )
+                .map_err(|error| format!("executing provider request: {error:#}"))?;
+                let output_fingerprint = provider_session_output_fingerprint(&output);
+                *behavioral_witness = Some(EndpointCalibrationBehavioralWitness {
+                    output: output.clone(),
+                    fingerprint: output_fingerprint.clone(),
+                });
+                (
+                    output,
+                    stable_value_hash(&json!({
+                        "worker_semantic_validation": semantic_fingerprint,
+                        "full_inference": output_fingerprint,
+                    })),
+                    EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::FullInference,
+                        behavioral_witness_fingerprint: None,
+                    },
+                )
+            }
+        } else {
+            let output = provider_engine_session_response_with_sampling_bounded(
+                backend,
+                Some(&model.model_id),
+                &model.adapter,
+                &model.sampling,
+                &sealed,
+                None,
+                Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                &CancellationToken::new(),
+            )
+            .map_err(|error| format!("executing provider request: {error:#}"))?;
+            let output_fingerprint = provider_session_output_fingerprint(&output);
+            (
+                output,
+                output_fingerprint,
+                EndpointCalibrationBackendProof {
+                    kind: EndpointCalibrationBackendProofKind::FullInference,
+                    behavioral_witness_fingerprint: None,
+                },
+            )
+        };
     let response = catalog_endpoint_calibration_response(&contract.family, request, &output)
         .map_err(|error| format!("normalizing public response: {error:#}"))?;
     Ok(EndpointCalibrationExecution {
         provider_translation_fingerprint: stable_value_hash(&translation),
         handled_request_attributes,
-        backend_execution_fingerprint: provider_session_output_fingerprint(&output),
+        backend_execution_fingerprint,
+        backend_proof,
         response,
     })
 }
 
 const ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS: u32 = 128;
+
+fn provider_engine_session_media_validation(
+    backend: &mut dyn EngineBackend,
+    expected_model_id: Option<&str>,
+    adapter: &catalog::CatalogAdapter,
+    body: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Option<mayhem_engine::MediaGenerationValidation>> {
+    cancellation.check().context("provider request cancelled")?;
+    let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
+    if !matches!(
+        verified.family,
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    ) {
+        return Ok(None);
+    }
+    let request = provider_media_generation_request_from_body(&verified.family, &verified.request)?;
+    Ok(backend.validate_media_generation(request, cancellation)?)
+}
 
 fn catalog_endpoint_calibration_transport(
     contract: &mayhem_proto::EndpointFamilyContract,
@@ -14282,6 +14807,26 @@ fn verify_calibration_sidecars_match_catalog(
                 "Transformers ASR calibration requires --artifact-sidecar {required}=PATH"
             );
         }
+    }
+    if artifact.engine == "ace-step" {
+        for (required, source_path, _) in ACE_STEP_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("ACE-Step calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.path == *source_path,
+                "ACE-Step sidecar {required} must use path {source_path}, got {}",
+                sidecar.path
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "ACE-Step calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+        ensure!(
+            paths.len() == ACE_STEP_REQUIRED_SIDECARS.len(),
+            "ACE-Step calibration received unapproved or incomplete sidecars"
+        );
     }
     Ok(())
 }
@@ -15344,6 +15889,12 @@ fn catalog_canary_evidence_report(
             ));
             continue;
         };
+        let calibration_model = catalog_doc
+            .models
+            .iter()
+            .find(|model| model.model_id == calibration.model_id)
+            .expect("evidence entry model comes from catalog");
+        let canary_min_match_bps = catalog_canary_min_match_bps(calibration_model);
         let entry = &mut entries[entry_idx];
         if entry.report_path.is_some() {
             let message = format!(
@@ -15435,20 +15986,11 @@ fn catalog_canary_evidence_report(
                 "report catalog_fingerprint does not bind its prompt reports; expected {bound_report_fingerprint}"
             ));
         }
-        let matches_catalog = entry
-            .expected_fingerprint
-            .as_ref()
-            .map(|expected| expected == &calibration.catalog_fingerprint);
-        entry.matches_catalog = matches_catalog;
-        let modality_fingerprints_match_catalog = entry
-            .expected_modality_fingerprints
-            .as_ref()
-            .map(|expected| expected == &calibration.modality_fingerprints);
-        entry.modality_fingerprints_match_catalog = modality_fingerprints_match_catalog;
-        let modality_resource_profiles_match_catalog = entry
-            .expected_modality_resource_profiles
-            .as_ref()
-            .map(|expected| expected == &calibration.modality_resource_profiles);
+        let modality_resource_profiles_match_catalog =
+            calibration_resource_profiles_fit_catalog_envelope(
+                entry.expected_modality_resource_profiles.as_ref(),
+                &calibration.modality_resource_profiles,
+            );
         entry.modality_resource_profiles_match_catalog = modality_resource_profiles_match_catalog;
         let speciality_calibrations_match_catalog = Some(
             entry
@@ -15474,8 +16016,26 @@ fn catalog_canary_evidence_report(
             &report_embedding_vectors,
             &report_transcripts,
             &report_audio_fingerprints,
+            canary_min_match_bps,
         );
         entry.method_values_match_catalog = method_values_match_catalog;
+        let matches_catalog = if entry.verification_method == CANARY_VERIFICATION_AUDIO_FINGERPRINT
+        {
+            method_values_match_catalog
+        } else {
+            entry
+                .expected_fingerprint
+                .as_ref()
+                .map(|expected| expected == &calibration.catalog_fingerprint)
+        };
+        entry.matches_catalog = matches_catalog;
+        let modality_fingerprints_match_catalog = calibration_modality_fingerprints_match_catalog(
+            &entry.verification_method,
+            entry.expected_modality_fingerprints.as_ref(),
+            &calibration.modality_fingerprints,
+            method_values_match_catalog,
+        );
+        entry.modality_fingerprints_match_catalog = modality_fingerprints_match_catalog;
 
         if calibration.engine != entry.engine {
             entry.errors.push(format!(
@@ -15508,11 +16068,6 @@ fn catalog_canary_evidence_report(
                     .to_owned(),
             );
         }
-        let calibration_model = catalog_doc
-            .models
-            .iter()
-            .find(|model| model.model_id == entry.model_id)
-            .expect("evidence entry model comes from catalog");
         entry.errors.extend(
             validate_endpoint_calibration_report(
                 &calibration_model.adapter.endpoint_families,
@@ -15600,11 +16155,17 @@ fn catalog_canary_evidence_report(
             );
         }
         if mode == CatalogCanaryReportMode::VerifyMatchesCatalog && matches_catalog != Some(true) {
-            entry.errors.push(format!(
-                "report fingerprint {} does not match catalog fingerprint {}",
-                calibration.catalog_fingerprint,
-                entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
-            ));
+            if entry.verification_method == CANARY_VERIFICATION_AUDIO_FINGERPRINT {
+                entry.errors.push(format!(
+                    "report audio fingerprints do not meet the catalog minimum similarity of {canary_min_match_bps} bps"
+                ));
+            } else {
+                entry.errors.push(format!(
+                    "report fingerprint {} does not match catalog fingerprint {}",
+                    calibration.catalog_fingerprint,
+                    entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
+                ));
+            }
         }
         if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
             && modality_fingerprints_match_catalog != Some(true)
@@ -16097,6 +16658,8 @@ fn validate_modality_resource_profile_evidence(
             || profile.calibration_baseline_memory_bytes == 0
             || profile.calibration_peak_memory_bytes < profile.calibration_baseline_memory_bytes
             || profile.calibration_peak_memory_bytes > profile.calibration_f13_budget_bytes
+            || profile.measured_working_set_bytes
+                != calibrated_resource_working_set_bytes(*modality, profile)
             || profile.default_max_inflight_items != 1
             || profile.default_max_items_per_request != 1
         {
@@ -16124,6 +16687,7 @@ fn method_values_match_catalog(
     report_embedding_vectors: &BTreeMap<String, Vec<f32>>,
     report_transcripts: &BTreeMap<String, String>,
     report_audio_fingerprints: &BTreeMap<String, String>,
+    min_match_bps: u32,
 ) -> Option<bool> {
     match method {
         "seed_perceptual_hash" => {
@@ -16133,16 +16697,142 @@ fn method_values_match_catalog(
             expected_embedding_vectors.map(|expected| expected == report_embedding_vectors)
         }
         "transcript_match" => expected_transcripts.map(|expected| expected == report_transcripts),
-        "audio_fingerprint" => {
-            expected_audio_fingerprints.map(|expected| expected == report_audio_fingerprints)
-        }
+        "audio_fingerprint" => expected_audio_fingerprints.map(|expected| {
+            expected.len() == report_audio_fingerprints.len()
+                && expected.iter().all(|(prompt_id, expected_fingerprint)| {
+                    report_audio_fingerprints
+                        .get(prompt_id)
+                        .and_then(|observed| {
+                            mayhem_gateway::audio_fingerprint_similarity_bps(
+                                expected_fingerprint,
+                                observed,
+                            )
+                        })
+                        .is_some_and(|similarity| similarity >= min_match_bps)
+                })
+        }),
         _ => None,
     }
+}
+
+fn catalog_canary_min_match_bps(model: &catalog::CatalogModel) -> u32 {
+    model
+        .canary
+        .verification_tolerance_bps
+        .map(|tolerance| 10_000_u32.saturating_sub(tolerance))
+        .unwrap_or_else(|| {
+            (model.canary.match_min * 10_000.0)
+                .round()
+                .clamp(0.0, 10_000.0) as u32
+        })
+}
+
+fn calibration_modality_fingerprints_match_catalog(
+    method: &str,
+    expected: Option<&BTreeMap<String, String>>,
+    report: &BTreeMap<String, String>,
+    method_values_match: Option<bool>,
+) -> Option<bool> {
+    expected.map(|expected| {
+        expected.len() == report.len()
+            && expected.iter().all(|(modality, expected_fingerprint)| {
+                report.get(modality).is_some_and(|report_fingerprint| {
+                    if method == CANARY_VERIFICATION_AUDIO_FINGERPRINT && modality == "audio" {
+                        method_values_match == Some(true)
+                    } else {
+                        expected_fingerprint == report_fingerprint
+                    }
+                })
+            })
+    })
+}
+
+fn calibration_resource_profiles_fit_catalog_envelope(
+    expected: Option<&BTreeMap<String, catalog::CatalogModalityResourceProfile>>,
+    report: &BTreeMap<String, catalog::CatalogModalityResourceProfile>,
+) -> Option<bool> {
+    expected.map(|expected| {
+        expected.len() == report.len()
+            && expected.iter().all(|(modality, expected_profile)| {
+                report.get(modality).is_some_and(|report_profile| {
+                    calibrated_resource_profile_is_self_consistent(modality, expected_profile)
+                        && calibrated_resource_profile_is_self_consistent(modality, report_profile)
+                        && expected_profile.unit == report_profile.unit
+                        && resource_measurement_probe(&expected_profile.measurement_source)
+                            == resource_measurement_probe(&report_profile.measurement_source)
+                        && expected_profile.max_item_bytes == report_profile.max_item_bytes
+                        && expected_profile.max_item_units == report_profile.max_item_units
+                        && expected_profile.measured_item_bytes
+                            == report_profile.measured_item_bytes
+                        && expected_profile.measured_item_units
+                            == report_profile.measured_item_units
+                        && expected_profile.default_max_inflight_items
+                            == report_profile.default_max_inflight_items
+                        && expected_profile.default_max_items_per_request
+                            == report_profile.default_max_items_per_request
+                        && report_profile.measured_working_set_bytes
+                            <= expected_profile.measured_working_set_bytes
+                })
+            })
+    })
+}
+
+fn resource_measurement_probe(source: &str) -> &str {
+    source.split(';').next().unwrap_or(source).trim()
+}
+
+fn calibrated_resource_profile_is_self_consistent(
+    modality: &str,
+    profile: &catalog::CatalogModalityResourceProfile,
+) -> bool {
+    !resource_measurement_probe(&profile.measurement_source).is_empty()
+        && profile.max_item_bytes > 0
+        && profile.max_item_units > 0
+        && profile.measured_item_bytes == profile.max_item_bytes
+        && profile.measured_item_units == profile.max_item_units
+        && profile.calibration_baseline_memory_bytes > 0
+        && profile.calibration_peak_memory_bytes >= profile.calibration_baseline_memory_bytes
+        && profile.calibration_peak_memory_bytes <= profile.calibration_f13_budget_bytes
+        && profile
+            .calibration_baseline_memory_bytes
+            .saturating_add(profile.measured_working_set_bytes)
+            <= profile.calibration_f13_budget_bytes
+        && profile.measured_working_set_bytes
+            == calibrated_resource_working_set_bytes(modality, profile)
+        && profile.default_max_inflight_items == 1
+        && profile.default_max_items_per_request == 1
+}
+
+fn calibrated_resource_working_set_bytes(
+    modality: &str,
+    profile: &catalog::CatalogModalityResourceProfile,
+) -> u64 {
+    let decoded_floor = match modality {
+        "image" => profile.max_item_units.saturating_mul(3).saturating_mul(4),
+        "audio" => profile
+            .max_item_units
+            .saturating_mul(48_000)
+            .saturating_mul(4),
+        "video" => profile
+            .max_item_units
+            .saturating_mul(224)
+            .saturating_mul(224)
+            .saturating_mul(3)
+            .saturating_mul(4),
+        _ => profile.max_item_bytes,
+    }
+    .max(profile.max_item_bytes);
+    profile
+        .calibration_peak_memory_bytes
+        .saturating_sub(profile.calibration_baseline_memory_bytes)
+        .max(decoded_floor)
+        .max(1)
 }
 
 fn calibration_prompt_fingerprint_valid(method: &str, fingerprint: &str) -> bool {
     match method {
         "seed_perceptual_hash" => valid_perceptual_hash_value(fingerprint),
+        "audio_fingerprint" => mayhem_gateway::valid_audio_fingerprint(fingerprint),
         _ => is_hex_len(fingerprint, 64),
     }
 }
@@ -16216,9 +16906,9 @@ fn validate_calibration_prompt_method_value(
             )),
         },
         "audio_fingerprint" => match prompt.audio_fingerprint.as_deref() {
-            Some(value) if is_hex_len(value, 64) => {}
+            Some(value) if mayhem_gateway::valid_audio_fingerprint(value) => {}
             _ => errors.push(format!(
-                "prompt {} audio_fingerprint must be 32-byte hex",
+                "prompt {} audio_fingerprint must be a valid audiospec-v1 spectral fingerprint",
                 prompt.prompt_id
             )),
         },
@@ -16530,6 +17220,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 "llama.cpp"
                 | "mlx"
                 | "stable-diffusion.cpp"
+                | "ace-step"
                 | "transformers-asr"
                 | "whisper.cpp"
                 | "piper" => "ready",
@@ -17038,9 +17729,10 @@ fn catalog_canary_matrix_report(
                             }
                             for prompt_id in prompt_ids {
                                 match fingerprints.get(prompt_id) {
-                                    Some(fingerprint) if is_hex_len(fingerprint, 64) => {}
+                                    Some(fingerprint)
+                                        if mayhem_gateway::valid_audio_fingerprint(fingerprint) => {}
                                     Some(_) => entry_errors.push(format!(
-                                        "canary audio_fingerprints for {artifact_name} prompt {prompt_id} must be 32-byte hex"
+                                        "canary audio_fingerprints for {artifact_name} prompt {prompt_id} must be a valid audiospec-v1 spectral fingerprint"
                                     )),
                                     None => entry_errors.push(format!(
                                         "canary audio_fingerprints missing prompt {prompt_id} for artifact {artifact_name}"
@@ -17409,25 +18101,9 @@ fn catalog_calibration_backend(
     sidecar_paths: &BTreeMap<String, PathBuf>,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<Box<dyn EngineBackend>> {
-    let materialized_artifact_path;
-    let artifact_path = if artifact.engine == "transformers-asr" {
-        let paths = ProviderArtifactPaths {
-            primary: artifact_path.to_path_buf(),
-            sidecars: sidecar_paths.clone(),
-        };
-        materialized_artifact_path = materialize_transformers_asr_layout(
-            &format!("{}/{}", artifact.source.repo, artifact.path),
-            &artifact.artifact_root,
-            artifact,
-            &paths,
-        )?;
-        materialized_artifact_path.as_path()
-    } else {
-        artifact_path
-    };
     let managed_runtime = if matches!(
         artifact.engine.as_str(),
-        "mlx" | "transformers-asr" | "trt-llm" | "vllm"
+        "mlx" | "ace-step" | "transformers-asr" | "trt-llm" | "vllm"
     ) {
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let home = absolutize(home)?;
@@ -17444,12 +18120,46 @@ fn catalog_calibration_backend(
     } else {
         None
     };
+    let materialized_artifact_path;
+    let artifact_path = if artifact.engine == "transformers-asr" {
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_transformers_asr_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.artifact_root,
+            artifact,
+            &paths,
+        )?;
+        materialized_artifact_path.as_path()
+    } else if artifact.engine == "ace-step" {
+        let cache_dir = &managed_runtime
+            .as_ref()
+            .context("ACE-Step calibration runtime cache was not resolved")?
+            .1;
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_ace_step_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.artifact_root,
+            artifact,
+            &paths,
+            cache_dir,
+        )?;
+        materialized_artifact_path.as_path()
+    } else {
+        artifact_path
+    };
     let mut config = match artifact.engine.as_str() {
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
@@ -17585,6 +18295,19 @@ fn catalog_calibration_backend(
                 .context("loading stable-diffusion.cpp canary calibration artifact")?;
             Ok(Box::new(backend))
         }
+        "ace-step" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("ACE-Step calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::AceStepBackend::with_python(python)
+                .context("initializing ACE-Step backend")?;
+            backend
+                .load(config)
+                .context("loading ACE-Step canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
         "transformers-asr" => {
             let python = &managed_runtime
                 .as_ref()
@@ -17624,6 +18347,7 @@ fn calibrate_canary_prompt(
     prompt: &CanaryPrompt,
     seed: u32,
     include_output: bool,
+    artifact_output_dir: Option<&Path>,
 ) -> Result<CanaryCalibrationPromptReport> {
     match model.canary.verification_method.as_str() {
         "token_fingerprint" => {
@@ -17634,7 +18358,9 @@ fn calibrate_canary_prompt(
         }
         "embedding_cosine" => calibrate_embedding_cosine_prompt(backend, prompt),
         "transcript_match" => calibrate_transcript_match_prompt(backend, prompt, include_output),
-        "audio_fingerprint" => calibrate_audio_fingerprint_prompt(backend, prompt),
+        "audio_fingerprint" => {
+            calibrate_audio_fingerprint_prompt(backend, model, prompt, artifact_output_dir)
+        }
         other => bail!(
             "catalog calibrate-canary does not support verification_method {other}; attestation-only descriptors do not produce output fingerprints"
         ),
@@ -17722,10 +18448,13 @@ fn calibrate_token_canary_prompt_with_speciality(
         word_timestamps: Vec::new(),
         segment_timestamps: Vec::new(),
         audio_fingerprint: None,
+        retained_artifacts: Vec::new(),
         resource_items: calibration_chat_resource_items(&body)?,
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: include_output.then_some(output.text),
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
     })
 }
 
@@ -17806,10 +18535,13 @@ fn calibrate_image_perceptual_hash_prompt(
         word_timestamps: Vec::new(),
         segment_timestamps: Vec::new(),
         audio_fingerprint: None,
+        retained_artifacts: Vec::new(),
         resource_items,
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: None,
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
     })
 }
 
@@ -17865,10 +18597,13 @@ fn calibrate_embedding_cosine_prompt(
         word_timestamps: Vec::new(),
         segment_timestamps: Vec::new(),
         audio_fingerprint: None,
+        retained_artifacts: Vec::new(),
         resource_items,
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: None,
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
     })
 }
 
@@ -17919,10 +18654,13 @@ fn calibrate_transcript_match_prompt(
         word_timestamps: output.words.clone(),
         segment_timestamps: output.segments.clone(),
         audio_fingerprint: None,
+        retained_artifacts: Vec::new(),
         resource_items,
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: include_output.then_some(output.text),
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
     };
     validate_transcript_calibration_prompt_evidence(prompt, &report)?;
     Ok(report)
@@ -18036,46 +18774,165 @@ fn validate_transcript_calibration_prompt_evidence(
 
 fn calibrate_audio_fingerprint_prompt(
     backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
     prompt: &CanaryPrompt,
+    artifact_output_dir: Option<&Path>,
 ) -> Result<CanaryCalibrationPromptReport> {
-    let request = SpeechRequest {
-        input: canary_prompt_text(prompt)?,
-        voice: prompt.voice.clone(),
-        response_format: Some(
-            prompt
-                .response_format
-                .clone()
-                .unwrap_or_else(|| "wav".to_owned()),
-        ),
-        speed: None,
-    };
     let mut artifacts = Vec::new();
-    let speech = backend
-        .synthesize_speech(
-            request,
-            &mut |chunk: ArtifactChunk| {
-                artifacts.push(chunk);
-                Ok(())
-            },
-            &CancellationToken::new(),
-        )
-        .with_context(|| format!("synthesizing TTS canary prompt {}", prompt.id))?;
+    let mut expected_artifact_count = 1_usize;
+    let (output_seconds, witness_usage) = match model.model_class.as_str() {
+        "tts" => {
+            let request = SpeechRequest {
+                input: canary_prompt_text(prompt)?,
+                voice: prompt.voice.clone(),
+                response_format: Some(
+                    prompt
+                        .response_format
+                        .clone()
+                        .unwrap_or_else(|| "wav".to_owned()),
+                ),
+                speed: None,
+            };
+            let input_characters = u64::try_from(request.input.chars().count())
+                .context("TTS canary input character count overflowed u64")?;
+            let output_seconds = backend
+                .synthesize_speech(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifacts.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
+                .with_context(|| format!("synthesizing TTS canary prompt {}", prompt.id))?
+                .audio_seconds;
+            (
+                output_seconds,
+                provider_audio_speech_usage(input_characters, output_seconds),
+            )
+        }
+        "audio-generation" | "music-generation" => {
+            let body = provider_canary_self_test_body(model, prompt)?;
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .with_context(|| {
+                        format!(
+                            "{} canary prompt {} violates its signed endpoint contract",
+                            model.model_class, prompt.id
+                        )
+                    })?;
+            let verified =
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)?;
+            expected_artifact_count = verified
+                .request
+                .get("n")
+                .and_then(Value::as_u64)
+                .map(usize::try_from)
+                .transpose()
+                .context("audio canary artifact count exceeds this platform")?
+                .unwrap_or(1);
+            ensure!(
+                expected_artifact_count == 1,
+                "audio fingerprint canary prompt {} must request exactly one artifact",
+                prompt.id
+            );
+            let input_characters =
+                provider_media_generation_input_characters(&verified.family, &verified.request)?;
+            let request =
+                provider_media_generation_request_from_body(&verified.family, &verified.request)?;
+            let output = if model.model_class == "music-generation" {
+                backend.generate_music(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifacts.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
+            } else {
+                backend.generate_audio(
+                    request,
+                    &mut |chunk: ArtifactChunk| {
+                        artifacts.push(chunk);
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                )
+            }
+            .with_context(|| {
+                format!(
+                    "generating {} canary prompt {}",
+                    model.model_class, prompt.id
+                )
+            })?;
+            (
+                output.duration_seconds,
+                provider_audio_generation_usage(input_characters, output.duration_seconds),
+            )
+        }
+        other => bail!("audio_fingerprint calibration is not wired for model class {other}"),
+    };
     let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
+    ensure!(
+        artifacts.len() == expected_artifact_count,
+        "audio canary prompt {} returned {} artifacts, expected {}",
+        prompt.id,
+        artifacts.len(),
+        expected_artifact_count
+    );
     let artifact = artifacts
         .iter()
         .find(|artifact| artifact.content_type == "audio/wav")
         .or_else(|| artifacts.first())
-        .with_context(|| format!("TTS canary prompt {} produced no audio artifact", prompt.id))?;
+        .with_context(|| {
+            format!(
+                "audio canary prompt {} produced no audio artifact",
+                prompt.id
+            )
+        })?;
+    let measured_seconds = audio_duration_seconds_ceil(&artifact.bytes)
+        .with_context(|| format!("audio canary prompt {} returned invalid audio", prompt.id))?;
+    ensure!(
+        output_seconds > 0,
+        "audio canary prompt {} reported zero output seconds",
+        prompt.id
+    );
+    ensure!(
+        output_seconds.abs_diff(measured_seconds) <= 1,
+        "audio canary prompt {} reported {}s but encoded audio measures {}s",
+        prompt.id,
+        output_seconds,
+        measured_seconds
+    );
     let fingerprint = audio_fingerprint(&artifact.bytes);
+    let retained_artifacts = artifact_output_dir
+        .map(|output_dir| write_calibration_artifacts(output_dir, &prompt.id, &artifacts))
+        .transpose()?
+        .unwrap_or_default();
     let resource_items = BTreeMap::from([(
         "audio".to_owned(),
         CanaryCalibrationResourceItem {
             unit: "second".to_owned(),
             item_count: 1,
             item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX),
-            item_units: speech.audio_seconds.max(1),
+            item_units: measured_seconds.max(1),
         },
     )]);
+    let behavioral_witness = ProviderSessionOutput {
+        content: String::new(),
+        reasoning_evidence: String::new(),
+        tools: Vec::new(),
+        embeddings: None,
+        transcription: None,
+        artifacts: artifacts.clone(),
+        finish_reason: "stop".to_owned(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        token_ids: Vec::new(),
+        usage: witness_usage,
+        usage_attribution: BTreeMap::new(),
+    };
+    let behavioral_output_fingerprint = provider_session_output_fingerprint(&behavioral_witness);
     Ok(CanaryCalibrationPromptReport {
         prompt_id: prompt.id.clone(),
         max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
@@ -18095,11 +18952,61 @@ fn calibrate_audio_fingerprint_prompt(
         word_timestamps: Vec::new(),
         segment_timestamps: Vec::new(),
         audio_fingerprint: Some(fingerprint),
+        retained_artifacts,
         resource_items,
         calibration_baseline_memory_bytes: 0,
         calibration_peak_memory_bytes: 0,
         output_text: None,
+        behavioral_output_fingerprint: Some(behavioral_output_fingerprint),
+        behavioral_witness: Some(behavioral_witness),
     })
+}
+
+fn write_calibration_artifacts(
+    output_dir: &Path,
+    prompt_id: &str,
+    artifacts: &[ProviderSessionArtifact],
+) -> Result<Vec<RetainedCalibrationArtifact>> {
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "creating calibration artifact output {}",
+            output_dir.display()
+        )
+    })?;
+    let prompt_id = safe_path_component(prompt_id);
+    let mut retained = Vec::with_capacity(artifacts.len());
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let extension = match artifact.content_type.as_str() {
+            "audio/aac" => "aac",
+            "audio/flac" => "flac",
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/ogg" | "audio/opus" => "opus",
+            "audio/wav" | "audio/x-wav" => "wav",
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "video/mp4" => "mp4",
+            "video/webm" => "webm",
+            other => bail!("cannot persist calibration artifact content type {other}"),
+        };
+        let file_name = format!("{prompt_id}-{index}.{extension}");
+        let path = output_dir.join(&file_name);
+        fs::write(&path, &artifact.bytes)
+            .with_context(|| format!("writing calibration artifact {}", path.display()))?;
+        let persisted = fs::read(&path)
+            .with_context(|| format!("reading calibration artifact {}", path.display()))?;
+        ensure!(
+            persisted == artifact.bytes,
+            "retained calibration artifact {} failed its write-back verification",
+            path.display()
+        );
+        retained.push(RetainedCalibrationArtifact {
+            file_name,
+            content_type: artifact.content_type.clone(),
+            bytes: u64::try_from(persisted.len()).unwrap_or(u64::MAX),
+            sha256: sha256_bytes_hex(&persisted),
+        });
+    }
+    Ok(retained)
 }
 
 fn canary_prompt_text(prompt: &CanaryPrompt) -> Result<String> {
@@ -20963,7 +21870,7 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 }
 
 fn backend_supports_tool_calls(backend: &str) -> bool {
-    !matches!(backend, "mlx" | "transformers-asr" | "trt-llm")
+    !matches!(backend, "mlx" | "ace-step" | "transformers-asr" | "trt-llm")
 }
 
 #[derive(Debug)]
@@ -31050,6 +31957,24 @@ struct CanaryPrompt {
     #[serde(default)]
     input: Option<String>,
     #[serde(default)]
+    lyrics: Option<String>,
+    #[serde(default)]
+    instrumental: Option<bool>,
+    #[serde(default)]
+    duration_seconds: Option<u64>,
+    #[serde(default)]
+    bpm: Option<u32>,
+    #[serde(default)]
+    keyscale: Option<String>,
+    #[serde(default)]
+    timesignature: Option<String>,
+    #[serde(default)]
+    task_type: Option<String>,
+    #[serde(default)]
+    thinking: Option<bool>,
+    #[serde(default)]
+    guidance_scale: Option<f32>,
+    #[serde(default)]
     audio_b64: Option<String>,
     #[serde(default)]
     audio_repeat_count: Option<u32>,
@@ -31077,6 +32002,8 @@ struct CanaryPrompt {
     size: Option<String>,
     #[serde(default)]
     steps: Option<u32>,
+    #[serde(default)]
+    n: Option<u32>,
     #[serde(default)]
     cfg_scale: Option<f32>,
     #[serde(default)]
@@ -31167,11 +32094,25 @@ struct CanaryCalibrationPromptReport {
     segment_timestamps: Vec<mayhem_engine::AudioTranscriptionTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audio_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_artifacts: Vec<RetainedCalibrationArtifact>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     resource_items: BTreeMap<String, CanaryCalibrationResourceItem>,
     calibration_baseline_memory_bytes: u64,
     calibration_peak_memory_bytes: u64,
     output_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    behavioral_output_fingerprint: Option<String>,
+    #[serde(skip)]
+    behavioral_witness: Option<ProviderSessionOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct RetainedCalibrationArtifact {
+    file_name: String,
+    content_type: String,
+    bytes: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -40721,6 +41662,7 @@ fn provider_backend_runtime_child_env(
             insert_path("MAYHEM_TRTLLM_CUDA_HOME", runtime.cuda_home.as_deref());
         }
         "mlx" => insert_path("MAYHEM_MLX_PYTHON", runtime.python.as_deref()),
+        "ace-step" => insert_path("MAYHEM_ACE_STEP_PYTHON", runtime.python.as_deref()),
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
         }
@@ -40897,7 +41839,7 @@ fn provider_backend_runtime_preflight_for_backend(
 ) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
-        "vllm" | "trt-llm" | "mlx" | "transformers-asr" => {
+        "vllm" | "trt-llm" | "mlx" | "ace-step" | "transformers-asr" => {
             let python = python_runtime::ensure_backend_python(home, backend)
                 .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
@@ -48635,6 +49577,7 @@ fn backend_rank(backend: &str) -> u8 {
         "vllm" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
+        "ace-step" => 2,
         "transformers-asr" => 2,
         "llama.cpp" => 1,
         "stable-diffusion.cpp" | "whisper.cpp" | "piper" => 0,
@@ -51697,12 +52640,29 @@ fn provider_session_modality_load(
         }
         "audio_generation" | "music_generation" => {
             let request = provider_media_generation_request_from_body(family, body)?;
+            let output_item_count = request
+                .request
+                .get("n")
+                .and_then(Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .context("media generation n overflowed u32")?
+                .unwrap_or(1)
+                .max(1);
+            let inline_audio = artifact_generation_inline_audio_load(&request.request)
+                .map_err(anyhow::Error::msg)?;
+            let item_count = output_item_count.max(inline_audio.item_count);
+            let max_item_units = request
+                .duration_seconds
+                .unwrap_or(inline_audio.max_item_seconds.max(1))
+                .max(inline_audio.max_item_seconds)
+                .max(1);
             Ok(BTreeMap::from([(
                 "audio".to_owned(),
                 ModalityRequestLoad {
-                    item_count: 1,
-                    max_item_bytes: 1,
-                    max_item_units: request.duration_seconds.unwrap_or(1).max(1),
+                    item_count,
+                    max_item_bytes: inline_audio.max_item_bytes.max(1),
+                    max_item_units,
                 },
             )]))
         }
@@ -54841,6 +55801,23 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "ace-step" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("ACE-Step runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::AceStepBackend::with_python(python)
+                .context("initializing ACE-Step provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "ACE-Step engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading ACE-Step provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         "transformers-asr" => {
             let python = ctx
                 .backend_runtime
@@ -55135,12 +56112,19 @@ fn provider_canary_self_test_body(
             }
             Ok(body)
         }
-        "video-generation" => Ok(json!({
-            "kind": "video_generation",
-            "prompt": canary_prompt_text(prompt)?,
-            "seconds": "4",
-            "size": prompt.size.clone().unwrap_or_else(|| "1280x720".to_owned()),
-        })),
+        "video-generation" => {
+            let mut body = json!({
+                "kind": "video_generation",
+                "prompt": canary_prompt_text(prompt)?,
+            });
+            if let Some(duration) = prompt.duration_seconds {
+                body["seconds"] = json!(duration.to_string());
+            }
+            if let Some(size) = &prompt.size {
+                body["size"] = json!(size);
+            }
+            Ok(body)
+        }
         "stt" => {
             let audio = base64::engine::general_purpose::STANDARD
                 .decode(
@@ -55183,27 +56167,79 @@ fn provider_canary_self_test_body(
             let mut body = json!({
                 "kind": "audio_speech",
                 "input": canary_prompt_text(prompt)?,
-                "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
             });
             if let Some(voice) = &prompt.voice {
                 body["voice"] = json!(voice);
             }
+            if let Some(response_format) = &prompt.response_format {
+                body["response_format"] = json!(response_format);
+            }
             Ok(body)
         }
-        "audio-generation" => Ok(json!({
-            "kind": "audio_generation",
-            "prompt": canary_prompt_text(prompt)?,
-            "duration_seconds": 1.0,
-            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
-            "seed": prompt.seed.unwrap_or(7),
-        })),
-        "music-generation" => Ok(json!({
-            "kind": "music_generation",
-            "prompt": canary_prompt_text(prompt)?,
-            "duration_seconds": 1.0,
-            "response_format": prompt.response_format.clone().unwrap_or_else(|| "wav".to_owned()),
-            "seed": prompt.seed.unwrap_or(7),
-        })),
+        "audio-generation" => {
+            let mut body = json!({
+                "kind": "audio_generation",
+                "prompt": canary_prompt_text(prompt)?,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("audio-generation canary body is an object");
+            for (name, value) in [
+                ("duration_seconds", prompt.duration_seconds.map(Value::from)),
+                (
+                    "response_format",
+                    prompt.response_format.clone().map(Value::from),
+                ),
+                ("temperature", prompt.temperature.map(Value::from)),
+                ("top_k", prompt.top_k.map(Value::from)),
+                ("top_p", prompt.top_p.map(Value::from)),
+                ("guidance_scale", prompt.guidance_scale.map(Value::from)),
+                ("seed", prompt.seed.map(Value::from)),
+            ] {
+                if let Some(value) = value {
+                    object.insert(name.to_owned(), value);
+                }
+            }
+            Ok(body)
+        }
+        "music-generation" => {
+            let mut body = json!({
+                "kind": "music_generation",
+                "prompt": canary_prompt_text(prompt)?,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("music-generation canary body is an object");
+            for (name, value) in [
+                ("lyrics", prompt.lyrics.clone().map(Value::from)),
+                ("instrumental", prompt.instrumental.map(Value::from)),
+                ("duration_seconds", prompt.duration_seconds.map(Value::from)),
+                ("bpm", prompt.bpm.map(Value::from)),
+                ("keyscale", prompt.keyscale.clone().map(Value::from)),
+                (
+                    "timesignature",
+                    prompt.timesignature.clone().map(Value::from),
+                ),
+                ("task_type", prompt.task_type.clone().map(Value::from)),
+                ("thinking", prompt.thinking.map(Value::from)),
+                ("steps", prompt.steps.map(Value::from)),
+                ("n", prompt.n.map(Value::from)),
+                ("temperature", prompt.temperature.map(Value::from)),
+                ("top_k", prompt.top_k.map(Value::from)),
+                ("top_p", prompt.top_p.map(Value::from)),
+                ("guidance_scale", prompt.guidance_scale.map(Value::from)),
+                (
+                    "response_format",
+                    prompt.response_format.clone().map(Value::from),
+                ),
+                ("seed", prompt.seed.map(Value::from)),
+            ] {
+                if let Some(value) = value {
+                    object.insert(name.to_owned(), value);
+                }
+            }
+            Ok(body)
+        }
         other => bail!("functional modality self-test is not wired for model_class {other}"),
     }
 }
@@ -55337,6 +56373,12 @@ fn provider_engine_load_config(
         materialized_trt_engine_dir = Some(layout.engine_dir);
     } else if selected.artifact.engine == "vllm" {
         artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "ace-step" {
+        let cache_dir = backend_runtime
+            .cache_dir
+            .as_deref()
+            .context("ACE-Step provider runtime cache was not resolved")?;
+        artifact_path_buf = materialize_ace_step_artifacts(selected, artifact_paths, cache_dir)?;
     } else if selected.artifact.engine == "transformers-asr" {
         artifact_path_buf = materialize_transformers_asr_artifacts(selected, artifact_paths)?;
     }
@@ -55347,6 +56389,7 @@ fn provider_engine_load_config(
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
+        "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
         "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
         "piper" => ModelArtifact::piper_voice(artifact_path),
@@ -55363,6 +56406,7 @@ fn provider_engine_load_config(
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
@@ -55480,6 +56524,131 @@ const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("transformers_tokenizer_config", "tokenizer_config.json"),
 ];
 
+const ACE_STEP_PRIMARY_DESTINATION: &str = "acestep-v15-sft/model.safetensors";
+const ACE_STEP_REQUIRED_SIDECARS: &[(&str, &str, &str)] = &[
+    (
+        "ace_dit_config",
+        "config.json",
+        "acestep-v15-sft/config.json",
+    ),
+    (
+        "ace_dit_configuration",
+        "configuration_acestep_v15.py",
+        "acestep-v15-sft/configuration_acestep_v15.py",
+    ),
+    (
+        "ace_dit_modeling",
+        "modeling_acestep_v15_base.py",
+        "acestep-v15-sft/modeling_acestep_v15_base.py",
+    ),
+    (
+        "ace_dit_apg_guidance",
+        "apg_guidance.py",
+        "acestep-v15-sft/apg_guidance.py",
+    ),
+    (
+        "ace_dit_silence_latent",
+        "silence_latent.pt",
+        "acestep-v15-sft/silence_latent.pt",
+    ),
+    (
+        "ace_embedding_added_tokens",
+        "Qwen3-Embedding-0.6B/added_tokens.json",
+        "Qwen3-Embedding-0.6B/added_tokens.json",
+    ),
+    (
+        "ace_embedding_chat_template",
+        "Qwen3-Embedding-0.6B/chat_template.jinja",
+        "Qwen3-Embedding-0.6B/chat_template.jinja",
+    ),
+    (
+        "ace_embedding_config",
+        "Qwen3-Embedding-0.6B/config.json",
+        "Qwen3-Embedding-0.6B/config.json",
+    ),
+    (
+        "ace_embedding_merges",
+        "Qwen3-Embedding-0.6B/merges.txt",
+        "Qwen3-Embedding-0.6B/merges.txt",
+    ),
+    (
+        "ace_embedding_model",
+        "Qwen3-Embedding-0.6B/model.safetensors",
+        "Qwen3-Embedding-0.6B/model.safetensors",
+    ),
+    (
+        "ace_embedding_special_tokens",
+        "Qwen3-Embedding-0.6B/special_tokens_map.json",
+        "Qwen3-Embedding-0.6B/special_tokens_map.json",
+    ),
+    (
+        "ace_embedding_tokenizer",
+        "Qwen3-Embedding-0.6B/tokenizer.json",
+        "Qwen3-Embedding-0.6B/tokenizer.json",
+    ),
+    (
+        "ace_embedding_tokenizer_config",
+        "Qwen3-Embedding-0.6B/tokenizer_config.json",
+        "Qwen3-Embedding-0.6B/tokenizer_config.json",
+    ),
+    (
+        "ace_embedding_vocab",
+        "Qwen3-Embedding-0.6B/vocab.json",
+        "Qwen3-Embedding-0.6B/vocab.json",
+    ),
+    (
+        "ace_lm_added_tokens",
+        "acestep-5Hz-lm-1.7B/added_tokens.json",
+        "acestep-5Hz-lm-1.7B/added_tokens.json",
+    ),
+    (
+        "ace_lm_chat_template",
+        "acestep-5Hz-lm-1.7B/chat_template.jinja",
+        "acestep-5Hz-lm-1.7B/chat_template.jinja",
+    ),
+    (
+        "ace_lm_config",
+        "acestep-5Hz-lm-1.7B/config.json",
+        "acestep-5Hz-lm-1.7B/config.json",
+    ),
+    (
+        "ace_lm_merges",
+        "acestep-5Hz-lm-1.7B/merges.txt",
+        "acestep-5Hz-lm-1.7B/merges.txt",
+    ),
+    (
+        "ace_lm_model",
+        "acestep-5Hz-lm-1.7B/model.safetensors",
+        "acestep-5Hz-lm-1.7B/model.safetensors",
+    ),
+    (
+        "ace_lm_special_tokens",
+        "acestep-5Hz-lm-1.7B/special_tokens_map.json",
+        "acestep-5Hz-lm-1.7B/special_tokens_map.json",
+    ),
+    (
+        "ace_lm_tokenizer",
+        "acestep-5Hz-lm-1.7B/tokenizer.json",
+        "acestep-5Hz-lm-1.7B/tokenizer.json",
+    ),
+    (
+        "ace_lm_tokenizer_config",
+        "acestep-5Hz-lm-1.7B/tokenizer_config.json",
+        "acestep-5Hz-lm-1.7B/tokenizer_config.json",
+    ),
+    (
+        "ace_lm_vocab",
+        "acestep-5Hz-lm-1.7B/vocab.json",
+        "acestep-5Hz-lm-1.7B/vocab.json",
+    ),
+    ("ace_vae_config", "vae/config.json", "vae/config.json"),
+    (
+        "ace_vae_model",
+        "vae/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors",
+    ),
+];
+
 fn materialize_vllm_artifacts(
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
@@ -55590,6 +56759,204 @@ fn materialize_transformers_asr_layout(
         })?;
     }
     Ok(model_dir)
+}
+
+fn materialize_ace_step_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    materialize_ace_step_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+        cache_dir,
+    )
+}
+
+fn materialize_ace_step_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        artifact.path == "model.safetensors",
+        "ACE-Step primary artifact must use path model.safetensors"
+    );
+    let model_root = ace_step_checkpoint_cache_dir(cache_dir, artifact_name, artifact);
+    fs::create_dir_all(&model_root)
+        .with_context(|| format!("creating ACE-Step model layout {}", model_root.display()))?;
+
+    let primary = model_root.join(validate_catalog_artifact_relative_path(
+        ACE_STEP_PRIMARY_DESTINATION,
+    )?);
+    materialize_verified_ace_step_file(
+        &artifact_paths.primary,
+        &primary,
+        artifact.weights_bytes,
+        artifact
+            .source_sha256
+            .as_deref()
+            .context("ACE-Step primary artifact is missing source_sha256")?,
+        "ACE-Step primary artifact",
+    )?;
+
+    for (sidecar_name, expected_source_path, destination_path) in ACE_STEP_REQUIRED_SIDECARS {
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!("ACE-Step artifact {label} requires admin catalog sidecar {sidecar_name}")
+        })?;
+        ensure!(
+            sidecar.path == *expected_source_path,
+            "ACE-Step artifact {label} sidecar {} must use source path {}, got {}",
+            sidecar_name,
+            expected_source_path,
+            sidecar.path
+        );
+        let source = artifact_paths
+            .sidecars
+            .get(*sidecar_name)
+            .with_context(|| {
+                format!(
+                    "downloaded ACE-Step artifact {label} is missing admin sidecar {sidecar_name}"
+                )
+            })?;
+        let destination =
+            model_root.join(validate_catalog_artifact_relative_path(destination_path)?);
+        materialize_verified_ace_step_file(
+            source,
+            &destination,
+            sidecar.weights_bytes,
+            &sidecar.source_sha256,
+            sidecar_name,
+        )
+        .with_context(|| {
+            format!(
+                "materializing ACE-Step sidecar {} at {}",
+                sidecar_name,
+                destination.display()
+            )
+        })?;
+    }
+    ensure!(
+        artifact.sidecars.len() == ACE_STEP_REQUIRED_SIDECARS.len(),
+        "ACE-Step artifact {label} contains unapproved sidecars",
+    );
+    Ok(primary)
+}
+
+fn materialize_verified_ace_step_file(
+    source: &Path,
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<()> {
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(destination).with_context(|| {
+            format!(
+                "inspecting existing materialized {label} {}",
+                destination.display()
+            )
+        })?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "existing materialized {label} {} is not a regular file",
+            destination.display()
+        );
+        if verify_materialized_ace_step_file(destination, expected_bytes, expected_sha256, label)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        make_materialized_file_replaceable(destination, &metadata, label)?;
+        fs::remove_file(destination).with_context(|| {
+            format!(
+                "removing invalid materialized {label} {}",
+                destination.display()
+            )
+        })?;
+    }
+
+    link_or_copy_file(source, destination)?;
+    verify_materialized_ace_step_file(destination, expected_bytes, expected_sha256, label)
+}
+
+fn make_materialized_file_replaceable(
+    path: &Path,
+    metadata: &fs::Metadata,
+    label: &str,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).with_context(|| {
+                format!(
+                    "making invalid materialized {label} replaceable at {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(path, permissions).with_context(|| {
+                format!(
+                    "making invalid materialized {label} replaceable at {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).with_context(|| {
+                format!(
+                    "making invalid materialized {label} replaceable at {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_materialized_ace_step_file(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading materialized {label} {}", path.display()))?;
+    ensure!(metadata.is_file(), "{label} is not a regular file");
+    ensure!(
+        metadata.len() == expected_bytes,
+        "{label} size mismatch: expected {expected_bytes}, got {}",
+        metadata.len()
+    );
+    let actual_sha256 = file_sha256_hex(path)?;
+    ensure!(
+        actual_sha256.eq_ignore_ascii_case(expected_sha256),
+        "{label} SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+    );
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("making materialized {label} read-only"))?;
+    Ok(())
 }
 
 fn materialize_trt_llm_artifacts(
@@ -55823,6 +57190,25 @@ fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &s
     };
     base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
+}
+
+fn ace_step_checkpoint_cache_dir(
+    cache_dir: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/ace-step/materialized-layout/v1\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(&(name.len() as u64).to_be_bytes());
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+    }
+    cache_dir
+        .join("models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn trt_kv_cache_dtype_for_artifact(
@@ -57427,8 +58813,8 @@ fn provider_engine_session_response_with_sampling_bounded(
     ) {
         let request = provider_media_generation_request_from_body(endpoint_family, request_body)?;
         let requested_duration = request.duration_seconds;
-        let input_characters = u64::try_from(request.prompt.chars().count())
-            .context("media generation prompt character count overflowed u64")?;
+        let input_characters =
+            provider_media_generation_input_characters(endpoint_family, &request.request)?;
         let mut artifact_chunks = Vec::new();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -57459,8 +58845,8 @@ fn provider_engine_session_response_with_sampling_bounded(
         );
         if let Some(expected) = requested_duration {
             ensure!(
-                output.duration_seconds == expected,
-                "provider audio engine returned {} seconds, expected {expected}",
+                output.duration_seconds.abs_diff(expected) <= 1,
+                "provider audio engine returned {} seconds, expected approximately {expected}",
                 output.duration_seconds
             );
         }
@@ -57472,6 +58858,38 @@ fn provider_engine_session_response_with_sampling_bounded(
                     .all(|artifact| artifact.content_type.starts_with("audio/")),
             "provider audio generation engine produced no valid audio artifact"
         );
+        let mut measured_audio_seconds = 0_u64;
+        for artifact in &artifacts {
+            let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
+                format!(
+                    "provider audio engine returned invalid {} bytes",
+                    artifact.content_type
+                )
+            })?;
+            ensure!(
+                provider_audio_content_type_matches_format(&artifact.content_type, metadata.format),
+                "provider audio engine content type {} does not match the encoded audio format",
+                artifact.content_type
+            );
+            ensure!(
+                output
+                    .duration_seconds
+                    .abs_diff(metadata.duration_seconds_ceil)
+                    <= 1,
+                "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
+                output.duration_seconds,
+                metadata.duration_seconds_ceil
+            );
+            if let Some(expected) = requested_duration {
+                ensure!(
+                    expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
+                    "provider audio artifact measures {} seconds, expected {expected}",
+                    metadata.duration_seconds_ceil
+                );
+            }
+            measured_audio_seconds =
+                measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
+        }
         if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
             ensure!(
                 artifacts.iter().all(|artifact| {
@@ -57492,7 +58910,7 @@ fn provider_engine_session_response_with_sampling_bounded(
             prompt_tokens: 0,
             completion_tokens: 0,
             token_ids: Vec::new(),
-            usage: provider_audio_generation_usage(input_characters, output.duration_seconds),
+            usage: provider_audio_generation_usage(input_characters, measured_audio_seconds),
             usage_attribution: BTreeMap::new(),
         });
     }
@@ -57840,6 +59258,7 @@ fn provider_image_generation_request_from_body(
     };
     let prompt = body
         .get(prompt_key)
+        .or_else(|| body.get("caption"))
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .context("image_generation request missing prompt")?
@@ -57983,12 +59402,20 @@ fn provider_media_generation_request_from_body(
     let prompt = body
         .get(prompt_key)
         .and_then(Value::as_str)
-        .filter(|prompt| !prompt.trim().is_empty())
-        .context("media generation request missing prompt")?
+        .unwrap_or_default()
         .to_owned();
+    ensure!(
+        !prompt.trim().is_empty()
+            || endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        "media generation request missing prompt"
+    );
     let duration_seconds = body
         .get("duration_seconds")
         .and_then(provider_duration_seconds_ceil)
+        .or_else(|| {
+            body.get("duration")
+                .and_then(provider_duration_seconds_ceil)
+        })
         .or_else(|| {
             parameters
                 .and_then(|parameters| parameters.get("duration_seconds"))
@@ -58023,6 +59450,8 @@ fn provider_media_generation_request_from_body(
     let step_count = parameters
         .and_then(|parameters| parameters.get("num_inference_steps"))
         .and_then(Value::as_u64)
+        .or_else(|| body.get("inference_steps").and_then(Value::as_u64))
+        .or_else(|| body.get("steps").and_then(Value::as_u64))
         .or_else(|| {
             generation_parameters
                 .and_then(|parameters| parameters.get("max_new_tokens"))
@@ -58031,6 +59460,7 @@ fn provider_media_generation_request_from_body(
         .or_else(|| body.get("max_new_tokens").and_then(Value::as_u64));
     let response_format = body
         .get("response_format")
+        .or_else(|| body.get("format"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let request = EngineMediaGenerationRequest {
@@ -58083,6 +59513,40 @@ fn provider_audio_speech_usage(input_characters: u64, audio_seconds: u64) -> Rec
         (USAGE_INPUT_CHARACTER, input_characters),
         (USAGE_AUDIO_SECOND, audio_seconds),
     ])
+}
+
+fn provider_media_generation_input_characters(
+    endpoint_family: &str,
+    request: &Value,
+) -> Result<u64> {
+    Ok(mayhem_proto::artifact_generation_input_characters(
+        endpoint_family,
+        request,
+    ))
+}
+
+fn provider_audio_content_type_matches_format(
+    content_type: &str,
+    format: mayhem_proto::ValidatedAudioFormat,
+) -> bool {
+    match format {
+        mayhem_proto::ValidatedAudioFormat::Wav => {
+            matches!(content_type, "audio/wav" | "audio/x-wav")
+        }
+        mayhem_proto::ValidatedAudioFormat::Flac => content_type == "audio/flac",
+        mayhem_proto::ValidatedAudioFormat::Mp3 => {
+            matches!(content_type, "audio/mpeg" | "audio/mp3")
+        }
+        mayhem_proto::ValidatedAudioFormat::Opus => {
+            matches!(content_type, "audio/ogg" | "audio/opus")
+        }
+        mayhem_proto::ValidatedAudioFormat::Aac => {
+            matches!(
+                content_type,
+                "audio/aac" | "audio/m4a" | "audio/mp4" | "audio/x-m4a"
+            )
+        }
+    }
 }
 
 fn provider_video_generation_usage(video_seconds: u64, frame_count: u64) -> ReceiptUsage {
@@ -59575,6 +61039,9 @@ fn detected_audio_content_type(bytes: &[u8]) -> Option<&'static str> {
     match validated_audio_metadata(bytes)?.format {
         ValidatedAudioFormat::Wav => Some("audio/wav"),
         ValidatedAudioFormat::Flac => Some("audio/flac"),
+        ValidatedAudioFormat::Mp3 => Some("audio/mpeg"),
+        ValidatedAudioFormat::Opus => Some("audio/ogg"),
+        ValidatedAudioFormat::Aac => Some("audio/mp4"),
     }
 }
 
@@ -60878,6 +62345,59 @@ mod tests {
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn ace_step_materialization_reuses_and_repairs_read_only_files() {
+        let temp = test_temp_dir("mayhem-ace-materialized-readonly");
+        let source = temp.join("source/model.safetensors");
+        let destination = temp.join("layout/acestep-v15-sft/model.safetensors");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&source, b"canonical-ace-step-weights").unwrap();
+        fs::copy(&source, &destination).unwrap();
+        let expected_sha256 = file_sha256_hex(&source).unwrap();
+        let expected_bytes = fs::metadata(&source).unwrap().len();
+
+        let mut permissions = fs::metadata(&destination).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&destination, permissions).unwrap();
+        materialize_verified_ace_step_file(
+            &source,
+            &destination,
+            expected_bytes,
+            &expected_sha256,
+            "test weights",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"canonical-ace-step-weights"
+        );
+        assert!(fs::metadata(&destination).unwrap().permissions().readonly());
+
+        let metadata = fs::metadata(&destination).unwrap();
+        make_materialized_file_replaceable(&destination, &metadata, "test weights").unwrap();
+        fs::write(&destination, b"stale-materialized-weights").unwrap();
+        let mut permissions = fs::metadata(&destination).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&destination, permissions).unwrap();
+        materialize_verified_ace_step_file(
+            &source,
+            &destination,
+            expected_bytes,
+            &expected_sha256,
+            "test weights",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"canonical-ace-step-weights"
+        );
+
+        let metadata = fs::metadata(&destination).unwrap();
+        make_materialized_file_replaceable(&destination, &metadata, "test weights").unwrap();
+        let _ = fs::remove_dir_all(temp);
+    }
+
     fn weak_identity_key_and_signature() -> (String, String) {
         let mut weak_key = [0_u8; 32];
         weak_key[0] = 1;
@@ -61031,6 +62551,9 @@ mod tests {
         artifact_chunks: Vec<ArtifactChunk>,
         repeat_image_artifact_to_count: bool,
         image_generation_calls: usize,
+        music_generation_calls: usize,
+        media_validation_enabled: bool,
+        media_validation_calls: usize,
         last_request: Option<GenerateRequest>,
         last_image_request: Option<EngineImageGenerationRequest>,
         last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
@@ -61150,6 +62673,9 @@ mod tests {
                 artifact_chunks: Vec::new(),
                 repeat_image_artifact_to_count: false,
                 image_generation_calls: 0,
+                music_generation_calls: 0,
+                media_validation_enabled: false,
+                media_validation_calls: 0,
                 last_request: None,
                 last_image_request: None,
                 last_embedding_request: None,
@@ -61168,6 +62694,11 @@ mod tests {
 
         fn with_repeated_image_artifact(mut self) -> Self {
             self.repeat_image_artifact_to_count = true;
+            self
+        }
+
+        fn with_media_validation(mut self) -> Self {
+            self.media_validation_enabled = true;
             self
         }
     }
@@ -61322,6 +62853,7 @@ mod tests {
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
             _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
+            self.music_generation_calls = self.music_generation_calls.saturating_add(1);
             let output = mayhem_engine::MediaGenerationOutput {
                 duration_seconds: request.duration_seconds.unwrap_or(1),
                 frame_count: 0,
@@ -61332,6 +62864,39 @@ mod tests {
                 artifact_sink.on_artifact_chunk(chunk)?;
             }
             Ok(output)
+        }
+
+        fn validate_media_generation(
+            &mut self,
+            request: EngineMediaGenerationRequest,
+            _cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<Option<mayhem_engine::MediaGenerationValidation>> {
+            if !self.media_validation_enabled {
+                return Ok(None);
+            }
+            fn collect(value: &Value, prefix: &str, paths: &mut BTreeSet<String>) {
+                let Value::Object(object) = value else {
+                    return;
+                };
+                for (name, child) in object {
+                    let path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    paths.insert(path.clone());
+                    collect(child, &path, paths);
+                }
+            }
+            self.media_validation_calls = self.media_validation_calls.saturating_add(1);
+            let mut handled_request_attributes = BTreeSet::new();
+            collect(&request.request, "", &mut handled_request_attributes);
+            Ok(Some(mayhem_engine::MediaGenerationValidation {
+                evidence: serde_json::to_value(&request).map_err(|error| {
+                    mayhem_engine::EngineError::InvalidConfig(error.to_string())
+                })?,
+                handled_request_attributes,
+            }))
         }
     }
 
@@ -61385,6 +62950,65 @@ mod tests {
             (source.len() - 44) * 130
         );
         assert_eq!(source.len(), 32_044);
+    }
+
+    #[test]
+    fn retained_calibration_artifact_is_report_bound_after_read_back() {
+        let output_dir = test_temp_dir("mayhem-retained-calibration");
+        let bytes = tiny_wav_bytes(16_000);
+        let artifacts = vec![ProviderSessionArtifact {
+            id: "music-1".to_owned(),
+            content_type: "audio/wav".to_owned(),
+            bytes: bytes.clone(),
+        }];
+
+        let retained =
+            write_calibration_artifacts(&output_dir, "music/canary", &artifacts).unwrap();
+
+        assert_eq!(
+            retained,
+            vec![RetainedCalibrationArtifact {
+                file_name: "music_canary-0.wav".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                bytes: u64::try_from(bytes.len()).unwrap(),
+                sha256: sha256_bytes_hex(&bytes),
+            }]
+        );
+        assert_eq!(
+            fs::read(output_dir.join(&retained[0].file_name)).unwrap(),
+            bytes
+        );
+        fs::remove_dir_all(output_dir).unwrap();
+    }
+
+    #[test]
+    fn resumed_endpoint_witness_loads_only_hash_bound_retained_artifacts() {
+        let output_dir = test_temp_dir("mayhem-resumed-endpoint-witness");
+        let report_path = output_dir.join("report.json");
+        let bytes = tiny_wav_bytes(16_000);
+        let file_name = "music-canary.wav";
+        fs::write(output_dir.join(file_name), &bytes).unwrap();
+        let mut report = test_calibration_report("aa".repeat(32), None);
+        report.prompts[0].behavioral_output_fingerprint = Some("bb".repeat(32));
+        report.prompts[0].retained_artifacts = vec![RetainedCalibrationArtifact {
+            file_name: file_name.to_owned(),
+            content_type: "audio/wav".to_owned(),
+            bytes: u64::try_from(bytes.len()).unwrap(),
+            sha256: sha256_bytes_hex(&bytes),
+        }];
+
+        let witness = resumed_endpoint_behavioral_witness(&report_path, None, &report)
+            .unwrap()
+            .expect("retained endpoint witness");
+        assert_eq!(witness.fingerprint, "bb".repeat(32));
+        assert_eq!(witness.output.artifacts.len(), 1);
+        assert_eq!(witness.output.artifacts[0].bytes, bytes);
+
+        fs::write(output_dir.join(file_name), b"tampered").unwrap();
+        let error = resumed_endpoint_behavioral_witness(&report_path, None, &report)
+            .expect_err("tampered retained artifact must fail");
+        assert!(error.to_string().contains("bytes, expected"), "{error:#}");
+        fs::remove_dir_all(output_dir).unwrap();
     }
 
     #[test]
@@ -66685,6 +68309,7 @@ mod tests {
             "mmproj".to_owned(),
             catalog::CatalogArtifactSidecar {
                 source: artifact.source.clone(),
+                upstream_source: None,
                 path: "mmproj.gguf".to_owned(),
                 artifact_root: "bb".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -70701,6 +72326,75 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn media_provider_canaries_use_each_signed_duration_default() {
+        for (model_class, endpoint_family, transport_kind) in [
+            (
+                "audio-generation",
+                mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+                "audio_generation",
+            ),
+            (
+                "music-generation",
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+                "music_generation",
+            ),
+        ] {
+            let mut model = test_catalog(&"aa".repeat(32)).models.remove(0);
+            model.model_class = model_class.to_owned();
+            model.adapter.endpoint_families = vec![
+                mayhem_proto::endpoint_family_contract_template(endpoint_family)
+                    .expect("media endpoint contract"),
+            ];
+            let contract = model.adapter.endpoint_families.first_mut().unwrap();
+            let duration = contract
+                .request_attribute_specs
+                .get_mut("duration_seconds")
+                .expect("duration_seconds media attribute");
+            duration.minimum = Some(10.0);
+            duration.maximum = Some(600.0);
+            duration.default = Some(json!(10));
+
+            let defaulted_prompt: CanaryPrompt = serde_json::from_value(json!({
+                "id": "signed-media-defaults",
+                "prompt": "a short calibration sound"
+            }))
+            .unwrap();
+            let body = provider_canary_self_test_body(&model, &defaulted_prompt).unwrap();
+            assert_eq!(body["kind"], transport_kind);
+            assert!(body.get("duration_seconds").is_none());
+            assert!(body.get("response_format").is_none());
+            assert!(body.get("seed").is_none());
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap();
+            assert_eq!(sealed["contract_request"]["duration_seconds"], 10);
+
+            let explicit_prompt: CanaryPrompt = serde_json::from_value(json!({
+                "id": "explicit-media-values",
+                "prompt": "a short calibration sound",
+                "duration_seconds": 12,
+                "response_format": "wav",
+                "seed": 11,
+                "n": 1
+            }))
+            .unwrap();
+            let explicit = provider_canary_self_test_body(&model, &explicit_prompt).unwrap();
+            assert_eq!(explicit["duration_seconds"], 12);
+            assert_eq!(explicit["response_format"], "wav");
+            assert_eq!(explicit["seed"], 11);
+            if model_class == "music-generation" {
+                assert_eq!(explicit["n"], 1);
+            } else {
+                assert!(explicit.get("n").is_none());
+            }
+            let sealed =
+                provider_seal_local_contract_request(&explicit, &model.adapter, &model.model_id)
+                    .unwrap();
+            assert_eq!(sealed["contract_request"]["duration_seconds"], 12);
+        }
+    }
+
+    #[test]
     fn parakeet_provider_canaries_omit_absent_language_and_match_signed_endpoints() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
         let catalog = catalog::load_document(&catalog_path).unwrap();
@@ -70745,6 +72439,97 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &sealed,
             )
             .unwrap_or_else(|error| panic!("{} transported audio: {error:#}", prompt.id));
+        }
+    }
+
+    #[test]
+    fn ace_music_endpoint_preflight_uses_real_codec_and_repaint_fixtures() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "acestep/ace-step-1.5")
+            .expect("ACE-Step catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].response_format.as_deref(), Some("wav"));
+
+        let (_, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        assert_eq!(fixtures.audio_by_content_type.len(), 10);
+        assert!(CALIBRATION_AUDIO_AAC.starts_with(&[0xff]));
+        assert!(CALIBRATION_AUDIO_FLAC.starts_with(b"fLaC"));
+        assert_eq!(&CALIBRATION_AUDIO_M4A[4..8], b"ftyp");
+        assert!(
+            CALIBRATION_AUDIO_MP3.starts_with(b"ID3") || CALIBRATION_AUDIO_MP3.starts_with(&[0xff])
+        );
+        assert!(CALIBRATION_AUDIO_OPUS.starts_with(b"OggS"));
+        assert!(CALIBRATION_AUDIO_OPUS
+            .windows(8)
+            .any(|bytes| bytes == b"OpusHead"));
+        assert!(CALIBRATION_AUDIO_WAV.starts_with(b"RIFF"));
+        assert_eq!(&CALIBRATION_AUDIO_WAV[8..12], b"WAVE");
+
+        let max_repaint_source = calibration_music_source_wav(600.0).unwrap();
+        assert_eq!(max_repaint_source.len(), 44 + 600 * 8_000 * 2);
+        assert_eq!(
+            u32::from_le_bytes(max_repaint_source[40..44].try_into().unwrap()) as usize,
+            max_repaint_source.len() - 44
+        );
+
+        catalog_endpoint_calibration_preflight(model, &prompts)
+            .expect("ACE-Step endpoint matrix preflight");
+
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .expect("ACE-Step music endpoint contract");
+        for case in mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap() {
+            if !case.expect_accept {
+                continue;
+            }
+            let request =
+                mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
+                    .unwrap();
+            let request = catalog_endpoint_calibration_materialize_request(
+                contract, &case, request, &fixtures,
+            )
+            .unwrap();
+            for root in [
+                "source_audio",
+                "src_audio",
+                "ctx_audio",
+                "reference_audio",
+                "melody",
+                "ref_audio",
+            ] {
+                let Some(audio) = request.get(root).and_then(Value::as_object) else {
+                    continue;
+                };
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(audio["data"].as_str().expect("inline audio data"))
+                    .unwrap_or_else(|error| {
+                        panic!("{} {root} invalid base64: {error}", case.case_id)
+                    });
+                let metadata = validated_audio_metadata(&bytes).unwrap_or_else(|| {
+                    panic!("{} {root} has no valid audio signature", case.case_id)
+                });
+                let content_type = audio["content_type"]
+                    .as_str()
+                    .expect("inline audio content type");
+                assert!(
+                    provider_audio_content_type_matches_format(content_type, metadata.format),
+                    "{} {root} declares {content_type} for {:?}",
+                    case.case_id,
+                    metadata.format
+                );
+            }
         }
     }
 
@@ -70839,7 +72624,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }])
             .with_repeated_image_artifact();
 
-        let report = catalog_endpoint_calibration_report(&mut backend, model, &prompts);
+        let report = catalog_endpoint_calibration_report(&mut backend, model, &prompts, None);
         let failures = report
             .families
             .iter()
@@ -70876,6 +72661,82 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .len();
         assert_eq!(backend.image_generation_calls, distinct_normalized);
         assert!(backend.image_generation_calls < accepted);
+    }
+
+    #[test]
+    fn ace_endpoint_matrix_semantically_validates_every_row_without_regenerating_songs() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "acestep/ace-step-1.5")
+            .expect("ACE-Step catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let audio = tiny_wav_bytes(10 * 16_000);
+        let witness = ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts: vec![ProviderSessionArtifact {
+                id: "ace-canary".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                bytes: audio,
+            }],
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::default(),
+            usage_attribution: BTreeMap::new(),
+        };
+        let mut backend = FakeEngineBackend::new("").with_media_validation();
+        let witness_fingerprint = provider_session_output_fingerprint(&witness);
+
+        let report = catalog_endpoint_calibration_report(
+            &mut backend,
+            model,
+            &prompts,
+            Some(EndpointCalibrationBehavioralWitness {
+                output: witness,
+                fingerprint: witness_fingerprint,
+            }),
+        );
+        let failures = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| !case.ok)
+            .map(|case| {
+                format!(
+                    "{}: translation={:?}; backend={:?}; response={:?}",
+                    case.case_id,
+                    case.provider_translation.error,
+                    case.backend_execution.error,
+                    case.response_normalization.error
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(report.ok, "{failures:#?}");
+        assert!(backend.media_validation_calls > 100);
+        assert_eq!(backend.music_generation_calls, 0);
+        assert!(report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| case.expect_accept)
+            .all(|case| {
+                case.backend_proof.as_ref().is_some_and(|proof| {
+                    proof.kind == EndpointCalibrationBackendProofKind::WorkerSemanticValidation
+                        && proof.behavioral_witness_fingerprint.is_some()
+                })
+            }));
     }
 
     #[test]
@@ -71505,15 +73366,15 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_engine_session_response_keeps_audio_and_music_generation_distinct() {
-        let artifact = ArtifactChunk {
+        let audio_artifact = ArtifactChunk {
             artifact_id: "audio-1".to_owned(),
             index: 0,
             content_type: "audio/wav".to_owned(),
-            bytes: tiny_wav_bytes(16_000),
+            bytes: tiny_wav_bytes(32_000),
             final_chunk: true,
         };
         let mut audio_backend =
-            FakeEngineBackend::new("").with_artifact_chunks(vec![artifact.clone()]);
+            FakeEngineBackend::new("").with_artifact_chunks(vec![audio_artifact]);
         let audio_body = json!({
             "kind": "audio_generation",
             "prompt": "noise",
@@ -71533,11 +73394,21 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(audio.usage.get(USAGE_INPUT_CHARACTER), 5);
         assert_eq!(audio.usage.get(USAGE_AUDIO_SECOND), 2);
 
-        let mut music_backend = FakeEngineBackend::new("").with_artifact_chunks(vec![artifact]);
+        let music_artifact = ArtifactChunk {
+            artifact_id: "music-1".to_owned(),
+            index: 0,
+            content_type: "audio/wav".to_owned(),
+            bytes: tiny_wav_bytes(160_000),
+            final_chunk: true,
+        };
+        let mut music_backend =
+            FakeEngineBackend::new("").with_artifact_chunks(vec![music_artifact]);
         let music_body = json!({
             "kind": "music_generation",
             "prompt": "piano",
-            "duration_seconds": 3.0,
+            "lyrics": "rise",
+            "tags": "acoustic",
+            "duration_seconds": 10.0,
             "response_format": "wav",
             "seed": 7
         });
@@ -71550,8 +73421,152 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
         assert!(music_backend.last_music_request.is_some());
         assert!(music_backend.last_audio_request.is_none());
-        assert_eq!(music.usage.get(USAGE_INPUT_CHARACTER), 5);
-        assert_eq!(music.usage.get(USAGE_AUDIO_SECOND), 3);
+        assert_eq!(music.usage.get(USAGE_INPUT_CHARACTER), 89);
+        assert_eq!(music.usage.get(USAGE_AUDIO_SECOND), 10);
+    }
+
+    #[test]
+    fn provider_music_request_accepts_lyrics_without_a_caption() {
+        let music = provider_media_generation_request_from_body(
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            &json!({
+                "model": "test/music",
+                "lyrics": "[Verse]\nA deterministic calibration line",
+                "duration_seconds": 10
+            }),
+        )
+        .unwrap();
+        assert!(music.prompt.is_empty());
+
+        let error = provider_media_generation_request_from_body(
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            &json!({
+                "model": "test/audio",
+                "duration_seconds": 10
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing prompt"));
+    }
+
+    #[test]
+    fn provider_music_admission_measures_inline_audio_instead_of_one_byte() {
+        let source = tiny_wav_bytes(32_000);
+        let reference = tiny_wav_bytes(16_000);
+        let source_len = u64::try_from(source.len()).unwrap();
+        let body = json!({
+            "model": "test/music",
+            "task_type": "cover",
+            "n": 1,
+            "source_audio": {
+                "data": base64::engine::general_purpose::STANDARD.encode(source),
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            },
+            "reference_audio": {
+                "data": base64::engine::general_purpose::STANDARD.encode(reference),
+                "encoding": "base64",
+                "content_type": "audio/wav"
+            }
+        });
+
+        let load = provider_session_modality_load(
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            &body,
+            &json!({"kind": "music_generation"}),
+        )
+        .unwrap();
+
+        assert_eq!(load["audio"].item_count, 2);
+        assert_eq!(load["audio"].max_item_bytes, source_len);
+        assert_eq!(load["audio"].max_item_units, 2);
+    }
+
+    #[test]
+    fn provider_music_usage_sums_every_generated_artifact_duration() {
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![
+            ArtifactChunk {
+                artifact_id: "music-1".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes: tiny_wav_bytes(160_000),
+                final_chunk: true,
+            },
+            ArtifactChunk {
+                artifact_id: "music-2".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes: tiny_wav_bytes(160_000),
+                final_chunk: true,
+            },
+        ]);
+        let body = json!({
+            "kind": "music_generation",
+            "prompt": "duet",
+            "duration_seconds": 10,
+            "response_format": "wav",
+            "n": 2
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.artifacts.len(), 2);
+        assert_eq!(output.usage.get(USAGE_INPUT_CHARACTER), 76);
+        assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 20);
+    }
+
+    #[test]
+    fn provider_music_modality_load_counts_every_requested_artifact() {
+        let body = json!({
+            "model": "test/music",
+            "prompt": "three short variations",
+            "duration_seconds": 10,
+            "n": 3
+        });
+
+        let load = provider_session_modality_load(
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            &body,
+            &json!({"kind": "music_generation"}),
+        )
+        .unwrap();
+
+        assert_eq!(load["audio"].item_count, 3);
+        assert_eq!(load["audio"].max_item_units, 10);
+    }
+
+    #[test]
+    fn provider_music_usage_counts_every_semantic_text_input() {
+        let request = json!({
+            "prompt": "p",
+            "global_caption": "gc",
+            "lyrics": "lyr",
+            "style": "st",
+            "genre": "g",
+            "tags": ["t1", "t2"],
+            "sample_query": "sq",
+            "audio_codes": "ac",
+            "negative_prompt": "np",
+            "lm_negative_prompt": "lnp",
+            "instruction": "i",
+            "flow_edit_source_caption": "fc",
+            "flow_edit_source_lyrics": "fl"
+        });
+
+        assert_eq!(
+            provider_media_generation_input_characters(
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+                &request,
+            )
+            .unwrap(),
+            27
+        );
     }
 
     #[test]
@@ -71897,6 +73912,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                         revision: "1".repeat(40),
                         publisher_key: None,
                     },
+                    upstream_source: None,
                     path: path.to_owned(),
                     artifact_root: "bc".repeat(32),
                     artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -72043,6 +74059,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                         revision: "1".repeat(40),
                         publisher_key: None,
                     },
+                    upstream_source: None,
                     path: path.to_owned(),
                     artifact_root: "bc".repeat(32),
                     artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -72182,6 +74199,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                         revision: "1".repeat(40),
                         publisher_key: None,
                     },
+                    upstream_source: None,
                     path: "mmproj.gguf".to_owned(),
                     artifact_root: sidecar_root.clone(),
                     artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -72260,6 +74278,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     revision: "1".repeat(40),
                     publisher_key: None,
                 },
+                upstream_source: None,
                 path: "voice.onnx.json".to_owned(),
                 artifact_root: sidecar_root.clone(),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -75803,6 +77822,15 @@ State initialization...
             max_tokens: Some(16),
             prompt: None,
             input: None,
+            lyrics: None,
+            instrumental: None,
+            duration_seconds: None,
+            bpm: None,
+            keyscale: None,
+            timesignature: None,
+            task_type: None,
+            thinking: None,
+            guidance_scale: None,
             audio_b64: None,
             audio_repeat_count: None,
             calibration_only: false,
@@ -75817,6 +77845,7 @@ State initialization...
             response_format: None,
             size: None,
             steps: None,
+            n: None,
             cfg_scale: None,
             shift: None,
             seed: None,
@@ -76526,11 +78555,78 @@ State initialization...
                 bytes: tts_wav.clone(),
                 final_chunk: true,
             }]);
-        let speech = calibrate_audio_fingerprint_prompt(&mut tts_backend, &tts_prompt).unwrap();
+        let mut tts_model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        tts_model.model_class = "tts".to_owned();
+        let artifact_output = test_temp_dir("mayhem-calibration-artifacts");
+        let speech = calibrate_audio_fingerprint_prompt(
+            &mut tts_backend,
+            &tts_model,
+            &tts_prompt,
+            Some(&artifact_output),
+        )
+        .unwrap();
         assert_eq!(
             speech.audio_fingerprint.as_deref(),
             Some(audio_fingerprint(&tts_wav).as_str())
         );
+        assert_eq!(
+            fs::read(artifact_output.join("tts-p1-0.wav")).unwrap(),
+            tts_wav
+        );
+        fs::remove_dir_all(&artifact_output).unwrap();
+
+        let mut music_model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        music_model.model_class = "music-generation".to_owned();
+        music_model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            )
+            .expect("music endpoint contract")];
+        let contract = music_model.adapter.endpoint_families.first_mut().unwrap();
+        for (name, value) in [
+            ("duration_seconds", json!(12)),
+            ("response_format", json!("wav")),
+            ("steps", json!(50)),
+            ("guidance_scale", json!(7.0)),
+            ("seed", json!(99)),
+            ("n", json!(1)),
+        ] {
+            contract
+                .request_attribute_specs
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("missing {name} music attribute"))
+                .default = Some(value);
+        }
+        let music_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "music-p1",
+            "prompt": "an instrumental calibration cue"
+        }))
+        .unwrap();
+        let music_wav = tiny_wav_bytes(12 * 16_000);
+        let mut music_backend =
+            FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "music-1".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes: music_wav,
+                final_chunk: true,
+            }]);
+        let music = calibrate_audio_fingerprint_prompt(
+            &mut music_backend,
+            &music_model,
+            &music_prompt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(music.resource_items["audio"].item_units, 12);
+        let request = music_backend
+            .last_music_request
+            .expect("music calibration request");
+        assert_eq!(request.duration_seconds, Some(12));
+        assert_eq!(request.response_format.as_deref(), Some("wav"));
+        assert_eq!(request.step_count, Some(50));
+        assert_eq!(request.request["guidance_scale"], 7.0);
+        assert_eq!(request.request["seed"], 99);
     }
 
     #[test]
@@ -76831,10 +78927,13 @@ State initialization...
             word_timestamps: Vec::new(),
             segment_timestamps: Vec::new(),
             audio_fingerprint: None,
+            retained_artifacts: Vec::new(),
             resource_items: BTreeMap::new(),
             calibration_baseline_memory_bytes: 1,
             calibration_peak_memory_bytes: 1,
             output_text: None,
+            behavioral_output_fingerprint: None,
+            behavioral_witness: None,
         }];
         stamp_test_calibration_report(&mut calibration, &canaries_dir);
         let report_path = write_temp_calibration_report(&calibration);
@@ -76864,6 +78963,148 @@ State initialization...
         assert_eq!(
             catalog_value["models"][0]["canary"]["embedding_vectors"]["gguf-q4_k_m"]["p1"],
             json!(vector)
+        );
+    }
+
+    #[test]
+    fn audio_canary_evidence_uses_signed_similarity_threshold() {
+        fn fingerprint(duration_ms: u64, mut value: impl FnMut(usize) -> i8) -> String {
+            let vector = (0..256).map(|index| value(index) as u8).collect::<Vec<_>>();
+            let mut encoded = String::with_capacity(vector.len() * 2);
+            for byte in vector {
+                write!(&mut encoded, "{byte:02x}").unwrap();
+            }
+            format!("audiospec-v1:{duration_ms}:{encoded}")
+        }
+
+        let expected_value = fingerprint(10_000, |index| (index % 31) as i8 + 1);
+        let close_value = fingerprint(10_000, |index| {
+            (index % 31) as i8 + 1 + if index % 32 == 0 { 1 } else { 0 }
+        });
+        let unrelated_value = fingerprint(10_000, |index| -((index % 31) as i8 + 1));
+        let wrong_duration = fingerprint(9_900, |index| (index % 31) as i8 + 1);
+        assert_eq!(
+            mayhem_gateway::audio_fingerprint_similarity_bps(&expected_value, &expected_value),
+            Some(10_000)
+        );
+        assert!(
+            mayhem_gateway::audio_fingerprint_similarity_bps(&expected_value, &close_value)
+                .unwrap()
+                >= 9_000
+        );
+
+        let expected = BTreeMap::from([("p1".to_owned(), expected_value)]);
+        let empty_hashes = BTreeMap::new();
+        let empty_vectors = BTreeMap::new();
+        let exact = expected.clone();
+        let close = BTreeMap::from([("p1".to_owned(), close_value)]);
+        let unrelated = BTreeMap::from([("p1".to_owned(), unrelated_value)]);
+        let duration_drift = BTreeMap::from([("p1".to_owned(), wrong_duration)]);
+
+        let matches = |observed: &BTreeMap<String, String>| {
+            method_values_match_catalog(
+                CANARY_VERIFICATION_AUDIO_FINGERPRINT,
+                None,
+                None,
+                None,
+                Some(&expected),
+                &empty_hashes,
+                &empty_vectors,
+                &empty_hashes,
+                observed,
+                9_000,
+            )
+        };
+        assert_eq!(matches(&exact), Some(true));
+        assert_eq!(matches(&close), Some(true));
+        assert_eq!(matches(&unrelated), Some(false));
+        assert_eq!(matches(&duration_drift), Some(false));
+        assert_eq!(matches(&BTreeMap::new()), Some(false));
+
+        let mut extra = exact;
+        extra.insert("p2".to_owned(), close["p1"].clone());
+        assert_eq!(matches(&extra), Some(false));
+
+        let expected_modalities =
+            BTreeMap::from([("audio".to_owned(), "reference-aggregate".to_owned())]);
+        let report_modalities =
+            BTreeMap::from([("audio".to_owned(), "platform-aggregate".to_owned())]);
+        assert_eq!(
+            calibration_modality_fingerprints_match_catalog(
+                CANARY_VERIFICATION_AUDIO_FINGERPRINT,
+                Some(&expected_modalities),
+                &report_modalities,
+                Some(true),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            calibration_modality_fingerprints_match_catalog(
+                CANARY_VERIFICATION_AUDIO_FINGERPRINT,
+                Some(&expected_modalities),
+                &report_modalities,
+                Some(false),
+            ),
+            Some(false)
+        );
+
+        let reference_profile =
+            serde_json::from_value::<catalog::CatalogModalityResourceProfile>(json!({
+                "unit": "second",
+                "measurement_source": "process_rss; linux reference",
+                "max_item_bytes": 1_920_044,
+                "max_item_units": 10,
+                "measured_item_bytes": 1_920_044,
+                "measured_item_units": 10,
+                "measured_working_set_bytes": 1_200_000_000,
+                "calibration_baseline_memory_bytes": 3_500_000_000_u64,
+                "calibration_peak_memory_bytes": 4_700_000_000_u64,
+                "calibration_f13_budget_bytes": 100_000_000_000_u64,
+                "default_max_inflight_items": 1,
+                "default_max_items_per_request": 1
+            }))
+            .unwrap();
+        let mut secondary_profile = reference_profile.clone();
+        secondary_profile.measurement_source = "process_rss; windows secondary".to_owned();
+        secondary_profile.measured_working_set_bytes = 3_000_000;
+        secondary_profile.calibration_baseline_memory_bytes = 40_000_000;
+        secondary_profile.calibration_peak_memory_bytes = 43_000_000;
+        secondary_profile.calibration_f13_budget_bytes = 50_000_000_000;
+        let reference_profiles = BTreeMap::from([("audio".to_owned(), reference_profile.clone())]);
+        let secondary_profiles = BTreeMap::from([("audio".to_owned(), secondary_profile.clone())]);
+        assert_eq!(
+            calibration_resource_profiles_fit_catalog_envelope(
+                Some(&reference_profiles),
+                &secondary_profiles,
+            ),
+            Some(true)
+        );
+        let mut unbound_profile = secondary_profile.clone();
+        unbound_profile.measured_working_set_bytes = 1;
+        assert_eq!(
+            calibration_resource_profiles_fit_catalog_envelope(
+                Some(&reference_profiles),
+                &BTreeMap::from([("audio".to_owned(), unbound_profile)]),
+            ),
+            Some(false)
+        );
+        let mut wrong_probe = secondary_profile.clone();
+        wrong_probe.measurement_source = "guessed-memory; windows secondary".to_owned();
+        assert_eq!(
+            calibration_resource_profiles_fit_catalog_envelope(
+                Some(&reference_profiles),
+                &BTreeMap::from([("audio".to_owned(), wrong_probe)]),
+            ),
+            Some(false)
+        );
+        secondary_profile.measured_working_set_bytes =
+            reference_profile.measured_working_set_bytes + 1;
+        assert_eq!(
+            calibration_resource_profiles_fit_catalog_envelope(
+                Some(&reference_profiles),
+                &BTreeMap::from([("audio".to_owned(), secondary_profile)]),
+            ),
+            Some(false)
         );
     }
 
@@ -77694,6 +79935,7 @@ State initialization...
             "mmproj".to_owned(),
             catalog::CatalogArtifactSidecar {
                 source: artifact.source.clone(),
+                upstream_source: None,
                 path: "mmproj-model-BF16.gguf".to_owned(),
                 artifact_root: "12".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -77734,6 +79976,92 @@ State initialization...
     }
 
     #[test]
+    fn artifact_stage_plan_mirrors_sidecars_from_distinct_pinned_upstreams() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let artifact = catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap();
+        let primary_source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "vendor/model".to_owned(),
+            revision: "8".repeat(40),
+            publisher_key: None,
+        };
+        let component_source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "vendor/shared-components".to_owned(),
+            revision: "9".repeat(40),
+            publisher_key: None,
+        };
+        artifact.upstream_source = Some(primary_source.clone());
+        artifact.path = "model.safetensors".to_owned();
+        artifact.sidecars.insert(
+            "shared_config".to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                upstream_source: Some(component_source.clone()),
+                path: "shared/config.json".to_owned(),
+                artifact_root: "12".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: "34".repeat(32),
+            },
+        );
+        let source_cache = PathBuf::from("/tmp/mayhem-composite-source-cache");
+
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: source_cache.clone(),
+            hf_token_file: None,
+            launch_only: true,
+            model_filter: None,
+            artifact_filter: None,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.source_count, 2);
+        let source_repos = report
+            .source_commands
+            .iter()
+            .map(|entry| entry.source_repo.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            source_repos,
+            BTreeSet::from(["vendor/model", "vendor/shared-components"])
+        );
+        let primary_download = report
+            .source_commands
+            .iter()
+            .find(|entry| entry.source_repo == "vendor/model")
+            .unwrap();
+        assert!(primary_download.command.shell.contains("model.safetensors"));
+        assert!(!primary_download
+            .command
+            .shell
+            .contains("shared/config.json"));
+        let component_download = report
+            .source_commands
+            .iter()
+            .find(|entry| entry.source_repo == "vendor/shared-components")
+            .unwrap();
+        assert!(component_download
+            .command
+            .shell
+            .contains("shared/config.json"));
+        assert!(!component_download
+            .command
+            .shell
+            .contains("model.safetensors"));
+
+        let stage = &report.stage_commands[0].stage_command.shell;
+        let primary_dir = catalog_artifact_stage_source_dir(&source_cache, &primary_source);
+        let component_dir = catalog_artifact_stage_source_dir(&source_cache, &component_source);
+        assert!(stage.contains(&primary_dir.display().to_string()));
+        assert!(stage.contains(&component_dir.display().to_string()));
+    }
+
+    #[test]
     fn artifact_publish_plan_uploads_and_links_prebuilt_gguf_sidecars() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -77749,6 +80077,7 @@ State initialization...
             "mmproj".to_owned(),
             catalog::CatalogArtifactSidecar {
                 source: artifact.source.clone(),
+                upstream_source: None,
                 path: "mmproj-model-BF16.gguf".to_owned(),
                 artifact_root: "12".repeat(32),
                 artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -78377,6 +80706,7 @@ State initialization...
                         revision: "1".repeat(40),
                         publisher_key: None,
                     },
+                    upstream_source: None,
                     path: "config.json".to_owned(),
                     artifact_root: "55".repeat(32),
                     artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -79551,10 +81881,13 @@ State initialization...
             word_timestamps: Vec::new(),
             segment_timestamps: Vec::new(),
             audio_fingerprint: None,
+            retained_artifacts: Vec::new(),
             resource_items: BTreeMap::new(),
             calibration_baseline_memory_bytes: 1,
             calibration_peak_memory_bytes: 1,
             output_text: None,
+            behavioral_output_fingerprint: None,
+            behavioral_witness: None,
         }
     }
 
@@ -79729,6 +82062,10 @@ State initialization...
                         .cloned()
                         .collect(),
                     backend_execution_fingerprint: "22".repeat(32),
+                    backend_proof: EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::FullInference,
+                        behavioral_witness_fingerprint: None,
+                    },
                     response: json!({
                         "id": "chatcmpl-test",
                         "object": "chat.completion",
@@ -79761,6 +82098,32 @@ State initialization...
         report
     }
 
+    #[test]
+    fn endpoint_semantic_proof_requires_a_canonical_behavioral_witness() {
+        let mut report = test_calibration_report("witness".to_owned(), None);
+        let semantic_fingerprint = "bb".repeat(32);
+        let accepted = report
+            .endpoint_calibration
+            .families
+            .iter_mut()
+            .flat_map(|family| &mut family.cases)
+            .find(|case| case.expect_accept)
+            .expect("accepted endpoint calibration row");
+        accepted.backend_proof = Some(EndpointCalibrationBackendProof {
+            kind: EndpointCalibrationBackendProofKind::WorkerSemanticValidation,
+            behavioral_witness_fingerprint: Some(semantic_fingerprint.clone()),
+        });
+
+        let missing = validate_endpoint_behavioral_witness_links(&report);
+        assert!(missing.iter().any(|error| {
+            error.contains("absent from canonical canary evidence")
+                && error.contains(&semantic_fingerprint)
+        }));
+
+        report.prompts[0].behavioral_output_fingerprint = Some(semantic_fingerprint);
+        assert!(validate_endpoint_behavioral_witness_links(&report).is_empty());
+    }
+
     fn stamp_test_calibration_report(report: &mut CatalogCanaryCalibrationReport, dir: &Path) {
         report.canary_set_sha256 =
             file_sha256_hex(&dir.join(format!("{}.json", report.canary_set))).unwrap();
@@ -79783,6 +82146,7 @@ State initialization...
             memory_reserve: None,
             seed: 0,
             include_output: false,
+            artifact_output_dir: None,
             resume_core_report: None,
             report_output: None,
             require_match: false,
@@ -81066,6 +83430,7 @@ State initialization...
         };
         let sidecar = |path: &str, byte: &str| catalog::CatalogArtifactSidecar {
             source: source.clone(),
+            upstream_source: None,
             path: path.to_owned(),
             artifact_root: byte.repeat(64),
             artifact_root_kind: "blake3_merkle_v1".to_owned(),

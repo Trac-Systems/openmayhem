@@ -14,6 +14,10 @@ pub const CRATE_NAME: &str = "mayhem-hwprobe";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+const ACE_STEP_RAM_FLOOR: u64 = 16 * GIB;
+const ACE_STEP_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
+const ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR: u64 = 20 * GIB;
+const ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 16 * GIB;
 const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
 const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 
@@ -40,7 +44,11 @@ impl Default for ProbeOptions {
 pub enum FixtureProfile {
     AppleSilicon,
     LinuxNvidia,
+    LinuxNvidiaArm64,
+    WindowsNvidia,
     CpuOnly,
+    UnsupportedHost,
+    InsufficientHost,
 }
 
 impl FixtureProfile {
@@ -48,7 +56,11 @@ impl FixtureProfile {
         match value.trim().to_ascii_lowercase().as_str() {
             "apple-silicon" | "apple" | "mac" | "macos" => Some(Self::AppleSilicon),
             "linux-nvidia" | "nvidia" | "blackwell" => Some(Self::LinuxNvidia),
+            "linux-nvidia-arm64" | "linux-aarch64" | "nvidia-arm64" => Some(Self::LinuxNvidiaArm64),
+            "windows-nvidia" | "windows-4090" | "rtx-4090" => Some(Self::WindowsNvidia),
             "cpu-only" | "cpu" => Some(Self::CpuOnly),
+            "unsupported" | "unsupported-host" => Some(Self::UnsupportedHost),
+            "insufficient" | "insufficient-host" => Some(Self::InsufficientHost),
             _ => None,
         }
     }
@@ -57,7 +69,11 @@ impl FixtureProfile {
         match self {
             Self::AppleSilicon => "apple-silicon",
             Self::LinuxNvidia => "linux-nvidia",
+            Self::LinuxNvidiaArm64 => "linux-nvidia-arm64",
+            Self::WindowsNvidia => "windows-nvidia",
             Self::CpuOnly => "cpu-only",
+            Self::UnsupportedHost => "unsupported-host",
+            Self::InsufficientHost => "insufficient-host",
         }
     }
 }
@@ -298,6 +314,7 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
         stable_diffusion_cpp_verdict(profile),
+        ace_step_verdict(profile),
         transformers_asr_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
@@ -753,6 +770,157 @@ fn stable_diffusion_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
                 .unwrap_or(profile.memory.total_bytes)
                 / 5,
         }
+    }
+}
+
+fn ace_step_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if !ace_step_cpu_platform_supported(&profile.host) {
+        return insufficient(
+            "ace-step",
+            &format!(
+                "ACE-Step 1.5 v0.1.8 has no supported runtime path for {}/{}",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+
+    let host_memory = profile
+        .memory
+        .available_bytes
+        .unwrap_or(profile.memory.total_bytes);
+    if host_memory < ACE_STEP_RAM_FLOOR {
+        return insufficient(
+            "ace-step",
+            &format!(
+                "ACE-Step needs at least 16 GiB available host RAM for the generic runtime; {} detected; model-specific CLI RAM/VRAM checks still apply",
+                format_bytes(host_memory)
+            ),
+        );
+    }
+
+    let cuda_gpu = ace_step_cuda_platform_supported(&profile.host)
+        .then(|| {
+            profile
+                .gpus
+                .iter()
+                .filter(|gpu| gpu.vendor == GpuVendor::Nvidia && gpu.backend == GpuBackend::Nvml)
+                .max_by_key(|gpu| ace_step_nvidia_memory_bytes(profile, gpu))
+        })
+        .flatten();
+    if let Some(gpu) = cuda_gpu {
+        let cuda_memory = ace_step_nvidia_memory_bytes(profile, gpu);
+        if cuda_memory >= ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR {
+            return BackendVerdict {
+                backend: "ace-step".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: Some(format!(
+                    "ACE-Step CUDA hardware path available on {}/{} with {} detected device memory; the worker rechecks load-time free memory before selecting its pinned no-offload or offload policy, and throughput comes from artifact calibration; model-specific CLI RAM/VRAM checks still apply",
+                    profile.host.os,
+                    profile.host.arch,
+                    format_bytes(cuda_memory)
+                )),
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: cuda_memory / 8,
+            };
+        }
+        if cuda_memory >= ACE_STEP_CUDA_MEMORY_FLOOR {
+            return BackendVerdict {
+                backend: "ace-step".to_owned(),
+                status: VerdictStatus::PartialOffload,
+                reason: Some(format!(
+                    "ACE-Step CUDA hardware path available on {}/{} with {} detected device memory; the pinned runtime supports CPU/INT8 offload and the worker rechecks load-time free memory before selecting it, while throughput comes from artifact calibration; model-specific CLI RAM/VRAM checks still apply",
+                    profile.host.os,
+                    profile.host.arch,
+                    format_bytes(cuda_memory)
+                )),
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: cuda_memory / 8,
+            };
+        }
+    }
+
+    let apple_metal = (profile.host.os == "macos"
+        && matches!(profile.host.arch.as_str(), "aarch64" | "arm64"))
+    .then(|| {
+        profile.gpus.iter().find(|gpu| {
+            gpu.vendor == GpuVendor::Apple && gpu.backend == GpuBackend::Metal && gpu.unified_memory
+        })
+    })
+    .flatten();
+    if let Some(gpu) = apple_metal {
+        let unified_memory = gpu.memory_bytes.unwrap_or(host_memory).min(host_memory);
+        if unified_memory >= ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR {
+            return BackendVerdict {
+                backend: "ace-step".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: Some(format!(
+                    "ACE-Step Apple Silicon Metal/MPS hardware path available with {} detected available unified memory; the pinned runtime keeps CPU offload disabled for unified memory, and throughput comes from artifact calibration; model-specific CLI RAM/VRAM checks still apply",
+                    format_bytes(unified_memory)
+                )),
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: unified_memory / 8,
+            };
+        }
+    }
+
+    let accelerator_note = if let Some(gpu) = cuda_gpu {
+        let memory = ace_step_nvidia_memory_bytes(profile, gpu);
+        if memory == 0 {
+            "NVIDIA/NVML device detected but usable CUDA memory is unknown; "
+        } else {
+            "NVIDIA/NVML device detected but usable CUDA memory is below 4 GiB; "
+        }
+    } else if apple_metal.is_some() {
+        "Apple Metal device detected but usable unified memory is below 16 GiB; "
+    } else {
+        "no supported accelerator probe was detected; "
+    };
+    BackendVerdict {
+        backend: "ace-step".to_owned(),
+        status: VerdictStatus::CpuOnly,
+        reason: Some(format!(
+            "{accelerator_note}ACE-Step will use the supported CPU fallback on {}/{} with at least 16 GiB available host memory; throughput comes from artifact calibration; model-specific CLI RAM/VRAM checks still apply",
+            profile.host.os, profile.host.arch
+        )),
+        est_tok_s: None,
+        n_layers_gpu: Some(0),
+        max_sessions: 1,
+        kv_cache_bytes_budget: host_memory / 16,
+    }
+}
+
+fn ace_step_cpu_platform_supported(host: &HostInfo) -> bool {
+    match host.os.as_str() {
+        "linux" => matches!(host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        "windows" => host.arch == "x86_64",
+        "macos" => matches!(host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        _ => false,
+    }
+}
+
+fn ace_step_cuda_platform_supported(host: &HostInfo) -> bool {
+    match host.os.as_str() {
+        "linux" => matches!(host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        "windows" => host.arch == "x86_64",
+        _ => false,
+    }
+}
+
+fn ace_step_nvidia_memory_bytes(profile: &HardwareProfile, gpu: &GpuInfo) -> u64 {
+    if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+        let host_memory = profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes);
+        gpu.memory_bytes.unwrap_or(host_memory).min(host_memory)
+    } else {
+        gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
     }
 }
 
@@ -1286,7 +1454,7 @@ fn probe_nvidia(
         let cc = compute_capability
             .as_deref()
             .and_then(parse_compute_capability);
-        let split = windows_memory_split_for_name(&windows_memory, parts[0]);
+        let split = windows_memory_split_for_name(windows_memory, parts[0]);
         let dedicated_memory_bytes =
             memory_bytes.or_else(|| split.as_ref().and_then(|split| split.dedicated_bytes));
         gpus.push(GpuInfo {
@@ -1890,6 +2058,103 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
             tee: fixture_tee(1),
             warnings: Vec::new(),
         },
+        FixtureProfile::LinuxNvidiaArm64 => {
+            let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, disk_path);
+            profile.source.fixture = Some(fixture.as_str().to_owned());
+            profile.host.arch = "aarch64".to_owned();
+            profile.cpu = CpuInfo {
+                model: Some("NVIDIA Grace".to_owned()),
+                physical_cores: Some(20),
+                logical_cores: 20,
+                flags: CpuFlags {
+                    neon: true,
+                    ..CpuFlags::default()
+                },
+            };
+            profile.memory = MemoryInfo {
+                total_bytes: 128 * GIB,
+                available_bytes: Some(112 * GIB),
+                unified_memory: true,
+            };
+            profile.gpus.truncate(1);
+            profile.gpus[0] = GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                name: "NVIDIA GB10".to_owned(),
+                backend: GpuBackend::Nvml,
+                memory_bytes: Some(128 * GIB),
+                dedicated_memory_bytes: None,
+                shared_memory_bytes: None,
+                unified_memory: true,
+                compute_capability: Some("12.1".to_owned()),
+                supports_nvfp4: true,
+                supports_fp8: true,
+                supports_tensor_parallel: false,
+            };
+            profile
+        }
+        FixtureProfile::WindowsNvidia => {
+            let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, disk_path);
+            profile.source.fixture = Some(fixture.as_str().to_owned());
+            profile.host = HostInfo {
+                os: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                family: "windows".to_owned(),
+                kernel: Some("Windows 11 24H2".to_owned()),
+            };
+            profile.cpu = CpuInfo {
+                model: Some("AMD Ryzen 9 7950X3D".to_owned()),
+                physical_cores: Some(16),
+                logical_cores: 32,
+                flags: CpuFlags {
+                    avx2: true,
+                    ..CpuFlags::default()
+                },
+            };
+            profile.memory = MemoryInfo {
+                total_bytes: 64 * GIB,
+                available_bytes: Some(48 * GIB),
+                unified_memory: false,
+            };
+            profile.gpus.truncate(1);
+            profile.gpus[0] = GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                name: "NVIDIA GeForce RTX 4090".to_owned(),
+                backend: GpuBackend::Nvml,
+                memory_bytes: Some(24 * GIB),
+                dedicated_memory_bytes: Some(24 * GIB),
+                shared_memory_bytes: Some(32 * GIB),
+                unified_memory: false,
+                compute_capability: Some("8.9".to_owned()),
+                supports_nvfp4: false,
+                supports_fp8: true,
+                supports_tensor_parallel: false,
+            };
+            profile.warnings = vec![
+                "Windows WDDM shared GPU memory detected; provider capacity ignores shared memory to avoid silent paging".to_owned(),
+            ];
+            profile
+        }
+        FixtureProfile::UnsupportedHost => {
+            let mut profile = fixture_profile(FixtureProfile::CpuOnly, disk_path);
+            profile.source.fixture = Some(fixture.as_str().to_owned());
+            profile.host = HostInfo {
+                os: "freebsd".to_owned(),
+                arch: "x86_64".to_owned(),
+                family: "unix".to_owned(),
+                kernel: Some("FreeBSD 14.2".to_owned()),
+            };
+            profile
+        }
+        FixtureProfile::InsufficientHost => {
+            let mut profile = fixture_profile(FixtureProfile::CpuOnly, disk_path);
+            profile.source.fixture = Some(fixture.as_str().to_owned());
+            profile.memory = MemoryInfo {
+                total_bytes: 8 * GIB,
+                available_bytes: Some(6 * GIB),
+                unified_memory: false,
+            };
+            profile
+        }
         FixtureProfile::CpuOnly => HardwareProfile {
             source: ReportSource {
                 kind: "fixture".to_owned(),
@@ -2261,6 +2526,161 @@ mod tests {
     }
 
     #[test]
+    fn ace_step_windows_4090_uses_cuda_without_counting_wddm_shared_memory() {
+        let report = fixture_report(FixtureProfile::WindowsNvidia);
+        let verdict = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "ace-step")
+            .expect("ace-step verdict");
+
+        assert_eq!(verdict.backend, "ace-step");
+        assert_eq!(verdict.status, VerdictStatus::FullOffload);
+        assert_eq!(verdict.max_sessions, 1);
+        assert_eq!(verdict.est_tok_s, None);
+        let reason = verdict.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("CUDA"));
+        assert!(reason.contains("windows/x86_64"));
+        assert!(reason.contains("24.0 GiB detected device memory"));
+        assert!(reason.contains("rechecks load-time free memory"));
+        assert!(reason.contains("throughput comes from artifact calibration"));
+        assert!(reason.contains("model-specific CLI RAM/VRAM checks still apply"));
+    }
+
+    #[test]
+    fn ace_step_uses_cuda_on_linux_x86_and_aarch64() {
+        for (fixture, arch) in [
+            (FixtureProfile::LinuxNvidia, "x86_64"),
+            (FixtureProfile::LinuxNvidiaArm64, "aarch64"),
+        ] {
+            let profile = fixture_profile(fixture, Path::new("."));
+
+            let verdict = ace_step_verdict(&profile);
+
+            assert_eq!(verdict.status, VerdictStatus::FullOffload, "{arch}");
+            let reason = verdict.reason.unwrap_or_default();
+            assert!(reason.contains("CUDA"), "{arch}");
+            assert!(reason.contains(&format!("linux/{arch}")), "{arch}");
+            assert!(reason.contains("detected device memory"), "{arch}");
+            assert!(reason.contains("rechecks load-time free memory"), "{arch}");
+            assert!(
+                reason.contains("throughput comes from artifact calibration"),
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn ace_step_uses_apple_silicon_mps() {
+        let profile = fixture_profile(FixtureProfile::AppleSilicon, Path::new("."));
+
+        let verdict = ace_step_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::FullOffload);
+        assert_eq!(verdict.est_tok_s, None);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("Apple Silicon Metal/MPS"));
+        assert!(reason.contains("detected available unified memory"));
+        assert!(reason.contains("throughput comes from artifact calibration"));
+    }
+
+    #[test]
+    fn ace_step_cpu_only_fixture_reports_slow_supported_fallback() {
+        let profile = fixture_profile(FixtureProfile::CpuOnly, Path::new("."));
+
+        let verdict = ace_step_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::CpuOnly);
+        assert_eq!(verdict.n_layers_gpu, Some(0));
+        assert_eq!(verdict.est_tok_s, None);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("CPU fallback"));
+        assert!(reason.contains("at least 16 GiB available host memory"));
+        assert!(reason.contains("throughput comes from artifact calibration"));
+        assert!(reason.contains("no supported accelerator probe was detected"));
+    }
+
+    #[test]
+    fn ace_step_low_vram_cuda_reports_partial_offload() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.gpus.truncate(1);
+        profile.gpus[0].memory_bytes = Some(6 * GIB);
+        profile.gpus[0].dedicated_memory_bytes = Some(6 * GIB);
+
+        let verdict = ace_step_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::PartialOffload);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("6.0 GiB detected device memory"));
+        assert!(reason.contains("supports CPU/INT8 offload"));
+        assert!(reason.contains("rechecks load-time free memory"));
+        assert!(reason.contains("throughput comes from artifact calibration"));
+    }
+
+    #[test]
+    fn ace_step_does_not_infer_acceleration_from_linux_arm_or_nvidia_name() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidiaArm64, Path::new("."));
+        profile.gpus[0].backend = GpuBackend::Vulkan;
+
+        let verdict = ace_step_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::CpuOnly);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("no supported accelerator probe was detected"));
+        assert!(!reason.contains("CUDA hardware path available"));
+    }
+
+    #[test]
+    fn ace_step_does_not_count_windows_shared_memory_as_cuda_capacity() {
+        let mut profile = fixture_profile(FixtureProfile::WindowsNvidia, Path::new("."));
+        profile.gpus[0].memory_bytes = Some(3 * GIB);
+        profile.gpus[0].dedicated_memory_bytes = Some(3 * GIB);
+        profile.gpus[0].shared_memory_bytes = Some(64 * GIB);
+
+        let verdict = ace_step_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::CpuOnly);
+        assert!(verdict
+            .reason
+            .unwrap_or_default()
+            .contains("usable CUDA memory is below 4 GiB"));
+    }
+
+    #[test]
+    fn ace_step_rejects_unsupported_and_insufficient_fixtures() {
+        let unsupported = fixture_profile(FixtureProfile::UnsupportedHost, Path::new("."));
+        let unsupported_verdict = ace_step_verdict(&unsupported);
+        assert_eq!(unsupported_verdict.status, VerdictStatus::Insufficient);
+        assert!(unsupported_verdict
+            .reason
+            .unwrap_or_default()
+            .contains("no supported runtime path for freebsd/x86_64"));
+
+        let insufficient = fixture_profile(FixtureProfile::InsufficientHost, Path::new("."));
+        let insufficient_verdict = ace_step_verdict(&insufficient);
+        assert_eq!(insufficient_verdict.status, VerdictStatus::Insufficient);
+        assert!(insufficient_verdict
+            .reason
+            .unwrap_or_default()
+            .contains("at least 16 GiB available host RAM"));
+    }
+
+    #[test]
+    fn ace_step_fixture_names_are_publicly_parseable() {
+        for (name, expected) in [
+            ("windows-4090", FixtureProfile::WindowsNvidia),
+            ("linux-nvidia", FixtureProfile::LinuxNvidia),
+            ("linux-aarch64", FixtureProfile::LinuxNvidiaArm64),
+            ("apple-silicon", FixtureProfile::AppleSilicon),
+            ("cpu-only", FixtureProfile::CpuOnly),
+            ("unsupported-host", FixtureProfile::UnsupportedHost),
+            ("insufficient-host", FixtureProfile::InsufficientHost),
+        ] {
+            assert_eq!(FixtureProfile::parse(name), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
     fn transformers_asr_uses_cuda_on_linux_and_windows() {
         for os in ["linux", "windows"] {
             let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
@@ -2368,7 +2788,7 @@ VkPhysicalDeviceMemoryProperties:
 "#;
         let parsed = parse_vulkan_device_local_memory_bytes(output);
         assert_eq!(parsed.get("AMD Radeon Test"), Some(&(8 * GIB)));
-        assert!(parsed.get("Software Rasterizer").is_none());
+        assert!(!parsed.contains_key("Software Rasterizer"));
     }
 
     #[test]

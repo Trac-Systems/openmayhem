@@ -8,7 +8,7 @@ use mayhem_proto::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub(crate) const ENDPOINT_CALIBRATION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const ENDPOINT_CALIBRATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +28,20 @@ pub(crate) struct EndpointCalibrationStageReport {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EndpointCalibrationBackendProofKind {
+    FullInference,
+    WorkerSemanticValidation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EndpointCalibrationBackendProof {
+    pub(crate) kind: EndpointCalibrationBackendProofKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) behavioral_witness_fingerprint: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct EndpointCalibrationCaseReport {
     pub(crate) case_id: String,
@@ -41,6 +55,8 @@ pub(crate) struct EndpointCalibrationCaseReport {
     pub(crate) gateway_normalization: EndpointCalibrationStageReport,
     pub(crate) provider_translation: EndpointCalibrationStageReport,
     pub(crate) backend_execution: EndpointCalibrationStageReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backend_proof: Option<EndpointCalibrationBackendProof>,
     pub(crate) response_normalization: EndpointCalibrationStageReport,
     pub(crate) ok: bool,
 }
@@ -70,6 +86,7 @@ pub(crate) struct EndpointCalibrationExecution {
     pub(crate) provider_translation_fingerprint: String,
     pub(crate) handled_request_attributes: BTreeSet<String>,
     pub(crate) backend_execution_fingerprint: String,
+    pub(crate) backend_proof: EndpointCalibrationBackendProof,
     pub(crate) response: Value,
 }
 
@@ -87,10 +104,11 @@ pub(crate) fn normalize_endpoint_calibration_request(
     mayhem_gateway::openai::normalize_endpoint_request_for_provider(contract, &request)
 }
 
+#[cfg(test)]
 pub(crate) fn run_endpoint_calibration_matrix<F>(
     contracts: &[EndpointFamilyContract],
     substitutions: &BTreeMap<String, Value>,
-    mut execute: F,
+    execute: F,
 ) -> EndpointCalibrationReport
 where
     F: FnMut(
@@ -99,9 +117,33 @@ where
         &Value,
     ) -> Result<EndpointCalibrationExecution, String>,
 {
+    run_endpoint_calibration_matrix_with_materializer(
+        contracts,
+        substitutions,
+        |_contract, _case, request| Ok(request),
+        execute,
+    )
+}
+
+pub(crate) fn run_endpoint_calibration_matrix_with_materializer<F, M>(
+    contracts: &[EndpointFamilyContract],
+    substitutions: &BTreeMap<String, Value>,
+    mut materialize: M,
+    mut execute: F,
+) -> EndpointCalibrationReport
+where
+    F: FnMut(
+        &EndpointFamilyContract,
+        &EndpointCalibrationCase,
+        &Value,
+    ) -> Result<EndpointCalibrationExecution, String>,
+    M: FnMut(&EndpointFamilyContract, &EndpointCalibrationCase, Value) -> Result<Value, String>,
+{
     let mut families = contracts
         .iter()
-        .map(|contract| run_endpoint_family_calibration(contract, substitutions, &mut execute))
+        .map(|contract| {
+            run_endpoint_family_calibration(contract, substitutions, &mut materialize, &mut execute)
+        })
         .collect::<Vec<_>>();
     families.sort_by(|left, right| left.endpoint_family.cmp(&right.endpoint_family));
     let case_count = families.iter().map(|family| family.case_count).sum();
@@ -117,9 +159,10 @@ where
     }
 }
 
-fn run_endpoint_family_calibration<F>(
+fn run_endpoint_family_calibration<F, M>(
     contract: &EndpointFamilyContract,
     substitutions: &BTreeMap<String, Value>,
+    materialize: &mut M,
     execute: &mut F,
 ) -> EndpointFamilyCalibrationReport
 where
@@ -128,6 +171,7 @@ where
         &EndpointCalibrationCase,
         &Value,
     ) -> Result<EndpointCalibrationExecution, String>,
+    M: FnMut(&EndpointFamilyContract, &EndpointCalibrationCase, Value) -> Result<Value, String>,
 {
     let contract_fingerprint = endpoint_contract_fingerprint(contract);
     let generated = generate_endpoint_calibration_cases(contract);
@@ -147,7 +191,9 @@ where
     let matrix_fingerprint = calibration_cases_fingerprint(&cases);
     let reports = cases
         .iter()
-        .map(|case| run_endpoint_calibration_case(contract, case, substitutions, execute))
+        .map(|case| {
+            run_endpoint_calibration_case(contract, case, substitutions, materialize, execute)
+        })
         .collect::<Vec<_>>();
     let ok = !reports.is_empty() && reports.iter().all(|report| report.ok);
     EndpointFamilyCalibrationReport {
@@ -160,10 +206,11 @@ where
     }
 }
 
-fn run_endpoint_calibration_case<F>(
+fn run_endpoint_calibration_case<F, M>(
     contract: &EndpointFamilyContract,
     case: &EndpointCalibrationCase,
     substitutions: &BTreeMap<String, Value>,
+    materialize: &mut M,
     execute: &mut F,
 ) -> EndpointCalibrationCaseReport
 where
@@ -172,9 +219,13 @@ where
         &EndpointCalibrationCase,
         &Value,
     ) -> Result<EndpointCalibrationExecution, String>,
+    M: FnMut(&EndpointFamilyContract, &EndpointCalibrationCase, Value) -> Result<Value, String>,
 {
     let request = match materialize_endpoint_calibration_request(case, substitutions) {
-        Ok(request) => request,
+        Ok(request) => match materialize(contract, case, request) {
+            Ok(request) => request,
+            Err(error) => return failed_materialization_report(case, error),
+        },
         Err(error) => return failed_materialization_report(case, error),
     };
     if let Some(marker) = unresolved_calibration_marker(&request) {
@@ -210,6 +261,7 @@ where
             gateway_normalization,
             provider_translation: blocked_stage(),
             backend_execution: blocked_stage(),
+            backend_proof: None,
             response_normalization: blocked_stage(),
             ok,
         };
@@ -296,6 +348,7 @@ where
     }
     let provider_translation = passed_stage(Some(execution.provider_translation_fingerprint));
     let backend_execution = passed_stage(Some(execution.backend_execution_fingerprint));
+    let backend_proof = Some(execution.backend_proof);
     let response_fingerprint = stable_value_fingerprint(&execution.response);
     let response_result =
         validate_endpoint_response(contract, &execution.response).map_err(|violations| {
@@ -334,6 +387,7 @@ where
         gateway_normalization,
         provider_translation,
         backend_execution,
+        backend_proof,
         response_normalization,
         ok,
     }
@@ -561,6 +615,31 @@ fn validate_case_stages(
             ));
         }
     }
+    if expected.expect_accept {
+        match case.backend_proof.as_ref() {
+            Some(EndpointCalibrationBackendProof {
+                kind: EndpointCalibrationBackendProofKind::FullInference,
+                behavioral_witness_fingerprint: None,
+            }) => {}
+            Some(EndpointCalibrationBackendProof {
+                kind: EndpointCalibrationBackendProofKind::WorkerSemanticValidation,
+                behavioral_witness_fingerprint: Some(fingerprint),
+            }) if is_blake3_hex(fingerprint) => {}
+            Some(proof) => errors.push(format!(
+                "endpoint calibration case {} has invalid backend proof {:?}",
+                expected.case_id, proof
+            )),
+            None => errors.push(format!(
+                "endpoint calibration case {} has no backend proof",
+                expected.case_id
+            )),
+        }
+    } else if case.backend_proof.is_some() {
+        errors.push(format!(
+            "rejected endpoint calibration case {} unexpectedly has backend proof",
+            expected.case_id
+        ));
+    }
     if !case.ok {
         errors.push(format!(
             "endpoint calibration case {} is not successful",
@@ -585,6 +664,7 @@ fn failed_materialization_report(
         gateway_normalization: failed_stage("request was not materialized"),
         provider_translation: failed_stage("request was not materialized"),
         backend_execution: failed_stage("request was not materialized"),
+        backend_proof: None,
         response_normalization: failed_stage("request was not materialized"),
         ok: false,
     }
@@ -607,6 +687,7 @@ fn failed_valid_request_report(
         gateway_normalization: failed_stage("contract validation failed"),
         provider_translation: failed_stage("contract validation failed"),
         backend_execution: failed_stage("contract validation failed"),
+        backend_proof: None,
         response_normalization: failed_stage("contract validation failed"),
         ok: false,
     }
@@ -630,6 +711,7 @@ fn failed_gateway_report(
         gateway_normalization: failed_stage(error),
         provider_translation: failed_stage("gateway normalization failed"),
         backend_execution: failed_stage("gateway normalization failed"),
+        backend_proof: None,
         response_normalization: failed_stage("gateway normalization failed"),
         ok: false,
     }
@@ -654,6 +736,7 @@ fn failed_execution_report(
         gateway_normalization,
         provider_translation: failed_stage(error),
         backend_execution: failed_stage("provider translation or execution failed"),
+        backend_proof: None,
         response_normalization: failed_stage("provider translation or execution failed"),
         ok: false,
     }
@@ -794,6 +877,10 @@ mod tests {
                         .cloned()
                         .collect(),
                     backend_execution_fingerprint: "22".repeat(32),
+                    backend_proof: EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::FullInference,
+                        behavioral_witness_fingerprint: None,
+                    },
                     response: json!({
                         "id": "cmpl-test",
                         "object": "text_completion",
@@ -817,6 +904,22 @@ mod tests {
             initial_errors.is_empty(),
             "{initial_errors:#?}\n{failed:#?}"
         );
+
+        let mut invalid_proof = report.clone();
+        let accepted = invalid_proof.families[0]
+            .cases
+            .iter_mut()
+            .find(|case| case.expect_accept)
+            .expect("accepted calibration row");
+        accepted.backend_proof = Some(EndpointCalibrationBackendProof {
+            kind: EndpointCalibrationBackendProofKind::WorkerSemanticValidation,
+            behavioral_witness_fingerprint: None,
+        });
+        let proof_errors =
+            validate_endpoint_calibration_report(std::slice::from_ref(&contract), &invalid_proof);
+        assert!(proof_errors
+            .iter()
+            .any(|error| error.contains("invalid backend proof")));
 
         report.families[0].cases.pop();
         report.families[0].case_count -= 1;
@@ -846,6 +949,10 @@ mod tests {
                         .cloned()
                         .collect(),
                     backend_execution_fingerprint: "22".repeat(32),
+                    backend_proof: EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::FullInference,
+                        behavioral_witness_fingerprint: None,
+                    },
                     response: json!({
                         "id": "cmpl-test",
                         "object": "text_completion",
@@ -871,5 +978,51 @@ mod tests {
                 && case.provider_translation.status
                     == EndpointCalibrationStageStatus::BlockedByExpectedRejection
         }));
+    }
+
+    #[test]
+    fn accepted_rows_fail_when_provider_translation_drops_an_attribute() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+        )
+        .unwrap();
+        let substitutions = BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]);
+        let report = run_endpoint_calibration_matrix(
+            std::slice::from_ref(&contract),
+            &substitutions,
+            |_contract, _case, _request| {
+                Ok(EndpointCalibrationExecution {
+                    provider_translation_fingerprint: "11".repeat(32),
+                    handled_request_attributes: BTreeSet::new(),
+                    backend_execution_fingerprint: "22".repeat(32),
+                    backend_proof: EndpointCalibrationBackendProof {
+                        kind: EndpointCalibrationBackendProofKind::FullInference,
+                        behavioral_witness_fingerprint: None,
+                    },
+                    response: json!({
+                        "id": "cmpl-test",
+                        "object": "text_completion",
+                        "created": 1,
+                        "model": "test/model",
+                        "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                        "mayhem": {}
+                    }),
+                })
+            },
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| case.expect_accept)
+            .any(|case| {
+                case.provider_translation
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("did not handle signed request"))
+            }));
     }
 }

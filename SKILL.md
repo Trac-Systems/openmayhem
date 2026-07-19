@@ -180,11 +180,197 @@ into each other.
 ```
 mayhem doctor                                  # what fits + expected tok/s + memory
 mayhem up --provider --yes                      # start serving the first feasible enclave
-mayhem provider rails set --rails <fiat,tap,tnk>
+mayhem provider rails set --rails <fiat,tap,tnk> --submit
 mayhem provider min-ask set <...>               # participation floor (per market)
 mayhem provider limits set [--max-concurrent N] [--accept-rate R] [--budget <USD/day|month|total>]
 mayhem provider health                          # green AND the model appears in /v1/models
 ```
+#### 4.2.1 Canonical model provider matrix
+
+Use the exact catalog `model_id` as `--provider-enclave`; do not normalize case or substitute an
+upstream repository name. `mayhem doctor --provider-backend <backend>` preflights that backend and
+its managed runtime only. The exact model/artifact/enclave fit is decided by the subsequent
+`mayhem up` command against the admin-published catalog and ledger.
+
+| Exact selector | Doctor backend | Canonical artifact | Supported execution | Catalog minimum | Gateway endpoints |
+|---|---|---|---|---|---|
+| `hauhaucs/qwen3.6-35b-a3b-uncensored` | `vllm` | `nvfp4` / vLLM safetensors | Current documented path is Linux NVIDIA; CLI rejects Windows; artifact requires compute capability >= 12.0 | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `google/gemma-4-E4B-it` | `llama.cpp` | `gguf-q4_k_m` + mandatory BF16 projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed Mayhem build has that feature | 12 GiB RAM, 8 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `tongyi/z-image-turbo` | `stable-diffusion.cpp` | `gguf-q4_k` + text encoder + VAE | Linux/Windows/macOS CPU fallback; CUDA, Metal, ROCm, or Vulkan selected from hwprobe when the matching `sd-cli`/`sd-server` build is installed | 16 GiB RAM, 8 GiB VRAM for full offload; no catalog CPU-flag floor | `/v1/images/generations`, `/hf-inference/models/<model-id>` |
+| `nvidia/parakeet-tdt-0.6b-v3` | `transformers-asr` | `safetensors` + processor/tokenizer | Linux, Windows, or macOS CPU; CUDA on Linux/Windows; Metal/MPS on macOS | 8 GiB RAM, 4 GiB VRAM for full offload, AVX2 or NEON | `/v1/audio/transcriptions`, `/hf-inference/models/<model-id>` |
+| `acestep/ace-step-1.5` | `ace-step` | `safetensors` composite | Linux x86_64/ARM64, Windows x86_64, or macOS x86_64/ARM64 CPU; CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 16 GiB RAM, 20 GiB VRAM for full offload, AVX2 or NEON | `/v1/music/generations`, `/v1/audio/generations`, `/hf-inference/models/<model-id>` |
+
+For every published model, the managed sequence is:
+```
+mayhem models --gateway
+mayhem doctor --provider-backend <exact-backend>
+mayhem up --provider --provider-enclave <exact-model-id> --yes
+mayhem provider health --json
+mayhem models --gateway
+```
+The start command is the model-artifact installer: it resolves an active admin-created enclave,
+downloads the immutable primary artifact and every signed sidecar, verifies size/hash/Merkle
+bindings, seals the artifact, loads the canonical backend, runs signed functional modality prompts,
+and only then joins canonical rooms and emits heartbeats. Never use a development catalog, a local
+artifact override, an upstream clone, manually selected weights/projectors/encoders, or a hand-built
+Python environment for provider service. `HF_TOKEN`/`--hf-token-file` changes download
+authentication only.
+
+`mayhem doctor` succeeds for a requested backend when it is not `Insufficient` and its runtime
+preflight completes; the non-JSON success line is `Provider backend preflight: <backend> ready`.
+It does **not** prove that this model's catalog floor, artifact, active enclave, room, or current
+price exists. `mayhem up` is the authoritative model check. On success its provider worker reports
+`self_test.ok=true`, functional `modality_health` rows with `ok=true`, and
+`Provider start complete: heartbeats flowing.` Final health requires `ok=true`, at least one active
+serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and this model/provider in
+`/v1/models`.
+
+**Qwen 3.6 35B-A3B uncensored**
+- **Install/start:** `mayhem doctor --provider-backend vllm`, then
+  `mayhem up --provider --provider-enclave hauhaucs/qwen3.6-35b-a3b-uncensored --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-hauhaucs-qwen3-6-35b-a3b-uncensored-NVFP4@58722d97ba2d93c32740f409efc9155b784edb95`;
+  `model.safetensors` is 23,354,242,416 bytes, plus exactly eight signed chat-template,
+  config/generation/processor/preprocessor/recipe/tokenizer sidecars. Total catalog payload is about
+  21.77 GiB. The only canonical backend/artifact pair is vLLM/`nvfp4`.
+- **Compute:** CPU-only, Apple Metal, AMD, pre-Blackwell NVIDIA, and Windows are not eligible for
+  this artifact. In addition to the catalog floors in the matrix, vLLM preflight requires a CUDA
+  toolkit containing `bin/nvcc`; no CPU fallback or alternate quant is cataloged.
+- **Endpoints/controls:** text output with text/image/video input, 262,144-token catalog context,
+  JSON and tools. Defaults are temperature `1.0`, top-p `0.95`, top-k `20`, min-p `0`, and
+  presence penalty `1.5`. `thinking_mode` defaults to `enabled`; `thinking_history` defaults to
+  `latest_only`. The provider may advertise only modalities and speciality levels present in the
+  signed adapter.
+- **Evidence:** `canary-launch-v2`, `token_fingerprint`, `match_min=0.9`; canonical `nvfp4`
+  fingerprint `e8e920fbe8d2a63fc4742a7fb49eef7ba250c34aa2f91180e465bf567a6e14f3`.
+  Startup functional cases must cover text, image, and video and return non-empty text/tool output;
+  periodic auditor probes perform the fingerprint comparison.
+- **Stop on:** `no NVIDIA GPU detected`, Windows vLLM rejection, compute capability below `12.0`,
+  less than 48 GiB RAM or 24 GiB NVIDIA memory, or the exact CUDA-toolkit preflight error. Relay the
+  reason; do not choose another Qwen checkpoint, quant, runtime, or local weights.
+
+**Gemma 4 E4B IT**
+- **Install/start:** `mayhem doctor --provider-backend llama.cpp`, then
+  `mayhem up --provider --provider-enclave google/gemma-4-E4B-it --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-google-gemma-4-E4B-it-GGUF@68772908c9431af9c9bfc3cee0ebefcd74995891`;
+  `gemma-4-E4B-it-Q4_K_M.gguf` is 5,335,289,664 bytes and the exact mandatory sidecar is
+  `mmproj-gemma-4-E4B-it-BF16.gguf` at 991,551,840 bytes. Never pair the GGUF with another
+  projector. Total payload is about 5.89 GiB.
+- **Compute:** 8 GiB VRAM is the catalog full-offload target, not a CPU admission minimum.
+  llama.cpp may run CPU-only or partially offloaded after the 12 GiB RAM and AVX2-or-NEON gates;
+  an accelerator verdict also requires the matching CUDA, Metal, or Vulkan feature in this Mayhem
+  build.
+- **Endpoints/controls:** text output with signed text/image/audio/video input, 131,072-token catalog
+  context, JSON and tools. Defaults are temperature `1.0`, top-p `0.95`, top-k `64`;
+  `thinking_mode` defaults to `disabled`. `visual_token_budget` is exactly
+  `budget_70|budget_140|budget_280|budget_560|budget_1120`, default `budget_280`.
+- **Evidence:** `canary-gemma4-launch-v1`, `token_fingerprint`, `match_min=0.9`,
+  `tolerance_bps=0`; canonical `gguf-q4_k_m` fingerprint
+  `99e2ae42e6d36c8ccbbee9ed12cafc84628490163b9a1e1d53854f971abe2a48`.
+  Startup must functionally cover text, image, audio, and video.
+- **Stop on:** `needs at least 12 GiB RAM`, `missing required CPU feature expression avx2|neon`,
+  a build-feature preflight error, missing/mismatched `mmproj`, or a canary failure. A CPU-only
+  doctor verdict is valid; an artifact/projector substitution is not.
+
+**Z-Image Turbo**
+- **Install/start:** `mayhem doctor --provider-backend stable-diffusion.cpp`, then
+  `mayhem up --provider --provider-enclave tongyi/z-image-turbo --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-tongyi-z-image-turbo-GGUF@b0110258385798d6e5b9bea626f6560607ce17ad`;
+  `z_image_turbo-Q4_K.gguf` is 3,864,250,304 bytes, with mandatory
+  `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` text encoder and `ae.safetensors` VAE sidecars. Total payload
+  is about 6.24 GiB. Signed backend semantics require a separate diffusion model and map public
+  steps by `-1` and guidance by `+1`; providers do not alter those offsets.
+- **Compute:** 8 GiB VRAM is the full-offload target; the catalog also permits a 16 GiB RAM CPU
+  path. hwprobe chooses CUDA, Metal, ROCm, Vulkan, or CPU, but runtime preflight still requires the
+  documented external `sd-cli` and sibling `sd-server`; Mayhem manages the model files, not those
+  executables.
+- **Endpoints/controls:** prompt up to 32,000 characters; width/height `576..2048`, each divisible
+  by 16, default `1024x1024`; steps `7..9`, default `9`; guidance `0..49`, default `0`; shift
+  `1..10`, default `3`; `n=1..4`, seed `0..4294967295`, and optional negative prompt. OpenAI output
+  is `b64_json`.
+- **Evidence:** `canary-z-image-launch-v1`, `seed_perceptual_hash`, `match_min=0.9`,
+  `tolerance_bps=1500`; prompt `z-image-red-cube-studio-seed7` expects pHash
+  `a0000303c3c73f07`. Startup must return an `image/*` artifact.
+- **Stop on:** the exact preflight:
+  ```text
+  stable-diffusion.cpp requires `sd-cli` on PATH or an explicit MAYHEM_STABLE_DIFFUSION_CPP_BIN path before `mayhem up --provider`
+  ```
+  Also stop on a missing sibling server, less than 16 GiB RAM, missing sidecars, invalid signed
+  offsets, or no image canary artifact. Report the prerequisite; do not download an arbitrary
+  engine binary or swap the text encoder/VAE.
+
+**Parakeet TDT 0.6B v3**
+- **Install/start:** `mayhem doctor --provider-backend transformers-asr`, then
+  `mayhem up --provider --provider-enclave nvidia/parakeet-tdt-0.6b-v3 --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers@a83f71f1a8a1cf099b5dbe23262c5028ad931086`;
+  byte-identical `model.safetensors` is 2,508,311,120 bytes, with exactly five signed config,
+  generation-config, processor, and tokenizer sidecars. The portable canonical backend is
+  `transformers-asr`; the upstream NeMo format is not a provider alternative.
+- **Compute:** CUDA uses Linux/Windows and at least 4 GiB usable device memory; Apple Metal/MPS uses
+  macOS unified memory; otherwise Linux/Windows/macOS CPU is supported. The 4 GiB value is the
+  full-offload target while the 8 GiB RAM and AVX2-or-NEON catalog gates still apply to every path.
+  Concurrency is one transcription.
+- **Endpoints/controls:** arbitrary bounded 16 kHz mono WAV/FLAC, automatic recognition across 25
+  languages, model punctuation/capitalization, overlapping long-audio chunking, and word/segment
+  timestamps. OpenAI `response_format` is `json|text|srt|verbose_json|vtt`;
+  `timestamp_granularities` is `word` and/or `segment`. HF `return_timestamps` is
+  `false|true|word|segment`. Forced language, prompt, sampling, and streaming controls are not
+  supported; do not advertise them.
+- **Evidence:** `canary-stt-launch-v2`, `transcript_match`, `match_min=1`; exact transcript evidence
+  covers `stt-en-punctuation-auto-language`, `stt-de-auto-language`, and
+  `stt-long-overlap-chunking`. Startup must return non-empty transcript text; auditor health requires
+  exact normalized transcript matches.
+- **Stop on:** less than 8 GiB RAM, missing `avx2|neon`, an unsupported OS, managed
+  `transformers-asr` bootstrap/import failure, malformed WAV/FLAC, or transcript canary failure.
+  Let Mayhem repair/recreate its exact pinned managed runtime on retry; do not `pip install`, clone
+  NeMo, or substitute weights.
+
+**ACE-Step 1.5: calibrated and signed locally, not ledger-live yet**
+- **Authority/status:** `acestep/ace-step-1.5` is present in the signed five-model local catalog.
+  The exact artifact and endpoint surface passed Windows CUDA, Linux CUDA, and Apple M5 Max MPS
+  calibration. Ledger publication, T1/T2 market creation, and the first paid provider proof are
+  still pending. Do not present it as live or run a provider until `mayhem models --gateway` shows
+  the admin-published model and active market.
+- **Future managed start:** after publication only, run `mayhem doctor --provider-backend ace-step`,
+  then `mayhem up --provider --provider-enclave acestep/ace-step-1.5 --yes`.
+- **Artifact shape:** admin mirror
+  `TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT@f41443d7171a03181ada08912780b0449e8ff7fe`;
+  SFT DiT `model.safetensors` is 4,787,825,604 bytes plus exactly 25 signed sidecars: measured DiT
+  config/modeling/APG code and silence latent, pinned Qwen3-Embedding-0.6B files, pinned
+  `acestep-5Hz-lm-1.7B` files, and pinned VAE config/weights. Total payload is about 9.40 GiB.
+  The measured ACE-Step v0.1.8 source is embedded in the Mayhem engine and runs in the enclave
+  sandbox; providers never enable arbitrary `trust_remote_code`.
+- **Compute:** the catalog floor is 16 GiB RAM, 20 GiB VRAM for full offload, and AVX2 or
+  NEON. Current doctor logic supports CPU on the matrix platforms, CUDA full offload at >=20 GiB,
+  CUDA CPU/INT8 partial offload at >=4 GiB, and Apple Silicon Metal/MPS with >=16 GiB available
+  unified memory. The worker rechecks free memory at load; do not promise throughput from these
+  thresholds. Managed ACE runtime bootstrap also requires 24 GiB free disk.
+- **Endpoints/controls:** full music endpoint supports `text2music|cover|cover-nofsq|repaint`,
+  prompt/caption (composed maximum 512 characters), lyrics (maximum 4096), style/genre/tags, source
+  and reference audio, duration auto/`-1` or `10..600` seconds, steps `1..200` default `50`,
+  guidance `1..15` default `7`, `n=1..8` default `2`, seed `-1..4294967295`, thinking, BPM
+  `30..300`, key/time signature, ODE/SDE, Euler/Heun, cover/repaint controls, and
+  `flac|opus|aac|wav|wav32|mp3`. The simpler audio/HF endpoints expose prompt, duration
+  `10..600`, guidance, seed, and their narrower signed response shape.
+- **Evidence/pending publication:** `canary-music-launch-v1`, `audio_fingerprint`,
+  `match_min=0.9`, `tolerance_bps=1500` (signed floor 8500), using
+  `ace-step-text2music-seed7`. Windows/Linux similarity is 9918 bps; two fresh M5 MPS runs are
+  byte-identical and score 8730 against Linux; unrelated audio scores 1666. All three endpoint
+  families and 1,208 cases pass. Until ledger publication, the correct outcome is an absent gateway
+  model or no active admin-created priced enclave. Stop there; never clone ACE-Step, manually install
+  its runtime, publish local output, or substitute any component.
+
+For any model, preserve and relay the exact `mayhem up` rejection bullets. In particular,
+`ledger artifact binding does not match signed catalog artifact`, `no local-compatible artifact`,
+`functional modality canary <id> failed/returned invalid output`, and
+`provider engine became unhealthy during functional modality self-test` are hard stops. A degraded
+health report or missing route is not green: re-run that model's exact doctor command and the same
+managed start, fix only documented environment prerequisites, and never bypass verification or
+change the admin artifact.
+
 For explicit Tier 2, pass `--provider-hardware-quote-kind tpm2-quote-ek` and the platform helper
 to `mayhem up --provider --yes`: `scripts/hardware/mayhem-tpm2-quote-linux.sh` on Linux or
 `scripts/hardware/mayhem-tpm2-quote-windows.ps1` on Windows. Both run under the provider account;
@@ -236,7 +422,7 @@ forwarded as-is.
 | Price + derivation | `mayhem price show` |
 | Max price ceiling | `mayhem config max-price <v\|--clear>` |
 | What fits (provider) | `mayhem doctor` |
-| Accept rails | `mayhem provider rails set --rails fiat,tap,tnk` |
+| Accept rails | `mayhem provider rails set --rails fiat,tap,tnk --submit` |
 | Min-ask floor | `mayhem provider min-ask set <…>` |
 | Limits | `mayhem provider limits set --max-concurrent N --accept-rate R --budget <USD/day>` |
 | Provider health | `mayhem provider health` |

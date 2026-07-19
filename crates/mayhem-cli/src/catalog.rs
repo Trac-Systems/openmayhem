@@ -264,6 +264,8 @@ pub(crate) struct CatalogArtifact {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct CatalogArtifactSidecar {
     pub(crate) source: SourceRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream_source: Option<SourceRef>,
     pub(crate) path: String,
     pub(crate) artifact_root: String,
     pub(crate) artifact_root_kind: String,
@@ -1245,9 +1247,11 @@ fn validate_modality_resource_profiles(model: &CatalogModel, errors: &mut Vec<St
                     .calibration_baseline_memory_bytes
                     .saturating_add(profile.measured_working_set_bytes)
                     > profile.calibration_f13_budget_bytes
+                || profile.measured_working_set_bytes
+                    != modality_profile_working_set_bytes(modality, profile)
             {
                 errors.push(format!(
-                    "{} modality resource profile for {}/{} peak and decoded working set must fit between baseline and its F13 budget",
+                    "{} modality resource profile for {}/{} must bind its measured working set to peak-minus-baseline or the decoded-item floor within its F13 budget",
                     model.model_id, artifact, modality
                 ));
             }
@@ -1283,6 +1287,32 @@ fn validate_modality_resource_profiles(model: &CatalogModel, errors: &mut Vec<St
             }
         }
     }
+}
+
+fn modality_profile_working_set_bytes(
+    modality: &str,
+    profile: &CatalogModalityResourceProfile,
+) -> u64 {
+    let decoded_floor = match modality {
+        "image" => profile.max_item_units.saturating_mul(3).saturating_mul(4),
+        "audio" => profile
+            .max_item_units
+            .saturating_mul(48_000)
+            .saturating_mul(4),
+        "video" => profile
+            .max_item_units
+            .saturating_mul(224)
+            .saturating_mul(224)
+            .saturating_mul(3)
+            .saturating_mul(4),
+        _ => profile.max_item_bytes,
+    }
+    .max(profile.max_item_bytes);
+    profile
+        .calibration_peak_memory_bytes
+        .saturating_sub(profile.calibration_baseline_memory_bytes)
+        .max(decoded_floor)
+        .max(1)
 }
 
 fn validate_modality_calibration_fingerprints(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -1580,11 +1610,16 @@ fn validate_transcript_match_canary(model: &CatalogModel, errors: &mut Vec<Strin
 }
 
 fn validate_audio_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
-    if model.canary.verification_tolerance_bps.is_some() {
-        errors.push(format!(
-            "{} audio_fingerprint canary must not set verification_tolerance_bps",
+    match model.canary.verification_tolerance_bps {
+        Some(0..=2_500) => {}
+        Some(_) => errors.push(format!(
+            "{} audio_fingerprint canary verification_tolerance_bps must be between 0 and 2500",
             model.model_id
-        ));
+        )),
+        None => errors.push(format!(
+            "{} audio_fingerprint canary requires verification_tolerance_bps",
+            model.model_id
+        )),
     }
     validate_text_and_image_blobs_absent(model, "audio_fingerprint", errors);
     if !model.canary.embedding_vectors.is_empty() || !model.canary.transcripts.is_empty() {
@@ -1604,9 +1639,9 @@ fn validate_audio_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<Stri
                     "{model_id} canary audio_fingerprints for {artifact} has empty prompt id"
                 ));
             }
-            if !is_hex_len(fingerprint, 64) {
+            if !mayhem_gateway::valid_audio_fingerprint(fingerprint) {
                 errors.push(format!(
-                    "{model_id} canary audio_fingerprints for {artifact} prompt {prompt_id} must be 32-byte hex"
+                    "{model_id} canary audio_fingerprints for {artifact} prompt {prompt_id} must be a valid audiospec-v1 spectral fingerprint"
                 ));
             }
         },
@@ -2644,10 +2679,28 @@ fn validate_endpoint_attribute_spec(
         ));
     }
     for value in values {
+        if endpoint_calibration_marker_is_standard(value, standard) {
+            continue;
+        }
         if let Err(reason) = mayhem_proto::validate_endpoint_attribute_value(spec, value) {
             errors.push(format!("{label} has invalid declared test value: {reason}"));
         }
     }
+}
+
+fn endpoint_calibration_marker_is_standard(
+    value: &Value,
+    standard: &mayhem_proto::EndpointAttributeSpec,
+) -> bool {
+    let Some(marker) = value.as_str() else {
+        return false;
+    };
+    marker.strip_prefix('$').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) && (standard.calibration_values.contains(value) || standard.default.as_ref() == Some(value))
 }
 
 fn validate_endpoint_attribute_names(
@@ -2657,9 +2710,9 @@ fn validate_endpoint_attribute_names(
     attributes: &[String],
     errors: &mut Vec<String>,
 ) {
-    if attributes.is_empty() || attributes.len() > 64 {
+    if attributes.is_empty() || attributes.len() > 128 {
         errors.push(format!(
-            "{model_id} endpoint family {family} {field} must contain 1..=64 entries"
+            "{model_id} endpoint family {family} {field} must contain 1..=128 entries"
         ));
     }
     let mut seen = BTreeSet::new();
@@ -2843,6 +2896,7 @@ fn validate_artifact(
             | "diffusers"
             | "stable-diffusion.cpp"
             | "comfyui"
+            | "ace-step"
             | "transformers-asr"
             | "whisper.cpp"
             | "piper"
@@ -2958,6 +3012,37 @@ fn validate_artifact(
             }
         }
     }
+    if artifact.engine == "ace-step" {
+        if artifact.path != "model.safetensors" {
+            errors.push(format!(
+                "{model_id}/{name} ace-step primary artifact must use path model.safetensors, got {}",
+                artifact.path
+            ));
+        }
+        for (required, expected_path) in ACE_STEP_REQUIRED_SIDECARS {
+            match artifact.sidecars.get(*required) {
+                Some(sidecar) if sidecar.path == *expected_path => {}
+                Some(sidecar) => errors.push(format!(
+                    "{model_id}/{name} ace-step sidecar {required} must use path {expected_path}, got {}",
+                    sidecar.path
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} ace-step artifact needs sidecar {required}"
+                )),
+            }
+        }
+        let required = ACE_STEP_REQUIRED_SIDECARS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<BTreeSet<_>>();
+        for sidecar_name in artifact.sidecars.keys() {
+            if !required.contains(sidecar_name.as_str()) {
+                errors.push(format!(
+                    "{model_id}/{name} ace-step artifact has unapproved sidecar {sidecar_name}"
+                ));
+            }
+        }
+    }
     match (&artifact.stable_diffusion_cpp, artifact.engine.as_str()) {
         (Some(config), "stable-diffusion.cpp") => {
             if let Err(error) = config.validate() {
@@ -2990,6 +3075,64 @@ fn validate_artifact(
     let _ = (artifact.download_check, &artifact.notes);
 }
 
+const ACE_STEP_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("ace_dit_config", "config.json"),
+    ("ace_dit_configuration", "configuration_acestep_v15.py"),
+    ("ace_dit_modeling", "modeling_acestep_v15_base.py"),
+    ("ace_dit_apg_guidance", "apg_guidance.py"),
+    ("ace_dit_silence_latent", "silence_latent.pt"),
+    (
+        "ace_embedding_added_tokens",
+        "Qwen3-Embedding-0.6B/added_tokens.json",
+    ),
+    (
+        "ace_embedding_chat_template",
+        "Qwen3-Embedding-0.6B/chat_template.jinja",
+    ),
+    ("ace_embedding_config", "Qwen3-Embedding-0.6B/config.json"),
+    ("ace_embedding_merges", "Qwen3-Embedding-0.6B/merges.txt"),
+    (
+        "ace_embedding_model",
+        "Qwen3-Embedding-0.6B/model.safetensors",
+    ),
+    (
+        "ace_embedding_special_tokens",
+        "Qwen3-Embedding-0.6B/special_tokens_map.json",
+    ),
+    (
+        "ace_embedding_tokenizer",
+        "Qwen3-Embedding-0.6B/tokenizer.json",
+    ),
+    (
+        "ace_embedding_tokenizer_config",
+        "Qwen3-Embedding-0.6B/tokenizer_config.json",
+    ),
+    ("ace_embedding_vocab", "Qwen3-Embedding-0.6B/vocab.json"),
+    (
+        "ace_lm_added_tokens",
+        "acestep-5Hz-lm-1.7B/added_tokens.json",
+    ),
+    (
+        "ace_lm_chat_template",
+        "acestep-5Hz-lm-1.7B/chat_template.jinja",
+    ),
+    ("ace_lm_config", "acestep-5Hz-lm-1.7B/config.json"),
+    ("ace_lm_merges", "acestep-5Hz-lm-1.7B/merges.txt"),
+    ("ace_lm_model", "acestep-5Hz-lm-1.7B/model.safetensors"),
+    (
+        "ace_lm_special_tokens",
+        "acestep-5Hz-lm-1.7B/special_tokens_map.json",
+    ),
+    ("ace_lm_tokenizer", "acestep-5Hz-lm-1.7B/tokenizer.json"),
+    (
+        "ace_lm_tokenizer_config",
+        "acestep-5Hz-lm-1.7B/tokenizer_config.json",
+    ),
+    ("ace_lm_vocab", "acestep-5Hz-lm-1.7B/vocab.json"),
+    ("ace_vae_config", "vae/config.json"),
+    ("ace_vae_model", "vae/diffusion_pytorch_model.safetensors"),
+];
+
 fn validate_artifact_sidecar(
     model_id: &str,
     artifact_name: &str,
@@ -3009,6 +3152,14 @@ fn validate_artifact_sidecar(
         &sidecar.source,
         errors,
     );
+    if let Some(upstream_source) = &sidecar.upstream_source {
+        validate_source(
+            model_id,
+            &format!("artifacts.{artifact_name}.sidecars.{sidecar_name}.upstream_source"),
+            upstream_source,
+            errors,
+        );
+    }
     if sidecar.path.trim().is_empty() {
         errors.push(format!(
             "{model_id}/{artifact_name} sidecar {sidecar_name} path is required"
@@ -3748,6 +3899,95 @@ mod tests {
     }
 
     #[test]
+    fn ace_step_artifact_requires_the_exact_signed_component_inventory() {
+        let mut model = verification_test_model(
+            "admin/ace-step@sft",
+            MODEL_CLASS_MUSIC_GENERATION,
+            "ace-step",
+            CanaryRef {
+                set_id: "canary-music-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([(
+                        "music".to_owned(),
+                        format!("audiospec-v1:1000:{}", "01".repeat(256)),
+                    )]),
+                )]),
+            },
+        );
+        let artifact = model.artifacts.get_mut("fixture").unwrap();
+        artifact.sidecars = ACE_STEP_REQUIRED_SIDECARS
+            .iter()
+            .enumerate()
+            .map(|(index, (name, path))| {
+                (
+                    (*name).to_owned(),
+                    CatalogArtifactSidecar {
+                        source: artifact.source.clone(),
+                        upstream_source: None,
+                        path: (*path).to_owned(),
+                        artifact_root: format!("{index:064x}"),
+                        artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                        weights_bytes: 1,
+                        source_sha256: format!("{:064x}", index + 1),
+                    },
+                )
+            })
+            .collect();
+
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            model.artifacts.get("fixture").unwrap(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut missing = model.artifacts["fixture"].clone();
+        missing.sidecars.remove("ace_vae_model");
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &missing,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("needs sidecar ace_vae_model")));
+
+        let mut extra = model.artifacts["fixture"].clone();
+        extra.sidecars.insert(
+            "provider_code".to_owned(),
+            CatalogArtifactSidecar {
+                source: extra.source.clone(),
+                upstream_source: None,
+                path: "provider.py".to_owned(),
+                artifact_root: "b".repeat(64),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 1,
+                source_sha256: "c".repeat(64),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_artifact(&model.model_id, &model.tier, "fixture", &extra, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unapproved sidecar provider_code")));
+    }
+
+    #[test]
     fn model_min_app_version_must_be_semver_when_present() {
         let mut model = verification_test_model(
             "admin/model@4bit",
@@ -4176,7 +4416,7 @@ mod tests {
                 set_id: "canary-music-v1".to_owned(),
                 match_min: 0.9,
                 verification_method: VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
-                verification_tolerance_bps: None,
+                verification_tolerance_bps: Some(1_000),
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
@@ -4184,13 +4424,33 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::from([(
                     "fixture".to_owned(),
-                    BTreeMap::from([("fixed-audio".to_owned(), "c".repeat(64))]),
+                    BTreeMap::from([(
+                        "fixed-audio".to_owned(),
+                        format!("audiospec-v1:1000:{}", "01".repeat(256)),
+                    )]),
                 )]),
             },
         );
         let mut errors = Vec::new();
         validate_model(&audio, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut unknown_marker = audio.clone();
+        unknown_marker
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+            .unwrap()
+            .request_attribute_specs
+            .get_mut("source_audio.data")
+            .unwrap()
+            .calibration_values = vec![Value::String("$UNKNOWN_AUDIO_FIXTURE".to_owned())];
+        let mut errors = Vec::new();
+        validate_model(&unknown_marker, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("has invalid declared test value")));
 
         let mut attested_audio = audio.clone();
         attested_audio.canary.verification_method = VERIFICATION_ATTESTATION_OF_COMPUTE.to_owned();
@@ -4717,6 +4977,16 @@ mod tests {
     }
 
     fn verification_test_resource_profile(modality: &str) -> CatalogModalityResourceProfile {
+        let measured_working_set_bytes = match modality {
+            "image" => 3 * 4,
+            "audio" => 48_000 * 4,
+            "video" => 224 * 224 * 3 * 4,
+            _ => 1,
+        }
+        .max(10);
+        let calibration_baseline_memory_bytes = 1_000_000;
+        let calibration_peak_memory_bytes =
+            calibration_baseline_memory_bytes + measured_working_set_bytes;
         CatalogModalityResourceProfile {
             unit: match modality {
                 "image" => "pixel",
@@ -4731,10 +5001,10 @@ mod tests {
             max_item_units: 1,
             measured_item_bytes: 1,
             measured_item_units: 1,
-            measured_working_set_bytes: 10,
-            calibration_baseline_memory_bytes: 100,
-            calibration_peak_memory_bytes: 110,
-            calibration_f13_budget_bytes: 200,
+            measured_working_set_bytes,
+            calibration_baseline_memory_bytes,
+            calibration_peak_memory_bytes,
+            calibration_f13_budget_bytes: calibration_peak_memory_bytes + 1_000_000,
             default_max_inflight_items: 1,
             default_max_items_per_request: 1,
         }

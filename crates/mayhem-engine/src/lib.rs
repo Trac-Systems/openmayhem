@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -21,6 +22,7 @@ pub const DEFAULT_UBATCH_SIZE: u32 = 512;
 pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 #[cfg(any(
+    feature = "ace-step",
     feature = "mlx",
     feature = "vllm",
     feature = "trt-llm",
@@ -62,6 +64,8 @@ pub enum EngineError {
     Vllm(String),
     #[error("Transformers ASR backend error: {0}")]
     TransformersAsr(String),
+    #[error("ACE-Step backend error: {0}")]
+    AceStep(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
     StableDiffusionCpp(String),
     #[error("whisper.cpp backend error: {0}")]
@@ -201,6 +205,7 @@ pub enum ArtifactFormat {
     TensorRtLlmCheckpoint,
     VllmSafetensors,
     TransformersSafetensors,
+    AceStepSafetensors,
     StableDiffusionCheckpoint,
     WhisperGgml,
     PiperVoice,
@@ -215,6 +220,7 @@ impl ArtifactFormat {
             Self::TensorRtLlmCheckpoint => b"",
             Self::VllmSafetensors => b"",
             Self::TransformersSafetensors => b"",
+            Self::AceStepSafetensors => b"",
             Self::StableDiffusionCheckpoint => b"",
             Self::WhisperGgml => b"",
             Self::PiperVoice => b"",
@@ -229,6 +235,7 @@ impl ArtifactFormat {
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
             Self::VllmSafetensors => "vLLM safetensors",
             Self::TransformersSafetensors => "Transformers safetensors",
+            Self::AceStepSafetensors => "ACE-Step safetensors",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
             Self::WhisperGgml => "whisper.cpp ggml model",
             Self::PiperVoice => "Piper voice",
@@ -313,6 +320,14 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::TransformersSafetensors,
+            sha256: None,
+        }
+    }
+
+    pub fn ace_step_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::AceStepSafetensors,
             sha256: None,
         }
     }
@@ -439,6 +454,13 @@ impl LoadConfig {
     pub fn transformers_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::transformers_safetensors(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn ace_step_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::ace_step_safetensors(path),
             ..Self::default()
         }
     }
@@ -978,7 +1000,7 @@ impl MediaGenerationRequest {
                 "media generation endpoint_family must not be empty".to_owned(),
             ));
         }
-        if self.prompt.trim().is_empty() {
+        if self.prompt.trim().is_empty() && !music_request_has_validated_task_input(self) {
             return Err(EngineError::InvalidConfig(
                 "media generation prompt must not be empty".to_owned(),
             ));
@@ -1003,11 +1025,52 @@ impl MediaGenerationRequest {
     }
 }
 
+fn music_request_has_validated_task_input(request: &MediaGenerationRequest) -> bool {
+    if request.endpoint_family != "mayhem_music_generations" {
+        return false;
+    }
+    let Some(body) = request.request.as_object() else {
+        return false;
+    };
+    let nonempty_text = |field: &str| {
+        body.get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let has_source_audio = ["source_audio", "src_audio", "input_audio", "audio"]
+        .into_iter()
+        .any(|field| {
+            body.get(field).is_some_and(|value| match value {
+                Value::String(encoded) => !encoded.trim().is_empty(),
+                Value::Object(descriptor) => descriptor
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|encoded| !encoded.trim().is_empty()),
+                _ => false,
+            })
+        });
+    match body
+        .get("task_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text2music")
+    {
+        "text2music" => nonempty_text("caption") || nonempty_text("lyrics"),
+        "cover" | "cover-nofsq" | "repaint" => has_source_audio,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaGenerationOutput {
     pub duration_seconds: u64,
     pub frame_count: u64,
     pub step_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaGenerationValidation {
+    pub evidence: Value,
+    pub handled_request_attributes: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1108,6 +1171,9 @@ impl ArtifactSink for NoopArtifactSink {
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
+    fn loaded_backend_evidence(&self) -> Option<Value> {
+        None
+    }
     fn component_healthy(&mut self) -> bool {
         true
     }
@@ -1204,6 +1270,13 @@ pub trait EngineBackend {
             "{} backend does not support music generation",
             self.backend_id()
         )))
+    }
+    fn validate_media_generation(
+        &mut self,
+        _request: MediaGenerationRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<MediaGenerationValidation>> {
+        Ok(None)
     }
 }
 
@@ -1457,6 +1530,16 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             let payload = transformers_safetensors_payload_path(&artifact.path)?;
             verify_safetensors_header_as(&payload, artifact.format.label())?;
             payload
+        }
+        ArtifactFormat::AceStepSafetensors => {
+            if !artifact.path.is_file() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "ACE-Step primary artifact {} must be a safetensors file",
+                    artifact.path.display()
+                )));
+            }
+            verify_safetensors_header_as(&artifact.path, artifact.format.label())?;
+            artifact.path.clone()
         }
         ArtifactFormat::StableDiffusionCheckpoint => {
             let payload = stable_diffusion_payload_path(&artifact.path)?;
@@ -1841,7 +1924,7 @@ fn piper_voice_model_path(path: &Path) -> Result<PathBuf> {
             ))
         })?)
     } else {
-        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+        Err(EngineError::ModelPathMissing(path.to_path_buf()))
     }
 }
 
@@ -1995,6 +2078,15 @@ pub use vllm_backend::VllmBackend;
 
 #[cfg(feature = "transformers-asr")]
 pub use transformers_asr_backend::TransformersAsrBackend;
+
+#[cfg(feature = "ace-step")]
+mod ace_step_backend;
+
+#[cfg(feature = "ace-step")]
+pub use ace_step_backend::{
+    ensure_ace_step_source, AceStepBackend, AceStepExecutionConfig, ACE_STEP_SOURCE_COMMIT,
+    ACE_STEP_SOURCE_SHA256,
+};
 
 #[cfg(feature = "vllm")]
 pub fn discover_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
@@ -8396,6 +8488,60 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-engine");
+    }
+
+    #[test]
+    fn media_validation_allows_only_task_complete_music_without_a_prompt() {
+        let request = |endpoint_family: &str, request: Value| MediaGenerationRequest {
+            endpoint_family: endpoint_family.to_owned(),
+            prompt: String::new(),
+            request,
+            duration_seconds: None,
+            frame_count: None,
+            step_count: None,
+            response_format: None,
+        };
+
+        request(
+            "mayhem_music_generations",
+            json!({"lyrics": "[Verse]\nA lyrics-only song"}),
+        )
+        .validate()
+        .expect("music accepts lyrics-only text2music");
+        request(
+            "mayhem_music_generations",
+            json!({"caption": "A caption-only song"}),
+        )
+        .validate()
+        .expect("music accepts the caption prompt alias");
+        request(
+            "mayhem_music_generations",
+            json!({
+                "task_type": "cover",
+                "source_audio": {
+                    "encoding": "base64",
+                    "data": "UklGRg==",
+                    "content_type": "audio/wav"
+                }
+            }),
+        )
+        .validate()
+        .expect("music accepts a source-driven cover");
+
+        for invalid in [
+            request("mayhem_audio_generations", json!({"lyrics": "not music"})),
+            request("mayhem_music_generations", json!({})),
+            request(
+                "mayhem_music_generations",
+                json!({"task_type": "cover", "lyrics": "missing source"}),
+            ),
+            request(
+                "mayhem_music_generations",
+                json!({"task_type": "extract", "source_audio": "UklGRg=="}),
+            ),
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[cfg(unix)]

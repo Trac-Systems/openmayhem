@@ -274,8 +274,16 @@ impl GatewaySessionBackend for ArtifactGenerationDirectSessionBackend {
                     "video/mp4",
                     b"mayhem-test-mp4".to_vec(),
                     ReceiptUsage::from_units([
-                        (USAGE_VIDEO_SECOND, request.duration_seconds),
-                        (USAGE_FRAME, request.frame_count),
+                        (
+                            USAGE_VIDEO_SECOND,
+                            request
+                                .duration_seconds
+                                .saturating_mul(request.artifact_count),
+                        ),
+                        (
+                            USAGE_FRAME,
+                            request.frame_count.saturating_mul(request.artifact_count),
+                        ),
                     ]),
                 )
             } else {
@@ -285,22 +293,162 @@ impl GatewaySessionBackend for ArtifactGenerationDirectSessionBackend {
                     ReceiptUsage::from_units([
                         (
                             USAGE_INPUT_CHARACTER,
-                            u64::try_from(request.prompt.chars().count()).unwrap(),
+                            mayhem_proto::artifact_generation_input_characters(
+                                &request.endpoint_family,
+                                &request.contract_request,
+                            ),
                         ),
-                        (USAGE_AUDIO_SECOND, request.duration_seconds),
+                        (
+                            USAGE_AUDIO_SECOND,
+                            request
+                                .duration_seconds
+                                .saturating_mul(request.artifact_count),
+                        ),
                     ]),
                 )
             };
-            let artifact_id = format!("{}-test", request.output_modality);
+            let artifacts = (0..request.artifact_count)
+                .map(|index| GatewayArtifactOutput {
+                    id: format!("{}-test-{index}", request.output_modality),
+                    content_type: content_type.to_owned(),
+                    blake3: blake3::hash(&bytes).to_hex().to_string(),
+                    bytes: bytes.clone(),
+                })
+                .collect();
             Ok(GatewayArtifactGenerationResult {
-                output: ArtifactGenerationOutput {
-                    artifacts: vec![GatewayArtifactOutput {
-                        id: artifact_id,
-                        content_type: content_type.to_owned(),
+                output: ArtifactGenerationOutput { artifacts, usage },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactGenerationRecordingBackend {
+    requests: Arc<Mutex<Vec<ArtifactGenerationRequest>>>,
+}
+
+impl GatewaySessionBackend for ArtifactGenerationRecordingBackend {
+    fn name(&self) -> &str {
+        "test-artifact-recording"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_artifact_generation<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ArtifactGenerationRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayArtifactGenerationFuture<'a> {
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("artifact generation records")
+                .push(request.clone());
+            let artifacts = (0..request.artifact_count)
+                .map(|index| {
+                    let bytes = tiny_wav_bytes(16_000 + u32::try_from(index).unwrap_or(0));
+                    GatewayArtifactOutput {
+                        id: format!("recorded-audio-{index}"),
+                        content_type: "audio/wav".to_owned(),
                         blake3: blake3::hash(&bytes).to_hex().to_string(),
                         bytes,
-                    }],
-                    usage,
+                    }
+                })
+                .collect();
+            Ok(GatewayArtifactGenerationResult {
+                output: ArtifactGenerationOutput {
+                    artifacts,
+                    usage: ReceiptUsage::from_units([
+                        (
+                            USAGE_INPUT_CHARACTER,
+                            mayhem_proto::artifact_generation_input_characters(
+                                &request.endpoint_family,
+                                &request.contract_request,
+                            ),
+                        ),
+                        (
+                            USAGE_AUDIO_SECOND,
+                            request
+                                .duration_seconds
+                                .saturating_mul(request.artifact_count),
+                        ),
+                    ]),
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ExtraCanaryArtifactBackend;
+
+impl GatewaySessionBackend for ExtraCanaryArtifactBackend {
+    fn name(&self) -> &str {
+        "test-extra-canary-artifact"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_artifact_generation<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ArtifactGenerationRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayArtifactGenerationFuture<'a> {
+        Box::pin(async move {
+            let count = request
+                .artifact_count
+                .saturating_add(u64::from(request.prompt == "fixed music canary"));
+            let bytes = tiny_wav_bytes(16_000);
+            let artifacts = (0..count)
+                .map(|index| GatewayArtifactOutput {
+                    id: format!("recorded-audio-{index}"),
+                    content_type: "audio/wav".to_owned(),
+                    blake3: blake3::hash(&bytes).to_hex().to_string(),
+                    bytes: bytes.clone(),
+                })
+                .collect();
+            Ok(GatewayArtifactGenerationResult {
+                output: ArtifactGenerationOutput {
+                    artifacts,
+                    usage: ReceiptUsage::from_units([
+                        (
+                            USAGE_INPUT_CHARACTER,
+                            mayhem_proto::artifact_generation_input_characters(
+                                &request.endpoint_family,
+                                &request.contract_request,
+                            ),
+                        ),
+                        (
+                            USAGE_AUDIO_SECOND,
+                            request
+                                .duration_seconds
+                                .saturating_mul(request.artifact_count),
+                        ),
+                    ]),
                 },
                 backend: self.name().to_owned(),
                 direct_session: true,
@@ -2172,6 +2320,8 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
     .await;
     assert_eq!(audio_status, StatusCode::OK, "{audio}");
     assert_eq!(audio["object"], "audio.generation");
+    assert_eq!(audio["data"].as_array().unwrap().len(), 1);
+    assert_eq!(audio["audio"], audio["data"][0]["audio"]);
     assert_eq!(audio["usage"][USAGE_INPUT_CHARACTER], 4);
     assert_eq!(audio["usage"][USAGE_AUDIO_SECOND], 2);
     assert_eq!(audio["mayhem"]["receipt"]["rail"], "fiat");
@@ -2183,7 +2333,7 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
         json!({
             "model": "admin/music-generation-fixture",
             "prompt": "piano",
-            "duration_seconds": 3,
+            "duration_seconds": 10,
             "response_format": "wav",
             "seed": 9
         }),
@@ -2191,8 +2341,10 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
     .await;
     assert_eq!(music_status, StatusCode::OK, "{music}");
     assert_eq!(music["object"], "music.generation");
-    assert_eq!(music["usage"][USAGE_INPUT_CHARACTER], 5);
-    assert_eq!(music["usage"][USAGE_AUDIO_SECOND], 3);
+    assert_eq!(music["data"].as_array().unwrap().len(), 2);
+    assert_eq!(music["music"], music["data"][0]["music"]);
+    assert_eq!(music["usage"][USAGE_INPUT_CHARACTER], 77);
+    assert_eq!(music["usage"][USAGE_AUDIO_SECOND], 20);
     assert_eq!(music["mayhem"]["receipt"]["rail"], "fiat");
 
     let (hf_status, hf_headers, hf_audio) = raw_request(
@@ -2211,6 +2363,806 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
     assert_eq!(hf_audio, tiny_wav_bytes(16_000));
     assert!(hf_headers.contains_key("x-mayhem-receipt"));
     assert_eq!(state.receipts().len(), 3);
+}
+
+#[tokio::test]
+async fn music_generation_normalizes_repaint_surface_and_returns_every_artifact() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut model = routed_music_generation_test_model();
+    model.mayhem.model_class = "general-audio-foundation-model".to_owned();
+    let state = test_gateway_state_from_models(vec![model])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+    let source_bytes = tiny_wav_bytes(16_000);
+    let reference_bytes = tiny_wav_bytes(8_000);
+    let mut request_body = json!({
+        "model": "admin/music-generation-fixture",
+        "caption": "a bright synth-pop chorus",
+        "lyrics": "[Chorus]\nMayhem in the moonlight",
+        "instrumental": false,
+        "style": "glossy",
+        "genre": "synth-pop",
+        "tags": [" bright ", "anthemic", "night drive"],
+        "vocal_language": "en",
+        "bpm": 124,
+        "keyscale": "F# minor",
+        "timesignature": "4/4",
+        "duration": 12.25,
+        "inference_steps": 8,
+        "guidance_scale": 7.0,
+        "seeds": [42, 43],
+    });
+    for controls in [
+        json!({
+            "task_type": "repaint",
+            "inference_method": "ode",
+            "shift": 1.5,
+            "use_adg": true,
+            "cfg_interval_start": 0.1,
+            "cfg_interval_end": 0.9,
+        }),
+        json!({
+            "repainting_start": 0.25,
+            "repainting_end": 1.75,
+            "repaint_strength": 0.6,
+            "chunk_mask_mode": "explicit",
+            "repaint_mode": "balanced",
+            "audio_cover_strength": 0.7,
+            "coverNoiseStrength": 0.2,
+            "sampler_mode": "heun",
+            "velocity_norm_threshold": 1.0,
+            "velocity_ema_factor": 0.1,
+            "dcw_enabled": true,
+            "dcw_mode": "double",
+            "dcw_scaler": 0.04,
+            "dcw_high_scaler": 0.01,
+            "dcw_wavelet": "db2",
+        }),
+        json!({
+            "enable_normalization": true,
+            "normalization_db": -2.0,
+            "fade_in_duration": 0.2,
+            "fade_out_duration": 0.3,
+            "latent_shift": 0.1,
+            "latent_rescale": 1.1,
+            "retake_seed": 99,
+            "retake_variance": 0.2,
+            "audio_format": "mp3",
+            "mp3_bitrate": "320k",
+            "mp3_sample_rate": 44100,
+            "batch_size": 2,
+        }),
+        json!({
+            "src_audio": format!(
+                "data:audio/wav;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&source_bytes)
+            ),
+            "melody": format!(
+                "data:audio/wav;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&reference_bytes)
+            ),
+        }),
+    ] {
+        request_body
+            .as_object_mut()
+            .expect("music request fixture object")
+            .extend(
+                controls
+                    .as_object()
+                    .expect("music controls fixture object")
+                    .clone(),
+            );
+    }
+
+    let (status, response) =
+        json_request(app, Method::POST, "/v1/music/generations", request_body).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["object"], "music.generation");
+    assert_eq!(response["data"].as_array().unwrap().len(), 2);
+    assert_eq!(response["mayhem"]["artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(response["music"], response["data"][0]["music"]);
+    assert_eq!(response["usage"][USAGE_AUDIO_SECOND], 26);
+
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.model, "admin/music-generation-fixture");
+    assert_eq!(request.prompt, "a bright synth-pop chorus");
+    assert_eq!(request.duration_seconds, 13);
+    assert_eq!(request.step_count, 8);
+    assert_eq!(request.artifact_count, 2);
+    assert_eq!(request.response_format, "mp3");
+    let signed = &request.contract_request;
+    assert_eq!(signed["prompt"], "a bright synth-pop chorus");
+    assert_eq!(signed["style"], "glossy");
+    assert_eq!(signed["genre"], "synth-pop");
+    assert_eq!(signed["tags"], "bright, anthemic, night drive");
+    assert_eq!(signed["language"], "en");
+    assert_eq!(signed["key"], "F# minor");
+    assert_eq!(signed["time_signature"], "4/4");
+    assert_eq!(signed["duration_seconds"], 12.25);
+    assert_eq!(signed["steps"], 8);
+    assert_eq!(signed["n"], 2);
+    assert_eq!(signed["seeds"], json!([42, 43]));
+    assert!(signed.get("custom_timesteps").is_none());
+    assert_eq!(signed["infer_method"], "ode");
+    assert_eq!(signed["repaint_start"], 0.25);
+    assert_eq!(signed["repaint_end"], 1.75);
+    assert_eq!(signed["repaint_strength"], 0.6);
+    assert_eq!(signed["chunk_mask_mode"], "explicit");
+    assert_eq!(signed["repaint_mode"], "balanced");
+    assert_eq!(signed["cover_strength"], 0.7);
+    assert_eq!(signed["cover_noise_strength"], 0.2);
+    assert_eq!(signed["sampler"], "heun");
+    assert_eq!(signed["velocity_norm_threshold"], 1.0);
+    assert_eq!(signed["velocity_ema_factor"], 0.1);
+    assert_eq!(signed["dcw_enabled"], true);
+    assert_eq!(signed["dcw_mode"], "double");
+    assert_eq!(signed["dcw_scaler"], 0.04);
+    assert_eq!(signed["dcw_high_scaler"], 0.01);
+    assert_eq!(signed["dcw_wavelet"], "db2");
+    assert_eq!(signed["enable_normalization"], true);
+    assert_eq!(signed["normalization_db"], -2.0);
+    assert_eq!(signed["fade_in_duration"], 0.2);
+    assert_eq!(signed["fade_out_duration"], 0.3);
+    assert_eq!(signed["latent_shift"], 0.1);
+    assert_eq!(signed["latent_rescale"], 1.1);
+    assert_eq!(signed["retake_seed"], 99);
+    assert_eq!(signed["retake_variance"], 0.2);
+    assert_eq!(signed["response_format"], "mp3");
+    assert_eq!(signed["mp3_bitrate"], "320k");
+    assert_eq!(signed["mp3_sample_rate"], 44100);
+    assert_eq!(signed["source_audio"]["encoding"], "base64");
+    assert_eq!(signed["source_audio"]["content_type"], "audio/wav");
+    assert_eq!(
+        signed["source_audio"]["data"],
+        base64::engine::general_purpose::STANDARD.encode(&source_bytes)
+    );
+    assert_eq!(signed["reference_audio"]["encoding"], "base64");
+    assert_eq!(signed["reference_audio"]["content_type"], "audio/wav");
+    assert_eq!(
+        signed["reference_audio"]["data"],
+        base64::engine::general_purpose::STANDARD.encode(&reference_bytes)
+    );
+    for alias in [
+        "caption",
+        "vocal_language",
+        "keyscale",
+        "timesignature",
+        "duration",
+        "inference_steps",
+        "coverNoiseStrength",
+        "sampler_mode",
+        "batch_size",
+        "src_audio",
+        "melody",
+    ] {
+        assert!(
+            signed.get(alias).is_none(),
+            "alias {alias} was not normalized"
+        );
+    }
+}
+
+#[tokio::test]
+async fn music_generation_normalizes_lm_and_audio_code_aliases_in_valid_requests() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (sample_status, sample_response) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "caption": "an upbeat night-drive chorus",
+            "sampleMode": true,
+            "description": "bright synth-pop with a large chorus",
+            "useFormat": true,
+            "thinking": true,
+            "temperature": 0.85,
+            "lm_cfg": 2.0,
+            "top_k": 40,
+            "top_p": 0.9,
+            "negative_prompt": "noise",
+            "cot_metas": true,
+            "cot_caption": true,
+            "cot_language": true,
+            "use_constrained_decoding": true
+        }),
+    )
+    .await;
+    assert_eq!(sample_status, StatusCode::OK, "{sample_response}");
+
+    let (codes_status, codes_response) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "continue these semantic audio codes",
+            "task_type": "cover",
+            "audioCodeString": "<|audio_code_1|><|audio_code_2|>"
+        }),
+    )
+    .await;
+    assert_eq!(codes_status, StatusCode::OK, "{codes_response}");
+
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 2);
+    let sample = &requests[0].contract_request;
+    assert_eq!(sample["sample_mode"], true);
+    assert_eq!(
+        sample["sample_query"],
+        "bright synth-pop with a large chorus"
+    );
+    assert_eq!(sample["use_format"], true);
+    assert_eq!(sample["thinking"], true);
+    assert_eq!(sample["lm_temperature"], 0.85);
+    assert_eq!(sample["lm_cfg_scale"], 2.0);
+    assert_eq!(sample["lm_top_k"], 40);
+    assert_eq!(sample["lm_top_p"], 0.9);
+    assert_eq!(sample["lm_negative_prompt"], "noise");
+    assert_eq!(sample["use_cot_metas"], true);
+    assert_eq!(sample["use_cot_caption"], true);
+    assert_eq!(sample["use_cot_language"], true);
+    assert_eq!(sample["constrained_decoding"], true);
+    let codes = &requests[1].contract_request;
+    assert_eq!(codes["audio_codes"], "<|audio_code_1|><|audio_code_2|>");
+    for alias in [
+        "sampleMode",
+        "description",
+        "useFormat",
+        "temperature",
+        "lm_cfg",
+        "top_k",
+        "top_p",
+        "negative_prompt",
+        "cot_metas",
+        "cot_caption",
+        "cot_language",
+        "use_constrained_decoding",
+    ] {
+        assert!(
+            sample.get(alias).is_none(),
+            "alias {alias} was not normalized"
+        );
+    }
+    assert!(codes.get("audioCodeString").is_none());
+}
+
+#[tokio::test]
+async fn music_generation_normalizes_creator_source_and_cover_aliases() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+    let source = format!(
+        "data:audio/wav;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000))
+    );
+    let reference = format!(
+        "data:audio/wav;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(8_000))
+    );
+
+    let (status, response) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "no_fsq": true,
+            "ctx_audio": source,
+            "ref_audio": reference,
+            "flow_edit": true,
+            "flow_edit_source_caption": "the original arrangement"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    let signed = &requests[0].contract_request;
+    assert_eq!(signed["task_type"], "cover-nofsq");
+    assert_eq!(signed["flow_edit_morph"], true);
+    assert_eq!(signed["source_audio"]["content_type"], "audio/wav");
+    assert_eq!(signed["reference_audio"]["content_type"], "audio/wav");
+    for alias in ["no_fsq", "ctx_audio", "ref_audio", "flow_edit"] {
+        assert!(
+            signed.get(alias).is_none(),
+            "alias {alias} was not normalized"
+        );
+    }
+}
+
+#[tokio::test]
+async fn music_generation_preserves_signed_flow_edit_controls() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+    let source_audio = format!(
+        "data:audio/wav;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000))
+    );
+
+    let (status, response) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "caption": "reshape this arrangement",
+            "task_type": "cover",
+            "source_audio": source_audio,
+            "flow_edit_morph": true,
+            "flow_edit_source_caption": "a sparse original arrangement",
+            "flow_edit_source_lyrics": "original lyrics",
+            "flow_edit_n_min": 0.1,
+            "flow_edit_n_max": 0.9,
+            "flow_edit_n_avg": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    let signed = &requests[0].contract_request;
+    assert_eq!(signed["flow_edit_morph"], true);
+    assert_eq!(
+        signed["flow_edit_source_caption"],
+        "a sparse original arrangement"
+    );
+    assert_eq!(signed["flow_edit_source_lyrics"], "original lyrics");
+    assert_eq!(signed["flow_edit_n_min"], 0.1);
+    assert_eq!(signed["flow_edit_n_max"], 0.9);
+    assert_eq!(signed["flow_edit_n_avg"], 1);
+}
+
+#[tokio::test]
+async fn music_generation_uses_signed_defaults_and_ranges() {
+    let model = routed_music_generation_test_model();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (default_status, defaulted) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "signed defaults"
+        }),
+    )
+    .await;
+    assert_eq!(default_status, StatusCode::OK, "{defaulted}");
+    assert_eq!(defaulted["data"].as_array().unwrap().len(), 2);
+    assert_eq!(defaulted["usage"][USAGE_INPUT_CHARACTER], 87);
+    assert_eq!(defaulted["usage"][USAGE_AUDIO_SECOND], 2);
+
+    let (range_status, rejected) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "caption": "outside signed batch range",
+            "batch": 9
+        }),
+    )
+    .await;
+    assert_eq!(range_status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert!(rejected.to_string().contains("n"));
+
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].duration_seconds, 1);
+    assert_eq!(requests[0].step_count, 50);
+    assert_eq!(requests[0].artifact_count, 2);
+    assert_eq!(requests[0].response_format, "flac");
+    assert_eq!(requests[0].contract_request["guidance_scale"], 7.0);
+    assert_eq!(requests[0].contract_request["thinking"], false);
+    assert_eq!(requests[0].contract_request["use_cot_caption"], true);
+}
+
+#[tokio::test]
+async fn music_generation_accepts_task_specific_promptless_requests() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (lyrics_status, lyrics_response) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "task_type": "text2music",
+            "lyrics": "[Verse]\nLyrics carry this request"
+        }),
+    )
+    .await;
+    assert_eq!(lyrics_status, StatusCode::OK, "{lyrics_response}");
+
+    let source_audio = format!(
+        "data:audio/wav;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000))
+    );
+    for task_type in ["cover", "cover-nofsq", "repaint"] {
+        let (status, response) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/music/generations",
+            json!({
+                "model": "admin/music-generation-fixture",
+                "task_type": task_type,
+                "source_audio": source_audio
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{task_type}: {response}");
+    }
+
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 4);
+    for request in requests.iter() {
+        assert_eq!(request.prompt, "");
+        assert_eq!(request.contract_request["prompt"], "");
+    }
+    assert_eq!(
+        requests[0].contract_request["lyrics"],
+        "[Verse]\nLyrics carry this request"
+    );
+    for request in &requests[1..] {
+        assert_eq!(
+            request.contract_request["source_audio"]["content_type"],
+            "audio/wav"
+        );
+    }
+}
+
+#[tokio::test]
+async fn music_generation_rejects_task_requests_missing_required_inputs() {
+    let model = routed_music_generation_test_model();
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+        .expect("music endpoint contract");
+    assert!(!contract
+        .required_request_attributes
+        .iter()
+        .any(|attribute| matches!(attribute.as_str(), "prompt" | "caption")));
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (text_status, text_error) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "task_type": "text2music"
+        }),
+    )
+    .await;
+    assert_eq!(text_status, StatusCode::BAD_REQUEST, "{text_error}");
+    assert!(text_error.to_string().contains("lyrics"), "{text_error}");
+
+    for task_type in ["cover", "cover-nofsq", "repaint"] {
+        let (status, error) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/music/generations",
+            json!({
+                "model": "admin/music-generation-fixture",
+                "task_type": task_type,
+                "caption": "text cannot replace the required source"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{task_type}: {error}");
+        assert!(
+            error.to_string().contains("source_audio"),
+            "{task_type}: {error}"
+        );
+    }
+    assert!(requests
+        .lock()
+        .expect("artifact generation records")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn music_generation_rejects_unsupported_controls_and_server_paths() {
+    let mut model = routed_music_generation_test_model();
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter_mut()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+        .expect("music endpoint contract");
+    contract
+        .request_attributes
+        .retain(|path| path != "cover_noise_strength");
+    contract
+        .request_attribute_specs
+        .remove("cover_noise_strength");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (unsupported_status, unsupported) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "unsupported capability",
+            "cover_noise_strength": 0.2
+        }),
+    )
+    .await;
+    assert_eq!(unsupported_status, StatusCode::BAD_REQUEST, "{unsupported}");
+    assert!(unsupported.to_string().contains("cover_noise_strength"));
+
+    let (alias_status, alias_error) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "ambiguous sampling query",
+            "sample_query": "first query",
+            "description": "second query"
+        }),
+    )
+    .await;
+    assert_eq!(alias_status, StatusCode::BAD_REQUEST, "{alias_error}");
+    assert!(alias_error.to_string().contains("conflicting aliases"));
+
+    let (negative_status, negative_error) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "ambiguous negative prompt",
+            "negative_prompt": "first exclusion",
+            "lm_negative_prompt": "second exclusion"
+        }),
+    )
+    .await;
+    assert_eq!(negative_status, StatusCode::BAD_REQUEST, "{negative_error}");
+    assert!(negative_error.to_string().contains("conflicting aliases"));
+
+    let (sampling_status, sampling_error) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "ambiguous temperature",
+            "temperature": 0.8,
+            "lm_temperature": 0.9
+        }),
+    )
+    .await;
+    assert_eq!(sampling_status, StatusCode::BAD_REQUEST, "{sampling_error}");
+    assert!(sampling_error.to_string().contains("conflicting aliases"));
+
+    let (path_status, path_error) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "forbidden path",
+            "source_audio_path": "/srv/private/reference.wav"
+        }),
+    )
+    .await;
+    assert_eq!(path_status, StatusCode::BAD_REQUEST, "{path_error}");
+    assert!(path_error.to_string().contains("forbidden"));
+    assert!(requests
+        .lock()
+        .expect("artifact generation records")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn selected_music_sft_does_not_expose_or_accept_unsupported_controls() {
+    let model = routed_music_generation_test_model();
+    let unsupported = [
+        ("global_caption", json!("not supported by the selected SFT")),
+        ("use_cot_lyrics", json!(true)),
+        ("lm_repetition_penalty", json!(1.1)),
+        ("repaint_latent_crossfade_frames", json!(12)),
+        ("repaint_wav_crossfade_sec", json!(0.1)),
+        ("typical_p", json!(0.9)),
+        ("do_sample", json!(true)),
+        ("max_new_tokens", json!(128)),
+    ];
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+        .expect("music endpoint contract");
+    for (field, _) in &unsupported {
+        assert!(
+            !contract
+                .request_attributes
+                .iter()
+                .any(|attribute| attribute == field),
+            "selected SFT contract unexpectedly exposes {field}"
+        );
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    for (field, value) in unsupported {
+        let mut body = json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "unsupported selected-SFT control"
+        });
+        body.as_object_mut()
+            .expect("music request fixture object")
+            .insert(field.to_owned(), value);
+        let (status, error) =
+            json_request(app.clone(), Method::POST, "/v1/music/generations", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {error}");
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+    assert!(requests
+        .lock()
+        .expect("artifact generation records")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn hf_text_to_audio_maps_caption_and_arbitrary_inline_audio_generically() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_general_audio_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+    let source = format!(
+        "data:audio/x-custom;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"not a wav or flac")
+    );
+
+    let (status, headers, bytes) = raw_request(
+        app,
+        Method::POST,
+        "/hf-inference/models/admin/audio-generation-fixture",
+        Some(json!({
+            "caption": "generic HF audio",
+            "source_audio": source,
+            "duration": 2,
+            "temperature": 0.7
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/wav");
+    assert!(bytes.starts_with(b"RIFF"));
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt, "generic HF audio");
+    assert_eq!(requests[0].duration_seconds, 2);
+    assert_eq!(requests[0].contract_request["inputs"], "generic HF audio");
+    assert_eq!(
+        requests[0].contract_request["parameters"]["generation_parameters"]["temperature"],
+        0.7
+    );
+    assert_eq!(
+        requests[0].contract_request["parameters"]["audio"]["content_type"],
+        "audio/x-custom"
+    );
+    assert_eq!(
+        requests[0].contract_request["parameters"]["audio"]["encoding"],
+        "base64"
+    );
+    assert_eq!(
+        requests[0].contract_request["parameters"]["audio"]["data"],
+        base64::engine::general_purpose::STANDARD.encode(b"not a wav or flac")
+    );
+}
+
+#[tokio::test]
+async fn general_audio_controls_are_not_rewritten_as_music_lm_controls() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![routed_general_audio_generation_test_model()])
+        .with_dev_session_shim()
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state);
+
+    let (status, response) = json_request(
+        app,
+        Method::POST,
+        "/v1/audio/generations",
+        json!({
+            "model": "admin/audio-generation-fixture",
+            "caption": "clean rain ambience",
+            "negative_prompt": "speech",
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8,
+            "duration_seconds": 2,
+            "response_format": "wav"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt, "clean rain ambience");
+    assert_eq!(requests[0].contract_request["negative_prompt"], "speech");
+    assert_eq!(requests[0].contract_request["temperature"], 0.7);
+    assert_eq!(requests[0].contract_request["top_k"], 20);
+    assert_eq!(requests[0].contract_request["top_p"], 0.8);
+    for field in [
+        "lm_negative_prompt",
+        "lm_temperature",
+        "lm_top_k",
+        "lm_top_p",
+    ] {
+        assert!(requests[0].contract_request.get(field).is_none(), "{field}");
+    }
 }
 
 #[tokio::test]
@@ -2329,6 +3281,114 @@ async fn automatic_audio_fingerprint_probe_records_pass() {
     assert!(probe.pass);
     assert_eq!(probe.match_bps, 10_000);
     assert_eq!(probe.evidence["receipts"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn automatic_music_fingerprint_probe_uses_signed_music_surface() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let expected_audio = tiny_wav_bytes(16_000);
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_canary_registry(test_music_audio_fingerprint_canary_registry(
+            audio_fingerprint(&expected_audio),
+        ))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(ArtifactGenerationRecordingBackend {
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "user music request",
+            "duration_seconds": 10,
+            "response_format": "wav",
+            "n": 1,
+            "seed": 5
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let requests = requests.lock().expect("artifact generation records");
+    assert_eq!(requests.len(), 2);
+    let canary = &requests[1];
+    assert_eq!(
+        canary.endpoint_family,
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+    );
+    assert_eq!(canary.output_modality, "audio");
+    assert_eq!(canary.prompt, "fixed music canary");
+    assert_eq!(canary.duration_seconds, 10);
+    assert_eq!(canary.step_count, 50);
+    assert_eq!(canary.artifact_count, 1);
+    assert_eq!(canary.response_format, "wav");
+    assert_eq!(
+        canary.contract_request["lyrics"],
+        "[Verse]\nCanonical proof"
+    );
+    assert_eq!(canary.contract_request["instrumental"], false);
+    assert_eq!(canary.contract_request["bpm"], 120);
+    assert_eq!(canary.contract_request["key"], "C major");
+    assert_eq!(canary.contract_request["time_signature"], "4/4");
+    assert_eq!(canary.contract_request["task_type"], "text2music");
+    assert_eq!(canary.contract_request["thinking"], false);
+    assert_eq!(canary.contract_request["guidance_scale"], 7);
+    assert_eq!(canary.contract_request["seed"], 7);
+    assert!(canary.contract_request.get("audio_b64").is_none());
+    drop(requests);
+
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].verification_method, "audio_fingerprint");
+    assert!(probes[0].pass, "music canary probe: {:?}", probes[0]);
+    assert_eq!(probes[0].match_bps, 10_000);
+    assert_eq!(state.receipts().len(), 2);
+}
+
+#[tokio::test]
+async fn automatic_music_fingerprint_probe_rejects_extra_artifacts() {
+    let expected_audio = tiny_wav_bytes(16_000);
+    let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
+        .with_canary_registry(test_music_audio_fingerprint_canary_registry(
+            audio_fingerprint(&expected_audio),
+        ))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(ExtraCanaryArtifactBackend));
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/v1/music/generations",
+        json!({
+            "model": "admin/music-generation-fixture",
+            "prompt": "user music request",
+            "duration_seconds": 10,
+            "response_format": "wav",
+            "n": 1,
+            "seed": 5
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    assert!(!probes[0].pass);
+    assert_eq!(probes[0].match_bps, 0);
+    assert_eq!(
+        probes[0].evidence["reason"],
+        "provider returned 2 audio canary artifact(s), expected 1"
+    );
+    assert_eq!(
+        state.receipts().len(),
+        1,
+        "the rejected canary must not be metered"
+    );
 }
 
 #[tokio::test]
@@ -4441,7 +5501,11 @@ fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
     bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
     bytes.extend_from_slice(b"data");
     bytes.extend_from_slice(&data_len.to_le_bytes());
-    bytes.resize(44 + data_len as usize, 0);
+    for frame in 0..sample_count {
+        let phase = std::f64::consts::TAU * 220.0 * f64::from(frame) / f64::from(sample_rate);
+        let sample = (phase.sin() * 4_096.0).round() as i16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
     bytes
 }
 
@@ -4505,6 +5569,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     cfg_scale: None,
                     shift: None,
                     seed: None,
+                    endpoint_attributes: BTreeMap::new(),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
@@ -4569,6 +5634,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                     cfg_scale: Some(1.0),
                     shift: None,
                     seed: Some(7),
+                    endpoint_attributes: BTreeMap::new(),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
@@ -4630,6 +5696,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                     cfg_scale: None,
                     shift: None,
                     seed: None,
+                    endpoint_attributes: BTreeMap::new(),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
@@ -4682,6 +5749,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
         cfg_scale: None,
         shift: None,
         seed: None,
+        endpoint_attributes: BTreeMap::new(),
     };
     let mut calibration_prompt = runtime_prompt.clone();
     calibration_prompt.id = "long-calibration-only".to_owned();
@@ -4762,6 +5830,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     cfg_scale: None,
                     shift: None,
                     seed: None,
+                    endpoint_attributes: BTreeMap::new(),
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
@@ -4771,6 +5840,84 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 audio_fingerprints_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-tts".to_owned(), expected_fingerprint)]),
+                )]),
+                speciality_calibrations_by_artifact_root: BTreeMap::new(),
+                default_fingerprint: None,
+                default_token_prefixes: None,
+                default_perceptual_hashes: None,
+                default_embedding_vectors: None,
+                default_transcripts: None,
+                default_audio_fingerprints: None,
+            },
+        )]),
+    }
+}
+
+fn test_music_audio_fingerprint_canary_registry(
+    expected_fingerprint: String,
+) -> GatewayCanaryRegistry {
+    GatewayCanaryRegistry {
+        models: BTreeMap::from([(
+            "admin/music-generation-fixture".to_owned(),
+            GatewayCanaryModelConfig {
+                canary_set: "canary-music-test-v1".to_owned(),
+                requires_launch_evidence: false,
+                match_min_bps: 9_000,
+                verification_method: "audio_fingerprint".to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                prompts: vec![GatewayCanaryPrompt {
+                    id: "fixed-music".to_owned(),
+                    calibration_only: false,
+                    messages: Vec::new(),
+                    tools: None,
+                    specialities: BTreeMap::new(),
+                    max_tokens: 1,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: None,
+                    frequency_penalty: None,
+                    presence_penalty: None,
+                    prompt: Some("fixed music canary".to_owned()),
+                    input: None,
+                    audio_b64: Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(b"STT-only fixture must not enter a music request"),
+                    ),
+                    content_type: None,
+                    filename: None,
+                    language: None,
+                    voice: None,
+                    response_format: Some("wav".to_owned()),
+                    require_word_timestamps: false,
+                    require_segment_timestamps: false,
+                    size: None,
+                    steps: Some(50),
+                    cfg_scale: None,
+                    shift: None,
+                    seed: Some(7),
+                    endpoint_attributes: BTreeMap::from([
+                        ("lyrics".to_owned(), json!("[Verse]\nCanonical proof")),
+                        ("instrumental".to_owned(), json!(false)),
+                        ("duration_seconds".to_owned(), json!(10)),
+                        ("bpm".to_owned(), json!(120)),
+                        ("keyscale".to_owned(), json!("C major")),
+                        ("timesignature".to_owned(), json!("4/4")),
+                        ("task_type".to_owned(), json!("text2music")),
+                        ("thinking".to_owned(), json!(false)),
+                        ("guidance_scale".to_owned(), json!(7)),
+                        ("n".to_owned(), json!(1)),
+                    ]),
+                }],
+                fingerprints_by_artifact_root: BTreeMap::new(),
+                token_prefixes_by_artifact_root: BTreeMap::new(),
+                perceptual_hashes_by_artifact_root: BTreeMap::new(),
+                embedding_vectors_by_artifact_root: BTreeMap::new(),
+                transcripts_by_artifact_root: BTreeMap::new(),
+                audio_fingerprints_by_artifact_root: BTreeMap::from([(
+                    "aa".repeat(32),
+                    BTreeMap::from([("fixed-music".to_owned(), expected_fingerprint)]),
                 )]),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,

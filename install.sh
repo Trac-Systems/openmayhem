@@ -78,6 +78,85 @@ log() {
   printf '==> %s\n' "$*" >&2
 }
 
+run_as_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+  command -v sudo >/dev/null 2>&1 ||
+    die "sudo is required once to install the Ubuntu AppArmor user-namespace profile"
+  sudo "$@"
+}
+
+apparmor_quote_path() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+configure_linux_user_namespace_sandbox() {
+  local restriction profile cli enclave unshare_bin
+  local cli_quoted enclave_quoted unshare_quoted smoke_root output
+
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  restriction="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+  [[ -r "$restriction" ]] || return 0
+  [[ "$(cat "$restriction")" == "1" ]] || return 0
+
+  command -v unshare >/dev/null 2>&1 ||
+    die "util-linux unshare is required for the Linux enclave sandbox"
+  if unshare --user --map-root-user --mount true >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v apparmor_parser >/dev/null 2>&1 ||
+    die "AppArmor is restricting user namespaces; install apparmor_parser and rerun install.sh"
+
+  cli="$(readlink -f "$INSTALL_DIR/mayhem")"
+  enclave="$(readlink -f "$INSTALL_DIR/mayhem-enclave")"
+  unshare_bin="$(readlink -f "$(command -v unshare)")"
+  cli_quoted="$(apparmor_quote_path "$cli")"
+  enclave_quoted="$(apparmor_quote_path "$enclave")"
+  unshare_quoted="$(apparmor_quote_path "$unshare_bin")"
+  profile="$TMP_ROOT/mayhem-userns"
+
+  cat > "$profile" <<PROFILE
+abi <abi/4.0>,
+include <tunables/global>
+
+profile mayhem-userns-cli $cli_quoted flags=(unconfined) {
+  userns,
+  $unshare_quoted ix,
+}
+
+profile mayhem-userns-enclave $enclave_quoted flags=(unconfined) {
+  userns,
+  $unshare_quoted ix,
+}
+PROFILE
+
+  log "installing the narrow Ubuntu AppArmor user-namespace profile"
+  run_as_root install -m 0644 "$profile" /etc/apparmor.d/mayhem-userns
+  run_as_root apparmor_parser -r /etc/apparmor.d/mayhem-userns
+
+  smoke_root="$TMP_ROOT/linux-sandbox-smoke"
+  mkdir -p "$smoke_root/read-only" "$smoke_root/writable"
+  printf 'mayhem-userns-ready\n' > "$smoke_root/read-only/input.txt"
+  if ! output="$(
+    "$enclave" sandbox-run \
+      --read-only-dir "$smoke_root/read-only" \
+      --writable-dir "$smoke_root/writable" \
+      -- \
+      "$enclave" sandbox-probe-store-read \
+      --path "$smoke_root/read-only/input.txt" 2>&1
+  )"; then
+    die "the installed AppArmor profile did not enable the private Linux sandbox: $output"
+  fi
+  [[ "$output" == "mayhem-userns-ready" ]] ||
+    die "the private Linux sandbox returned an unexpected readiness result: $output"
+  log "Linux user-namespace sandbox smoke test passed"
+}
+
 cleanup() {
   rm -rf "$TMP_ROOT"
 }
@@ -774,6 +853,7 @@ else
   install_from_artifact
 fi
 
+configure_linux_user_namespace_sandbox
 hydrate_runtime_assets
 install_opencode
 update_shell_profile

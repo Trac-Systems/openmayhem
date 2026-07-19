@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::Command;
 use std::process::ExitStatus;
+#[cfg(not(target_os = "windows"))]
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,9 +32,11 @@ const DEFAULT_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
-pub const SANDBOX_SCHEMA_VERSION: u32 = 1;
+pub const SANDBOX_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
 pub const SATURATION_SHED_THRESHOLD: f64 = 0.9;
+#[cfg(not(target_os = "windows"))]
+const SANDBOX_READY_LINE: &[u8] = b"mayhem-sandbox-ready-v1\n";
 
 type Result<T> = std::result::Result<T, EnclaveError>;
 
@@ -78,6 +81,10 @@ pub enum EnclaveError {
     SandboxCommandEmpty,
     #[error("sandbox is not supported on this platform: {0}")]
     SandboxUnsupported(String),
+    #[error("sandbox setup failed before child exec: {0}")]
+    SandboxSetupFailed(String),
+    #[error("sandbox setup exited with {status} before child exec: {detail}")]
+    SandboxSetupExited { status: ExitStatus, detail: String },
     #[error("outbound TCP unexpectedly succeeded to {addr}")]
     OutboundTcpUnexpectedlySucceeded { addr: String },
     #[error("outbound TCP failed, but not with a sandbox denial: {addr}: {error}")]
@@ -206,16 +213,60 @@ pub enum SandboxPlatform {
 
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
-    pub sealed_store_dir: PathBuf,
-    pub ipc_socket_path: PathBuf,
+    pub read_only_dirs: Vec<PathBuf>,
+    pub writable_dirs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SandboxedStderr {
+    #[default]
+    Inherit,
+    Piped,
+    Null,
+}
+
+#[derive(Clone, Debug)]
+pub struct SandboxedCommand {
+    program: OsString,
+    args: Vec<OsString>,
+    env: BTreeMap<OsString, Option<OsString>>,
+    env_clear: bool,
+    current_dir: Option<PathBuf>,
+    stderr: SandboxedStderr,
+    memory_limit_bytes: Option<u64>,
+    sandbox_helper: Option<PathBuf>,
+    executable_read_only_dirs: Vec<PathBuf>,
+    allow_code_generation: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+pub type SandboxedChildStdin = ChildStdin;
+#[cfg(target_os = "windows")]
+pub type SandboxedChildStdin = std::fs::File;
+
+#[cfg(not(target_os = "windows"))]
+pub type SandboxedChildStdout = ChildStdout;
+#[cfg(target_os = "windows")]
+pub type SandboxedChildStdout = std::fs::File;
+
+#[cfg(not(target_os = "windows"))]
+pub type SandboxedChildStderr = ChildStderr;
+#[cfg(target_os = "windows")]
+pub type SandboxedChildStderr = std::fs::File;
+
+pub struct SandboxedChild {
+    #[cfg(not(target_os = "windows"))]
+    child: Child,
+    #[cfg(target_os = "windows")]
+    child: mayhem_windows_sandbox::WindowsSandboxChild,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxProfile {
     pub schema_version: u32,
     pub platform: SandboxPlatform,
-    pub sealed_store_dir: PathBuf,
-    pub ipc_socket_path: PathBuf,
+    pub read_only_dirs: Vec<PathBuf>,
+    pub writable_dirs: Vec<PathBuf>,
     pub policy: String,
 }
 
@@ -517,10 +568,193 @@ impl RuntimeKeypairStoreOptions {
 }
 
 impl SandboxConfig {
-    pub fn new(sealed_store_dir: impl Into<PathBuf>, ipc_socket_path: impl Into<PathBuf>) -> Self {
+    pub fn new(read_only_dirs: Vec<PathBuf>, writable_dirs: Vec<PathBuf>) -> Self {
         Self {
-            sealed_store_dir: sealed_store_dir.into(),
-            ipc_socket_path: ipc_socket_path.into(),
+            read_only_dirs,
+            writable_dirs,
+        }
+    }
+}
+
+impl SandboxedCommand {
+    pub fn new(program: impl AsRef<OsStr>) -> Self {
+        Self {
+            program: program.as_ref().to_os_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            env_clear: false,
+            current_dir: None,
+            stderr: SandboxedStderr::Inherit,
+            memory_limit_bytes: None,
+            sandbox_helper: None,
+            executable_read_only_dirs: Vec::new(),
+            allow_code_generation: false,
+        }
+    }
+
+    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+        self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.args
+            .extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
+        self
+    }
+
+    pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.env.insert(
+            key.as_ref().to_os_string(),
+            Some(value.as_ref().to_os_string()),
+        );
+        self
+    }
+
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        for (key, value) in vars {
+            self.env(key, value);
+        }
+        self
+    }
+
+    pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+        self.env.insert(key.as_ref().to_os_string(), None);
+        self
+    }
+
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.env_clear = true;
+        self
+    }
+
+    pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+        self.current_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn stderr(&mut self, stderr: SandboxedStderr) -> &mut Self {
+        self.stderr = stderr;
+        self
+    }
+
+    pub fn memory_limit_bytes(&mut self, limit: u64) -> &mut Self {
+        self.memory_limit_bytes = (limit > 0).then_some(limit);
+        self
+    }
+
+    pub fn sandbox_helper(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.sandbox_helper = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn executable_read_only_dir(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.executable_read_only_dirs
+            .push(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn allow_code_generation(&mut self) -> &mut Self {
+        self.allow_code_generation = true;
+        self
+    }
+
+    pub fn spawn(&self, config: &SandboxConfig) -> Result<SandboxedChild> {
+        spawn_sandboxed_child(config, self)
+    }
+
+    pub fn get_program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
+        self.args.iter().map(OsString::as_os_str)
+    }
+}
+
+impl SandboxedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn stdin(&mut self) -> Option<&mut SandboxedChildStdin> {
+        self.child.stdin.as_mut()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<SandboxedChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn stdout(&mut self) -> Option<&mut SandboxedChildStdout> {
+        self.child.stdout.as_mut()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<SandboxedChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn stderr(&mut self) -> Option<&mut SandboxedChildStderr> {
+        self.child.stderr.as_mut()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<SandboxedChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.child.try_wait().map_err(EnclaveError::Io)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::ExitStatusExt;
+
+            self.child
+                .try_wait()
+                .map(|status| status.map(ExitStatus::from_raw))
+                .map_err(map_windows_sandbox_error)
+        }
+    }
+
+    pub fn kill(&mut self) -> Result<()> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.child.kill().map_err(EnclaveError::Io)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.child.kill().map_err(map_windows_sandbox_error)
+        }
+    }
+
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.child.stdin.take();
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.child.wait().map_err(EnclaveError::Io)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::ExitStatusExt;
+
+            self.child
+                .wait()
+                .map(ExitStatus::from_raw)
+                .map_err(map_windows_sandbox_error)
         }
     }
 }
@@ -1603,17 +1837,24 @@ pub fn build_sandbox_profile(
     config: &SandboxConfig,
     platform: SandboxPlatform,
 ) -> Result<SandboxProfile> {
-    validate_sandbox_config(config)?;
+    let config = resolve_sandbox_config(config)?;
+    build_resolved_sandbox_profile(&config, platform)
+}
+
+fn build_resolved_sandbox_profile(
+    config: &SandboxConfig,
+    platform: SandboxPlatform,
+) -> Result<SandboxProfile> {
     let policy = match platform {
-        SandboxPlatform::LinuxSeccompBpf => linux_seccomp_policy_document(),
+        SandboxPlatform::LinuxSeccompBpf => linux_seccomp_policy_document(config),
         SandboxPlatform::MacosSandboxExec => macos_sandbox_exec_profile(config),
         SandboxPlatform::WindowsAppContainer => windows_appcontainer_policy_document(config)?,
     };
     Ok(SandboxProfile {
         schema_version: SANDBOX_SCHEMA_VERSION,
         platform,
-        sealed_store_dir: config.sealed_store_dir.clone(),
-        ipc_socket_path: config.ipc_socket_path.clone(),
+        read_only_dirs: config.read_only_dirs.clone(),
+        writable_dirs: config.writable_dirs.clone(),
         policy,
     })
 }
@@ -1622,12 +1863,12 @@ pub fn run_sandboxed_command(
     config: &SandboxConfig,
     command: &[String],
 ) -> Result<SandboxRunReport> {
-    validate_sandbox_config(config)?;
     if command.is_empty() {
         return Err(EnclaveError::SandboxCommandEmpty);
     }
+    let config = resolve_sandbox_config(config)?;
     let platform = current_sandbox_platform()?;
-    let status = run_platform_sandbox(config, command)?;
+    let status = run_platform_sandbox(&config, command)?;
     Ok(SandboxRunReport {
         platform,
         command: command.to_vec(),
@@ -1636,28 +1877,64 @@ pub fn run_sandboxed_command(
     })
 }
 
+pub fn spawn_sandboxed_child(
+    config: &SandboxConfig,
+    command: &SandboxedCommand,
+) -> Result<SandboxedChild> {
+    if command.program.is_empty() {
+        return Err(EnclaveError::SandboxCommandEmpty);
+    }
+    let config = resolve_sandbox_config(config)?;
+    current_sandbox_platform()?;
+    spawn_platform_sandboxed_child(&config, command)
+}
+
 pub fn apply_current_process_sandbox(config: &SandboxConfig) -> Result<()> {
-    validate_sandbox_config(config)?;
-    apply_platform_sandbox(config)
+    let config = resolve_sandbox_config(config)?;
+    apply_platform_sandbox(&config)
 }
 
 pub fn exec_sandboxed_child(config: &SandboxConfig, command: &[String]) -> Result<()> {
-    validate_sandbox_config(config)?;
+    let command = command.iter().map(OsString::from).collect::<Vec<_>>();
+    exec_sandboxed_child_inner(config, &command, false)
+}
+
+#[doc(hidden)]
+pub fn exec_sandboxed_child_os(config: &SandboxConfig, command: &[OsString]) -> Result<()> {
+    exec_sandboxed_child_inner(config, command, false)
+}
+
+#[doc(hidden)]
+pub fn exec_sandboxed_child_with_ready(config: &SandboxConfig, command: &[OsString]) -> Result<()> {
+    exec_sandboxed_child_inner(config, command, true)
+}
+
+fn exec_sandboxed_child_inner(
+    config: &SandboxConfig,
+    command: &[OsString],
+    signal_ready: bool,
+) -> Result<()> {
     if command.is_empty() {
         return Err(EnclaveError::SandboxCommandEmpty);
     }
+    let config = resolve_sandbox_config(config)?;
 
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
 
-        apply_current_process_sandbox(config)?;
+        apply_platform_sandbox(&config)?;
+        if signal_ready {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(SANDBOX_READY_LINE)?;
+            stdout.flush()?;
+        }
         Err(Command::new(&command[0]).args(&command[1..]).exec().into())
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = command;
+        let _ = (config, command, signal_ready);
         Err(EnclaveError::SandboxUnsupported(
             "sandbox child exec is only implemented for Linux".to_owned(),
         ))
@@ -1922,16 +2199,96 @@ fn validate_identity(identity: &CatalogEnclaveIdentity) -> Result<()> {
     Ok(())
 }
 
-fn validate_sandbox_config(config: &SandboxConfig) -> Result<()> {
-    if config.sealed_store_dir.as_os_str().is_empty() {
+fn resolve_sandbox_config(config: &SandboxConfig) -> Result<SandboxConfig> {
+    if config.read_only_dirs.is_empty() {
         return Err(EnclaveError::InvalidInput(
-            "sealed_store_dir cannot be empty".to_owned(),
+            "read_only_dirs must contain at least one directory".to_owned(),
         ));
     }
-    if config.ipc_socket_path.as_os_str().is_empty() {
-        return Err(EnclaveError::InvalidInput(
-            "ipc_socket_path cannot be empty".to_owned(),
-        ));
+
+    let read_only_dirs = resolve_sandbox_dirs("read_only_dirs", &config.read_only_dirs)?;
+    let writable_dirs = resolve_sandbox_dirs("writable_dirs", &config.writable_dirs)?;
+    reject_sandbox_dir_overlaps(&read_only_dirs, &writable_dirs)?;
+
+    Ok(SandboxConfig::new(read_only_dirs, writable_dirs))
+}
+
+fn resolve_sandbox_dirs(field: &str, dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    dirs.iter()
+        .enumerate()
+        .map(|(index, path)| resolve_sandbox_dir(field, index, path))
+        .collect()
+}
+
+fn resolve_sandbox_dir(field: &str, index: usize, path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(EnclaveError::InvalidInput(format!(
+            "{field}[{index}] cannot be empty"
+        )));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} is unavailable: {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} must not be a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} must be a directory",
+            path.display()
+        )));
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} could not be canonicalized: {err}",
+            path.display()
+        ))
+    })?;
+    let canonical_text = canonical.to_str().ok_or_else(|| {
+        EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} must be valid UTF-8",
+            canonical.display()
+        ))
+    })?;
+    if canonical_text.chars().any(char::is_control) {
+        return Err(EnclaveError::InvalidInput(format!(
+            "{field}[{index}] {} must not contain control characters",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn reject_sandbox_dir_overlaps(read_only: &[PathBuf], writable: &[PathBuf]) -> Result<()> {
+    let dirs = read_only
+        .iter()
+        .enumerate()
+        .map(|(index, path)| ("read_only_dirs", index, path))
+        .chain(
+            writable
+                .iter()
+                .enumerate()
+                .map(|(index, path)| ("writable_dirs", index, path)),
+        )
+        .collect::<Vec<_>>();
+
+    for (left_index, (left_field, left_pos, left_path)) in dirs.iter().enumerate() {
+        for (right_field, right_pos, right_path) in &dirs[left_index + 1..] {
+            if left_path.starts_with(right_path) || right_path.starts_with(left_path) {
+                return Err(EnclaveError::InvalidInput(format!(
+                    "{left_field}[{left_pos}] {} overlaps {right_field}[{right_pos}] {}",
+                    left_path.display(),
+                    right_path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1996,20 +2353,32 @@ fn bounded_ratio_f64(numerator: f64, denominator: f64) -> f64 {
 }
 
 fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
-    let sealed_store = sandbox_quote_existing_or_raw_path(&config.sealed_store_dir);
-    let ipc_socket = sandbox_quote_path(&config.ipc_socket_path);
-    format!(
-        r#"(version 1)
-(allow default)
-(deny network*)
-(allow file-read* (subpath {sealed_store}))
-(allow file-read* file-write* (literal {ipc_socket}))
-(deny file-write* (subpath {sealed_store}))
-"#
-    )
+    let mut profile = String::from("(version 1)\n(allow default)\n(deny network*)\n");
+    if config.writable_dirs.is_empty() {
+        profile.push_str("(deny file-write*)\n");
+    } else {
+        profile.push_str("(deny file-write*\n  (require-not\n    (require-any\n");
+        for path in &config.writable_dirs {
+            profile.push_str(&format!("      (subpath {})\n", sandbox_quote_path(path)));
+        }
+        profile.push_str("    )))\n");
+    }
+    for path in &config.read_only_dirs {
+        let path = sandbox_quote_path(path);
+        profile.push_str(&format!(
+            "(allow file-read* (subpath {path}))\n(deny file-write* (subpath {path}))\n"
+        ));
+    }
+    for path in &config.writable_dirs {
+        let path = sandbox_quote_path(path);
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (subpath {path}))\n"
+        ));
+    }
+    profile
 }
 
-fn linux_seccomp_policy_document() -> String {
+fn linux_seccomp_policy_document(config: &SandboxConfig) -> String {
     serde_json::json!({
         "schema_version": SANDBOX_SCHEMA_VERSION,
         "kind": "seccomp-bpf",
@@ -2017,20 +2386,26 @@ fn linux_seccomp_policy_document() -> String {
         "match_action": "errno(EPERM)",
         "blocked_syscalls": [
             { "syscall": "socket", "arg": "domain", "values": ["AF_INET", "AF_INET6", "AF_PACKET", "AF_NETLINK"] },
-            { "syscall": "mount", "reason": "sealed store is remounted read-only before child exec" },
-            { "syscall": "umount2", "reason": "sealed store read-only mount must not be removed" },
+            { "syscall": "mount", "reason": "configured read-only trees are remounted before child exec" },
+            { "syscall": "umount2", "reason": "configured read-only mounts must not be removed" },
             { "syscall": "open_tree", "reason": "mount graph must not be rearranged after sandbox entry" },
             { "syscall": "move_mount", "reason": "mount graph must not be rearranged after sandbox entry" },
             { "syscall": "fsopen", "reason": "new mounts must not be created after sandbox entry" },
             { "syscall": "fsconfig", "reason": "new mounts must not be configured after sandbox entry" },
             { "syscall": "fsmount", "reason": "new mounts must not be created after sandbox entry" },
             { "syscall": "fspick", "reason": "mount graph must not be rearranged after sandbox entry" },
-            { "syscall": "mount_setattr", "reason": "sealed store read-only mount attributes must remain stable" },
-            { "syscall": "pivot_root", "reason": "sealed store mount namespace must remain stable" }
+            { "syscall": "mount_setattr", "reason": "configured read-only mount attributes must remain stable" },
+            { "syscall": "pivot_root", "reason": "the configured mount namespace must remain stable" }
         ],
         "fs": {
-            "sealed_store": "read-only enforced by sandbox-run private mount namespace and bind remount; direct apply requires pre-existing read-only mount",
-            "ipc_socket": "AF_UNIX only"
+            "read_only_dirs": {
+                "paths": &config.read_only_dirs,
+                "policy": "each tree is bind-mounted and remounted read-only in a private mount namespace; direct apply requires pre-existing read-only mounts"
+            },
+            "writable_dirs": {
+                "paths": &config.writable_dirs,
+                "policy": "left writable and verified not to be covered by a read-only mount"
+            }
         }
     })
     .to_string()
@@ -2042,13 +2417,13 @@ fn windows_appcontainer_policy_document(config: &SandboxConfig) -> Result<String
         "kind": "appcontainer",
         "capabilities": [],
         "network": "no internetClient/privateNetworkClientServer capability",
-        "sealed_store": {
-            "path": config.sealed_store_dir,
-            "access": "read-only"
+        "read_only_dirs": {
+            "paths": &config.read_only_dirs,
+            "access": "read-only ACL grants"
         },
-        "ipc_socket": {
-            "path": config.ipc_socket_path,
-            "access": "only named-pipe/AF_UNIX IPC endpoint granted to the container"
+        "writable_dirs": {
+            "paths": &config.writable_dirs,
+            "access": "read/write ACL grants"
         }
     }))?)
 }
@@ -2062,15 +2437,231 @@ fn sandbox_quote_path(path: &Path) -> String {
     )
 }
 
-fn sandbox_quote_existing_or_raw_path(path: &Path) -> String {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    sandbox_quote_path(&resolved)
+fn spawn_platform_sandboxed_child(
+    config: &SandboxConfig,
+    command: &SandboxedCommand,
+) -> Result<SandboxedChild> {
+    #[cfg(target_os = "macos")]
+    {
+        let profile = build_resolved_sandbox_profile(config, SandboxPlatform::MacosSandboxExec)?;
+        let mut process = Command::new("sandbox-exec");
+        process
+            .arg("-p")
+            .arg(profile.policy)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'mayhem-sandbox-ready-v1\\n'; exec \"$@\"")
+            .arg("mayhem-sandbox-child")
+            .arg(&command.program)
+            .args(&command.args);
+        configure_std_spawn(&mut process, command);
+        let child = spawn_and_confirm_ready(process, "macOS sandbox-exec")?;
+        Ok(SandboxedChild { child })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        spawn_linux_sandboxed_child(config, command)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let stderr = match command.stderr {
+            SandboxedStderr::Inherit => mayhem_windows_sandbox::WindowsSandboxStderr::Inherit,
+            SandboxedStderr::Piped => mayhem_windows_sandbox::WindowsSandboxStderr::Piped,
+            SandboxedStderr::Null => mayhem_windows_sandbox::WindowsSandboxStderr::Null,
+        };
+        let child = mayhem_windows_sandbox::spawn_appcontainer(
+            &mayhem_windows_sandbox::WindowsSandboxConfig {
+                read_only_dirs: config.read_only_dirs.clone(),
+                writable_dirs: config.writable_dirs.clone(),
+                memory_limit_bytes: command.memory_limit_bytes,
+            },
+            &mayhem_windows_sandbox::WindowsSandboxCommand {
+                program: command.program.clone(),
+                args: command.args.clone(),
+                env: command.env.clone(),
+                env_clear: command.env_clear,
+                current_dir: command.current_dir.clone(),
+                stderr,
+                executable_read_only_dirs: command.executable_read_only_dirs.clone(),
+                allow_code_generation: command.allow_code_generation,
+            },
+        )
+        .map_err(map_windows_sandbox_error)?;
+        Ok(SandboxedChild { child })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (config, command);
+        Err(EnclaveError::SandboxUnsupported(
+            std::env::consts::OS.to_owned(),
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn map_windows_sandbox_error(err: mayhem_windows_sandbox::WindowsSandboxError) -> EnclaveError {
+    match err {
+        mayhem_windows_sandbox::WindowsSandboxError::Io(err) => EnclaveError::Io(err),
+        err => EnclaveError::SandboxSetupFailed(err.to_string()),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_std_spawn(process: &mut Command, command: &SandboxedCommand) {
+    if command.env_clear {
+        process.env_clear();
+    }
+    for (key, value) in &command.env {
+        match value {
+            Some(value) => {
+                process.env(key, value);
+            }
+            None => {
+                process.env_remove(key);
+            }
+        }
+    }
+    if let Some(current_dir) = &command.current_dir {
+        process.current_dir(current_dir);
+    }
+    process.stdin(Stdio::piped()).stdout(Stdio::piped());
+    match command.stderr {
+        SandboxedStderr::Inherit => {
+            process.stderr(Stdio::inherit());
+        }
+        SandboxedStderr::Piped => {
+            process.stderr(Stdio::piped());
+        }
+        SandboxedStderr::Null => {
+            process.stderr(Stdio::null());
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_and_confirm_ready(mut process: Command, setup: &str) -> Result<Child> {
+    let mut child = process.spawn().map_err(|err| {
+        EnclaveError::SandboxSetupFailed(format!("{setup} could not start: {err}"))
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        EnclaveError::SandboxSetupFailed(format!("{setup} did not provide a stdout pipe"))
+    })?;
+    let mut ready = vec![0_u8; SANDBOX_READY_LINE.len()];
+    if let Err(read_err) = stdout.read_exact(&mut ready) {
+        child.stdin.take();
+        let status = child.wait().map_err(EnclaveError::Io)?;
+        return Err(EnclaveError::SandboxSetupExited {
+            status,
+            detail: format!("{setup} did not signal policy readiness: {read_err}"),
+        });
+    }
+    if ready != SANDBOX_READY_LINE {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(EnclaveError::SandboxSetupFailed(format!(
+            "{setup} returned an invalid policy-readiness marker"
+        )));
+    }
+    child.stdout = Some(stdout);
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_sandboxed_child(
+    config: &SandboxConfig,
+    command: &SandboxedCommand,
+) -> Result<SandboxedChild> {
+    let helper = resolve_linux_sandbox_helper(command.sandbox_helper.as_deref())?;
+    let child = spawn_linux_sandbox_attempt(config, command, &helper)?;
+    Ok(SandboxedChild { child })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_sandbox_helper(configured: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = configured {
+        return fs::canonicalize(path).map_err(|err| {
+            EnclaveError::SandboxSetupFailed(format!(
+                "Linux sandbox helper {} is unavailable: {err}",
+                path.display()
+            ))
+        });
+    }
+
+    let current_exe = std::env::current_exe().map_err(EnclaveError::Io)?;
+    let current_name = current_exe.file_name().and_then(OsStr::to_str);
+    if current_name == Some("mayhem-enclave") {
+        return Ok(current_exe);
+    }
+    let sibling = current_exe.with_file_name("mayhem-enclave");
+    if sibling.is_file() {
+        return fs::canonicalize(&sibling).map_err(EnclaveError::Io);
+    }
+    Err(EnclaveError::SandboxSetupFailed(
+        "Linux long-lived sandboxing requires the mayhem-enclave helper; set SandboxedCommand::sandbox_helper to its path"
+            .to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_sandbox_attempt(
+    config: &SandboxConfig,
+    command: &SandboxedCommand,
+    helper: &Path,
+) -> Result<Child> {
+    let mut process = Command::new("unshare");
+    process
+        .arg("--user")
+        .arg("--map-root-user")
+        .arg("--mount")
+        .arg("--propagation")
+        .arg("private")
+        .arg("--")
+        .arg("sh")
+        .arg("-eu")
+        .arg("-c")
+        .arg(
+            r#"while [ "$1" != "--" ]; do
+    store=$1
+    shift
+    mount --bind "$store" "$store" || exit 125
+    mount -o remount,bind,ro "$store" || exit 125
+done
+shift
+exec "$@"
+"#,
+        )
+        .arg("mayhem-sandbox-mount")
+        .args(&config.read_only_dirs)
+        .arg("--")
+        .arg(helper)
+        .arg("sandbox-exec-child");
+    append_linux_sandbox_config_args(&mut process, config);
+    process
+        .arg("--ready")
+        .arg("--")
+        .arg(&command.program)
+        .args(&command.args);
+    configure_std_spawn(&mut process, command);
+    spawn_and_confirm_ready(process, "Linux mount namespace and seccomp-bpf")
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_sandbox_config_args(process: &mut Command, config: &SandboxConfig) {
+    for path in &config.read_only_dirs {
+        process.arg("--read-only-dir").arg(path);
+    }
+    for path in &config.writable_dirs {
+        process.arg("--writable-dir").arg(path);
+    }
 }
 
 fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<ExitStatus> {
     #[cfg(target_os = "macos")]
     {
-        let profile = build_sandbox_profile(config, SandboxPlatform::MacosSandboxExec)?;
+        let profile = build_resolved_sandbox_profile(config, SandboxPlatform::MacosSandboxExec)?;
         Command::new("sandbox-exec")
             .arg("-p")
             .arg(profile.policy)
@@ -2090,13 +2681,13 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 
         let report = mayhem_windows_sandbox::run_appcontainer(
             &mayhem_windows_sandbox::WindowsSandboxConfig {
-                sealed_store_dir: config.sealed_store_dir.clone(),
-                ipc_socket_path: config.ipc_socket_path.clone(),
+                read_only_dirs: config.read_only_dirs.clone(),
+                writable_dirs: config.writable_dirs.clone(),
                 memory_limit_bytes: None,
             },
             command,
         )
-        .map_err(|err| EnclaveError::SandboxUnsupported(err.to_string()))?;
+        .map_err(map_windows_sandbox_error)?;
         Ok(ExitStatus::from_raw(report.status_code))
     }
 
@@ -2114,38 +2705,34 @@ fn run_linux_mount_namespace_sandbox(
     config: &SandboxConfig,
     command: &[String],
 ) -> Result<ExitStatus> {
-    let sealed_store = linux_sandbox_fs::canonical_sealed_store_dir(&config.sealed_store_dir)?;
     let current_exe = std::env::current_exe().map_err(EnclaveError::Io)?;
     let mut helper = vec![
         current_exe.to_string_lossy().to_string(),
         "sandbox-exec-child".to_owned(),
-        "--sealed-store".to_owned(),
-        sealed_store.to_string_lossy().to_string(),
-        "--ipc-socket".to_owned(),
-        config.ipc_socket_path.to_string_lossy().to_string(),
-        "--".to_owned(),
     ];
+    for path in &config.read_only_dirs {
+        helper.push("--read-only-dir".to_owned());
+        helper.push(path.to_string_lossy().to_string());
+    }
+    for path in &config.writable_dirs {
+        helper.push("--writable-dir".to_owned());
+        helper.push(path.to_string_lossy().to_string());
+    }
+    helper.push("--".to_owned());
     helper.extend_from_slice(command);
 
-    let status = run_linux_mount_namespace_attempt(&sealed_store, &helper, false)?;
-    if status.code() == Some(125) {
-        run_linux_mount_namespace_attempt(&sealed_store, &helper, true)
-    } else {
-        Ok(status)
-    }
+    run_linux_mount_namespace_attempt(&config.read_only_dirs, &helper)
 }
 
 #[cfg(target_os = "linux")]
 fn run_linux_mount_namespace_attempt(
-    sealed_store: &Path,
+    read_only_dirs: &[PathBuf],
     command: &[String],
-    use_user_namespace: bool,
 ) -> Result<ExitStatus> {
     let mut process = Command::new("unshare");
-    if use_user_namespace {
-        process.arg("--user").arg("--map-root-user");
-    }
     process
+        .arg("--user")
+        .arg("--map-root-user")
         .arg("--mount")
         .arg("--fork")
         .arg("--propagation")
@@ -2155,15 +2742,19 @@ fn run_linux_mount_namespace_attempt(
         .arg("-eu")
         .arg("-c")
         .arg(
-            r#"store=$1
+            r#"while [ "$1" != "--" ]; do
+    store=$1
+    shift
+    mount --bind "$store" "$store" || exit 125
+    mount -o remount,bind,ro "$store" || exit 125
+done
 shift
-mount --bind "$store" "$store" || exit 125
-mount -o remount,bind,ro "$store" || exit 125
 exec "$@"
 "#,
         )
         .arg("mayhem-sandbox-mount")
-        .arg(sealed_store)
+        .args(read_only_dirs)
+        .arg("--")
         .args(command)
         .status()
         .map_err(EnclaveError::Io)
@@ -2172,7 +2763,12 @@ exec "$@"
 fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux_sandbox_fs::ensure_sealed_store_read_only(&config.sealed_store_dir)?;
+        for path in &config.read_only_dirs {
+            linux_sandbox_fs::ensure_read_only_dir(path)?;
+        }
+        for path in &config.writable_dirs {
+            linux_sandbox_fs::ensure_writable_dir(path)?;
+        }
         linux::apply_network_deny_seccomp()
     }
 
@@ -2214,8 +2810,8 @@ mod linux_sandbox_fs {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    pub fn ensure_sealed_store_read_only(path: &Path) -> Result<()> {
-        let canonical = canonical_sealed_store_dir(path)?;
+    pub fn ensure_read_only_dir(path: &Path) -> Result<()> {
+        let canonical = fs::canonicalize(path).map_err(EnclaveError::Io)?;
         let mounts = read_mountinfo()?;
         let covering_mount = mounts
             .iter()
@@ -2223,13 +2819,13 @@ mod linux_sandbox_fs {
             .max_by_key(|mount| mount.mount_point.as_os_str().len())
             .ok_or_else(|| {
                 EnclaveError::InvalidInput(format!(
-                    "sealed store path {} is not covered by a Linux mount",
+                    "read-only path {} is not covered by a Linux mount",
                     canonical.display()
                 ))
             })?;
         if !covering_mount.read_only {
             return Err(EnclaveError::InvalidInput(format!(
-                "sealed store path {} is covered by writable Linux mount {}",
+                "read-only path {} is covered by writable Linux mount {}",
                 canonical.display(),
                 covering_mount.mount_point.display()
             )));
@@ -2239,7 +2835,7 @@ mod linux_sandbox_fs {
         }) {
             if !mount.read_only {
                 return Err(EnclaveError::InvalidInput(format!(
-                    "sealed store path {} contains writable nested mount {}",
+                    "read-only path {} contains writable nested mount {}",
                     canonical.display(),
                     mount.mount_point.display()
                 )));
@@ -2248,36 +2844,35 @@ mod linux_sandbox_fs {
         Ok(())
     }
 
-    pub fn canonical_sealed_store_dir(path: &Path) -> Result<PathBuf> {
-        let metadata = fs::symlink_metadata(path).map_err(EnclaveError::Io)?;
-        if metadata.file_type().is_symlink() {
+    pub fn ensure_writable_dir(path: &Path) -> Result<()> {
+        let canonical = fs::canonicalize(path).map_err(EnclaveError::Io)?;
+        let mounts = read_mountinfo()?;
+        let covering_mount = mounts
+            .iter()
+            .filter(|mount| canonical.starts_with(&mount.mount_point))
+            .max_by_key(|mount| mount.mount_point.as_os_str().len())
+            .ok_or_else(|| {
+                EnclaveError::InvalidInput(format!(
+                    "writable path {} is not covered by a Linux mount",
+                    canonical.display()
+                ))
+            })?;
+        if covering_mount.read_only {
             return Err(EnclaveError::InvalidInput(format!(
-                "sealed store path {} must not be a symlink",
-                path.display()
+                "writable path {} is covered by read-only Linux mount {}",
+                canonical.display(),
+                covering_mount.mount_point.display()
             )));
         }
-        if !metadata.is_dir() {
-            return Err(EnclaveError::InvalidInput(format!(
-                "sealed store path {} must be a directory",
-                path.display()
-            )));
-        }
-        reject_nested_symlinks(path)?;
-        fs::canonicalize(path).map_err(EnclaveError::Io)
-    }
-
-    fn reject_nested_symlinks(path: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(path).map_err(EnclaveError::Io)?;
-        if metadata.file_type().is_symlink() {
-            return Err(EnclaveError::InvalidInput(format!(
-                "sealed store path {} must not contain symlinks",
-                path.display()
-            )));
-        }
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path).map_err(EnclaveError::Io)? {
-                let entry = entry.map_err(EnclaveError::Io)?;
-                reject_nested_symlinks(&entry.path())?;
+        for mount in mounts.iter().filter(|mount| {
+            mount.mount_point != canonical && mount.mount_point.starts_with(&canonical)
+        }) {
+            if mount.read_only {
+                return Err(EnclaveError::InvalidInput(format!(
+                    "writable path {} contains read-only nested mount {}",
+                    canonical.display(),
+                    mount.mount_point.display()
+                )));
             }
         }
         Ok(())
@@ -2646,8 +3241,17 @@ mod tests {
         }
     }
 
-    fn sandbox_config() -> SandboxConfig {
-        SandboxConfig::new("/sealed/store", "/tmp/mayhem-ipc.sock")
+    fn sandbox_config(temp: &tempfile::TempDir) -> Result<SandboxConfig> {
+        let model_root = temp.path().join("model-root");
+        let source_root = temp.path().join("source-root");
+        let worker_cache = temp.path().join("worker-cache");
+        fs::create_dir_all(&model_root)?;
+        fs::create_dir_all(&source_root)?;
+        fs::create_dir_all(&worker_cache)?;
+        Ok(SandboxConfig::new(
+            vec![model_root, source_root],
+            vec![worker_cache],
+        ))
     }
 
     fn scheduler_config() -> SchedulerConfig {
@@ -3041,37 +3645,45 @@ mod tests {
 
     #[test]
     fn macos_sandbox_profile_denies_network_and_sealed_store_writes() -> Result<()> {
-        let profile = build_sandbox_profile(&sandbox_config(), SandboxPlatform::MacosSandboxExec)?;
+        let temp = tempfile::tempdir()?;
+        let config = sandbox_config(&temp)?;
+        let profile = build_sandbox_profile(&config, SandboxPlatform::MacosSandboxExec)?;
 
         assert_eq!(profile.schema_version, SANDBOX_SCHEMA_VERSION);
         assert!(profile.policy.contains("(deny network*)"));
         assert!(profile.policy.contains("(deny file-write*"));
-        assert!(profile.policy.contains("/sealed/store"));
-        assert!(profile.policy.contains("/tmp/mayhem-ipc.sock"));
+        assert!(profile.policy.contains("model-root"));
+        assert!(profile.policy.contains("source-root"));
+        assert!(profile.policy.contains("worker-cache"));
+        assert!(profile.policy.contains("(require-not"));
         Ok(())
     }
 
     #[test]
     fn linux_sandbox_profile_documents_seccomp_network_deny() -> Result<()> {
-        let profile = build_sandbox_profile(&sandbox_config(), SandboxPlatform::LinuxSeccompBpf)?;
+        let temp = tempfile::tempdir()?;
+        let config = sandbox_config(&temp)?;
+        let profile = build_sandbox_profile(&config, SandboxPlatform::LinuxSeccompBpf)?;
 
         assert!(profile.policy.contains("seccomp-bpf"));
         assert!(profile.policy.contains("AF_INET"));
         assert!(profile.policy.contains("AF_INET6"));
-        assert!(profile.policy.contains("read-only enforced"));
-        assert!(profile.policy.contains("AF_UNIX only"));
+        assert!(profile.policy.contains("bind-mounted"));
+        assert!(profile.policy.contains("worker-cache"));
         Ok(())
     }
 
     #[test]
     fn windows_sandbox_profile_uses_appcontainer_without_network_capabilities() -> Result<()> {
-        let profile =
-            build_sandbox_profile(&sandbox_config(), SandboxPlatform::WindowsAppContainer)?;
+        let temp = tempfile::tempdir()?;
+        let config = sandbox_config(&temp)?;
+        let profile = build_sandbox_profile(&config, SandboxPlatform::WindowsAppContainer)?;
 
         assert!(profile.policy.contains("appcontainer"));
         assert!(profile.policy.contains("\"capabilities\": []"));
         assert!(profile.policy.contains("no internetClient"));
-        assert!(profile.policy.contains("read-only"));
+        assert!(profile.policy.contains("read-only ACL grants"));
+        assert!(profile.policy.contains("read/write ACL grants"));
         Ok(())
     }
 

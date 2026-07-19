@@ -1,19 +1,21 @@
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_enclave::{
     boot_sealed_store, build_hardware_attestation_report, build_merkle_manifest,
-    build_sandbox_profile, build_tier1_attestation_report, exec_sandboxed_child,
-    expect_outbound_tcp_denied, hex_secret, load_or_create_runtime_keypair_store, measure_binary,
-    measure_current_binary, prepare_hardware_quote_binding, probe_outbound_tcp,
-    provider_signing_seed_from_hex, run_sandboxed_command, seal_artifact, unix_timestamp_now,
-    BootOptions, HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext,
-    RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig, SandboxPlatform, SealOptions,
+    build_sandbox_profile, build_tier1_attestation_report, exec_sandboxed_child_os,
+    exec_sandboxed_child_with_ready, expect_outbound_tcp_denied, hex_secret,
+    load_or_create_runtime_keypair_store, measure_binary, measure_current_binary,
+    prepare_hardware_quote_binding, probe_outbound_tcp, provider_signing_seed_from_hex,
+    run_sandboxed_command, seal_artifact, unix_timestamp_now, BootOptions,
+    HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext, RuntimeKeyContext,
+    RuntimeKeypairStoreOptions, SandboxConfig, SandboxPlatform, SealOptions,
     Tier1AttestationOptions, DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
 use mayhem_proto::{
@@ -51,6 +53,10 @@ enum Commands {
     SandboxProbeTcp(SandboxProbeTcpArgs),
     /// Probe whether sealed-store writes are denied from this process.
     SandboxProbeStoreWrite(SandboxProbeStoreWriteArgs),
+    #[command(hide = true)]
+    SandboxProbeStoreRead(SandboxProbeStoreReadArgs),
+    #[command(hide = true)]
+    SandboxProbeStdio(SandboxProbeStdioArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -295,13 +301,13 @@ enum PlatformArg {
 
 #[derive(Debug, Parser)]
 struct SandboxProfileArgs {
-    /// Read-only sealed store directory.
-    #[arg(long, value_name = "PATH")]
-    sealed_store: PathBuf,
+    /// Read-only directory. Repeat for each independently located tree.
+    #[arg(long = "read-only-dir", required = true, value_name = "PATH")]
+    read_only_dirs: Vec<PathBuf>,
 
-    /// Local IPC socket/named-pipe path allowed through the sandbox.
-    #[arg(long, value_name = "PATH")]
-    ipc_socket: PathBuf,
+    /// Writable directory. Repeat for each private worker subtree.
+    #[arg(long = "writable-dir", value_name = "PATH")]
+    writable_dirs: Vec<PathBuf>,
 
     /// Platform profile to render.
     #[arg(long, value_enum, default_value_t = PlatformArg::Current)]
@@ -314,13 +320,13 @@ struct SandboxProfileArgs {
 
 #[derive(Debug, Parser)]
 struct SandboxRunArgs {
-    /// Read-only sealed store directory.
-    #[arg(long, value_name = "PATH")]
-    sealed_store: PathBuf,
+    /// Read-only directory. Repeat for each independently located tree.
+    #[arg(long = "read-only-dir", required = true, value_name = "PATH")]
+    read_only_dirs: Vec<PathBuf>,
 
-    /// Local IPC socket/named-pipe path allowed through the sandbox.
-    #[arg(long, value_name = "PATH")]
-    ipc_socket: PathBuf,
+    /// Writable directory. Repeat for each private worker subtree.
+    #[arg(long = "writable-dir", value_name = "PATH")]
+    writable_dirs: Vec<PathBuf>,
 
     /// Command and arguments to run under the sandbox.
     #[arg(required = true, trailing_var_arg = true)]
@@ -329,17 +335,21 @@ struct SandboxRunArgs {
 
 #[derive(Debug, Parser)]
 struct SandboxExecChildArgs {
-    /// Read-only sealed store directory.
-    #[arg(long, value_name = "PATH")]
-    sealed_store: PathBuf,
+    /// Read-only directory. Repeat for each independently located tree.
+    #[arg(long = "read-only-dir", required = true, value_name = "PATH")]
+    read_only_dirs: Vec<PathBuf>,
 
-    /// Local IPC socket/named-pipe path allowed through the sandbox.
-    #[arg(long, value_name = "PATH")]
-    ipc_socket: PathBuf,
+    /// Writable directory. Repeat for each private worker subtree.
+    #[arg(long = "writable-dir", value_name = "PATH")]
+    writable_dirs: Vec<PathBuf>,
+
+    /// Signal policy readiness on stdout before replacing this helper.
+    #[arg(long, hide = true)]
+    ready: bool,
 
     /// Command and arguments to exec after applying child-only sandbox rules.
     #[arg(required = true, trailing_var_arg = true)]
-    command: Vec<String>,
+    command: Vec<OsString>,
 }
 
 #[derive(Debug, Parser)]
@@ -375,9 +385,25 @@ struct SandboxProbeStoreWriteArgs {
     #[arg(long)]
     attempt_restore_permissions: bool,
 
+    /// Create and write through a child directory under the probed root.
+    #[arg(long)]
+    nested: bool,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct SandboxProbeStoreReadArgs {
+    #[arg(long, value_name = "PATH")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct SandboxProbeStdioArgs {
+    #[arg(long)]
+    label: String,
 }
 
 fn main() {
@@ -402,6 +428,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Commands::SandboxExecChild(args) => return sandbox_exec_child(args),
         Commands::SandboxProbeTcp(args) => sandbox_probe_tcp(args)?,
         Commands::SandboxProbeStoreWrite(args) => sandbox_probe_store_write(args)?,
+        Commands::SandboxProbeStoreRead(args) => sandbox_probe_store_read(args)?,
+        Commands::SandboxProbeStdio(args) => sandbox_probe_stdio(args)?,
     }
     Ok(0)
 }
@@ -630,7 +658,7 @@ fn parse_runtime_config(
 }
 
 fn sandbox_profile(args: SandboxProfileArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
+    let config = SandboxConfig::new(args.read_only_dirs, args.writable_dirs);
     let platform = match args.platform {
         PlatformArg::Current => mayhem_enclave::current_sandbox_platform()?,
         PlatformArg::Linux => SandboxPlatform::LinuxSeccompBpf,
@@ -648,7 +676,7 @@ fn sandbox_profile(args: SandboxProfileArgs) -> Result<(), Box<dyn std::error::E
 }
 
 fn sandbox_run(args: SandboxRunArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
+    let config = SandboxConfig::new(args.read_only_dirs, args.writable_dirs);
     let report = run_sandboxed_command(&config, &args.command)?;
     Ok(report
         .status_code
@@ -656,9 +684,37 @@ fn sandbox_run(args: SandboxRunArgs) -> Result<i32, Box<dyn std::error::Error>> 
 }
 
 fn sandbox_exec_child(args: SandboxExecChildArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
-    exec_sandboxed_child(&config, &args.command)?;
+    let config = SandboxConfig::new(args.read_only_dirs, args.writable_dirs);
+    if args.ready {
+        exec_sandboxed_child_with_ready(&config, &args.command)?;
+    } else {
+        exec_sandboxed_child_os(&config, &args.command)?;
+    }
     Ok(1)
+}
+
+fn sandbox_probe_store_read(
+    args: SandboxProbeStoreReadArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = fs::read(args.path)?;
+    std::io::stdout().write_all(&bytes)?;
+    Ok(())
+}
+
+fn sandbox_probe_stdio(args: SandboxProbeStdioArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "line": line.trim_end_matches(['\r', '\n']),
+            "label": args.label,
+            "env": std::env::var("MAYHEM_SANDBOX_TEST_ENV").ok(),
+            "cwd": std::env::current_dir()?,
+        }))?
+    );
+    eprintln!("mayhem-sandbox-test-stderr");
+    Ok(())
 }
 
 fn sandbox_probe_tcp(args: SandboxProbeTcpArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -690,10 +746,16 @@ fn sandbox_probe_tcp(args: SandboxProbeTcpArgs) -> Result<(), Box<dyn std::error
 fn sandbox_probe_store_write(
     args: SandboxProbeStoreWriteArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = args.sealed_store.join(format!(
-        ".mayhem-sandbox-write-probe-{}",
-        std::process::id()
-    ));
+    let probe_name = format!(".mayhem-sandbox-write-probe-{}", std::process::id());
+    let nested_parent = args.nested.then(|| args.sealed_store.join(&probe_name));
+    let path = nested_parent
+        .as_deref()
+        .unwrap_or(&args.sealed_store)
+        .join(if args.nested {
+            "probe.bin"
+        } else {
+            &probe_name
+        });
     let mut wrote = false;
     let mut denied = false;
     let mut error_kind = None;
@@ -702,6 +764,9 @@ fn sandbox_probe_store_write(
     let mut restore_denied = false;
     let mut restore_error_kind = None;
     let mut restore_raw_os_error = None;
+    let mut cleanup_succeeded = true;
+    let mut cleanup_error_kind = None;
+    let mut cleanup_raw_os_error = None;
 
     if args.attempt_restore_permissions {
         match try_restore_sealed_store_permissions(&args.sealed_store) {
@@ -716,22 +781,49 @@ fn sandbox_probe_store_write(
         }
     }
 
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            wrote = true;
-            file.write_all(b"write-probe")?;
-            let _ = fs::remove_file(&path);
-        }
-        Err(err) => {
+    if let Some(parent) = &nested_parent {
+        if let Err(err) = fs::create_dir(parent) {
             denied = fs_denied_error(&err);
             error_kind = Some(format!("{:?}", err.kind()));
             raw_os_error = err.raw_os_error();
         }
     }
 
+    if error_kind.is_none() {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                wrote = true;
+                file.write_all(b"write-probe")?;
+                if let Err(err) = fs::remove_file(&path) {
+                    cleanup_succeeded = false;
+                    cleanup_error_kind = Some(format!("{:?}", err.kind()));
+                    cleanup_raw_os_error = err.raw_os_error();
+                }
+            }
+            Err(err) => {
+                denied = fs_denied_error(&err);
+                error_kind = Some(format!("{:?}", err.kind()));
+                raw_os_error = err.raw_os_error();
+            }
+        }
+    }
+    if let Some(parent) = &nested_parent {
+        if let Err(err) = fs::remove_dir(parent) {
+            cleanup_succeeded = false;
+            cleanup_error_kind = Some(format!("{:?}", err.kind()));
+            cleanup_raw_os_error = err.raw_os_error();
+        }
+    }
+
     if args.expect_denied && !denied {
         return Err(format!(
             "sealed-store write was not denied: wrote={wrote} error_kind={error_kind:?} raw_os_error={raw_os_error:?}"
+        )
+        .into());
+    }
+    if !args.expect_denied && wrote && !cleanup_succeeded {
+        return Err(format!(
+            "writable-tree cleanup failed: error_kind={cleanup_error_kind:?} raw_os_error={cleanup_raw_os_error:?}"
         )
         .into());
     }
@@ -747,6 +839,10 @@ fn sandbox_probe_store_write(
         "restore_denied": restore_denied,
         "restore_error_kind": restore_error_kind,
         "restore_raw_os_error": restore_raw_os_error,
+        "cleanup_succeeded": cleanup_succeeded,
+        "cleanup_error_kind": cleanup_error_kind,
+        "cleanup_raw_os_error": cleanup_raw_os_error,
+        "nested": args.nested,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);

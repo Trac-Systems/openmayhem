@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -518,10 +519,69 @@ pub fn evaluate_catalog_canary_transcript_match_probe(
 }
 
 pub fn audio_fingerprint(bytes: &[u8]) -> String {
-    wav_audio_feature_fingerprint(bytes).unwrap_or_else(|| blake3::hash(bytes).to_hex().to_string())
+    wav_audio_spectral_fingerprint(bytes)
+        .map(|fingerprint| fingerprint.encode())
+        .unwrap_or_else(|| blake3::hash(bytes).to_hex().to_string())
 }
 
-fn wav_audio_feature_fingerprint(bytes: &[u8]) -> Option<String> {
+const AUDIO_FINGERPRINT_VERSION: &str = "audiospec-v1";
+const AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE: u32 = 16_000;
+const AUDIO_FINGERPRINT_FFT_SIZE: usize = 1_024;
+const AUDIO_FINGERPRINT_HOP_SIZE: usize = 256;
+const AUDIO_FINGERPRINT_BANDS: usize = 16;
+const AUDIO_FINGERPRINT_TIME_BUCKETS: usize = 16;
+const AUDIO_FINGERPRINT_VECTOR_LEN: usize =
+    AUDIO_FINGERPRINT_BANDS * AUDIO_FINGERPRINT_TIME_BUCKETS;
+const AUDIO_FINGERPRINT_QUANTIZATION_SCALE: f64 = 32.0;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AudioSpectralFingerprint {
+    duration_bucket_ms: u64,
+    vector: Vec<i8>,
+}
+
+impl AudioSpectralFingerprint {
+    fn encode(&self) -> String {
+        let bytes = self
+            .vector
+            .iter()
+            .map(|value| *value as u8)
+            .collect::<Vec<_>>();
+        format!(
+            "{AUDIO_FINGERPRINT_VERSION}:{}:{}",
+            self.duration_bucket_ms,
+            hex::encode(bytes)
+        )
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        let mut fields = value.splitn(3, ':');
+        if fields.next()? != AUDIO_FINGERPRINT_VERSION {
+            return None;
+        }
+        let duration_bucket_ms = fields.next()?.parse::<u64>().ok()?;
+        if duration_bucket_ms == 0 {
+            return None;
+        }
+        let bytes = hex::decode(fields.next()?).ok()?;
+        if bytes.len() != AUDIO_FINGERPRINT_VECTOR_LEN {
+            return None;
+        }
+        let vector = bytes
+            .into_iter()
+            .map(|value| value as i8)
+            .collect::<Vec<_>>();
+        if vector.iter().all(|value| *value == 0) {
+            return None;
+        }
+        Some(Self {
+            duration_bucket_ms,
+            vector,
+        })
+    }
+}
+
+fn wav_audio_spectral_fingerprint(bytes: &[u8]) -> Option<AudioSpectralFingerprint> {
     if bytes.len() < 44 || bytes.get(0..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
         return None;
     }
@@ -585,13 +645,7 @@ fn wav_audio_feature_fingerprint(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
-    let bucket_count = 16_usize;
-    let mut bucket_energy = vec![0_u64; bucket_count];
-    let mut bucket_crossings = vec![0_u32; bucket_count];
-    let mut bucket_samples = vec![0_u32; bucket_count];
-    let mut previous = 0_i32;
-    let mut has_previous = false;
-
+    let mut mono = Vec::with_capacity(frame_count);
     for frame in 0..frame_count {
         let mut sum = 0_i32;
         for channel in 0..usize::from(channels) {
@@ -603,54 +657,187 @@ fn wav_audio_feature_fingerprint(bytes: &[u8]) -> Option<String> {
             );
             sum += i32::from(sample);
         }
-        let mono = sum / i32::from(channels);
-        let bucket = ((frame * bucket_count) / frame_count).min(bucket_count - 1);
-        bucket_energy[bucket] =
-            bucket_energy[bucket].saturating_add(u64::from(mono.unsigned_abs()));
-        bucket_samples[bucket] = bucket_samples[bucket].saturating_add(1);
-        if has_previous && ((previous < 0 && mono >= 0) || (previous >= 0 && mono < 0)) {
-            bucket_crossings[bucket] = bucket_crossings[bucket].saturating_add(1);
-        }
-        previous = mono;
-        has_previous = true;
+        mono.push(f64::from(sum) / f64::from(channels) / f64::from(i16::MAX));
     }
 
-    let max_energy = bucket_energy
+    let resampled_len = usize::try_from(
+        (frame_count as u128).checked_mul(u128::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE))?
+            / u128::from(sample_rate),
+    )
+    .ok()?;
+    if resampled_len == 0 {
+        return None;
+    }
+    let mut resampled = Vec::with_capacity(resampled_len);
+    for target_index in 0..resampled_len {
+        let source_position_numerator =
+            (target_index as u128).checked_mul(u128::from(sample_rate))?;
+        let source_index = usize::try_from(
+            source_position_numerator / u128::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE),
+        )
+        .ok()?
+        .min(frame_count - 1);
+        let next_index = source_index.saturating_add(1).min(frame_count - 1);
+        let fraction = (source_position_numerator
+            % u128::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE)) as f64
+            / f64::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE);
+        resampled.push(mono[source_index] * (1.0 - fraction) + mono[next_index] * fraction);
+    }
+    let rms_squared =
+        resampled.iter().map(|sample| sample * sample).sum::<f64>() / resampled.len() as f64;
+    if !rms_squared.is_finite() || rms_squared <= f64::EPSILON {
+        return None;
+    }
+    let rms = rms_squared.sqrt();
+    for sample in &mut resampled {
+        *sample /= rms;
+    }
+
+    let frame_windows = if resampled.len() <= AUDIO_FINGERPRINT_FFT_SIZE {
+        1
+    } else {
+        1 + (resampled.len() - AUDIO_FINGERPRINT_FFT_SIZE) / AUDIO_FINGERPRINT_HOP_SIZE
+    };
+    let low_hz = 60.0_f64;
+    let high_hz = (f64::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE) * 0.4875).max(low_hz + 1.0);
+    let band_ratio = (high_hz / low_hz).powf(1.0 / AUDIO_FINGERPRINT_BANDS as f64);
+    let mut band_edges = Vec::with_capacity(AUDIO_FINGERPRINT_BANDS + 1);
+    for index in 0..=AUDIO_FINGERPRINT_BANDS {
+        band_edges.push(low_hz * band_ratio.powf(index as f64));
+    }
+    let mut bin_bands = vec![None; AUDIO_FINGERPRINT_FFT_SIZE / 2 + 1];
+    let mut band_bin_counts = [0_u32; AUDIO_FINGERPRINT_BANDS];
+    for (bin, target) in bin_bands.iter_mut().enumerate().skip(1) {
+        let frequency = bin as f64 * f64::from(AUDIO_FINGERPRINT_TARGET_SAMPLE_RATE)
+            / AUDIO_FINGERPRINT_FFT_SIZE as f64;
+        let band = (0..AUDIO_FINGERPRINT_BANDS)
+            .find(|band| frequency >= band_edges[*band] && frequency < band_edges[*band + 1]);
+        *target = band;
+        if let Some(band) = band {
+            band_bin_counts[band] = band_bin_counts[band].saturating_add(1);
+        }
+    }
+    if band_bin_counts.iter().any(|count| *count == 0) {
+        return None;
+    }
+
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(AUDIO_FINGERPRINT_FFT_SIZE);
+    let mut fft_buffer = vec![Complex::new(0.0, 0.0); AUDIO_FINGERPRINT_FFT_SIZE];
+    let mut matrix = vec![0.0_f64; AUDIO_FINGERPRINT_VECTOR_LEN];
+    let mut bucket_frames = [0_u32; AUDIO_FINGERPRINT_TIME_BUCKETS];
+    let denominator = (AUDIO_FINGERPRINT_FFT_SIZE - 1) as f64;
+    for frame in 0..frame_windows {
+        let start = frame.saturating_mul(AUDIO_FINGERPRINT_HOP_SIZE);
+        for (index, value) in fft_buffer.iter_mut().enumerate() {
+            let sample = resampled.get(start + index).copied().unwrap_or(0.0);
+            let window = 0.5 - 0.5 * (std::f64::consts::TAU * index as f64 / denominator).cos();
+            *value = Complex::new(sample * window, 0.0);
+        }
+        fft.process(&mut fft_buffer);
+        let time_bucket = ((frame * AUDIO_FINGERPRINT_TIME_BUCKETS) / frame_windows)
+            .min(AUDIO_FINGERPRINT_TIME_BUCKETS - 1);
+        bucket_frames[time_bucket] = bucket_frames[time_bucket].saturating_add(1);
+        let mut frame_energy = [0.0_f64; AUDIO_FINGERPRINT_BANDS];
+        for (bin, band) in bin_bands.iter().enumerate() {
+            if let Some(band) = band {
+                frame_energy[*band] += fft_buffer[bin].norm_sqr();
+            }
+        }
+        for band in 0..AUDIO_FINGERPRINT_BANDS {
+            matrix[time_bucket * AUDIO_FINGERPRINT_BANDS + band] +=
+                frame_energy[band] / f64::from(band_bin_counts[band]);
+        }
+    }
+    if bucket_frames.iter().any(|count| *count == 0) {
+        return None;
+    }
+    for time_bucket in 0..AUDIO_FINGERPRINT_TIME_BUCKETS {
+        for band in 0..AUDIO_FINGERPRINT_BANDS {
+            let index = time_bucket * AUDIO_FINGERPRINT_BANDS + band;
+            matrix[index] = (matrix[index] / f64::from(bucket_frames[time_bucket])).ln_1p();
+        }
+    }
+
+    let mean = matrix.iter().sum::<f64>() / matrix.len() as f64;
+    let variance = matrix
         .iter()
-        .zip(bucket_samples.iter())
-        .filter_map(|(energy, samples)| (*samples > 0).then_some(*energy / u64::from(*samples)))
-        .max()
-        .unwrap_or(1)
-        .max(1);
+        .map(|value| {
+            let centered = value - mean;
+            centered * centered
+        })
+        .sum::<f64>()
+        / matrix.len() as f64;
+    if !variance.is_finite() || variance <= f64::EPSILON {
+        return None;
+    }
+    let standard_deviation = variance.sqrt();
+    let vector = matrix
+        .into_iter()
+        .map(|value| {
+            (((value - mean) / standard_deviation) * AUDIO_FINGERPRINT_QUANTIZATION_SCALE)
+                .round()
+                .clamp(f64::from(i8::MIN), f64::from(i8::MAX)) as i8
+        })
+        .collect::<Vec<_>>();
+    if vector.iter().all(|value| *value == 0) {
+        return None;
+    }
+
     let duration_ms = ((frame_count as u128) * 1_000_u128 / u128::from(sample_rate)) as u64;
     let duration_bucket_ms = ((duration_ms + 50) / 100) * 100;
-    let mut feature =
-        format!("wav-pcm16-v1;sr={sample_rate};ch={channels};dur_ms={duration_bucket_ms};");
-    for idx in 0..bucket_count {
-        let avg_energy = if bucket_samples[idx] == 0 {
-            0
-        } else {
-            bucket_energy[idx] / u64::from(bucket_samples[idx])
-        };
-        let energy_bucket = ((avg_energy * 7) / max_energy).min(7);
-        let crossing_bucket = if bucket_samples[idx] == 0 {
-            0
-        } else {
-            ((u64::from(bucket_crossings[idx]) * 7) / u64::from(bucket_samples[idx])).min(7)
-        };
-        feature.push_str(&format!("{energy_bucket:x}{crossing_bucket:x}"));
+    if duration_bucket_ms == 0 {
+        return None;
     }
+    Some(AudioSpectralFingerprint {
+        duration_bucket_ms,
+        vector,
+    })
+}
 
-    Some(blake3::hash(feature.as_bytes()).to_hex().to_string())
+pub fn audio_fingerprint_similarity_bps(expected: &str, observed: &str) -> Option<u32> {
+    let expected = AudioSpectralFingerprint::decode(expected)?;
+    let observed = AudioSpectralFingerprint::decode(observed)?;
+    if expected.duration_bucket_ms != observed.duration_bucket_ms
+        || expected.vector.len() != observed.vector.len()
+    {
+        return Some(0);
+    }
+    let (dot, expected_norm, observed_norm) = expected.vector.iter().zip(&observed.vector).fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, expected_norm, observed_norm), (expected, observed)| {
+            let expected = f64::from(*expected);
+            let observed = f64::from(*observed);
+            (
+                dot + expected * observed,
+                expected_norm + expected * expected,
+                observed_norm + observed * observed,
+            )
+        },
+    );
+    if expected_norm == 0.0 || observed_norm == 0.0 {
+        return None;
+    }
+    let cosine = dot / (expected_norm.sqrt() * observed_norm.sqrt());
+    if !cosine.is_finite() {
+        return None;
+    }
+    Some((cosine.clamp(0.0, 1.0) * 10_000.0).round() as u32)
+}
+
+pub fn valid_audio_fingerprint(value: &str) -> bool {
+    AudioSpectralFingerprint::decode(value).is_some()
 }
 
 pub fn evaluate_catalog_canary_audio_fingerprint_probe(
     spec: &CanaryProbeSpec,
     expected_fingerprints_by_prompt: &BTreeMap<String, String>,
     observed_fingerprints_by_prompt: &BTreeMap<String, String>,
+    min_match_bps: u32,
 ) -> CanaryProbeEvaluation {
     let mut matched_positions = 0_u32;
     let mut total_positions = 0_u32;
+    let mut score_sum = 0_u64;
     let mut expected_fingerprints = Vec::with_capacity(expected_fingerprints_by_prompt.len());
     let mut observed_fingerprints = Vec::with_capacity(expected_fingerprints_by_prompt.len());
 
@@ -659,10 +846,10 @@ pub fn evaluate_catalog_canary_audio_fingerprint_probe(
             .get(prompt_id)
             .map(String::as_str)
             .unwrap_or_default();
+        let score = audio_fingerprint_similarity_bps(expected, observed).unwrap_or(0);
         total_positions = total_positions.saturating_add(1);
-        matched_positions = matched_positions.saturating_add(u32::from(
-            !expected.is_empty() && expected.eq_ignore_ascii_case(observed),
-        ));
+        matched_positions = matched_positions.saturating_add(u32::from(score >= min_match_bps));
+        score_sum = score_sum.saturating_add(u64::from(score));
         expected_fingerprints.push((prompt_id.as_str(), expected.to_ascii_lowercase()));
         observed_fingerprints.push((prompt_id.as_str(), observed.to_ascii_lowercase()));
     }
@@ -670,7 +857,7 @@ pub fn evaluate_catalog_canary_audio_fingerprint_probe(
     let match_bps = if total_positions == 0 {
         0
     } else {
-        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+        (score_sum / u64::from(total_positions)) as u32
     };
     let expected_fingerprint = aggregate_canary_fingerprints(
         expected_fingerprints
@@ -692,7 +879,9 @@ pub fn evaluate_catalog_canary_audio_fingerprint_probe(
         matched_positions,
         total_positions,
         match_bps,
-        pass: total_positions > 0 && matched_positions == total_positions,
+        pass: total_positions > 0
+            && matched_positions == total_positions
+            && match_bps >= min_match_bps,
     }
 }
 
@@ -953,6 +1142,81 @@ mod tests {
                 !evaluate_catalog_canary_transcript_match_probe(&spec(), &expected, &mismatch).pass
             );
         }
+    }
+
+    fn test_pcm16_wav(frequency_hz: f64, gain: f64, duration_seconds: u32) -> Vec<u8> {
+        let sample_rate = 16_000_u32;
+        let frames = sample_rate * duration_seconds;
+        let data_len = frames * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let time = f64::from(frame) / f64::from(sample_rate);
+            let envelope = 0.55 + 0.45 * (std::f64::consts::TAU * 1.75 * time).sin().abs();
+            let sample = gain
+                * envelope
+                * ((std::f64::consts::TAU * frequency_hz * time).sin()
+                    + 0.3 * (std::f64::consts::TAU * frequency_hz * 1.5 * time).sin());
+            let sample = (sample * f64::from(i16::MAX))
+                .round()
+                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    #[test]
+    fn audio_spectral_fingerprint_is_gain_invariant_and_content_sensitive() {
+        let reference = audio_fingerprint(&test_pcm16_wav(220.0, 0.5, 2));
+        let gain_variant = audio_fingerprint(&test_pcm16_wav(220.0, 0.2, 2));
+        let unrelated = audio_fingerprint(&test_pcm16_wav(880.0, 0.5, 2));
+
+        assert!(valid_audio_fingerprint(&reference));
+        assert_eq!(
+            audio_fingerprint_similarity_bps(&reference, &gain_variant),
+            Some(10_000)
+        );
+        assert!(
+            audio_fingerprint_similarity_bps(&reference, &unrelated).unwrap_or_default() < 9_000
+        );
+        assert!(!valid_audio_fingerprint(&audio_fingerprint(
+            &test_pcm16_wav(220.0, 0.0, 2)
+        )));
+    }
+
+    #[test]
+    fn audio_spectral_probe_applies_tolerance_and_rejects_duration_drift() {
+        let expected_fingerprint = audio_fingerprint(&test_pcm16_wav(220.0, 0.5, 2));
+        let expected = BTreeMap::from([("fixed".to_owned(), expected_fingerprint.clone())]);
+        let exact = BTreeMap::from([("fixed".to_owned(), expected_fingerprint)]);
+        let exact_evaluation =
+            evaluate_catalog_canary_audio_fingerprint_probe(&spec(), &expected, &exact, 9_000);
+        assert_eq!(exact_evaluation.match_bps, 10_000);
+        assert!(exact_evaluation.pass);
+
+        let wrong_duration = BTreeMap::from([(
+            "fixed".to_owned(),
+            audio_fingerprint(&test_pcm16_wav(220.0, 0.5, 3)),
+        )]);
+        let mismatch = evaluate_catalog_canary_audio_fingerprint_probe(
+            &spec(),
+            &expected,
+            &wrong_duration,
+            9_000,
+        );
+        assert_eq!(mismatch.match_bps, 0);
+        assert!(!mismatch.pass);
     }
 
     #[test]

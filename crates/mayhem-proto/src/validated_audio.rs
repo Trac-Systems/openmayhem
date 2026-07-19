@@ -1,4 +1,11 @@
-use std::io;
+use std::io::{self, Cursor};
+
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP3, CODEC_ID_OPUS};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::Timestamp;
 
 pub const MAX_TRANSCRIPTION_AUDIO_SECONDS: u64 = 3 * 60 * 60;
 
@@ -6,6 +13,9 @@ pub const MAX_TRANSCRIPTION_AUDIO_SECONDS: u64 = 3 * 60 * 60;
 pub enum ValidatedAudioFormat {
     Wav,
     Flac,
+    Mp3,
+    Opus,
+    Aac,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +28,80 @@ pub struct ValidatedAudioMetadata {
 }
 
 pub fn validated_audio_metadata(bytes: &[u8]) -> Option<ValidatedAudioMetadata> {
-    validated_wav_audio_metadata(bytes).or_else(|| validated_flac_audio_metadata(bytes))
+    validated_wav_audio_metadata(bytes)
+        .or_else(|| validated_flac_audio_metadata(bytes))
+        .or_else(|| validated_packet_audio_metadata(bytes))
+}
+
+fn validated_packet_audio_metadata(bytes: &[u8]) -> Option<ValidatedAudioMetadata> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &Hint::new(),
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = format.default_track(TrackType::Audio)?.clone();
+    let params = track.codec_params.as_ref()?.audio()?;
+    let audio_format = match params.codec {
+        CODEC_ID_MP3 => ValidatedAudioFormat::Mp3,
+        CODEC_ID_OPUS => ValidatedAudioFormat::Opus,
+        CODEC_ID_AAC => ValidatedAudioFormat::Aac,
+        _ => return None,
+    };
+    let sample_rate = params.sample_rate?;
+    let channels = u8::try_from(params.channels.as_ref()?.count()).ok()?;
+    if sample_rate == 0 || channels == 0 || channels > 8 {
+        return None;
+    }
+    let track_id = track.id;
+    let time_base = track.time_base?;
+    let mut last_end: Option<Timestamp> = None;
+    loop {
+        match format.next_packet() {
+            Ok(Some(packet)) => {
+                if packet.track_id != track_id || packet.data.is_empty() {
+                    continue;
+                }
+                let end = packet.pts.checked_add(packet.dur)?;
+                last_end = Some(last_end.map_or(end, |current| current.max(end)));
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    let duration = last_end?.duration_from(track.start_ts)?;
+    let time = time_base.calc_time(duration.timestamp_from(Timestamp::ZERO)?)?;
+    if time.is_zero() || time.is_negative() {
+        return None;
+    }
+    let duration_seconds_ceil = u64::try_from(time.as_secs())
+        .ok()?
+        .saturating_add(u64::from(time.parts().1 > 0));
+    if duration_seconds_ceil == 0 || duration_seconds_ceil > MAX_TRANSCRIPTION_AUDIO_SECONDS {
+        return None;
+    }
+    let frame_numerator = u128::try_from(time.as_nanos())
+        .ok()?
+        .checked_mul(u128::from(sample_rate))?;
+    let frames = u64::try_from(frame_numerator.div_ceil(1_000_000_000)).ok()?;
+    if frames == 0
+        || frames > u64::from(sample_rate).checked_mul(MAX_TRANSCRIPTION_AUDIO_SECONDS)?
+    {
+        return None;
+    }
+    Some(ValidatedAudioMetadata {
+        format: audio_format,
+        sample_rate,
+        channels,
+        frames,
+        duration_seconds_ceil,
+    })
 }
 
 pub fn validated_wav_audio_metadata(bytes: &[u8]) -> Option<ValidatedAudioMetadata> {
@@ -107,10 +190,9 @@ pub fn validated_wav_audio_metadata(bytes: &[u8]) -> Option<ValidatedAudioMetada
                 u8::try_from(channels).ok()?,
                 u64::from(block_align),
             ));
-        } else if chunk_id == b"data" {
-            if data_len.replace(u64::try_from(chunk_len).ok()?).is_some() {
-                return None;
-            }
+        } else if chunk_id == b"data" && data_len.replace(u64::try_from(chunk_len).ok()?).is_some()
+        {
+            return None;
         }
         offset = padded_end;
     }
@@ -218,5 +300,37 @@ mod tests {
         let mut trailing = pcm16_wav(16_000, 1, 16_000);
         trailing.push(0);
         assert_eq!(validated_wav_audio_metadata(&trailing), None);
+    }
+
+    #[test]
+    fn packet_audio_metadata_validates_supported_music_formats() {
+        for (bytes, format) in [
+            (
+                include_bytes!("../tests/fixtures/audio/tone-1.25s.mp3").as_slice(),
+                ValidatedAudioFormat::Mp3,
+            ),
+            (
+                include_bytes!("../tests/fixtures/audio/tone-1.25s.opus").as_slice(),
+                ValidatedAudioFormat::Opus,
+            ),
+            (
+                include_bytes!("../tests/fixtures/audio/tone-1.25s.m4a").as_slice(),
+                ValidatedAudioFormat::Aac,
+            ),
+        ] {
+            let metadata = validated_audio_metadata(bytes).expect("valid encoded audio");
+            assert_eq!(metadata.format, format);
+            assert_eq!(metadata.sample_rate, 48_000);
+            assert_eq!(metadata.channels, 2);
+            assert_eq!(metadata.duration_seconds_ceil, 2);
+        }
+    }
+
+    #[test]
+    fn packet_audio_metadata_rejects_corruption_and_garbage() {
+        let mp3 = include_bytes!("../tests/fixtures/audio/tone-1.25s.mp3");
+        let corrupt = vec![0_u8; mp3.len()];
+        assert!(validated_audio_metadata(&corrupt).is_none());
+        assert!(validated_audio_metadata(b"not audio").is_none());
     }
 }

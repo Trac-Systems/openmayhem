@@ -460,6 +460,27 @@ mayhem provider start --hf-token-file ~/.mayhem/hf.txt
 
 The Read role can only download; keep the token out of anything you commit or share.
 
+There is no separate model installer to maintain. To serve a specific canonical
+model, name it when starting the normal Mayhem stack:
+
+```bash
+# Speech-to-text
+mayhem up --provider --provider-enclave nvidia/parakeet-tdt-0.6b-v3 --yes
+
+# Music generation
+mayhem up --provider --provider-enclave acestep/ace-step-1.5 --yes
+```
+
+Run `mayhem doctor` first and serve only a model it marks feasible. On start,
+Mayhem resolves the active admin-created enclave from the ledger, downloads the
+immutable Hugging Face artifact and every required sidecar, verifies their
+signed hashes and Merkle roots, prepares the managed backend, runs the signed
+functional self-test, and joins the enclave's canonical room. Parakeet and
+ACE-Step use this same path; providers do not clone either model repository,
+install a separate model server, choose arbitrary weights, or submit a local
+model to the catalog. `--hf-token-file` only authenticates the download and
+never changes which artifact is allowed.
+
 ```bash
 mayhem provider list              # your enclave and room joins
 mayhem provider health            # ledger state, heartbeats, route visibility
@@ -477,9 +498,13 @@ mayhem up --provider                              # re-pack with the new selecti
 Pick which rails you accept — you will only be matched with users paying on rails you accept:
 
 ```bash
-mayhem provider rails set --rails fiat,tap,tnk    # accept everything (recommended)
+mayhem provider rails set --rails fiat,tap,tnk --submit    # accept everything (recommended)
 mayhem provider rails get
 ```
+
+`--submit` sends the provider-signed, free rails declaration through the local
+read-only peer to the admin indexer. Without it, the command is a dry run and
+only prints the copy/paste submission command.
 
 When accepting fiat, finish the one-time Stripe Connect setup from the same
 terminal:
@@ -493,6 +518,11 @@ The onboarding command always prints the exact `https://connect.stripe.com/...`
 URL before attempting to open a browser. On a remote terminal, pass `--no-open`
 and open that copy/paste URL anywhere; rerunning `status` completes the
 admin-approved payout binding without giving the provider ledger write access.
+For TNK and TAP, `mayhem wallet show --json` prints the provider public key plus
+the Trac and Ethereum addresses that the operator verifies and binds. Providers
+choose which rails they accept, but cannot write canonical payout destinations.
+An absent payout binding does not block registration or serving; earnings remain
+accounted until the corresponding destination is bound.
 
 Earnings settle **automatically at the end of every epoch (hourly)** on each rail you earned in. You keep 85%; the network fee funds gas sponsorship and operations.
 
